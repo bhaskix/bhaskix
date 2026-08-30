@@ -87,6 +87,13 @@ pub enum StackError {
         /// Bytes available.
         capacity: usize,
     },
+    /// More argument or environment strings than [`MAX_STRINGS`].
+    TooManyStrings {
+        /// How many were given, whichever vector was the longer.
+        count: usize,
+        /// How many this builder places.
+        limit: usize,
+    },
 }
 
 /// Builds an initial-stack image into a caller's buffer.
@@ -148,8 +155,28 @@ impl<'a> Builder<'a> {
     ///
     /// # Errors
     ///
-    /// [`StackError::TooLarge`] if `buffer` cannot hold [`Builder::size`].
+    /// [`StackError::TooLarge`] if `buffer` cannot hold [`Builder::size`], and
+    /// [`StackError::TooManyStrings`] if either vector is longer than
+    /// [`MAX_STRINGS`].
+    ///
+    /// **The second refusal was claimed before it existed.** `MAX_STRINGS`'
+    /// own comment has said since it was written that a process with more
+    /// strings than this "is refused rather than silently truncated", and
+    /// nothing refused it: the loops below index `[u64; MAX_STRINGS]` by
+    /// `enumerate`, so a sixty-fifth string was an out-of-bounds index — a
+    /// panic, which in a `no_std` program built with `panic = "abort"` is a
+    /// `ud2`. It was unreachable while every caller passed a literal array of
+    /// at most three. RFC 0059 makes `argv` come out of a hosted process's
+    /// own memory, which is untrusted input, so the claim had to become true
+    /// before the caller arrived rather than after.
     pub fn build(&self, buffer: &mut [u8], base: u64) -> Result<usize, StackError> {
+        let count = self.args.len().max(self.env.len());
+        if count > MAX_STRINGS {
+            return Err(StackError::TooManyStrings {
+                count,
+                limit: MAX_STRINGS,
+            });
+        }
         let needed = self.size();
         if buffer.len() < needed {
             return Err(StackError::TooLarge {
@@ -214,7 +241,12 @@ impl<'a> Builder<'a> {
 /// with more than this many is refused rather than silently truncated; the
 /// number is generous for the workloads RFC 0005 targets and is a fixed array
 /// because this crate does not allocate.
-const MAX_STRINGS: usize = 64;
+///
+/// **Public since RFC 0059**, because the refusal is now a caller's business:
+/// `bin/linuxd` reads `argv` and `envp` out of a hosted process's own memory
+/// and has to stop counting somewhere, and it should stop at the same number
+/// this stops at rather than at a second one that happens to agree today.
+pub const MAX_STRINGS: usize = 64;
 
 #[cfg(test)]
 mod tests {
@@ -330,6 +362,47 @@ mod tests {
         builder.build(&mut a, 0x2000).unwrap();
         builder.build(&mut b, 0x2000).unwrap();
         assert_eq!(a, b);
+    }
+
+    /// The regression test for the refusal `MAX_STRINGS` claimed and did not
+    /// make.
+    ///
+    /// Before RFC 0059 this input did not return an error — it indexed
+    /// `[u64; MAX_STRINGS]` at 64 and panicked, which in the ring 3 program
+    /// that will now build these images is a `ud2`, taken by a hosted process
+    /// choosing its own `argv`. The buffer is deliberately made large enough
+    /// for the image, so that a `TooLarge` cannot pass this test by accident.
+    #[test]
+    fn more_strings_than_the_builder_places_are_refused_rather_than_panicking() {
+        let many = [b"x".as_slice(); MAX_STRINGS + 1];
+        let env: [&[u8]; 0] = [];
+        let builder = Builder::new(&many, &env, info());
+        let mut buffer = alloc_zeroed(builder.size());
+        let error = builder.build(&mut buffer, 0x1000).unwrap_err();
+        assert!(
+            matches!(error, StackError::TooManyStrings { count, limit }
+                if count == MAX_STRINGS + 1 && limit == MAX_STRINGS),
+            "expected TooManyStrings, got {error:?}"
+        );
+
+        // The environment vector is counted too, and separately: a process
+        // with two arguments and a thousand variables is the same overflow.
+        let args: [&[u8]; 2] = [b"prog", b"x"];
+        let vars = [b"K=V".as_slice(); MAX_STRINGS + 1];
+        let builder = Builder::new(&args, &vars, info());
+        let mut buffer = alloc_zeroed(builder.size());
+        assert!(matches!(
+            builder.build(&mut buffer, 0x1000).unwrap_err(),
+            StackError::TooManyStrings { .. }
+        ));
+
+        // And exactly the limit still builds, so the refusal is at the right
+        // place rather than one early.
+        let full = [b"x".as_slice(); MAX_STRINGS];
+        let builder = Builder::new(&full, &env, info());
+        let mut buffer = alloc_zeroed(builder.size());
+        builder.build(&mut buffer, 0x1000).unwrap();
+        assert_eq!(word(&buffer, 0), MAX_STRINGS as u64, "argc");
     }
 
     // Small std helpers, test-only.

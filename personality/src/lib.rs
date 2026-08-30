@@ -19,6 +19,7 @@
 
 pub mod call;
 pub mod event;
+pub mod exec;
 pub mod file;
 pub mod memory;
 pub mod pipe;

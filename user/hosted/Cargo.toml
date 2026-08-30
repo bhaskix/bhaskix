@@ -1,0 +1,54 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# `bin/hosted` — the program a hosted `execve` loads off the filesystem.
+#
+# [RFC 0059](../../docs/rfc/0059-an-execve-that-runs-a-program.md). It is a
+# **Linux** program: it makes no Bhaskix system call and holds no capability,
+# and every call it makes is a Linux one answered by `bin/linuxd`. That is what
+# makes it evidence — a Bhaskix program running would prove nothing about the
+# Linux personality, and a program that read a capability could not be the
+# thing a hosted process is.
+#
+# What it prints is what nothing else on the machine can invent: the arguments
+# and environment its parent chose, its own pid, and whether the auxiliary
+# vector it was entered on is real.
+#
+# Deliberately **not** a member of the root workspace, for the reason
+# `user/probe` gives: it needs its own code-generation settings — static
+# relocation, the small code model, its own linker script — and a workspace
+# member cannot have its own `rustflags`.
+[workspace]
+
+[package]
+name = "bhaskix-user-hosted"
+description = "A Linux program, exec'd from the filesystem by the Linux personality."
+version = "0.0.0"
+edition = "2024"
+authors = ["Tarun Kumar Kushwaha"]
+repository = "https://github.com/bhaskix/bhaskix"
+license = "Apache-2.0"
+
+[[bin]]
+name = "hosted"
+path = "src/main.rs"
+
+[package.metadata.bhaskix]
+# 3 — the `_start` stub the System V ABI requires, which must reach `rsp`
+# before anything else touches it; the `syscall` sequence, since this program
+# speaks the Linux ABI and has no libc to carry one; and the `ud2` in the
+# panic handler, which stops where the kernel can see it.
+asm_budget = 3
+# The `syscall` block, the panic handler's `ud2`, and the reads of the initial
+# process image — which is the one thing this program is given as a *pointer*
+# rather than through a call, because that is what Linux hands a program at
+# entry. Reading it is the whole point of this program: an image built wrongly
+# is a bug that does not fail visibly, and something has to look.
+unsafe_budget_exact = true
+unsafe_budget = 27
+
+[profile.release]
+panic = "abort"
+opt-level = "z"
+
+[profile.dev]
+panic = "abort"

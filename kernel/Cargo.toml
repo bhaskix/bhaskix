@@ -578,7 +578,18 @@ asm_budget = 10
 # holding it, plus the reads that take its two answers back. Five lines, and it
 # shares the launcher the pair before it introduced -- the probe differs only in
 # its code and where it lives.
-unsafe_budget = 1983
+# 1989 for RFC 0059's hosted-exec probe: one line in `put_in_probe_page`, the
+# `vm::install`, and the `enter_ring3` that every ring 3 probe here ends with.
+#
+# **It was 2021 first, and the thirty-eight lines were one mistake.** The
+# probe's page is built by writing ten things into it, and the first version
+# wrapped the whole building block -- three loops and their arithmetic -- in a
+# single `unsafe`. Every line inside counts, and none of the arithmetic needed
+# to be there. `coding-style.md` §3 asks for the smallest block that can carry
+# the obligation rather than the smallest number of blocks; one helper holding
+# the copy, called ten times from safe loops, is six lines instead of
+# thirty-eight and says exactly what it promises in three arguments.
+unsafe_budget = 1989
 # Up thirty-one for RFC 0005 step 9's socket probe -- `ring3_socketeer`, which
 # is `ring3_lister` with a `sockaddr_in6` copied in beside its code instead of
 # two filenames. The same two blocks every hosted probe has: one

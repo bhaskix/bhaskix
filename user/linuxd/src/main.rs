@@ -2315,13 +2315,18 @@ const CHILD: u64 = bhaskix_abi::adapter::CHILD as u64;
 /// The name the new domain is created under, packed as `SPAWN` wants it.
 const EXEC_NAME_LOW: u64 = u64::from_le_bytes(*b"execed\0\0");
 
-/// The one program this personality can exec, and the whole of its filesystem.
+/// The one program this personality carries inside itself.
 ///
-/// **A path with one answer is still a path.** There is no file surface yet —
-/// that is RFC 0033 step 6 — so `execve` resolves exactly this name and answers
-/// `ENOENT` for everything else, which is a Linux answer a program can act on
-/// and is not a lie about what is there. When directories arrive, this constant
-/// is what they replace.
+/// **A synthetic path, and it stays one** — exactly as `/proc/self/*` is
+/// synthetic, and for the same reason: what it answers is this adapter's own
+/// business and no filesystem has, or should have, a file by that name. It was
+/// the *only* path `execve` had until RFC 0059; it is now the only one that
+/// does not go to the filesystem.
+///
+/// It is kept rather than deleted because it is the exec that works on a
+/// machine with **no filesystem service at all**, which is four of this
+/// project's five boot lanes. Deleting it would move RFC 0033 step 5's gate
+/// from every lane to one, which is a loss of coverage disguised as a tidy-up.
 const EXEC_PATH: &[u8; 11] = b"/bin/execed";
 
 /// Where the exec'd program's code and stack land in its own space.
@@ -2329,6 +2334,42 @@ const EXEC_CODE_AT: u64 = 0x0000_0000_2000_0000;
 const EXEC_STACK_AT: u64 = 0x0000_0000_2001_0000;
 /// Where the string sits inside the image, as an offset from its start.
 const EXEC_STRING_AT: u64 = 80;
+
+/// Where a program read off the filesystem gets its stack — RFC 0059.
+///
+/// **Well clear of three things, and each one is a real collision avoided.**
+/// Below it are the fixed addresses this adapter maps into a hosted domain:
+/// [`EXEC_CODE_AT`], [`EXEC_STACK_AT`] and [`FORK_TRAMPOLINE_AT`]. Above it is
+/// the `mmap` window, which starts at `layout::MMAP_FLOOR` and runs for a
+/// terabyte — a stack inside it would be handed out again by the first
+/// `mmap` whose draw landed there. And the program's own segments are checked
+/// against this range at load time rather than assumed to be elsewhere,
+/// because the program is a file and its link address is whatever it says.
+const EXEC_STACK_BASE: u64 = 0x0000_6000_0000_0000;
+/// Sixteen pages: fifteen to grow down into, and the top one holding the
+/// initial process image the program is entered on.
+const EXEC_STACK_PAGES: u64 = 16;
+
+/// Where the staging object is mapped in **this** program's space.
+///
+/// Chosen after checking every other window this program owns, which is not a
+/// formality: the obvious next address, `0x1D00_0000`, is where the kernel
+/// puts this program's own **stack** (`LINUXD_STACK`), and attaching there
+/// would have been discovered as something far stranger than a refused
+/// mapping.
+const STAGE_AT: u64 = 0x0000_0000_1A00_0000;
+/// The staging slot, and how much it holds.
+const STAGING: u64 = bhaskix_abi::adapter::STAGING as u64;
+/// Sixteen pages, which is what the kernel granted and what `shared::create`
+/// can make at most. It is the largest program a hosted `execve` can load.
+const STAGING_BYTES: u64 = 16 * 4096;
+
+/// The most pages one eager [`method::MAP_AT`] may ask for.
+///
+/// The kernel's `MAX_SUPERVISED_PAGES`. A segment larger than this is mapped
+/// in several calls rather than refused — a 64-page bound on a *call* is not a
+/// bound on a program.
+const MAX_EAGER_PAGES: u64 = 64;
 
 /// The program `/bin/execed` *is*: hand-assembled, and small on purpose.
 ///
@@ -2665,6 +2706,45 @@ const FILE_SLOTS: usize = bhaskix_abi::adapter::FILE_COUNT;
 
 /// Which file slots are taken.
 static mut FILE_HELD: [bool; FILE_SLOTS] = [false; FILE_SLOTS];
+
+/// Whether the staging object has been attached yet — RFC 0059.
+///
+/// `ATTACH` refuses an address that is already mapped, with the same
+/// `SlotUnavailable` it gives for every unusable address, so a second `execve`
+/// would be refused for a reason that has nothing to do with it. That exact
+/// bug was paid for once already, on the datagram payload page, and the flag
+/// below is the same fix.
+static mut STAGE_MAPPED: bool = false;
+
+/// The `argv` and `envp` of the exec in flight.
+///
+/// **A static rather than a local**, and the reason is arithmetic: this
+/// program's stack is eight pages, and `Arguments` plus the initial image page
+/// plus two arrays of sixty-four slices is over eight kilobytes in one call
+/// chain. The kernel gives a server exactly one outstanding reply, so there is
+/// no second caller inside `answer_execve` and no lock here could be
+/// contended — the same promise every other table in this program makes.
+static mut EXEC_ARGUMENTS: bhaskix_personality::exec::Arguments =
+    bhaskix_personality::exec::Arguments::new();
+
+/// The page the initial process image is built in, for the same reason.
+static mut EXEC_IMAGE_PAGE: [u8; bhaskix_personality::exec::IMAGE_BYTES] =
+    [0; bhaskix_personality::exec::IMAGE_BYTES];
+
+/// How many argument or environment strings one exec may carry.
+const ARGUMENT_SLOTS: usize = bhaskix_personality::exec::MAX_STRINGS;
+
+/// The vectors of the exec in flight.
+fn exec_arguments() -> &'static mut bhaskix_personality::exec::Arguments {
+    // SAFETY: single-threaded, as the note above.
+    unsafe { &mut *core::ptr::addr_of_mut!(EXEC_ARGUMENTS) }
+}
+
+/// The page the initial process image is built in.
+fn exec_image_page() -> &'static mut [u8; bhaskix_personality::exec::IMAGE_BYTES] {
+    // SAFETY: single-threaded, as the note above.
+    unsafe { &mut *core::ptr::addr_of_mut!(EXEC_IMAGE_PAGE) }
+}
 
 /// Takes a free slot for an open file, or `None` when there are none left.
 fn claim_file_slot() -> Option<u64> {
@@ -3150,6 +3230,12 @@ const STAGE_MAP_SILENT: i64 = -106;
 const STAGE_MAP_REFUSED: i64 = -107;
 const STAGE_NOT_ATTACHED: i64 = -109;
 const STAGE_NOT_COPIED: i64 = -110;
+/// And where a hosted `execve` stopped — RFC 0059. The value beside each says
+/// what it stopped *on*: the size that was refused, the service's outcome, or
+/// how many bytes had arrived.
+const STAGE_EXEC_REFUSED: i64 = -140;
+const STAGE_EXEC_READ: i64 = -141;
+const STAGE_EXEC_SHORT: i64 = -142;
 
 /// The work behind [`answer_openat`], so that every path through it is traced.
 fn open_the_file(request: &PersonalityCall, path_at: u64, flags: u64) -> Answer {
@@ -3201,57 +3287,27 @@ fn open_the_file(request: &PersonalityCall, path_at: u64, flags: u64) -> Answer 
     let Some(slot) = claim_file_slot() else {
         return Answer::error(-24); // EMFILE
     };
-    // Where the answer may land, said before asking and addressed to the
-    // service being asked -- the protocol's own rule, and what stops a
-    // capability arriving somewhere the caller did not choose.
-    let declared = call(syscall::INVOKE, ROOT_DIR, method::EXPECT, [slot, 0, 0, 0]);
-    if declared.status != status::OK {
-        release_file_slot(slot);
-        trace_file(-2, STAGE_NO_DIRECTORY, declared.status);
-        return Answer::error(-2);
-    }
-    let (chunk, rest) = bhaskix_abi::Chunk::take(component);
-    if !rest.is_empty() {
-        release_file_slot(slot);
-        return Answer::error(-36); // ENAMETOOLONG
-    }
-    // **`CALL` and not `INVOKE`.** A directory is a *badged endpoint to the
-    // filesystem service*, so opening a name is a message to that service
-    // rather than an operation the kernel performs. Invoking it asked the
-    // kernel to do something to an endpoint and was refused with
-    // `InsufficientRights` -- a refusal that says nothing about directories,
-    // and cost a boot to read.
-    let reply = call(
-        syscall::CALL,
-        ROOT_DIR,
-        bhaskix_abi::dir::OPEN_AT,
-        chunk.pack(0),
-    );
-    if reply.status != status::OK {
-        release_file_slot(slot);
-        trace_file(-2, STAGE_SERVICE_SILENT, reply.status);
-        return Answer::error(-2);
-    }
-    if reply.args[0] != bhaskix_abi::dir::OK {
-        release_file_slot(slot);
-        trace_file(-2, STAGE_SERVICE_REFUSED, reply.args[0]);
-        return Answer::error(-2); // ENOENT
-    }
-    let directory = reply.args[2] != 0;
+    let opened = match resolve_into(slot, component) {
+        Ok(opened) => opened,
+        Err(errno) => {
+            release_file_slot(slot);
+            return Answer::error(errno);
+        }
+    };
     let entry = Entry {
         handle: slot,
         // The filesystem's own name for what was opened, which `fstat`
         // answers with and this program cannot derive from anything else it
         // holds -- the slot is reused between files.
-        inode: reply.args[3],
-        kind: if directory {
+        inode: opened.inode,
+        kind: if opened.directory {
             Kind::Directory
         } else {
             Kind::File
         },
         close_on_exec: flags & open::CLOEXEC != 0,
         offset: 0,
-        size: reply.args[1],
+        size: opened.size,
         readable: true,
         writable: false,
     };
@@ -4510,6 +4566,74 @@ fn one_component(name: &[u8]) -> Option<&[u8]> {
 /// The longest path this personality reads out of a hosted program.
 const MAX_NAME: usize = 64;
 
+/// What the filesystem service said about a name it resolved.
+#[derive(Clone, Copy)]
+struct Opened {
+    /// The filesystem's own name for it, which `fstat` answers with.
+    inode: u64,
+    /// Its size in bytes.
+    size: u64,
+    /// Whether it is a directory rather than a file.
+    directory: bool,
+}
+
+/// Resolves one name in this process's root directory into `slot`.
+///
+/// **Extracted at RFC 0059 rather than copied.** `execve` has to resolve a
+/// name exactly the way `open` does — same directory, same one component, same
+/// four refusals told apart by stage — and a second copy of this sequence
+/// would be a second place for the `CALL`-versus-`INVOKE` mistake below to be
+/// made again.
+///
+/// The caller owns the slot: on any error nothing was installed into it, and
+/// releasing it is the caller's business because only the caller knows whether
+/// it came from the file pool or somewhere else.
+///
+/// # Errors
+///
+/// The Linux errno to answer with. `ENOENT` for every way the service can say
+/// no, because that is the truth a hosted program can act on; *which* way it
+/// was goes into the trace record, for whoever is reading a boot.
+fn resolve_into(slot: u64, component: &[u8]) -> Result<Opened, i64> {
+    // Where the answer may land, said before asking and addressed to the
+    // service being asked -- the protocol's own rule, and what stops a
+    // capability arriving somewhere the caller did not choose.
+    let declared = call(syscall::INVOKE, ROOT_DIR, method::EXPECT, [slot, 0, 0, 0]);
+    if declared.status != status::OK {
+        trace_file(-2, STAGE_NO_DIRECTORY, declared.status);
+        return Err(-2);
+    }
+    let (chunk, rest) = bhaskix_abi::Chunk::take(component);
+    if !rest.is_empty() {
+        return Err(-36); // ENAMETOOLONG
+    }
+    // **`CALL` and not `INVOKE`.** A directory is a *badged endpoint to the
+    // filesystem service*, so opening a name is a message to that service
+    // rather than an operation the kernel performs. Invoking it asked the
+    // kernel to do something to an endpoint and was refused with
+    // `InsufficientRights` -- a refusal that says nothing about directories,
+    // and cost a boot to read.
+    let reply = call(
+        syscall::CALL,
+        ROOT_DIR,
+        bhaskix_abi::dir::OPEN_AT,
+        chunk.pack(0),
+    );
+    if reply.status != status::OK {
+        trace_file(-2, STAGE_SERVICE_SILENT, reply.status);
+        return Err(-2);
+    }
+    if reply.args[0] != bhaskix_abi::dir::OK {
+        trace_file(-2, STAGE_SERVICE_REFUSED, reply.args[0]);
+        return Err(-2); // ENOENT
+    }
+    Ok(Opened {
+        inode: reply.args[3],
+        size: reply.args[1],
+        directory: reply.args[2] != 0,
+    })
+}
+
 /// Records how a hosted process ended, for whoever waits for it.
 ///
 /// **The record becomes a zombie rather than disappearing**, because the exit
@@ -4859,15 +4983,50 @@ fn build_fork_child(request: &PersonalityCall, rip: u64, rsp: u64) -> Option<u64
 /// what `execve` is in Linux.
 fn answer_execve(request: &PersonalityCall) -> (u64, Answer) {
     // The path, read out of the caller's memory through the `Domain`
-    // capability. **There is one program**, and asking for anything else is
-    // `ENOENT` rather than a lie -- see `EXEC_PATH`.
-    let mut path = [0u8; EXEC_PATH.len()];
-    if !copy_in(request.domain, request.first(), &mut path) {
-        return (REPLY_VALUE, Answer::error(-14)); // EFAULT
+    // capability -- **to its NUL, not to a fixed width**. A `[u8; MAX_NAME]`
+    // copy refuses a short path that happens to sit in the last bytes of a
+    // mapping, because the copy reaches past it into a page the process does
+    // not have; `exec::read_string` stops at each page boundary for exactly
+    // that case and is host-tested against it.
+    let mut path = [0u8; MAX_NAME];
+    let length =
+        match bhaskix_personality::exec::read_string(request.first(), &mut path, &mut |at, out| {
+            copy_in(request.domain, at, out)
+        }) {
+            Ok(length) => length,
+            // `E2BIG` from a *path* is Linux's `ENAMETOOLONG`; `EFAULT` passes
+            // through as itself.
+            Err(bhaskix_personality::exec::errno::E2BIG) => {
+                return (REPLY_VALUE, Answer::error(-36));
+            }
+            Err(errno) => return (REPLY_VALUE, Answer::error(errno)),
+        };
+    let path = &path[..length];
+
+    // **The two vectors, before anything is created.** An `execve` refused for
+    // its arguments must leave the caller running and unchanged, and the
+    // cheapest way to guarantee that is to do every refusable read before the
+    // first act that would have to be undone. A hosted process chose every one
+    // of these pointers, so this is the untrusted-input parser of the call and
+    // it lives in `bhaskix-personality`, host-tested, with no capability
+    // anywhere near it.
+    let arguments = exec_arguments();
+    if let Err(errno) = arguments.read(request.second(), request.third(), &mut |at, out| {
+        copy_in(request.domain, at, out)
+    }) {
+        return (REPLY_VALUE, Answer::error(errno));
     }
-    if path != *EXEC_PATH {
-        return (REPLY_VALUE, Answer::error(-2)); // ENOENT
-    }
+
+    // Where the image comes from: this program carries one, and the filesystem
+    // holds the rest.
+    let staged = if path == EXEC_PATH.as_slice() {
+        None
+    } else {
+        match stage_from_filesystem(path) {
+            Ok(bytes) => Some(bytes),
+            Err(errno) => return (REPLY_VALUE, Answer::error(errno)),
+        }
+    };
 
     // A domain to become. The slot is this program's own scratch, and one at a
     // time is enough: this program has one thread, so no second exec can be in
@@ -4885,7 +5044,16 @@ fn answer_execve(request: &PersonalityCall) -> (u64, Answer) {
         return (REPLY_VALUE, Answer::error(-11));
     }
 
-    let built = build_exec_image();
+    // **The errno is the builder's to choose.** The built-in image can only
+    // fail for want of memory; a program off the filesystem can be refused by
+    // the ELF parser, or for a segment that would land on its own stack, and
+    // answering `ENOMEM` to either would send whoever is debugging it looking
+    // for memory pressure that is not there.
+    let built = match staged {
+        None if build_exec_image() => Ok(()),
+        None => Err(-12), // ENOMEM
+        Some(bytes) => build_staged_image(bytes, arguments),
+    };
     // The handle is given back either way. A slot left occupied would refuse
     // the *next* exec for a reason that has nothing to do with it.
     // **The record is looked up before anything moves it**, and the first
@@ -4895,12 +5063,11 @@ fn answer_execve(request: &PersonalityCall) -> (u64, Answer) {
     // program it replaced, which is the exact failure this step exists to
     // prevent. The old slot's incarnation moves when the kernel says it has
     // been reused (`FORGET`), which is the only moment that is true.
-    let outcome = if built {
-        (REPLY_END_DOMAIN, Answer::ok(0))
-    } else {
-        (REPLY_VALUE, Answer::error(-12)) // ENOMEM
+    let outcome = match built {
+        Ok(()) => (REPLY_END_DOMAIN, Answer::ok(0)),
+        Err(errno) => (REPLY_VALUE, Answer::error(errno)),
     };
-    if built {
+    if built.is_ok() {
         // The record moves to the new domain *before* the old one ends, so a
         // call arriving from the new domain finds the same process. The
         // generation is this program's own count of how often the slot has
@@ -4916,6 +5083,313 @@ fn answer_execve(request: &PersonalityCall) -> (u64, Answer) {
     }
     let _ = call(syscall::INVOKE, CHILD, method::DELETE, [0; 4]);
     outcome
+}
+
+/// Reads a program out of this process's root directory into the staging
+/// object, and says how many bytes arrived — RFC 0059 step 3.
+///
+/// **Nothing is created before this succeeds.** It is called with no child
+/// domain in existence, so every refusal here leaves the calling process
+/// exactly as it was, which is what `execve` promises for a failed exec.
+///
+/// # Errors
+///
+/// `ENOENT` for a name that is not there, `EACCES` for a directory (Linux's
+/// answer for `execve` of one), `ENOEXEC` for an empty file, `E2BIG` for one
+/// larger than the staging object, and `EIO` if the service stops answering
+/// part way through.
+fn stage_from_filesystem(name: &[u8]) -> Result<u64, i64> {
+    let Some(component) = one_component(name) else {
+        return Err(-2); // ENOENT
+    };
+    let Some(slot) = claim_file_slot() else {
+        return Err(-24); // EMFILE
+    };
+    let opened = match resolve_into(slot, component) {
+        Ok(opened) => opened,
+        Err(errno) => {
+            release_file_slot(slot);
+            return Err(errno);
+        }
+    };
+    let refusal = if opened.directory {
+        Some(-13) // EACCES: a directory is not a program
+    } else if opened.size == 0 {
+        Some(-8) // ENOEXEC: nothing is not a program either
+    } else if opened.size > STAGING_BYTES {
+        // **Said, not truncated.** Loading the first 64 KiB of a larger
+        // program would produce a domain that faults somewhere unrelated, and
+        // the limit is a property of this adapter rather than of the file.
+        Some(-7) // E2BIG
+    } else {
+        None
+    };
+    if let Some(errno) = refusal {
+        release_file_slot(slot);
+        trace_file(errno, STAGE_EXEC_REFUSED, opened.size);
+        return Err(errno);
+    }
+
+    // **`READ_INTO` lands the bytes at the file's own offset**, which is what
+    // makes a linear read reassemble the file in place — and also why the
+    // staging object has to be as large as the file rather than a window that
+    // could be slid along it. The service moves at most a page per call and
+    // says how much went; the loop is the caller's, as the protocol says.
+    let mut done = 0u64;
+    while done < opened.size {
+        let reply = call(
+            syscall::CALL,
+            slot,
+            bhaskix_abi::dir::READ_INTO,
+            [STAGING, 4096, done, 0],
+        );
+        if reply.status != status::OK || reply.args[0] != bhaskix_abi::dir::OK {
+            release_file_slot(slot);
+            trace_file(-5, STAGE_EXEC_READ, reply.args[0] | (reply.status << 32));
+            return Err(-5); // EIO
+        }
+        let moved = reply.args[1];
+        if moved == 0 {
+            // The service says end of file before the size it reported. That
+            // is a disagreement inside the filesystem, not something the
+            // calling program did, and a short image would fail later as
+            // something stranger.
+            break;
+        }
+        done += moved;
+    }
+    release_file_slot(slot);
+    if done != opened.size {
+        trace_file(-5, STAGE_EXEC_SHORT, done);
+        return Err(-5); // EIO
+    }
+    Ok(done)
+}
+
+/// The staged bytes, as a slice, mapping the staging object on first use.
+///
+/// # Errors
+///
+/// `EIO` if the object will not attach — which would mean this program's own
+/// address space, not anything the caller did.
+fn staged_bytes(length: u64) -> Result<&'static [u8], i64> {
+    // SAFETY: single-threaded by construction, as every other table here.
+    let mapped = unsafe { &mut *core::ptr::addr_of_mut!(STAGE_MAPPED) };
+    if !*mapped {
+        // Read-only: this program parses the image and never edits it, and
+        // `READ_INTO` fills the object through the kernel rather than through
+        // this mapping, so no write right is wanted here.
+        if call(
+            syscall::INVOKE,
+            STAGING,
+            method::ATTACH,
+            [STAGE_AT, 0, 0, 0],
+        )
+        .status
+            != status::OK
+        {
+            return Err(-5); // EIO
+        }
+        *mapped = true;
+    }
+    let length = (length.min(STAGING_BYTES)) as usize;
+    // SAFETY: inside the window `ATTACH` mapped from the object the kernel
+    // granted this program at boot, bounded by the object's own size — and by
+    // the file size, which `stage_from_filesystem` refused above if larger.
+    Ok(unsafe { core::slice::from_raw_parts(STAGE_AT as *const u8, length) })
+}
+
+/// Loads a program off the filesystem into the child domain and starts it —
+/// RFC 0059 step 4.
+///
+/// **Every segment arrives through a mapping this program never holds
+/// writable**, which is how `W^X` survives a loader in ring 3: `COPY_OUT`
+/// writes through the *kernel's* view of the child's frames, so a read-execute
+/// segment is filled without ever being writable in any address space. That is
+/// the same mechanism the built-in image has always used, applied to a file.
+///
+/// # Errors
+///
+/// `ENOEXEC` for anything the ELF parser refuses or that would land on the
+/// stack this loader is about to map, `E2BIG` if the initial image does not
+/// fit its page, and `ENOMEM` for a kernel call that refuses.
+fn build_staged_image(
+    length: u64,
+    arguments: &bhaskix_personality::exec::Arguments,
+) -> Result<(), i64> {
+    use bhaskix_personality::stack::{Builder, ProcessInfo};
+
+    let bytes = staged_bytes(length)?;
+    let Ok(parsed) = bhaskix_elf::parse(bytes) else {
+        return Err(-8); // ENOEXEC
+    };
+
+    if call(syscall::INVOKE, CHILD, method::PERSONALITY, [1, 0, 0, 0]).status != status::OK {
+        return Err(-12);
+    }
+    if call(syscall::INVOKE, CHILD, method::MAKE_SPACE, [0; 4]).status != status::OK {
+        return Err(-12);
+    }
+
+    let stack_end = EXEC_STACK_BASE + EXEC_STACK_PAGES * 4096;
+    for segment in parsed.segments() {
+        let Some((start, end)) = bhaskix_elf::page_span(segment) else {
+            return Err(-8);
+        };
+        // **A program may not be linked over its own stack.** The parser
+        // checks a segment against the address space; it has no idea where
+        // this loader is about to put a stack, so that check is here. Refused
+        // rather than relocated: moving the stack to suit an image would make
+        // the layout a function of the file, and a program that asked for this
+        // address is asking for something it will not get.
+        if start < stack_end && end > EXEC_STACK_BASE {
+            return Err(-8); // ENOEXEC
+        }
+        let protection = match segment.protection {
+            bhaskix_elf::Protection::ReadOnly => PROT_READ,
+            bhaskix_elf::Protection::ReadWrite => PROT_READ_WRITE,
+            bhaskix_elf::Protection::ReadExecute => PROT_READ_EXECUTE,
+        };
+        // Eagerly, and in runs the kernel will accept in one call: `COPY_OUT`
+        // writes through the kernel's own view of the frames, so a lazily
+        // mapped page has nothing to write into yet.
+        let mut mapped = start;
+        while mapped < end {
+            let pages = ((end - mapped) / 4096).min(MAX_EAGER_PAGES);
+            if !map_at_eager(CHILD, mapped, pages, protection) {
+                return Err(-12); // ENOMEM
+            }
+            mapped += pages * 4096;
+        }
+        // Then its contents, straight out of the staging object: the source is
+        // an *object and an offset*, so the bytes never pass through this
+        // program's own scratch and no part of the image is dereferenced here.
+        // A segment's `memory_size` may exceed its `file_size` — that is
+        // `.bss`, and it is already the zero a fresh mapping is.
+        if !copy_from_staging(
+            segment.file_offset as u64,
+            segment.address,
+            segment.file_size as u64,
+        ) {
+            return Err(-12);
+        }
+    }
+
+    // The stack, and the initial image at the top of it.
+    if !map_at_eager(CHILD, EXEC_STACK_BASE, EXEC_STACK_PAGES, PROT_READ_WRITE) {
+        return Err(-12);
+    }
+    let image_at = stack_end - 4096;
+
+    let mut argv: [&[u8]; ARGUMENT_SLOTS] = [b""; ARGUMENT_SLOTS];
+    let mut envp: [&[u8]; ARGUMENT_SLOTS] = [b""; ARGUMENT_SLOTS];
+    let argc = arguments.arguments(&mut argv)?;
+    let envc = arguments.environment(&mut envp)?;
+
+    let (phdr, phent, phnum) = program_headers(bytes, &parsed);
+    let mut entropy = [0u8; 16];
+    // A machine with no `RDRAND` gets a fixed block rather than no block: a
+    // runtime that reads `AT_RANDOM` and finds nothing there is worse off than
+    // one that reads something predictable, and the fallback is the same
+    // shape `drawn_base` already uses for the same reason.
+    entropy[..8].copy_from_slice(
+        &bhaskix_rand::u64()
+            .unwrap_or(0x5eed_0000_5eed_0000)
+            .to_le_bytes(),
+    );
+    entropy[8..].copy_from_slice(
+        &bhaskix_rand::u64()
+            .unwrap_or(0x0dd0_5eed_0dd0_5eed)
+            .to_le_bytes(),
+    );
+
+    let builder = Builder::new(
+        &argv[..argc],
+        &envp[..envc],
+        ProcessInfo {
+            entry: parsed.entry,
+            phdr,
+            phent,
+            phnum,
+            page_size: 4096,
+            hwcap: 0,
+            random: entropy,
+        },
+    );
+    let image = exec_image_page();
+    if builder.build(image, image_at).is_err() {
+        return Err(-7); // E2BIG
+    }
+    let size = builder.size();
+    if !copy_page_out(CHILD, image_at, &image[..size]) {
+        return Err(-12);
+    }
+
+    // `rsp` is where `argc` sits, which is the offset `build` returns and is
+    // zero by construction: the vectors are at the bottom of the image and the
+    // strings above them.
+    if call(
+        syscall::INVOKE,
+        CHILD,
+        method::SPAWN_THREAD,
+        [parsed.entry, image_at, 0, 0],
+    )
+    .status
+        != status::OK
+    {
+        return Err(-12);
+    }
+    Ok(())
+}
+
+/// Copies `length` bytes of the staged image into the child at `address`.
+///
+/// The kernel moves at most a page per `COPY_OUT`, so the loop is here; the
+/// offset into the staging object *is* the file offset, because that is where
+/// `READ_INTO` put the bytes.
+fn copy_from_staging(from: u64, address: u64, length: u64) -> bool {
+    let mut done = 0u64;
+    while done < length {
+        let take = (length - done).min(4096);
+        let moved = call(
+            syscall::INVOKE,
+            CHILD,
+            method::COPY_OUT,
+            [STAGING, from + done, address + done, take],
+        );
+        if moved.status != status::OK {
+            return false;
+        }
+        done += take;
+    }
+    true
+}
+
+/// Where the program headers land in the process's own space, and how many.
+///
+/// `AT_PHDR` is a **virtual address in the program's space**, and the loader
+/// does not track it — so it is computed from the file's own header and the
+/// segment that carries it, exactly as the kernel does for the boot corpus. A
+/// runtime that walks its own headers reads this and nothing else.
+fn program_headers(bytes: &[u8], parsed: &bhaskix_elf::Image) -> (u64, u64, u64) {
+    let word_at = |at: usize, width: usize| -> u64 {
+        let mut value = [0u8; 8];
+        let Some(slice) = bytes.get(at..at + width) else {
+            return 0;
+        };
+        value[..width].copy_from_slice(slice);
+        u64::from_le_bytes(value)
+    };
+    // ELF64: `e_phoff` at 32, `e_phentsize` at 54, `e_phnum` at 56.
+    let phoff = word_at(32, 8) as usize;
+    let phdr = parsed
+        .segments()
+        .find(|segment| {
+            phoff >= segment.file_offset && phoff < segment.file_offset + segment.file_size
+        })
+        .map(|segment| segment.address + (phoff - segment.file_offset) as u64)
+        .unwrap_or(0);
+    (phdr, word_at(54, 2), word_at(56, 2))
 }
 
 /// Maps and fills the exec'd program's memory, and starts its thread.

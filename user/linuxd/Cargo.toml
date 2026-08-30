@@ -35,6 +35,12 @@ bhaskix-abi = { path = "../../abi" }
 # **unchanged by this move** -- which is the point of having kept it separate
 # while the rest of the personality was in the kernel.
 bhaskix-personality = { path = "../../personality" }
+# The ELF64 parser, for `execve` -- RFC 0059. A leaf crate with no
+# dependencies of its own, `forbid(unsafe_code)`, and 10.97 billion fuzz
+# executions of assurance; the kernel, the boot loader and this program all
+# need exactly the same checks over a file somebody supplied, so there is one
+# copy of them and this is the third caller rather than a fourth parser.
+bhaskix-elf = { path = "../../elf" }
 # `RDRAND` and the `CPUID` that detects it, for a hosted process's `mmap` base
 # -- security.md §1 gap 3. Unprivileged, so a ring 3 program draws for itself
 # and holds nothing extra to do it: RFC 0021's finding, and why there is no
@@ -188,7 +194,24 @@ asm_budget = 3
 # program believes it gave back and `bin/ipd` still holds is a port lost for the
 # rest of the boot, and the defect that made it possible was an answer thrown
 # away with `let _ =`.
-unsafe_budget = 95
+# 99 as of RFC 0059, and the four lines are named because a number that grows
+# without a reason beside it is a number nobody is watching. Two are
+# accessors, one per table, which is this crate's convention: the vectors of
+# the exec in flight, and the page its initial image is built in. Both are
+# statics rather than locals for an arithmetic reason — this program's stack is
+# eight pages and those two together are over six kilobytes. One is the flag
+# remembering that the staging object has been attached, which exists because
+# `ATTACH` refuses an address that is already mapped and the second `execve`
+# would otherwise be refused for a reason that has nothing to do with it. The
+# fourth is the slice over the staged image, so `bhaskix-elf` can parse it.
+#
+# **The loader itself adds none**, which is the same sentence RFC 0033 step 5
+# could write and is worth repeating now that the image is a *file*: a domain
+# is created, given an address space, mapped, filled and started entirely
+# through capability invocations, and the bytes reach it through `COPY_OUT`
+# from an object — so the largest thing this program does to another domain
+# still dereferences nothing belonging to anybody else.
+unsafe_budget = 99
 # Up five for RFC 0005 step 9's datagram page: the volatile writes that stage
 # a payload into it, the volatile reads that take one back out, and the static
 # that remembers whether it has been mapped.

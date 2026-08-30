@@ -3991,6 +3991,53 @@ fn adapter_file_record() -> (i64, i64, u64) {
 /// Prints nothing when no foreign call has been made: a machine that ran no
 /// hosted program has no boundary to report on, and a mean over zero samples
 /// is a zero pretending to be a measurement.
+/// The adapter's record of the last `execve` it served: pid, old domain, new.
+///
+/// **Read rather than printed here**, because it is read twice: once in the
+/// boundary report for the built-in exec, and again after the hosted exec of
+/// RFC 0059, which happens much later in the boot — after the filesystem
+/// service exists. A single print at the first site would have described the
+/// wrong exec by the time the second one had run, and the gate that compares
+/// this pid against the program's own `getpid` would have failed for a reason
+/// that had nothing to do with the exec.
+fn adapter_exec_record() -> Option<[u64; 3]> {
+    let page = ADAPTER_REPORT.load(core::sync::atomic::Ordering::Acquire);
+    if page == u64::MAX {
+        return None;
+    }
+    let object = shared::MemoryId::from_u64(page);
+    let mut record = [0u64; 3];
+    let mut at = 0usize;
+    // **From the object's beginning, past the `mmap` records *and* the
+    // adapter's scratch area.** `drain_into` is named for a sink rather than
+    // for consumption: it reads from the start every time, so an offset is
+    // walked rather than resumed.
+    //
+    // The scratch area matters and cost two boots: it began at 256, which is
+    // where this record first sat, so every `copy_in` after the exec overwrote
+    // it and the kernel printed the tail of a path as a pid. The fix was
+    // `personality::report`, which is why no offset is computed here any more
+    // -- the "1,280 = 256 + 1,024" this comment used to give was itself out of
+    // date by the time anyone read it.
+    const EXEC_RECORD_BYTE: usize = bhaskix_personality::report::EXEC_AT;
+    const EXEC_RECORD_WORD: usize = EXEC_RECORD_BYTE / 8;
+    let taken = shared::drain_into(object, EXEC_RECORD_BYTE + 24, &mut |chunk: &[u8]| {
+        for word in chunk.as_chunks::<8>().0 {
+            if at >= EXEC_RECORD_WORD + 3 {
+                break;
+            }
+            if at >= EXEC_RECORD_WORD {
+                let mut eight = [0u8; 8];
+                eight.copy_from_slice(word);
+                record[at - EXEC_RECORD_WORD] = u64::from_le_bytes(eight);
+            }
+            at += 1;
+        }
+        chunk.len()
+    });
+    (taken.is_some() && record[0] != 0).then_some(record)
+}
+
 fn personality_boundary_report() {
     let order = core::sync::atomic::Ordering::Relaxed;
     let answered = syscall::ADAPTER_ANSWERED.load(order);
@@ -4140,44 +4187,11 @@ fn personality_boundary_report() {
     // The other witness is the exec'd program itself, which asks `getpid` in
     // the new domain and prints the answer. The boot test compares the two,
     // and neither can produce the other's number.
-    if page != u64::MAX {
-        let object = shared::MemoryId::from_u64(page);
-        let mut record = [0u64; 3];
-        let mut at = 0usize;
-        // Past the eight `mmap` records, which is where the adapter puts it.
-        // **From the object's beginning, past the `mmap` records *and* the
-        // adapter's scratch area.** `drain_into` is named for a sink rather
-        // than for consumption: it reads from the start every time, so an
-        // offset is walked rather than resumed.
-        //
-        // The scratch area matters and cost two boots: it began at 256, which
-        // is where this record first sat, so every `copy_in` after the exec
-        // overwrote it and the kernel printed the tail of a path as a pid. The
-        // fix was `personality::report`, which is why no offset is computed
-        // here any more -- the "1,280 = 256 + 1,024" this comment used to give
-        // was itself out of date by the time anyone read it.
-        const EXEC_RECORD_BYTE: usize = bhaskix_personality::report::EXEC_AT;
-        const EXEC_RECORD_WORD: usize = EXEC_RECORD_BYTE / 8;
-        let taken = shared::drain_into(object, EXEC_RECORD_BYTE + 24, &mut |chunk: &[u8]| {
-            for word in chunk.as_chunks::<8>().0 {
-                if at >= EXEC_RECORD_WORD + 3 {
-                    break;
-                }
-                if at >= EXEC_RECORD_WORD {
-                    let mut eight = [0u8; 8];
-                    eight.copy_from_slice(word);
-                    record[at - EXEC_RECORD_WORD] = u64::from_le_bytes(eight);
-                }
-                at += 1;
-            }
-            chunk.len()
-        });
-        if taken.is_some() && record[0] != 0 {
-            println!(
-                "    linux exec     pid {} kept across an exec: domain {} became domain {}",
-                record[0], record[1], record[2]
-            );
-        }
+    if let Some(record) = adapter_exec_record() {
+        println!(
+            "    linux exec     pid {} kept across an exec: domain {} became domain {}",
+            record[0], record[1], record[2]
+        );
     }
 
     report_supervised_copy();
@@ -6184,12 +6198,172 @@ const EXEC_PROBE_CODE: [u8; 44] = [
     b'/', b'b', b'i', b'n', b'/', b'e', b'x', b'e', b'c', b'e', b'd',
 ];
 
+/// Where the hosted-exec probe's code, strings and vectors live — RFC 0059.
+///
+/// Its own page, unshared with any other probe: eight programs once sat at
+/// 0x10000000 in eight address spaces, and one address meaning eight
+/// instructions is a debugging cost this project has already paid once.
+const HOSTED_PROBE_CODE_AT: u64 = 0x0000_0000_2200_0000;
+
+/// Offsets inside that page: the path, the three argument strings, the one
+/// environment string, and the two NULL-terminated pointer arrays.
+///
+/// **Absolute addresses, computed rather than assembled.** A hand-written blob
+/// would have to carry two pointer arrays of absolute addresses, and the
+/// arithmetic that produces them is the part a reader cannot check by eye. The
+/// page is at a fixed address, so the pointers are just that address plus
+/// these offsets, and the code below writes them.
+const HOSTED_PATH_AT: u64 = 0x40;
+const HOSTED_ARG0_AT: u64 = 0x50;
+const HOSTED_ARG1_AT: u64 = 0x60;
+const HOSTED_ARG2_AT: u64 = 0x70;
+const HOSTED_ENV0_AT: u64 = 0x80;
+const HOSTED_ARGV_AT: u64 = 0xa0;
+const HOSTED_ENVP_AT: u64 = 0xc0;
+
+/// What the probe asks for, and what the gate then requires to come back.
+///
+/// **Chosen so that nothing else on this machine could print them.** The
+/// arguments and the variable have to travel out of one address space, through
+/// the adapter, into an initial image, and back out of the program's own
+/// `write` — so the line appearing at all is the whole claim.
+const HOSTED_PATH: &[u8] = b"/hosted\0";
+const HOSTED_ARG0: &[u8] = b"hosted\0";
+const HOSTED_ARG1: &[u8] = b"one\0";
+const HOSTED_ARG2: &[u8] = b"two\0";
+const HOSTED_ENV0: &[u8] = b"GREETING=namaste\0";
+
+/// The hosted-exec probe: `execve("/hosted", ["hosted","one","two"],
+/// ["GREETING=namaste"])`, and a spin if it ever returns.
+///
+/// Thirty bytes, and every immediate is filled in by [`ring3_hosted_execer`]
+/// because it is an absolute address in a page that has no loader to relocate
+/// it — the same constraint the built-in exec probe lives under, one step
+/// further along.
+#[rustfmt::skip]
+const HOSTED_PROBE_CODE: [u8; 30] = [
+    0x48, 0xc7, 0xc7, 0, 0, 0, 0,        // mov rdi, <path>
+    0x48, 0xc7, 0xc6, 0, 0, 0, 0,        // mov rsi, <argv>
+    0x48, 0xc7, 0xc2, 0, 0, 0, 0,        // mov rdx, <envp>
+    0xb8, 0x3b, 0x00, 0x00, 0x00,        // mov eax, 59           ; execve
+    0x0f, 0x05,                          // syscall
+    // Only reached if the exec was refused. Spinning rather than exiting is
+    // what makes the failure visible: the gate waits for this domain to *end*,
+    // which an exec does to it, so a refused exec leaves it alive and says so.
+    0xeb, 0xfe,                          // jmp $
+];
+
 /// Where the `/proc` probe's code lands in its own space.
 ///
 /// The address is in the blob: the probe loads its two path strings by
 /// absolute address, because they sit past its own code and a
 /// supervisor-built program has no loader to relocate anything for it.
 const PROC_PROBE_CODE_AT: u64 = 0x0000_0000_1700_0000;
+
+/// The hosted-exec probe's page: code, strings, and the two pointer vectors.
+///
+/// Built here rather than hand-assembled so that the pointer arrays are
+/// arithmetic a reader can follow instead of eight bytes of hexadecimal per
+/// entry.
+/// Writes `bytes` at `offset` inside the hosted-exec probe's page.
+///
+/// One `unsafe` line for an operation the caller performs ten times, which is
+/// what keeps the obligation readable: everything the safety comment has to
+/// promise is visible in this function's three arguments.
+fn put_in_probe_page(page: u64, offset: u64, bytes: &[u8]) {
+    // SAFETY: `page` is the direct-map address of a freshly mapped frame the
+    // caller's space owns and nothing else can reach yet; the executable
+    // mapping of it is never writable. Every call site uses a constant offset
+    // inside that one 4,096-byte page, and the furthest write ends at
+    // `HOSTED_ENVP_AT + 16` — 208 bytes in.
+    unsafe {
+        core::ptr::copy_nonoverlapping(bytes.as_ptr(), (page + offset) as *mut u8, bytes.len())
+    }
+}
+
+extern "C" fn ring3_hosted_execer(hhdm_base: u64) -> ! {
+    use bhaskix_boot::VirtAddr;
+    use bhaskix_mm::{Protection, VirtRange};
+    use vm::AddressSpace;
+
+    let stop = || -> ! { sched::exit() };
+    let Ok(mut space) = AddressSpace::new(hhdm_base) else {
+        stop()
+    };
+    let Some(code) = VirtRange::from_pages(VirtAddr(HOSTED_PROBE_CODE_AT), 1) else {
+        stop()
+    };
+    if space.map_anonymous(code, Protection::ReadExecute).is_err() {
+        stop()
+    }
+    let Some(code_pa) = space.translate(VirtAddr(HOSTED_PROBE_CODE_AT)) else {
+        stop()
+    };
+    let page = hhdm_base + code_pa;
+
+    let mut instructions = HOSTED_PROBE_CODE;
+    // The three immediates, in the order the instructions above take them.
+    // Each is a 32-bit sign-extended address, and `HOSTED_PROBE_CODE_AT` is
+    // well inside the positive half, so the sign extension is a no-op — a
+    // property this page's address is chosen to have rather than one it
+    // happens to have.
+    for (at, offset) in [
+        (3usize, HOSTED_PATH_AT),
+        (10, HOSTED_ARGV_AT),
+        (17, HOSTED_ENVP_AT),
+    ] {
+        let address = (HOSTED_PROBE_CODE_AT + offset) as u32;
+        instructions[at..at + 4].copy_from_slice(&address.to_le_bytes());
+    }
+
+    // **The loops are outside the `unsafe`, and only the copy is inside it.**
+    // The first version wrapped the whole page-building block, which cost the
+    // kernel thirty-eight `unsafe` lines for what is one operation repeated —
+    // and `coding-style.md` §3 asks for the smallest block that can carry the
+    // obligation, not the smallest number of blocks.
+    put_in_probe_page(page, 0, &instructions);
+    for (offset, bytes) in [
+        (HOSTED_PATH_AT, HOSTED_PATH),
+        (HOSTED_ARG0_AT, HOSTED_ARG0),
+        (HOSTED_ARG1_AT, HOSTED_ARG1),
+        (HOSTED_ARG2_AT, HOSTED_ARG2),
+        (HOSTED_ENV0_AT, HOSTED_ENV0),
+    ] {
+        put_in_probe_page(page, offset, bytes);
+    }
+    // `argv`, then `envp`, each NULL-terminated as `execve` requires — and as
+    // `exec::Arguments` on the other side requires, since an unterminated
+    // vector is what it answers `EFAULT` or `E2BIG` to.
+    for (at, entries) in [
+        (
+            HOSTED_ARGV_AT,
+            [HOSTED_ARG0_AT, HOSTED_ARG1_AT, HOSTED_ARG2_AT, 0].as_slice(),
+        ),
+        (HOSTED_ENVP_AT, [HOSTED_ENV0_AT, 0].as_slice()),
+    ] {
+        for (index, offset) in entries.iter().enumerate() {
+            let pointer = if *offset == 0 {
+                0
+            } else {
+                HOSTED_PROBE_CODE_AT + offset
+            };
+            put_in_probe_page(page, at + index as u64 * 8, &pointer.to_le_bytes());
+        }
+    }
+
+    // SAFETY: the higher half is copied from the running table.
+    unsafe { vm::install(space) };
+    // SAFETY: the entry is the first byte of the page mapped read-execute
+    // above, and the stack is one past its writable end -- this program pushes
+    // nothing and its fifth instruction is the `execve`.
+    unsafe {
+        bhaskix_arch::syscall::enter_ring3(
+            HOSTED_PROBE_CODE_AT,
+            HOSTED_PROBE_CODE_AT + bhaskix_mm::FRAME_SIZE,
+            [0, 0],
+        )
+    }
+}
 
 /// The `/proc` probe, assembled by the same script as the last three — RFC
 /// 0033 step 10.
@@ -9538,6 +9712,122 @@ fn exec_self_test(hhdm_base: u64, cpus: u32) -> bool {
     ended
 }
 
+/// RFC 0059's witness: a Linux program `execve`s a **real program off the
+/// filesystem**, with the arguments and environment its parent chose.
+///
+/// Three things have to be true at once, and no two of them can be arranged by
+/// the same part of the system:
+///
+/// 1. the probe's own domain **ended**, which is what an `execve` does to it;
+/// 2. the program that was exec'd **printed a line only it could print** —
+///    its arguments and its environment, which travelled out of the probe's
+///    address space, through `bin/linuxd`, into an initial image, and back out
+///    of the program's own `write`;
+/// 3. that line says **`auxv ok`**, which the program only writes after
+///    following `AT_PHDR` to a real program header. The auxiliary vector is
+///    where a wrong image hides: a runtime handed a bad one runs and
+///    misbehaves rather than failing.
+///
+/// **Three absences are told apart, not merged.** No filesystem service is a
+/// skip and is the ordinary case on four of five lanes. A filesystem with no
+/// `bin/hosted` staged on it is a skip too — an image built on a machine that
+/// could not produce the program. But a filesystem that *has* it and a hosted
+/// `execve` that did not run it is a failure, and reporting those three the
+/// same way is how a green gate comes to mean nothing. That mistake was made
+/// once already, one function up, and caught by arming it.
+fn hosted_exec_self_test(hhdm_base: u64, cpus: u32) -> bool {
+    use core::sync::atomic::Ordering;
+
+    if cpus < 2 {
+        println!("\x1b[93m    hosted exec    skipped, needs a second cpu\x1b[0m");
+        return true;
+    }
+    const CPU: u32 = 3;
+
+    if FS_ENDPOINT.load(Ordering::Acquire) == u64::MAX {
+        println!(
+            "    hosted exec    skipped: this machine has no filesystem service, so there is no \
+             program for a hosted execve to find"
+        );
+        return true;
+    }
+    let staged = HOSTED_STAGED.load(Ordering::Acquire);
+    if staged == 0 {
+        println!(
+            "\x1b[93m    hosted exec    skipped: `bin/hosted` is not in this image, so nothing \
+             was staged for a hosted execve to run\x1b[0m"
+        );
+        return true;
+    }
+
+    let Ok(realm) = domain::create("hosted-execer", domain::ResourceEnvelope::new()) else {
+        println!("\x1b[91m    hosted exec    FAILED: no domain\x1b[0m");
+        return false;
+    };
+    if domain::with(realm, |owner| {
+        owner.set_personality(domain::Personality::Linux)
+    }) != Some(Ok(()))
+    {
+        println!("\x1b[91m    hosted exec    FAILED: the tag was refused\x1b[0m");
+        return false;
+    }
+    let options = sched::SpawnOptions::new()
+        .pinned()
+        .in_domain(realm.as_u32());
+    if sched::spawn_on_with(
+        CPU,
+        "hosted-execer",
+        ring3_hosted_execer,
+        hhdm_base,
+        hhdm_base,
+        options,
+    )
+    .is_err()
+    {
+        println!("\x1b[91m    hosted exec    FAILED: the probe would not spawn\x1b[0m");
+        return false;
+    }
+
+    let mut ended = false;
+    for _ in 0..400 {
+        if sched::threads_counted_in(realm.as_u32()) == 0 {
+            ended = true;
+            break;
+        }
+        wait_millis(5);
+    }
+    retire_probe(realm);
+
+    if !ended {
+        println!(
+            "\x1b[91m    hosted exec    FAILED: the execing domain is still alive, so the execve \
+             was refused\x1b[0m"
+        );
+        return false;
+    }
+    println!(
+        "    hosted exec    a Linux program execed {staged} bytes read off the filesystem: \
+         its own domain ended and the program it became ran in another"
+    );
+    // **And the adapter's own record, read again.** The boundary report printed
+    // this once, in `kernel_main`, long before the filesystem service existed —
+    // so the pid it printed belongs to the *built-in* exec and says nothing
+    // about this one. Reading it here is what lets the gate compare a pid the
+    // adapter kept against the pid the exec'd program asked for and printed:
+    // two witnesses, neither able to produce the other's number.
+    match adapter_exec_record() {
+        Some(record) => println!(
+            "    hosted exec    pid {} kept across an exec: domain {} became domain {}",
+            record[0], record[1], record[2]
+        ),
+        None => println!(
+            "\x1b[93m    hosted exec    the adapter kept no record of it, so the pid cannot be \
+             checked from both ends\x1b[0m"
+        ),
+    }
+    true
+}
+
 /// RFC 0005 step 2's witness: a Linux-tagged domain's system calls are all
 /// foreign, all answered `-ENOSYS`, all logged -- and the tag itself obeys
 /// its rules: refused once a thread exists, cleared when the domain ends.
@@ -12469,6 +12759,13 @@ const LINUXD_STACK: u64 = 0x0000_0000_1D00_0000;
 const LINUXD_STACK_PAGES: u64 = 8;
 const LINUXD_PROGRAM: &[u8] = b"bin/linuxd";
 
+/// Pages of the adapter's exec staging object — RFC 0059.
+///
+/// Sixteen, which is `shared::MAX_FRAMES` and so the most one object can be.
+/// It bounds the largest program a hosted `execve` can load, and the adapter
+/// says so when a file exceeds it rather than loading a prefix of it.
+const ADAPTER_STAGING_PAGES: u64 = 16;
+
 /// Starts `bin/linuxd`, the Linux personality in a domain of its own.
 ///
 /// [RFC 0032](../../docs/rfc/0032-a-supervisor-interface.md) step 3, and the
@@ -12595,6 +12892,32 @@ fn start_linux_domain(cpu: u32, hhdm_base: u64) -> Result<(), &'static str> {
     }) != Some(true)
     {
         return Err("the adapter's fault page would not install");
+    }
+
+    // Slot 25: where a program being `execve`d is read in and parsed --
+    // RFC 0059. Sixteen pages, which is `shared::create`'s ceiling
+    // (`MAX_FRAMES`) and therefore the largest program a hosted `execve` can
+    // load; the adapter reports that limit rather than truncating an image
+    // that does not fit.
+    //
+    // **The adapter's own memory, and not a hosted process's.** The bytes of
+    // a program are read here from the filesystem, parsed here by
+    // `bhaskix-elf`, and copied out into the domain that will run them -- so
+    // no process ever holds, or can write to, the image it is about to
+    // become. That ordering is what makes the parse worth doing: a check
+    // against memory the checked party can still change is not a check.
+    let staging = shared::create(realm, ADAPTER_STAGING_PAGES * bhaskix_mm::FRAME_SIZE)
+        .map_err(|_| "the adapter's exec staging memory would not be created")?;
+    let staging_named =
+        shared::name(staging).map_err(|_| "the adapter's exec staging would not be named")?;
+    if domain::with(realm, |owner| {
+        owner
+            .cspace
+            .install_at(bhaskix_abi::adapter::STAGING, staging_named)
+            .is_ok()
+    }) != Some(true)
+    {
+        return Err("the adapter's exec staging would not install");
     }
 
     // Slot 3: the console, **write-only** -- RFC 0032 step 10. A hosted
@@ -13366,6 +13689,17 @@ fn block_service_self_test(hhdm: u64) -> bool {
 /// take one.
 static DISK_JOURNAL: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
 
+/// The program a hosted `execve` loads, as it is named in the archive.
+const HOSTED_PROGRAM: &[u8] = b"bin/hosted";
+
+/// How many bytes of it reached the disk, or zero if it never did.
+///
+/// Read by the exec gate, which must tell two absences apart: an image with no
+/// `bin/hosted` in it, which is a skip, and a write that went short, which is a
+/// failure of this code and would otherwise show up as a hosted `execve`
+/// refusing a program for reasons of its own.
+static HOSTED_STAGED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 /// A block device reached by asking the block service for one sector at a time.
 ///
 /// The `Store` RFC 0015 step 6 introduced, finally over something that is not
@@ -13607,7 +13941,39 @@ extern "C" fn journal_on_disk(endpoint: u64) -> ! {
             let inner = volume.create(sub, b"inner", Kind::File).ok()?;
             volume
                 .write(inner, 0, b"only reachable through the subdirectory\n")
-                .ok()
+                .ok()?;
+            // **And a program, in the one directory the Linux adapter holds**
+            // — RFC 0059. `sub` is what `bin/linuxd` is granted as a hosted
+            // process's whole filesystem, so this is where a program a hosted
+            // `execve` can reach has to be. It is copied out of the archive
+            // rather than built here: the archive is where every other program
+            // on this machine comes from, and a program the kernel synthesised
+            // would prove less than one that was compiled, linked and shipped.
+            //
+            // A machine whose image has no `bin/hosted` gets the tree without
+            // it, and the gate says `skipped` rather than failing — the same
+            // rule the corpus programs live under.
+            if let Ok(file) = vfs::open(HOSTED_PROGRAM) {
+                let bytes = file.bytes();
+                if !bytes.is_empty()
+                    && let Ok(hosted) = volume.create(sub, b"hosted", Kind::File)
+                {
+                    // **One block per call**, which is what `Volume::write`
+                    // documents and answers with: a write spanning blocks is
+                    // several transactions, and the loop belongs to whoever
+                    // wants them all rather than being hidden inside one that
+                    // implies a single commit.
+                    let mut done = 0usize;
+                    while done < bytes.len() {
+                        match volume.write(hosted, done as u64, &bytes[done..]) {
+                            Ok(0) | Err(_) => break,
+                            Ok(moved) => done += moved,
+                        }
+                    }
+                    HOSTED_STAGED.store(done as u64, Ordering::Release);
+                }
+            }
+            Some(())
         })();
         if made.is_none() {
             DISK_JOURNAL.store(15, Ordering::Release);
@@ -18354,6 +18720,18 @@ fn user_shell(handoff: &Handoff) -> Result<(), &'static str> {
     if !list_self_test(hhdm, bhaskix_arch::percpu::online_count()) {
         println!("\x1b[91m    linux dir      FAILED\x1b[0m");
     }
+    // And RFC 0059's, which needs the same directory for the same reason and
+    // therefore belongs here rather than beside `linux exec` in `kernel_main`.
+    //
+    // **The first version of this was up there**, next to the built-in exec it
+    // extends, where it read `FS_ENDPOINT` before `start_fs_domain` had ever
+    // run and skipped on every lane including the two that have a filesystem.
+    // It would have reported a green skip for ever. The comment fifteen lines
+    // above says exactly this about the probes it was written for, which is
+    // how the mistake was caught before a boot rather than after one.
+    if !hosted_exec_self_test(hhdm, bhaskix_arch::percpu::online_count()) {
+        println!("\x1b[91m    hosted exec    FAILED\x1b[0m");
+    }
     // **After both probes, and that is the whole reason it is here** rather
     // than with the other personality reports in `kernel_main`: those run
     // before this bring-up thread has started a hosted program, so the record
@@ -21306,8 +21684,12 @@ fn vfs_self_test(handoff: &Handoff) -> bool {
             // built -- the Go corpus is compiled from a source file in
             // `corpus/`, and this is somebody else's shipped binary. It caught
             // that one on the first boot too, which is eighteen for eighteen.
+            // **Nineteen** as of RFC 0059: `bin/hosted`, the program a hosted
+            // `execve` loads off the filesystem. Nineteen for nineteen -- it
+            // went red on the first boot of that change, before the change's
+            // own gate had ever run.
             "a listing shows what is directly under a directory",
-            entries >= 3 && bin == 18,
+            entries >= 3 && bin == 19,
         ),
         (
             "the user program is an ELF the loader accepts",

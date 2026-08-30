@@ -7,6 +7,10 @@ name = "bhaskix-abi"
 version = "0.0.0"
 
 [[package]]
+name = "bhaskix-elf"
+version = "0.0.0"
+
+[[package]]
 name = "bhaskix-personality"
 version = "0.0.0"
 
@@ -26,6 +30,7 @@ name = "bhaskix-user-linuxd"
 version = "0.1.0"
 dependencies = [
  "bhaskix-abi",
+ "bhaskix-elf",
  "bhaskix-personality",
  "bhaskix-rand",
  "bhaskix-sock",

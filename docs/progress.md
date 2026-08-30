@@ -10,7 +10,7 @@
 
 | | |
 |---|---|
-| RFCs accepted | **42** |
+| RFCs accepted | **43** |
 | RFCs open | 15 |
 | RFCs closed without shipping | 1 |
 | Milestone rows done | **92 of 95** |
@@ -78,6 +78,7 @@ gantt
     RFC 0042 Reading the boot report back :done, r0042, 2026-08-23, 1d
     RFC 0051 a shell that can ask what arrived :done, r0051, 2026-08-27, 1d
     RFC 0052 a line that waits for its newline :done, r0052, 2026-08-27, 1d
+    RFC 0059 an execve that runs a program with argv and... :done, r0059, 2026-08-30, 1d
     section Process & tooling
     RFC 0001 License — Apache-2.0 :done, r0001, 2026-08-03, 1d
     RFC 0007 Live patching the nucleus :active, r0007, 2026-08-04, 2026-08-30

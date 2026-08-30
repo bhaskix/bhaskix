@@ -52,6 +52,11 @@ LIMINE_DIR   := boot/limine/limine
 # have (see user/probe/Cargo.toml).
 PROBE_DIR    := user/probe
 PROBE        := $(PROBE_DIR)/target/$(TARGET)/release/probe
+# RFC 0059: the program a hosted `execve` loads off the filesystem. A Linux
+# program, not a Bhaskix one -- it makes no Bhaskix system call and holds no
+# capability, which is what makes what it prints evidence about the adapter.
+HOSTED_DIR   := user/hosted
+HOSTED       := $(HOSTED_DIR)/target/$(TARGET)/release/hosted
 SHELL_DIR    := user/shell
 VFSD_DIR     := user/vfsd
 CONSOLED_DIR := user/consoled
@@ -111,6 +116,8 @@ USER_FSD     := $(FSD_DIR)/target/$(TARGET)/release/fsd
 # at a fixed low address.
 PROBE_FLAGS  := -C relocation-model=static -C code-model=small \
                 -C link-arg=-T$(CURDIR)/$(PROBE_DIR)/link.ld
+HOSTED_FLAGS := -C relocation-model=static -C code-model=small \
+                -C link-arg=-T$(CURDIR)/$(HOSTED_DIR)/link.ld
 SHELL_FLAGS  := -C relocation-model=static -C code-model=small \
                 -C link-arg=-T$(CURDIR)/$(SHELL_DIR)/link.ld
 VFSD_FLAGS   := -C relocation-model=static -C code-model=small \
@@ -274,13 +281,14 @@ FORCE:
 # and mkimage stages, hashes, verifies with the machine's own parsers, and
 # drives the same tar flags this rule always trusted. Assembled twice and
 # byte-compared every build: determinism is a gate, not a hope.
-$(INITRD): $(MKIMAGE) $(shell find $(INITRD_DIR) packages -type f 2>/dev/null | sort) $(PROBE) $(USER_SHELL) $(USER_VFSD) $(USER_CONSOLED) $(USER_BLKD) $(USER_AHCID) $(USER_NETD) $(USER_IPD) $(USER_DHCPD) $(USER_UDP6) $(USER_TCPD) $(USER_LINUXD) $(USER_TCPC) $(USER_TRACED) $(USER_FSD) $(USER_SUP) $(FS_IMAGE) $(HELLO_BPK) $(GREEDY_BPK) $(GO_HELLO) $(BUSYBOX)
+$(INITRD): $(MKIMAGE) $(shell find $(INITRD_DIR) packages -type f 2>/dev/null | sort) $(PROBE) $(USER_SHELL) $(USER_VFSD) $(USER_CONSOLED) $(USER_BLKD) $(USER_AHCID) $(USER_NETD) $(USER_IPD) $(USER_DHCPD) $(USER_UDP6) $(USER_TCPD) $(USER_LINUXD) $(USER_TCPC) $(USER_TRACED) $(USER_FSD) $(USER_SUP) $(FS_IMAGE) $(HELLO_BPK) $(GREEDY_BPK) $(GO_HELLO) $(BUSYBOX) $(HOSTED)
 	@mkdir -p $(dir $@)
 	./$(MKIMAGE) $@ $(INITRD_ROOT) --root . --static $(INITRD_DIR) \
 	    --file fs.img=$(FS_IMAGE) \
 	    --file hello.bpk=$(HELLO_BPK) \
 	    --file greedy.bpk=$(GREEDY_BPK) \
 	    --file bin/go-hello=$(GO_HELLO) \
+	    --file bin/hosted=$(HOSTED) \
 	    --file bin/busybox=$(BUSYBOX) \
 	    \
 	    $(foreach manifest,$(PACKAGES),--package $(manifest))
@@ -289,6 +297,7 @@ $(INITRD): $(MKIMAGE) $(shell find $(INITRD_DIR) packages -type f 2>/dev/null | 
 	    --file hello.bpk=$(HELLO_BPK) \
 	    --file greedy.bpk=$(GREEDY_BPK) \
 	    --file bin/go-hello=$(GO_HELLO) \
+	    --file bin/hosted=$(HOSTED) \
 	    --file bin/busybox=$(BUSYBOX) \
 	    $(foreach manifest,$(PACKAGES),--package $(manifest))
 	cmp $@ $@.again
@@ -297,6 +306,10 @@ $(INITRD): $(MKIMAGE) $(shell find $(INITRD_DIR) packages -type f 2>/dev/null | 
 
 # Built through a staging directory rather than into `initrd/`, so that a
 # compiled artefact never lands in a source tree that is under version control.
+$(HOSTED): $(HOSTED_DIR)/src/main.rs $(HOSTED_DIR)/link.ld $(HOSTED_DIR)/Cargo.toml
+	cd $(HOSTED_DIR) && RUSTFLAGS="$(HOSTED_FLAGS)" \
+	    $(CARGO) build --release --target $(TARGET)
+
 $(PROBE): $(PROBE_DIR)/src/main.rs $(PROBE_DIR)/link.ld $(PROBE_DIR)/Cargo.toml
 	cd $(PROBE_DIR) && RUSTFLAGS="$(PROBE_FLAGS)" \
 	    $(CARGO) build --release --target $(TARGET)
@@ -717,6 +730,7 @@ test-faults:
 fmt:
 	$(CARGO) fmt --all --check
 	cd $(PROBE_DIR) && $(CARGO) fmt --all --check
+	cd $(HOSTED_DIR) && $(CARGO) fmt --all --check
 	cd $(SHELL_DIR) && $(CARGO) fmt --all --check
 	cd $(VFSD_DIR) && $(CARGO) fmt --all --check
 	cd $(LINUXD_DIR) && $(CARGO) fmt --all --check
@@ -743,6 +757,8 @@ clippy:
 	$(CARGO) clippy --target $(HOST_TARGET) --all-targets \
 	    --workspace --exclude bhaskix-boot-shim -- -D warnings
 	cd $(PROBE_DIR) && RUSTFLAGS="$(PROBE_FLAGS)" \
+	    $(CARGO) clippy --release --target $(TARGET) -- -D warnings
+	cd $(HOSTED_DIR) && RUSTFLAGS="$(HOSTED_FLAGS)" \
 	    $(CARGO) clippy --release --target $(TARGET) -- -D warnings
 	cd $(SHELL_DIR) && RUSTFLAGS="$(SHELL_FLAGS)" \
 	    $(CARGO) clippy --release --target $(TARGET) -- -D warnings
@@ -945,6 +961,7 @@ mkfs:
 clean:
 	$(CARGO) clean
 	cd $(PROBE_DIR) && $(CARGO) clean
+	cd $(HOSTED_DIR) && $(CARGO) clean
 	cd $(SHELL_DIR) && $(CARGO) clean
 	cd $(VFSD_DIR) && $(CARGO) clean
 	cd $(CONSOLED_DIR) && $(CARGO) clean

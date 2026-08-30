@@ -1306,7 +1306,10 @@ fi
 # **Eighteen** since `bin/busybox` joined, 2026-08-27 -- the L1 corpus, and the
 # first entry that nobody here wrote or built. It failed twice in two files
 # exactly as this comment said it would, which is the comment earning its place.
-if grep -qE "vfs +[0-9]+ entries in /, 18 in /bin; bin/probe is ELF64, entry 0x10000000, 3 segments" "$LOG"; then
+# **Nineteen** since `bin/hosted` joined at RFC 0059 -- and it failed twice in
+# two files again, in that order, which is now twice this comment has paid for
+# itself.
+if grep -qE "vfs +[0-9]+ entries in /, 19 in /bin; bin/probe is ELF64, entry 0x10000000, 3 segments" "$LOG"; then
     pass "paths resolve, bad paths are refused, and bin/probe parses as ELF64"
 else
     fail "the VFS or the ELF parser did not pass"
@@ -2740,6 +2743,55 @@ elif grep -qE "linux exec     skipped" "$LOG"; then
     pass "no second cpu, so the exec self-test was skipped"
 else
     fail "the exec self-test did not conclude"
+    status=1
+fi
+
+# RFC 0059: an `execve` that runs a program **off the filesystem**, with the
+# argv and environment its parent chose.
+#
+# The line the exec'd program prints is the whole assertion, and every field in
+# it had to survive a journey nothing else on this machine makes:
+#
+#   * `hosted one two` are the arguments the probe chose. They were written
+#     into the probe's own page, read out of it by `bin/linuxd` through a
+#     capability, laid out in an initial process image, copied into a second
+#     domain, and read back off that domain's stack by the program itself.
+#   * `GREETING=namaste` is the same journey for the environment, which is a
+#     separate vector and was got wrong in the first draft of the reader --
+#     one shared budget, two counts, and the split between them is a number.
+#   * `auxv ok` is the program having followed `AT_PHDR` to a real program
+#     header. Nothing else here checks the auxiliary vector, and it is the
+#     field a wrong image gets wrong without crashing.
+#   * The pid is matched against the adapter's own record of the pid it kept,
+#     exactly as the gate above does -- so the program that printed the line
+#     really is the process that made the call.
+#
+# **The exact string, not a pattern that would accept less.** A gate that
+# matched `hosted pid [0-9]*` would pass an exec that lost every argument.
+if grep -qE "hosted exec    a Linux program execed [1-9][0-9]* bytes read off the filesystem" "$LOG"; then
+    line=$(grep -aoE 'hosted pid [0-9]+ args hosted one two env GREETING=namaste auxv [a-zA-Z]+' "$LOG" | tail -1)
+    hosted_pid=$(sed -n 's/^hosted pid \([0-9]*\) .*/\1/p' <<<"$line")
+    if [[ -z $line ]]; then
+        fail "the exec'd program printed no line, or not the one it was given: $(grep -aoE 'hosted pid .*' "$LOG" | head -1)"
+        grep -a "hosted" "$LOG" | sed 's/^/      /'
+        status=1
+    elif [[ $line != *"auxv ok" ]]; then
+        fail "the exec'd program ran but its initial image is wrong: $line"
+        status=1
+    elif ! grep -qF "hosted exec    pid $hosted_pid kept across an exec" "$LOG"; then
+        fail "the exec'd program printed pid $hosted_pid and the adapter kept a different one: $(grep -aoE 'hosted exec    pid [0-9]+ kept across an exec.*' "$LOG" | tail -1)"
+        status=1
+    else
+        pass "a hosted program execed a real ELF off the filesystem: pid $hosted_pid, its own argv and environment, and an auxiliary vector it could follow"
+    fi
+elif grep -qF "hosted exec    skipped: this machine has no filesystem service" "$LOG"; then
+    pass "no filesystem service on this machine, so there is no program for a hosted execve to find"
+elif grep -qF "hosted exec    skipped: \`bin/hosted\` is not in this image" "$LOG"; then
+    pass "no bin/hosted staged in this image, so the hosted execve had nothing to run"
+elif grep -qE "hosted exec    skipped, needs a second cpu" "$LOG"; then
+    pass "no second cpu, so the hosted exec self-test was skipped"
+else
+    fail "the hosted exec self-test did not conclude: $(grep -aoE 'hosted exec .*' "$LOG" | head -1)"
     status=1
 fi
 

@@ -151,13 +151,25 @@ pub mod adapter {
     pub const LENT: usize = 23;
     /// The console's own notification, **read-only** — RFC 0054.
     pub const INPUT_WAKE: usize = 24;
+    /// Where a program being `execve`d is read into — RFC 0059.
+    ///
+    /// Sixteen pages of the adapter's own memory, which is `shared::create`'s
+    /// ceiling and therefore the largest program a hosted `execve` can load.
+    /// It is the adapter's, not a hosted process's: the bytes of a program are
+    /// read here, parsed here, and copied out into the domain that will run
+    /// them, so no process ever holds the image it is about to become.
+    pub const STAGING: usize = 25;
 
     /// The lowest slot a hosted domain's `Domain` capability may be put in.
     ///
     /// The kernel takes the lowest free slot at or above this — RFC 0033
     /// step 3 — so the region grows with the number of hosted domains alive at
     /// once and shrinks as they end.
-    pub const HANDLE_FLOOR: usize = 25;
+    ///
+    /// **Twenty-six since RFC 0059**, which took the slot below it. The
+    /// capacity that costs is stated at [`HANDLE_CAPACITY`] rather than left
+    /// to be discovered.
+    pub const HANDLE_FLOOR: usize = 26;
 
     /// The protocol service's endpoint.
     pub const NETWORK: usize = 88;
@@ -179,11 +191,23 @@ pub mod adapter {
 
     /// **How many hosted domains may hold a handle at once.**
     ///
+    /// **How many hosted domains may hold a handle at once.**
+    ///
     /// The handle region runs from [`HANDLE_FLOOR`] up to whatever sits above
-    /// it, which is [`NETWORK`]. That is **sixty-three**, and
-    /// [`crate::limits::MAX_DOMAINS`] is sixty-four — so a machine whose every
+    /// it, which is [`NETWORK`]. That was **sixty-three** against a
+    /// [`crate::limits::MAX_DOMAINS`] of sixty-four, so a machine whose every
     /// domain slot held a hosted program would find the last handle refused by
     /// `install_at`.
+    ///
+    /// **It is sixty-two since RFC 0059**, which put [`STAGING`] at the slot
+    /// the region used to start at. The shortfall is now two rather than one,
+    /// and the trade is written down rather than absorbed: a CSpace holds 128
+    /// slots and every one of them is spoken for, so a new fixed grant comes
+    /// out of the only pool with room, and the pool with room is this one. The
+    /// bound was already unreachable — the domain table is shared with every
+    /// service on the machine, so no boot has ever come near sixty-two hosted
+    /// programs — but "already unreachable" is a reason to record the number,
+    /// not a reason to stop counting it.
     ///
     /// A stated capacity rather than a silent one. Raising it means moving the
     /// four grants above it, which is a change to a contract two programs share
@@ -191,9 +215,9 @@ pub mod adapter {
     pub const HANDLE_CAPACITY: usize = NETWORK - HANDLE_FLOOR;
 
     /// Every fixed grant, for the checks below.
-    const FIXED: [usize; 11] = [
-        ENDPOINT, REPORT, FAULTS, CONSOLE, CONTROL, CHILD, ROOT_DIR, LENT, INPUT_WAKE, NETWORK,
-        PAYLOAD,
+    const FIXED: [usize; 12] = [
+        ENDPOINT, REPORT, FAULTS, CONSOLE, CONTROL, CHILD, ROOT_DIR, LENT, INPUT_WAKE, STAGING,
+        NETWORK, PAYLOAD,
     ];
 
     /// Whether `slot` is one a pool allocates from.
@@ -231,6 +255,7 @@ pub mod adapter {
     const _: () = {
         assert!(WAKES + WAKE_COUNT <= CONTROL);
         assert!(HANDLE_FLOOR > INPUT_WAKE);
+        assert!(HANDLE_FLOOR > STAGING);
         assert!(NETWORK > HANDLE_FLOOR);
         assert!(SOCKETS > PAYLOAD);
         assert!(SOCKETS + SOCKET_COUNT <= DATAGRAM_BELL);

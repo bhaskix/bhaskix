@@ -150,6 +150,12 @@ LAYERS = {
     # is why that sits lower still.
     "bhaskix-user-probe": -1,
     "bhaskix-user-shell": -1,
+    # RFC 0059's exec'd program. Layer -1 like the rest, and it depends on
+    # **nothing at all** -- not even the ABI, which every other program here
+    # links. That absence is the claim: it is a *Linux* program, so every call
+    # it makes is a Linux one answered by `bin/linuxd`, and a Bhaskix system
+    # call anywhere in it would mean the thing under test had been bypassed.
+    "bhaskix-user-hosted": -1,
     # The network driver. A plain program like the others: it holds
     # capabilities and reaches the kernel only through system calls. It depends
     # on the ABI and on `bhaskix-device` for the virtqueue -- and deliberately

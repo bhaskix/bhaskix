@@ -181,6 +181,14 @@ We will not pretend to cover these. Each has a note on whether it becomes in-sco
 > refuses the park unless the calling domain holds the input grant, on the same terms as the read,
 > and counts every refusal in the boot report.
 >
+> **[RFC 0059](rfc/0059-an-execve-that-runs-a-program.md) added one object on 2026-08-30**, and it
+> is memory rather than reach: sixteen pages of the adapter's **own** memory, where a program being
+> `execve`d is read in and parsed. It confers nothing over anybody else — a hosted program's bytes
+> are read into it from the filesystem, checked there, and copied out into the domain that will run
+> them, so no process ever holds or can write to the image it is about to become. The directory the
+> exec resolves in is the one the adapter already held, and it is still `sub` rather than the root:
+> a hosted `execve` can run what is inside it and can name nothing above it.
+>
 > "Every boot today" stopped being true on 2026-08-28: a boot with `busybox=sh` grants the console
 > to the BusyBox domain, and it is the only one. Every other boot grants nothing and reaches no
 > keystroke at all. It is not

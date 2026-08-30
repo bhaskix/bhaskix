@@ -507,6 +507,17 @@ the argument is read out of the caller's memory through a capability, compared, 
 does not match. What is *not* real yet is resolution, `argv`, `envp`, and anything an ELF loader
 would do. Each is named here so that none of them is discovered later as a surprise.
 
+> **All four are real as of 2026-08-30 — [RFC 0059](0059-an-execve-that-runs-a-program.md).** A
+> hosted `execve` resolves a name in the directory the adapter holds, reads the file with
+> `READ_INTO`, parses it with `bhaskix-elf`, maps each segment at its own protection and enters the
+> program on an initial image carrying the `argv` and `envp` its parent chose. The paragraph above
+> is kept rather than rewritten, because naming the four gaps is what made them a list to work
+> through instead of a surprise — which is the only claim it was making.
+>
+> `/bin/execed` survives, and is now what it always was underneath: **a synthetic path the adapter
+> answers itself**, as `/proc/self/*` is. It is kept because it is the exec that works on a machine
+> with no filesystem service at all, which is four of this project's five boot lanes.
+
 ### Three mistakes, all of them arithmetic, all found by the instrument
 
 - **The record was moved after its key was invalidated.** The first version bumped the old domain's
