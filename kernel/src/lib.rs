@@ -1352,6 +1352,19 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
     // previously have lost its sleeper for ever. Silent when zero, which is
     // also the answer to whether the window is real.
     {
+        // **The scan missed a live sleeper.** Dropping the entry on this was
+        // how `run-188` lost `ring-1`: alive, blocked, its predicate frozen at
+        // the token before its turn, and nothing left in the queue to find it
+        // with. The entry is kept now, so this counts a delay rather than a
+        // loss -- but it is printed, because a scan that cannot see a blocked
+        // thread is a fact about the scheduler and not about this queue.
+        let unseen = wait::UNSEEN_WAKES.load(core::sync::atomic::Ordering::Relaxed);
+        if unseen > 0 {
+            println!(
+                "\x1b[93m    wake unseen    {unseen} wake(s) found no queue holding their \
+                 sleeper though it was neither woken nor gone; the entry was kept\x1b[0m"
+            );
+        }
         let lost = wait::LOST_WAKES.load(core::sync::atomic::Ordering::Relaxed);
         if lost > 0 {
             println!(

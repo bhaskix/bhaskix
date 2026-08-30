@@ -158,9 +158,20 @@ impl Waiters {
 pub(crate) enum Fate {
     /// The wake landed; the entry has done its job and goes.
     Delivered,
-    /// No queue holds that thread: it exited. The entry can never be woken, and
-    /// keeping it would waste one of very few slots.
-    Stale,
+    /// No queue holds that thread *right now*.
+    ///
+    /// **This used to drop the entry, and that was the bug.** The reasoning was
+    /// "not in any queue means it exited"; the reasoning is unsound. A station
+    /// only reaches `sched::exit` *after* `wait_until` has returned, which is
+    /// after its entry was already removed -- so a thread is never both
+    /// enqueued and exited. What "not found" really means is that a scan which
+    /// takes one queue lock at a time did not see it, and `run-188` of
+    /// 2026-08-30 is that: `ring-1` asleep, alive, `Blocked`, its predicate
+    /// frozen at the token before its turn, and its entry gone.
+    ///
+    /// So the entry is **kept** here too. A miss is recoverable; a dropped
+    /// entry is not.
+    Unseen,
     /// It is still there and the wake did not take. **Keep the entry** so the
     /// next waker tries again -- the difference between a delayed wake and a
     /// lost one.
@@ -174,9 +185,17 @@ pub(crate) fn fate(woke: bool, still_present: bool) -> Fate {
     } else if still_present {
         Fate::Retained
     } else {
-        Fate::Stale
+        Fate::Unseen
     }
 }
+
+/// Wakes whose thread no queue could find.
+///
+/// **Not "it exited".** A live, blocked thread can be missed by a scan that
+/// takes one runqueue lock at a time, and dropping its entry on that basis is
+/// how `run-188` lost a station for ever. Non-zero means the scan missed
+/// somebody; the entry was kept, so the next waker delivers it.
+pub static UNSEEN_WAKES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// Wakes that found their thread present but not `Blocked`.
 ///
@@ -292,7 +311,9 @@ impl WaitQueue {
                         *entry = None;
                         woken += 1;
                     }
-                    Fate::Stale => *entry = None,
+                    Fate::Unseen => {
+                        UNSEEN_WAKES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                    }
                     Fate::Retained => {
                         LOST_WAKES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                     }
@@ -330,7 +351,9 @@ impl WaitQueue {
                         woken = true;
                         break;
                     }
-                    Fate::Stale => *entry = None,
+                    Fate::Unseen => {
+                        UNSEEN_WAKES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                    }
                     Fate::Retained => {
                         LOST_WAKES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                     }
@@ -399,13 +422,15 @@ mod tests {
     }
 
     /// And the case that argues against simply always keeping it.
+    /// The case that cost `run-188` a station.
     #[test]
-    fn an_exited_thread_does_not_hold_a_slot_for_ever() {
+    fn a_thread_no_queue_could_find_keeps_its_entry_too() {
         assert_eq!(
             fate(false, false),
-            Fate::Stale,
-            "no queue holds it, so no wake can ever land: keeping this entry \
-             spends one of very few slots on a thread that is gone"
+            Fate::Unseen,
+            "not found by a scan that takes one queue lock at a time is not \
+             the same claim as gone -- a station is never enqueued and exited \
+             at once, so dropping the entry here loses a live sleeper"
         );
     }
 

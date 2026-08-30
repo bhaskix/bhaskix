@@ -1123,6 +1123,50 @@ makes it a terminal discipline rather than a buffer, and it is the part most
 likely to be got wrong. It belongs in the service, where policy belongs, and it
 wants its own RFC and its own gates.
 
+### 2026-08-30 (found: the entry was dropped because a scan could not see a live thread)
+
+**`run-188` names it, and the counters make it airtight.**
+
+```
+ring-1 (thread 13) asleep, 647 laps, last saw token 2, 1643 predicate evaluations
+token 1, phase 3, 0 sleepers still queued, 0 overflowed
+```
+
+`ring-1` blocked while the token was **2** and its predicate evaluations are
+**frozen** at 1643, while the other three sit near 1600-1700 and kept turning.
+So it was never given another look -- not at the handoff to 3, to 0, to 1 (its
+own turn), nor by the retire.
+
+**Chain the counters and only one story survives.** Its entry is gone, and
+`wake retries` is zero, so `fate` never returned `Retained`. That leaves
+`Delivered` or `Stale`. It cannot be `Delivered`: a delivered wake makes the
+thread `Ready`, it runs, and the evaluation count climbs. It did not.
+**So the entry was dropped as `Stale`** -- `sched::is_blocked` answered `None`
+and the code concluded the thread had exited.
+
+**It had not exited.** The same report line says it is alive and `Blocked`.
+`sched::wake` and `sched::is_blocked` both walk the run queues **one lock at a
+time**, and both missed a live blocked thread.
+
+**And the inference was unsound to begin with.** A station reaches
+`sched::exit` only *after* `wait_until` has returned, which is after its entry
+was removed -- so a thread is never both enqueued and exited. "Not found in any
+queue" therefore cannot mean "gone"; it means the scan did not see it.
+
+**So `Stale` becomes `Unseen` and keeps the entry.** A miss is recoverable: the
+next waker, at worst the retire's own `wake_all`, delivers it. A dropped entry
+is not recoverable by anything. `UNSEEN_WAKES` counts it and the boot report
+names it, because a scan that cannot see a blocked thread is a fact about the
+scheduler rather than about this queue -- and it is the next thing to chase.
+
+**What this says about the previous fix.** `1c8e253` stopped `wake_all`
+consuming an entry on a failed wake, which is a real hole and was measured to
+rescue three sleepers under injection. But it added the `Stale` arm, which
+reproduced the old behaviour in exactly the case that mattered. The bug survived
+its own fix by one branch, and the instrument added with it -- `SEEN_TOKEN` and
+`PREDICATE_EVALS` -- is what made that visible in one log rather than another
+2400 boots.
+
 ### 2026-08-30 (the wake fix is real and is not the cause; what the station last saw)
 
 **`wake_all` consumed a waiter's entry whether or not the wake landed** --
