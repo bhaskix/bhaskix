@@ -23037,9 +23037,19 @@ fn wait_queue_self_test(hhdm_base: u64) -> bool {
                 (false, None) => "retired and reaped",
             };
             let seen = SEEN_TOKEN[id].load(Ordering::Relaxed);
+            // **What the wakes aimed at this thread actually did.** Counted
+            // from the recorded attempts rather than inferred by elimination,
+            // which is what `run-1007` left this report doing.
+            let (mut woken, mut missed, mut busy) = (0u32, 0u32, 0u32);
+            sched::for_each_wake_attempt(spawned[id], |outcome| match outcome {
+                0 => woken += 1,
+                2 => busy += 1,
+                _ => missed += 1,
+            });
             println!(
                 "\x1b[91m                   {name} (thread {}) {state}, {} laps, last saw token \
-                 {}, {} predicate evaluations\x1b[0m",
+                 {}, {} predicate evaluations; recent wakes: {woken} landed, {missed} not found, \
+                 {busy} contended\x1b[0m",
                 spawned[id],
                 LAPS[id].load(Ordering::Relaxed),
                 if seen == u64::MAX { -1 } else { seen as i64 },

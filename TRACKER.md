@@ -1123,6 +1123,54 @@ makes it a terminal discipline rather than a buffer, and it is the part most
 likely to be got wrong. It belongs in the service, where policy belongs, and it
 wants its own RFC and its own gates.
 
+### 2026-08-30 (both fixes are guards that never fired, and the rate did not move)
+
+**1200 boots on the `Unseen` kernel, checksum identical: 1198 passed.** One ring
+retire failure (`run-1007`), one `LOCK ORDER` canary (`run-250`), and --
+decisively -- **`wake unseen` and `wake retries` both zero across the whole
+run**.
+
+**So both fixes are guards that have never fired in the wild.** `1c8e253`
+stopped `wake_all` consuming an entry whose wake did not land; `fd37f89` stopped
+it discarding an entry because a scan could not see the thread. Both are real
+holes, both were watched red by injection, and **neither is this bug**. The rate
+is one in 1200 against a baseline of four in 2400 -- unchanged within noise. It
+would be easy to present two fixes and a clean-looking soak as progress on the
+defect; it is not, and the table says so.
+
+**`run-1007` is the specimen that matters, and it is contradictory.**
+
+```
+ring-1 (thread 13) asleep, 972 laps, last saw token 0, 2543 predicate evaluations
+ring-0 retired 973 (2369)   ring-2 retired 972 (2353)   ring-3 retired 972 (2630)
+token 1, 0 sleepers still queued
+```
+
+Unlike `run-188`, its evaluations are **level with its peers** -- it was being
+woken and re-blocking normally to the end. Its entry is gone and both new
+counters are zero, so by elimination the entry went via `Delivered`: the wake
+**landed**. But a landed wake makes a thread `Ready`, and a `Ready` thread this
+report would call *"runnable, not chosen"*. It says **asleep**. One of those
+statements is false and **no counter in the tree could say which** -- the
+argument was by elimination, which is not an observation.
+
+**`run-250` is a third sighting of the stale mask**, after `run-221` and
+`run-244`: `blocking on wait::WaitQueue (rank 9) while holding mask
+0b1000000000` with *"no open guard -- the counted hold has no open guard, which
+is itself the answer"*. The accounting claims a rank nothing holds.
+
+**So the next instrument records the wakes themselves.** `WAKE_LOG` keeps the
+last thirty-two attempts as `id | outcome << 32` -- one relaxed store on a path
+that already takes a runqueue lock -- and the retire report prints, per station,
+`recent wakes: N landed, M not found, K contended`. Watched red by the injection
+that stops a station retiring; every station's line carries its counts.
+
+**What it will decide.** If the sleeper's line says a wake *landed* after its
+last evaluation, then a delivered wake did not make it runnable and the fault is
+in the scheduler's state transition, not the queue. If it says *not found*, the
+scan missed it and the entry was consumed by a path that believed otherwise. The
+answer is one line either way, and it will not be by elimination.
+
 ### 2026-08-30 (found: the entry was dropped because a scan could not see a live thread)
 
 **`run-188` names it, and the counters make it airtight.**

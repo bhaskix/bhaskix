@@ -4057,6 +4057,49 @@ static DEFERRED_WAKES: [core::sync::atomic::AtomicU32; MAX_CPUS * MAX_THREADS_PE
     [const { core::sync::atomic::AtomicU32::new(NO_THREAD) }; MAX_CPUS * MAX_THREADS_PER_CPU];
 static DEFERRED_LOST: AtomicU64 = AtomicU64::new(0);
 
+/// The last wake attempts made on this machine: which thread, and what came of
+/// it.
+///
+/// **Because "by elimination it must have been delivered" is not an
+/// observation.** `run-1007` has a station asleep with its entry gone, both
+/// `UNSEEN_WAKES` and `LOST_WAKES` at zero, and its predicate evaluations level
+/// with its peers -- so the wake landed, and a landed wake makes a thread
+/// `Ready`. It is `Blocked`. One of those statements is wrong and no counter
+/// currently in the tree can say which.
+///
+/// Packed as `id | outcome << 32`, one relaxed store per attempt on a path that
+/// already takes a runqueue lock. Thirty-two slots, because what matters is the
+/// handful of attempts around the moment a station stopped.
+static WAKE_LOG: [core::sync::atomic::AtomicU64; 32] =
+    [const { core::sync::atomic::AtomicU64::new(u64::MAX) }; 32];
+
+/// Where the next [`WAKE_LOG`] entry goes.
+static WAKE_LOG_NEXT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Records one wake attempt. `outcome`: 0 woken, 1 not found, 2 contended.
+fn note_wake(id: u32, outcome: u64) {
+    let slot = WAKE_LOG_NEXT.fetch_add(1, Ordering::Relaxed) as usize % WAKE_LOG.len();
+    WAKE_LOG[slot].store(u64::from(id) | (outcome << 32), Ordering::Relaxed);
+}
+
+/// Walks the recorded wake attempts for one thread, oldest slot first, as
+/// `(outcome, position)` where position is the slot index.
+///
+/// Reading by thread rather than dumping all thirty-two: the question is always
+/// "what happened to *this* sleeper", and a report that prints every wake on the
+/// machine is one nobody reads.
+pub fn for_each_wake_attempt(thread: u32, mut f: impl FnMut(u64)) {
+    for slot in &WAKE_LOG {
+        let packed = slot.load(Ordering::Relaxed);
+        if packed == u64::MAX {
+            continue;
+        }
+        if u32::try_from(packed & 0xffff_ffff).unwrap_or(u32::MAX) == thread {
+            f(packed >> 32);
+        }
+    }
+}
+
 fn wake_with(id: u32, from_interrupt: bool) -> WakeResult {
     let online = percpu::online_count() as usize;
     let here = percpu::cpu_id();
@@ -4112,13 +4155,16 @@ fn wake_with(id: u32, from_interrupt: bool) -> WakeResult {
             if cpu as u32 != here {
                 notify(cpu as u32);
             }
+            note_wake(id, 0);
             return WakeResult::Woken;
         }
     }
 
     if contended {
+        note_wake(id, 2);
         WakeResult::Contended
     } else {
+        note_wake(id, 1);
         WakeResult::NotFound
     }
 }
