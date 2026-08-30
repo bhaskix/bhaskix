@@ -174,6 +174,28 @@ pub fn destroy(id: NotificationId) -> bool {
     slot.generation.fetch_add(1, Ordering::AcqRel);
     slot.pending.store(0, Ordering::Relaxed);
 
+    // **A destroyed notification's deadline goes with it.**
+    //
+    // It could not have woken anybody -- `expire` hands back the generation it
+    // recorded and `resolve` refuses a stale one -- so this is not a spurious
+    // wake. What it was is a **leak of a scarce slot**: there are
+    // `MAX_DEADLINES` of them, sixteen, and one armed on a notification that is
+    // then destroyed sat there until its deadline passed, doing nothing but
+    // occupying a slot the next caller needs. `two_wake_sources_self_test` has
+    // a `FAILED: no deadline slot` branch for exactly that shortage.
+    //
+    // By index and not by identity: the generation was bumped two lines above,
+    // so no `NotificationId` naming this slot can still resolve, and every
+    // deadline recorded against it is by definition dead.
+
+    let want = id.index() + 1;
+    for armed in &DEADLINES {
+        if armed.who.load(Ordering::Acquire) == want {
+            armed.deadline.store(0, Ordering::Release);
+            armed.who.store(0, Ordering::Release);
+        }
+    }
+
     let waiter = slot.waiter.swap(0, Ordering::AcqRel);
     if waiter != 0 {
         STRANDED.fetch_add(1, Ordering::Relaxed);
@@ -735,6 +757,35 @@ mod tests {
     fn alone() -> MutexGuard<'static, ()> {
         ARENA.lock().unwrap_or_else(PoisonError::into_inner)
     }
+    /// A destroyed notification does not keep its deadline slot.
+    ///
+    /// There are only `MAX_DEADLINES` of them. One armed on a notification that
+    /// is then destroyed could never wake anybody -- `expire` carries the
+    /// generation and `resolve` refuses a stale one -- but it held a slot until
+    /// its deadline passed, and `two_wake_sources_self_test` has a
+    /// `FAILED: no deadline slot` branch for that shortage.
+    #[test]
+    fn destroying_a_notification_gives_its_deadline_slot_back() {
+        let _alone = alone();
+        let before = armed_deadlines();
+
+        let id = create().expect("a slot");
+        assert!(arm(id, u64::MAX / 2, 7).is_ok(), "a deadline far away");
+        assert_eq!(
+            armed_deadlines(),
+            before + 1,
+            "arming should occupy exactly one slot"
+        );
+
+        destroy(id);
+        assert_eq!(
+            armed_deadlines(),
+            before,
+            "destroying the notification must release the deadline it held: the \
+             slot can never fire usefully again, and there are only {MAX_DEADLINES}"
+        );
+    }
+
     #[test]
     fn the_object_behaves_as_rfc_0010_specifies() {
         let _alone = alone();

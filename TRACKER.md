@@ -1124,6 +1124,46 @@ makes it a terminal discipline rather than a buffer, and it is the part most
 likely to be got wrong. It belongs in the service, where policy belongs, and it
 wants its own RFC and its own gates.
 
+### 2026-08-30 (both two-sources candidates refuted by reading, and a real leak found on the way)
+
+The entry below named two candidates for the gate's spurious `BY_TIMER`. **Both
+are refuted, by reading rather than by another soak.**
+
+**A stale deadline signalling a recycled notification: it cannot.** `destroy`
+bumps the slot's generation; `expire` reconstructs
+`NotificationId::from_parts(who - 1, generation)` from what `arm` recorded; and
+`resolve` refuses an id whose generation does not match. A deadline outliving
+its notification therefore fires into nothing. That path is closed and was
+closed before this was looked at.
+
+**A badge surviving into the next round: it cannot.** `destroy` clears
+`pending` explicitly, so nothing carries over.
+
+**What the reading did find is a slot leak.** `destroy` did **not** release an
+armed deadline. There are only `MAX_DEADLINES` -- **sixteen** -- and one armed
+on a notification that was then destroyed sat there until its deadline passed,
+occupying a slot for no possible benefit, since it could never resolve.
+`two_wake_sources_self_test` carries a `FAILED: no deadline slot` branch for
+exactly that shortage.
+
+**It also interacted with a change made an hour earlier.** Round one's deadline
+now derives from the calibrated rate and is an *hour* rather than the twenty to
+sixty seconds the old cycle count happened to mean. Any path that armed and
+destroyed without disarming would have held a slot sixty times longer than
+before. The leak was worth fixing on its own; that change made it worth fixing
+now.
+
+**Fixed in `destroy`, by index rather than identity** -- the generation is
+bumped two lines above, so every deadline recorded against that slot is by
+definition dead. Host-tested and watched red: removing the release fails
+`destroying_a_notification_gives_its_deadline_slot_back` and nothing else.
+
+**The gate's intermittent is still unexplained.** Neither candidate survived,
+the deadline-length hypothesis was refuted by experiment, and the failure stands
+at about 2 boots in 1200. What is different is that three explanations are now
+eliminated with reasons a reader can check, rather than one being adopted
+because it sounded right.
+
 ### 2026-08-30 (the two-sources gate: a plausible cause, tested and refuted)
 
 **The RFC 0057 gate fails about 2 boots in 1200**, with `leftover [false,
