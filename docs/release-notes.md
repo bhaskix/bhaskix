@@ -86,7 +86,7 @@ for a user to discover.
 | A ring station in a scheduler self-test sleeps through its own turn, halting that test | ~1 boot in 1200 |
 | A kernel fault: control transfers to an unmapped address, alongside a trap frame whose vector field is garbage | ~1 boot in 2400 |
 | Lock accounting occasionally disagrees with the guards it describes (a rank claimed with no open guard) | 3 sightings |
-| A socket reclaim returns the slot but not the port, so an immediate re-bind is refused | 1 in 7 observed |
+| A socket reclaim returns the slot but not the port, so an immediate re-bind is refused | 1 sighting only; 36 consecutive passes since |
 | The RFC 0057 two-source park gate fails | ~2 in 1200 |
 | CI's `interactive shell` job fails intermittently | ~7% of pushes |
 

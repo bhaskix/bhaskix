@@ -1124,6 +1124,40 @@ makes it a terminal discipline rather than a buffer, and it is the part most
 likely to be got wrong. It belongs in the service, where policy belongs, and it
 wants its own RFC and its own gates.
 
+### 2026-08-30 ("1 in 7" was one sighting, and 36 runs say so)
+
+**The release note written earlier today listed this defect as "1 in 7
+observed". That was my overstatement, not this file's**: the entry of
+2026-08-29 says accurately *"one sighting in seven ... it did not reproduce in
+six consecutive runs of that lane"*. Turning that into a rate in a
+reader-facing document was exactly the kind of rounding this project exists not
+to do, and it is corrected in
+[docs/release-notes.md](docs/release-notes.md).
+
+**Thirty more consecutive runs of the `iommu` boot lane today, after six
+yesterday: 36 passes, 0 failures.** One sighting, thirty-six clean runs since.
+
+**It also settled a design question by not needing to.** The gate asserts that a
+killed domain's successor can bind the same port on its *first* attempt, while
+RFC 0058 promises only that the release is **eventual** -- *"the message arrives
+when the slot is reused ... this bounds the leak; it does not remove it"*. So
+the gate asks for more than the contract gives, and the two honest responses
+were to strengthen the contract (an RFC, and RFC 0058 already rejected the
+neighbouring idea as a deadlock risk) or to relax the gate to a bounded retry
+that measures the delay.
+
+**Neither was done, and that is the point.** Both would have been changes to a
+gate guarding a real leak on the strength of a single sighting. 36 clean runs
+say the gate does not over-assert in practice. It stays as it is.
+
+**What is still missing, and is the thing to build if it recurs**: the datum
+that would decide it lives in `linuxd`. `release_sockets_of` retries a close
+four times and counts `CLOSES_REFUSED`; if those four were refused the release
+genuinely failed, and if not it was timing. The kernel's failure line cannot see
+a ring 3 adapter's counter, and there is no channel for it today. That is a
+small, bounded piece of work and it is worth doing **when there is a second
+sighting**, not before.
+
 ### 2026-08-30 (R7 written, and R6 made askable)
 
 **R7 is drafted** -- [docs/release-notes.md](docs/release-notes.md). Every
@@ -1583,7 +1617,8 @@ leak from the one RFC 0058 closed, and it is the shape a gate can only catch
 because it re-binds rather than merely counting slots.
 
 **One sighting in seven.** It did not reproduce in six consecutive runs of that
-lane afterwards. It is recorded as a sighting with its exact numbers, not as a
+lane afterwards. **Thirty more runs on 2026-08-30 also passed: 36
+clean runs since the single sighting.** It is recorded as a sighting with its exact numbers, not as a
 diagnosis, and it is **not** attributable to the fault-report work in the same
 change -- that touches only `report_exception` and paths reachable from it, and
 this gate exercises neither.
