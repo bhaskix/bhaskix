@@ -97,10 +97,21 @@ for a user to discover.
 | A socket reclaim returns the slot but not the port, so an immediate re-bind is refused | 1 sighting only; 36 consecutive passes since |
 | The RFC 0057 two-source park gate fails | ~2 in 1200 |
 | CI's `interactive shell` job fails intermittently | ~7% of pushes |
+| A wake can be delayed ~445 ms, and 4-second bounded waits occasionally starve behind it | 3 in 500 boots; **every** boot shows a worst wake of 442–447 ms against a 50 µs target |
+| The TCP inbound gate fails intermittently, at a rate that is **environmental as well as timing-bound** | 1 in 14–30, and 10 in 12 after a host reboot on an unchanged tree |
 
 **None of these has a fix.** Two fixes were made near the first while chasing
 it — both closed real holes, and the write-up says plainly that neither was the
 cause and that the rate did not move.
+
+**One of them is not a property of this software alone.** The TCP inbound gate
+ran at 1 boot in 14–30 for most of one day and at 10 in 12 later the same day,
+on a tree with none of that day's changes — the host had rebooted in between.
+It is not load. What the reboot changed that matters to the emulator's
+retransmit timing is **not established**, and the practical consequence is
+recorded because it will otherwise mislead: a rate measured for this gate before
+and after a change says nothing unless both were measured on the same boot of
+the host.
 
 ---
 
