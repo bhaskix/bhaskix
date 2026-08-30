@@ -197,7 +197,7 @@ make test               # everything CI runs -- about six minutes
 
 Builds on **stable Rust** — no nightly, no `#![feature]` anywhere in the tree
 (see [docs/nightly-features.md](docs/nightly-features.md)). Verified with Rust
-1.97.1, QEMU 4.2.1, and Limine 8.7.0.
+1.98.0, QEMU 4.2.1, and Limine 8.7.0.
 
 `make test` runs, cheapest first, so a trivial mistake fails in seconds rather
 than after a QEMU boot: `rustfmt`; `clippy` on both the freestanding and host

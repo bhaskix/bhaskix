@@ -137,7 +137,7 @@ make test            # everything CI runs
 ```
 
 Builds on **stable Rust** — no nightly and no `#![feature]` anywhere in the
-tree. Verified with Rust 1.97.1, QEMU 4.2.1 and Limine 8.7.0.
+tree. Verified with Rust 1.98.0, QEMU 4.2.1 and Limine 8.7.0.
 
 ---
 

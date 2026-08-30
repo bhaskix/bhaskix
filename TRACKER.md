@@ -1124,6 +1124,38 @@ makes it a terminal discipline rather than a buffer, and it is the part most
 likely to be got wrong. It belongs in the service, where policy belongs, and it
 wants its own RFC and its own gates.
 
+### 2026-08-30 (three documents claimed a Rust version the tree stopped using eight days ago)
+
+**`rust-toolchain.toml` has pinned 1.98.0 since 2026-08-22 (`01eeb29`), and
+three documents still said 1.97.1**: `README.md`, `docs/nightly-features.md`,
+and -- written *today* -- `docs/release-notes.md`, which inherited the claim by
+copying it.
+
+**Found by checking a document against the machine rather than reading it.**
+`rustc --version` answers `1.98.0`, `rust-toolchain.toml` pins `1.98.0`, and the
+documents asserted otherwise for eight days across a toolchain bump that has its
+own commit. QEMU 4.2.1 and Limine 8.7.0 were checked the same way and are
+correct -- Limine against `git describe` in the vendored tree, which says
+`v8.7.0-binary`.
+
+**The release note is the one that matters.** It is written for people outside
+the project, it was drafted hours earlier, and it carried a false claim about
+what the software was built with. That is the second overstatement in that
+document in one day, after the socket-reclaim rate, and both were introduced by
+copying a figure instead of measuring it. **The lesson is not "check the
+release note" but "a number copied is a number unverified"**, which is the rule
+this project already applies to code and had not been applying to its own
+documents.
+
+`arch/x86_64/src/context.rs` keeps its mention of 1.97: it records *when* a lint
+began rejecting something, which is a historical fact and still true.
+
+**What would have caught it earlier.** Nothing does today. A gate comparing
+`rust-toolchain.toml` against the version the documents claim would be a few
+lines in `make gates`, and it is the kind of check this project already runs for
+the progress chart and the RFC count. Recorded as worth doing rather than done,
+because it wants deciding where the list of documents to check lives.
+
 ### 2026-08-30 (both two-sources candidates refuted by reading, and a real leak found on the way)
 
 The entry below named two candidates for the gate's spurious `BY_TIMER`. **Both
