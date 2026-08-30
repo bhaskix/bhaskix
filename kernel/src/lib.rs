@@ -402,6 +402,26 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
     // thread that failed to start. It cost two milestones to notice twice, so
     // the restart lives here, once, rather than inside whichever test happens
     // to need it next.
+    // `ringsoak=<ms>` — the ring-station hunt's knob, and it is read **here**,
+    // immediately before the test that uses it.
+    //
+    // The first version parsed it beside `faultinject::from_cmdline`, seven
+    // hundred lines down, which reads as the natural home for command-line
+    // options and is nowhere near early enough: `scheduling_self_test` runs on
+    // the next line. The flag was in the image, the parse was correct, and the
+    // window stayed 2000 ms — a knob that silently did nothing, which is the
+    // failure this whole day has been about. Caught by checking that the
+    // printed window actually changed rather than that the flag was accepted.
+    for word in handoff.cmdline.split_ascii_whitespace() {
+        if let Some(value) = word.strip_prefix("ringsoak=")
+            && let Ok(ms) = value.parse::<u64>()
+        {
+            // Bounded at ten minutes: a window past the harness's own timeout
+            // turns a hunt into a hang, and a hang reports nothing at all.
+            RING_SOAK_MS.store(ms.min(600_000), core::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
     if scheduling_self_test(handoff.hhdm_base.as_u64()) {
         println!("    scheduler      timer-driven preemption works");
     } else {
@@ -3739,6 +3759,28 @@ static CORPUS_PROGRAM: core::sync::atomic::AtomicU8 = core::sync::atomic::Atomic
 /// Set from `busybox=sh` on the command line. Off by default, because an
 /// interactive shell blocks reading and an ordinary boot has nobody to type at
 /// it: the machine would stop in the middle of its own self-tests.
+/// How long the ring test watches, in milliseconds — RFC-less hunt knob.
+///
+/// **Default 2000, which is what every lane runs and what the gate asserts.**
+/// `ringsoak=<ms>` on the command line raises it, and nothing else changes: the
+/// stations, the protocol, the retire and the report are identical.
+///
+/// It exists because of arithmetic rather than a hunch. The ring-station lost
+/// wakeup (TRACKER §3) runs at about **1 boot in 1200**, and a boot turns the
+/// ring roughly 8,000 times in its two seconds — so the defect is on the order
+/// of **1 in 10 million laps**. Ten hours of soaking bought "the rate did not
+/// move" because each boot spends two seconds on the ring and two minutes on
+/// everything else. Watching for two minutes instead puts ~480,000 laps in one
+/// boot, which is sixty boots' worth of the thing that actually matters, and
+/// brings a specimen inside an afternoon instead of a week.
+///
+/// **What it cannot rule out, said plainly**: if the defect needs the boot's
+/// other traffic rather than the ring's own, a long quiet window will be a
+/// worse place to find it, not a better one. A soak that finds nothing in ten
+/// million laps is therefore evidence *about the model*, not only about the
+/// bug — and either answer is worth the afternoon.
+static RING_SOAK_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(2000);
+
 static BUSYBOX_INTERACTIVE: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
@@ -23400,13 +23442,14 @@ fn wait_queue_self_test(hhdm_base: u64) -> bool {
     // untouched. This one says the stations exist and the window is starting;
     // reaching it and not the next one puts the hang in the window or the
     // counter reads that follow it.
-    println!("    wait queues    {RING_SIZE} stations spawned; watching for 2000 ms");
+    let watch_ms = RING_SOAK_MS.load(Ordering::Relaxed);
+    println!("    wait queues    {RING_SIZE} stations spawned; watching for {watch_ms} ms");
 
     // Generous, because the budget has to cover the slowest configuration
     // rather than the fastest. A cross-CPU wake waits for the target CPU's
     // next tick, and under UEFI the framebuffer console is slow enough that
     // the ring turns several times slower than it does under BIOS.
-    wait_millis(2000);
+    wait_millis(watch_ms);
 
     let blocks = sched::blocks() - blocks_before;
     let wakeups = sched::wakeups() - wakeups_before;
