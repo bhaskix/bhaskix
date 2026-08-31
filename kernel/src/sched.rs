@@ -1453,10 +1453,21 @@ pub fn set_fs_base(thread: u32, base: u64) -> bool {
                     // makes it the first suspect and says how often the window
                     // opens.
                     //
-                    // Counting, not fixing: closing it means making the *other* CPU
-                    // load the register, which is an IPI and a design decision, not
-                    // an edit.
+                    // ~~Counting, not fixing~~ — **fixed by RFC 0062, with the IPI
+                    // this sentence named.** `notify` already exists to make a
+                    // CPU look at its queue; here it makes that CPU load the
+                    // base its current thread has just been given, in the
+                    // handler, *before* it schedules. The counter stays and
+                    // changes meaning: it now says how often the IPI was
+                    // needed, not how often the window was left open.
+                    //
+                    // The receiving half is the one that matters and is in
+                    // `trap.rs`: `preempt` loads a base only when it actually
+                    // switches, and a thread that is simply re-selected would
+                    // return to user mode with the stale base and leave this
+                    // exactly as broken as before.
                     FS_BASE_SET_ELSEWHERE.fetch_add(1, Ordering::Relaxed);
+                    notify(index as u32);
                 }
                 BaseReach::NotRunning => {}
             }
@@ -1464,6 +1475,50 @@ pub fn set_fs_base(thread: u32, base: u64) -> bool {
         }
     }
     false
+}
+
+/// Loads this CPU's current thread's recorded FS base into the register.
+///
+/// **The receiving half of RFC 0062.** `set_fs_base` cannot write another CPU's
+/// `IA32_FS_BASE`, so it records the value and sends `RESCHEDULE_VECTOR`; this
+/// runs there. It is not enough to let `preempt` do it: `preempt` loads a base
+/// only when it *switches*, and the thread whose base was just set is usually
+/// the one that gets re-selected — it would return to user mode with the stale
+/// base and the window would be exactly as open as before.
+///
+/// `try_lock`, because this is reachable from an interrupt on a CPU that may
+/// have been interrupted holding this very lock. A miss is not a failure: the
+/// base still arrives at the next switch, which is what happened before this
+/// existed.
+pub(crate) fn refresh_fs_base_here() {
+    let cpu = percpu::cpu_id() as usize;
+    if cpu >= MAX_CPUS {
+        return;
+    }
+    let Some(queue) = QUEUES[cpu].try_lock() else {
+        return;
+    };
+    let current = queue.current;
+    let Some(thread) = queue.threads[current].as_ref() else {
+        return;
+    };
+    let base = thread.fs_base;
+    drop(queue);
+    if base != 0 && base != fs_base_loaded() {
+        FS_BASES_LOADED_BY_IPI.fetch_add(1, Ordering::Relaxed);
+        // SAFETY: as `load_fs_base` — a user-mode segment base for the thread
+        // this CPU is about to return to.
+        unsafe { load_fs_base(base) };
+    }
+}
+
+/// Bases put in the register by RFC 0062's IPI rather than by a switch.
+static FS_BASES_LOADED_BY_IPI: AtomicU64 = AtomicU64::new(0);
+
+/// How many bases the IPI loaded — RFC 0062.
+#[must_use]
+pub fn fs_bases_loaded_by_ipi() -> u64 {
+    FS_BASES_LOADED_BY_IPI.load(Ordering::Relaxed)
 }
 
 /// Records the page table `thread` runs in.

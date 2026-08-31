@@ -11,7 +11,7 @@
 | | |
 |---|---|
 | RFCs accepted | **43** |
-| RFCs open | 17 |
+| RFCs open | 18 |
 | RFCs closed without shipping | 1 |
 | Milestone rows done | **92 of 95** |
 | Phase 2 bullets done | **12 of 13** |
@@ -68,6 +68,7 @@ gantt
     RFC 0050 a console line that arrives whole :done, r0050, 2026-08-27, 1d
     section Memory & scheduling
     RFC 0024 Preemption on wake :crit, r0024, 2026-08-15, 1d
+    RFC 0062 a thread may not run with a TLS base it did not... :active, r0062, 2026-09-01, 2026-09-01
     section Userspace & personality
     RFC 0005 Linux ABI compatibility as a domain personality :active, r0005, 2026-08-03, 2026-08-31
     RFC 0027 A sockets API worth the name :done, r0027, 2026-08-17, 1d
@@ -156,6 +157,7 @@ gantt
 | 0045 | One adapter per workload and the three failures that argued for it | 2026-08-23 |
 | 0060 | a writable path for a hosted process | 2026-08-31 |
 | 0061 | a connection nobody accepted | 2026-08-31 |
+| 0062 | a thread may not run with a TLS base it did not set | 2026-09-01 |
 
 ## Annexes
 

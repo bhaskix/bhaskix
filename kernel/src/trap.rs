@@ -467,6 +467,17 @@ fn handle_interrupt(frame: &mut TrapFrame) {
             // whose APIC is initialised.
             unsafe { crate::time::rearm_this_cpu() };
 
+            // **RFC 0062, and it must happen before `preempt`.** The sender may
+            // have been `set_fs_base`, which cannot write this CPU's
+            // `IA32_FS_BASE` from where it ran. `preempt` loads a base only
+            // when it *switches*, and the thread whose base was just set is
+            // usually the one re-selected — so leaving it to `preempt` returns
+            // that thread to user mode with a stale base, which for a thread
+            // that never had one is zero, and its first `%fs:` read faults at a
+            // small absolute address. That is the whole of the BusyBox
+            // intermittent this closes.
+            crate::sched::refresh_fs_base_here();
+
             crate::sched::preempt();
         }
 

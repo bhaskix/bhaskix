@@ -502,8 +502,18 @@ pub fn _print(args: fmt::Arguments<'_>) {
         write_fatal(args);
         return;
     }
-    let _ = CONSOLE.lock().write_fmt(args);
-    PRINTS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    // **Counted inside the guard, not after it.** The increment used to sit
+    // after `CONSOLE.lock()`'s temporary was dropped, so a print that wrote and
+    // was preempted before counting itself was invisible to `TORN` — and that
+    // made `TORN` a heuristic. Inside, it is an assertion: `put_run` samples
+    // this while *holding* the console, so any change it sees means a second
+    // holder wrote while it held the lock. That is the one assumption behind
+    // this whole investigation that had never been tested.
+    {
+        let mut console = CONSOLE.lock();
+        let _ = console.write_fmt(args);
+        PRINTS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// Set once a fatal report begins: every print after it goes through

@@ -4424,10 +4424,19 @@ fn personality_boundary_report() {
     // of zeroes nobody reads.
     let elsewhere = sched::FS_BASE_SET_ELSEWHERE.load(core::sync::atomic::Ordering::Relaxed);
     if elsewhere > 0 {
+        // **Both numbers, because one of them is the fix working.** `elsewhere`
+        // counts a base set for a thread running on another CPU -- the window
+        // itself, which RFC 0062 does not remove and cannot: the register is
+        // per CPU. `by_ipi` counts the bases that reached a register because
+        // the IPI put them there rather than a switch, and it is what says the
+        // window was *attended* rather than left open. A boot with `elsewhere`
+        // above zero and `by_ipi` at zero is the old behaviour, and would mean
+        // the IPI is not arriving or the handler is losing the race for the
+        // queue lock.
+        let by_ipi = sched::fs_bases_loaded_by_ipi();
         println!(
-            "\x1b[93m    linux tls      {elsewhere} FS base(s) set for a thread running on \
-             another cpu, so the register followed at that cpu's next switch rather than at \
-             once -- the window the rip 0x500000a6 fault would come through\x1b[0m"
+            "    linux tls      {elsewhere} FS base(s) set for a thread running on another cpu; \
+             {by_ipi} loaded there by RFC 0062's IPI rather than waiting for a switch"
         );
     }
     // **And every park that did not happen** — RFC 0054. A refused park loses a
