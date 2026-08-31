@@ -393,6 +393,20 @@ pub static NONCONTIGUOUS: core::sync::atomic::AtomicU64 = core::sync::atomic::At
 /// Bytes the record advanced beyond a run's own length, summed.
 pub static INTERLOPER_BYTES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
+/// How many runs carried the hosted probe's line, and how long the last was.
+///
+/// **The one thing the other counters cannot say.** They agree that every run
+/// lands contiguously and that no print interleaves one — and the line still
+/// comes out split. Both are true at once if the line arrives as **two runs**
+/// with a print between them, because a print *between* runs is inside
+/// neither. This says which: one run of 28 means the split is below `put_run`;
+/// two runs means it is above, and every layer that claims to send it whole is
+/// wrong somewhere.
+pub static HOSTED_RUNS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// The length of the last run carrying that line.
+pub static HOSTED_RUN_LEN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 /// Who handed each run over, paired with [`RUN_LENS`]. Temporary, with it.
 ///
 /// `0` is a kernel-side caller (the in-kernel console service); anything else
@@ -450,6 +464,17 @@ pub fn put_run_tagged(bytes: &[u8], tag: u32) {
         RUN_LENS[at % RUN_LENS.len()]
             .store(bytes.len() as u32, core::sync::atomic::Ordering::Relaxed);
         RUN_TAGS[at % RUN_TAGS.len()].store(tag, core::sync::atomic::Ordering::Relaxed);
+        // Targeted, and narrow on purpose: only the line under investigation.
+        // **`errno` alone is not unique to this line**, and that is the third
+        // needle in one investigation to have been too loose: the boot also
+        // prints "and got a Linux errno five times". A counter that matches the
+        // wrong line reports a length that belongs to somebody else, which is
+        // exactly the confusion its numbers were meant to resolve.
+        const NEEDLE: &[u8] = b"open refused errno";
+        if bytes.len() >= NEEDLE.len() && bytes.windows(NEEDLE.len()).any(|w| w == NEEDLE) {
+            HOSTED_RUNS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            HOSTED_RUN_LEN.store(bytes.len() as u64, core::sync::atomic::Ordering::Relaxed);
+        }
         RUN_HEADS[at % RUN_HEADS.len()].store(
             u32::from(bytes.first().copied().unwrap_or(0)),
             core::sync::atomic::Ordering::Relaxed,

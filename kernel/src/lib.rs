@@ -19137,6 +19137,11 @@ fn user_shell(handoff: &Handoff) -> Result<(), &'static str> {
             crate::console::PRINTS.load(core::sync::atomic::Ordering::Relaxed)
         );
         println!(
+            "    put_run hosted {} run(s) carried the probe's line, the last {} bytes long",
+            crate::console::HOSTED_RUNS.load(core::sync::atomic::Ordering::Relaxed),
+            crate::console::HOSTED_RUN_LEN.load(core::sync::atomic::Ordering::Relaxed)
+        );
+        println!(
             "    put_run split  {} run(s) did not land contiguously in the record; {} \
              interloping byte(s)",
             crate::console::NONCONTIGUOUS.load(core::sync::atomic::Ordering::Relaxed),
