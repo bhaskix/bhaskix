@@ -3063,6 +3063,9 @@ fn two_wake_sources_self_test(cpu: u32, hhdm_base: u64) -> bool {
 
     let mut outcomes = [0u64; 2];
     let mut leftover = [false; 2];
+    // Whether round one's hand signal was refused rather than merely losing
+    // the race — see the call site.
+    let mut signal_refused: Option<notify::NotifyError> = None;
     for (round, by_hand) in [true, false].into_iter().enumerate() {
         let Ok(notification) = notify::create() else {
             println!("\x1b[91m    two sources    FAILED to create a notification\x1b[0m");
@@ -3126,8 +3129,21 @@ fn two_wake_sources_self_test(cpu: u32, hhdm_base: u64) -> bool {
             return false;
         }
         time::arm_no_later_than(time::now().saturating_add(ahead));
-        if by_hand {
-            let _ = notify::signal(notification, BY_HAND);
+        // **The answer is kept.** It was `let _ =`, and that is the one thing
+        // this gate's intermittent failure cannot currently distinguish: a
+        // wake carrying `BY_TIMER` in round one means *the deadline was the
+        // waker*, and there are two ways for that to happen -- the signal
+        // raced and lost, or **the signal never happened at all**. `signal`
+        // returns `Gone` when `resolve` refuses, and a refused signal leaves
+        // the deadline as the only waker, which produces exactly the observed
+        // `0x101`.
+        //
+        // Which of those it was decides where to look next, and discarding the
+        // result made the two indistinguishable. This is the fourth time in
+        // this project that an answer thrown away with `let _ =` has hidden
+        // the explanation of an intermittent failure.
+        if by_hand && let Err(error) = notify::signal(notification, BY_HAND) {
+            signal_refused = Some(error);
         }
         let woke = wait_until(|| TWO_SOURCE_WOKE.load(Ordering::Acquire) != 0, 20_000);
         outcomes[round] = if woke {
@@ -3166,9 +3182,19 @@ fn two_wake_sources_self_test(cpu: u32, hhdm_base: u64) -> bool {
         );
     } else {
         println!(
-            "\x1b[91m    two sources    FAILED: by signal {by_signal:#x}, by deadline \
-             {by_timer:#x}, leftover {leftover:?}\x1b[0m"
+            "\x1b[91m    two sources    FAILED{}: by signal {by_signal:#x}, by deadline \
+             {by_timer:#x}, leftover {leftover:?}\x1b[0m",
+            match signal_refused {
+                // **The one word that decides the diagnosis.** `BY_TIMER` in
+                // round one means the deadline was the waker; this says
+                // whether the signal lost a race or was never sent.
+                Some(_) => " (the hand signal was REFUSED, so the deadline was the only waker)",
+                None => " (the hand signal was accepted, so it lost the race)",
+            }
         );
+        if let Some(error) = signal_refused {
+            println!("\x1b[91m    two sources    the refusal was {error:?}\x1b[0m");
+        }
     }
     ok
 }
