@@ -321,7 +321,58 @@ pub fn with_output_held<T>(f: impl FnOnce() -> T) -> T {
 /// put exactly as [`crate::syscall`]'s `PUT` puts one — as a scalar value, or
 /// `?` if it is not one — so a run of *n* bytes is *n* `PUT`s and nothing else.
 /// What it removes is the gap between them.
+/// **Temporary instrument (2026-08-31), not for keeping.** The last run
+/// lengths handed to [`put_run`], so a line that arrives split can be told
+/// apart from a line that was split *after* it got here. TRACKER §3 records
+/// that every layer above this one sends a whole line in one call, and a line
+/// still split after byte 22 of 27; this says which side of `put_run` that
+/// happened on.
+pub static RUN_LENS: [core::sync::atomic::AtomicU32; 48] =
+    [const { core::sync::atomic::AtomicU32::new(0) }; 48];
+/// Who handed each run over, paired with [`RUN_LENS`]. Temporary, with it.
+///
+/// `0` is a kernel-side caller (the in-kernel console service); anything else
+/// is the domain id that issued a `PUT_RUN` syscall. Without this the ring
+/// shows a `28` that could be any of a dozen callers, and attributing one to
+/// the line under investigation would be pattern-matching rather than evidence.
+pub static RUN_TAGS: [core::sync::atomic::AtomicU32; 48] =
+    [const { core::sync::atomic::AtomicU32::new(0) }; 48];
+
+/// The ring cursor for [`RUN_LENS`]. Temporary, with it.
+pub static RUN_AT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// The run lengths recorded so far, oldest-first from the ring's cursor.
+pub fn run_lengths() -> ([u32; 48], [u32; 48], usize) {
+    let mut lens = [0u32; 48];
+    let mut tags = [0u32; 48];
+    for (index, slot) in RUN_LENS.iter().enumerate() {
+        lens[index] = slot.load(core::sync::atomic::Ordering::Relaxed);
+    }
+    for (index, slot) in RUN_TAGS.iter().enumerate() {
+        tags[index] = slot.load(core::sync::atomic::Ordering::Relaxed);
+    }
+    (
+        lens,
+        tags,
+        RUN_AT.load(core::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+/// Puts a run of bytes with the console held once — RFC 0050. See the note
+/// above [`RUN_LENS`] for the instrument, and the block comment further up for
+/// why this function exists at all.
 pub fn put_run(bytes: &[u8]) {
+    put_run_tagged(bytes, 0);
+}
+
+/// As [`put_run`], recording which domain handed the run over. Temporary.
+pub fn put_run_tagged(bytes: &[u8], tag: u32) {
+    {
+        let at = RUN_AT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        RUN_LENS[at % RUN_LENS.len()]
+            .store(bytes.len() as u32, core::sync::atomic::Ordering::Relaxed);
+        RUN_TAGS[at % RUN_TAGS.len()].store(tag, core::sync::atomic::Ordering::Relaxed);
+    }
     if FATAL.load(core::sync::atomic::Ordering::Acquire) {
         // The fatal path cannot block on this lock and must not start now. One
         // byte at a time is exactly what it did before, and a report racing a

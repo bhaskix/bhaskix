@@ -19037,6 +19037,23 @@ fn user_shell(handoff: &Handoff) -> Result<(), &'static str> {
     // was right and its position made it a lie.
     datagram_bell_report();
 
+    // **Temporary instrument (2026-08-31), not for keeping.** The lengths of
+    // the runs `put_run` was handed, printed **after every probe** -- the same
+    // trap `datagram_bell_report` records four lines above, met again: the
+    // first placement was before the hosted probes ran and reported eight runs
+    // that could not include the line under investigation. A hosted line that
+    // reaches here as one run and still appears split in the log was split
+    // below `put_run`; one that arrives as two was split above it.
+    {
+        let (lens, tags, at) = crate::console::run_lengths();
+        let count = lens.len().min(at);
+        print!("    put_run runs   {at} total, last {count} as domain:bytes:");
+        for index in 0..count {
+            let slot = (at + lens.len() - count + index) % lens.len();
+            print!(" {}:{}", tags[slot], lens[slot]);
+        }
+        println!();
+    }
     BRINGUP_DONE.store(true, core::sync::atomic::Ordering::Release);
     println!("\x1b[92m  M6 in progress. Nothing left to do at this milestone.\x1b[0m");
 

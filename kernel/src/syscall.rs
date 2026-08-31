@@ -1555,7 +1555,10 @@ fn dispatch_inner(frame: &mut SyscallFrame) -> Outcome {
                     buffer[taken..taken + room].copy_from_slice(source);
                     taken += room;
                 }
-                crate::console::put_run(&buffer[..taken]);
+                crate::console::put_run_tagged(
+                    &buffer[..taken],
+                    crate::sched::current_domain().map_or(0, |domain| domain.as_u32()),
+                );
                 crate::service::counted(taken as u64, 0);
                 Outcome::ok(taken as u64)
             }
