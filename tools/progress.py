@@ -39,6 +39,7 @@ import re
 import subprocess
 import sys
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -74,22 +75,41 @@ def run(*args: str) -> str:
 def first_commit_date(path: Path) -> str | None:
     """When this file entered the tree, which is when the work became real.
 
-    **`None` for a file that is not committed yet, and that is a trap worth
-    knowing about.** Generating this chart while a new RFC is still untracked
-    dates it `-`; committing the RFC and the chart together then leaves a
-    `docs/progress.md` that CI regenerates differently, and the invariants job
-    goes red on a change that had nothing wrong with it. It did on 2026-08-27,
-    for RFC 0050.
+    **An uncommitted file is dated *today*, and that is the fix for a trap that
+    fired three times.** `git log --diff-filter=A` has nothing to say about a
+    file no commit has added yet, so this used to return `None`: the RFC landed
+    under "Undated", CI regenerated the chart with the file committed, found a
+    date, and the invariants job went red on a change with nothing wrong with
+    it. RFC 0050 on 2026-08-27, then RFC 0060 and RFC 0061 on 2026-08-31 --
+    runs 461 and 469.
 
-    So: **commit the RFC file first, then `make progress`, then commit the
-    chart** -- or run `make progress` a second time after committing and amend.
-    The gate is doing its job either way; this note exists so the next person
-    spends a minute rather than a CI round trip working out why.
+    **A comment was tried, then a warning was tried, and the trap fired anyway**
+    (the warning goes to stderr, and the third victim had redirected it). So
+    this is a mechanism rather than a third notice: the commit that is about to
+    add this file will carry today's date, so today's date is what the chart
+    should already say, and the artifact generated before the commit matches the
+    one CI regenerates after it.
+
+    **The one case this does not cover, stated rather than left to be found:**
+    generating the chart on one day and committing it on the next. The dates
+    then disagree by one and the gate fails, correctly -- the chart really is
+    stale. `warn_if_untracked` says so at the moment of the assumption.
     """
     out = run(
         "git", "log", "--diff-filter=A", "--format=%ad", "--date=short", "--", str(path)
     )
-    return out.split("\n")[-1] if out else None
+    if out:
+        return out.split("\n")[-1]
+    if path.exists():
+        return date.today().isoformat()
+    return None
+
+
+def is_uncommitted(path: Path) -> bool:
+    """Whether no commit has added this file yet -- the assumption's condition."""
+    return not run(
+        "git", "log", "--diff-filter=A", "--format=%ad", "--date=short", "--", str(path)
+    )
 
 
 def warn_if_untracked(path: Path, when: str | None) -> None:
@@ -106,11 +126,13 @@ def warn_if_untracked(path: Path, when: str | None) -> None:
     So the tool now says it at the moment it happens, where the person is
     looking, instead of leaving it to a gate a push away.
     """
-    if when is None:
+    if when is None or is_uncommitted(path):
         print(
-            f"  note  {path.name} is not committed yet, so it has no date and this "
-            "chart will not match the one CI generates.\n"
-            "        Commit the RFC first, then run `make progress` again.",
+            f"  note  {path.name} is not committed yet, so it is dated today "
+            f"({date.today().isoformat()}) on the assumption that the commit "
+            "adding it lands today.\n"
+            "        That is what makes this chart match the one CI regenerates. "
+            "If the commit slips past midnight, run `make progress` again.",
             file=sys.stderr,
         )
 
