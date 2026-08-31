@@ -200,7 +200,7 @@ OVMF_SUFFIX  := $(if $(wildcard /usr/share/OVMF/OVMF_CODE_4M.fd),_4M,)
 OVMF_CODE    := $(firstword $(wildcard $(OVMF_DIR)OVMF_CODE$(OVMF_SUFFIX).fd))
 OVMF_VARS    := $(firstword $(wildcard $(OVMF_DIR)OVMF_VARS$(OVMF_SUFFIX).fd))
 
-.PHONY: FORCE all kernel iso demo run run-uefi progress test test-host test-boot test-boot-uefi test-boot-iommu test-keyboard \
+.PHONY: FORCE all kernel iso demo run run-uefi progress test test-host test-boot test-boot-uefi test-boot-uefi-qemu64 test-boot-iommu test-keyboard \
         test-boot-iommu-off test-boot-qemu64 test-boot-native test-boot-native-full \
         test-placements mkfs test-shell test-faults test-usb-keyboard fmt clippy gates hooks clean distclean help
 
@@ -560,7 +560,8 @@ run-uefi: $(ISO)
 # Everything CI runs. Ordered cheapest-first so a trivial mistake fails in
 # seconds rather than after a QEMU boot.
 test: fmt clippy test-host gates test-boot test-boot-uefi test-boot-iommu test-boot-iommu-off \
-      test-boot-qemu64 test-boot-native test-boot-native-full test-placements test-shell \
+      test-boot-qemu64 test-boot-uefi-qemu64 test-boot-native test-boot-native-full \
+      test-placements test-shell \
       test-keyboard test-usb-keyboard test-busybox test-faults
 	@echo
 	@echo "  all checks passed"
@@ -665,6 +666,20 @@ test-boot-iommu-off: $(ISO)
 # facts and the firmware axis is already covered above.
 test-boot-qemu64: $(ISO)
 	QEMU_CPU=qemu64 tests/qemu/boot-test.sh bios
+
+# **The fourth corner of CI's matrix, which this list was missing.**
+#
+# CI runs `firmware x cpu` = {bios, uefi} x {qemu64, max}, four lanes. This file
+# ran three of them: `test-boot` and `test-boot-uefi` take the default `max`,
+# and `test-boot-qemu64` above covers *bios* only. `uefi` on `qemu64` was tested
+# by nobody locally and by CI on every push -- so "make test passed" could not
+# speak for the lane, and on 2026-08-31 it repeatedly did not: run 489 went red
+# there on a change whose author had a green suite in hand.
+#
+# `make test` is meant to *be* the CI list. A lane CI runs and this does not is
+# the same defect as a gate nobody runs, one level up.
+test-boot-uefi-qemu64: $(ISO)
+	QEMU_CPU=qemu64 tests/qemu/boot-test.sh uefi
 
 # RFC 0028's graduated lane: the native loader under OVMF. Its gate list is
 # the honest statement of how far sovereignty has come, and it grows a check

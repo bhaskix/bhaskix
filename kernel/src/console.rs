@@ -379,6 +379,20 @@ pub static PRINTS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64
 /// Runs during which [`PRINTS`] moved: exclusion failures. Must read zero.
 pub static TORN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
+/// Runs whose bytes did **not** land contiguously in the record.
+///
+/// **The instrument that decides the contradiction.** A torn boot shows all of:
+/// the line reaching `put_run` whole as one run, `CONSOLE` held for the whole
+/// of it, `TORN` at zero — and the record split anyway. Those cannot all be
+/// true. This measures the last one directly and at the moment it happens: the
+/// recorder is append-only, so a run of *n* bytes must advance it by exactly
+/// *n*. Anything else means somebody else's bytes landed in between, and the
+/// difference names how many.
+pub static NONCONTIGUOUS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Bytes the record advanced beyond a run's own length, summed.
+pub static INTERLOPER_BYTES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 /// Who handed each run over, paired with [`RUN_LENS`]. Temporary, with it.
 ///
 /// `0` is a kernel-side caller (the in-kernel console service); anything else
@@ -452,6 +466,7 @@ pub fn put_run_tagged(bytes: &[u8], tag: u32) {
     }
     let mut console = CONSOLE.lock();
     let before = PRINTS.load(core::sync::atomic::Ordering::Relaxed);
+    let recorded_before = console.recorder.kept().len();
     for byte in bytes {
         // The same rendering `PUT` performs, and deliberately not `str`
         // conversion: this path has never promised UTF-8 and a run that
@@ -461,6 +476,16 @@ pub fn put_run_tagged(bytes: &[u8], tag: u32) {
     }
     if PRINTS.load(core::sync::atomic::Ordering::Relaxed) != before {
         TORN.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    }
+    // Append-only, so `n` bytes must advance it by `n` — unless the record
+    // filled, which is its own answer and not this one.
+    let grew = console.recorder.kept().len() - recorded_before;
+    if grew != bytes.len() && console.recorder.refused() == 0 {
+        NONCONTIGUOUS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        INTERLOPER_BYTES.fetch_add(
+            (grew as u64).saturating_sub(bytes.len() as u64),
+            core::sync::atomic::Ordering::Relaxed,
+        );
     }
 }
 
