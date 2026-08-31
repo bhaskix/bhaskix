@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | 🔨 **Draft 2026-08-31 — steps 1, 4 and 5 built and gated; steps 2 and 3 are not built and the reason for each is below.** The denial of service is closed; the listener still serves one connection at a time |
+| **Status** | 🔨 **Draft 2026-08-31 — steps 1, 4 and 5 built and gated; step 2 withdrawn on evidence and step 3 not built, with the reason for each below.** The denial of service is closed. The listener serves one connection at a time and **that is now a decision rather than a limit**: cookies queue peers statelessly for 64-128 s, measured at 11 connections through one slot in a single boot |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | net |
 | **Milestone** | Phase 2 — networking |
@@ -124,13 +124,37 @@ issues the `CLOSE` itself — the local user's obligation under §3.6 — sends 
 which frees the slot with no new release rule. This closes the denial of
 service on its own.
 
-**Step 2 — a backlog, POSIX-shaped, inside the existing ABI.**
-A completed connection needs a control block; it does not need rings until an
-application takes it. Queued connections are held **without rings, advertising
-a zero window**, and the listener's gifted rings are bound at `ACCEPT`. So the
-`LISTEN` ABI does not change, `bhaskix-sockets` does not change, and no caller
-changes — which is what makes this a service fix and not a flag day. Depth is a
-constant, sized and printed like every other table in this tree.
+**Step 2 — a backlog, POSIX-shaped, inside the existing ABI. WITHDRAWN
+2026-08-31, before it was built, and the reason is a measurement.**
+
+The queue this step proposed to add **already exists, statelessly, and is
+better.** RFC 0048 made a `SYN` allocate nothing: the connection is built when
+the peer's `ACK` brings a cookie home, and `cookie::TICK` gives that cookie
+**64 to 128 seconds** of validity. A peer whose `ACK` arrives while the single
+accepted slot is busy is not refused and not dropped — TCP retransmits its
+`ACK`, and any retransmission inside that window builds the connection the
+moment the slot frees. The queue is the peer's retransmit timer, and the state
+it costs this machine is zero.
+
+**Measured rather than reasoned**, on boots of the `iommu` lane with the step-4
+prober running: **11 connections built through the one accepted slot in a single
+boot**, 9 of them reclaimed, and the real caller still served; 6 and 3 on two
+others. Sequential reuse of one slot is not a theory here, it is what the
+counter prints on every networked boot.
+
+So a backlog of control blocks would buy **latency and nothing else** — a
+queued peer served at once instead of after one retransmit timeout — and it
+would pay for that by holding state for peers the application has not accepted.
+That is precisely the state RFC 0048 removed, re-added one layer up: attacker
+-controllable, bounded only by the table's depth, and the direct ancestor of the
+defect this RFC exists to fix.
+
+**The trade, stated so it can be overruled rather than assumed.** If a hosted
+server ever needs several connections *concurrently* — not sequentially — this
+becomes necessary, because retransmission serialises them by construction.
+Nothing in this tree needs that today: `bin/tcpc` accepts one, and the sockets
+API exposes one listener. When something does, the right shape is the one
+described above and the reason to build it will be concurrency, not queueing.
 
 **Step 3 — host tests, which this defect could have been caught by. NOT BUILT,
 and the reason is a finding in itself.** The state machine in `net/src/tcp/state.rs`
