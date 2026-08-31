@@ -420,6 +420,16 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
             // turns a hunt into a hang, and a hang reports nothing at all.
             RING_SOAK_MS.store(ms.min(600_000), core::sync::atomic::Ordering::Relaxed);
         }
+        if let Some(value) = word.strip_prefix("ringload=")
+            && let Ok(threads) = value.parse::<u64>()
+        {
+            // Eight, because `MAX_THREADS_PER_CPU` is eight and the stations,
+            // the idles and the boot thread already hold several per CPU. A
+            // load that cannot be spawned is a load that silently is not there
+            // -- which is this week's recurring failure, so it is bounded here
+            // and the spawn is reported if it fails.
+            RING_LOAD.store(threads.min(8), core::sync::atomic::Ordering::Relaxed);
+        }
     }
 
     if scheduling_self_test(handoff.hhdm_base.as_u64()) {
@@ -3780,6 +3790,26 @@ static CORPUS_PROGRAM: core::sync::atomic::AtomicU8 = core::sync::atomic::Atomic
 /// million laps is therefore evidence *about the model*, not only about the
 /// bug — and either answer is worth the afternoon.
 static RING_SOAK_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(2000);
+
+/// Extra runnable threads spawned alongside the ring — `ringload=<n>`.
+///
+/// **Default zero, and this is the second half of the same experiment.** The
+/// 120-second quiet soak of 2026-08-31 ran 1,661 ordinary boots' worth of ring
+/// laps and found nothing, which argues the defect is not a uniform per-lap
+/// race. The most likely reason is visible in `block_self`: with only the four
+/// stations runnable, a blocking station's `pick_next` has nothing to choose
+/// but idle, and a woken one is picked the instant it is marked `Ready`. An
+/// ordinary boot is not like that — other work is queued, so a blocked station
+/// really switches away and a woken one *waits its turn*.
+///
+/// The race §3 names lives "between `mark_blocked` and the switch". A quiet
+/// ring barely has a switch to race with. These threads restore the thing the
+/// quiet window removed: each CPU keeps a runnable alternative, so blocking
+/// switches to real work and waking joins a queue instead of running at once.
+///
+/// Bounded, because `MAX_THREADS_PER_CPU` is eight and the stations, the idle
+/// threads and the boot thread already hold several.
+static RING_LOAD: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 static BUSYBOX_INTERACTIVE: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
@@ -22810,6 +22840,25 @@ extern "C" fn ring_station(id: u64) -> ! {
     }
 }
 
+/// A runnable thread that retires with the ring — `ringload=<n>`.
+///
+/// It exists to be *chosen*, not to compute anything: what the ring soak was
+/// missing is a run queue with something else in it, so that a station
+/// blocking really switches and a station woken has to wait its turn.
+///
+/// It retires on the ring's own phase, so it cannot outlive the window and
+/// disturb the tests that follow — which the tickless burner's comment records
+/// getting wrong once, by sharing a body across two generations.
+extern "C" fn ring_loader(_id: u64) -> ! {
+    use core::sync::atomic::Ordering;
+    loop {
+        if PHASE.load(Ordering::Acquire) > PHASE_WAIT {
+            sched::exit();
+        }
+        core::hint::spin_loop();
+    }
+}
+
 /// Checks that a domain's CPU share is independent of its thread count.
 ///
 /// `docs/scheduler.md` §3 claims a domain's share is "honoured regardless of
@@ -23429,6 +23478,36 @@ fn wait_queue_self_test(hhdm_base: u64) -> bool {
         }
     }
 
+    // The load, if this boot asked for one — `ringload=<n>`. Spawned *after*
+    // the stations so the ring is already turning, and placed by load like
+    // they are, so the extra runnable work lands across the CPUs rather than
+    // piling onto one.
+    //
+    // Their ids are kept for the same reason the stations' are: the retire
+    // below waits for them, and a loader still spinning into the next phase
+    // would be measured by whatever runs next as if it were that test's own
+    // machine.
+    let load = RING_LOAD.load(Ordering::Relaxed) as usize;
+    let mut loaders = [0u32; 8];
+    let mut loaded = 0usize;
+    for index in 0..load.min(loaders.len()) {
+        match sched::spawn("ring-load", ring_loader, index as u64, hhdm_base) {
+            Ok(thread) => {
+                loaders[loaded] = thread;
+                loaded += 1;
+            }
+            // **Said, not swallowed.** A load that could not be spawned is a
+            // soak that quietly measures the quiet case again — which is the
+            // exact result this run exists to move past.
+            Err(error) => println!(
+                "\x1b[93m    wait queues    load thread {index} would not spawn: {error:?}\x1b[0m"
+            ),
+        }
+    }
+    if load > 0 {
+        println!("    wait queues    {loaded} of {load} load threads spinning alongside the ring");
+    }
+
     // **A breadcrumb, and the reason is a specimen.** One boot in three hundred
     // on 2026-08-29 stopped dead here: the last line was the migration report
     // and the next line on a healthy boot is this test's summary, so the
@@ -23480,6 +23559,19 @@ fn wait_queue_self_test(hhdm_base: u64) -> bool {
     PHASE.store(PHASE_WAIT + 1, Ordering::Release);
     RING.wake_all();
     let ring_retired = wait_until(|| sched::threads_present_exact(&spawned) == 0, 4_000);
+    // The loaders retire on the same phase. Waited for separately so that a
+    // loader that outlives the window is not counted as a station that did:
+    // the gate above is about the ring, and folding the two together would let
+    // a spinning loader read as a lost wakeup.
+    if loaded > 0 {
+        let left = &loaders[..loaded];
+        if !wait_until(|| sched::threads_present_exact(left) == 0, 4_000) {
+            println!(
+                "\x1b[93m    wait queues    a load thread outlived the window; later tests share \
+                 a busier machine than they think\x1b[0m"
+            );
+        }
+    }
 
     let mut ok = true;
 
