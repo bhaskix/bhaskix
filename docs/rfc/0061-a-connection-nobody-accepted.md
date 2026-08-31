@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | 🔨 **Draft 2026-08-31 — steps 1, 4 and 5 built and gated; step 2 withdrawn on evidence and step 3 not built, with the reason for each below.** The denial of service is closed. The listener serves one connection at a time and **that is now a decision rather than a limit**: cookies queue peers statelessly for 64-128 s, measured at 11 connections through one slot in a single boot |
+| **Status** | 🔨 **Draft 2026-08-31 — steps 1, 3, 4 and 5 built and gated; step 2 withdrawn on evidence, with the reason below.** The denial of service is closed. The listener serves one connection at a time and **that is now a decision rather than a limit**: cookies queue peers statelessly for 64-128 s, measured at 11 connections through one slot in a single boot |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | net |
 | **Milestone** | Phase 2 — networking |
@@ -156,8 +156,21 @@ Nothing in this tree needs that today: `bin/tcpc` accepts one, and the sockets
 API exposes one listener. When something does, the right shape is the one
 described above and the reason to build it will be concurrency, not queueing.
 
-**Step 3 — host tests, which this defect could have been caught by. NOT BUILT,
-and the reason is a finding in itself.** The state machine in `net/src/tcp/state.rs`
+**Step 3 — host tests, which this defect could have been caught by. BUILT
+2026-08-31, after being deferred with the reason below.** The rule moved to
+`net/src/tcp/state.rs` as `reclaim_unclaimed(state, claimed)` — a pure function
+of two values, where a host test can drive it. Three tests, and **both
+directions armed red**: breaking the fix so it never reclaims fails the positive
+test, and breaking it so it reclaims a connection an application *holds* fails
+the negative one. That second direction is the one worth having, because
+reclaiming a connection out from under a program using it is a worse defect than
+the wedge this RFC fixes, and nothing else in the tree would have caught it.
+
+The deferral's reasoning is kept below because it was right about where the
+defect lived and wrong about what to do next: the answer was not "there is no
+host test to write", it was "extract the rule so there is one".
+
+~~NOT BUILT, and the reason is a finding in itself.~~ The state machine in `net/src/tcp/state.rs`
 is host-testable and it is **not where the defect lives**: the machine moved to
 `CLOSE-WAIT` correctly and every transition it made was right. The defect is in
 the *ownership* rule around it — `drive_at` and the release condition in

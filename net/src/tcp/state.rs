@@ -1097,6 +1097,36 @@ pub fn synack_for(segment: &Segment<'_>, cookie: Sequence, window: u16, mss: u16
     })
 }
 
+/// Whether a connection **no application ever accepted** must be reclaimed by
+/// the service holding it — RFC 0061.
+///
+/// # Why this is here rather than in `bin/tcpd`
+///
+/// It was there, inside `drive_at`, and that put the whole of RFC 0061 beyond a
+/// host test: a `no_std` binary with no harness, so the only instrument left
+/// was a boot gate — a weaker one than this project normally accepts, which its
+/// own RFC said at the time rather than after somebody noticed. The rule is a
+/// pure function of two values and belongs where it can be driven directly.
+///
+/// # The rule
+///
+/// [`State::CloseWait`] is defined by RFC 9293 §3.3.2 as *"waiting for a
+/// connection termination request from the **local user**"*, and §3.6 case 2
+/// names the `CLOSE` that discharges it. A connection that completed a
+/// handshake and reached no application **has no local user**, so nothing can
+/// ever discharge that obligation: it holds its slot for the rest of the boot,
+/// which is a remote denial of service costing three packets
+/// (`docs/security.md` T12).
+///
+/// `claimed` is the whole distinction, and the direction that matters is the
+/// one this returns `false` for: a connection an application holds is **its**
+/// obligation, and reclaiming one out from under a program using it would be a
+/// worse defect than the one this fixes.
+#[must_use]
+pub fn reclaim_unclaimed(state: State, claimed: bool) -> bool {
+    !claimed && matches!(state, State::CloseWait)
+}
+
 /// The `RST` that answers a segment naming no connection here, or `None` when
 /// there is nothing to say.
 ///
@@ -1510,6 +1540,62 @@ fn finish_timing(tcb: &mut Tcb, ack: Sequence, now: u64) {
     // constants above are written in.
     let sample_us = now.saturating_sub(sent_at) / 1_000;
     measure(tcb, sample_us);
+}
+
+#[cfg(test)]
+mod reclaim_tests {
+    use super::{State, reclaim_unclaimed};
+
+    /// The defect, driven directly: a peer completed a handshake, no
+    /// application accepted it, the peer closed. Nothing can discharge
+    /// `CLOSE-WAIT` because there is no local user, so the service must.
+    #[test]
+    fn a_connection_nobody_accepted_is_reclaimed_when_the_peer_closes() {
+        assert!(reclaim_unclaimed(State::CloseWait, false));
+    }
+
+    /// **The direction that would be worse to get wrong.** A connection an
+    /// application holds is that application's obligation; reclaiming one out
+    /// from under a program using it is a defect worse than the wedge.
+    #[test]
+    fn a_connection_an_application_holds_is_never_reclaimed() {
+        for state in [
+            State::Closed,
+            State::Listen,
+            State::SynSent,
+            State::SynReceived,
+            State::Established,
+            State::FinWait1,
+            State::FinWait2,
+            State::CloseWait,
+            State::Closing,
+            State::LastAck,
+        ] {
+            assert!(
+                !reclaim_unclaimed(state, true),
+                "a claimed connection was reclaimed in {state:?}"
+            );
+        }
+    }
+
+    /// An unclaimed connection that is merely *open* is not reclaimed either:
+    /// the peer has not closed, so there is no obligation outstanding and the
+    /// application may still accept it. Only `CLOSE-WAIT` names an obligation
+    /// nobody can meet.
+    #[test]
+    fn an_unclaimed_connection_still_open_is_left_alone() {
+        for state in [
+            State::Listen,
+            State::SynSent,
+            State::SynReceived,
+            State::Established,
+        ] {
+            assert!(
+                !reclaim_unclaimed(state, false),
+                "an open unclaimed connection was reclaimed in {state:?}"
+            );
+        }
+    }
 }
 
 #[cfg(test)]

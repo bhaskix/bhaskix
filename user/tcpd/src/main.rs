@@ -691,12 +691,20 @@ fn drive_at(service: &mut Service, index: usize, event: Event<'_>) {
     // answered every later `SYN` with a cookie it could not build on. Two
     // packets from an unauthenticated peer, measured.
     //
+    // **The rule itself lives in `bhaskix-net`** (`state::reclaim_unclaimed`),
+    // where a host test can drive it — RFC 0061 step 3. It was inlined here,
+    // and that put the whole of this fix beyond anything but a boot gate,
+    // which the RFC admitted at the time was a weaker instrument than this
+    // project accepts. Three host tests cover it now, and the one that matters
+    // most is the negative: a connection an application *holds* is never
+    // reclaimed, in any state.
+    //
     // `Abort` rather than `Shutdown`, and the difference is the whole fix.
     // `Shutdown` is the polite answer and the wrong one: it parks in
     // `LAST-ACK` waiting for an acknowledgement from a peer that has already
     // gone, and `LAST-ACK` is no more `Closed` than `CLOSE-WAIT` was. It would
     // move the wedge one state along and leave it standing.
-    if index == ACCEPTED && !connection.claimed && connection.tcb.state == state::State::CloseWait {
+    if index == ACCEPTED && state::reclaim_unclaimed(connection.tcb.state, connection.claimed) {
         let (tcb, actions) = state::step(connection.tcb, Event::Abort, now);
         connection.tcb = tcb;
         perform(service, &mut connection, index, &actions);
