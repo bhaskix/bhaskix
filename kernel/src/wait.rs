@@ -128,7 +128,7 @@ impl Waiters {
         match self.entries.iter().position(Option::is_none) {
             Some(slot) => {
                 self.entries[slot] = Some(waiter);
-                sched::mark_blocked();
+                sched::mark_blocked(waiter.id);
                 true
             }
             None => {

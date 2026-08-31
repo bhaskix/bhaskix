@@ -23530,6 +23530,20 @@ fn wait_queue_self_test(hhdm_base: u64) -> bool {
     // the ring turns several times slower than it does under BIOS.
     wait_millis(watch_ms);
 
+    // **A thread put to sleep by somebody else's wait**, which is the one way
+    // this project has found for a station to be `Blocked` with no queue entry
+    // -- specimen nine's terminal state, and otherwise unreachable by reading.
+    // Printed whenever it is non-zero, and silent otherwise, because a number
+    // that is always there stops being read.
+    let mismarked = sched::mismarked_blocks();
+    if mismarked > 0 {
+        println!(
+            "\x1b[91m    wait queues    {mismarked} blocks were refused because the caller was not \
+             the thread about to be marked: a migration inside `mark_blocked` would have put an \
+             uninvolved thread to sleep with nothing to wake it\x1b[0m"
+        );
+    }
+
     let blocks = sched::blocks() - blocks_before;
     let wakeups = sched::wakeups() - wakeups_before;
     let races = sched::races() - races_before;

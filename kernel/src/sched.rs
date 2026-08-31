@@ -3583,18 +3583,67 @@ pub fn block_unless<T>(ready: impl FnOnce() -> Option<T>) -> Option<T> {
 /// which fuses them so they cannot drift apart. A waker only wakes threads
 /// that are already `Blocked`, so an enqueued thread that is still `Ready` is
 /// a lost wakeup waiting to happen.
-pub fn mark_blocked() {
+pub fn mark_blocked(id: u32) {
     let cpu = percpu::cpu_id() as usize;
     if cpu >= MAX_CPUS {
         return;
     }
     let mut queue = QUEUES[cpu].lock();
     let current = queue.current;
-    if let Some(thread) = queue.threads[current].as_mut()
-        && !thread.dying
-    {
+    let Some(thread) = queue.threads[current].as_mut() else {
+        return;
+    };
+    // **The caller says who it is, and this is checked rather than assumed.**
+    //
+    // The old signature took nobody's word for anything: it read
+    // `percpu::cpu_id()`, then acquired a lock, then marked whatever thread
+    // was `current` on that CPU. Those are three separate instants, and a
+    // spinlock in this kernel does **not** hold interrupts off for its
+    // duration -- `claim_uninterrupted` covers two bookkeeping stores and
+    // nothing else. So a tick can land between reading the CPU and taking its
+    // queue; `preempt` normally refuses to deschedule a lock holder, but §3
+    // carries an open defect in exactly that accounting, and `preempt`'s own
+    // comment names the state in which the veto "waves a genuine holder
+    // through".
+    //
+    // Waved through, migrated, and resumed elsewhere, this function would lock
+    // the *old* CPU's queue and mark **whatever thread is running there** as
+    // blocked -- a thread that never enqueued, and so one that is `Blocked`
+    // with no queue entry and nothing that will ever wake it.
+    //
+    // That is precisely specimen nine's terminal state, which reading the code
+    // says is otherwise unreachable: `Blocked` comes only from here, and here
+    // is only reached from `enqueue_and_block`, which always leaves an entry;
+    // while having no entry means a wake landed, which always leaves `Ready`.
+    // One of those "always" claims had to be false, and this is a way for the
+    // first one to be.
+    //
+    // Refusing is safe and self-correcting rather than merely cautious: the
+    // caller's entry is already queued, so `block_self` finds it not blocked
+    // and returns, `wait_until` loops, removes its own entry and re-evaluates.
+    // A missed sleep is a spin; a mis-marked sleep is a lost thread.
+    if thread.id != id {
+        MISMARKED_BLOCKS.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    if !thread.dying {
         thread.state = State::Blocked;
     }
+}
+
+/// Times `mark_blocked` was asked to mark a thread that was not its caller.
+///
+/// **Zero is the only correct value**, and a non-zero one is a thread put to
+/// sleep by somebody else's `wait_until` — `Blocked` with no queue entry, which
+/// nothing will wake. Counted rather than asserted because the condition is
+/// rare enough that a boot which never sees it must still say so.
+static MISMARKED_BLOCKS: AtomicU64 = AtomicU64::new(0);
+
+/// How many times a block was refused because the caller was not the thread
+/// about to be marked.
+#[must_use]
+pub fn mismarked_blocks() -> u64 {
+    MISMARKED_BLOCKS.load(Ordering::Relaxed)
 }
 
 /// Undoes a [`mark_blocked`] that turned out not to be needed.
