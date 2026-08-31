@@ -202,6 +202,25 @@ pub fn recorded_contains(needle: &[u8]) -> bool {
     kept.windows(needle.len()).any(|window| window == needle)
 }
 
+/// How many times `needle` appears contiguously in the record.
+///
+/// **Counting, not just finding, because the question is how many survived.**
+/// `tear_probe` hands the same payload to [`put_run`] many times and asks how
+/// many came back whole; a `bool` would answer "at least one", which is the
+/// wrong question. Overlaps cannot occur for the payload it uses, so a simple
+/// window scan is exact.
+#[must_use]
+pub fn recorded_occurrences(needle: &[u8]) -> usize {
+    let guard = CONSOLE.lock();
+    let kept = guard.recorder.kept();
+    if needle.is_empty() || kept.len() < needle.len() {
+        return 0;
+    }
+    kept.windows(needle.len())
+        .filter(|window| *window == needle)
+        .count()
+}
+
 /// Eight bytes of the record starting at `offset`, zero-padded past the end.
 ///
 /// Eight because that is what one reply word carries, and a caller asks

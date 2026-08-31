@@ -420,6 +420,13 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
             // turns a hunt into a hang, and a hang reports nothing at all.
             RING_SOAK_MS.store(ms.min(600_000), core::sync::atomic::Ordering::Relaxed);
         }
+        // `tearprobe=<runs>` — tries to reproduce the console tear on demand
+        // rather than waiting for it at one boot in twenty-five.
+        if let Some(value) = word.strip_prefix("tearprobe=")
+            && let Ok(runs) = value.parse::<u64>()
+        {
+            TEAR_PROBE_RUNS.store(runs.min(4_000), core::sync::atomic::Ordering::Relaxed);
+        }
         if let Some(value) = word.strip_prefix("ringload=")
             && let Ok(threads) = value.parse::<u64>()
         {
@@ -3798,6 +3805,17 @@ static CORPUS_PROGRAM: core::sync::atomic::AtomicU8 = core::sync::atomic::Atomic
 /// How long the ring test watches, in milliseconds — RFC-less hunt knob.
 ///
 /// **Default 2000, which is what every lane runs and what the gate asserts.**
+/// How many runs `tearprobe=<n>` hands to `put_run` while another CPU prints.
+///
+/// **The tear, made an experiment instead of a wait.** `TRACKER` §3 has a line
+/// torn at about one boot in twenty-five, and every specimen so far arrived by
+/// accident. The oracle is already here: `Write::write_str` fills the recorder
+/// **before** the UART, so a payload handed whole to `put_run` and found
+/// non-contiguous in the record was torn *inside this kernel*, above the serial
+/// port and the emulator and the capture. Zero, so a boot without the flag does
+/// nothing at all.
+static TEAR_PROBE_RUNS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 /// `ringsoak=<ms>` on the command line raises it, and nothing else changes: the
 /// stations, the protocol, the retire and the report are identical.
 ///
@@ -23059,6 +23077,67 @@ extern "C" fn ring_station(id: u64) -> ! {
 /// It retires on the ring's own phase, so it cannot outlive the window and
 /// disturb the tests that follow — which the tickless burner's comment records
 /// getting wrong once, by sharing a body across two generations.
+/// Prints continuously while [`tear_probe`] hands runs to `put_run`.
+///
+/// It exists to *contend*, not to say anything: the tear needs another writer
+/// on another CPU, and the boot report's own printing is too sparse and too
+/// unpredictable to be an experiment.
+extern "C" fn tear_noise(_id: u64) -> ! {
+    use core::sync::atomic::Ordering;
+    loop {
+        if TEAR_PROBE_RUNS.load(Ordering::Acquire) == 0 {
+            sched::exit();
+        }
+        println!("    tear noise     a line printed to contend with a run in flight");
+    }
+}
+
+/// Hands a known payload to `put_run` while another CPU prints, and asks the
+/// recorder whether it survived — RFC-less diagnostic, `tearprobe=<n>`.
+///
+/// **The whole point is the oracle.** `Write::write_str` records *before* it
+/// writes the UART, so a payload that went in as one `put_run` and is not in
+/// the record contiguously was torn **inside this kernel**. That decides the
+/// question three readings got wrong on 2026-08-31: whether the tear is above
+/// the serial port or below it.
+///
+/// The payload carries no spaces and a distinctive shape so a partial match
+/// cannot be mistaken for a whole one, and it is searched for exactly.
+fn tear_probe(runs: u64) {
+    use core::sync::atomic::Ordering;
+    const PAYLOAD: &[u8] = b"<<tearprobe-payload-0123456789-abcdefghij>>\n";
+
+    println!("    tear probe     {runs} run(s), with another CPU printing against them");
+    let before = console::recorded().0;
+    for _ in 0..runs {
+        console::put_run(PAYLOAD);
+    }
+    // Counted by walking the record once: how many of the payloads came out
+    // whole. A torn one leaves its bytes in the record but not adjacent, so
+    // the count falls short of `runs` and the difference *is* the defect.
+    let whole = console::recorded_occurrences(PAYLOAD);
+    let after = console::recorded().1;
+    if whole == runs as usize && after == 0 {
+        println!(
+            "    tear probe     {whole} of {runs} runs came out of `put_run` whole in this \
+             kernel's own record"
+        );
+    } else if after != 0 {
+        println!(
+            "\x1b[93m    tear probe     the record refused {after} bytes, so this says nothing: \
+             raise RECORDED_BYTES or lower the run count\x1b[0m"
+        );
+    } else {
+        println!(
+            "\x1b[91m    tear probe     FAILED: {whole} of {runs} runs survived -- {} were torn \
+             *inside this kernel*, above the serial port and the emulator (record grew {} bytes)\x1b[0m",
+            runs as usize - whole,
+            console::recorded().0 - before
+        );
+    }
+    TEAR_PROBE_RUNS.store(0, Ordering::Release);
+}
+
 extern "C" fn ring_loader(_id: u64) -> ! {
     use core::sync::atomic::Ordering;
     loop {
@@ -23684,6 +23763,25 @@ fn wait_queue_self_test(hhdm_base: u64) -> bool {
             Err(error) => {
                 println!("\x1b[91m    wait queues    FAILED to spawn {name}: {error:?}\x1b[0m");
                 return false;
+            }
+        }
+    }
+
+    // **The tear probe, if this boot asked for one — `tearprobe=<n>`.**
+    //
+    // Here because this is where a second CPU can be given something to print
+    // while a run is in flight, which is the whole experiment: the tear needs
+    // contention and the boot report's own printing is too sparse to be one.
+    // Nothing happens without the flag.
+    {
+        let runs = TEAR_PROBE_RUNS.load(Ordering::Acquire);
+        if runs > 0 {
+            match sched::spawn("tear-noise", tear_noise, 0, hhdm_base) {
+                Ok(_) => tear_probe(runs),
+                Err(error) => {
+                    println!("    tear probe     no noise thread ({error:?}), so no experiment");
+                    TEAR_PROBE_RUNS.store(0, Ordering::Release);
+                }
             }
         }
     }
