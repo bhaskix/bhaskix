@@ -699,6 +699,37 @@ else
 fi
 
 
+# **What the session *did* contain, said once, on the first miss.**
+#
+# A miss reported only what was absent, and absence has two causes that want
+# opposite work: a shell that never replied, and a shell whose reply arrived
+# **torn**. CI run 485 reported six markers "never appeared" -- including the
+# first one and `dmesg` -- and nothing in the annotation could say whether the
+# session was empty or full of split lines. One torn line fails one assertion;
+# an empty session fails all of them, and the two look identical from here.
+#
+# The tear is not hypothetical: `TRACKER` §3 has it at about one boot in 25,
+# splitting a line at an arbitrary offset -- after one byte, in the specimen
+# collected on 2026-08-31. A `grep` for a marker cannot see a defect that
+# splits the marker, which is the same trap the hosted-open gate fell into and
+# is recorded there in those words.
+#
+# So: the size, the line count, and the tail. Once, because thirty annotations
+# saying the same thing would bury the assertion that named the mode.
+session_context_reported=""
+report_session_context() {
+    [[ -n "$session_context_reported" ]] && return 0
+    session_context_reported="yes"
+    local bytes lines
+    bytes=$(wc -c <"$SESSION" 2>/dev/null || echo 0)
+    lines=$(wc -l <"$SESSION" 2>/dev/null || echo 0)
+    github_annotation "the session held $bytes bytes in $lines lines -- an empty one is a shell \
+that never replied, a full one with a marker missing is a reply that arrived torn (TRACKER 3)"
+    while IFS= read -r line; do
+        github_annotation "session tail: $line"
+    done < <(tail -6 "$SESSION" 2>/dev/null | tr -d '\r' | cut -c1-160)
+}
+
 for check in "${checks[@]}"; do
     name="${check%%:*}"
     marker="${check#*:}"
@@ -706,6 +737,7 @@ for check in "${checks[@]}"; do
         pass "$name"
     else
         fail "$name -- '$marker' never appeared"
+        report_session_context
         status=1
     fi
 done
