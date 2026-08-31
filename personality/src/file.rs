@@ -349,7 +349,8 @@ impl Table {
     }
 
     /// Closes every descriptor marked `FD_CLOEXEC`, handing each to
-    /// `released`, and answers how many went — [RFC 0033](../../docs/rfc/0033-what-a-hosted-process-is.md).
+    /// `released` with **whether it was the last row naming its handle**, and
+    /// answers how many went — [RFC 0033](../../docs/rfc/0033-what-a-hosted-process-is.md).
     ///
     /// **The callback is not a convenience; it is the point.** Each entry
     /// carried a handle the adapter holds a capability behind, and an exec
@@ -357,15 +358,45 @@ impl Table {
     /// closed descriptor for the life of the adapter. Handing them back makes
     /// the release the caller's obligation and makes forgetting it visible in
     /// the type rather than in a boot six weeks later.
-    pub fn close_on_exec(&mut self, mut released: impl FnMut(Entry)) -> usize {
+    ///
+    /// # Why the second argument exists, and why one line was never the fix
+    ///
+    /// `bin/linuxd` passed `|_| {}` here and leaked a slot per closed
+    /// descriptor. The obvious repair — release the capability in the closure
+    /// — is **wrong**, because `dup` lets two descriptors name one handle:
+    ///
+    /// * both marked `FD_CLOEXEC`: the capability must be given back **once**,
+    ///   not twice, and a double release hands a live program's slot away;
+    /// * only one marked: it must **not** be given back at all, because the
+    ///   surviving descriptor still needs it.
+    ///
+    /// The caller cannot work that out for itself — it is holding the answer's
+    /// only source through a `&mut` borrow — so this decides it, after taking
+    /// each row out and before handing it over. A row is the last when no
+    /// entry that *survives this call* names its handle, which is exactly the
+    /// question `close` asks with [`Descriptors::holders`].
+    pub fn close_on_exec(&mut self, mut released: impl FnMut(Entry, bool)) -> usize {
         let mut closed = 0;
-        for slot in &mut self.entries {
-            if slot.is_some_and(|entry| entry.close_on_exec)
-                && let Some(entry) = slot.take()
-            {
-                released(entry);
-                closed += 1;
+        // By index, not by iterator: taking the row out has to end the borrow
+        // so `holders` can be asked about what is left. A `for slot in &mut
+        // self.entries` loop holds `self` for its whole body and is why the
+        // caller was handed a question it could not answer.
+        for index in 0..self.entries.len() {
+            let Some(entry) = self.entries[index] else {
+                continue;
+            };
+            if !entry.close_on_exec {
+                continue;
             }
+            self.entries[index] = None;
+            // Asked *after* the row is gone, so a handle named only by this
+            // row now has no holders. Rows not yet visited still count, which
+            // is what makes the double-release case fall out correctly: the
+            // first of two `FD_CLOEXEC` duplicates sees its twin and reports
+            // false, the second sees nothing and reports true.
+            let last = self.holders(entry.handle) == 0;
+            released(entry, last);
+            closed += 1;
         }
         closed
     }
@@ -1175,6 +1206,110 @@ mod tests {
         );
         table.close(second).expect("open");
         assert_eq!(table.holders(99), 0, "now it may be");
+    }
+
+    /// The case that makes the obvious one-line fix wrong.
+    ///
+    /// `bin/linuxd` passed `|_| {}` to `close_on_exec` and leaked a slot per
+    /// closed descriptor. Releasing the capability inside that closure is the
+    /// repair everyone reaches for, and `dup` breaks it in both directions:
+    /// two `FD_CLOEXEC` rows naming one handle would give the capability back
+    /// **twice**, handing a live program's slot to somebody else.
+    #[test]
+    fn two_cloexec_duplicates_report_the_last_holder_once() {
+        let mut table = Table::new();
+        let entry = Entry {
+            handle: 42,
+            inode: 0,
+            kind: Kind::File,
+            close_on_exec: true,
+            offset: 0,
+            size: 10,
+            readable: true,
+            writable: false,
+        };
+        let first = table.insert(entry, 0).expect("room");
+        let (_second, displaced) = table.dup3(first, first + 5, true).expect("a free number");
+        assert!(displaced.is_none());
+        assert_eq!(table.holders(42), 2, "two rows, one open file");
+
+        let mut released = std::vec::Vec::new();
+        let closed = table.close_on_exec(|entry, last| released.push((entry.handle, last)));
+
+        assert_eq!(closed, 2, "both rows are marked, so both close");
+        assert_eq!(
+            released.iter().filter(|(_, last)| *last).count(),
+            1,
+            "the capability may be given back exactly once, not once per row"
+        );
+        assert_eq!(released[0], (42, false), "the first still has a twin");
+        assert_eq!(released[1], (42, true), "the second is the last");
+    }
+
+    /// And the other direction: one duplicate marked, one not.
+    ///
+    /// The surviving descriptor still needs the capability, so nothing may be
+    /// given back at all. A closure that released on sight would take an open
+    /// file away from the program that just `execve`d and still holds it.
+    #[test]
+    fn a_surviving_duplicate_keeps_the_capability() {
+        let mut table = Table::new();
+        let entry = Entry {
+            handle: 7,
+            inode: 0,
+            kind: Kind::File,
+            close_on_exec: true,
+            offset: 0,
+            size: 10,
+            readable: true,
+            writable: false,
+        };
+        let marked = table.insert(entry, 0).expect("room");
+        // The duplicate is **not** close-on-exec, which is what `dup` gives
+        // you: Linux clears the flag on the new descriptor unless `dup3` is
+        // asked for it.
+        let (survivor, _) = table
+            .dup3(marked, marked + 5, false)
+            .expect("a free number");
+
+        let mut released = std::vec::Vec::new();
+        let closed = table.close_on_exec(|entry, last| released.push((entry.handle, last)));
+
+        assert_eq!(closed, 1, "only the marked row closes");
+        assert_eq!(
+            released,
+            std::vec![(7, false)],
+            "a row still names it, so the capability stays"
+        );
+        assert_eq!(table.holders(7), 1);
+        assert!(table.get(survivor).is_some(), "the survivor is still open");
+    }
+
+    /// The ordinary case, which is what actually leaked.
+    #[test]
+    fn a_lone_cloexec_descriptor_is_reported_as_the_last_holder() {
+        let mut table = Table::new();
+        let entry = Entry {
+            handle: 5,
+            inode: 0,
+            kind: Kind::File,
+            close_on_exec: true,
+            offset: 0,
+            size: 10,
+            readable: true,
+            writable: false,
+        };
+        table.insert(entry, 0).expect("room");
+
+        let mut released = std::vec::Vec::new();
+        let closed = table.close_on_exec(|entry, last| released.push((entry.handle, last)));
+
+        assert_eq!(closed, 1);
+        assert_eq!(
+            released,
+            std::vec![(5, true)],
+            "nothing else names it, so the caller must give it back"
+        );
     }
 
     #[test]

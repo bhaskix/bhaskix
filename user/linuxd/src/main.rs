@@ -4448,6 +4448,72 @@ fn answer_recvfrom(request: &PersonalityCall) -> Answer {
 }
 
 /// Answers a hosted `close`, giving the capability back with the descriptor.
+/// Gives back whatever a closed descriptor named, if it was the last to name it.
+///
+/// **Extracted rather than copied**, because it now has two callers and the
+/// second one is what this exists for: `close` has always done this, and
+/// `execve` — which closes every `FD_CLOEXEC` row — did not, and leaked one of
+/// this program's thirty-two file slots per descriptor for the life of the
+/// boot. Two copies of these three arms would be two places for the next arm
+/// to be added to only one of them.
+///
+/// `last` is the caller's answer to "does any surviving row still name this
+/// handle", which `Descriptors::holders` decides. It is a parameter rather
+/// than a question asked here because the two callers learn it at different
+/// moments: `close` after removing one row, `close_on_exec` after removing one
+/// of possibly several.
+fn give_back_descriptor(entry: bhaskix_personality::file::Entry, last: bool) {
+    use bhaskix_personality::file::Kind;
+
+    // **Except the root**, which was never claimed from the pool and must
+    // never be given back to it: `release_file_slot` `DELETE`s the capability
+    // in the slot, and the capability in this one is the directory the kernel
+    // granted this program at boot. One hosted `close(dirfd)` would take every
+    // hosted process's filesystem away for the life of the machine.
+    if entry.handle != ROOT_DIR && last && matches!(entry.kind, Kind::File | Kind::Directory) {
+        release_file_slot(entry.handle);
+    }
+    // **And a socket's slot, which comes from a different pool.** A socket
+    // that was never bound holds nothing -- `u64::MAX` is the row's way of
+    // saying so -- and releasing that would compute an index far outside the
+    // six.
+    if entry.kind == Kind::Socket && entry.handle != u64::MAX && last {
+        release_socket_slot(entry.handle);
+    }
+    // **A pipe end closing is a count, not a teardown** — RFC 0033 step 7.
+    // Which end matters: with no reader left a writer is told `EPIPE`, and
+    // with no writer left a reader is told end of file. Getting the two the
+    // wrong way round would make a pipeline either hang for ever or stop at
+    // its first pause.
+    //
+    // **Not gated on `last`**, and that is deliberate: a pipe end is a *count*
+    // of readers and writers, so every row that closes decrements it. The two
+    // arms above hand back a capability, which may happen once; this one
+    // records that one holder of many has gone.
+    if entry.kind == Kind::Pipe {
+        // SAFETY: single-threaded by construction, as elsewhere here.
+        let pipes = pipes_held();
+        if let Some(slot) = pipes.get_mut(entry.handle as usize)
+            && let Some(pipe) = slot.as_mut()
+        {
+            if entry.readable {
+                pipe.close_read_end();
+            } else {
+                pipe.close_write_end();
+            }
+            // A reader waiting on a pipe whose last writer has just gone must
+            // be woken to be told so, or it waits for bytes nobody will ever
+            // write.
+            if pipe.at_end() {
+                wake_pipe_reader(entry.handle as usize);
+            }
+            if pipe.abandoned() {
+                *slot = None;
+            }
+        }
+    }
+}
+
 fn answer_close(request: &PersonalityCall) -> Answer {
     let Ok(descriptor) = i32::try_from(request.first()) else {
         return Answer::error(-9);
@@ -4468,49 +4534,8 @@ fn answer_close(request: &PersonalityCall) -> Answer {
             // this one is the directory the kernel granted this program at
             // boot. One hosted `close(dirfd)` would take every hosted
             // process's filesystem away for the life of the machine.
-            if entry.handle != ROOT_DIR
-                && process.descriptors.holders(entry.handle) == 0
-                && matches!(entry.kind, Kind::File | Kind::Directory)
-            {
-                release_file_slot(entry.handle);
-            }
-            // **And a socket's slot, which comes from a different pool.** A
-            // socket that was never bound holds nothing -- `u64::MAX` is the
-            // row's way of saying so -- and releasing that would compute an
-            // index far outside the six.
-            if entry.kind == Kind::Socket
-                && entry.handle != u64::MAX
-                && process.descriptors.holders(entry.handle) == 0
-            {
-                release_socket_slot(entry.handle);
-            }
-            // **A pipe end closing is a count, not a teardown** — RFC 0033
-            // step 7. Which end matters: with no reader left a writer is told
-            // `EPIPE`, and with no writer left a reader is told end of file.
-            // Getting the two the wrong way round would make a pipeline either
-            // hang for ever or stop at its first pause.
-            if entry.kind == Kind::Pipe {
-                // SAFETY: single-threaded by construction, as elsewhere here.
-                let pipes = pipes_held();
-                if let Some(slot) = pipes.get_mut(entry.handle as usize)
-                    && let Some(pipe) = slot.as_mut()
-                {
-                    if entry.readable {
-                        pipe.close_read_end();
-                    } else {
-                        pipe.close_write_end();
-                    }
-                    // A reader waiting on a pipe whose last writer has just
-                    // gone must be woken to be told so, or it waits for bytes
-                    // nobody will ever write.
-                    if pipe.at_end() {
-                        wake_pipe_reader(entry.handle as usize);
-                    }
-                    if pipe.abandoned() {
-                        *slot = None;
-                    }
-                }
-            }
+            let last = process.descriptors.holders(entry.handle) == 0;
+            give_back_descriptor(entry, last);
             Answer::ok(0)
         }
         Err(errno) => Answer::error(errno),
@@ -5117,7 +5142,14 @@ fn answer_execve(request: &PersonalityCall) -> (u64, Answer) {
         if let Some(process) = process_for(request.domain) {
             let pid = process.pid;
             let from = process.domain;
-            process.exec_into(child, generation, drawn_base(), |_| {});
+            // **The capabilities go with the rows** — the defect filed on
+            // 2026-08-30 and fixed here. This was `|_| {}`, so every
+            // `FD_CLOEXEC` descriptor carried across an `execve` leaked one of
+            // this program's thirty-two file slots for the rest of the boot.
+            // `last` is `close_on_exec`'s own answer to whether a surviving
+            // row still names the handle, which is the part `dup` makes
+            // impossible for a caller to work out for itself.
+            process.exec_into(child, generation, drawn_base(), give_back_descriptor);
             trace_exec(pid, from, child);
         }
     }

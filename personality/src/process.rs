@@ -362,7 +362,7 @@ impl Process {
         domain: u32,
         generation: u32,
         base: u64,
-        released: impl FnMut(crate::file::Entry),
+        released: impl FnMut(crate::file::Entry, bool),
     ) -> usize {
         // **A new image gets a new layout**, which is where Linux randomises
         // too: `fork` copies and must not move anything, `execve` replaces and
@@ -764,7 +764,7 @@ mod tests {
         process.descriptors = table_with(true);
         assert_eq!(process.descriptors.open_count(), 4);
 
-        let closed = process.exec_into(11, 2, layout::base_from(99), |_| {});
+        let closed = process.exec_into(11, 2, layout::base_from(99), |_, _| {});
         assert_eq!(closed, 1, "the exec must say what it closed");
 
         assert_eq!(
@@ -790,7 +790,7 @@ mod tests {
         let mut process = Process::new(9, 2, 3, 1);
         process.descriptors = table_with(false);
         let mut released = 0;
-        process.exec_into(11, 2, layout::base_from(7), |_| released += 1);
+        process.exec_into(11, 2, layout::base_from(7), |_, _| released += 1);
         assert_eq!(released, 0);
         assert_eq!(process.descriptors.open_count(), 4);
         assert_eq!(process.descriptors.get(3).map(|e| e.handle), Some(42));
@@ -830,7 +830,7 @@ mod tests {
                 protection: 2,
             })
             .expect("room");
-        process.exec_into(11, 2, layout::base_from(1), |_| {});
+        process.exec_into(11, 2, layout::base_from(1), |_, _| {});
         assert_eq!(
             process.mapped_pages(),
             0,
@@ -1155,7 +1155,7 @@ mod aslr_tests {
         // new one, which is the whole thing this defends against.
         let mut after = child;
         let fresh = layout::base_from(0x2222);
-        after.exec_into(7, 2, fresh, |_| {});
+        after.exec_into(7, 2, fresh, |_, _| {});
         assert_eq!(after.mmap_next, fresh, "exec kept the old layout");
         assert_ne!(after.mmap_next, parent.mmap_next, "exec did not move it");
     }
