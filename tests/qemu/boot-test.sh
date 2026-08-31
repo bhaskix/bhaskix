@@ -247,7 +247,12 @@ DISK="$REPO_ROOT/build/initrd.tar"
 # domain driver gets a device rather than a share of the kernel's.
 # The lane's name, used to keep every writable image this boot touches
 # separate from another lane's -- see the copy in `devices.sh`.
-BHASKIX_LANE="${MODE}-${QEMU_CPU:-max}"
+# **The caller may name it**, and that is what lets two boots of the *same*
+# mode run at once. The derived name distinguishes lanes from each other, which
+# is what CI needs; a soak hunting an intermittent needs several machines on the
+# same lane, and those would share these files and collide exactly as the fixed
+# ports used to. So an explicit `BHASKIX_LANE` wins.
+BHASKIX_LANE="${BHASKIX_LANE:-${MODE}-${QEMU_CPU:-max}}"
 export BHASKIX_LANE
 DOMAIN_DISK="$REPO_ROOT/build/domain-disk-${BHASKIX_LANE}.img"
 
@@ -3070,6 +3075,15 @@ elif grep -qF "hosted open " "$LOG"; then
     # whole, which is the difference between a tear below this kernel and one
     # above it.
     fail "the hosted writable open was TORN, not refused: $(grep -aoE 'hosted open .{0,40}' "$LOG" | head -1)"
+    # **An annotation, not an `echo`, and run 484 is why.** CI produced a torn
+    # specimen that afternoon, correctly named TORN by the arm above -- and
+    # arrived without this line, because a plain `echo` to stderr reaches the
+    # job log, which needs a token to read, while `::error::` needs none. This
+    # is the one value that says whether the tear is *inside* this kernel: the
+    # recorder is filled by `write_str` before the UART, so WHOLE here with a
+    # torn log puts the tear below the kernel, and TORN here puts it above.
+    # Losing it is losing the specimen.
+    github_annotation "the kernel's own record says: $(grep -aoE 'console record .*' "$LOG" | head -1 | cut -c1-120)"
     echo "        the kernel's own record says: $(grep -aoE 'console record .*' "$LOG" | head -1 | cut -c1-90)" >&2
     status=1
 else
@@ -3078,6 +3092,7 @@ else
     # torn line: the probe printed nothing. Both arms said "did not conclude"
     # until 2026-08-31, and an afternoon was spent treating one as the other.
     fail "the hosted writable open printed NOTHING: no fragment of the line reached the log"
+    github_annotation "the kernel's own record says: $(grep -aoE 'console record .*' "$LOG" | head -1 | cut -c1-120)"
     echo "        the kernel's own record says: $(grep -aoE 'console record .*' "$LOG" | head -1 | cut -c1-90)" >&2
     status=1
 fi

@@ -19061,7 +19061,17 @@ fn user_shell(handoff: &Handoff) -> Result<(), &'static str> {
         // read as evidence. This verdict was three-valued for one afternoon
         // and the third value was doing exactly that.
         let whole = crate::console::recorded_contains(b"hosted open refused errno 2\n");
-        let started = crate::console::recorded_contains(b"hosted open ");
+        // **A short needle, because a long one has the defect it is looking
+        // for.** This asked for `b"hosted open "` -- twelve bytes -- and the
+        // tear it exists to detect splits the line at an arbitrary offset,
+        // including inside that word: boot `u10` came out as `ho` … `sted open
+        // r`, so the search missed and the verdict read ABSENT for a line that
+        // had plainly been printed. That is the same mistake the *gate* made
+        // with `grep`, made again one layer down, in the instrument written to
+        // correct it. Seven bytes can still be split; they are split far less
+        // often, and the verdict says TORN rather than ABSENT when they
+        // survive.
+        let started = crate::console::recorded_contains(b"errno 2");
         let (kept, refused) = crate::console::recorded();
         println!(
             "    console record  the hosted line is {} in this kernel's own record ({kept} bytes \
