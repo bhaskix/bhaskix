@@ -576,7 +576,6 @@ fn is_one_component(name: &[u8]) -> bool {
     clippy::too_many_arguments,
     reason = "one parameter per counter reported"
 )]
-#[allow(clippy::too_many_arguments)]
 fn report(
     blocks: u64,
     entries: u64,
@@ -750,9 +749,8 @@ extern "C" fn fsd_main() -> ! {
             exit()
         };
         let root_index = volume.superblock().root;
-        let made = volume
-            .lookup(root_index, b"sub")
-            .and_then(|(sub, _)| match volume.lookup(sub, b"tmp") {
+        let made = volume.lookup(root_index, b"sub").and_then(|(sub, _)| {
+            match volume.lookup(sub, b"tmp") {
                 Ok((index, inode)) if inode.kind == Kind::Directory => {
                     Ok((index, inode.generation))
                 }
@@ -765,7 +763,8 @@ extern "C" fn fsd_main() -> ! {
                 Err(_) => volume
                     .create(sub, b"tmp", Kind::Directory)
                     .and_then(|index| volume.inode(index).map(|i| (index, i.generation))),
-            });
+            }
+        });
         cache = volume.into_cache();
         match made {
             Ok((index, generation)) => dir::handle_writable(index, generation),
