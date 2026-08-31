@@ -44,3 +44,4 @@ qemu.pid
 /fuzz/corpus/
 /fuzz/artifacts/
 /fuzz/coverage/
+.aptcache
