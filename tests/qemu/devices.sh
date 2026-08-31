@@ -34,14 +34,99 @@
 # `iommu_platform` bypasses the unit entirely on QEMU, so every assertion about
 # isolation would pass on a machine where the IOMMU protects nothing — which is
 # exactly what the first version of the boot test did.
+# **The forwarded ports are chosen, not fixed** -- and this is what lets two
+# machines boot at once.
+#
+# They were hard-coded at 45557 and 45558, so a second QEMU with this device
+# profile could not start: `hostfwd` binds them on the host and two machines
+# cannot share one port. That serialised every lane on a machine, and it cost an
+# investigation on 2026-08-26 when a boot sweep in another working tree held
+# 45557 and the failure presented as a missing `initrd.tar`.
+#
+# It lives **here** rather than in `boot-test.sh` for the reason this file
+# exists at all: seven harnesses source it, and picking the ports in one of them
+# would leave the other six colliding with each other -- which is precisely the
+# drift the header above was written about.
+#
+# `BHASKIX_INBOUND_PORT` and `BHASKIX_CLOSED_PORT` override the choice, so a
+# caller that wants the old fixed pair can have it.
+#
+# **The check is advisory and the bind is authoritative.** There is a window
+# between asking whether a port is free and QEMU taking it, so this narrows the
+# odds rather than closing them, and QEMU still fails loudly if it loses that
+# race -- which is what `boot-test.sh`'s diagnostic already describes. Reserving
+# a port by binding it here is not open to us: it would have to be handed to
+# QEMU still bound.
+bhaskix_pick_free_port() {
+    local port
+    for _ in $(seq 1 64); do
+        port=$(( 20000 + RANDOM % 40000 ))
+        if ! ss -ltn "sport = :$port" 2>/dev/null | grep -q LISTEN; then
+            printf '%s' "$port"
+            return 0
+        fi
+    done
+    return 1
+}
+if [[ -z "${BHASKIX_INBOUND_PORT:-}" ]]; then
+    BHASKIX_INBOUND_PORT="$(bhaskix_pick_free_port)" || BHASKIX_INBOUND_PORT=45557
+fi
+if [[ -z "${BHASKIX_CLOSED_PORT:-}" ]]; then
+    BHASKIX_CLOSED_PORT="$(bhaskix_pick_free_port)" || BHASKIX_CLOSED_PORT=45558
+fi
+while [[ "$BHASKIX_CLOSED_PORT" == "$BHASKIX_INBOUND_PORT" ]]; do
+    BHASKIX_CLOSED_PORT="$(bhaskix_pick_free_port)" || BHASKIX_CLOSED_PORT=45558
+done
+export BHASKIX_INBOUND_PORT BHASKIX_CLOSED_PORT
+
 qemu_device_list() {
     local profile="$1"
     local translated="${2:-no}"
     local suffix=""
     # Derived from this file's own location rather than taken from the harness,
     # so a drive declared here needs nothing of whoever sources it.
-    local sata_disk
-    sata_disk="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/build/sata-disk.img"
+    # **A copy per machine, because QEMU takes a write lock on it.** Two
+    # harnesses booting at once both open this file, the second is refused, and
+    # the failure arrives as "the machine did not finish booting" 0.25 s in --
+    # which reads as a hung kernel and is a held file. Measured on 2026-08-31
+    # while making the forwarded ports concurrent: freeing the ports exposed
+    # this immediately, because it was the *second* reason two lanes could not
+    # share a machine and the first one had been hiding it.
+    #
+    # Named for the caller's mode, matching `OVMF_VARS_${MODE}.fd` above it in
+    # `boot-test.sh`, so the lanes -- which are modes -- are isolated from each
+    # other. Two runs of the *same* mode still collide, and that is the same
+    # bound the OVMF copy has had all along.
+    # **Named here, copied by the caller, and the order is the point.** This
+    # function runs while the QEMU arguments are assembled, which is *before*
+    # `boot-test.sh` rebuilds `build/sata-disk.img`. A copy taken here would
+    # therefore be of the previous run's master, and the lane would boot a
+    # stale disk and report on it -- passing or failing for reasons unrelated
+    # to the change under test, which is worse than the serialisation this was
+    # meant to remove. So this only decides the *name*; the caller copies the
+    # master onto it after building, under the lock that keeps two lanes from
+    # racing on the master itself.
+    # **A caller that has not opted in gets exactly what it got before.**
+    # `BHASKIX_LANE` is set only by a harness that also *copies* the master onto
+    # the per-lane name after building it. Six of the seven harnesses that
+    # source this file do neither, and the first version of this named a
+    # per-lane file for all of them -- so `shell-test.sh` asked QEMU for
+    # `sata-disk-shared.img`, which nothing creates, and the suite stopped with
+    # "Could not open". Opt-in by the presence of the variable, so the default
+    # path is the one that has always worked.
+    local sata_disk sata_dir
+    sata_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/build"
+    # Keyed on the variable and **not** on the file existing: this function runs
+    # while the arguments are assembled, before the caller has copied the master
+    # onto the per-lane name, so an existence test here would always miss and
+    # silently hand the shared master back to the very harness that asked to be
+    # isolated. The contract is the other way round -- set the variable and the
+    # file exists by the time QEMU opens it.
+    if [[ -n "${BHASKIX_LANE:-}" ]]; then
+        sata_disk="$sata_dir/sata-disk-${BHASKIX_LANE}.img"
+    else
+        sata_disk="$sata_dir/sata-disk.img"
+    fi
 
     MACHINE="q35"
     IOMMU_ARGS=()
@@ -68,7 +153,8 @@ qemu_device_list() {
                 # `guestfwd` hands a guest connection to 10.0.2.100:9 to a
                 # host-side `cat`, which echoes the stream until EOF.
                 # Inbound: `hostfwd` forwards host connections to
-                # 127.0.0.1:45557 into the guest's port 7, which is what
+                # `$BHASKIX_INBOUND_PORT` (45557 unless the caller picked
+                # one) into the guest's port 7, which is what
                 # lets the boot test's driver *initiate* a connection the
                 # guest must accept -- RFC 0020 step 5's other direction.
                 # The port is fixed because the driver must know it; a
@@ -86,14 +172,15 @@ qemu_device_list() {
                 # it). Do not "tidy" this line by making the default
                 # explicit; the default and the flag are different worlds.
                 # A third forward, and the only one whose guest end nothing
-                # ever holds: RFC 0047's gate connects to 45558 and requires
+                # ever holds: RFC 0047's gate connects to
+                # `$BHASKIX_CLOSED_PORT` and requires
                 # to be *refused*. Port 1234 is chosen because no program in
                 # this image listens on it and none is meant to -- if one ever
                 # does, that gate starts passing for the wrong reason, which
                 # is why the number is stated here rather than picked in the
                 # test. `bin/ipd` forwards TCP by address and not by port, so
                 # the SYN reaches `bin/tcpd` and is answered by it.
-                -netdev "user,id=net0,restrict=on,guestfwd=tcp:10.0.2.100:9-cmd:cat,hostfwd=tcp:127.0.0.1:45557-:7,hostfwd=tcp:127.0.0.1:45558-:1234"
+                -netdev "user,id=net0,restrict=on,guestfwd=tcp:10.0.2.100:9-cmd:cat,hostfwd=tcp:127.0.0.1:${BHASKIX_INBOUND_PORT:-45557}-:7,hostfwd=tcp:127.0.0.1:${BHASKIX_CLOSED_PORT:-45558}-:1234"
                 -device "virtio-net-pci,netdev=net0$suffix"
                 # Two xHCI controllers, and the pair is the point.
                 #

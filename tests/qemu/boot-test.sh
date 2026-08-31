@@ -245,7 +245,11 @@ DISK="$REPO_ROOT/build/initrd.tar"
 # A second disk, for the block driver that runs in a domain. Its own device:
 # two drivers on one device would race resets and interleave rings, so the
 # domain driver gets a device rather than a share of the kernel's.
-DOMAIN_DISK="$REPO_ROOT/build/domain-disk.img"
+# The lane's name, used to keep every writable image this boot touches
+# separate from another lane's -- see the copy in `devices.sh`.
+BHASKIX_LANE="${MODE}-${QEMU_CPU:-max}"
+export BHASKIX_LANE
+DOMAIN_DISK="$REPO_ROOT/build/domain-disk-${BHASKIX_LANE}.img"
 
 # RFC 0012's escape hatch, and it is tested on a machine that **has** an IOMMU
 # -- turning off a unit that is not there proves nothing. The image is built
@@ -404,7 +408,23 @@ fi
 # A fixture a test mutates is a fixture whose next run starts somewhere nobody
 # chose, and this one carries the marker other checks look for in sector zero.
 rm -f "$REPO_ROOT/build/domain-disk.img"
+# **Building the masters is serialised; booting them is not.**
+#
+# Each lane rebuilds `build/domain-disk.img` and `build/sata-disk.img` and then
+# takes its own copy. Concurrently that races on the masters -- one lane's
+# `rm -f` and `make` land while another is copying -- and the result is not a
+# timeout but a *deterministic* failure of the block-driver gates, the same two
+# every time. Measured on 2026-08-31: two concurrent lanes failed identically
+# twice, which is what ruled out the contention this was first blamed on.
+#
+# So the lock covers the build and the copy, which take a moment, and is
+# released before the boot, which takes half a minute. That is the part worth
+# running in parallel.
+exec 9>"$REPO_ROOT/build/.disk-master.lock"
+flock 9 2>/dev/null || true
 make -C "$REPO_ROOT" build/domain-disk.img >/dev/null 2>&1 || true
+# The lane's own copy: QEMU write-locks it, so a shared one serialises lanes.
+cp -f "$REPO_ROOT/build/domain-disk.img" "$DOMAIN_DISK" 2>/dev/null || true
 
 # And the SATA disk, for the same reason and since RFC 0046 step 6: the AHCI
 # driver now *writes* to it -- a pattern into its last sector, read back to
@@ -413,6 +433,11 @@ make -C "$REPO_ROOT" build/domain-disk.img >/dev/null 2>&1 || true
 # the last one left it.
 rm -f "$REPO_ROOT/build/sata-disk.img"
 make -C "$REPO_ROOT" build/sata-disk.img >/dev/null 2>&1 || true
+# Now the masters exist, take this lane's copies -- `devices.sh` named them and
+# deliberately did not copy, because it runs before this point.
+cp -f "$REPO_ROOT/build/sata-disk.img" \
+      "$REPO_ROOT/build/sata-disk-${BHASKIX_LANE}.img" 2>/dev/null || true
+flock -u 9 2>/dev/null || true
 
 # RFC 0020 step 5's inbound driver: a host-side client that connects *into*
 # the guest through hostfwd, sends sixteen bytes, and demands them back.
@@ -467,7 +492,7 @@ rm -f "$INBOUND_VERDICT"
 (
     payload='bhaskix-tcp-in-1'
     for _ in $(seq 1 "$TIMEOUT"); do
-        if { exec 3<>/dev/tcp/127.0.0.1/45557; } 2>/dev/null; then
+        if { exec 3<>/dev/tcp/127.0.0.1/$BHASKIX_INBOUND_PORT; } 2>/dev/null; then
             printf '%s' "$payload" >&3
             reply=$(timeout 3 dd bs=1 count=16 <&3 2>/dev/null || true)
             exec 3>&- 3<&- || true
@@ -519,7 +544,7 @@ echo 0 > "$WEDGE_ATTEMPTS"
         sleep 0.25
     done
     for _ in $(seq 1 14); do
-        if { exec 5<>/dev/tcp/127.0.0.1/45557; } 2>/dev/null; then
+        if { exec 5<>/dev/tcp/127.0.0.1/$BHASKIX_INBOUND_PORT; } 2>/dev/null; then
             exec 5>&- 5<&- || true
             made=$((made + 1))
             echo "$made" > "$WEDGE_ATTEMPTS"
@@ -557,7 +582,7 @@ rm -f "$CLOSED_VERDICT"
         sleep 0.25
     done
     for _ in $(seq 1 "$TIMEOUT"); do
-        if { exec 4<>/dev/tcp/127.0.0.1/45558; } 2>/dev/null; then
+        if { exec 4<>/dev/tcp/127.0.0.1/$BHASKIX_CLOSED_PORT; } 2>/dev/null; then
             if stray=$(timeout 3 dd bs=1 count=16 <&4 2>/dev/null); then
                 exec 4>&- 4<&- || true
                 if [[ -z "$stray" ]]; then
@@ -601,10 +626,10 @@ if ! grep -qF "Nothing left to do at this milestone" "$LOG"; then
         # loud. The message here blamed a held `initrd.tar` instead, and on
         # 2026-08-26 that sent an investigation looking at disk images for
         # several minutes when the actual cause was a boot sweep in another
-        # working tree holding 45557. So ask the port.
-        if { exec 3<>/dev/tcp/127.0.0.1/45557; } 2>/dev/null; then
+        # working tree holding the port. So ask it.
+        if { exec 3<>/dev/tcp/127.0.0.1/$BHASKIX_INBOUND_PORT; } 2>/dev/null; then
             exec 3<&- 3>&-
-            echo "        127.0.0.1:45557 is already bound: another QEMU with this device" >&2
+            echo "        127.0.0.1:$BHASKIX_INBOUND_PORT is already bound: another QEMU took" >&2
             echo "        profile is running, and two cannot share the forwarded ports." >&2
             echo "        Wait for it, or run this lane on its own." >&2
         else
