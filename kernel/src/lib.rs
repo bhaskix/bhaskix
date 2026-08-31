@@ -19045,6 +19045,23 @@ fn user_shell(handoff: &Handoff) -> Result<(), &'static str> {
     // reaches here as one run and still appears split in the log was split
     // below `put_run`; one that arrives as two was split above it.
     {
+        // **The transport test.** The recorder holds what this kernel printed,
+        // in order, taken before the UART. If the line is whole here and torn
+        // in the serial log, the tear is below this kernel entirely.
+        // Three-valued, because the first version was two and conflated the
+        // cases: a boot where the probe printed nothing at all reported the
+        // same word as a boot where the line was cut in half, and only one of
+        // those says anything about the transport.
+        let whole = crate::console::recorded_contains(b"hosted open refused errno 2\n");
+        let started = crate::console::recorded_contains(b"hosted open ");
+        println!(
+            "    console record  the hosted line is {} in this kernel's own record",
+            match (whole, started) {
+                (true, _) => "WHOLE",
+                (false, true) => "TORN (its opening is here, the rest is not)",
+                (false, false) => "ABSENT (the probe printed nothing)",
+            }
+        );
         let (lens, tags, heads, at) = crate::console::run_lengths();
         let count = lens.len().min(at);
         print!(

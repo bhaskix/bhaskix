@@ -183,6 +183,25 @@ pub fn recorded() -> (usize, usize) {
     (guard.recorder.kept().len(), guard.recorder.refused())
 }
 
+/// Whether the record holds `needle` contiguously — the transport test.
+///
+/// **Temporary (2026-08-31), with the run rings above.** [`Write::write_str`]
+/// records *before* it writes to the UART, so this is the guest's own byte
+/// order, taken upstream of the serial port, QEMU's chardev and the capture. A
+/// line that is whole here and torn in the serial log was torn **below this
+/// kernel**, which is the question three wrong answers were spent on today.
+///
+/// Takes the console lock, so it must not be called from inside a print.
+#[must_use]
+pub fn recorded_contains(needle: &[u8]) -> bool {
+    let guard = CONSOLE.lock();
+    let kept = guard.recorder.kept();
+    if needle.is_empty() || kept.len() < needle.len() {
+        return false;
+    }
+    kept.windows(needle.len()).any(|window| window == needle)
+}
+
 /// Eight bytes of the record starting at `offset`, zero-padded past the end.
 ///
 /// Eight because that is what one reply word carries, and a caller asks

@@ -3028,8 +3028,22 @@ elif grep -qF "hosted open refused errno 30" "$LOG"; then
 elif grep -qF "hosted exec    skipped" "$LOG" \
     || grep -qF "fs domain      no block service on this machine" "$LOG"; then
     pass "no filesystem service on this machine, so no hosted program opened anything"
+elif grep -qF "hosted open " "$LOG"; then
+    # **Torn, and named as such.** The line started and did not finish, so the
+    # bytes exist and something got between them. Measured at about 1 boot in
+    # 33; the kernel's own record line says whether *this kernel* printed it
+    # whole, which is the difference between a tear below this kernel and one
+    # above it.
+    fail "the hosted writable open was TORN, not refused: $(grep -aoE 'hosted open .{0,40}' "$LOG" | head -1)"
+    echo "        the kernel's own record says: $(grep -aoE 'console record .*' "$LOG" | head -1 | cut -c1-90)" >&2
+    status=1
 else
-    fail "the hosted writable open did not conclude: $(grep -aoE 'hosted open .*' "$LOG" | head -1)"
+    # **Absent, which is a different defect and used to report as the same
+    # one.** No fragment of the line reached the log at all, so this is not a
+    # torn line: the probe printed nothing. Both arms said "did not conclude"
+    # until 2026-08-31, and an afternoon was spent treating one as the other.
+    fail "the hosted writable open printed NOTHING: no fragment of the line reached the log"
+    echo "        the kernel's own record says: $(grep -aoE 'console record .*' "$LOG" | head -1 | cut -c1-90)" >&2
     status=1
 fi
 
