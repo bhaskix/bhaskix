@@ -19045,12 +19045,25 @@ fn user_shell(handoff: &Handoff) -> Result<(), &'static str> {
     // reaches here as one run and still appears split in the log was split
     // below `put_run`; one that arrives as two was split above it.
     {
-        let (lens, tags, at) = crate::console::run_lengths();
+        let (lens, tags, heads, at) = crate::console::run_lengths();
         let count = lens.len().min(at);
+        print!(
+            "    put_run torn   {} run(s) had a println! land inside them while the console \
+             was held; {} prints total\n",
+            crate::console::TORN.load(core::sync::atomic::Ordering::Relaxed),
+            crate::console::PRINTS.load(core::sync::atomic::Ordering::Relaxed)
+        );
         print!("    put_run runs   {at} total, last {count} as domain:bytes:");
         for index in 0..count {
             let slot = (at + lens.len() - count + index) % lens.len();
-            print!(" {}:{}", tags[slot], lens[slot]);
+            print!(
+                " {}:{}{}",
+                tags[slot],
+                lens[slot],
+                char::from_u32(heads[slot])
+                    .filter(char::is_ascii_graphic)
+                    .unwrap_or('.')
+            );
         }
         println!();
     }

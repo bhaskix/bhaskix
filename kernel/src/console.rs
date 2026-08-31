@@ -329,6 +329,18 @@ pub fn with_output_held<T>(f: impl FnOnce() -> T) -> T {
 /// happened on.
 pub static RUN_LENS: [core::sync::atomic::AtomicU32; 48] =
     [const { core::sync::atomic::AtomicU32::new(0) }; 48];
+/// Every completed [`_print`], counted. Temporary, with the ring below.
+///
+/// **The mutual-exclusion test.** `put_run` samples this before and after
+/// writing a run, *inside* the same `CONSOLE` guard. `_print` takes that guard
+/// too, so the two values must be equal on every run. If they are not, a
+/// `println!` ran while `put_run` held the console -- which is the tear, and
+/// proves the lock is not excluding them rather than leaving it inferred.
+pub static PRINTS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Runs during which [`PRINTS`] moved: exclusion failures. Must read zero.
+pub static TORN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 /// Who handed each run over, paired with [`RUN_LENS`]. Temporary, with it.
 ///
 /// `0` is a kernel-side caller (the in-kernel console service); anything else
@@ -338,13 +350,26 @@ pub static RUN_LENS: [core::sync::atomic::AtomicU32; 48] =
 pub static RUN_TAGS: [core::sync::atomic::AtomicU32; 48] =
     [const { core::sync::atomic::AtomicU32::new(0) }; 48];
 
+/// The first byte of each run, paired with [`RUN_LENS`]. Temporary, with it.
+///
+/// Identifying a run by its length alone is inference: a 28 could be any
+/// caller. The first byte says which line it is, so `12h` followed by `16r`
+/// proves a split above `put_run`, and a single `28h` proves the line left
+/// here whole.
+pub static RUN_HEADS: [core::sync::atomic::AtomicU32; 48] =
+    [const { core::sync::atomic::AtomicU32::new(0) }; 48];
+
 /// The ring cursor for [`RUN_LENS`]. Temporary, with it.
 pub static RUN_AT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
 /// The run lengths recorded so far, oldest-first from the ring's cursor.
-pub fn run_lengths() -> ([u32; 48], [u32; 48], usize) {
+pub fn run_lengths() -> ([u32; 48], [u32; 48], [u32; 48], usize) {
     let mut lens = [0u32; 48];
     let mut tags = [0u32; 48];
+    let mut heads = [0u32; 48];
+    for (index, slot) in RUN_HEADS.iter().enumerate() {
+        heads[index] = slot.load(core::sync::atomic::Ordering::Relaxed);
+    }
     for (index, slot) in RUN_LENS.iter().enumerate() {
         lens[index] = slot.load(core::sync::atomic::Ordering::Relaxed);
     }
@@ -354,6 +379,7 @@ pub fn run_lengths() -> ([u32; 48], [u32; 48], usize) {
     (
         lens,
         tags,
+        heads,
         RUN_AT.load(core::sync::atomic::Ordering::Relaxed),
     )
 }
@@ -372,6 +398,10 @@ pub fn put_run_tagged(bytes: &[u8], tag: u32) {
         RUN_LENS[at % RUN_LENS.len()]
             .store(bytes.len() as u32, core::sync::atomic::Ordering::Relaxed);
         RUN_TAGS[at % RUN_TAGS.len()].store(tag, core::sync::atomic::Ordering::Relaxed);
+        RUN_HEADS[at % RUN_HEADS.len()].store(
+            u32::from(bytes.first().copied().unwrap_or(0)),
+            core::sync::atomic::Ordering::Relaxed,
+        );
     }
     if FATAL.load(core::sync::atomic::Ordering::Acquire) {
         // The fatal path cannot block on this lock and must not start now. One
@@ -383,12 +413,16 @@ pub fn put_run_tagged(bytes: &[u8], tag: u32) {
         return;
     }
     let mut console = CONSOLE.lock();
+    let before = PRINTS.load(core::sync::atomic::Ordering::Relaxed);
     for byte in bytes {
         // The same rendering `PUT` performs, and deliberately not `str`
         // conversion: this path has never promised UTF-8 and a run that
         // refused to print because one byte was not a scalar would lose the
         // line it exists to keep whole.
         let _ = console.write_fmt(format_args!("{}", char::from(*byte)));
+    }
+    if PRINTS.load(core::sync::atomic::Ordering::Relaxed) != before {
+        TORN.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -406,6 +440,7 @@ pub fn _print(args: fmt::Arguments<'_>) {
         return;
     }
     let _ = CONSOLE.lock().write_fmt(args);
+    PRINTS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
 }
 
 /// Set once a fatal report begins: every print after it goes through
