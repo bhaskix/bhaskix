@@ -500,15 +500,25 @@ WEDGE_ATTEMPTS=$(mktemp)
 echo 0 > "$WEDGE_ATTEMPTS"
 (
     made=0
+    # **Waits for the echo before it starts, and that ordering is a bug fix.**
+    #
+    # This loop used to run *alongside* the echo driver, on the reasoning that
+    # a wedge created before a real caller is the stronger demonstration. It is
+    # -- and it also races that caller for the one accepted slot and sometimes
+    # wins. `bin/tcpc` accepts exactly **once**: when a probe connection takes
+    # that accept, the guest reports it served an inbound echo, the driver
+    # never gets its bytes, and two gates go red for a defect that is not
+    # there. Measured on 2026-08-31, locally, after this prober was added.
+    #
+    # Waiting costs the "while wedged" half of the property and keeps the half
+    # that matters: `bin/tcpc` has finished and gone, so every connection below
+    # completes a handshake that **no application will ever accept** and then
+    # closes -- which is exactly the state RFC 0061 reclaims, and the boot
+    # report's reclaim counter is what proves it happened.
+    until [[ -f "$INBOUND_VERDICT" ]]; do
+        sleep 0.25
+    done
     for _ in $(seq 1 14); do
-        # **Stops as soon as the echo is served, and that bound is not
-        # cosmetic.** The wedge only has to be created *before* a real caller
-        # is served for the property to be demonstrated; carrying on after
-        # that is pure contention for the one accepted slot, and it starved
-        # the hosted `linux socket` gate three lanes down when this loop first
-        # ran unbounded. A prober that breaks a neighbouring gate is measuring
-        # the harness, not the machine.
-        [[ -f "$INBOUND_VERDICT" ]] && break
         if { exec 5<>/dev/tcp/127.0.0.1/45557; } 2>/dev/null; then
             exec 5>&- 5<&- || true
             made=$((made + 1))

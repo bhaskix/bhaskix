@@ -23701,14 +23701,28 @@ fn wait_queue_self_test(hhdm_base: u64) -> bool {
     // **A thread put to sleep by somebody else's wait**, which is the one way
     // this project has found for a station to be `Blocked` with no queue entry
     // -- specimen nine's terminal state, and otherwise unreachable by reading.
-    // Printed whenever it is non-zero, and silent otherwise, because a number
-    // that is always there stops being read.
+    // ~~Printed whenever it is non-zero, and silent otherwise, because a
+    // number that is always there stops being read.~~ **Printed always, from
+    // 2026-08-31, and the reason is specimen ten.** CI produced a stuck
+    // station that afternoon and its annotation carried the `recent wakes:`
+    // line and no mismark line — and a reader cannot tell "the count was zero"
+    // from "the line was never reached" when zero is spelled as silence. The
+    // whole value of this counter on a *failing* boot is the zero: it says the
+    // one mechanism this project could find for `Blocked` with no queue entry
+    // did **not** happen, which is what narrows the next search. A number
+    // nobody reads costs a line; a number that cannot be distinguished from a
+    // missing line costs an investigation.
     let mismarked = sched::mismarked_blocks();
     if mismarked > 0 {
         println!(
             "\x1b[91m    wait queues    {mismarked} blocks were refused because the caller was not \
              the thread about to be marked: a migration inside `mark_blocked` would have put an \
              uninvolved thread to sleep with nothing to wake it\x1b[0m"
+        );
+    } else {
+        println!(
+            "    wait queues    0 blocks refused for a caller that was not the thread being \
+             marked, so no station was put to sleep by somebody else's wait"
         );
     }
 
@@ -23808,6 +23822,19 @@ fn wait_queue_self_test(hhdm_base: u64) -> bool {
             "\x1b[91m    wait queues    FAILED: {} ring stations did not retire, so the class \
              phase would measure a machine they are still competing on\x1b[0m",
             sched::threads_present_exact(&spawned)
+        );
+        // **Indented to here so CI carries it.** `annotate_failure_detail`
+        // keeps the lines after the marker that are indented past column 15
+        // and stops at the first that is not, so the report's own mismark line
+        // — four spaces in, printed much later — never reached an annotation
+        // and specimen ten arrived without the one number that eliminates a
+        // mechanism. Zero here is the useful value: it says the station was
+        // **not** put to sleep by somebody else's wait, which leaves the lost
+        // wakeup below as the reading.
+        println!(
+            "                   {} block(s) refused for a caller that was not the thread being \
+             marked",
+            sched::mismarked_blocks()
         );
         // **Which station, and what it was waiting on.** Three sightings of
         // this failure were counted rather than read, and a count cannot tell
