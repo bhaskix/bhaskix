@@ -206,19 +206,34 @@ given none`, reproducibly, on two consecutive boots.
 compiled in and only the hosted program's *call* removed, the socket failure
 disappears. So it is triggered by exercising the path, not by its presence.
 
-**And the obvious explanation is wrong.** A dangling `EXPECT` declaration was
+**One explanation examined and set aside.** A dangling `EXPECT` declaration was
 the natural suspect — the adapter declares where a capability may land and, on
-a create that returns `EXISTS`, nothing consumes it. But a declaration is
-**one per thread, tagged with the endpoint that may use it**, so a later
-declaration overwrites a stale one, and the socket's endpoint is not the
-filesystem's. Worse for the theory: the adapter answered **exactly 115 foreign
-calls in both boots**, so the round trip made no system calls at all in the
-failing one — the program did not reach it.
+a create that returns `EXISTS`, nothing consumes it. It is a weak fit: a
+declaration is **one per thread, tagged with the endpoint that may use it**, so
+a later declaration overwrites a stale one, and the socket's endpoint is not the
+filesystem's. Not disproved, but not supported either.
 
-That last fact is the thread to pull, and it points at the *hosted program*
-rather than the adapter. Left here because a bisect that narrows a fault to
-"exercising this changes something it should not touch" is worth more than a
-guess at which line.
+**And a second argument that appeared here was wrong — corrected 2026-08-31,
+the same day it was written.** It read: the adapter answered *exactly 115
+foreign calls in both boots*, so the round trip made no system calls in the
+failing one, so the fault is in the hosted program rather than the adapter.
+**That inference does not hold.** The count comes from
+`personality_boundary_report`, called from `kernel_main` — and the hosted exec
+probe runs much later, in the shell bring-up thread. The figure is captured
+*before the hosted program has ever run*, so identical counts say nothing at
+all about whether the round trip executed.
+
+**It is the same ordering trap three other things hit today** — a self-test
+placed before the service it reads, a report placed before the probe that fills
+it, a command-line flag parsed after the test that uses it. Reading a counter
+without checking *when* it is taken is that mistake in its fourth costume, and
+it had already produced a confident conclusion pointing the next reader at the
+wrong half of the system.
+
+**What survives is the bisect and nothing more**: exercising the write path
+reproducibly breaks an unrelated socket gate, and removing only the *call*
+makes it stop. Which side the fault is on is **not established**, and the next
+person should not start from a direction this document briefly gave them.
 
 **Nothing half-working shipped.** The adapter changes are reverted; the
 authority stands, granted and inert, and no hosted program can reach it until

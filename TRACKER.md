@@ -833,6 +833,43 @@ the distinction is in the table rather than in somebody's head.
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-08-31 (a conclusion withdrawn: the ordering trap in its fourth costume)
+
+**RFC 0060 and the commit that shipped its first step both carried an inference
+that does not hold, and it is withdrawn the same day.**
+
+It read: the adapter answered *exactly 115 foreign calls in both boots*, so the
+hosted program's write round trip made no system calls in the failing one, so
+the fault lies in the hosted program rather than the adapter.
+
+**The count is captured before the hosted program has ever run.** It comes from
+`personality_boundary_report`, called from `kernel_main` at line 1063; the
+hosted exec probe runs much later, in the shell bring-up thread. Identical
+counts therefore say nothing about whether the round trip executed.
+
+**This is the fourth time today the same trap has been sprung**, and the first
+three were caught before they cost anything:
+
+* `hosted_exec_self_test` was first called from `kernel_main`, where it read
+  `FS_ENDPOINT` before `start_fs_domain` had run — it would have reported a
+  green *skip* on every lane for ever;
+* the socket-close record was first printed from `kernel_main`, before the
+  probes that fill it — a reassuring zero on every boot including the failing
+  ones;
+* `ringsoak=<ms>` was first parsed seven hundred lines after the test that
+  reads it — the flag was in the image, the parse was correct, the window
+  stayed 2000 ms.
+
+The fourth is the same mistake read from the other end: not *placing* something
+before the thing it depends on, but *reading a number* without checking when it
+was taken. It is the one that got through, because the first three failed
+visibly and this one produced a confident sentence instead.
+
+**What survives of that investigation is the bisect and nothing more**:
+exercising RFC 0060's write path reproducibly breaks an unrelated socket gate,
+and removing only the *call* makes it stop. Which side the fault is on is not
+established, and RFC 0060 no longer points the next reader at half the system.
+
 ### 2026-08-31 (a fourth explanation for the two-sources gate, killed by experiment)
 
 **My leading hypothesis, refuted the same hour I formed it.** `notify::signal(notification,
