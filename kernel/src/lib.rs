@@ -22960,6 +22960,23 @@ static SEEN_TOKEN: [core::sync::atomic::AtomicU64; 4] = [
 /// Every pass of `wait_until`'s loop evaluates it once, so this counts how
 /// often the station has been given a chance to look -- which is the difference
 /// between "never woken" and "woken and blocked again".
+/// The **phase** each station's predicate read, beside the token it read.
+///
+/// **Specimen ten is why.** Its predicate is `token == id || phase >
+/// PHASE_WAIT`, and the failure printed `phase 3 (retire is above 2)` — so the
+/// second half was *true* at the moment of the report, and `ring-2` was asleep
+/// anyway. Either it never evaluated again after the phase was published, or it
+/// evaluated and read a phase that was not 3. Those are a lost wakeup and a
+/// visibility failure respectively, and the token alone cannot tell them apart:
+/// recording the token but not the phase instruments one half of a two-term
+/// predicate.
+static SEEN_PHASE: [core::sync::atomic::AtomicU64; 4] = [
+    core::sync::atomic::AtomicU64::new(u64::MAX),
+    core::sync::atomic::AtomicU64::new(u64::MAX),
+    core::sync::atomic::AtomicU64::new(u64::MAX),
+    core::sync::atomic::AtomicU64::new(u64::MAX),
+];
+
 static PREDICATE_EVALS: [core::sync::atomic::AtomicU64; 4] = [
     core::sync::atomic::AtomicU64::new(0),
     core::sync::atomic::AtomicU64::new(0),
@@ -22985,6 +23002,9 @@ extern "C" fn ring_station(id: u64) -> ! {
             // question nobody asked.
             if let Some(slot) = SEEN_TOKEN.get(id as usize) {
                 slot.store(token, Ordering::Relaxed);
+            }
+            if let Some(slot) = SEEN_PHASE.get(id as usize) {
+                slot.store(phase, Ordering::Relaxed);
             }
             if let Some(slot) = PREDICATE_EVALS.get(id as usize) {
                 slot.fetch_add(1, Ordering::Relaxed);
@@ -23900,13 +23920,19 @@ fn wait_queue_self_test(hhdm_base: u64) -> bool {
                 2 => busy += 1,
                 _ => missed += 1,
             });
+            let seen_phase = SEEN_PHASE[id].load(Ordering::Relaxed);
             println!(
                 "\x1b[91m                   {name} (thread {}) {state}, {} laps, last saw token \
-                 {}, {} predicate evaluations; recent wakes: {woken} landed, {missed} not found, \
-                 {busy} contended\x1b[0m",
+                 {} at phase {}, {} predicate evaluations; recent wakes: {woken} landed, {missed} \
+                 not found, {busy} contended\x1b[0m",
                 spawned[id],
                 LAPS[id].load(Ordering::Relaxed),
                 if seen == u64::MAX { -1 } else { seen as i64 },
+                if seen_phase == u64::MAX {
+                    -1
+                } else {
+                    seen_phase as i64
+                },
                 PREDICATE_EVALS[id].load(Ordering::Relaxed)
             );
         }
