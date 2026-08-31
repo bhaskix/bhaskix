@@ -59,7 +59,39 @@ RED=$'\033[1;31m'; GREEN=$'\033[1;32m'; YELLOW=$'\033[1;33m'; DIM=$'\033[2m'; RE
 command -v curl >/dev/null 2>&1 || { echo "ci-status: needs curl" >&2; exit 2; }
 command -v python3 >/dev/null 2>&1 || { echo "ci-status: needs python3" >&2; exit 2; }
 
-fetch() { curl -sS -m 30 -H 'Accept: application/vnd.github+json' "$1" 2>/dev/null; }
+# **`gh` when it is there and logged in, `curl` otherwise.**
+#
+# Everything above is still true: the job and step names this tool reports are
+# free without a token, and that is the point it was written to make. The one
+# thing the unauthenticated path gets wrong is the **budget** -- 60 requests an
+# hour, shared with every other unauthenticated caller on this host, and a run
+# of `tools/ci-status.sh` spends several. On 2026-08-31 that budget ran out
+# while a red `main` was being chased, and the tool could say nothing at all for
+# 45 minutes: not "green", not "red", just a wait. An authenticated `gh` has
+# 5,000 an hour, so the limit stops existing.
+#
+# It is a preference and not a requirement, deliberately. `gh` is not installed
+# everywhere, is often not logged in where it is, and this tool's whole claim is
+# that it works with neither. So: use `gh` when it is present *and*
+# authenticated, and fall back to `curl` when it is absent, logged out, or
+# fails -- a `gh` whose token has expired must not turn into "GitHub
+# unreachable", which would be a lie about the network.
+GH_OK=0
+if command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
+    GH_OK=1
+fi
+
+fetch() {
+    if [ "$GH_OK" = 1 ]; then
+        local out
+        out="$(gh api -H 'Accept: application/vnd.github+json' "${1#https://api.github.com/}" 2>/dev/null)"
+        if [ -n "$out" ]; then
+            printf '%s' "$out"
+            return
+        fi
+    fi
+    curl -sS -m 30 -H 'Accept: application/vnd.github+json' "$1" 2>/dev/null
+}
 
 runs_json="$(fetch "$API/runs?per_page=60&branch=main&event=push")"
 
@@ -75,7 +107,15 @@ case "$runs_json" in
     # an hour and the other sends you looking for a broken workflow. The `Not
     # Found` arm below already had the wildcard and was already right.
     *'"message":'*'API rate limit exceeded'*)
-          echo "${YELLOW}ci-status${RESET}  rate-limited (60/hour unauthenticated) -- try later" >&2; exit 3 ;;
+          # Which budget ran out matters: 60/hour says "log in and this stops
+          # happening", 5,000/hour says something is wrong with how often this
+          # is being called.
+          if [ "$GH_OK" = 1 ]; then
+              echo "${YELLOW}ci-status${RESET}  rate-limited (5,000/hour, authenticated via gh) -- try later" >&2
+          else
+              echo "${YELLOW}ci-status${RESET}  rate-limited (60/hour unauthenticated; \`gh auth login\` raises it to 5,000) -- try later" >&2
+          fi
+          exit 3 ;;
     *'"message":'*'Not Found'*)
           echo "${YELLOW}ci-status${RESET}  no such repository: $REPO" >&2; exit 3 ;;
 esac
