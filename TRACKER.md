@@ -1363,6 +1363,16 @@ brand-new record, release nothing, and report success -- a silent path neither n
 catch. That is the third hypothesis, and it is now the one to instrument if the next specimen shows
 both counters at zero.
 
+**2026-09-01: the next specimen showed exactly that, and both other hypotheses are dead.** A failing
+boot of the `iommu` lane reads `socket reclaim FAILED: held true, reaped true, same slot true, bound
+again false (fd 1, bind 1), forgets 1` beside `socket close   every close landed; the worst needed 1
+of 4 attempts, and no FORGET was refused`. So the close **landed**, the FORGET was **not refused**,
+and no retry was needed — and `1 of 4` refutes congestion outright, which is the sentence the
+counters were wired up to be able to say. The port still could not be rebound. Neither mechanism
+this defect has been split between since it was filed survives, and the third path above is the only
+one left standing — named in advance, before the specimen existed. **Two counters that reported
+nothing for weeks eliminated two hypotheses on the first failure they saw.**
+
 **And a number withdrawn.** §3's row briefly carried "roughly 7%", computed from 2 in 28. This soak
 makes that unlikely -- 29 clean boots is about a 12% event at 7% -- so the row states two
 disagreeing samples instead of one number. The swing itself is the lead: a rate that moves on one
