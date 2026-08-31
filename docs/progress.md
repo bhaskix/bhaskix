@@ -56,6 +56,7 @@ gantt
     RFC 0048 a listener that cannot be wedged :done, r0048, 2026-08-24, 2026-08-26
     RFC 0056 asking a socket whether anything arrived without... :done, r0056, 2026-08-28, 1d
     RFC 0058 what a service learns without being called :done, r0058, 2026-08-28, 1d
+    RFC 0061 a connection nobody accepted :active, r0061, 2026-08-31, 2026-08-31
     section Drivers & IOMMU
     RFC 0011 IrqHandler — who may receive an interrupt :done, r0011, 2026-08-04, 1d
     RFC 0012 The IOMMU and what a device is allowed to reach :done, r0012, 2026-08-04, 1d
@@ -154,17 +155,11 @@ gantt
 | 0044 | Revocation that reaches the mapping | 2026-08-23 |
 | 0045 | One adapter per workload and the three failures that argued for it | 2026-08-23 |
 | 0060 | a writable path for a hosted process | 2026-08-31 |
-| 0061 | a connection nobody accepted | — |
+| 0061 | a connection nobody accepted | 2026-08-31 |
 
 ## Annexes
 
 Companion documents that share an RFC's number. Counted here rather than as RFCs of their own.
 
 - RFC 0040 — step 1 — the libcrux inspection
-
-## Undated
-
-No commit adding these files was found, so they have no start date and are not on the chart.
-
-- RFC 0061 — a connection nobody accepted
 
