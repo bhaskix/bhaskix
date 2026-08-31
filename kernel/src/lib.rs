@@ -15789,9 +15789,9 @@ fn report_tcp_domain(hhdm: u64) {
     if count == 0 {
         return;
     }
-    let mut words = [0u64; 8];
+    let mut words = [0u64; 9];
     // SAFETY: a frame this object owns, through the direct map, read as the
-    // **eight** little-endian words the service wrote there.
+    // **nine** little-endian words the service wrote there.
     //
     // The count and the array have to move together, and they did not: adding
     // the cookie word to the array while this still said `56` made the loop
@@ -15840,6 +15840,21 @@ fn report_tcp_domain(hhdm: u64) {
          for a peer that has proved nothing",
         words[7]
     );
+    // **RFC 0061, and a counter whose healthy value is zero.**
+    //
+    // A peer that completes a handshake to a listening port and closes before
+    // any application accepts it has no local user, and `CLOSE-WAIT` is
+    // defined by an obligation on one (RFC 9293 §3.3.2). The service
+    // discharges it. Before RFC 0061 nothing did, and one such peer held the
+    // single accepted slot for the rest of the boot -- two packets, no
+    // authority, a listening port that served nobody until reboot.
+    if words[8] != 0 {
+        println!(
+            "    tcpd reclaim   {} connection(s) the peer closed before any application \
+             accepted them, reclaimed rather than left holding the slot",
+            words[8]
+        );
+    }
 }
 
 /// RFC 0019 step 2: a deadline fires, and not before it is due.

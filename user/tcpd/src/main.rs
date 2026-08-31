@@ -495,6 +495,16 @@ struct Connection {
     /// 0023), and whether the last step produced news worth ringing it for.
     notify_slot: Option<u64>,
     wake_owed: bool,
+    /// Whether `ACCEPT` ever handed this connection to an application — RFC
+    /// 0061.
+    ///
+    /// The distinction the wedge turned on. A connection that completed a
+    /// handshake but reached no application has **no local user**, and
+    /// `CLOSE-WAIT` is defined by an obligation on one (RFC 9293 §3.3.2). This
+    /// flag is how the service knows the obligation is its own. Always true for
+    /// the outbound connection, which the program that asked for it holds from
+    /// the moment it exists.
+    claimed: bool,
 }
 
 /// A port with a caller waiting behind it: RFC 0020's `LISTEN`, existing
@@ -526,6 +536,14 @@ struct Service {
     sent: u64,
     /// Entries refused before they reached the machine.
     refused: u64,
+    /// Connections reclaimed because the peer closed one no application had
+    /// accepted — RFC 0061.
+    ///
+    /// **Zero on a healthy boot, and that is the point of printing it.** A
+    /// non-zero value is a peer that completed a handshake to a listening port
+    /// and left before anyone took it; before RFC 0061 each one of those held
+    /// the single accepted slot until reboot.
+    unclaimed_reclaimed: u64,
     /// Connections built from a verified SYN cookie — RFC 0048 step 3.
     ///
     /// Reported because it is the difference between a stack that answers a
@@ -661,6 +679,34 @@ fn drive_at(service: &mut Service, index: usize, event: Event<'_>) {
     {
         let _ = call(syscall::INVOKE, slot, method::SIGNAL, [0; 4]);
         connection.wake_owed = false;
+    }
+    // **RFC 0061 step 1: the service is the local user for a connection
+    // nobody accepted.**
+    //
+    // `CLOSE-WAIT` is defined by an obligation on the local user (RFC 9293
+    // §3.3.2, and §3.6 case 2 names the `CLOSE` that discharges it). A
+    // connection that completed a handshake and reached no application has no
+    // local user, so nothing could ever discharge it: the slot was held for
+    // the rest of the boot, `ACCEPT` answered `LATER` for ever, and the port
+    // answered every later `SYN` with a cookie it could not build on. Two
+    // packets from an unauthenticated peer, measured.
+    //
+    // `Abort` rather than `Shutdown`, and the difference is the whole fix.
+    // `Shutdown` is the polite answer and the wrong one: it parks in
+    // `LAST-ACK` waiting for an acknowledgement from a peer that has already
+    // gone, and `LAST-ACK` is no more `Closed` than `CLOSE-WAIT` was. It would
+    // move the wedge one state along and leave it standing.
+    if index == ACCEPTED && !connection.claimed && connection.tcb.state == state::State::CloseWait {
+        let (tcb, actions) = state::step(connection.tcb, Event::Abort, now);
+        connection.tcb = tcb;
+        perform(service, &mut connection, index, &actions);
+        service.unclaimed_reclaimed += 1;
+    }
+    // Dropped rather than parked: no capability was ever handed out naming
+    // this slot, so nothing can be holding one.
+    if index == ACCEPTED && !connection.claimed && connection.tcb.state == state::State::Closed {
+        service.connections[index] = None;
+        return;
     }
     service.connections[index] = Some(connection);
 }
@@ -1017,11 +1063,21 @@ fn accept_cookie(
         service.connections[ACCEPTED] = None;
     }
     if service.connections[ACCEPTED].is_some() {
-        // Still one accepted connection at a time. **This is not the wedge**:
-        // the slot is held by a peer that completed a handshake and is being
-        // served, not by one that sent a packet and vanished. A peer whose
-        // cookie arrives now will retransmit its `ACK`, and the cookie stays
-        // valid for its whole window.
+        // Still one accepted connection at a time. A peer whose cookie
+        // arrives now will retransmit its `ACK`, and the cookie stays valid
+        // for its whole window.
+        //
+        // **This comment used to end "this is not the wedge: the slot is held
+        // by a peer that completed a handshake and is being served, not by one
+        // that sent a packet and vanished", and it named two cases out of
+        // three.** The third is a peer that completed a handshake, was never
+        // delivered to an application, and *left*: it parked in `CLOSE-WAIT`
+        // holding this slot for the rest of the boot, and every `ACK` that
+        // reached here afterwards was dropped by the line below -- which is
+        // why a wedged port still answers every `SYN` with a cookie and can
+        // never build on one. RFC 0061 reclaims it in `drive_at`. The
+        // sentence was written while looking at this function, and the case it
+        // missed was three lines further on.
         return None;
     }
 
@@ -1043,6 +1099,7 @@ fn accept_cookie(
     // `irs + 1`.
     let irs = bhaskix_net::tcp::Sequence(parsed.sequence.0.wrapping_sub(1));
     service.connections[ACCEPTED] = Some(Connection {
+        claimed: false,
         tcb: Tcb::from_cookie(
             connection,
             accepted.sequence,
@@ -1389,6 +1446,7 @@ fn connect_serving(
         };
         let iss = isn::initial_sequence(&service.key, connection, now_nanos(service.hertz));
         service.connections[OUTBOUND] = Some(Connection {
+            claimed: true,
             tcb: Tcb::new(connection),
             deadlines: Deadlines::new(),
             sendr_at: handover.at.0,
@@ -1527,6 +1585,12 @@ fn serve_handover_only(dark: u64) -> ! {
 /// Stamps the cycle counter into report word `index`, first time only.
 ///
 /// Leaves the findings where the kernel granted memory for them.
+// Eight named values, plus the marker, are the **nine** words on the report
+// page; a struct here would be eight fields written twice rather than a
+// shorter call. RFC 0061 added the eighth value and the ninth word, and the
+// kernel's reader moved with it -- its comment already records the boot that
+// died from letting that count and its array disagree.
+#[allow(clippy::too_many_arguments)]
 fn report(
     state_bits: u64,
     outcome: u64,
@@ -1535,9 +1599,10 @@ fn report(
     refused: u64,
     tcb_state: u64,
     cookies: u64,
+    reclaimed: u64,
 ) {
     let words = [
-        MARKER, state_bits, outcome, taken, sent, refused, tcb_state, cookies,
+        MARKER, state_bits, outcome, taken, sent, refused, tcb_state, cookies, reclaimed,
     ];
     // SAFETY: the page this program mapped writable, which nothing else
     // reaches. The marker is written last, so a kernel reading a partial report
@@ -1589,7 +1654,7 @@ extern "C" fn tcpd_main(hertz: u64) -> ! {
     }
     let mut bits = state_bits::ATTACHED;
     let networked = attach(BACK, BACK_AT, 1) && attach(CONFIG, CONFIG_AT, 0);
-    report(bits, outcome::PENDING, 0, 0, 0, 0, 0);
+    report(bits, outcome::PENDING, 0, 0, 0, 0, 0, 0);
 
     // **The refusal, before anything else.** A 128-bit secret from the
     // hardware, or nothing: `Key::draw` returns `None` if either half is
@@ -1603,11 +1668,11 @@ extern "C" fn tcpd_main(hertz: u64) -> ! {
         // exact bug the no-network arm below had already found and fixed.
         // The handover needs no key; only a sequence number does, and the
         // minted connection says so when asked.
-        report(bits, outcome::NO_ENTROPY, 0, 0, 0, 0, 0);
+        report(bits, outcome::NO_ENTROPY, 0, 0, 0, 0, 0, 0);
         serve_handover_only(tcp::NO_ENTROPY)
     };
     bits |= state_bits::KEYED;
-    report(bits, outcome::PENDING, 0, 0, 0, 0, 0);
+    report(bits, outcome::PENDING, 0, 0, 0, 0, 0, 0);
 
     if !networked {
         // No rings to a protocol service means no network, which is a state
@@ -1616,7 +1681,7 @@ extern "C" fn tcpd_main(hertz: u64) -> ! {
         // and mint connections — the handover needs no wire, and exiting
         // here would leave the endpoint dead with every caller queued
         // against it for ever.
-        report(bits, outcome::NO_NETWORK, 0, 0, 0, 0, 0);
+        report(bits, outcome::NO_NETWORK, 0, 0, 0, 0, 0, 0);
         serve_handover_only(tcp::UNREACHABLE)
     }
 
@@ -1647,7 +1712,7 @@ extern "C" fn tcpd_main(hertz: u64) -> ! {
         }
     }
     if me == Ipv4Addr::UNSPECIFIED {
-        report(bits, outcome::NO_NETWORK, 0, 0, 0, 0, 0);
+        report(bits, outcome::NO_NETWORK, 0, 0, 0, 0, 0, 0);
         serve_handover_only(tcp::UNREACHABLE)
     }
     bits |= state_bits::CONFIGURED;
@@ -1665,6 +1730,7 @@ extern "C" fn tcpd_main(hertz: u64) -> ! {
         taken: 0,
         sent: 0,
         refused: 0,
+        unclaimed_reclaimed: 0,
         cookies_accepted: 0,
         connections: [None, None],
         listener: None,
@@ -1706,6 +1772,7 @@ extern "C" fn tcpd_main(hertz: u64) -> ! {
                 .as_ref()
                 .map_or(0, |connection| state_number(&connection.tcb)),
             service.cookies_accepted,
+            service.unclaimed_reclaimed,
         );
 
         declare_gift_slot(&connect_handover, &listen_handover);
@@ -1791,6 +1858,13 @@ extern "C" fn tcpd_main(hertz: u64) -> ! {
                         [ENDPOINT, rights::READ | rights::WRITE, handle, 0],
                     );
                     if handed.0 == status::OK {
+                        // RFC 0061: from here this connection has a local
+                        // user, and the obligation `CLOSE-WAIT` names is
+                        // theirs. Before here it was the service's, and
+                        // nobody discharged it.
+                        if let Some(held) = service.connections[ACCEPTED].as_mut() {
+                            held.claimed = true;
+                        }
                         reply(tcp::OK, handle, 0);
                     } else {
                         reply(tcp::BARE, 0x20 | handed.0, 0);

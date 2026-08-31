@@ -439,6 +439,29 @@ make -C "$REPO_ROOT" build/sata-disk.img >/dev/null 2>&1 || true
 # SYN lands before the guest has an address gets no answer from anybody and
 # still waits for the next rung. Refusing a shut port removes the razor
 # edge, it does not remove the ladder.
+#
+# **Which is why the read below has a timeout.** Without one, "reattempts for
+# the whole boot" was false: `/dev/tcp` opens against slirp's host side
+# whatever the guest is doing, so the first attempt that opens -- measured at
+# t+1.005 s, identically on every boot traced -- entered an unbounded read and
+# the loop never reached its next iteration. One connection, opened a second
+# into the boot, carried the whole gate: a served boot's payload came back
+# 18.10 s after the open (slirp's rung, to two decimals) and a `NOBODY` boot's
+# read returned empty 30.6 s after it, when the boot itself ended. Three
+# seconds is what the closed-port driver below already uses, and an echo from
+# an armed listener is a loopback round trip.
+#
+# **This is a real defect in this driver and it is NOT the cause of the
+# 2026-08-24 intermittent** -- said plainly because the first draft of this
+# comment claimed it was, and a packet capture refuted that the same hour.
+# With the timeout in, the driver makes nine attempts instead of one and the
+# gate still fails whenever `bin/tcpc` starts after ~19 s. The cause is in
+# `bin/tcpd`: a peer that completes a handshake before the application accepts,
+# and then closes, parks the connection in `CLOSE-WAIT` holding the single
+# accepted slot, which is released only on `Closed | TimeWait` -- so it is held
+# for the rest of the boot and no later connection can ever be built. See
+# TRACKER §3. Fixing this driver makes the gate honest; it does not make the
+# machine correct.
 INBOUND_VERDICT=$(mktemp)
 rm -f "$INBOUND_VERDICT"
 (
@@ -446,7 +469,7 @@ rm -f "$INBOUND_VERDICT"
     for _ in $(seq 1 "$TIMEOUT"); do
         if { exec 3<>/dev/tcp/127.0.0.1/45557; } 2>/dev/null; then
             printf '%s' "$payload" >&3
-            reply=$(dd bs=1 count=16 <&3 2>/dev/null || true)
+            reply=$(timeout 3 dd bs=1 count=16 <&3 2>/dev/null || true)
             exec 3>&- 3<&- || true
             if [[ "$reply" == "$payload" ]]; then
                 echo "echoed" > "$INBOUND_VERDICT"
@@ -457,6 +480,44 @@ rm -f "$INBOUND_VERDICT"
     done
 ) &
 INBOUND_DRIVER=$!
+
+# **RFC 0061's gate: a connection nobody accepts must not wedge the port.**
+#
+# This opens a connection and closes it at once, without reading, repeatedly.
+# Each one completes a handshake that no application ever accepts and then
+# goes away -- which is the whole of the denial of service: before RFC 0061
+# the first of these parked in `CLOSE-WAIT` holding `bin/tcpd`'s single
+# accepted slot, and the port answered every later `SYN` with a cookie it
+# could never build on. One `SYN`, one `ACK`, one `FIN`, no authority.
+#
+# It runs *alongside* the echo driver above deliberately, rather than before
+# it, because the property being gated is not "the machine survives this in
+# isolation" but "the machine still serves a real caller while it is
+# happening". The echo above must still be served, and the boot report must
+# show the reclaim actually ran -- a gate that only checked the echo would
+# pass on a boot where these connections never completed at all.
+WEDGE_ATTEMPTS=$(mktemp)
+echo 0 > "$WEDGE_ATTEMPTS"
+(
+    made=0
+    for _ in $(seq 1 14); do
+        # **Stops as soon as the echo is served, and that bound is not
+        # cosmetic.** The wedge only has to be created *before* a real caller
+        # is served for the property to be demonstrated; carrying on after
+        # that is pure contention for the one accepted slot, and it starved
+        # the hosted `linux socket` gate three lanes down when this loop first
+        # ran unbounded. A prober that breaks a neighbouring gate is measuring
+        # the harness, not the machine.
+        [[ -f "$INBOUND_VERDICT" ]] && break
+        if { exec 5<>/dev/tcp/127.0.0.1/45557; } 2>/dev/null; then
+            exec 5>&- 5<&- || true
+            made=$((made + 1))
+            echo "$made" > "$WEDGE_ATTEMPTS"
+        fi
+        sleep 2
+    done
+) &
+WEDGE_DRIVER=$!
 
 # RFC 0047's gate: a connection to a port nobody holds must be *refused*, and
 # refused promptly.
@@ -507,6 +568,8 @@ echo "booting ($MODE), up to ${TIMEOUT}s..."
 run_until "$LOG" "Nothing left to do at this milestone" "$TIMEOUT" "${QEMU_ARGS[@]}"
 kill "$INBOUND_DRIVER" 2>/dev/null || true
 wait "$INBOUND_DRIVER" 2>/dev/null || true
+kill "$WEDGE_DRIVER" 2>/dev/null || true
+wait "$WEDGE_DRIVER" 2>/dev/null || true
 kill "$CLOSED_DRIVER" 2>/dev/null || true
 wait "$CLOSED_DRIVER" 2>/dev/null || true
 
@@ -2439,6 +2502,32 @@ else
     status=1
 fi
 rm -f "$INBOUND_VERDICT" 2>/dev/null || true
+
+# **RFC 0061: the port survived connections nobody accepted.**
+#
+# Three-valued for the same reason RFC 0047's gate below is: the interesting
+# failure is not "the machine refused" but "the machine was never asked". The
+# prober's own count says whether it managed to open anything at all, so a lane
+# with no network reports a skip rather than a pass it did not earn.
+#
+# The demanded evidence is the reclaim counter in `bin/tcpd`'s report, not just
+# a served echo. Before RFC 0061 the first completed-then-closed connection
+# held the single accepted slot for the rest of the boot; a boot that serves
+# the echo *and* reports at least one reclaim is a boot where the wedge was
+# created and undone, which is the property. A served echo alone would also
+# pass on a boot where the prober's connections never reached the guest.
+if grep -qE "no network this machine can drive" "$LOG"; then
+    pass "wedge probe skipped: this machine has no network"
+elif [[ "$(cat "$WEDGE_ATTEMPTS" 2>/dev/null || echo 0)" == "0" ]]; then
+    pass "wedge probe never opened a connection: nothing to conclude (see the inbound gate above)"
+elif grep -qE "tcpd reclaim +[1-9][0-9]* connection" "$LOG"; then
+    reclaimed=$(grep -oE "tcpd reclaim +[0-9]+" "$LOG" | grep -oE "[0-9]+$" | head -1)
+    pass "a connection nobody accepted did not wedge the port: ${reclaimed} reclaimed, and the inbound echo was still served"
+else
+    fail "the wedge probe opened $(cat "$WEDGE_ATTEMPTS" 2>/dev/null) connection(s) and bin/tcpd reclaimed none: the accepted slot is held by a connection with no local user (RFC 0061)"
+    status=1
+fi
+rm -f "$WEDGE_ATTEMPTS" 2>/dev/null || true
 
 # RFC 0047: a port nobody holds says so.
 #
