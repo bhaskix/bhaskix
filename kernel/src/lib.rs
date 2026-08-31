@@ -14194,6 +14194,14 @@ static FS_STALE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::
 /// the shell gets no writable directory rather than a wrong one.
 static FS_PKG: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
+/// The writable handle for `sub/tmp` — RFC 0060, the one directory a hosted
+/// process may change.
+///
+/// Zero when the service could not make it, in which case the adapter holds no
+/// writable directory and every hosted write answers `EROFS` — the honest
+/// state rather than a forged one, exactly as `pkg` behaves for the shell.
+static FS_TMP: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 /// Where the direct map is, for the thread above.
 static DISK_HHDM: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// The frame behind the memory that thread shares with the block service.
@@ -15584,7 +15592,7 @@ fn report_traced(hhdm: u64) {
         return;
     }
     let expected = TRACED_PROBES_EACH * u64::from(bhaskix_arch::percpu::online_count());
-    let mut words = [0u64; 10];
+    let mut words = [0u64; 11];
     let mut settled = false;
     for _ in 0..100u32 {
         let Some((pages, count)) = shared::frames_of(shared::MemoryId::from_u64(raw)) else {
@@ -17219,11 +17227,15 @@ fn start_fs_domain(hhdm: u64) -> bool {
     }
 
     // The report page is the object's last frame, read through the direct map.
-    let mut words = [0u64; 10];
+    let mut words = [0u64; 11];
     for _ in 0..200 {
         // SAFETY: a frame this object owns, through the direct map, read as
-        // the ten little-endian words the service writes there.
-        let raw = unsafe { core::slice::from_raw_parts((hhdm + frames[1]) as *const u8, 80) };
+        // the eleven little-endian words the service writes there. **Eighty-
+        // eight bytes, not eighty** — RFC 0060 added the writable directory's
+        // handle as an eleventh word, and a length left at ten would have read
+        // the array short and silently left `tmp` zero, which presents as "the
+        // adapter holds no writable directory" and not as a bug.
+        let raw = unsafe { core::slice::from_raw_parts((hhdm + frames[1]) as *const u8, 88) };
         for (index, word) in words.iter_mut().enumerate() {
             let mut buffer = [0u8; 8];
             buffer.copy_from_slice(&raw[index * 8..index * 8 + 8]);
@@ -17254,6 +17266,7 @@ fn start_fs_domain(hhdm: u64) -> bool {
         directory,
         stale,
         pkg,
+        tmp,
     ] = words;
     // What the service says names `sub`. The kernel is the only thing that can
     // mint a capability, so the service supplies the badge and the kernel
@@ -17263,13 +17276,15 @@ fn start_fs_domain(hhdm: u64) -> bool {
     FS_DIRECTORY.store(directory, Ordering::Release);
     FS_STALE.store(stale, Ordering::Release);
     FS_PKG.store(pkg, Ordering::Release);
+    FS_TMP.store(tmp, Ordering::Release);
     let _ = (directory, stale);
     let ok = matched == 1 && read == EXPECTED.len() as u64 && blocks > 0 && entries > 0;
     if ok {
         println!(
             "    fs domain      bin/fsd mounted the disk through the block service: \
              {sectors} sectors, {blocks} blocks, {entries} entries, and `on-a-disk` reads \
-             {read} bytes that the kernel wrote through its own copy of the same crate"
+             {read} bytes that the kernel wrote through its own copy of the same crate; \
+             writable handles: pkg {pkg:#x}, tmp {tmp:#x}"
         );
     } else {
         println!(
@@ -18486,6 +18501,71 @@ fn user_shell(handoff: &Handoff) -> Result<(), &'static str> {
                     }
                     None => println!(
                         "\x1b[93m    linux domain   no directory capability could be made\x1b[0m"
+                    ),
+                }
+            }
+
+            // RFC 0060: the adapter's one **writable** directory, `sub/tmp`.
+            //
+            // **A second capability beside the read-only root, not a change to
+            // it.** The grant above hands `bin/linuxd` `sub` with a read-only
+            // badge and that is untouched; this hands it `sub/tmp` with the
+            // writable bit, which only this mint can set. So what a hosted
+            // process may *change* is decided by which capability the adapter
+            // reaches for, and a program that never names `tmp` cannot write
+            // anywhere at all — structurally, with no check enforcing it.
+            //
+            // Zero means the service could not make the directory, and the
+            // adapter simply holds no writable handle: every hosted write then
+            // answers `EROFS`, which is the honest state rather than a forged
+            // one. The same shape, and the same sentence, as `pkg` below.
+            let tmp = FS_TMP.load(core::sync::atomic::Ordering::Acquire);
+            // **Absence says so.** The first version of this printed nothing
+            // when the handle was zero, which is the failure this whole file
+            // is full of: a grant that silently did not happen reads exactly
+            // like a hosted program that simply never wrote anything.
+            if adapter != u32::MAX && tmp == 0 {
+                println!(
+                    "\x1b[93m    linux domain   no writable directory: bin/fsd reported no \
+                     handle for `sub/tmp`, so hosted programs stay read-only\x1b[0m"
+                );
+            }
+            if adapter != u32::MAX && tmp != 0 {
+                let handle = cap::with_arena(|arena| {
+                    let root = arena
+                        .insert_root(
+                            cap::ObjectRef::new(cap::ObjectKind::Endpoint, raw),
+                            cap::Rights::ALL,
+                            0,
+                        )
+                        .ok()?;
+                    arena
+                        .derive(root, cap::Rights::READ.union(cap::Rights::DERIVE), tmp)
+                        .ok()
+                });
+                match handle {
+                    Some(handle) => {
+                        if domain::with(domain::DomainId::from_u32(adapter), |owner| {
+                            owner
+                                .cspace
+                                .install_at(bhaskix_abi::adapter::WRITABLE_DIR, handle)
+                                .is_ok()
+                        }) == Some(true)
+                        {
+                            println!(
+                                "    linux domain   holds a writable directory now: a hosted \
+                                 program may change what is under /tmp and nothing above it"
+                            );
+                        } else {
+                            println!(
+                                "\x1b[93m    linux domain   the writable directory would not \
+                                 install; hosted programs stay read-only\x1b[0m"
+                            );
+                        }
+                    }
+                    None => println!(
+                        "\x1b[93m    linux domain   no writable directory capability could be \
+                         made\x1b[0m"
                     ),
                 }
             }

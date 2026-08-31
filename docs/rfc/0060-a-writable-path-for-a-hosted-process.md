@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | ⬜ **Draft 2026-08-31 — scope only, nothing built.** Written to be argued with before any code exists |
+| **Status** | 🔨 **Draft 2026-08-31 — step 1 of 6 built and gated; steps 2-5 attempted and withdrawn.** The authority exists and is granted; the adapter does not use it yet, and the reason is recorded below rather than left as a gap |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | libc / userspace |
 | **Milestone** | Phase 2 — Linux personality (L1) |
@@ -182,10 +182,54 @@ comparable rather than one being asserted to be like the other.
    real, and the third such change should probably reorganise the map instead
    of shaving the same pool again.
 
+## What is built, and what was withdrawn — 2026-08-31
+
+**Step 1 is done and proved on a booted machine.** `bin/fsd` creates `sub/tmp`
+and reports its writable handle; the kernel mints it into
+`adapter::WRITABLE_DIR`; the boot says so:
+
+```
+fs domain      ... writable handles: pkg 0x8000000100000007, tmp 0x8000000100000008
+linux domain   holds a writable directory now: a hosted program may change what
+               is under /tmp and nothing above it
+```
+
+**Steps 2 and 3 were written, exercised, and taken back out.** The adapter's
+`open_writable` and `write_to_file` worked far enough to reach the service —
+the first attempt returned `EROFS` from a probe using `method::INFO`, which is
+a *domain* method and fails on a directory capability whether or not one is
+held — but with the write path actually exercised, **an unrelated gate began
+failing**: `linux socket FAILED: this machine has a network and the adapter was
+given none`, reproducibly, on two consecutive boots.
+
+**Bisected rather than guessed**: with every line of the new adapter code still
+compiled in and only the hosted program's *call* removed, the socket failure
+disappears. So it is triggered by exercising the path, not by its presence.
+
+**And the obvious explanation is wrong.** A dangling `EXPECT` declaration was
+the natural suspect — the adapter declares where a capability may land and, on
+a create that returns `EXISTS`, nothing consumes it. But a declaration is
+**one per thread, tagged with the endpoint that may use it**, so a later
+declaration overwrites a stale one, and the socket's endpoint is not the
+filesystem's. Worse for the theory: the adapter answered **exactly 115 foreign
+calls in both boots**, so the round trip made no system calls at all in the
+failing one — the program did not reach it.
+
+That last fact is the thread to pull, and it points at the *hosted program*
+rather than the adapter. Left here because a bisect that narrows a fault to
+"exercising this changes something it should not touch" is worth more than a
+guess at which line.
+
+**Nothing half-working shipped.** The adapter changes are reverted; the
+authority stands, granted and inert, and no hosted program can reach it until
+steps 2 and 3 are done properly.
+
 ## Implementation plan
 
-1. `bin/fsd` creates the writable directory and reports its handle, as it does
-   for `pkg`; the kernel mints the writable badge into a new adapter slot.
+1. ✅ **Done.** `bin/fsd` creates the writable directory and reports its handle,
+   as it does for `pkg`; the kernel mints the writable badge into a new adapter
+   slot, and the boot report says whether it holds one — **including when it
+   does not**, which the first version left silent.
 2. `open_the_file` stops discarding `plan_openat`'s answer: writable opens go
    to the writable directory, `O_CREAT` to `CREATE_AT`, and the read-only root
    still answers `EROFS`.

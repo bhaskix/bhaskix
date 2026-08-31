@@ -79,6 +79,7 @@ gantt
     RFC 0051 a shell that can ask what arrived :done, r0051, 2026-08-27, 1d
     RFC 0052 a line that waits for its newline :done, r0052, 2026-08-27, 1d
     RFC 0059 an execve that runs a program with argv and... :done, r0059, 2026-08-30, 1d
+    RFC 0060 a writable path for a hosted process :active, r0060, 2026-08-31, 2026-08-31
     section Process & tooling
     RFC 0001 License — Apache-2.0 :done, r0001, 2026-08-03, 1d
     RFC 0007 Live patching the nucleus :active, r0007, 2026-08-04, 2026-08-31
@@ -152,17 +153,11 @@ gantt
 | 0040 | Where cryptography comes from | 2026-08-22 |
 | 0044 | Revocation that reaches the mapping | 2026-08-23 |
 | 0045 | One adapter per workload and the three failures that argued for it | 2026-08-23 |
-| 0060 | a writable path for a hosted process | — |
+| 0060 | a writable path for a hosted process | 2026-08-31 |
 
 ## Annexes
 
 Companion documents that share an RFC's number. Counted here rather than as RFCs of their own.
 
 - RFC 0040 — step 1 — the libcrux inspection
-
-## Undated
-
-No commit adding these files was found, so they have no start date and are not on the chart.
-
-- RFC 0060 — a writable path for a hosted process
 

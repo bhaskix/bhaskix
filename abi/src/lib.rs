@@ -151,6 +151,18 @@ pub mod adapter {
     pub const LENT: usize = 23;
     /// The console's own notification, **read-only** — RFC 0054.
     pub const INPUT_WAKE: usize = 24;
+    /// The one **writable** directory a hosted process has — RFC 0060.
+    ///
+    /// A capability to `sub/tmp` on the disk, carrying `dir::WRITABLE` in its
+    /// badge, which only the kernel can mint. It is a *second* capability
+    /// beside [`ROOT_DIR`], which stays read-only: what a hosted process may
+    /// change is therefore a property of which capability the adapter reaches
+    /// for, not of a flag on a call, and a program that never names this
+    /// directory cannot write anywhere at all.
+    ///
+    /// The same shape `bin/shell` has held for `/pkg` since RFC 0030.
+    pub const WRITABLE_DIR: usize = 26;
+
     /// Where a program being `execve`d is read into — RFC 0059.
     ///
     /// Sixteen pages of the adapter's own memory, which is `shared::create`'s
@@ -166,10 +178,12 @@ pub mod adapter {
     /// step 3 — so the region grows with the number of hosted domains alive at
     /// once and shrinks as they end.
     ///
-    /// **Twenty-six since RFC 0059**, which took the slot below it. The
-    /// capacity that costs is stated at [`HANDLE_CAPACITY`] rather than left
-    /// to be discovered.
-    pub const HANDLE_FLOOR: usize = 26;
+    /// **Twenty-seven since RFC 0060**, which took another slot below it, as
+    /// RFC 0059 took the one before. The capacity that costs is stated at
+    /// [`HANDLE_CAPACITY`] rather than left to be discovered — and RFC 0060's
+    /// own open question 4 says a third such change should reorganise this map
+    /// rather than shave the same pool again.
+    pub const HANDLE_FLOOR: usize = 27;
 
     /// The protocol service's endpoint.
     pub const NETWORK: usize = 88;
@@ -199,7 +213,7 @@ pub mod adapter {
     /// domain slot held a hosted program would find the last handle refused by
     /// `install_at`.
     ///
-    /// **It is sixty-two since RFC 0059**, which put [`STAGING`] at the slot
+    /// **It is sixty-one since RFC 0060**, and was sixty-two after RFC 0059, which put [`STAGING`] at the slot
     /// the region used to start at. The shortfall is now two rather than one,
     /// and the trade is written down rather than absorbed: a CSpace holds 128
     /// slots and every one of them is spoken for, so a new fixed grant comes
@@ -215,9 +229,20 @@ pub mod adapter {
     pub const HANDLE_CAPACITY: usize = NETWORK - HANDLE_FLOOR;
 
     /// Every fixed grant, for the checks below.
-    const FIXED: [usize; 12] = [
-        ENDPOINT, REPORT, FAULTS, CONSOLE, CONTROL, CHILD, ROOT_DIR, LENT, INPUT_WAKE, STAGING,
-        NETWORK, PAYLOAD,
+    const FIXED: [usize; 13] = [
+        ENDPOINT,
+        REPORT,
+        FAULTS,
+        CONSOLE,
+        CONTROL,
+        CHILD,
+        ROOT_DIR,
+        LENT,
+        INPUT_WAKE,
+        STAGING,
+        WRITABLE_DIR,
+        NETWORK,
+        PAYLOAD,
     ];
 
     /// Whether `slot` is one a pool allocates from.
@@ -256,6 +281,7 @@ pub mod adapter {
         assert!(WAKES + WAKE_COUNT <= CONTROL);
         assert!(HANDLE_FLOOR > INPUT_WAKE);
         assert!(HANDLE_FLOOR > STAGING);
+        assert!(HANDLE_FLOOR > WRITABLE_DIR);
         assert!(NETWORK > HANDLE_FLOOR);
         assert!(SOCKETS > PAYLOAD);
         assert!(SOCKETS + SOCKET_COUNT <= DATAGRAM_BELL);
