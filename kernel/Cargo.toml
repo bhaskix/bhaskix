@@ -589,7 +589,15 @@ asm_budget = 10
 # the obligation rather than the smallest number of blocks; one helper holding
 # the copy, called ten times from safe loops, is six lines instead of
 # thirty-eight and says exactly what it promises in three arguments.
-unsafe_budget = 1989
+# 1990 for RFC 0062's `refresh_fs_base_here`: **one line**, the `load_fs_base`
+# that the IPI handler performs on the CPU the thread is actually running on.
+# It carries the same obligation `load_fs_base`'s other callers do -- a
+# user-mode segment base for a thread this CPU is about to return to -- and it
+# exists because that register is per CPU and the code that knows the new value
+# is running on a different one. Everything around it is safe: the queue is
+# taken with `try_lock`, the record is read through a reference, and the guard
+# is dropped before the write.
+unsafe_budget = 1990
 # Up thirty-one for RFC 0005 step 9's socket probe -- `ring3_socketeer`, which
 # is `ring3_lister` with a `sockaddr_in6` copied in beside its code instead of
 # two filenames. The same two blocks every hosted probe has: one
