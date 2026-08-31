@@ -2877,6 +2877,42 @@ else
     status=1
 fi
 
+# The other two authorities the adapter is given, asserted for the same reason
+# the writable one now is: **announced and unread is a thing that can quietly
+# stop happening.** Both were printed on every boot since they were built and
+# checked by nothing, and the failure shape of an ungated grant is already on
+# record here -- the socket probe reporting "the adapter was given none", which
+# names the probe rather than the grant that did not arrive.
+#
+# The kernel already distinguishes three states for each, so the gates do too:
+# granted, a capability that would not install (a failure), and no service to
+# grant from (an honest skip). Nothing new is printed for these; the lines have
+# existed all along and simply had no reader.
+if grep -qF "linux domain   holds a directory now" "$LOG"; then
+    pass "the adapter holds a read-only directory: hosted programs have files to open"
+elif grep -qF "linux domain   the directory would not install" "$LOG" \
+    || grep -qF "linux domain   no directory capability could be made" "$LOG"; then
+    fail "the adapter's directory grant failed: $(grep -aoE 'linux domain   (the directory|no directory).*' "$LOG" | head -1)"
+    status=1
+elif grep -qF "fs domain      no block service on this machine" "$LOG"; then
+    pass "no filesystem service on this machine, so there is no directory to grant"
+else
+    fail "the directory grant did not conclude: $(grep -aoE 'linux domain   .*director.*' "$LOG" | head -1)"
+    status=1
+fi
+
+if grep -qF "linux domain   holds a network now" "$LOG"; then
+    pass "the adapter holds a network: a hosted program's socket reaches bin/ipd"
+elif grep -qF "linux domain   the network capability would not install" "$LOG"; then
+    fail "the adapter's network grant failed: $(grep -aoE 'linux domain   the network.*' "$LOG" | head -1)"
+    status=1
+elif grep -qF "linux domain   no protocol service on this machine" "$LOG"; then
+    pass "no protocol service on this machine, so there are no sockets to grant"
+else
+    fail "the network grant did not conclude: $(grep -aoE 'linux domain   .*network.*' "$LOG" | head -1)"
+    status=1
+fi
+
 # RFC 0033 step 4: a pid is invented by the adapter and is **not** the domain
 # id. The claim a coincidence cannot satisfy is the one gated here: two hosted
 # programs that ran in the *same domain slot* were given **different** pids.
