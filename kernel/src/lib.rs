@@ -19127,6 +19127,12 @@ fn user_shell(handoff: &Handoff) -> Result<(), &'static str> {
             crate::console::TORN.load(core::sync::atomic::Ordering::Relaxed),
             crate::console::PRINTS.load(core::sync::atomic::Ordering::Relaxed)
         );
+        println!(
+            "    put_run split  {} run(s) did not land contiguously in the record; {} \
+             interloping byte(s)",
+            crate::console::NONCONTIGUOUS.load(core::sync::atomic::Ordering::Relaxed),
+            crate::console::INTERLOPER_BYTES.load(core::sync::atomic::Ordering::Relaxed)
+        );
         print!("    put_run runs   {at} total, last {count} as domain:bytes:");
         for index in 0..count {
             let slot = (at + lens.len() - count + index) % lens.len();
@@ -23809,12 +23815,25 @@ fn wait_queue_self_test(hhdm_base: u64) -> bool {
             // Noise without a probe: the experiment is whether *somebody
             // else's* line survives, and the hosted probe writes one later in
             // this boot.
-            match sched::spawn("tear-noise", tear_noise, 0, hhdm_base) {
-                Ok(_) => println!(
-                    "    tear noise     printing for {noise_ms} ms against whatever writes next"
-                ),
-                Err(error) => println!("    tear noise     no thread ({error:?})"),
+            // **Three threads, not one.** One printer against one writer tore
+            // 2 boots in 3 on the afternoon this was built, then 0 in 13 on
+            // the same tree with the same flag — a rate that moves with the
+            // machine, which is what §3 already records about this family of
+            // defects. Contention is the one variable this experiment
+            // controls, so it is the one to push.
+            let mut noise_threads = 0;
+            for index in 0..3u64 {
+                match sched::spawn("tear-noise", tear_noise, index, hhdm_base) {
+                    Ok(_) => noise_threads += 1,
+                    Err(error) => {
+                        println!("    tear noise     thread {index} refused ({error:?})");
+                    }
+                }
             }
+            println!(
+                "    tear noise     {noise_threads} thread(s) printing for {noise_ms} ms against \
+                 whatever writes next"
+            );
         }
         if runs > 0 {
             match sched::spawn("tear-noise", tear_noise, 0, hhdm_base) {
