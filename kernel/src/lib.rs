@@ -23836,6 +23836,26 @@ fn wait_queue_self_test(hhdm_base: u64) -> bool {
              marked",
             sched::mismarked_blocks()
         );
+        // **The number that separates the two readings left, and it was
+        // computed here already without ever being printed.**
+        //
+        // `RACES` counts the `block_self` recheck firing: a thread that
+        // reached the switch, found itself no longer `Blocked`, and returned
+        // instead of sleeping. That is the window between dropping the queue
+        // lock and switching, and it is the window a lost wakeup would have to
+        // live in.
+        //
+        // So on a stuck boot: **zero** says the recheck never fired, and the
+        // stuck station was not woken-then-re-blocked through that path —
+        // which points at the predicate rather than the scheduler. **Non-zero**
+        // says the window is live on this machine, and the station's own
+        // `wakes landed` count says whether one was aimed at it. Neither
+        // reading is available from a count of stuck stations, which is what
+        // three sightings were reduced to before the per-station line existed.
+        println!(
+            "                   {races} block/wake races caught by the recheck, {blocks} blocks \
+             and {wakeups} wakeups in this phase"
+        );
         // **Which station, and what it was waiting on.** Three sightings of
         // this failure were counted rather than read, and a count cannot tell
         // the two candidate mechanisms apart. These numbers can:
