@@ -3281,17 +3281,13 @@ const STAGE_EXEC_SHORT: i64 = -142;
 fn open_the_file(request: &PersonalityCall, path_at: u64, flags: u64) -> Answer {
     use bhaskix_personality::file::{Entry, Kind, open, plan_openat};
 
-    // Writing is refused before anything else, because the capability this
-    // program holds carries no `WRITE` right and a program told otherwise
-    // would discover it at the write.
-    if flags & open::ACCMODE != open::RDONLY {
-        return Answer::error(-30); // EROFS
-    }
+    // **The plan is used now** — RFC 0060. Until then this refused every
+    // non-read-only open with `EROFS` before looking at anything, computed the
+    // plan, and threw it away with `let _ = plan;`.
     let plan = match plan_openat(flags) {
         Ok(plan) => plan,
         Err(errno) => return Answer::error(errno),
     };
-    let _ = plan;
 
     let mut name = [0u8; MAX_NAME];
     if !copy_in(request.domain, path_at, &mut name) {
@@ -3304,6 +3300,14 @@ fn open_the_file(request: &PersonalityCall, path_at: u64, flags: u64) -> Answer 
     // cannot leak one.
     if let Some(file) = ProcFile::from_path(&name) {
         return open_proc(request, file, flags);
+    }
+    // `/tmp/<name>` resolves in the writable capability, and only there.
+    if let Some(component) = writable_component(&name) {
+        return open_writable(request, component, flags, plan);
+    }
+    // A write outside the writable directory is refused where it always was.
+    if plan.writable {
+        return Answer::error(-30); // EROFS
     }
     let Some(component) = one_component(&name) else {
         // **`/` and `.` are this process's own root**, and answering them is
@@ -3390,6 +3394,105 @@ fn names_own_root(name: &[u8]) -> bool {
 /// and [`answer_close`] carries the guard — releasing this handle would
 /// `DELETE` the adapter's only directory and every hosted process on the
 /// machine would stop finding files.
+/// Opens a name inside the one writable directory — RFC 0060.
+///
+/// The mirror of the read path against a different capability: it resolves
+/// through [`WRITABLE_DIR`], whose badge carries `dir::WRITABLE`, a bit only
+/// the kernel mints. What makes this writable is which capability is used, not
+/// a flag the caller passed.
+fn open_writable(
+    request: &PersonalityCall,
+    component: &[u8],
+    flags: u64,
+    plan: bhaskix_personality::file::OpenPlan,
+) -> Answer {
+    use bhaskix_personality::file::{Entry, Kind, open};
+
+    let Some(slot) = claim_file_slot() else {
+        return Answer::error(-24); // EMFILE
+    };
+    let (chunk, rest) = bhaskix_abi::Chunk::take(component);
+    if !rest.is_empty() {
+        release_file_slot(slot);
+        return Answer::error(-36); // ENAMETOOLONG
+    }
+    // **This is also the "is a writable directory held" check.** An empty slot
+    // has no capability to invoke, so one round trip answers both questions —
+    // and a first attempt that probed with `method::INFO` first answered
+    // `EROFS` on every machine, because `INFO` is a *domain* method.
+    if call(
+        syscall::INVOKE,
+        WRITABLE_DIR,
+        method::EXPECT,
+        [slot, 0, 0, 0],
+    )
+    .status
+        != status::OK
+    {
+        release_file_slot(slot);
+        trace_file(-30, STAGE_NO_DIRECTORY, 1);
+        return Answer::error(-30); // EROFS: none is held
+    }
+    let wanted = if plan.create {
+        bhaskix_abi::dir::CREATE_AT
+    } else {
+        bhaskix_abi::dir::OPEN_AT
+    };
+    let reply = call(syscall::CALL, WRITABLE_DIR, wanted, chunk.pack(0));
+    if reply.status != status::OK {
+        release_file_slot(slot);
+        trace_file(-5, STAGE_SERVICE_SILENT, reply.status);
+        return Answer::error(-5); // EIO
+    }
+    let outcome = reply.args[0];
+    if outcome == bhaskix_abi::dir::EXISTS {
+        release_file_slot(slot);
+        if plan.exclusive {
+            return Answer::error(-17); // EEXIST
+        }
+        // **Open it instead, and say so in the plan as well as the flags.**
+        // Clearing only the flag would leave `plan.create` true and recurse for
+        // ever, because the plan is what decides which method is sent.
+        let mut again = plan;
+        again.create = false;
+        return open_writable(request, component, flags & !open::CREAT, again);
+    }
+    if outcome != bhaskix_abi::dir::OK {
+        release_file_slot(slot);
+        trace_file(-2, STAGE_SERVICE_REFUSED, outcome);
+        return Answer::error(-2); // ENOENT
+    }
+
+    let entry = Entry {
+        handle: slot,
+        inode: reply.args[3],
+        kind: if reply.args[2] != 0 {
+            Kind::Directory
+        } else {
+            Kind::File
+        },
+        close_on_exec: flags & open::CLOEXEC != 0,
+        offset: 0,
+        size: reply.args[1],
+        readable: plan.readable,
+        writable: plan.writable,
+    };
+    let Some(process) = process_for(request.domain) else {
+        release_file_slot(slot);
+        return Answer::error(-11);
+    };
+    match process.descriptors.insert(entry, 0) {
+        Ok(descriptor) => {
+            trace_file(i64::from(descriptor), 0, entry.size);
+            Answer::ok(descriptor as u64)
+        }
+        Err(errno) => {
+            release_file_slot(slot);
+            Answer::error(errno)
+        }
+    }
+}
+
 fn open_own_root(request: &PersonalityCall, flags: u64) -> Answer {
     use bhaskix_personality::file::{Entry, Kind, open};
 
@@ -4630,6 +4733,39 @@ fn one_component(name: &[u8]) -> Option<&[u8]> {
 
 /// The longest path this personality reads out of a hosted program.
 const MAX_NAME: usize = 64;
+
+/// The one **writable** directory a hosted process has — RFC 0060.
+const WRITABLE_DIR: u64 = bhaskix_abi::adapter::WRITABLE_DIR as u64;
+
+/// The name it answers to inside a hosted process's root.
+const WRITABLE_NAME: &[u8] = b"tmp";
+
+/// Splits `/tmp/<name>` into its second component, when that is what it is.
+///
+/// **Two components, not general path walking.** `one_component` refuses
+/// separators, which is what confines a hosted process to the directory it was
+/// granted; this is the one exception and it is narrow on purpose — the first
+/// component must be exactly [`WRITABLE_NAME`], and what comes back is resolved
+/// in the *writable* capability. Deeper paths, `..`, or any other first
+/// component are still refused, so the exception cannot be widened by a caller.
+fn writable_component(name: &[u8]) -> Option<&[u8]> {
+    let start = name.iter().position(|byte| *byte != b'/')?;
+    let rest = &name[start..];
+    let end = rest
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(rest.len());
+    let rest = &rest[..end];
+    let slash = rest.iter().position(|byte| *byte == b'/')?;
+    if &rest[..slash] != WRITABLE_NAME {
+        return None;
+    }
+    let tail = &rest[slash + 1..];
+    if tail.is_empty() || tail.contains(&b'/') || tail == b"." || tail == b".." {
+        return None;
+    }
+    Some(tail)
+}
 
 /// What the filesystem service said about a name it resolved.
 #[derive(Clone, Copy)]

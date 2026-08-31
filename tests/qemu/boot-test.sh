@@ -2913,6 +2913,37 @@ else
     status=1
 fi
 
+# RFC 0060 step 2: a hosted program's open **resolves through the writable
+# directory**, and is not refused for want of one.
+#
+# The assertion is the errno. `ENOENT` means the adapter routed `/tmp/<name>`
+# to the writable capability, invoked it, and the service answered that the
+# name is not there -- so the path, the capability and the badge all worked.
+# `EROFS` is what every writable open answered before this step and is what it
+# would answer again if the routing or the grant regressed, so the two are
+# distinguishable and the weaker one fails.
+#
+# **It opens without `O_CREAT` deliberately, and the reason is a measurement.**
+# Creating the file works -- a hosted program got `fd 3` and a real file on the
+# disk -- but the journalled write that goes with it reproducibly tips the TCP
+# inbound gate: 5 boots of 5 red with the create, 3 of 3 green without it, and
+# 3 of 3 green on a control tree with no open at all. That is recorded against
+# the TCP defect in TRACKER §3, where it is a lever on something previously
+# called environmental. Until it is understood, this gate proves the path
+# without paying for it.
+if grep -qF "hosted open refused errno 2" "$LOG"; then
+    pass "a hosted program's open resolved through the writable directory (ENOENT, not EROFS)"
+elif grep -qF "hosted open refused errno 30" "$LOG"; then
+    fail "a hosted writable open was refused EROFS: the routing or the grant regressed"
+    status=1
+elif grep -qF "hosted exec    skipped" "$LOG" \
+    || grep -qF "fs domain      no block service on this machine" "$LOG"; then
+    pass "no filesystem service on this machine, so no hosted program opened anything"
+else
+    fail "the hosted writable open did not conclude: $(grep -aoE 'hosted open .*' "$LOG" | head -1)"
+    status=1
+fi
+
 # RFC 0033 step 4: a pid is invented by the adapter and is **not** the domain
 # id. The claim a coincidence cannot satisfy is the one gated here: two hosted
 # programs that ran in the *same domain slot* were given **different** pids.

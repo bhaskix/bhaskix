@@ -194,7 +194,27 @@ linux domain   holds a writable directory now: a hosted program may change what
                is under /tmp and nothing above it
 ```
 
-**Steps 2 and 3 were written, exercised, and taken back out.** The adapter's
+**Step 2 is done and gated as of 2026-08-31, and the bug was never in it.** A
+hosted program opens `/tmp/<name>` through the writable capability: with
+`O_CREAT` it gets a real file and `fd 3`, and without it a clean `ENOENT` from
+the writable directory rather than the `EROFS` every writable open used to get.
+The gate asserts that errno, because `ENOENT` and `EROFS` distinguish "the path
+and the capability worked" from "the routing or the grant regressed".
+
+**And what broke was measured rather than blamed.** Exercising the path
+reproducibly reddened a network gate, and the first write-up guessed at the
+adapter. It is neither: the failure follows the **journalled disk write**, not
+the code path. With `O_CREAT`, 5 boots of 5 red; the same routing, `EXPECT` and
+`CALL` without `O_CREAT`, 3 of 3 green; a control tree with no hosted open at
+all, 3 of 3 green. The victim is the TCP inbound gate, which §3 has called
+environmental since 2026-08-26 — so RFC 0060 has handed that defect a lever it
+did not have, and the finding is recorded there.
+
+**Step 3 remains out**, for the same reason: a write is a disk write, and until
+the interaction above is understood a gate that writes would be a gate that
+reddens the lane 5 times in 5 for something that is not its own fault.
+
+**The earlier write-up of this said something different and was wrong.** The adapter's
 `open_writable` and `write_to_file` worked far enough to reach the service —
 the first attempt returned `EROFS` from a probe using `method::INFO`, which is
 a *domain* method and fails on a directory capability whether or not one is

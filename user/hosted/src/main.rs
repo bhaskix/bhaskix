@@ -34,6 +34,26 @@ mod nr {
     pub const GETPID: u64 = 39;
     /// `exit_group(status)`.
     pub const EXIT_GROUP: u64 = 231;
+    /// `open(path, flags, mode)`.
+    pub const OPEN: u64 = 2;
+    /// `close(fd)`.
+    pub const CLOSE: u64 = 3;
+}
+
+/// `open` flags, from this machine's own headers.
+mod open {
+    /// Write only.
+    pub const WRONLY: u64 = 0o1;
+    /// Create if absent.
+    ///
+    /// **Not used, and kept deliberately.** Opening with it works — a hosted
+    /// program gets a real file and `fd 3` — but the journalled write that
+    /// follows reproducibly reddens the TCP inbound gate: 5 boots of 5 with
+    /// it, 3 of 3 without. It is measured in TRACKER §3 as a lever on that
+    /// defect, and this constant is what the next person flips to reproduce
+    /// it in one line.
+    #[allow(dead_code, reason = "the lever for TRACKER §3's TCP measurement")]
+    pub const CREAT: u64 = 0o100;
 }
 
 /// Auxiliary-vector entry types this program checks.
@@ -303,11 +323,42 @@ extern "C" fn hosted_main(stack: *const u64) -> ! {
     line.put(b"\n");
     line.flush();
 
+    // RFC 0060, step 2 in isolation: **open only, no write.** The bisect said
+    // exercising the write path breaks an unrelated socket gate, and which
+    // half does it was never established -- so this half runs alone.
+    open_only();
+
     syscall(nr::EXIT_GROUP, 0, 0, 0);
     // `exit_group` does not return. If it somehow does, stopping here is the
     // only honest thing left.
     #[allow(clippy::empty_loop)]
     loop {}
+}
+
+/// Opens a file under the writable directory and closes it. Nothing is
+/// written: this exists to say whether the *open* alone is what disturbs the
+/// machine.
+fn open_only() {
+    const PATH: &[u8] = b"/tmp/hosted.txt\0";
+
+    let mut line = Line::new();
+    line.put(b"hosted open ");
+    let fd = syscall(
+        nr::OPEN,
+        PATH.as_ptr() as u64,
+        open::WRONLY, // BISECT: no CREAT, so no journalled write
+        0o644,
+    );
+    if (fd as i64) < 0 {
+        line.put(b"refused errno ");
+        line.number(fd.wrapping_neg());
+    } else {
+        line.put(b"ok fd ");
+        line.number(fd);
+        syscall(nr::CLOSE, fd, 0, 0);
+    }
+    line.put(b"\n");
+    line.flush();
 }
 
 // The System V entry stub. `rsp` points at the initial process image, and it
