@@ -19052,14 +19052,26 @@ fn user_shell(handoff: &Handoff) -> Result<(), &'static str> {
         // cases: a boot where the probe printed nothing at all reported the
         // same word as a boot where the line was cut in half, and only one of
         // those says anything about the transport.
+        // **Four-valued, because three could not tell a torn line from a full
+        // buffer.** The recorder is a fixed 64 KiB that *truncates* when it
+        // fills — `record` counts the excess in `refused` and drops it — so
+        // "the needle is not here" has two causes and only one of them says
+        // anything about the console. A boot that overflowed cannot testify
+        // either way, and must say so instead of reporting ABSENT and being
+        // read as evidence. This verdict was three-valued for one afternoon
+        // and the third value was doing exactly that.
         let whole = crate::console::recorded_contains(b"hosted open refused errno 2\n");
         let started = crate::console::recorded_contains(b"hosted open ");
+        let (kept, refused) = crate::console::recorded();
         println!(
-            "    console record  the hosted line is {} in this kernel's own record",
-            match (whole, started) {
-                (true, _) => "WHOLE",
-                (false, true) => "TORN (its opening is here, the rest is not)",
-                (false, false) => "ABSENT (the probe printed nothing)",
+            "    console record  the hosted line is {} in this kernel's own record ({kept} bytes \
+             kept, {refused} refused)",
+            match (whole, started, refused) {
+                (true, _, _) => "WHOLE",
+                (false, true, _) => "TORN (its opening is here, the rest is not)",
+                (false, false, 0) => "ABSENT (the probe printed nothing, and the record is intact)",
+                (false, false, _) =>
+                    "UNTESTABLE (the record overflowed, so its silence proves nothing)",
             }
         );
         let (lens, tags, heads, at) = crate::console::run_lengths();
