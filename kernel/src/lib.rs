@@ -427,6 +427,11 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
         {
             TEAR_PROBE_RUNS.store(runs.min(4_000), core::sync::atomic::Ordering::Relaxed);
         }
+        if let Some(value) = word.strip_prefix("tearnoise=")
+            && let Ok(ms) = value.parse::<u64>()
+        {
+            TEAR_NOISE_MS.store(ms.min(120_000), core::sync::atomic::Ordering::Relaxed);
+        }
         if let Some(value) = word.strip_prefix("ringload=")
             && let Ok(threads) = value.parse::<u64>()
         {
@@ -3815,6 +3820,18 @@ static CORPUS_PROGRAM: core::sync::atomic::AtomicU8 = core::sync::atomic::Atomic
 /// port and the emulator and the capture. Zero, so a boot without the flag does
 /// nothing at all.
 static TEAR_PROBE_RUNS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// How long `tearnoise=<ms>` keeps a CPU printing, in milliseconds.
+///
+/// **Separate from the probe above because the conditions are.** 2,200 runs of
+/// `put_run` against a printing CPU could not be torn, and the ring 3 path is
+/// exercised constantly by `bin/consoled` on the shell's behalf without
+/// tearing either — but the shell runs *after* the boot report, when the kernel
+/// has gone quiet. The real tear only ever appears while a ring 3 program
+/// writes **and** the report is still printing, and nothing in this tree could
+/// arrange that on purpose. This arranges it: noise that outlives the ring test
+/// and is still running when the hosted probe writes its line.
+static TEAR_NOISE_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// `ringsoak=<ms>` on the command line raises it, and nothing else changes: the
 /// stations, the protocol, the retire and the report are identical.
@@ -23084,11 +23101,23 @@ extern "C" fn ring_station(id: u64) -> ! {
 /// unpredictable to be an experiment.
 extern "C" fn tear_noise(_id: u64) -> ! {
     use core::sync::atomic::Ordering;
+    // A deadline rather than a count: what matters is *spanning* the window a
+    // ring 3 program writes in, and a count of lines says nothing about how
+    // long it takes to print them.
+    let deadline = bhaskix_arch::tsc::read() + TEAR_NOISE_MS.load(Ordering::Acquire) * 1_000_000;
     loop {
-        if TEAR_PROBE_RUNS.load(Ordering::Acquire) == 0 {
+        let probing = TEAR_PROBE_RUNS.load(Ordering::Acquire) != 0;
+        let noising =
+            TEAR_NOISE_MS.load(Ordering::Acquire) != 0 && bhaskix_arch::tsc::read() < deadline;
+        if !probing && !noising {
             sched::exit();
         }
-        println!("    tear noise     a line printed to contend with a run in flight");
+        // **Short on purpose.** A sixty-byte line filled the 64 KiB recorder in
+        // one boot and made the verdict `UNTESTABLE` -- the instrument
+        // declining, correctly, but an experiment that cannot be read is not
+        // one. Two bytes contend just as often per line and leave the record
+        // able to answer.
+        println!("n");
     }
 }
 
@@ -23775,6 +23804,18 @@ fn wait_queue_self_test(hhdm_base: u64) -> bool {
     // Nothing happens without the flag.
     {
         let runs = TEAR_PROBE_RUNS.load(Ordering::Acquire);
+        let noise_ms = TEAR_NOISE_MS.load(Ordering::Acquire);
+        if runs == 0 && noise_ms > 0 {
+            // Noise without a probe: the experiment is whether *somebody
+            // else's* line survives, and the hosted probe writes one later in
+            // this boot.
+            match sched::spawn("tear-noise", tear_noise, 0, hhdm_base) {
+                Ok(_) => println!(
+                    "    tear noise     printing for {noise_ms} ms against whatever writes next"
+                ),
+                Err(error) => println!("    tear noise     no thread ({error:?})"),
+            }
+        }
         if runs > 0 {
             match sched::spawn("tear-noise", tear_noise, 0, hhdm_base) {
                 Ok(_) => tear_probe(runs),
