@@ -241,10 +241,24 @@ steps 2 and 3 are done properly.
 
 ## Implementation plan
 
-1. ✅ **Done.** `bin/fsd` creates the writable directory and reports its handle,
-   as it does for `pkg`; the kernel mints the writable badge into a new adapter
-   slot, and the boot report says whether it holds one — **including when it
-   does not**, which the first version left silent.
+1. ✅ **Done and gated.** `bin/fsd` creates the writable directory and reports
+   its handle, as it does for `pkg`; the kernel mints the writable badge into a
+   new adapter slot, and the boot report says whether it holds one —
+   **including when it does not**, which the first version left silent.
+
+   The gate is the **first positive assertion on an authority** in this
+   harness: the read-only directory and the network are both announced on every
+   boot and asserted by nothing, so a grant that quietly stopped happening
+   would present as some later gate failing for an unrelated-sounding reason.
+   Three outcomes are told apart — granted; a filesystem with no writable
+   directory, which is a failure of the service; and no filesystem at all,
+   which is an honest skip. **Armed**: forcing the handle to zero turns the
+   iommu lane red with the service named.
+
+   It deliberately does **not** assert that a hosted program can write through
+   it, because one cannot — steps 2 and 3 are withdrawn, and claiming the
+   authority works because it was granted is the same gap between "the counter
+   exists" and "the counter is read" that this tree has paid for repeatedly.
 2. `open_the_file` stops discarding `plan_openat`'s answer: writable opens go
    to the writable directory, `O_CREAT` to `CREATE_AT`, and the read-only root
    still answers `EROFS`.

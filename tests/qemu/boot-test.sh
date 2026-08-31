@@ -2840,6 +2840,43 @@ else
     status=1
 fi
 
+# RFC 0060 step 1: the adapter holds a **writable** directory.
+#
+# **A positive gate for an authority, which is a thing this file did not have
+# before.** The two grants beside it -- the read-only directory and the network
+# -- are announced on every boot and asserted by nothing, so a grant that
+# silently stopped happening would present as some later gate failing for a
+# reason that names something else entirely. This one is asserted where it is
+# announced.
+#
+# Three outcomes, told apart rather than merged, because they mean different
+# things and want different work:
+#
+#   * granted -- the capability is in the adapter's CSpace, minted with the
+#     writable badge that only the kernel can stamp;
+#   * a filesystem exists and there is **no** writable directory -- `bin/fsd`
+#     could not make `sub/tmp`, which is a failure of the service and not of
+#     the machine;
+#   * no filesystem service at all -- the ordinary case on four of five lanes,
+#     and an honest skip.
+#
+# What this does **not** assert is that a hosted program can write through it.
+# It cannot yet: RFC 0060's steps 2 and 3 were withdrawn, and claiming the
+# authority works because it was granted is exactly the gap between "the
+# counter exists" and "the counter is read" that this tree has paid for
+# repeatedly.
+if grep -qF "linux domain   holds a writable directory now" "$LOG"; then
+    pass "the adapter holds a writable directory: a hosted program's writes have somewhere to go"
+elif grep -qF "linux domain   no writable directory" "$LOG"; then
+    fail "this machine has a filesystem and bin/fsd made no writable directory: $(grep -aoE 'linux domain   no writable directory.*' "$LOG" | head -1)"
+    status=1
+elif grep -qF "fs domain      no block service on this machine" "$LOG"; then
+    pass "no filesystem service on this machine, so there is no writable directory to grant"
+else
+    fail "the writable directory grant did not conclude: $(grep -aoE 'linux domain   .*writable.*' "$LOG" | head -1)"
+    status=1
+fi
+
 # RFC 0033 step 4: a pid is invented by the adapter and is **not** the domain
 # id. The claim a coincidence cannot satisfy is the one gated here: two hosted
 # programs that ran in the *same domain slot* were given **different** pids.
