@@ -330,6 +330,38 @@ descriptor number did not come from a fresh record and that hypothesis is dead; 
 `holding 1` the admission itself is wrong. Either answer closes a branch, which is more than any
 instrument in this RFC has managed so far.
 
+## Whose bind was it (2026-09-01)
+
+The gate reports the taker's `bind` answering **1**. `answer_bind` returns `Answer::ok(0)` or
+`Answer::error(-errno)`, so a positive one is not an answer it can give — which has been recorded
+here as a loose end for a day without anything able to pursue it.
+
+The richest specimen so far sharpened it into a contradiction. On a boot where the reclaim failed:
+
+    socket reclaim FAILED: ... bound again false (fd 1, bind 1), forgets 1
+    the adapter last recorded: 3 at stage -130 (the adapter thinks it bound port 7781)
+
+Stage −130 is `STAGE_SOCKET`, which `answer_bind` writes only when a bind **succeeded** — descriptor
+3, port 7781. So the adapter's own record says its last bind worked, while the gate says the taker's
+bind answered 1 on descriptor 1. Both cannot describe the same call, and nothing could say whether
+they did, because the record does not carry **whose** bind it was.
+
+`report::BIND_AT` carries that now: the asking domain and the outcome, written on **both** paths.
+Two words, which is exactly what was left in the report page before the scratch — the layout's
+compile-time assertion covers them. A domain absent from that record did not reach `answer_bind`.
+
+The healthy baseline, taken by forcing the failure branch on a boot where the reclaim works:
+
+    bound again true (fd 3, bind 0), forgets 2
+    last bind: domain 18, errno 0, port 7781, service word 0
+    the adapter last recorded: 3 at stage -130 (the adapter thinks it bound port 7781)
+
+The taker is domain 18, and the two records agree. On a failing boot they will either name the same
+domain — in which case the record *is* the taker's and a bind that returned 1 came out of a function
+that cannot return 1 — or a different one, in which case the taker's call never arrived and every
+instrument aimed at `answer_bind` has been watching the wrong thing. Both answers close something,
+which is more than this RFC has managed since it was opened.
+
 **So the next instrument samples at the failure rather than after it.** `bin/ipd` knows when it
 refuses a bind; latching the whole table at that instant would show what was held *then*, which is
 the question. That is a service-side change of a few lines and no new capability, and it is the

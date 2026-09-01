@@ -2912,6 +2912,25 @@ static LAST_ADMITTED_HELD: core::sync::atomic::AtomicU64 = core::sync::atomic::A
 /// The most file slots held at once, over the whole boot.
 static FILE_PEAK: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
+/// Where the bind record sits.
+const BIND_RECORD_AT: u64 = REPORT_AT + report::BIND_AT as u64;
+
+/// Records which domain asked to bind and what it was told — RFC 0063.
+///
+/// Written on **both** paths, so a domain with no record here did not reach
+/// this function. That is the distinction the reclaim hunt has been missing:
+/// its gate sees a bind answer 1, which `answer_bind` cannot produce.
+fn trace_bind(domain: u32, errno: i64, port: u16, refusal: u64) {
+    let outcome = ((-errno) as u64 & 0xffff) | (u64::from(port) << 16) | (refusal << 32);
+    // SAFETY: inside the page `ATTACH` mapped from this program's own object,
+    // past the process record and before the scratch -- asserted in
+    // `bhaskix_personality::report`.
+    unsafe {
+        core::ptr::write_volatile(BIND_RECORD_AT as *mut u64, u64::from(domain));
+        core::ptr::write_volatile((BIND_RECORD_AT + 8) as *mut u64, outcome);
+    }
+}
+
 /// Where the process record sits.
 const PROCESS_RECORD_AT: u64 = REPORT_AT + report::PROCESS_AT as u64;
 
@@ -4350,6 +4369,7 @@ fn answer_bind(request: &PersonalityCall) -> Answer {
                 entry.size = u64::from(port);
             }
             trace_file(i64::from(descriptor), STAGE_SOCKET, u64::from(port));
+            trace_bind(request.domain, 0, port, 0);
             Answer::ok(0)
         }
         Err(refusal) => {
@@ -4372,6 +4392,7 @@ fn answer_bind(request: &PersonalityCall) -> Answer {
                 STAGE_NOT_BOUND,
                 refusal.word() << 16 | u64::from(port),
             );
+            trace_bind(request.domain, errno, port, refusal.word());
             release_socket_slot(slot);
             Answer::error(errno)
         }

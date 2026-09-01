@@ -122,6 +122,25 @@ pub mod report {
     /// came back.
     pub const PROCESS_AT: usize = SOCKET_AT + 16;
 
+    /// The bind record: which domain asked, and what it was told.
+    ///
+    /// **The question the socket-reclaim hunt cannot currently answer.** Its
+    /// gate reports `fd 1, bind 1` from the taker, and `answer_bind` returns
+    /// `Answer::ok(0)` or `Answer::error(-errno)`, so a positive one is not an
+    /// answer it can give. On the richest specimen so far the adapter's last
+    /// file record said a bind had *succeeded*, descriptor 3, port 7781, while
+    /// the gate said the taker's bind answered one. Either the record belongs
+    /// to the previous program and
+    /// the taker's bind never reached `answer_bind` at all, or the record is
+    /// stale. Nothing distinguishes those, because the record does not say
+    /// **whose** bind it was.
+    ///
+    /// Two words: the domain that asked, and its outcome packed as errno in the
+    /// low sixteen bits, the port above them, and the service's refusal word
+    /// above that. Written on both paths, so "no record for this domain" means
+    /// the call did not arrive.
+    pub const BIND_AT: usize = PROCESS_AT + 48;
+
     /// Where bulk staging begins.
     ///
     /// Rounded up to 512 from the end of the records, so the boundary is
@@ -143,7 +162,7 @@ pub mod report {
     pub const PAGE: usize = 4096;
 
     /// Every record ends before the scratch begins.
-    const _: () = assert!(PROCESS_AT + 48 <= SCRATCH_AT);
+    const _: () = assert!(BIND_AT + 16 <= SCRATCH_AT);
     /// And the scratch ends inside the page.
     const _: () = assert!(SCRATCH_AT + SCRATCH_BYTES == PAGE);
     /// The fault log is past the traces, which is what it used to claim and

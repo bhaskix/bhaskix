@@ -233,7 +233,17 @@ asm_budget = 3
 # last of those decides the open branch: a fresh record holds three, and the
 # failing specimen's socket landed on descriptor one. Written as a loop rather
 # than four statements precisely so it costs five and not twelve.
-unsafe_budget = 113
+#
+# 117 on 2026-09-01, four lines, and the same hunt still. Its gate reports the
+# taker's bind answering a positive 1, which `answer_bind` cannot return -- it
+# gives `ok(0)` or `error(-errno)`. On the richest specimen the adapter's own
+# file record said a bind had succeeded, descriptor 3, port 7781, while the gate
+# said 1, and nothing could say whether those were the same bind: the record does
+# not carry **whose** it was. Two volatile writes now record the asking domain
+# and the outcome on both paths, so a domain absent from that record never
+# reached the function. That is the one distinction three days of instruments
+# have not been able to draw.
+unsafe_budget = 117
 # Up five for RFC 0005 step 9's datagram page: the volatile writes that stage
 # a payload into it, the volatile reads that take one back out, and the static
 # that remembers whether it has been mapped.

@@ -4082,6 +4082,40 @@ fn wait_for_probe_threads(realm: domain::DomainId) {
 /// `bhaskix_personality::report::PROCESS_AT` -- `process_for` is not a lookup,
 /// and until this existed a boot could not be asked how often it had quietly
 /// created a record where a caller believed it was reading one.
+/// Which domain last asked `bin/linuxd` to bind, and what it was told.
+///
+/// Two words — see `bhaskix_personality::report::BIND_AT`. A domain that does
+/// not appear here never reached `answer_bind`, which is the distinction the
+/// socket-reclaim gate has been unable to draw.
+fn adapter_bind_record() -> (u64, u64) {
+    let page = ADAPTER_REPORT.load(core::sync::atomic::Ordering::Acquire);
+    if page == u64::MAX {
+        return (0, 0);
+    }
+    const FIRST_WORD: usize = bhaskix_personality::report::BIND_AT / 8;
+    let object = shared::MemoryId::from_u64(page);
+    let mut record = [0u64; 2];
+    let mut at = 0usize;
+    let taken = shared::drain_into(object, (FIRST_WORD + 2) * 8, &mut |chunk: &[u8]| {
+        for word in chunk.as_chunks::<8>().0 {
+            if at >= FIRST_WORD + 2 {
+                break;
+            }
+            if at >= FIRST_WORD {
+                let mut eight = [0u8; 8];
+                eight.copy_from_slice(word);
+                record[at - FIRST_WORD] = u64::from_le_bytes(eight);
+            }
+            at += 1;
+        }
+        chunk.len()
+    });
+    if taken.is_none() {
+        return (0, 0);
+    }
+    (record[0], record[1])
+}
+
 fn adapter_process_record() -> [u64; 6] {
     let page = ADAPTER_REPORT.load(core::sync::atomic::Ordering::Acquire);
     if page == u64::MAX {
@@ -9383,6 +9417,18 @@ fn killed_domain_gives_its_socket_back(hhdm_base: u64, cpus: u32) -> bool {
         // been reporting cannot come from `answer_bind` at all: that function
         // returns 0 or a negative errno, and the taker has been seen answering
         // a positive 1.
+        // **Whose bind, and what it was told.** The gate above reports a value
+        // `answer_bind` cannot return, so the question is whether the taker's
+        // bind reached that function at all. A domain here that is not the
+        // taker's says it did not.
+        let (bind_domain, outcome) = adapter_bind_record();
+        println!(
+            "\x1b[91m                   last bind: domain {bind_domain}, errno {}, port {}, \
+             service word {}\x1b[0m",
+            outcome & 0xffff,
+            (outcome >> 16) & 0xffff,
+            outcome >> 32
+        );
         let (last, stage, detail) = adapter_file_record();
         println!(
             "\x1b[91m                   the adapter last recorded: {last} at stage {stage}\
