@@ -94,6 +94,24 @@ pub mod report {
     /// every gate, and the difference is the whole margin.
     pub const SOCKET_AT: usize = LEND_AT + 16;
 
+    /// The process record: records admitted, records found, the last domain a
+    /// record was admitted for, and how many descriptors that record held.
+    ///
+    /// **Because `process_for` is not a lookup and the boot never said so.**
+    /// It admits a fresh record when none matches `(domain, generation)`, so
+    /// "no record for this domain" and "here is a record for this domain" are
+    /// the same answer to every caller — and `release_sockets_of` walking a
+    /// record admitted a moment earlier releases nothing and reports success.
+    /// That path was written down as a suspect in the socket-reclaim hunt days
+    /// before anything could see it happen.
+    ///
+    /// The fourth word is the one that turns a count into evidence: the
+    /// reclaim gate's failing specimen showed a socket landing on descriptor
+    /// **1**, and a table with the three standard descriptors installed hands
+    /// out **3**. So the occupancy at the moment of admission says whether the
+    /// record the taker used had stdio at all.
+    pub const PROCESS_AT: usize = SOCKET_AT + 16;
+
     /// Where bulk staging begins.
     ///
     /// Rounded up to 512 from the end of the records, so the boundary is
@@ -115,7 +133,7 @@ pub mod report {
     pub const PAGE: usize = 4096;
 
     /// Every record ends before the scratch begins.
-    const _: () = assert!(SOCKET_AT + 16 <= SCRATCH_AT);
+    const _: () = assert!(PROCESS_AT + 32 <= SCRATCH_AT);
     /// And the scratch ends inside the page.
     const _: () = assert!(SCRATCH_AT + SCRATCH_BYTES == PAGE);
     /// The fault log is past the traces, which is what it used to claim and

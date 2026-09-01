@@ -220,7 +220,20 @@ asm_budget = 3
 # printed -- and every socket-reclaim failure has been silent about the single
 # question that separates its two causes. Nine lines to stop a defect being
 # invisible is the cheapest thing in this file.
-unsafe_budget = 108
+#
+# 113 on 2026-09-01, five lines, same hunt and the same reasoning one layer
+# further in. `process_for` is not a lookup -- it admits a fresh record when
+# none matches (domain, generation), so "no record for this domain" and "a
+# record for this domain" are one answer to every caller, and
+# `release_sockets_of` walking a record admitted moments earlier releases
+# nothing and reports success. That path has been written down as a suspect
+# twice in this investigation and instrumented neither time, so the suspicion
+# stayed a sentence. Five lines publish four words -- admitted, found, the last
+# domain admitted for, and how many descriptors that record held -- and the
+# last of those decides the open branch: a fresh record holds three, and the
+# failing specimen's socket landed on descriptor one. Written as a loop rather
+# than four statements precisely so it costs five and not twelve.
+unsafe_budget = 113
 # Up five for RFC 0005 step 9's datagram page: the volatile writes that stage
 # a payload into it, the volatile reads that take one back out, and the static
 # that remembers whether it has been mapped.

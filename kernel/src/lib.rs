@@ -4066,6 +4066,42 @@ fn wait_for_probe_threads(realm: domain::DomainId) {
 /// directory capability does not exist until the filesystem service does. It
 /// printed three zeros every time, which is what a record written after its
 /// reader looks like.
+/// What `process_for` in the adapter has admitted and found.
+///
+/// Four words: records admitted, records found, the last domain admitted for,
+/// and how many descriptors that record held. See
+/// `bhaskix_personality::report::PROCESS_AT` -- `process_for` is not a lookup,
+/// and until this existed a boot could not be asked how often it had quietly
+/// created a record where a caller believed it was reading one.
+fn adapter_process_record() -> (u64, u64, u64, u64) {
+    let page = ADAPTER_REPORT.load(core::sync::atomic::Ordering::Acquire);
+    if page == u64::MAX {
+        return (0, 0, 0, 0);
+    }
+    const FIRST_WORD: usize = bhaskix_personality::report::PROCESS_AT / 8;
+    let object = shared::MemoryId::from_u64(page);
+    let mut record = [0u64; 4];
+    let mut at = 0usize;
+    let taken = shared::drain_into(object, (FIRST_WORD + 4) * 8, &mut |chunk: &[u8]| {
+        for word in chunk.as_chunks::<8>().0 {
+            if at >= FIRST_WORD + 4 {
+                break;
+            }
+            if at >= FIRST_WORD {
+                let mut eight = [0u8; 8];
+                eight.copy_from_slice(word);
+                record[at - FIRST_WORD] = u64::from_le_bytes(eight);
+            }
+            at += 1;
+        }
+        chunk.len()
+    });
+    if taken.is_none() {
+        return (0, 0, 0, 0);
+    }
+    (record[0], record[1], record[2], record[3])
+}
+
 fn adapter_file_record() -> (i64, i64, u64) {
     let page = ADAPTER_REPORT.load(core::sync::atomic::Ordering::Acquire);
     if page == u64::MAX {
@@ -9269,6 +9305,19 @@ fn killed_domain_gives_its_socket_back(hhdm_base: u64, cpus: u32) -> bool {
         domain::end(taker, domain::Ending::Killed);
     }
 
+    // **What `process_for` did, on every boot rather than only a failing one.**
+    // It is not a lookup: it admits a fresh record when none matches
+    // `(domain, generation)`, so "no record" and "a record" are the same answer
+    // to every caller, and `release_sockets_of` walking one admitted a moment
+    // earlier releases nothing and reports success. Printed unconditionally
+    // because a number that only appears on the boot that fails has no
+    // baseline to be compared against -- which is exactly how this gate came to
+    // print a descriptor number for a week that nobody could read.
+    let (admitted, found, last_domain, held) = adapter_process_record();
+    println!(
+        "    process records {admitted} admitted, {found} found; last admitted for domain \
+         {last_domain} holding {held} descriptor(s)"
+    );
     if held_it && reaped && same_slot && bound_again {
         println!(
             "    socket reclaim a domain killed while holding a bound socket gave it back: the \

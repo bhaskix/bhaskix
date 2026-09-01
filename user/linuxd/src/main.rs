@@ -2899,6 +2899,41 @@ static mut INCARNATION: [u32; limits::MAX_DOMAINS] = [0; limits::MAX_DOMAINS];
 /// is the introduction, and a program that makes no call has no record and
 /// needs none. A table that is full answers `None`, and the caller turns that
 /// into the refusal Linux has for it.
+/// How many records `process_for` has admitted, and how many it found.
+///
+/// See `bhaskix_personality::report::PROCESS_AT` for why these exist. Written
+/// to the report page so the boot can be asked rather than reasoned about.
+static ADMITTED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static FOUND: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static LAST_ADMITTED_DOMAIN: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(u64::MAX);
+static LAST_ADMITTED_HELD: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Where the process record sits.
+const PROCESS_RECORD_AT: u64 = REPORT_AT + report::PROCESS_AT as u64;
+
+/// Publishes what `process_for` has been doing.
+fn trace_process() {
+    use core::sync::atomic::Ordering::Relaxed;
+    let words = [
+        ADMITTED.load(Relaxed),
+        FOUND.load(Relaxed),
+        LAST_ADMITTED_DOMAIN.load(Relaxed),
+        LAST_ADMITTED_HELD.load(Relaxed),
+    ];
+    // A loop rather than four statements, because each one would be a line of
+    // `unsafe` against this program's budget and they say the same thing.
+    //
+    // SAFETY: inside the page `ATTACH` mapped from this program's own object,
+    // past the socket record and before the scratch -- the layout is asserted
+    // in `bhaskix_personality::report`.
+    unsafe {
+        for (index, word) in words.into_iter().enumerate() {
+            core::ptr::write_volatile((PROCESS_RECORD_AT + index as u64 * 8) as *mut u64, word);
+        }
+    }
+}
+
 fn process_for(domain: u32) -> Option<&'static mut Process> {
     // SAFETY: single-threaded by construction, as `dispositions_of`.
     let incarnations = incarnation();
@@ -2906,6 +2941,8 @@ fn process_for(domain: u32) -> Option<&'static mut Process> {
     // SAFETY: as above.
     let processes = processes();
     if processes.by_domain(domain, generation).is_none() {
+        ADMITTED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        LAST_ADMITTED_DOMAIN.store(u64::from(domain), core::sync::atomic::Ordering::Relaxed);
         // Parent zero: nothing hosted started it, so nothing will wait for it.
         // When `fork` and `execve` exist, the parent is the process that asked.
         let pid = processes.admit(0, domain, generation).ok()?;
@@ -2923,6 +2960,20 @@ fn process_for(domain: u32) -> Option<&'static mut Process> {
             .by_pid_mut(pid)?
             .descriptors
             .install_standard(CONSOLE);
+        // How many descriptors the fresh record actually ended up holding. The
+        // reclaim gate's specimen showed a socket landing on descriptor 1, and
+        // a table with the three standard descriptors installed hands out 3 --
+        // so this is the number that says whether that record had stdio.
+        LAST_ADMITTED_HELD.store(
+            processes
+                .by_pid_mut(pid)
+                .map_or(0, |fresh| fresh.descriptors.open_count() as u64),
+            core::sync::atomic::Ordering::Relaxed,
+        );
+        trace_process();
+    } else {
+        FOUND.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        trace_process();
     }
     processes.by_domain_mut(domain, generation)
 }

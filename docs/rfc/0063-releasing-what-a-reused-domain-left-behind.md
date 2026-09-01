@@ -301,6 +301,35 @@ on the floor. The new line was armed by forcing the failure branch, so its decod
 the specimen it exists for arrives — twelve boots after adding it produced no failure, which is
 consistent with the rate this defect has always had.
 
+## Asking `process_for` what it does, on every boot (2026-09-01)
+
+`process_for` has been named a suspect in this hunt twice — once when it was written down as "not a
+lookup: it admits a fresh empty record when none matches `(domain, generation)`", and again when the
+descriptor number pointed at a table with no stdio. Both times the next step was "instrument it",
+and both times the instrument was never built, so the suspicion stayed a sentence.
+
+It is built now, in the layout module both rings share rather than at an address one of them guessed:
+`report::PROCESS_AT`, four words — records admitted, records found, the last domain admitted for,
+and how many descriptors that record held. The layout's own compile-time assertion that every record
+ends before the scratch was updated to cover it, so the new record cannot silently walk into the
+staging area the way `FAULT_LOG_OFFSET` once did.
+
+A healthy boot reads:
+
+    process records 31 admitted, 146 found; last admitted for domain 18 holding 3 descriptor(s)
+
+**Printed on every boot, not only a failing one**, which is the correction this hunt keeps having to
+make: the descriptor number in the paragraph above had been printed for a week and was unreadable
+because there was nothing to compare it against.
+
+**Three is the number that matters.** A freshly admitted record has the three standard descriptors
+installed, so the first socket opened through it lands on descriptor 3 — which is what a healthy
+taker gets. The failing specimen got descriptor 1, meaning a table holding one descriptor at slot 0.
+`install_standard` installs three unconditionally, so if a failing boot reads `holding 3` then the
+descriptor number did not come from a fresh record and that hypothesis is dead; if it reads
+`holding 1` the admission itself is wrong. Either answer closes a branch, which is more than any
+instrument in this RFC has managed so far.
+
 **So the next instrument samples at the failure rather than after it.** `bin/ipd` knows when it
 refuses a bind; latching the whole table at that instant would show what was held *then*, which is
 the question. That is a service-side change of a few lines and no new capability, and it is the
