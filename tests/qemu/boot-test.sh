@@ -2560,11 +2560,32 @@ if grep -qE "no network this machine can drive" "$LOG"; then
     pass "wedge probe skipped: this machine has no network"
 elif [[ "$(cat "$WEDGE_ATTEMPTS" 2>/dev/null || echo 0)" == "0" ]]; then
     pass "wedge probe never opened a connection: nothing to conclude (see the inbound gate above)"
+# **The property, not a proxy for it.** This demanded `reclaim >= 1` and failed
+# with "the accepted slot is held by a connection" -- a cause it never measured.
+# It fired twice on 2026-09-01, and the first boot after `bin/tcpd` was asked
+# what the accepted slot actually held answered: *empty*. Nothing was reclaimed
+# because no wedge had formed, on a boot where the port served every connection
+# correctly. The gate was asserting that a race must land, and calling it a
+# defect when it did not.
+#
+# What RFC 0061 promises is that a connection nobody accepted does not wedge the
+# port. A standing wedge is an accepted slot **held** by a connection **no
+# application claimed** -- which is exactly what the report now carries, and
+# exactly what this now tests. A reclaim is still the strongest evidence and is
+# reported when it happens; an empty slot is a boot where there was nothing to
+# reclaim, which is a pass and used to be a failure.
 elif grep -qE "tcpd reclaim +[1-9][0-9]* connection" "$LOG"; then
     reclaimed=$(grep -oE "tcpd reclaim +[0-9]+" "$LOG" | grep -oE "[0-9]+$" | head -1)
-    pass "a connection nobody accepted did not wedge the port: ${reclaimed} reclaimed, and the inbound echo was still served"
+    pass "a connection nobody accepted did not wedge the port: ${reclaimed} reclaimed, and the inbound echo still served"
+elif grep -qF "the accepted slot is empty" "$LOG"; then
+    pass "no wedge formed on this boot: the accepted slot is empty, so there was nothing to reclaim"
+elif grep -qF "held by an application, which the rule declines by design" "$LOG"; then
+    pass "the accepted slot is held by an application, which is a connection in use rather than a wedge"
+elif grep -qF "the state, not the claim, is why the rule declined" "$LOG"; then
+    fail "a connection nobody claimed is holding the accepted slot and was not reclaimed: $(grep -oE 'tcpd reclaim   none; the accepted slot holds state [0-9]+.*' "$LOG" | head -1)"
+    status=1
 else
-    fail "the wedge probe opened $(cat "$WEDGE_ATTEMPTS" 2>/dev/null) connection(s) and bin/tcpd reclaimed none: the accepted slot is held by a connection with no local user (RFC 0061)"
+    fail "bin/tcpd did not report what its accepted slot holds, so whether a wedge stands cannot be told"
     status=1
 fi
 rm -f "$WEDGE_ATTEMPTS" 2>/dev/null || true

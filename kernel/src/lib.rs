@@ -9148,9 +9148,32 @@ fn run_bell_program(
     ) else {
         stop()
     };
+    // **The report page is zeroed first, and this is the whole of the
+    // socket-reclaim defect.** Every one of these probes reports by writing
+    // words into this page, and the kernel waits for a word to become non-zero
+    // before reading the rest. The page was never cleared, so it arrived
+    // holding whatever the recycled frame last contained -- and a non-zero word
+    // there satisfies the wait *before the program has run*, handing the gate
+    // somebody else's bytes.
+    //
+    // That is exactly the specimen: the reclaim gate read `fd 1, bind 1` from
+    // the taker while `bin/linuxd`'s own record said it had bound descriptor 3,
+    // port 7781, for that domain, successfully -- the same record a passing
+    // boot writes. The adapter was right every time; the page was stale. It is
+    // intermittent because it depends on what the frame held before, which is
+    // why three days of instruments aimed at the adapter found nothing wrong
+    // with it.
+    //
+    // The comment lives out here rather than inside the block on purpose: the
+    // budget counter counts every line within an `unsafe`, and seventeen lines
+    // of explanation charged as seventeen lines of unsafe is a number that
+    // stops meaning what it is for.
+    //
     // SAFETY: freshly mapped frames this space owns, filled through the direct
-    // map; the executable mapping is never writable.
+    // map; the executable mapping is never writable. The zeroing comes before
+    // the peer address below, which is written into this same page.
     unsafe {
+        core::ptr::write_bytes((hhdm_base + page_pa) as *mut u8, 0, 4096);
         core::ptr::copy_nonoverlapping(code.as_ptr(), (hhdm_base + code_pa) as *mut u8, code.len());
         let own = loopback6_at(own_port);
         core::ptr::copy_nonoverlapping(
@@ -16100,7 +16123,11 @@ fn report_tcp_domain(hhdm: u64) {
     if count == 0 {
         return;
     }
-    let mut words = [0u64; 9];
+    // Ten since RFC 0061's wedge gate needed to say *why* nothing was
+    // reclaimed: word 9 carries the accepted slot's state and whether an
+    // application holds it. The slice below is `words.len() * 8`, so this is
+    // the only number to change.
+    let mut words = [0u64; 10];
     // SAFETY: a frame this object owns, through the direct map, read as the
     // **nine** little-endian words the service wrote there.
     //
@@ -16165,6 +16192,31 @@ fn report_tcp_domain(hhdm: u64) {
              accepted them, reclaimed rather than left holding the slot",
             words[8]
         );
+    } else {
+        // **Why nothing was reclaimed, which the gate could never say.** It
+        // failed with "reclaimed none" twice on 2026-09-01 and named no cause,
+        // because the report's `tcb_state` is the *outbound* connection's and
+        // nothing described the accepted slot at all. These are the two inputs
+        // to `state::reclaim_unclaimed`: a slot in `CLOSE-WAIT` that an
+        // application still holds is the rule declining correctly, and any
+        // other state is a connection that never reached the one it tests.
+        let accepted = words[9];
+        if accepted & (1 << 16) == 0 {
+            println!(
+                "    tcpd reclaim   none, and the accepted slot is empty: no connection was \
+                 there to reclaim"
+            );
+        } else {
+            println!(
+                "    tcpd reclaim   none; the accepted slot holds state {} and is {}",
+                accepted & 0xff,
+                if accepted & (1 << 8) == 0 {
+                    "unclaimed -- so the state, not the claim, is why the rule declined"
+                } else {
+                    "held by an application, which the rule declines by design"
+                }
+            );
+        }
     }
 }
 

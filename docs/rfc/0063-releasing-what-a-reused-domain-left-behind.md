@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | 🔨 **Draft 2026-09-01 — steps 1–3 implemented, found wrong, and reverted the same day.** The rule below is necessary and **not sufficient**: it selects the right *records* and says nothing about whether their *handles* are still theirs. See "What the first attempt got wrong" |
+| **Status** | ✅ **Closed 2026-09-01 — the adapter was right every time, and the defect was in the probe's report page.** `run_bell_program` never zeroed it, so a stale non-zero word satisfied the kernel's wait before the program had run. No rule in this RFC was needed. See "What it actually was" |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | libc / userspace (`bin/linuxd`) |
 | **Milestone** | Phase 2 — Linux personality (L1) |
@@ -380,3 +380,61 @@ first thing to try before any further correction to the adapter.
   correct for the syscall paths, where a hosted process meeting the adapter for
   the first time must get a record. What was wrong was calling it from a release
   path, where creating one is never the right answer.
+
+
+---
+
+## What it actually was (2026-09-01)
+
+**Nothing in this RFC was needed, and the two attempted fixes made the machine worse because they
+were correcting bookkeeping that was already correct.**
+
+The bind record added this morning gave the decisive specimen. On a boot where the reclaim gate
+failed:
+
+    socket reclaim FAILED: ... bound again false (fd 1, bind 1), forgets 1
+    last bind: domain 18, errno 0, port 7781, service word 0
+    the adapter last recorded: 3 at stage -130 (the adapter thinks it bound port 7781)
+
+and on a boot where it passed, taken by forcing the failure branch:
+
+    bound again true (fd 3, bind 0), forgets 2
+    last bind: domain 18, errno 0, port 7781, service word 0
+    the adapter last recorded: 3 at stage -130 (the adapter thinks it bound port 7781)
+
+**The adapter's two records are identical.** It bound port 7781 for domain 18 on descriptor 3, and
+said so, on the failing boot as on the passing one. So the `fd 1, bind 1` the gate reported never
+came from the adapter at all — and a taker that got descriptor 3 and a successful bind would have
+written `(3, 1)` into its report page.
+
+`run_bell_program` maps the probe's report page and **never clears it**. The kernel then waits for
+the second word to become non-zero before reading the pair. A recycled frame arriving with anything
+in that word satisfies the wait *before the program has run*, and the gate reads whatever the frame
+last held. That is the whole defect, and it is intermittent for the obvious reason: it depends on
+what was in the frame.
+
+The page is zeroed now, before the peer address that is written into the same page.
+
+**Proven rather than argued.** Poisoning the page with the specimen's own values — `1` and `2` —
+reproduces the failure character for character and deterministically:
+
+    socket reclaim FAILED: held true, reaped true, same slot true, bound again false (fd 1, bind 1), forgets 1
+
+Twelve consecutive boots of the lane are green with the page zeroed.
+
+**Why three days of instruments found nothing.** Every one of them was aimed at `bin/linuxd` or
+`bin/ipd` — which process record, which handle, which generation, which port, which slot. All of them
+reported the adapter and the service behaving correctly, and all of them were right. The two
+corrections attempted on that basis regressed the machine 4/4 against a 4/4-passing control, which
+should have been read as evidence sooner than it was: a fix that makes a correct mechanism worse is a
+fix aimed at the wrong mechanism.
+
+**This is not only this gate's problem.** Four probes go through `run_bell_program` and every one of
+them reports through a page that was never cleared. Any gate waiting on a word there could read a
+recycled frame; the zeroing fixes all of them at once, and other intermittents in §3 should be
+re-examined against it rather than assumed unrelated.
+
+The rule this RFC proposed is withdrawn. `Process::exec_into`, `release_sockets_of` and
+`process_for` are unchanged, and the instruments added along the way stay: `ipd sockets`, `process
+records`, the adapter's bind record and its file record all print on every boot or on every failure,
+and between them they are what made this answerable.

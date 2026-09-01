@@ -597,7 +597,16 @@ asm_budget = 10
 # is running on a different one. Everything around it is safe: the queue is
 # taken with `try_lock`, the record is read through a reference, and the guard
 # is dropped before the write.
-unsafe_budget = 1990
+#
+# 1991 on 2026-09-01: one line, and it closes the socket-reclaim defect. Every
+# probe `run_bell_program` starts reports by writing words into a page the
+# kernel then waits on, and that page was never cleared -- so a recycled frame
+# arriving with a non-zero word satisfied the wait before the program had run
+# and handed the gate whatever the frame last held. `write_bytes` of one page,
+# before the peer address written into the same page. The explanation sits
+# *outside* the block: the counter charges every line within an `unsafe`, and
+# the first draft of this comment cost eighteen.
+unsafe_budget = 1991
 # Up thirty-one for RFC 0005 step 9's socket probe -- `ring3_socketeer`, which
 # is `ring3_lister` with a `sockaddr_in6` copied in beside its code instead of
 # two filenames. The same two blocks every hosted probe has: one

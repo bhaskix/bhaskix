@@ -1606,11 +1606,12 @@ fn report(
     sent: u64,
     refused: u64,
     tcb_state: u64,
+    accepted: u64,
     cookies: u64,
     reclaimed: u64,
 ) {
     let words = [
-        MARKER, state_bits, outcome, taken, sent, refused, tcb_state, cookies, reclaimed,
+        MARKER, state_bits, outcome, taken, sent, refused, tcb_state, cookies, reclaimed, accepted,
     ];
     // SAFETY: the page this program mapped writable, which nothing else
     // reaches. The marker is written last, so a kernel reading a partial report
@@ -1662,7 +1663,7 @@ extern "C" fn tcpd_main(hertz: u64) -> ! {
     }
     let mut bits = state_bits::ATTACHED;
     let networked = attach(BACK, BACK_AT, 1) && attach(CONFIG, CONFIG_AT, 0);
-    report(bits, outcome::PENDING, 0, 0, 0, 0, 0, 0);
+    report(bits, outcome::PENDING, 0, 0, 0, 0, 0, 0, 0);
 
     // **The refusal, before anything else.** A 128-bit secret from the
     // hardware, or nothing: `Key::draw` returns `None` if either half is
@@ -1676,11 +1677,11 @@ extern "C" fn tcpd_main(hertz: u64) -> ! {
         // exact bug the no-network arm below had already found and fixed.
         // The handover needs no key; only a sequence number does, and the
         // minted connection says so when asked.
-        report(bits, outcome::NO_ENTROPY, 0, 0, 0, 0, 0, 0);
+        report(bits, outcome::NO_ENTROPY, 0, 0, 0, 0, 0, 0, 0);
         serve_handover_only(tcp::NO_ENTROPY)
     };
     bits |= state_bits::KEYED;
-    report(bits, outcome::PENDING, 0, 0, 0, 0, 0, 0);
+    report(bits, outcome::PENDING, 0, 0, 0, 0, 0, 0, 0);
 
     if !networked {
         // No rings to a protocol service means no network, which is a state
@@ -1689,7 +1690,7 @@ extern "C" fn tcpd_main(hertz: u64) -> ! {
         // and mint connections — the handover needs no wire, and exiting
         // here would leave the endpoint dead with every caller queued
         // against it for ever.
-        report(bits, outcome::NO_NETWORK, 0, 0, 0, 0, 0, 0);
+        report(bits, outcome::NO_NETWORK, 0, 0, 0, 0, 0, 0, 0);
         serve_handover_only(tcp::UNREACHABLE)
     }
 
@@ -1720,7 +1721,7 @@ extern "C" fn tcpd_main(hertz: u64) -> ! {
         }
     }
     if me == Ipv4Addr::UNSPECIFIED {
-        report(bits, outcome::NO_NETWORK, 0, 0, 0, 0, 0, 0);
+        report(bits, outcome::NO_NETWORK, 0, 0, 0, 0, 0, 0, 0);
         serve_handover_only(tcp::UNREACHABLE)
     }
     bits |= state_bits::CONFIGURED;
@@ -1781,6 +1782,20 @@ extern "C" fn tcpd_main(hertz: u64) -> ! {
                 .map_or(0, |connection| state_number(&connection.tcb)),
             service.cookies_accepted,
             service.unclaimed_reclaimed,
+            // **The accepted slot, which is the one that wedges** — RFC 0061.
+            // `tcb_state` above is the *outbound* connection's, so the report
+            // has never said anything about the slot this whole mechanism
+            // exists for. Its state and its `claimed` flag are exactly the two
+            // inputs to `state::reclaim_unclaimed`, so a boot where nothing was
+            // reclaimed can say which of them stopped it: bit 8 set with a
+            // `CLOSE-WAIT` state below it means an application still holds it,
+            // and any other state means the connection never reached the one
+            // the rule tests for. Bit 16 says the slot is occupied at all.
+            service.connections[ACCEPTED]
+                .as_ref()
+                .map_or(0, |connection| {
+                    state_number(&connection.tcb) | (u64::from(connection.claimed) << 8) | (1 << 16)
+                }),
         );
 
         declare_gift_slot(&connect_handover, &listen_handover);
