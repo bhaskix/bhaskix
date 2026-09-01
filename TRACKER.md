@@ -839,6 +839,33 @@ the distinction is in the table rather than in somebody's head.
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-09-01 (an instrument that reported the field it had destroyed)
+
+The socket-service observation added earlier today wrote its packed ports into the report page at
+word 9 with `write_volatile`, reasoning in its own comment that word nine was "past the eight
+`report` writes". `report` writes twenty-three. Word 9 is `DELIVERED` and word 10 is `WHY` — the
+delivery count, the last refusal reason, the frame size and the ethertype that the kernel's
+`ipd after` line prints.
+
+**It passed CI and read plausibly, which is the worst way for a defect to behave.** `DELIVERED` was
+2, and a single socket bound on port 2 packs to exactly 2, so `ipd holds slot 0 port 2` looked like
+an answer on every boot — while being the delivery count showing through the word it had
+overwritten. The conclusion drawn from it in RFC 0063, that the service holds nothing extra on a
+failing boot, is withdrawn there: it was a statement about `DELIVERED`.
+
+The comment beside that report array already said so, in the project's own words: *"RFC 0029's first
+draft took the zeros for spares and its v6 words were silently overwritten on the first refresh …
+this comment is the map that was missing."* The map was there and was not read.
+
+Corrected: three words appended past the v6 pair at 21 and 22, carried by `report` and `refresh`
+through statics, the way every other counter in that program reaches the kernel — so it costs no
+`unsafe`, and the budget raise to 159 that the first version needed is reverted to 156 the same day.
+All **six** slots, not four, since an instrument watching four of six cannot see a leak in the other
+two. A healthy boot reads `ipd sockets    none bound  | reuse 1,1,1,1,1,1`: nothing held at report
+time, every slot bound and released exactly once. A port still bound now puts the leak in the
+service, and a lower generation says the slot was never given back — two outcomes that were not
+distinguishable before.
+
 ### 2026-09-01 (the console tear, closed: the console never left its fatal path)
 
 **Six investigations, five mutually inconsistent measurements, and the cause was in a branch nobody

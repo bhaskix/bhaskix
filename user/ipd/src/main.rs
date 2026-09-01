@@ -631,6 +631,27 @@ static SERVING_TAIL: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU
 /// deliveries names none of them.
 static WHY: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
+/// The ports this service holds, packed four to a word — RFC 0063.
+///
+/// **A static and a word of its own, because words 9 and 10 are taken.** The
+/// first version of this instrument wrote straight into the report page at
+/// word 9 with `write_volatile` — which is `DELIVERED` — and word 10, which is
+/// `WHY`, clobbering the delivery count, the last refusal reason, the frame
+/// size and the ethertype that the kernel's "ipd after" line prints. Its own
+/// comment claimed word nine was "past the eight `report` writes"; `report`
+/// writes twenty-three. It went green because the values coincided —
+/// `DELIVERED` was 2, and a single socket on port 2 packs to 2 — which is the
+/// worst way for a defect to pass. That is precisely the mistake the comment
+/// beside the report array warns about, made again by someone who had not read
+/// it, and it is corrected here rather than quietly dropped.
+static BOUND_PORTS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// The generation of each of the low four slots, packed four to a word.
+static SLOT_GENERATIONS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Slots four and five, as `port`, `generation`, `port`, `generation`.
+static UPPER_SLOTS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 /// Refusal codes for [`WHY`], in the order `drain_ring` applies them.
 mod why {
     pub const NOT_A_FRAME: u64 = 1;
@@ -715,6 +736,9 @@ fn refresh() {
         NOTIFIED_WAKES.load(Relaxed),
         V6_PREFIX.load(Relaxed),
         V6_STATE.load(Relaxed),
+        BOUND_PORTS.load(Relaxed),
+        SLOT_GENERATIONS.load(Relaxed),
+        UPPER_SLOTS.load(Relaxed),
     ]);
 }
 
@@ -2517,6 +2541,23 @@ extern "C" fn ipd_main() -> ! {
 
         tail = framed.next;
         publish(tail);
+        // **What this service thinks it is holding** — RFC 0063.
+        //
+        // Nobody had ever asked. Every hypothesis about the socket-reclaim
+        // defect has been about the *adapter's* bookkeeping -- which process
+        // record, which handle, which generation -- and two corrections to that
+        // bookkeeping made the machine deterministically worse. The port is
+        // held here, so this is the service's own answer.
+        //
+        // Into statics that `report` and `refresh` both carry, rather than a
+        // write of its own into the page: the first version did the latter and
+        // landed on two words that were already in use. See `BOUND_PORTS`.
+        BOUND_PORTS.store(bound_ports(&sockets), core::sync::atomic::Ordering::Relaxed);
+        SLOT_GENERATIONS.store(
+            slot_generations(&sockets),
+            core::sync::atomic::Ordering::Relaxed,
+        );
+        UPPER_SLOTS.store(upper_slots(&sockets), core::sync::atomic::Ordering::Relaxed);
         report(
             frames,
             bytes,
@@ -2529,25 +2570,6 @@ extern "C" fn ipd_main() -> ! {
             prefix_word(prefix6),
             v6_word(global6.is_some(), router6.is_some(), resolved6, pongs6),
         );
-        // **What this service thinks it is holding** — RFC 0063, written
-        // beside the report rather than through it, because threading one
-        // observation through six call sites is more churn than the
-        // observation is worth.
-        //
-        // Nobody has ever asked. Every hypothesis about the socket-reclaim
-        // defect has been about the *adapter's* bookkeeping -- which process
-        // record, which handle, which generation -- and two corrections to that
-        // bookkeeping made the machine deterministically worse. The port is
-        // held here. This is the service's own answer, and a port still listed
-        // after the domain that bound it is gone says the leak is here rather
-        // than in the adapter's idea of here.
-        //
-        // SAFETY: the page this program mapped writable, which nothing else
-        // reaches -- as `report`. Word nine, past the eight `report` writes,
-        // so the two do not collide.
-        unsafe {
-            core::ptr::write_volatile((REPORT_AT + 9 * 8) as *mut u64, bound_ports(&sockets));
-        }
     }
 }
 
@@ -2592,6 +2614,39 @@ fn bound_ports(sockets: &[Socket; SOCKETS]) -> u64 {
     let mut packed = 0u64;
     for (index, socket) in sockets.iter().take(4).enumerate() {
         packed |= u64::from(socket.port) << (index * 16);
+    }
+    packed
+}
+
+/// The generation of each of the low four slots, packed four to a word.
+///
+/// **The discriminator [`bound_ports`] lacks.** That instrument samples once,
+/// at the boot report, which is after both the release and the rebind — so a
+/// boot where the reclaim worked and one where it did not can end with the
+/// same port in the same slot, and they do: `slot 0 port 2` reads identically
+/// on both. The generation does not: it is bumped every time the slot is
+/// reused, so two boots that end alike but arrived differently say so here.
+/// Truncated to 16 bits, which is four reuses short of nothing this boot can
+/// reach — the whole boot binds a handful of sockets.
+fn slot_generations(sockets: &[Socket; SOCKETS]) -> u64 {
+    let mut packed = 0u64;
+    for (index, socket) in sockets.iter().take(4).enumerate() {
+        packed |= u64::from(socket.generation as u16) << (index * 16);
+    }
+    packed
+}
+
+/// The last two slots, as `port`, `generation`, `port`, `generation`.
+///
+/// `SOCKETS` is six and a word holds four `u16`s, so the two words above cover
+/// slots 0 to 3 and this one covers the rest. Stated rather than left implicit:
+/// an instrument that watches four of six slots cannot see a leak in the other
+/// two, and this defect has already cost two fixes aimed at the wrong place.
+fn upper_slots(sockets: &[Socket; SOCKETS]) -> u64 {
+    let mut packed = 0u64;
+    for (index, socket) in sockets.iter().skip(4).take(2).enumerate() {
+        packed |= u64::from(socket.port) << (index * 32);
+        packed |= u64::from(socket.generation as u16) << (index * 32 + 16);
     }
     packed
 }
@@ -2654,6 +2709,12 @@ fn report(
         // serving starts.
         v6_prefix,
         v6_state,
+        // Words 23 and 24: which ports this service holds and how many times
+        // each slot has been reused. RFC 0063. Appended, not slotted into a
+        // zero that looked spare -- see `BOUND_PORTS`.
+        BOUND_PORTS.load(core::sync::atomic::Ordering::Relaxed),
+        SLOT_GENERATIONS.load(core::sync::atomic::Ordering::Relaxed),
+        UPPER_SLOTS.load(core::sync::atomic::Ordering::Relaxed),
     ];
     V6_PREFIX.store(v6_prefix, core::sync::atomic::Ordering::Relaxed);
     V6_STATE.store(v6_state, core::sync::atomic::Ordering::Relaxed);
@@ -2673,7 +2734,7 @@ fn report(
 }
 
 /// Puts ten words on the report page.
-fn write_report(words: [u64; 23]) {
+fn write_report(words: [u64; 26]) {
     // SAFETY: the page this program mapped writable, which nothing else
     // reaches. The marker is written last, so a kernel reading a partial report
     // sees no marker rather than half the fields.

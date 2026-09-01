@@ -204,27 +204,70 @@ document had thought about.
 
 The previous section ended by recommending that somebody ask `bin/ipd` what it thinks it holds,
 since every hypothesis so far had been about the *adapter's* bookkeeping and two corrections to that
-made the machine deterministically worse. That has now been done, and the answer eliminates a
-hypothesis rather than confirming one.
+made the machine deterministically worse. That has now been done — and the first attempt at it was
+wrong in a way worth recording, because it produced a confident reading and a conclusion drawn from
+nothing.
 
-`bin/ipd`'s `Socket` has `port`, `generation`, family, peer and length — and **no owner field**, so
-the service cannot attribute a port to a domain even in principle. What it can report is which ports
-are occupied. It now packs the low four slots' ports into report word 9, and the kernel prints them:
+**The first instrument reported a field it had itself destroyed.** It wrote its packed ports into
+the report page at word 9 with `write_volatile`, on the stated reasoning that word nine was "past
+the eight `report` writes". `report` writes twenty-three. Word 9 is `DELIVERED` and word 10 is `WHY`
+— the delivery count, the last refusal reason, the frame size and the ethertype that the kernel's
+`ipd after` line prints. Nothing went red, because the values coincided: `DELIVERED` was 2, and a
+single socket bound on port 2 packs to exactly 2. The line `ipd holds slot 0 port 2` was the
+delivery count showing through the word that had been overwritten, on every boot, whether or not
+the instrument ever ran.
 
-    ipd holds      slot 0 port 2; (a port here after its domain is gone is a leak in the service)
+**So the conclusion drawn from it is withdrawn.** This section previously said that the reading was
+identical on a failing boot and a passing one, and that the service therefore was not sitting on an
+extra port at report time. That was a statement about `DELIVERED`, not about any socket, and it is
+not evidence for or against anything. The hypothesis it claimed to eliminate is open again.
 
-That line reads **exactly the same on a boot where the reclaim gate fails as on one where it
-passes** — one port, slot 0, port 2, both times. So at report time the service is not sitting on an
-extra port. Whatever `bound again false` means, it is not "the old port was never given back and is
-still occupying a slot", which was the natural reading of the defect and is now measured false.
+This is the second time in this RFC that a correction to bookkeeping has been worse than the
+bookkeeping, and the same lesson as the console tear closed the same day: a value that looks
+plausible is not a measurement, and the comment beside the report array — *"RFC 0029's first draft
+took the zeros for spares and its v6 words were silently overwritten"* — had already written this
+mistake down before it was made again.
 
-**The limit of this instrument, stated so the next reader does not over-read it.** It samples once,
-at the boot report, which is after both the release and the rebind. A pass and a failure can reach
-the same final table by different routes: on a pass the port is released and re-bound into the same
-slot, and on a failure it may never have moved. The discriminator that would separate them is
-already in the struct and is not yet reported — `generation`, which the service bumps on every
-close. Two boots that end with the same port in the same slot but different generations took
-different paths, and that is the next thing to print.
+**What is there now.** Three words appended past the v6 pair at 21 and 22, carried by both
+`report` and `refresh` the way every other counter in that program reaches the kernel, costing no
+`unsafe` at all — so the raise to 159 that the first version needed is reverted to 156 the same day.
+They cover **all six** slots, not four: an instrument that watches four of six cannot see a leak in
+the other two, and this defect has already cost two fixes aimed at the wrong place. A healthy boot
+now reads:
+
+    ipd sockets    none bound  | reuse 1,1,1,1,1,1
+
+which is already worth having: at boot-report time the service holds nothing, and every slot has
+been bound and released exactly once. A failing boot that shows a port still bound puts the leak in
+the service; one that shows the same table with a lower generation says the slot was never given
+back. Both are distinguishable now, and neither was before.
+
+**The first real specimen, taken the same day.** A `make test` run failed the reclaim gate with the
+corrected instrument in, and it reads:
+
+    socket reclaim FAILED: held true, reaped true, same slot true, bound again false (fd 1, bind 1), forgets 1
+    ipd sockets    none bound  | reuse 1,1,1,1,1,1
+
+which is **character for character** what a passing boot reads. So the service ends a failing boot
+holding nothing, with every slot bound and released exactly once — the same as a healthy one. The
+port is given back. Whatever `bound again false` means, it is not a port stranded in the service's
+table for the rest of the boot.
+
+That is the same sentence this section withdrew an hour earlier, and it is worth being explicit
+about why it may be asserted now and could not be then: then it was a reading of `DELIVERED` through
+a word the instrument had overwritten, and now it is a reading of the six slots the service actually
+holds. The conclusion is the same; only one of the two was evidence.
+
+**The limit, stated so it is not over-read.** It samples once, at the boot report — after the
+failure, after the release, after everything. It says the port is not leaked *for the rest of the
+boot*. It does **not** say the port was free at the moment the rebind was refused, and that moment
+is the one the defect lives in. A generation of 1 on every slot on both boots says only that each
+slot was closed once by the end.
+
+**So the next instrument samples at the failure rather than after it.** `bin/ipd` knows when it
+refuses a bind; latching the whole table at that instant would show what was held *then*, which is
+the question. That is a service-side change of a few lines and no new capability, and it is the
+first thing to try before any further correction to the adapter.
 
 ## What this does not do
 

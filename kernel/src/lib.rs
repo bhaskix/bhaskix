@@ -15138,10 +15138,14 @@ fn report_net_after_exchange(hhdm: u64) {
     if count == 0 {
         return;
     }
-    let mut ipd = [0u64; 21];
-    // SAFETY: a frame this object owns, through the direct map, read as the ten
-    // little-endian words the service wrote there.
-    let bytes = unsafe { core::slice::from_raw_parts((hhdm + pages[0]) as *const u8, 168) };
+    // Twenty-five words, 200 bytes. Twenty-one until RFC 0063 appended what
+    // the service holds and how often each slot has been reused at 23 and 24 --
+    // appended, because the two words this instrument first used were the
+    // delivery count and the refusal reason the "ipd after" line prints.
+    let mut ipd = [0u64; 26];
+    // SAFETY: a frame this object owns, through the direct map, read as the
+    // twenty-six little-endian words the service wrote there.
+    let bytes = unsafe { core::slice::from_raw_parts((hhdm + pages[0]) as *const u8, 208) };
     for (index, word) in ipd.iter_mut().enumerate() {
         let mut buffer = [0u8; 8];
         buffer.copy_from_slice(&bytes[index * 8..index * 8 + 8]);
@@ -15161,16 +15165,52 @@ fn report_net_after_exchange(hhdm: u64) {
     // Every hypothesis about the socket-reclaim defect so far has been about
     // the *adapter's* bookkeeping, and two corrections to that made the machine
     // worse; this is the service's own answer, which nothing had asked for.
-    if ipd[9] != 0 {
-        print!("    ipd holds      ");
-        for slot in 0..4u32 {
-            let port = (ipd[9] >> (slot * 16)) & 0xffff;
-            if port != 0 {
-                print!("slot {slot} port {port}; ");
-            }
+    // **What the socket service says about every one of its slots** — RFC 0063.
+    //
+    // Printed whether or not anything is held, because "nothing held" is the
+    // answer on a healthy boot and a silent line cannot be told from a broken
+    // instrument. This one was broken and silent for a day: its first version
+    // wrote into words 9 and 10, which are the delivery count and the refusal
+    // reason, and the "port 2" it appeared to report was the delivery count
+    // showing through. A port still listed after the domain that bound it is
+    // gone says the leak is in the service; the generation, which the service
+    // bumps on every reuse, tells two boots apart that end with the same table.
+    print!("    ipd sockets    ");
+    let mut held = 0;
+    for slot in 0..6u32 {
+        let (port, generation) = if slot < 4 {
+            (
+                (ipd[23] >> (slot * 16)) & 0xffff,
+                (ipd[24] >> (slot * 16)) & 0xffff,
+            )
+        } else {
+            let shift = (slot - 4) * 32;
+            (
+                (ipd[25] >> shift) & 0xffff,
+                (ipd[25] >> (shift + 16)) & 0xffff,
+            )
+        };
+        if port != 0 {
+            held += 1;
+            print!("[{slot}] port {port} gen {generation}  ");
         }
-        println!("(a port here after its domain is gone is a leak in the service)");
     }
+    if held == 0 {
+        print!("none bound  ");
+    }
+    print!("| reuse ");
+    for slot in 0..6u32 {
+        let generation = if slot < 4 {
+            (ipd[24] >> (slot * 16)) & 0xffff
+        } else {
+            (ipd[25] >> ((slot - 4) * 32 + 16)) & 0xffff
+        };
+        print!("{generation}");
+        if slot < 5 {
+            print!(",");
+        }
+    }
+    println!();
     println!(
         "    ipd after      {} frames taken, {} refused, {} datagrams delivered to a socket; \
          last refusal reason {}, on a frame of {} bytes with ethertype {:#06x}; ring head {} tail {}; \

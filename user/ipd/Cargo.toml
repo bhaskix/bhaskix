@@ -81,12 +81,11 @@ asm_budget = 4
 # brace balance, so `if let Some(x) = unsafe { f() } {` read as still-open and
 # charged the outer block's body to this crate. See the changelog; the
 # scanner now walks from the block's own brace and has a self-test.
-# 159 on 2026-09-01: three lines, and a temporary instrument rather than a
-# feature. RFC 0063's socket-reclaim defect has survived three hypotheses and
-# two attempted fixes that each made the machine deterministically worse, and
-# every one of them reasoned about the *adapter's* bookkeeping. The port is
-# held here, and nothing had asked this service what it thinks it holds. The
-# write is the same shape as the report word above it -- a volatile store into
-# the report page this program already owns -- and comes out with the
-# instrument.
-unsafe_budget = 159
+# Back to 156 on 2026-09-01, the same day it went to 159 and for a better
+# reason than it rose: the three lines were a `write_volatile` into the report
+# page that landed on two words already in use. The observation it carried is
+# still here and now costs no unsafe at all -- two statics the existing report
+# writers carry, which is how every other counter in this program reaches the
+# kernel. A raise that turns out to be unnecessary is worth undoing in the same
+# day rather than leaving as headroom.
+unsafe_budget = 156
