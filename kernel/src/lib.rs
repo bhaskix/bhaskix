@@ -10111,6 +10111,22 @@ fn hosted_exec_self_test(hhdm_base: u64, cpus: u32) -> bool {
     // fitted, so a file the filesystem could not hold became a truncated one
     // and failed much later as `ENOEXEC` from a parser that was right. Said
     // here, where it happened, rather than left to be diagnosed there.
+    // What the staging cost, and what that implies for a program the size of
+    // BusyBox — the one number the roadmap's L1 row has been estimating.
+    let cycles = HOSTED_STAGE_CYCLES.load(Ordering::Acquire);
+    let blocks = staged.div_ceil(4096).max(1);
+    if let Some(hertz) = bhaskix_arch::tsc::hertz()
+        && hertz > 0
+    {
+        let per_block = cycles / blocks;
+        println!(
+            "    hosted stage   {staged} bytes in {blocks} block(s), {} ms; {} us per block, so \
+             BusyBox's 531 blocks would cost about {} ms here",
+            cycles * 1_000 / hertz,
+            per_block * 1_000_000 / hertz,
+            per_block * 531 * 1_000 / hertz
+        );
+    }
     let wanted = HOSTED_WANTED.load(Ordering::Acquire);
     if staged != wanted {
         println!(
@@ -14089,6 +14105,10 @@ static HOSTED_STAGED: core::sync::atomic::AtomicU64 = core::sync::atomic::Atomic
 /// distinguishable at the place the truncation happens.
 static HOSTED_WANTED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
+/// Cycles the whole of that write took, so the cost per block can be read off
+/// rather than estimated.
+static HOSTED_STAGE_CYCLES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 /// A block device reached by asking the block service for one sector at a time.
 ///
 /// The `Store` RFC 0015 step 6 introduced, finally over something that is not
@@ -14356,6 +14376,14 @@ extern "C" fn journal_on_disk(endpoint: u64) -> ! {
                     // several transactions, and the loop belongs to whoever
                     // wants them all rather than being hidden inside one that
                     // implies a single commit.
+                    // **Priced, because the next question about this path is
+                    // "how large a program could be staged here?"** RFC 0064
+                    // and RFC 0065 removed the two limits that stopped a hosted
+                    // `execve` of BusyBox; what is left is that every block of
+                    // this write is one journal transaction, and BusyBox is 531
+                    // of them. A number beats an estimate, and the roadmap has
+                    // been quoting estimates.
+                    let began = bhaskix_arch::tsc::read();
                     let mut done = 0usize;
                     while done < bytes.len() {
                         match volume.write(hosted, done as u64, &bytes[done..]) {
@@ -14365,6 +14393,10 @@ extern "C" fn journal_on_disk(endpoint: u64) -> ! {
                     }
                     HOSTED_STAGED.store(done as u64, Ordering::Release);
                     HOSTED_WANTED.store(bytes.len() as u64, Ordering::Release);
+                    HOSTED_STAGE_CYCLES.store(
+                        bhaskix_arch::tsc::read().saturating_sub(began),
+                        Ordering::Release,
+                    );
                 }
             }
             Some(())
