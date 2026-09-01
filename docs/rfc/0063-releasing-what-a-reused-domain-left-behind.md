@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | ✅ **Closed 2026-09-01 — the adapter was right every time, and the defect was in the probe's report page.** `run_bell_program` never zeroed it, so a stale non-zero word satisfied the kernel's wait before the program had run. No rule in this RFC was needed. See "What it actually was" |
+| **Status** | 🔍 **Open — reopened 2026-09-01, hours after being closed, because the cause given for closing it was false.** The page was never stale: `map_anonymous` zeroes every frame it allocates. See "The closure was wrong" |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | libc / userspace (`bin/linuxd`) |
 | **Milestone** | Phase 2 — Linux personality (L1) |
@@ -384,7 +384,7 @@ first thing to try before any further correction to the adapter.
 
 ---
 
-## What it actually was (2026-09-01)
+## What it was said to be, and was not (2026-09-01)
 
 **Nothing in this RFC was needed, and the two attempted fixes made the machine worse because they
 were correcting bookkeeping that was already correct.**
@@ -438,3 +438,40 @@ The rule this RFC proposed is withdrawn. `Process::exec_into`, `release_sockets_
 `process_for` are unchanged, and the instruments added along the way stay: `ipd sockets`, `process
 records`, the adapter's bind record and its file record all print on every boot or on every failure,
 and between them they are what made this answerable.
+
+
+---
+
+## The closure was wrong (2026-09-01, the same day)
+
+**The section above is retracted.** It claimed the probe's report page arrived holding stale bytes
+from a recycled frame, and that a non-zero word there satisfied the kernel's wait before the program
+ran. The page is not stale. `AddressSpace::map_anonymous` allocates every present page and zeroes it
+unconditionally — *"Zero on allocation, never on free"*, `docs/memory.md` §2 — and the probe's buffer
+page is mapped through exactly that call. There is no window in which it holds anything.
+
+**How a wrong answer got this far.** The poison test looked conclusive and was not. Writing `1` and
+`2` into the page reproduces the failure line character for character, which proves those values are
+*sufficient* to produce it — it says nothing about whether they were ever *there*. That is a
+sufficient condition mistaken for a necessary one, and the twelve green boots that followed are
+consistent with an intermittent that fires about once in twenty simply not firing. Neither
+measurement was evidence for the claim, and the claim was written as settled.
+
+The zeroing is reverted rather than kept as defensive tidiness: it duplicated a policy the memory
+manager already states and implements, which is the second derivation this project keeps paying for,
+and its justification comment and unsafe-budget raise both cited a cause that does not exist.
+
+**What is actually known**, and this part survives:
+
+- The gate reads `fd 1, bind 1` from the taker on a failing boot.
+- `bin/linuxd`'s bind record and file record are **identical on a failing and a passing boot** —
+  `domain 18, errno 0, port 7781` and `3 at stage -130`. The adapter bound the port correctly both
+  times, so `fd 1, bind 1` is not an answer it gave.
+- The probe's page is zeroed before the program runs, so those values were *written by something*.
+- `answers[1] == 2` means a writer put 2 there, and the taker writes `bind + 1`.
+
+So the open question is sharper than before and differently shaped: not "why did the adapter answer
+wrongly" — it did not — but **who wrote `(1, 2)` into a page that starts zeroed**. Domain numbers are
+reused, so `domain 18` on the failing boot may be the *leaker's* bind rather than the taker's, which
+would mean the taker's call never reached `answer_bind` at all. Distinguishing those needs the record
+to carry a boot-unique identity rather than a domain number, and that is the next instrument.
