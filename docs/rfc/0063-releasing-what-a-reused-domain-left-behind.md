@@ -169,7 +169,30 @@ value recorded in the `Entry` when the socket is opened. A stale record's handle
 is then released only when the slot's counter still matches what the record was
 issued — and a reallocated slot is left alone, because its counter has moved.
 
-Until that exists, **any implementation of the rule below is unsafe**, however
+**And a second attempt, with that identity built, broke it too.** On 2026-09-01
+`SOCKET_OWNER` was added — a `(domain, generation)` per slot, stamped where a
+slot is claimed, cleared where it is released — and the stale release was gated
+on it: release only where the slot still agrees it was issued to this domain at
+this generation. The reclaim gate then failed **4 boots of 4**, against a
+control on the same tree that passed **4 of 4**. Reverted.
+
+So the identity was necessary and still not sufficient, and this document should
+stop predicting what will be. **Two implementations, two deterministic
+regressions, from a defect that is intermittent when left alone** — which is
+itself the strongest evidence about it: whatever holds that port is not simply a
+record nobody released, or releasing it correctly would help. The second attempt
+released *more* and the port stayed held (`bound again false`, `bind -98`,
+`forgets 2`), which is the opposite of what the model predicts.
+
+**What the next attempt should establish before writing any code**: where the
+port is actually held. Every hypothesis so far has been about the adapter's
+bookkeeping — which record, which handle, which generation — and two corrections
+to that bookkeeping have made the machine worse rather than better. The port
+lives in `bin/ipd`, and no instrument in this investigation has yet asked *it*
+what it thinks it is holding and for whom. That is the question, and it is one
+service call away.
+
+Until then, **any implementation of the rule below is unsafe**, however
 carefully it picks its records — which is why this section sits above the steps
 rather than after them.
 
