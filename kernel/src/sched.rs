@@ -2765,15 +2765,24 @@ fn preempt_reporting() -> bool {
     // increment the mask still remembers. Caught here because this is the
     // decision the mismatch corrupts; printed once, because the condition
     // repeats on every tick until the drop that will underflow.
-    if crate::sync::held_mask() != 0
-        && !crate::sync::holds_any()
-        && COUNT_MISMATCHES.fetch_add(1, Ordering::Relaxed) == 0
-    {
+    // Sampled once, as `block_self` above: the mask this message prints must be
+    // the mask the condition tested, or the report describes two moments.
+    //
+    // **Behind a cheap check, because this runs on every tick.** The coherent
+    // sample costs a `cli`/`sti` pair when interrupts are on, and the common
+    // case is a mask of zero — one relaxed load, exactly what this cost
+    // before. The pair is only paid on the boots where there is something to
+    // report, which is the whole point of a diagnostic.
+    let (mask, held) = if crate::sync::held_mask() == 0 {
+        (0, 0)
+    } else {
+        crate::sync::accounting()
+    };
+    if mask != 0 && held == 0 && COUNT_MISMATCHES.fetch_add(1, Ordering::Relaxed) == 0 {
         crate::println!(
-            "    COUNT MISMATCH  cpu {cpu} rank mask {:#b} with a hold count of zero: a \
+            "    COUNT MISMATCH  cpu {cpu} rank mask {mask:#b} with a hold count of zero: a \
              counted increment has been lost, and the next release of this guard will \
-             underflow",
-            crate::sync::held_mask(),
+             underflow"
         );
     }
 
@@ -3755,13 +3764,20 @@ pub fn block_self() {
     // Reporting rather than refusing, because the fix belongs at the call site
     // -- release before you block -- and refusing here would hide which call
     // site that is. `#[track_caller]` names it.
-    if crate::sync::held_mask() != 0 || crate::sync::holds_any() {
+    // **Sampled once.** This used to ask four separate questions -- the mask
+    // and `holds_any` for the guard, then the mask and the count again for the
+    // message -- and this path runs with interrupts enabled, so an interrupt
+    // taking and releasing a lock between them produced exactly the
+    // "mask 0b000000, 0 held" contradiction filed against the accounting. A
+    // report built from two reads cannot describe one moment; see
+    // `sync::accounting`.
+    let (mask, held) = crate::sync::accounting();
+    if mask != 0 || held != 0 {
         BLOCKED_HOLDING.fetch_add(1, Ordering::Relaxed);
         let site = core::panic::Location::caller();
         crate::println!(
-            "    BLOCK HOLDING  a thread blocked holding locks (mask {:#08b}, {} held), at {}:{}",
-            crate::sync::held_mask(),
-            crate::sync::holds_count(),
+            "    BLOCK HOLDING  a thread blocked holding locks (mask {mask:#08b}, {held} held), \
+             at {}:{}",
             site.file(),
             site.line()
         );

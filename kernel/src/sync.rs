@@ -790,6 +790,34 @@ pub fn holds_count() -> u32 {
     holds_slot().load(Ordering::Relaxed)
 }
 
+/// This CPU's rank mask and hold count, sampled as one value.
+///
+/// **Two reads are not one measurement, and every specimen of the accounting
+/// defect was built from two.** The diagnostics that reported the mask and the
+/// count contradicting each other read each of them separately — the guard
+/// asked `held_mask()` and `holds_any()`, then the message asked `held_mask()`
+/// and `holds_count()` again — so a report of "mask set, nothing held" is
+/// consistent with an interrupt on this CPU taking and releasing a lock
+/// between the two, on a path where interrupts are enabled. `block_self` is
+/// such a path.
+///
+/// That does not prove the accounting is sound; it proves the instrument could
+/// not tell. Sampling both with interrupts off makes the pair coherent, so a
+/// contradiction that survives is a fact about the accounting rather than
+/// about the reader. This is the same correction the console tear needed: an
+/// instrument that reads twice cannot report one moment.
+#[must_use]
+pub fn accounting() -> (u64, u32) {
+    let mut sampled = (0, 0);
+    claim_uninterrupted(|| {
+        sampled = (
+            slot().load(Ordering::Relaxed),
+            holds_slot().load(Ordering::Relaxed),
+        );
+    });
+    sampled
+}
+
 /// Replaces the hold count for this CPU, for the incoming thread.
 pub fn set_holds_count(count: u32) {
     holds_slot().store(count, Ordering::Relaxed);
@@ -1408,6 +1436,46 @@ mod tests {
         );
         drop(guard);
         assert!(!lock.locked.load(Ordering::Relaxed) && held_mask() == 0);
+    }
+
+    #[test]
+    fn accounting_reports_the_mask_and_the_count_as_one_pair() {
+        // **The accessor the three accounting specimens were missing.** Each
+        // of them was assembled from separate reads -- the guard asked one
+        // question, the message asked another -- so "mask set, nothing held"
+        // was consistent with an interrupt between them and proved nothing
+        // about the accounting. This asserts the pair moves together: nothing
+        // held reads (0, 0), a ranked guard shows its bit *and* a count, and
+        // the pair returns to zero when it drops.
+        set_held_mask(0);
+        assert_eq!(accounting(), (0, 0), "nothing held is both, not one");
+        let lock = SpinLock::new(Rank::WaitQueue, ());
+        {
+            let _guard = lock.lock();
+            let (mask, held) = accounting();
+            assert_eq!(mask, Rank::WaitQueue.bit(), "a ranked guard is in the mask");
+            assert_eq!(held, 1, "and counted, in the same sample");
+        }
+        assert_eq!(accounting(), (0, 0), "and both come back");
+    }
+
+    #[test]
+    fn a_try_lock_is_counted_without_a_rank_and_accounting_says_so() {
+        // The asymmetry is deliberate -- `try_lock` cannot be an edge in a
+        // deadlock cycle, so it stays out of the ranked set -- and it is
+        // exactly the shape that reads as a contradiction when the mask and
+        // the count are sampled separately. Here it is one sample, so the
+        // asymmetry is visible as itself rather than as a defect.
+        set_held_mask(0);
+        let lock = SpinLock::new(Rank::WaitQueue, ());
+        let guard = lock.try_lock().expect("uncontended");
+        assert_eq!(
+            accounting(),
+            (0, 1),
+            "counted, unranked: a real state, not a torn read"
+        );
+        drop(guard);
+        assert_eq!(accounting(), (0, 0));
     }
 
     #[test]
