@@ -10,7 +10,7 @@
 
 | | |
 |---|---|
-| RFCs accepted | **45** |
+| RFCs accepted | **46** |
 | RFCs open | 19 |
 | RFCs closed without shipping | 1 |
 | Milestone rows done | **92 of 95** |
@@ -36,6 +36,7 @@ gantt
     RFC 0015 A filesystem that can be written to and a... :done, r0015, 2026-08-06, 1d
     RFC 0046 A driver for hardware that exists — AHCI :done, r0046, 2026-08-24, 1d
     RFC 0065 the block the format already had :done, r0065, 2026-09-01, 1d
+    RFC 0066 one commit for many blocks :done, r0066, 2026-09-01, 1d
     section Capabilities & IPC
     RFC 0008 The shape of the system-call and IPC interface :done, r0008, 2026-08-04, 1d
     RFC 0009 Shared memory and the objects that name it :done, r0009, 2026-08-04, 1d

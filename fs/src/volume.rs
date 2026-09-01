@@ -324,6 +324,41 @@ impl<'f, S: Store> Volume<'f, S> {
         self.free_block()
     }
 
+    /// Collects `into.len()` free blocks in **one** scan of the bitmap.
+    ///
+    /// **Because `free_block` is quadratic over a run and hands out the same
+    /// number twice inside a transaction** — RFC 0066. It scans from the start
+    /// of the data area every call, and the bitmap it reads is the *cached*
+    /// one while `stage_bitmap` edits a journalled copy, so a block claimed
+    /// earlier in the same transaction still reads as free. RFC 0065 met that
+    /// with `free_block_excluding` for two blocks; a run of five hundred needs
+    /// this instead.
+    ///
+    /// Returns how many it found, which is `into.len()` unless the filesystem
+    /// ran out — a short answer is the caller's to act on rather than an error,
+    /// because a run that half fits is a shorter run and not a failure.
+    fn free_blocks(&mut self, into: &mut [u32]) -> Result<usize, FsError> {
+        let mut found = 0;
+        let first = self.superblock.data_start;
+        for block in first..self.superblock.blocks {
+            if found == into.len() {
+                break;
+            }
+            let byte = block / 8;
+            let holding = self.superblock.bitmap_start + byte / BLOCK as u64;
+            let holding = u32::try_from(holding).map_err(|_| FsError::OutOfRange)?;
+            let page = self.cache.page(holding)?;
+            let cell = *page
+                .get((byte % BLOCK as u64) as usize)
+                .ok_or(FsError::OutOfRange)?;
+            if cell & (1 << (block % 8)) == 0 {
+                into[found] = u32::try_from(block).map_err(|_| FsError::OutOfRange)?;
+                found += 1;
+            }
+        }
+        Ok(found)
+    }
+
     fn free_block(&mut self) -> Result<u32, FsError> {
         self.free_block_excluding(u32::MAX)
     }
@@ -631,6 +666,181 @@ impl<'f, S: Store> Volume<'f, S> {
         Ok(taking)
     }
 
+    /// Writes whole blocks of `data` in **one** transaction, from `offset`.
+    ///
+    /// **One commit for many blocks** — RFC 0066. [`Volume::write`] is one
+    /// transaction per block, which this kernel's boot report prices at 14–47
+    /// ms each; storing a 2 MB program that way pays the durability cost five
+    /// hundred times for what the filesystem sees as one change. A file's data
+    /// blocks are never staged — RFC 0015 writes them to their homes *before*
+    /// the commit, so that a block an inode claims is never a block still
+    /// holding somebody else's bytes — so only the inode, one bitmap block and
+    /// at most one indirect table are staged, whatever the run's length.
+    ///
+    /// `offset` must be block-aligned: a run is about whole blocks, and a
+    /// partial first block would be a second shape inside one transaction.
+    ///
+    /// # Errors
+    ///
+    /// [`FsError::WrongKind`] on a directory, [`FsError::OutOfRange`] for an
+    /// unaligned offset or a range past what an inode can address,
+    /// [`FsError::Full`] if there are no free blocks at all, and whatever the
+    /// store returns. A run that is merely *longer* than one transaction can
+    /// hold is not an error: the answer says how many bytes went, and the
+    /// caller calls again.
+    pub fn write_run(&mut self, index: u32, offset: u64, data: &[u8]) -> Result<usize, FsError> {
+        let mut inode = self.inode(index)?;
+        if inode.kind != Kind::File {
+            return Err(FsError::WrongKind);
+        }
+        if !offset.is_multiple_of(BLOCK as u64) {
+            return Err(FsError::OutOfRange);
+        }
+        const SLOTS: usize = BLOCK / 4;
+        let direct_count = inode.direct.len();
+        let first = usize::try_from(offset / BLOCK as u64).map_err(|_| FsError::OutOfRange)?;
+        if first >= direct_count + SLOTS {
+            return Err(FsError::OutOfRange);
+        }
+
+        // **What one transaction can carry**, and it is bounded by blocks the
+        // *cache* must hold rather than by the journal: the staged set is three
+        // whatever the length. Sixty-four blocks is 256 KiB a call, which turns
+        // BusyBox's 531 transactions into nine.
+        const RUN_BLOCKS: usize = 64;
+        let whole = (data.len() / BLOCK).min(RUN_BLOCKS);
+        if whole == 0 {
+            // Nothing whole to write: the single-block path is the honest
+            // answer, and saying so beats silently doing a different thing.
+            return self.write(index, offset, data);
+        }
+        let whole = whole.min(direct_count + SLOTS - first);
+
+        // Which of them are new, and one scan for all of those.
+        let mut existing = [0u32; RUN_BLOCKS];
+        let mut wanted = 0usize;
+        for (step, slot) in existing.iter_mut().enumerate().take(whole) {
+            *slot = self.block_number(&inode, first + step)?;
+            if *slot == 0 {
+                wanted += 1;
+            }
+        }
+        // **The table is allocated in the same scan**, because a second scan
+        // returns a block the run has already chosen -- nothing is marked used
+        // until the commit. The first draft asked twice, detected the
+        // collision and answered `Full`, which is a refusal invented by the
+        // allocator rather than by the filesystem being full.
+        let needs_table = first + whole > direct_count && inode.indirect == 0;
+        let mut fresh = [0u32; RUN_BLOCKS + 1];
+        let asked = wanted + usize::from(needs_table);
+        let mut found = self.free_blocks(&mut fresh[..asked])?;
+        let table = if needs_table {
+            if found < 1 {
+                return Err(FsError::Full);
+            }
+            // The last of the run, so the data blocks keep the low numbers and
+            // a short scan shortens the run rather than losing the table.
+            found -= 1;
+            Some(fresh[found])
+        } else {
+            None
+        };
+        if found == 0 && wanted > 0 {
+            return Err(FsError::Full);
+        }
+        // A short answer shortens the run rather than failing it.
+        let whole = if found < wanted {
+            let mut allowed = 0;
+            let mut used = 0;
+            for slot in existing.iter().take(whole) {
+                if *slot == 0 {
+                    if used == found {
+                        break;
+                    }
+                    used += 1;
+                }
+                allowed += 1;
+            }
+            allowed
+        } else {
+            whole
+        };
+        if whole == 0 {
+            return Err(FsError::Full);
+        }
+
+        let table_fresh = table.is_some();
+        if let Some(table) = table {
+            if u64::from(table) >= self.superblock.blocks
+                || u64::from(table) < self.superblock.data_start
+            {
+                return Err(FsError::OutOfRange);
+            }
+            inode.indirect = table;
+        }
+
+        self.begin()?;
+        if table_fresh {
+            self.stage_bitmap(inode.indirect, true)?;
+            self.cache.edit(inode.indirect)?.fill(0);
+        }
+        let mut taken = 0usize;
+        for (step, slot) in existing.iter().enumerate().take(whole) {
+            let block = if *slot == 0 {
+                let block = fresh[taken];
+                taken += 1;
+                if u64::from(block) >= self.superblock.blocks
+                    || u64::from(block) < self.superblock.data_start
+                {
+                    return Err(FsError::OutOfRange);
+                }
+                self.stage_bitmap(block, true)?;
+                let at = first + step;
+                if at < direct_count {
+                    inode.direct[at] = block;
+                } else {
+                    let within = (at - direct_count) * 4;
+                    let table = self.cache.edit(inode.indirect)?;
+                    table
+                        .get_mut(within..within + 4)
+                        .ok_or(FsError::OutOfRange)?
+                        .copy_from_slice(&block.to_le_bytes());
+                }
+                block
+            } else {
+                *slot
+            };
+            let from = step * BLOCK;
+            let page = self.cache.edit(block)?;
+            page.copy_from_slice(&data[from..from + BLOCK]);
+        }
+        self.cache.flush()?;
+
+        let end = offset + (whole * BLOCK) as u64;
+        if end > inode.size {
+            inode.size = end;
+        }
+        self.stage_inode(index, &inode)?;
+        self.commit(&[])?;
+        Ok(whole * BLOCK)
+    }
+
+    /// The block an inode has at `which`, or zero — direct or through the
+    /// indirect table. RFC 0066.
+    fn block_number(&mut self, inode: &Inode, which: usize) -> Result<u32, FsError> {
+        if which < inode.direct.len() {
+            return Ok(inode.direct[which]);
+        }
+        if inode.indirect == 0 {
+            return Ok(0);
+        }
+        let at = (which - inode.direct.len()) * 4;
+        let table = self.cache.edit(inode.indirect)?;
+        let mut number = [0u8; 4];
+        number.copy_from_slice(table.get(at..at + 4).ok_or(FsError::OutOfRange)?);
+        Ok(u32::from_le_bytes(number))
+    }
+
     /// Removes `name` from `directory`, freeing what it named.
     ///
     /// The inode's generation is bumped when the slot is next used, which is
@@ -926,6 +1136,97 @@ mod tests {
             &contents[..read],
             b"a filesystem this kernel can write to\n"
         );
+    }
+
+    #[test]
+    fn a_run_lands_whole_and_reads_back_off_the_device() {
+        // RFC 0066: one transaction for many blocks. Sixteen blocks here, which
+        // crosses from the direct blocks into the indirect table -- the two
+        // shapes a run has to handle, in one call.
+        let mut bytes = image(256);
+        let mut payload = vec![0u8; 16 * BLOCK];
+        for (at, byte) in payload.iter_mut().enumerate() {
+            *byte = (at % 251) as u8;
+        }
+        run(&mut bytes, FRAMES, None, |volume| {
+            let root = volume.superblock().root;
+            let index = volume.create(root, b"run", Kind::File).expect("created");
+            let put = volume.write_run(index, 0, &payload).expect("a run lands");
+            assert_eq!(put, 16 * BLOCK, "all sixteen blocks, in one call");
+        });
+
+        let mut pages = Image::new(&bytes);
+        let mut mounted = Filesystem::mount(&mut pages).expect("mounts afterwards");
+        let root = mounted.root().unwrap();
+        let (_, inode) = mounted.lookup(&root, b"run").expect("with the file in it");
+        assert_eq!(inode.size, (16 * BLOCK) as u64);
+        assert_ne!(inode.indirect, 0, "it reached past the direct blocks");
+        // Every block, off the device, through a reader that never saw the cache.
+        for step in 0..16 {
+            let mut got = [0u8; 8];
+            let at = (step * BLOCK) as u64;
+            let read = mounted.read(&inode, at, &mut got);
+            assert_eq!(read, 8);
+            let want: [u8; 8] = core::array::from_fn(|k| ((step * BLOCK + k) % 251) as u8);
+            assert_eq!(got, want, "block {step} came back wrong");
+        }
+    }
+
+    #[test]
+    fn a_run_allocates_distinct_blocks() {
+        // **The test that fails against a naive loop of `free_block`.** Inside
+        // one transaction `stage_bitmap` edits a journalled copy while
+        // `free_block` reads the cached one, so every call in the run would
+        // return the same number and the blocks would overwrite each other --
+        // which is exactly what RFC 0065 hit with two blocks. Checked by
+        // reading each block back and requiring it to hold its own bytes,
+        // which a shared block cannot.
+        let mut bytes = image(256);
+        let mut payload = vec![0u8; 6 * BLOCK];
+        for step in 0..6 {
+            payload[step * BLOCK] = (step + 1) as u8;
+        }
+        run(&mut bytes, FRAMES, None, |volume| {
+            let root = volume.superblock().root;
+            let index = volume.create(root, b"run", Kind::File).expect("created");
+            volume.write_run(index, 0, &payload).expect("a run lands");
+            let inode = volume.inode(index).expect("the inode");
+            let mut seen = alloc::vec::Vec::new();
+            for slot in inode.direct.iter().take(6) {
+                assert_ne!(*slot, 0, "every block of the run was allocated");
+                assert!(!seen.contains(slot), "block {slot} was handed out twice");
+                seen.push(*slot);
+            }
+        });
+    }
+
+    #[test]
+    fn a_run_shorter_than_a_block_falls_back_to_one_write() {
+        // A run is about whole blocks. Fewer than one is the single-block
+        // path's business, and answering "nothing" would be a silent refusal.
+        let mut bytes = image(64);
+        run(&mut bytes, FRAMES, None, |volume| {
+            let root = volume.superblock().root;
+            let index = volume.create(root, b"run", Kind::File).expect("created");
+            assert_eq!(volume.write_run(index, 0, b"short").expect("written"), 5);
+            assert_eq!(volume.inode(index).expect("inode").size, 5);
+        });
+    }
+
+    #[test]
+    fn a_run_at_an_unaligned_offset_is_refused() {
+        // Refused rather than quietly turned into something else: a partial
+        // first block would be a second shape inside one transaction.
+        let mut bytes = image(64);
+        let payload = vec![0u8; 2 * BLOCK];
+        run(&mut bytes, FRAMES, None, |volume| {
+            let root = volume.superblock().root;
+            let index = volume.create(root, b"run", Kind::File).expect("created");
+            assert_eq!(
+                volume.write_run(index, 1, &payload),
+                Err(FsError::OutOfRange)
+            );
+        });
     }
 
     #[test]

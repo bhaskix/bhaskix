@@ -842,6 +842,41 @@ the distinction is in the table rather than in somebody's head.
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-09-01 (RFC 0066: one commit for many blocks, and the number moves)
+
+The entry below measured the remaining distance to a hosted BusyBox and named the next limit: every
+block of a write is one journal transaction. `Volume::write_run` is that limit removed.
+
+**Why the metadata does not grow with the data.** RFC 0015 never journals data — a data block goes
+straight to its home *before* the commit, so a block an inode claims can never be a block still
+holding somebody else's bytes. Only the inode, one bitmap block and at most one indirect table are
+staged, and `stage` already returns the existing slot for a home it has seen. Three of the eight a
+transaction may hold, whatever the run's length.
+
+Measured on a booted machine, the same write before and after:
+
+| | per block | 19 blocks | BusyBox's 531 |
+|---|---|---|---|
+| `write` in a loop | 14,037–46,715 µs | 266–887 ms | 7.5–25 s |
+| `write_run` | 3,811–4,421 µs | 72–84 ms | **2.0–2.3 s** |
+
+Between 3.5× and 10×, and the spread narrows — which is what paying a fixed cost once instead of N
+times looks like.
+
+**Two things the implementation got wrong first, both caught by the tests written to prove it.** The
+indirect table was allocated by a *second* scan, which returns a block the run has already chosen
+because nothing is marked used until the commit; the first draft detected that and answered `Full`,
+a refusal invented by the allocator rather than by the filesystem being full. And
+`a_run_allocates_distinct_blocks` was armed by putting a naive loop of `free_block` back — the way
+the single-block path allocates — and it fails, which is exactly why `free_blocks` exists.
+
+`Volume::write` is unchanged and keeps its meaning; `write_run` refuses an unaligned offset and falls
+back to it for anything shorter than a block. The cache's eight frames did not become the next bound,
+which was the RFC's unresolved question and is now answered by measurement rather than left open.
+
+What remains between here and a hosted `sh` running a command is a disk and a formatted filesystem
+large enough: 1 MiB and 128 blocks today, against the 531 blocks BusyBox needs.
+
 ### 2026-09-01 (what actually stops BusyBox now, measured instead of estimated)
 
 `docs/roadmap.md`'s L1 row named the two limits that stopped a hosted `sh` running a command: a

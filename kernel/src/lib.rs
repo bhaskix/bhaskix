@@ -14384,9 +14384,14 @@ extern "C" fn journal_on_disk(endpoint: u64) -> ! {
                     // of them. A number beats an estimate, and the roadmap has
                     // been quoting estimates.
                     let began = bhaskix_arch::tsc::read();
+                    // **One commit for many blocks** — RFC 0066. This was
+                    // `volume.write` in a loop, one journal transaction per 4
+                    // KiB, which the line below prices. `write_run` stages the
+                    // same three metadata blocks whatever the run's length and
+                    // falls back to the single-block path for the tail.
                     let mut done = 0usize;
                     while done < bytes.len() {
-                        match volume.write(hosted, done as u64, &bytes[done..]) {
+                        match volume.write_run(hosted, done as u64, &bytes[done..]) {
                             Ok(0) | Err(_) => break,
                             Ok(moved) => done += moved,
                         }
