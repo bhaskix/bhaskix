@@ -2915,18 +2915,36 @@ static FILE_PEAK: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64:
 /// Where the bind record sits.
 const BIND_RECORD_AT: u64 = REPORT_AT + report::BIND_AT as u64;
 
+/// How many binds this program has answered, of any outcome.
+static BINDS_SERVED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 /// Records which domain asked to bind and what it was told — RFC 0063.
 ///
 /// Written on **both** paths, so a domain with no record here did not reach
 /// this function. That is the distinction the reclaim hunt has been missing:
 /// its gate sees a bind answer 1, which `answer_bind` cannot produce.
+///
+/// **The incarnation is here because a domain number is not an identity.**
+/// The record read `domain 18` on a failing boot *and* on a passing one, and
+/// that settled nothing: domain slots are reused, so the failing boot's record
+/// may belong to the leaker rather than the taker — in which case the taker's
+/// bind never arrived and every instrument aimed at this function has been
+/// describing somebody else's call. The incarnation distinguishes two uses of
+/// one slot, and the served count says whether a second bind followed the one
+/// recorded, which a single overwritten record cannot.
 fn trace_bind(domain: u32, errno: i64, port: u16, refusal: u64) {
-    let outcome = ((-errno) as u64 & 0xffff) | (u64::from(port) << 16) | (refusal << 32);
+    let served = BINDS_SERVED.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
+    let generation = incarnation()[domain as usize % limits::MAX_DOMAINS];
+    let who = u64::from(domain) | (u64::from(generation) << 32);
+    let outcome = ((-errno) as u64 & 0xffff)
+        | (u64::from(port) << 16)
+        | ((refusal & 0xffff) << 32)
+        | ((served & 0xffff) << 48);
     // SAFETY: inside the page `ATTACH` mapped from this program's own object,
     // past the process record and before the scratch -- asserted in
     // `bhaskix_personality::report`.
     unsafe {
-        core::ptr::write_volatile(BIND_RECORD_AT as *mut u64, u64::from(domain));
+        core::ptr::write_volatile(BIND_RECORD_AT as *mut u64, who);
         core::ptr::write_volatile((BIND_RECORD_AT + 8) as *mut u64, outcome);
     }
 }

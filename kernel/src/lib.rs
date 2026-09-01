@@ -9423,11 +9423,14 @@ fn killed_domain_gives_its_socket_back(hhdm_base: u64, cpus: u32) -> bool {
         // taker's says it did not.
         let (bind_domain, outcome) = adapter_bind_record();
         println!(
-            "\x1b[91m                   last bind: domain {bind_domain}, errno {}, port {}, \
-             service word {}\x1b[0m",
+            "\x1b[91m                   last bind: domain {} incarnation {}, errno {}, port {}, \
+             service word {}, and {} bind(s) served in all\x1b[0m",
+            bind_domain & 0xffff_ffff,
+            bind_domain >> 32,
             outcome & 0xffff,
             (outcome >> 16) & 0xffff,
-            outcome >> 32
+            (outcome >> 32) & 0xffff,
+            outcome >> 48
         );
         let (last, stage, detail) = adapter_file_record();
         println!(

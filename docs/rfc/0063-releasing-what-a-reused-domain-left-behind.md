@@ -461,6 +461,20 @@ The zeroing is reverted rather than kept as defensive tidiness: it duplicated a 
 manager already states and implements, which is the second derivation this project keeps paying for,
 and its justification comment and unsafe-budget raise both cited a cause that does not exist.
 
+**The next instrument, built (2026-09-01).** A domain number is not an identity: slots are reused,
+so `domain 18` on a failing boot and `domain 18` on a passing one may be two different programs. The
+bind record now carries the **incarnation** of that slot and a count of every bind this adapter has
+served. The healthy baseline, taken by forcing the failure branch on a boot where the reclaim works:
+
+    bound again true (fd 3, bind 0), forgets 2
+    last bind: domain 18 incarnation 6, errno 0, port 7781, service word 0, and 4 bind(s) served in all
+
+So a failing boot reading **incarnation 5 with 3 served** says the taker's bind never reached
+`answer_bind`, and every instrument aimed at that function has been describing the leaker's call.
+One reading **incarnation 6 with 4 served** says the taker's bind did arrive and succeeded, and the
+`fd 1, bind 1` the gate reports came from somewhere that is not this adapter at all. There is no
+third answer, which is the first time this investigation has had a question shaped like that.
+
 **What is actually known**, and this part survives:
 
 - The gate reads `fd 1, bind 1` from the taker on a failing boot.
