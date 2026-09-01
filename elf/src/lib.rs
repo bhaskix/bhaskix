@@ -270,7 +270,41 @@ pub fn parse(bytes: &[u8]) -> Result<Image, ElfError> {
 ///
 /// [`ElfError`], exactly as [`parse`].
 pub fn parse_in(bytes: &[u8], half: AddressHalf) -> Result<Image, ElfError> {
+    parse_head(bytes, bytes.len(), half)
+}
+
+/// [`parse_in`], for a caller holding only the **front** of the file.
+///
+/// **Because a loader should not have to hold the whole program to read its
+/// headers** — RFC 0064. Every segment is checked to lie inside the file, and
+/// until now "the file" and "the slice" were the same thing, which is true for
+/// every caller that reads an image whole and false for one streaming a file
+/// through a fixed window. `bin/linuxd`'s staging object is sixteen pages and
+/// BusyBox is 2,172,376 bytes; that check, not the parser or the loader, is
+/// what stopped an `execve` of it.
+///
+/// `bytes` must hold the ELF header and the whole program header table —
+/// nothing here reads past them — and `file_len` is how long the file actually
+/// is. Segment contents are bounded against `file_len`, so a crafted header
+/// still cannot name bytes outside the file; it simply may name bytes the
+/// caller has not read yet, which is the caller's business to fetch.
+///
+/// # Errors
+///
+/// [`ElfError`], exactly as [`parse`]. A program header table running past
+/// `bytes` is [`ElfError::BadProgramHeaders`] — which a caller streaming a file
+/// fixes by reading more of the front rather than by rejecting the file, so the
+/// two cases share an error and are told apart by whether the caller holds the
+/// whole file. Said here because the first draft of this comment claimed
+/// `Truncated` and a test written from the comment failed against the code.
+pub fn parse_head(bytes: &[u8], file_len: usize, half: AddressHalf) -> Result<Image, ElfError> {
     if bytes.len() < 64 {
+        return Err(ElfError::Truncated);
+    }
+    // The headers must be present; the contents need only be *claimed* to be
+    // inside the file. A `file_len` smaller than what the caller holds would
+    // be the caller contradicting itself, and is refused rather than trusted.
+    if file_len < bytes.len() {
         return Err(ElfError::Truncated);
     }
     if bytes.get(0..4) != Some(&MAGIC) {
@@ -330,6 +364,11 @@ pub fn parse_in(bytes: &[u8], half: AddressHalf) -> Result<Image, ElfError> {
         if p_type == PT_DYNAMIC {
             // Captured for the relocation walk, bounds-checked like any
             // segment: a dynamic table outside the file is a header lying.
+            //
+            // Bounded by `bytes` and deliberately not by `file_len`, unlike
+            // `PT_LOAD` below: `relocate` reads this table out of the same
+            // slice, so a caller holding only the front of a dynamic image
+            // must read more before this parser can be asked about it.
             let offset = u64_at(bytes, header + 8).ok_or(ElfError::BadProgramHeaders)?;
             let filesz = u64_at(bytes, header + 32).ok_or(ElfError::BadProgramHeaders)?;
             let offset = usize::try_from(offset).map_err(|_| ElfError::BadProgramHeaders)?;
@@ -361,7 +400,13 @@ pub fn parse_in(bytes: &[u8], half: AddressHalf) -> Result<Image, ElfError> {
         let end = offset
             .checked_add(filesz)
             .ok_or(ElfError::SegmentOutsideFile)?;
-        if end > bytes.len() {
+        // **Against the file, not against what the caller is holding.** These
+        // are the only bytes this parser never dereferences -- a loader copies
+        // them out itself -- so a caller streaming a file through a window may
+        // legitimately not have them yet. Everything the parser *reads* is
+        // still bounded by `bytes`: the header, the program header table, and
+        // a dynamic segment. RFC 0064.
+        if end > file_len {
             return Err(ElfError::SegmentOutsideFile);
         }
 
@@ -708,6 +753,68 @@ mod tests {
         assert_eq!(
             parse_in(&low, AddressHalf::Kernel),
             Err(ElfError::SegmentOutsideUserSpace)
+        );
+    }
+
+    #[test]
+    fn a_head_parses_a_segment_the_caller_has_not_read_yet() {
+        // **The case that stopped an `execve` of BusyBox** — RFC 0064. The
+        // loader holds the front of the file in a sixteen-page window; the
+        // segment's contents are past it and are copied out later, a window at
+        // a time, so they are never dereferenced here. `parse` rejects that
+        // and is right to, because for its callers the slice *is* the file.
+        let whole = elf(0x40_0000, 0x40_0000, flags::READ | flags::EXEC, 16, 16);
+        let file_len = whole.len();
+        let head = &whole[..whole.len() - 16];
+        assert_eq!(
+            parse(head).map(|_| ()),
+            Err(ElfError::SegmentOutsideFile),
+            "the slice really is short, and the whole-file parser must say so"
+        );
+        let image = parse_head(head, file_len, AddressHalf::User)
+            .expect("the segment is inside the file, just not inside the window");
+        assert_eq!(image.segments().count(), 1);
+        assert_eq!(image.entry, 0x40_0000);
+    }
+
+    #[test]
+    fn a_head_still_refuses_a_segment_outside_the_file() {
+        // The check is moved, not removed: a header naming bytes past the end
+        // of the file is a header lying, and stays refused. Without this the
+        // change would have traded a bound for nothing.
+        let whole = elf(0x40_0000, 0x40_0000, flags::READ | flags::EXEC, 16, 16);
+        let file_len = whole.len();
+        assert_eq!(
+            parse_head(&whole, file_len - 1, AddressHalf::User).map(|_| ()),
+            Err(ElfError::Truncated),
+            "a file shorter than the slice is the caller contradicting itself"
+        );
+        let head = &whole[..whole.len() - 16];
+        assert_eq!(
+            parse_head(head, file_len - 1, AddressHalf::User).map(|_| ()),
+            Err(ElfError::SegmentOutsideFile),
+            "one byte short of the segment's end is still outside the file"
+        );
+    }
+
+    #[test]
+    fn a_head_too_short_for_the_program_headers_is_truncated() {
+        // The headers are what this parser *reads*, so they must be present
+        // however large the file is said to be. A caller fixes this by reading
+        // more of the front, which is a different action from rejecting the
+        // file, and the error says which.
+        let whole = elf(0x40_0000, 0x40_0000, flags::READ | flags::EXEC, 16, 16);
+        let file_len = whole.len();
+        assert_eq!(
+            parse_head(&whole[..70], file_len, AddressHalf::User).map(|_| ()),
+            Err(ElfError::BadProgramHeaders),
+            "the table is past the slice, and that is what this parser calls it"
+        );
+        // And a slice too short even for an ELF header is `Truncated`, which is
+        // a different thing and keeps its own name.
+        assert_eq!(
+            parse_head(&whole[..32], file_len, AddressHalf::User).map(|_| ()),
+            Err(ElfError::Truncated)
         );
     }
 

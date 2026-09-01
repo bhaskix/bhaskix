@@ -10101,6 +10101,15 @@ fn hosted_exec_self_test(hhdm_base: u64, cpus: u32) -> bool {
             "\x1b[91m    hosted exec    FAILED: the execing domain is still alive, so the execve \
              was refused\x1b[0m"
         );
+        // What the adapter recorded on its way to refusing. The stage names the
+        // step and the detail carries the size or the errno, so this can tell a
+        // refused open from a refused read from a parser that would not take
+        // the headers -- three failures that read identically as "still alive".
+        let (last, stage, detail) = adapter_file_record();
+        println!(
+            "\x1b[91m                   the adapter recorded {last} at stage {stage}, detail \
+             {detail}\x1b[0m"
+        );
         return false;
     }
     println!(

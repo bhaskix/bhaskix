@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | 🔨 **Draft 2026-09-01** |
+| **Status** | 🔨 **Draft 2026-09-01 — steps 1–3 implemented and measured; step 4 is blocked by a limit below this RFC.** The loader no longer caps a program at the staging window. The filesystem caps every file at **40,960 bytes**, so no program large enough to prove the difference can be put on a disk yet. See "What step 4 found" |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | filesystem (`bin/fsd`, `dir::READ_INTO`) / libc / userspace (`bin/linuxd`) |
 | **Milestone** | Phase 2 — Linux personality (L1) |
@@ -139,3 +139,37 @@ which for a typical binary is a small saving and one more thing to get wrong.
    each `PT_LOAD` copies the file's bytes into the child a window at a time, so the staging object
    bounds the window rather than the file.
 4. **A gate**, with a program deliberately larger than the window, armed red.
+
+
+---
+
+## What step 4 found (2026-09-01)
+
+Step 4 is a gate that `execve`s a program larger than the window, and building one found a lower
+limit that nothing in the tree recorded.
+
+`user/hosted` was padded to 109,760 bytes with a `.rodata` array — comfortably past the 65,536-byte
+window — and the boot refused it. The adapter's own record said `-8 at stage -143, detail 40960`:
+`ENOEXEC` from the parser, on a file the filesystem reported as **40,960 bytes** rather than 109,760.
+The parser was right to refuse it; the file really was that long by the time it reached the disk.
+
+**`fs`'s `Inode` has `direct: [u32; 10]` and an `indirect: u32` that is written as zero and never
+read.** `Volume::write` returns `FsError::Full` the moment `block_index >= inode.direct.len()`, so
+every file on this filesystem stops at ten blocks — 40,960 bytes — and the field that would carry the
+eleventh has been declared since the format was written without ever being used. The kernel's own
+staging loop breaks on that `Err`, which is why the program was truncated silently rather than
+failing where it was written.
+
+So the ordering of limits, which this RFC had wrong:
+
+| limit | was | now |
+|---|---|---|
+| the loader's staging window | 65,536 bytes | **gone** — the window is a window |
+| a file on this filesystem | not known to be a limit | **40,960 bytes**, and binding |
+
+Steps 1 and 3 stand and are measured: the protocol carries a landing offset, `parse_head` bounds
+segments against the file rather than against what the caller holds, and the loader streams each
+segment through a fixed window. What cannot be *demonstrated* is the thing that motivated it, because
+no program big enough to demonstrate it can be stored. Step 4 waits on indirect blocks, which is its
+own RFC and not a paragraph in this one — the padding was removed rather than left failing, so the
+tree stays green and the gate is not written against a capability that does not exist.

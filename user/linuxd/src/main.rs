@@ -3338,6 +3338,14 @@ const STAGE_NOT_COPIED: i64 = -110;
 const STAGE_EXEC_REFUSED: i64 = -140;
 const STAGE_EXEC_READ: i64 = -141;
 const STAGE_EXEC_SHORT: i64 = -142;
+/// The parser refused the staged head — RFC 0064 step 4 added this, because a
+/// build that fails writes no record and reads as "the domain is still alive",
+/// which is the same sentence a refused open produces.
+const STAGE_EXEC_PARSE: i64 = -143;
+/// A segment would not stream into the child.
+const STAGE_EXEC_STREAM: i64 = -144;
+/// The child's memory would not be mapped.
+const STAGE_EXEC_MAP: i64 = -145;
 
 /// The work behind [`answer_openat`], so that every path through it is traced.
 fn open_the_file(request: &PersonalityCall, path_at: u64, flags: u64) -> Answer {
@@ -5312,11 +5320,17 @@ fn answer_execve(request: &PersonalityCall) -> (u64, Answer) {
     // the ELF parser, or for a segment that would land on its own stack, and
     // answering `ENOMEM` to either would send whoever is debugging it looking
     // for memory pressure that is not there.
-    let built = match staged {
+    let built = match &staged {
         None if build_exec_image() => Ok(()),
         None => Err(-12), // ENOMEM
-        Some(bytes) => build_staged_image(bytes, arguments),
+        Some(staged) => build_staged_image(staged, arguments),
     };
+    // The file handle outlives the build now, because the build is what reads
+    // through it. Released here, on every path, so a refused exec does not
+    // leave one of the thirty-two slots occupied.
+    if let Some(staged) = &staged {
+        release_file_slot(staged.slot);
+    }
     // The handle is given back either way. A slot left occupied would refuse
     // the *next* exec for a reason that has nothing to do with it.
     // **The record is looked up before anything moves it**, and the first
@@ -5365,10 +5379,18 @@ fn answer_execve(request: &PersonalityCall) -> (u64, Answer) {
 /// # Errors
 ///
 /// `ENOENT` for a name that is not there, `EACCES` for a directory (Linux's
-/// answer for `execve` of one), `ENOEXEC` for an empty file, `E2BIG` for one
-/// larger than the staging object, and `EIO` if the service stops answering
-/// part way through.
-fn stage_from_filesystem(name: &[u8]) -> Result<u64, i64> {
+/// answer for `execve` of one), `ENOEXEC` for an empty file, and `EIO` if the
+/// service stops answering part way through.
+///
+/// **`E2BIG` for a program larger than the staging object is gone** — RFC 0064.
+/// It was the honest answer while the object had to hold the whole image, and
+/// it was what refused every program bigger than sixteen pages. The object is a
+/// window now: what has to fit in it is the ELF header and the program header
+/// table, not the file. A program whose headers sit past the window is refused
+/// by the parser as `ENOEXEC`, which is the same answer as any other header
+/// this loader cannot read, and no program produced by a normal linker puts
+/// them there.
+fn stage_from_filesystem(name: &[u8]) -> Result<Staged, i64> {
     let Some(component) = one_component(name) else {
         return Err(-2); // ENOENT
     };
@@ -5386,11 +5408,6 @@ fn stage_from_filesystem(name: &[u8]) -> Result<u64, i64> {
         Some(-13) // EACCES: a directory is not a program
     } else if opened.size == 0 {
         Some(-8) // ENOEXEC: nothing is not a program either
-    } else if opened.size > STAGING_BYTES {
-        // **Said, not truncated.** Loading the first 64 KiB of a larger
-        // program would produce a domain that faults somewhere unrelated, and
-        // the limit is a property of this adapter rather than of the file.
-        Some(-7) // E2BIG
     } else {
         None
     };
@@ -5405,8 +5422,15 @@ fn stage_from_filesystem(name: &[u8]) -> Result<u64, i64> {
     // staging object has to be as large as the file rather than a window that
     // could be slid along it. The service moves at most a page per call and
     // says how much went; the loop is the caller's, as the protocol says.
+    // **Only the front of the file, and the handle stays open** — RFC 0064
+    // step 3. This used to read the whole image, which is why the staging
+    // object had to be as large as the program and why BusyBox, at 2,172,376
+    // bytes against sixteen pages, could not be exec'd at all. What the parser
+    // needs is the ELF header and the program header table; the segments are
+    // streamed through this same window afterwards, by `stream_into_child`.
+    let head = opened.size.min(STAGING_BYTES);
     let mut done = 0u64;
-    while done < opened.size {
+    while done < head {
         let reply = call(
             syscall::CALL,
             slot,
@@ -5428,12 +5452,29 @@ fn stage_from_filesystem(name: &[u8]) -> Result<u64, i64> {
         }
         done += moved;
     }
-    release_file_slot(slot);
-    if done != opened.size {
+    if done != head {
+        release_file_slot(slot);
         trace_file(-5, STAGE_EXEC_SHORT, done);
         return Err(-5); // EIO
     }
-    Ok(done)
+    // The caller releases it: the segments have not been read yet, and the
+    // handle is how they will be.
+    Ok(Staged {
+        slot,
+        file_size: opened.size,
+        head,
+    })
+}
+
+/// A program whose front is staged and whose handle is still open.
+///
+/// RFC 0064 step 3. `head` is how much of the file is in the staging object —
+/// enough for the headers — and `file_size` is how long the file is, which the
+/// parser needs to bound segments it will never be handed.
+struct Staged {
+    slot: u64,
+    file_size: u64,
+    head: u64,
 }
 
 /// The staged bytes, as a slice, mapping the staging object on first use.
@@ -5484,15 +5525,29 @@ fn staged_bytes(length: u64) -> Result<&'static [u8], i64> {
 /// stack this loader is about to map, `E2BIG` if the initial image does not
 /// fit its page, and `ENOMEM` for a kernel call that refuses.
 fn build_staged_image(
-    length: u64,
+    staged: &Staged,
     arguments: &bhaskix_personality::exec::Arguments,
 ) -> Result<(), i64> {
     use bhaskix_personality::stack::{Builder, ProcessInfo};
 
-    let bytes = staged_bytes(length)?;
-    let Ok(parsed) = bhaskix_elf::parse(bytes) else {
+    let bytes = staged_bytes(staged.head)?;
+    // **The head, with the file's real length** — RFC 0064. Segment contents
+    // are bounded against the file rather than against what is in the window,
+    // because they are streamed out later and never dereferenced here.
+    let Ok(parsed) = bhaskix_elf::parse_head(
+        bytes,
+        staged.file_size as usize,
+        bhaskix_elf::AddressHalf::User,
+    ) else {
+        trace_file(-8, STAGE_EXEC_PARSE, staged.file_size);
         return Err(-8); // ENOEXEC
     };
+
+    // **Computed before anything streams**, because streaming reuses the very
+    // window these bytes are in. The first version of this change left it
+    // where it was, after the segment loop, where it would have read whatever
+    // the last segment's tail happened to leave behind.
+    let (phdr, phent, phnum) = program_headers(bytes, &parsed);
 
     if call(syscall::INVOKE, CHILD, method::PERSONALITY, [1, 0, 0, 0]).status != status::OK {
         return Err(-12);
@@ -5527,6 +5582,7 @@ fn build_staged_image(
         while mapped < end {
             let pages = ((end - mapped) / 4096).min(MAX_EAGER_PAGES);
             if !map_at_eager(CHILD, mapped, pages, protection) {
+                trace_file(-12, STAGE_EXEC_MAP, mapped);
                 return Err(-12); // ENOMEM
             }
             mapped += pages * 4096;
@@ -5536,12 +5592,14 @@ fn build_staged_image(
         // program's own scratch and no part of the image is dereferenced here.
         // A segment's `memory_size` may exceed its `file_size` — that is
         // `.bss`, and it is already the zero a fresh mapping is.
-        if !copy_from_staging(
+        if !stream_into_child(
+            staged.slot,
             segment.file_offset as u64,
             segment.address,
             segment.file_size as u64,
         ) {
-            return Err(-12);
+            trace_file(-5, STAGE_EXEC_STREAM, segment.file_offset as u64);
+            return Err(-5); // EIO: the read failed, not the memory
         }
     }
 
@@ -5556,7 +5614,6 @@ fn build_staged_image(
     let argc = arguments.arguments(&mut argv)?;
     let envc = arguments.environment(&mut envp)?;
 
-    let (phdr, phent, phnum) = program_headers(bytes, &parsed);
     let mut entropy = [0u8; 16];
     // A machine with no `RDRAND` gets a fixed block rather than no block: a
     // runtime that reads `AT_RANDOM` and finds nothing there is worse off than
@@ -5612,25 +5669,57 @@ fn build_staged_image(
     Ok(())
 }
 
-/// Copies `length` bytes of the staged image into the child at `address`.
+/// Streams `length` bytes from the file at `from` into the child at `address`.
 ///
-/// The kernel moves at most a page per `COPY_OUT`, so the loop is here; the
-/// offset into the staging object *is* the file offset, because that is where
-/// `READ_INTO` put the bytes.
-fn copy_from_staging(from: u64, address: u64, length: u64) -> bool {
+/// **The staging object is a window, not a copy of the file** — RFC 0064. Each
+/// pass reads up to `STAGING_BYTES` from the file into the *front* of the
+/// object and copies exactly those bytes out to the child, so the memory this
+/// program holds bounds the window and not the program it can load. That is
+/// the whole difference between exec'ing sixteen pages and exec'ing BusyBox.
+///
+/// Two loops, because two limits: `READ_INTO` moves at most a page per call
+/// and `COPY_OUT` moves at most a page per call, and both are the callee's
+/// limit rather than a choice made here.
+fn stream_into_child(slot: u64, from: u64, address: u64, length: u64) -> bool {
     let mut done = 0u64;
     while done < length {
-        let take = (length - done).min(4096);
-        let moved = call(
-            syscall::INVOKE,
-            CHILD,
-            method::COPY_OUT,
-            [STAGING, from + done, address + done, take],
-        );
-        if moved.status != status::OK {
-            return false;
+        let window = (length - done).min(STAGING_BYTES);
+        // Fill the front of the object from this point in the file.
+        let mut filled = 0u64;
+        while filled < window {
+            let reply = call(
+                syscall::CALL,
+                slot,
+                bhaskix_abi::dir::READ_INTO,
+                [STAGING, 4096, from + done + filled, filled],
+            );
+            if reply.status != status::OK || reply.args[0] != bhaskix_abi::dir::OK {
+                return false;
+            }
+            let moved = reply.args[1];
+            if moved == 0 {
+                // End of file inside a segment the headers said was there.
+                // A short image would fail later as something stranger.
+                return false;
+            }
+            filled += moved;
         }
-        done += take;
+        // And copy exactly what was filled, from the object's front.
+        let mut copied = 0u64;
+        while copied < window {
+            let take = (window - copied).min(4096);
+            let moved = call(
+                syscall::INVOKE,
+                CHILD,
+                method::COPY_OUT,
+                [STAGING, copied, address + done + copied, take],
+            );
+            if moved.status != status::OK {
+                return false;
+            }
+            copied += take;
+        }
+        done += window;
     }
     true
 }
