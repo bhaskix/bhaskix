@@ -1373,6 +1373,21 @@ this defect has been split between since it was filed survives, and the third pa
 one left standing — named in advance, before the specimen existed. **Two counters that reported
 nothing for weeks eliminated two hypotheses on the first failure they saw.**
 
+**And the third is confirmed by reading rather than inferred — 2026-09-01.** `release_sockets_of`
+opens with `process_for(domain)`, and `process_for` is a **get-or-create**: when
+`by_domain(domain, generation)` misses it calls `admit`, installs standard descriptors, and returns a
+**fresh empty record** — whose zero sockets the loop walks, releasing nothing and reporting success.
+**And the miss is guaranteed on the path that matters.** `by_domain` requires
+`p.generation == generation && p.state == State::Live`, while the `FORGET` caller's own comment says
+it *"arrives when the slot is reused"* — by which time the generation has advanced **and** the old
+record is a zombie or gone. Both filters exclude it. So the one path that exists to release a dead
+domain's socket cannot reach the record holding it, and fabricates an empty one rather than failing.
+`note_exit` works only because it runs *before* `processes.ended`, while the record is still live.
+**The fix is not written, deliberately**: it needs an accessor that finds records by domain across
+generations and states, and choosing which of those to release for is a design decision — release too
+broadly and a **live** program loses its network, which is the exact failure the comment beside
+`release_socket_slot` records having caused once already.
+
 **And a number withdrawn.** §3's row briefly carried "roughly 7%", computed from 2 in 28. This soak
 makes that unlikely -- 29 clean boots is about a 12% event at 7% -- so the row states two
 disagreeing samples instead of one number. The swing itself is the lead: a rate that moves on one
