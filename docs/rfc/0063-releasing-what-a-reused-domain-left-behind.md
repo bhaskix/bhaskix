@@ -200,6 +200,32 @@ The two host tests from the attempt are worth keeping when it is retried; they
 were correct and they passed. They simply tested the half of the problem this
 document had thought about.
 
+## What the service itself says it is holding (2026-09-01)
+
+The previous section ended by recommending that somebody ask `bin/ipd` what it thinks it holds,
+since every hypothesis so far had been about the *adapter's* bookkeeping and two corrections to that
+made the machine deterministically worse. That has now been done, and the answer eliminates a
+hypothesis rather than confirming one.
+
+`bin/ipd`'s `Socket` has `port`, `generation`, family, peer and length — and **no owner field**, so
+the service cannot attribute a port to a domain even in principle. What it can report is which ports
+are occupied. It now packs the low four slots' ports into report word 9, and the kernel prints them:
+
+    ipd holds      slot 0 port 2; (a port here after its domain is gone is a leak in the service)
+
+That line reads **exactly the same on a boot where the reclaim gate fails as on one where it
+passes** — one port, slot 0, port 2, both times. So at report time the service is not sitting on an
+extra port. Whatever `bound again false` means, it is not "the old port was never given back and is
+still occupying a slot", which was the natural reading of the defect and is now measured false.
+
+**The limit of this instrument, stated so the next reader does not over-read it.** It samples once,
+at the boot report, which is after both the release and the rebind. A pass and a failure can reach
+the same final table by different routes: on a pass the port is released and re-bound into the same
+slot, and on a failure it may never have moved. The discriminator that would separate them is
+already in the struct and is not yet reported — `generation`, which the service bumps on every
+close. Two boots that end with the same port in the same slot but different generations took
+different paths, and that is the next thing to print.
+
 ## What this does not do
 
 - It does not release *files*. That asymmetry is deliberate and already

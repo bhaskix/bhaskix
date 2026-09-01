@@ -545,6 +545,46 @@ pub fn _print(args: fmt::Arguments<'_>) {
 /// [`write_fatal`], which cannot block on the console lock.
 static FATAL: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
+/// Returns the console to its normal path after a report the machine survived.
+///
+/// **Why this has to exist, and what its absence cost.** [`enter_fatal`] is
+/// entered at the top of *every* exception report, before the report can know
+/// whether the machine will survive one — which is right, because a report
+/// that cannot print is worth nothing. But a ring-3 domain faulting is a
+/// survivable event this kernel handles by design, and the boot exercises it
+/// on purpose: the report ends "this machine is still running", the domain is
+/// torn down, and the boot continues for hundreds of lines. Nothing cleared
+/// the flag, so from the first such fault onward [`put_run`] returned early
+/// into [`write_fatal`], which takes the lock **once per byte** instead of
+/// once per run. RFC 0050's whole-run guarantee — the entire purpose of
+/// `put_run` — was void for most of every boot, and a user program's line tore
+/// whenever another CPU printed inside that window.
+///
+/// It read as intermittent because it is: it depends on whether a second CPU
+/// prints during those bytes. And it survived six investigations because every
+/// instrument built to answer "did another print get in?" — [`TORN`],
+/// [`NONCONTIGUOUS`], [`INTERLOPER_BYTES`] — sits *after* that early return
+/// and never ran on a torn boot. Five mutually inconsistent measurements, all
+/// reading zero because none of them was ever executed.
+///
+/// Called only where a report has concluded the machine lives. The protection
+/// `enter_fatal` exists for — run-80, where a CPU blocked on a lock a dead CPU
+/// held — applies *during* a report and is kept: this restores the normal path
+/// only once the report is over and the machine is known to be running.
+pub fn leave_fatal() {
+    FATAL.store(false, core::sync::atomic::Ordering::Release);
+}
+
+/// Whether the console is on its fatal path.
+///
+/// Set means [`put_run`] is no longer holding the console across a run. The
+/// boot report prints this and a gate reads it: it is the one assertion this
+/// defect needed and did not have.
+#[must_use]
+pub fn is_fatal() -> bool {
+    FATAL.load(core::sync::atomic::Ordering::Acquire)
+}
+
 /// Routes every later print through the path that cannot block.
 ///
 /// Called at the top of the exception report and the panic handler — the

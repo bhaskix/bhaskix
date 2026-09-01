@@ -3060,6 +3060,24 @@ fi
 # the TCP defect in TRACKER §3, where it is a lever on something previously
 # called environmental. Until it is understood, this gate proves the path
 # without paying for it.
+# **The console must not still be on its fatal path when the boot report runs.**
+# This is the assertion the tear below went six investigations without. Once
+# `enter_fatal` is set, `console::put_run` returns early into `write_fatal`,
+# which takes the console lock once per *byte* instead of once per run -- so
+# RFC 0050's whole-run guarantee is void and any line a user program prints can
+# be cut in half by another CPU. It was set on every boot, because a ring-3
+# domain faulting is a survivable event the boot tests on purpose and nothing
+# cleared the flag afterwards. A grep, because the boot report prints it.
+if grep -qF "console fatal   false" "$LOG"; then
+    pass "the console left its fatal path after the report the machine survived"
+elif grep -qF "console fatal   true" "$LOG"; then
+    fail "the console is still on its fatal path: put_run is not holding the lock across a run, and printed lines can tear"
+    status=1
+else
+    fail "the boot report did not say whether the console left its fatal path"
+    status=1
+fi
+
 if grep -qF "hosted open refused errno 2" "$LOG"; then
     pass "a hosted program's open resolved through the writable directory (ENOENT, not EROFS)"
 elif grep -qF "hosted open refused errno 30" "$LOG"; then

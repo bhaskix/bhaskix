@@ -81,4 +81,12 @@ asm_budget = 4
 # brace balance, so `if let Some(x) = unsafe { f() } {` read as still-open and
 # charged the outer block's body to this crate. See the changelog; the
 # scanner now walks from the block's own brace and has a self-test.
-unsafe_budget = 156
+# 159 on 2026-09-01: three lines, and a temporary instrument rather than a
+# feature. RFC 0063's socket-reclaim defect has survived three hypotheses and
+# two attempted fixes that each made the machine deterministically worse, and
+# every one of them reasoned about the *adapter's* bookkeeping. The port is
+# held here, and nothing had asked this service what it thinks it holds. The
+# write is the same shape as the report word above it -- a volatile store into
+# the report page this program already owns -- and comes out with the
+# instrument.
+unsafe_budget = 159

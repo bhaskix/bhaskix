@@ -2529,6 +2529,25 @@ extern "C" fn ipd_main() -> ! {
             prefix_word(prefix6),
             v6_word(global6.is_some(), router6.is_some(), resolved6, pongs6),
         );
+        // **What this service thinks it is holding** — RFC 0063, written
+        // beside the report rather than through it, because threading one
+        // observation through six call sites is more churn than the
+        // observation is worth.
+        //
+        // Nobody has ever asked. Every hypothesis about the socket-reclaim
+        // defect has been about the *adapter's* bookkeeping -- which process
+        // record, which handle, which generation -- and two corrections to that
+        // bookkeeping made the machine deterministically worse. The port is
+        // held here. This is the service's own answer, and a port still listed
+        // after the domain that bound it is gone says the leak is here rather
+        // than in the adapter's idea of here.
+        //
+        // SAFETY: the page this program mapped writable, which nothing else
+        // reaches -- as `report`. Word nine, past the eight `report` writes,
+        // so the two do not collide.
+        unsafe {
+            core::ptr::write_volatile((REPORT_AT + 9 * 8) as *mut u64, bound_ports(&sockets));
+        }
     }
 }
 
@@ -2555,6 +2574,26 @@ fn prefix_word(prefix: Ipv6Addr) -> u64 {
 /// What v6 obtained, as bits, with the echo count above them.
 fn v6_word(global: bool, router: bool, resolved: bool, pongs6: u64) -> u64 {
     u64::from(global) | (u64::from(router) << 1) | (u64::from(resolved) << 2) | (pongs6 << 8)
+}
+
+/// The ports this service currently holds, packed four to a word.
+///
+/// **Nobody has ever asked it, and that is why the socket-reclaim defect has
+/// survived three hypotheses.** Every theory so far has been about the
+/// *adapter's* bookkeeping — which process record, which handle, which
+/// generation — and two corrections to that bookkeeping made the machine
+/// deterministically worse (RFC 0063). The port is held *here*, and this is the
+/// service saying what it thinks it holds rather than the adapter saying what
+/// it thinks it released.
+///
+/// Six slots, the low four packed as `u16`s; a zero port is a free slot, which
+/// is this table's own convention.
+fn bound_ports(sockets: &[Socket; SOCKETS]) -> u64 {
+    let mut packed = 0u64;
+    for (index, socket) in sockets.iter().take(4).enumerate() {
+        packed |= u64::from(socket.port) << (index * 16);
+    }
+    packed
 }
 
 #[allow(clippy::too_many_arguments)]

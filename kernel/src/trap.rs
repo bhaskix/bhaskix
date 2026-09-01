@@ -365,6 +365,14 @@ fn end_faulting_domain() -> ! {
             }
             println!("==================================================================");
 
+            // **The report is over and the machine lives, so the console goes
+            // back to holding a run together.** Without this the flag set at
+            // the top of this report stayed set for the rest of the boot, and
+            // `put_run` wrote one byte at a time with the lock released
+            // between them — see `console::leave_fatal`, which is where the
+            // whole account of that defect lives.
+            crate::console::leave_fatal();
+
             // `Faulted`, not `Killed`. A supervisor deciding whether to
             // start this program again wants to know the difference between a
             // program that was stopped on purpose and one with a bug in it.

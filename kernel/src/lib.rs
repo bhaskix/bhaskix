@@ -15154,6 +15154,23 @@ fn report_net_after_exchange(hhdm: u64) {
         "    ipd state      {:#x} (send/configured/tcp-rings)",
         ipd[7]
     );
+    // **What the socket service says it is holding** — RFC 0063.
+    //
+    // Printed only when it holds something, because the interesting boot is the
+    // one where a port is still listed after the domain that bound it is gone.
+    // Every hypothesis about the socket-reclaim defect so far has been about
+    // the *adapter's* bookkeeping, and two corrections to that made the machine
+    // worse; this is the service's own answer, which nothing had asked for.
+    if ipd[9] != 0 {
+        print!("    ipd holds      ");
+        for slot in 0..4u32 {
+            let port = (ipd[9] >> (slot * 16)) & 0xffff;
+            if port != 0 {
+                print!("slot {slot} port {port}; ");
+            }
+        }
+        println!("(a port here after its domain is gone is a leak in the service)");
+    }
     println!(
         "    ipd after      {} frames taken, {} refused, {} datagrams delivered to a socket; \
          last refusal reason {}, on a frame of {} bytes with ethertype {:#06x}; ring head {} tail {}; \
@@ -19127,6 +19144,14 @@ fn user_shell(handoff: &Handoff) -> Result<(), &'static str> {
                 (false, false, _) =>
                     "UNTESTABLE (the record overflowed, so its silence proves nothing)",
             }
+        );
+        // **The one assertion this defect needed and never had.** Set means
+        // `put_run` stopped holding the console across a run and went to one
+        // lock per byte, which is what tore the hosted line for weeks. It is
+        // false here on a healthy boot, and a gate reads this line.
+        println!(
+            "    console fatal   {} (set means put_run stopped holding the lock across a run)",
+            crate::console::is_fatal()
         );
         let (lens, tags, heads, at) = crate::console::run_lengths();
         let count = lens.len().min(at);
