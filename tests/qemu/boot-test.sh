@@ -2620,7 +2620,14 @@ if [[ "$MODE" == "iommu" || "$MODE" == "fsd" ]]; then
     # kernel programmed the MSI-X entry, the driver said which entry its queue
     # uses, and the completion arrived as a notification rather than as
     # something the driver noticed by looking.
-    if grep -qE 'block domain +ring 3 driver: .*drove it to 15, .*512 sectors, sector 0 begins "BHASKIX-", woken by the device, and says it is 1af4:1042 from its own configuration space' "$LOG"; then
+    # **The sector count is the fixture's size, not the driver's.** It read
+    # `512` until 2026-09-01, when the domain disk grew to 1 MiB so that
+    # RFC 0065's 109,760-byte program and a package install could both fit --
+    # and this gate failed with `did not report a device it had driven`, which
+    # says nothing about a disk size. What is being checked here is that a
+    # ring-3 driver drove a device and said how far; how large the test disk
+    # happens to be is a number this file should not be repeating.
+    if grep -qE 'block domain +ring 3 driver: .*drove it to 15, .*[0-9]+ sectors, sector 0 begins "BHASKIX-", woken by the device, and says it is 1af4:1042 from its own configuration space' "$LOG"; then
         # `1af4:1042` is the virtio vendor and the modern block device, read
         # by the driver out of its *own* configuration space with no help from
         # the kernel. It is only reported when the same page was **refused** a
@@ -2633,7 +2640,7 @@ if [[ "$MODE" == "iommu" || "$MODE" == "fsd" ]]; then
         grep -E "block domain" "$LOG" || true
         status=1
     fi
-elif grep -qE "block domain +ring 3 driver: .*drove it to 3, .*512 sectors" "$LOG"; then
+elif grep -qE "block domain +ring 3 driver: .*drove it to 3, .*[0-9]+ sectors" "$LOG"; then
     # Without a unit the driver gets registers and no window, so it brings the
     # device up and stops. That is the refusal, not a shortcoming: a domain
     # that could aim a device with physical addresses would be a domain that

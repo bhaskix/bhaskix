@@ -10057,6 +10057,20 @@ fn hosted_exec_self_test(hhdm_base: u64, cpus: u32) -> bool {
         );
         return true;
     }
+    // **A short write is this code's failure, and it used to be silent** —
+    // RFC 0065. The loop that stages the program breaks on `Err` and keeps what
+    // fitted, so a file the filesystem could not hold became a truncated one
+    // and failed much later as `ENOEXEC` from a parser that was right. Said
+    // here, where it happened, rather than left to be diagnosed there.
+    let wanted = HOSTED_WANTED.load(Ordering::Acquire);
+    if staged != wanted {
+        println!(
+            "\x1b[91m    hosted exec    FAILED: `bin/hosted` is {wanted} bytes and only {staged} \
+             reached the disk -- the filesystem would not hold it, and a truncated program is not \
+             a program\x1b[0m"
+        );
+        return false;
+    }
 
     let Ok(realm) = domain::create("hosted-execer", domain::ResourceEnvelope::new()) else {
         println!("\x1b[91m    hosted exec    FAILED: no domain\x1b[0m");
@@ -11168,8 +11182,16 @@ fn filesystem_self_test() -> bool {
 // 48 blocks since RFC 0030 step 4: the disk filesystem now holds installed
 // packages, and two fifteen-kilobyte payloads plus their records did not
 // fit in 32 -- the second install failed as `Full`, the allocator working,
-// the number simply outgrown. The 512-sector disk holds 64.
-static mut JOURNAL_IMAGE: [u8; 48 * bhaskix_fs::BLOCK] = [0; 48 * bhaskix_fs::BLOCK];
+// the number simply outgrown.
+//
+// 128 since RFC 0065, and outgrown the same way a third time. That RFC let a
+// file exceed ten blocks, and RFC 0064's gate needs a program larger than the
+// loader's 64 KiB window to prove anything -- `bin/hosted` is 109,760 bytes,
+// which is 27 data blocks and a table. It and a package install did not both
+// fit in 48, and the install failed as `Full` with a message about creating a
+// file rather than about space. The domain disk grew to 1 MiB in the same
+// change, so the `blocks <= sectors / 8` guard has room: 128 against 256.
+static mut JOURNAL_IMAGE: [u8; 128 * bhaskix_fs::BLOCK] = [0; 128 * bhaskix_fs::BLOCK];
 
 /// The pages that filesystem is cached in.
 ///
@@ -14007,6 +14029,17 @@ const HOSTED_PROGRAM: &[u8] = b"bin/hosted";
 /// refusing a program for reasons of its own.
 static HOSTED_STAGED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
+/// How many bytes it *should* have been — RFC 0065.
+///
+/// **Because a short write was invisible and cost an afternoon.** The staging
+/// loop below breaks on `Err` and keeps whatever fitted, and the gate compared
+/// the result against zero alone: a file too large to store therefore became a
+/// *short file*, and the program built from it failed much later in the
+/// adapter, as `ENOEXEC` from an ELF parser that was entirely right about the
+/// bytes it was given. Recording what was asked for makes the two
+/// distinguishable at the place the truncation happens.
+static HOSTED_WANTED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 /// A block device reached by asking the block service for one sector at a time.
 ///
 /// The `Store` RFC 0015 step 6 introduced, finally over something that is not
@@ -14183,11 +14216,15 @@ extern "C" fn journal_on_disk(endpoint: u64) -> ! {
     // what `mkfs` does from a developer's machine. Formatting through the
     // store would work equally well and would prove less: what is wanted here
     // is a device holding an image this kernel did not make up as it read it.
-    // Thirty-two, not sixteen, and forty-eight since RFC 0030 step 4 --
-    // each time it failed as `Full`, which is the allocator working; the
-    // number was simply outgrown, first by the journal tree, then by two
-    // installed packages.
-    let blocks = 48u32;
+    // Thirty-two, not sixteen, forty-eight since RFC 0030 step 4, and 128
+    // since RFC 0065 -- each time it failed as `Full`, which is the allocator
+    // working; the number was simply outgrown, first by the journal tree, then
+    // by two installed packages, then by a 109,760-byte hosted program that
+    // exists to prove a file may now exceed ten blocks.
+    //
+    // Kept in step with `JOURNAL_IMAGE` above, which is the same count and the
+    // reason this is not simply `sectors / 8`.
+    let blocks = 128u32;
     if bhaskix_fs::format(image, 128).is_err() || u64::from(blocks) > sectors / 8 {
         DISK_JOURNAL.store(0, Ordering::Release);
         sched::exit()
@@ -14278,6 +14315,7 @@ extern "C" fn journal_on_disk(endpoint: u64) -> ! {
                         }
                     }
                     HOSTED_STAGED.store(done as u64, Ordering::Release);
+                    HOSTED_WANTED.store(bytes.len() as u64, Ordering::Release);
                 }
             }
             Some(())

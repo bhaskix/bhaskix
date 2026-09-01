@@ -247,7 +247,13 @@ $(FS_IMAGE): $(MKFS) $(INITRD_DIR)/etc/hostname
 $(DOMAIN_DISK):
 	@mkdir -p $(dir $@)
 	@printf 'BHASKIX-DOMAIN-DISK-SECTOR-0' > $@
-	@dd if=/dev/zero bs=1 count=262116 >> $@ 2>/dev/null
+# 1 MiB since 2026-09-01, 256 KiB before. RFC 0065 let a file exceed ten
+# blocks, and RFC 0064's gate needs a program larger than the loader's
+# 64 KiB window to mean anything -- `bin/hosted` is 109,760 bytes. On the
+# old disk that program and a package install did not both fit, and the
+# install failed with `no space` rather than anything about itself. The disk
+# is a fixture, so its size is a test's business and not a design limit.
+	@dd if=/dev/zero bs=1 count=1048548 >> $@ 2>/dev/null
 	@echo "built $@"
 
 # The AHCI disk. Same size and shape as the domain disk and a **different first

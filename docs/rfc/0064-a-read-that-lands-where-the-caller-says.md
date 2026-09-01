@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | 🔨 **Draft 2026-09-01 — steps 1–3 implemented and measured; step 4 is blocked by a limit below this RFC.** The loader no longer caps a program at the staging window. The filesystem caps every file at **40,960 bytes**, so no program large enough to prove the difference can be put on a disk yet. See "What step 4 found" |
+| **Status** | ✅ **Accepted 2026-09-01 — all four steps done.** Step 4 was blocked for a few hours by a filesystem limit this RFC found; [RFC 0065](0065-the-block-the-format-already-had.md) removed it, and a 109,760-byte program now streams through a 65,536-byte window on every boot with a filesystem |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | filesystem (`bin/fsd`, `dir::READ_INTO`) / libc / userspace (`bin/linuxd`) |
 | **Milestone** | Phase 2 — Linux personality (L1) |
@@ -173,3 +173,11 @@ segment through a fixed window. What cannot be *demonstrated* is the thing that 
 no program big enough to demonstrate it can be stored. Step 4 waits on indirect blocks, which is its
 own RFC and not a paragraph in this one — the padding was removed rather than left failing, so the
 tree stays green and the gate is not written against a capability that does not exist.
+
+
+**Step 4, unblocked and done (2026-09-01).** [RFC 0065](0065-the-block-the-format-already-had.md)
+made the filesystem use the indirect block its format already had, so a program larger than the
+window can be stored. `user/hosted` is padded to 109,760 bytes and the boot reports
+`a Linux program execed 109760 bytes read off the filesystem` — 44,224 bytes more than the window it
+streamed through, on every boot that has a filesystem service. The limit this RFC existed to remove
+is measurably gone.

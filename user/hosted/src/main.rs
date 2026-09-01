@@ -335,6 +335,31 @@ extern "C" fn hosted_main(stack: *const u64) -> ! {
     loop {}
 }
 
+/// Bytes that exist only to make this program larger than the loader's window.
+///
+/// **RFC 0064 step 4, unblocked by RFC 0065.** The adapter's staging object is
+/// sixteen pages and RFC 0064 made it a window the file streams through; proving
+/// that needs a program bigger than the window, and storing one needed the
+/// filesystem to stop capping every file at ten blocks. With both, the boot that
+/// loads this is loading something neither the old loader nor the old filesystem
+/// could handle.
+///
+/// A non-zero fill on purpose: zeroes would land in `.bss`, cost nothing in the
+/// file, and leave the program exactly as small as before. `#[used]` so the
+/// linker cannot decide this is unreachable and quietly undo the test.
+///
+/// **Sized to clear both limits and no further.** 64 KiB of padding makes the
+/// program about 77 KB: past the 40,960-byte file limit RFC 0065 removed and
+/// past the 65,536-byte loader window RFC 0064 removed, which is everything
+/// this has to prove. It was 96 KiB for an afternoon, and every block of it is
+/// a journal transaction the kernel runs at boot before anything else starts --
+/// the `iommu-off` lane timed out once under the concurrent suite at that size.
+/// A fixture large enough to demonstrate a limit is the right size; larger is
+/// boot time spent on nothing.
+#[used]
+#[unsafe(no_mangle)]
+static WIDER_THAN_THE_WINDOW: [u8; 64 * 1024] = [0x5a; 64 * 1024];
+
 /// Opens a file under the writable directory and closes it. Nothing is
 /// written: this exists to say whether the *open* alone is what disturbs the
 /// machine.

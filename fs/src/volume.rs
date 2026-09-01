@@ -305,6 +305,15 @@ impl<'f, S: Store> Volume<'f, S> {
         Ok(())
     }
 
+    /// The cache, for a test that needs to read a metadata block back.
+    ///
+    /// RFC 0065's removal test has to see which data block the indirect table
+    /// names before the file is deleted, and there is no other way to ask.
+    #[cfg(test)]
+    pub(crate) fn cache_for_test(&mut self) -> &mut Cache<'f, S> {
+        &mut self.cache
+    }
+
     /// The first free block, without taking it.
     ///
     /// Reads the bitmap a block at a time, which is what a filesystem on a
@@ -316,8 +325,26 @@ impl<'f, S: Store> Volume<'f, S> {
     }
 
     fn free_block(&mut self) -> Result<u32, FsError> {
+        self.free_block_excluding(u32::MAX)
+    }
+
+    /// [`Volume::free_block`], skipping one block already spoken for.
+    ///
+    /// **Because two allocations in one transaction collide** — RFC 0065.
+    /// `stage_bitmap` edits a *journalled* copy of the bitmap and `free_block`
+    /// reads the *cached* one, so a block claimed earlier in the same
+    /// transaction still reads as free and is handed out twice. Nothing needed
+    /// two until a write past the tenth block had to allocate an indirect table
+    /// and a data block together, and the first version of that did exactly
+    /// this: the table and the data were the same block, and the file's own
+    /// bytes were read back as block numbers. Caught by the test written to
+    /// prove the feature, which is what those are for.
+    fn free_block_excluding(&mut self, taken: u32) -> Result<u32, FsError> {
         let first = self.superblock.data_start;
         for block in first..self.superblock.blocks {
+            if block == u64::from(taken) {
+                continue;
+            }
             let byte = block / 8;
             let holding = self.superblock.bitmap_start + byte / BLOCK as u64;
             let holding = u32::try_from(holding).map_err(|_| FsError::OutOfRange)?;
@@ -489,15 +516,59 @@ impl<'f, S: Store> Volume<'f, S> {
         let taking = data.len().min(room);
         let block_index =
             usize::try_from(offset / BLOCK as u64).map_err(|_| FsError::OutOfRange)?;
-        if block_index >= inode.direct.len() {
+        // **The block the format already had** — RFC 0065. `Inode` has carried
+        // an `indirect` since the format was written, `block_of` has always
+        // followed it, and this function stopped at the tenth direct block --
+        // so every file on this filesystem stopped at 40,960 bytes while the
+        // reader was capable of far more. One table of 1,024 numbers takes that
+        // to 4,239,360.
+        const SLOTS: usize = BLOCK / 4;
+        let direct_count = inode.direct.len();
+        if block_index >= direct_count + SLOTS {
             return Err(FsError::Full);
         }
+        let via_indirect = block_index >= direct_count;
 
-        let fresh = inode.direct[block_index] == 0;
-        let block = if fresh {
-            self.free_block()?
+        // The table itself, if this is the first block past the direct ones.
+        // Allocated before `begin`, exactly as the data block is.
+        let mut table_fresh = false;
+        if via_indirect && inode.indirect == 0 {
+            let table = self.free_block()?;
+            if u64::from(table) >= self.superblock.blocks
+                || u64::from(table) < self.superblock.data_start
+            {
+                return Err(FsError::OutOfRange);
+            }
+            inode.indirect = table;
+            table_fresh = true;
+        }
+
+        // What is already there, out of the table or out of the inode. The
+        // number read from the table is checked below with the direct ones,
+        // and for the reason `block_of` gives: it came off a disk.
+        let existing = if via_indirect {
+            if table_fresh {
+                0
+            } else {
+                let at = (block_index - direct_count) * 4;
+                let table = self.cache.edit(inode.indirect)?;
+                let mut number = [0u8; 4];
+                number.copy_from_slice(table.get(at..at + 4).ok_or(FsError::OutOfRange)?);
+                u32::from_le_bytes(number)
+            }
         } else {
             inode.direct[block_index]
+        };
+        let fresh = existing == 0;
+        let block = if fresh {
+            // Not the table, if one was just claimed: see `free_block_excluding`.
+            self.free_block_excluding(if table_fresh {
+                inode.indirect
+            } else {
+                u32::MAX
+            })?
+        } else {
+            existing
         };
         if u64::from(block) >= self.superblock.blocks
             || u64::from(block) < self.superblock.data_start
@@ -506,9 +577,28 @@ impl<'f, S: Store> Volume<'f, S> {
         }
 
         self.begin()?;
+        if table_fresh {
+            self.stage_bitmap(inode.indirect, true)?;
+            self.cache.edit(inode.indirect)?.fill(0);
+        }
         if fresh {
             self.stage_bitmap(block, true)?;
-            inode.direct[block_index] = block;
+            if via_indirect {
+                // **Into the table, and onto the device before the commit that
+                // points an inode at the table.** The same ordering RFC 0015
+                // states for data: a table an inode claims must never be a
+                // block still holding somebody else's bytes. A crash between
+                // the two leaks a block, which is the safe direction and the
+                // one this filesystem already chooses.
+                let at = (block_index - direct_count) * 4;
+                let table = self.cache.edit(inode.indirect)?;
+                table
+                    .get_mut(at..at + 4)
+                    .ok_or(FsError::OutOfRange)?
+                    .copy_from_slice(&block.to_le_bytes());
+            } else {
+                inode.direct[block_index] = block;
+            }
         }
 
         // The data itself, straight to its home and *onto the device* before
@@ -615,6 +705,26 @@ impl<'f, S: Store> Volume<'f, S> {
         )?;
         for block in victim.direct.iter().take_while(|block| **block != 0) {
             self.stage_bitmap(*block, false)?;
+        }
+        // **And whatever the indirect table named, then the table** — RFC 0065.
+        // This loop freed the direct blocks alone, which was complete while
+        // nothing could allocate a table; the moment a write can, a delete that
+        // stopped here would leak up to 1,025 blocks per file.
+        if victim.indirect != 0 {
+            let mut numbers = [0u32; BLOCK / 4];
+            {
+                let table = self.cache.edit(victim.indirect)?;
+                for (slot, number) in numbers.iter_mut().enumerate() {
+                    let at = slot * 4;
+                    let mut bytes = [0u8; 4];
+                    bytes.copy_from_slice(table.get(at..at + 4).ok_or(FsError::OutOfRange)?);
+                    *number = u32::from_le_bytes(bytes);
+                }
+            }
+            for number in numbers.iter().take_while(|number| **number != 0) {
+                self.stage_bitmap(*number, false)?;
+            }
+            self.stage_bitmap(victim.indirect, false)?;
         }
 
         self.commit(&[])
@@ -816,6 +926,145 @@ mod tests {
             &contents[..read],
             b"a filesystem this kernel can write to\n"
         );
+    }
+
+    #[test]
+    fn a_write_past_the_tenth_block_lands_in_the_indirect_table() {
+        // **The limit this filesystem had and did not record** — RFC 0065.
+        // `Inode` has carried an `indirect` since the format was written and
+        // `block_of` has always followed it; `write_ordered` stopped at the
+        // tenth direct block, so every file stopped at 40,960 bytes. This test
+        // fails against that code, which is the whole reason it exists.
+        let mut bytes = image(256);
+        let eleventh = 10 * BLOCK as u64;
+        run(&mut bytes, FRAMES, None, |volume| {
+            let root = volume.superblock().root;
+            let index = volume
+                .create(root, b"long", Kind::File)
+                .expect("a file is created");
+            // The tenth block, which always worked.
+            assert_eq!(
+                volume
+                    .write(index, 9 * BLOCK as u64, b"ten")
+                    .expect("direct"),
+                3
+            );
+            // And the eleventh, which did not.
+            assert_eq!(
+                volume
+                    .write(index, eleventh, b"eleven")
+                    .expect("past the direct blocks"),
+                6
+            );
+            assert_ne!(
+                volume.inode(index).expect("the inode").indirect,
+                0,
+                "a table was allocated"
+            );
+        });
+
+        // Read back through a reader that has never seen the cache, because
+        // the point is that this survives to the device and comes back.
+        let mut pages = Image::new(&bytes);
+        let mut mounted = Filesystem::mount(&mut pages).expect("mounts afterwards");
+        let root = mounted.root().unwrap();
+        let (_, inode) = mounted.lookup(&root, b"long").expect("with the file in it");
+        let mut contents = [0u8; 8];
+        let read = mounted.read(&inode, eleventh, &mut contents);
+        assert_eq!(
+            (inode.indirect != 0, inode.size),
+            (true, eleventh + 6),
+            "the table and the size reach the device"
+        );
+        assert_eq!(&contents[..read], b"eleven");
+        assert_eq!(inode.size, eleventh + 6);
+    }
+
+    #[test]
+    fn the_indirect_table_is_allocated_once_and_reused() {
+        // A second write past the tenth block must land in the table that is
+        // already there. Allocating a second one would strand the first and
+        // lose every block it named.
+        let mut bytes = image(256);
+        run(&mut bytes, FRAMES, None, |volume| {
+            let root = volume.superblock().root;
+            let index = volume.create(root, b"long", Kind::File).expect("created");
+            volume
+                .write(index, 10 * BLOCK as u64, b"a")
+                .expect("eleventh");
+            let first = volume.inode(index).expect("inode").indirect;
+            volume
+                .write(index, 12 * BLOCK as u64, b"b")
+                .expect("thirteenth");
+            assert_eq!(
+                volume.inode(index).expect("inode").indirect,
+                first,
+                "one table, not two"
+            );
+        });
+    }
+
+    #[test]
+    fn a_file_past_the_indirect_table_is_still_refused() {
+        // The limit moved; it did not go away. Ten direct plus 1,024 in the
+        // table is 4,239,360 bytes, and the block after that is `Full` --
+        // refused rather than silently dropped, which is the failure that made
+        // this defect invisible in the first place.
+        let mut bytes = image(64);
+        run(&mut bytes, FRAMES, None, |volume| {
+            let root = volume.superblock().root;
+            let index = volume.create(root, b"long", Kind::File).expect("created");
+            let past = (10 + BLOCK / 4) as u64 * BLOCK as u64;
+            assert_eq!(
+                volume.write(index, past, b"x"),
+                Err(FsError::Full),
+                "past the table is refused, not truncated"
+            );
+        });
+    }
+
+    #[test]
+    fn removing_a_long_file_frees_the_table_and_what_it_named() {
+        // `remove` freed the direct blocks alone, which was complete while
+        // nothing could allocate a table. The moment a write can, a delete
+        // that stopped there leaks up to 1,025 blocks per file -- proven here
+        // by counting what the allocator will hand out afterwards.
+        let mut bytes = image(256);
+        run(&mut bytes, FRAMES, None, |volume| {
+            let root = volume.superblock().root;
+            let index = volume.create(root, b"long", Kind::File).expect("created");
+            volume
+                .write(index, 10 * BLOCK as u64, b"a")
+                .expect("eleventh");
+            let table = volume.inode(index).expect("inode").indirect;
+            let data = {
+                let at = 0;
+                let page = volume.cache_for_test().edit(table).expect("the table");
+                let mut number = [0u8; 4];
+                number.copy_from_slice(&page[at..at + 4]);
+                u32::from_le_bytes(number)
+            };
+            assert_ne!(data, 0, "the eleventh block is named in the table");
+
+            volume.remove(root, b"long").expect("removed");
+
+            // Both must be back in the allocator's hands. Asking for two and
+            // getting these two is the strongest available check that neither
+            // was leaked -- and the second ask must exclude the first, because
+            // nothing has staged the bitmap in between and `free_block` would
+            // otherwise hand out the same number twice. That is the very
+            // collision this RFC had to fix in the write path, met again here
+            // by the test written to check the fix.
+            let first = volume.free_block_for_test().expect("a free block");
+            let second = volume
+                .free_block_excluding(first)
+                .expect("and a second one");
+            let handed = [first, second];
+            assert!(
+                handed.contains(&table) && handed.contains(&data),
+                "the table and its block came back: got {handed:?}, wanted {table} and {data}"
+            );
+        });
     }
 
     #[test]
