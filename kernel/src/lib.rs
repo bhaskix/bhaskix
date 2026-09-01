@@ -3134,13 +3134,22 @@ fn two_wake_sources_self_test(cpu: u32, hhdm_base: u64) -> bool {
         } else {
             2_000_000
         };
-        if notify::arm(notification, time::now().saturating_add(ahead), BY_TIMER).is_err() {
+        // **One reading of the clock, used for both.** The notification's
+        // deadline and the hardware timer were computed from two separate calls
+        // to `time::now()`, so the timer was always armed for a strictly later
+        // instant than the deadline it exists to serve -- by however long the
+        // intervening work took, which on a contended host is not a fixed
+        // amount. Two deadlines that are meant to be the same instant must come
+        // from one sample; that they usually agreed closely enough is not the
+        // same as their agreeing.
+        let deadline = time::now().saturating_add(ahead);
+        if notify::arm(notification, deadline, BY_TIMER).is_err() {
             println!("\x1b[91m    two sources    FAILED: no deadline slot\x1b[0m");
             domain::end(doomed, domain::Ending::Killed);
             notify::destroy(notification);
             return false;
         }
-        time::arm_no_later_than(time::now().saturating_add(ahead));
+        time::arm_no_later_than(deadline);
         // **The answer is kept.** It was `let _ =`, and that is the one thing
         // this gate's intermittent failure cannot currently distinguish: a
         // wake carrying `BY_TIMER` in round one means *the deadline was the

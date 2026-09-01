@@ -289,14 +289,19 @@ fn handle(frame: &mut TrapFrame) {
         // while `rt_sigaction` still lived in the nucleus, because the
         // dispositions the kernel held were then the only ones there were.
         // They are the adapter's, so this is the whole of it.
-        if crate::fault::hand_over(frame, read_cr2()) {
+        // **Read once, and the report says what faulted rather than what cr2
+        // holds by the time it prints.** `cr2` is a register the *next* page
+        // fault overwrites, and `hand_over` runs between the two reads this
+        // used to do -- so a report could name an address that was not the
+        // fault's, which is the one value a fault report exists to carry.
+        let faulted_at = read_cr2();
+        if crate::fault::hand_over(frame, faulted_at) {
             crate::sched::check_user_space(3);
             return;
         }
         println!(
-            "    linux fault    a hosted program faulted at {:#x} (rip {:#x}) and was ended: \
-             the personality did not deliver a signal for it",
-            read_cr2(),
+            "    linux fault    a hosted program faulted at {faulted_at:#x} (rip {:#x}) and was \
+             ended: the personality did not deliver a signal for it",
             frame.rip
         );
         crate::sched::check_user_space(3);
