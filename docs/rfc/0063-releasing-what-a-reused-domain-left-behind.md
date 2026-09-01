@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | 🔨 **Draft 2026-09-01** |
+| **Status** | 🔨 **Draft 2026-09-01 — steps 1–3 implemented, found wrong, and reverted the same day.** The rule below is necessary and **not sufficient**: it selects the right *records* and says nothing about whether their *handles* are still theirs. See "What the first attempt got wrong" |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | libc / userspace (`bin/linuxd`) |
 | **Milestone** | Phase 2 — Linux personality (L1) |
@@ -107,6 +107,53 @@ already prints `held / reaped / same slot / bound again`; it gains the count of
 stale records a `FORGET` released for, so a boot that releases nothing says
 whether it found nothing or had nothing to find — the distinction this defect
 spent weeks on the wrong side of.
+
+## What the first attempt got wrong
+
+**Implemented on 2026-09-01, and it made the defect deterministic: 4 boots of 4
+failed where it had been intermittent.** Reverted. What went wrong is worth more
+than the attempt.
+
+Steps 1–3 went in as written. `stale_for_domain` was added with four host tests
+and both directions armed red — a domain-id-only filter correctly fails
+`the_current_incarnation_is_never_stale`, which is the danger this document opens
+by naming. `release_sockets_of` stopped fabricating records. `FORGET` released
+the stale set. All of that is right.
+
+**And it still closed sockets belonging to live programs**, which is exactly the
+failure the section above warns about. The rule reasons about *which records* are
+stale. It says nothing about whether a stale record's **handles** are still its
+own:
+
+```rust
+if entry.kind == Kind::Socket
+    && entry.handle != u64::MAX
+    && process.descriptors.holders(entry.handle) == 1
+```
+
+`holders` counts entries *within one descriptor table* that name the same handle
+(`personality/src/file.rs`). It cannot see that the slot behind that handle was
+released long ago and handed to somebody else — and on the `FORGET` path that is
+the likely case, because the record has been dead long enough for its domain slot
+to be reused. Releasing on the strength of a number in a dead record closes
+whatever holds that slot **now**.
+
+So: selecting the right records is necessary and not sufficient. A handle read
+out of a stale record is a *claim*, not a fact, and this RFC treated it as a
+fact.
+
+**What a working step 2 needs**, and it is a question for the slot allocator
+rather than the process table: a handle must carry, or be checkable against,
+something that says which incarnation it was issued to — a generation on the
+slot, or an owner recorded beside it. Then a stale record's handle is released
+only when the slot still agrees it belongs to that incarnation, and a reallocated
+slot is left alone. Until that exists, **any implementation of the rule below is
+unsafe**, however carefully it picks its records — which is why this section sits
+above the steps rather than after them.
+
+The two host tests from the attempt are worth keeping when it is retried; they
+were correct and they passed. They simply tested the half of the problem this
+document had thought about.
 
 ## What this does not do
 
