@@ -142,14 +142,36 @@ So: selecting the right records is necessary and not sufficient. A handle read
 out of a stale record is a *claim*, not a fact, and this RFC treated it as a
 fact.
 
-**What a working step 2 needs**, and it is a question for the slot allocator
-rather than the process table: a handle must carry, or be checkable against,
-something that says which incarnation it was issued to — a generation on the
-slot, or an owner recorded beside it. Then a stale record's handle is released
-only when the slot still agrees it belongs to that incarnation, and a reallocated
-slot is left alone. Until that exists, **any implementation of the rule below is
-unsafe**, however carefully it picks its records — which is why this section sits
-above the steps rather than after them.
+**What a working step 2 needs — and this tree has already solved the same
+problem one field over.** `claim_socket_slot` carries no identity at all:
+
+```rust
+let index = held.iter().position(|taken| !*taken)?;   // a bool per slot
+held[index] = true;
+Some(SOCKET_SLOT + index as u64)
+```
+
+A handle is `SOCKET_SLOT + index`, so **two sockets in the same slot at
+different times have the identical handle**. Nor can the handle be widened to
+carry a generation: it *is* a CSpace slot number, passed to `INVOKE`.
+
+So the generation must sit **beside** the handle — which is exactly what
+`Entry::inode` already does, and its own comment says why:
+
+> *"Kept beside the handle rather than derived from it. The handle is a
+> capability slot, taken from a small pool and reused: two files opened one
+> after the other routinely land in the same slot, so a `st_ino` derived from
+> it would report them as the same file."*
+
+`inode` exists because a handle is not an identity. Socket ownership needs the
+same answer: a per-slot counter bumped on every `claim_socket_slot`, and the
+value recorded in the `Entry` when the socket is opened. A stale record's handle
+is then released only when the slot's counter still matches what the record was
+issued — and a reallocated slot is left alone, because its counter has moved.
+
+Until that exists, **any implementation of the rule below is unsafe**, however
+carefully it picks its records — which is why this section sits above the steps
+rather than after them.
 
 The two host tests from the attempt are worth keeping when it is retried; they
 were correct and they passed. They simply tested the half of the problem this
