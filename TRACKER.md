@@ -840,6 +840,30 @@ the distinction is in the table rather than in somebody's head.
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-09-01 (RFC 0064 step 1: a read that lands where the caller says)
+
+`dir::READ_INTO` landed bytes in the caller's object at **the file offset it read them from**, so a
+caller that wanted byte two million needed an object two million bytes long. That is right for
+`bin/shell`, which reads a package image it means to hold whole, and wrong for a loader, which wants
+each segment once at an address of its own and never two chunks at a time. It is why RFC 0059's
+`execve` cannot run a program larger than its sixteen-page staging object while BusyBox is 2,172,376
+bytes — a limit that RFC named openly rather than implying L1 was finished.
+
+Step 1 is the protocol alone: `arg3` is the offset **in the object**, `arg2` stays the offset **in
+the file**, and every existing caller passes `arg3 = arg2`. **Nothing observable changes**, which is
+the point — a protocol change and a behaviour change in one commit cannot be bisected apart.
+
+Two corrections the RFC took from its own implementation rather than keeping a tidy draft. **The
+bounds check does not belong in `bin/fsd`**: the service does not know how large the caller's object
+is, and `method::FILL` — which performs the copy and takes the destination offset — already refuses a
+range outside it, so the service passes the offset down and answers `dir::NOWHERE` on the path it
+already had. And **the scope was smaller than drafted**: `fs::READ_INTO` and `dir::READ_INTO` are
+different protocols, the in-kernel VFS one is session-based with no offset at all, and only the
+second is touched. `bin/shell` uses both, which is why the draft counted its callers wrongly.
+
+Steps 3 and 4 — the loader streaming, and a gate exec'ing a program larger than the window — are not
+in this commit and the RFC says so.
+
 ### 2026-09-01 (a sweep for the pattern that caused three defects in one day)
 
 Three things closed or corrected today had one shape: an instrument that read the state it was

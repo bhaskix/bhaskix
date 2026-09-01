@@ -449,7 +449,11 @@ fn remove_at(
 /// and the path an installed program's bytes travel to reach `START`.
 fn read_into(cache: &mut Cache<'static, BlockService>, badge: u64, args: &[u64; 4]) {
     let (index, generation) = dir::parts(badge);
-    let (caller_slot, limit, offset) = (args[0], (args[1] as usize).min(4096), args[2]);
+    // `args[3]` is where in the caller's object the bytes land — RFC 0064.
+    // It used to be `args[2]` by construction, which made the object a copy of
+    // the file rather than a window onto it.
+    let (caller_slot, limit, offset, landing) =
+        (args[0], (args[1] as usize).min(4096), args[2], args[3]);
     let Ok(mut mounted) = Filesystem::mount(cache) else {
         answer(dir::GONE, 0, 0);
         return;
@@ -472,7 +476,7 @@ fn read_into(cache: &mut Cache<'static, BlockService>, badge: u64, args: &[u64; 
             syscall::INVOKE,
             ENDPOINT,
             method::FILL,
-            [caller_slot, buffer.as_ptr() as u64, read as u64, offset],
+            [caller_slot, buffer.as_ptr() as u64, read as u64, landing],
         );
         if filled != status::OK {
             answer(dir::NOWHERE, filled, 0);

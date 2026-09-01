@@ -1991,7 +1991,11 @@ fn cycles() -> u64 {
 fn pkg_read_file(handle: u64, slot: u64, limit: u64) -> Option<u64> {
     let mut offset = 0u64;
     loop {
-        let reply = call(handle, dir::READ_INTO, [slot, 4096, offset, 0]);
+        // `offset` twice: read from there in the file, land there in the
+        // object. RFC 0064 made the second one explicit, and this caller
+        // genuinely wants the file reassembled in place -- it is holding a
+        // package image whole, which is what that behaviour was written for.
+        let reply = call(handle, dir::READ_INTO, [slot, 4096, offset, offset]);
         if !reply.delivered() || reply.raw() != dir::OK {
             pkg_refused(b"reading an installed file", reply.raw());
             return None;

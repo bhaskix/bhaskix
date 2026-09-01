@@ -970,10 +970,27 @@ pub mod dir {
     ///
     /// `arg0` = the caller's own slot holding a `Memory` object, `arg1` =
     /// how many bytes at most (one transfer page per call, the caller
-    /// loops), `arg2` = the file offset — which is also the offset the
-    /// bytes land at in the caller's object, so a linear read reassembles
-    /// the file in place. Replies with the count in `args[1]`; zero is end
-    /// of file. Any handle may read: reading is what every handle has.
+    /// loops), `arg2` = the offset **in the file** to read from, `arg3` =
+    /// the offset **in the object** to land them at. Replies with the count
+    /// in `args[1]`; zero is end of file. Any handle may read: reading is
+    /// what every handle has.
+    ///
+    /// **`arg3` exists so the object can be a window rather than a copy** —
+    /// RFC 0064. It used to be implied: the bytes landed at the file offset
+    /// they came from, so a linear read reassembled the file in place, and a
+    /// caller that wanted byte two million needed an object two million bytes
+    /// long. That is right for `bin/shell`, which reads a package image it
+    /// means to hold whole, and wrong for a loader, which wants each segment
+    /// once at an address of its own and never two chunks at a time. It is
+    /// why `execve` could not run a program larger than sixteen pages while
+    /// BusyBox is 2,172,376 bytes.
+    ///
+    /// Pass `arg3 = arg2` for the old meaning, which is what every caller
+    /// written before RFC 0064 does. The landing offset is an offset into the
+    /// **caller's own** object, so a bad one can only reach the caller's
+    /// memory — and it is bounds-checked anyway, by the `FILL` that performs
+    /// the copy, which refuses a range outside the object and makes the
+    /// service answer [`NOWHERE`].
     pub const READ_INTO: u64 = 9;
 
     /// Packs [`LIST_AT`]'s fourth reply word: the name's length in the low

@@ -5411,7 +5411,7 @@ fn stage_from_filesystem(name: &[u8]) -> Result<u64, i64> {
             syscall::CALL,
             slot,
             bhaskix_abi::dir::READ_INTO,
-            [STAGING, 4096, done, 0],
+            [STAGING, 4096, done, done],
         );
         if reply.status != status::OK || reply.args[0] != bhaskix_abi::dir::OK {
             release_file_slot(slot);
