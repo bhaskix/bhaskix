@@ -2909,17 +2909,28 @@ static LAST_ADMITTED_DOMAIN: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(u64::MAX);
 static LAST_ADMITTED_HELD: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
+/// The most file slots held at once, over the whole boot.
+static FILE_PEAK: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 /// Where the process record sits.
 const PROCESS_RECORD_AT: u64 = REPORT_AT + report::PROCESS_AT as u64;
 
 /// Publishes what `process_for` has been doing.
 fn trace_process() {
     use core::sync::atomic::Ordering::Relaxed;
+    // How many file slots are held now, and the most ever held at once. The
+    // second is what makes a leak legible: a slot that is never given back
+    // pushes the peak up and never lets it fall, so a boot can be asked
+    // whether the count came back down rather than only what it ended at.
+    let held_now = file_held().iter().filter(|taken| **taken).count() as u64;
+    let peak = FILE_PEAK.fetch_max(held_now, Relaxed).max(held_now);
     let words = [
         ADMITTED.load(Relaxed),
         FOUND.load(Relaxed),
         LAST_ADMITTED_DOMAIN.load(Relaxed),
         LAST_ADMITTED_HELD.load(Relaxed),
+        held_now,
+        peak,
     ];
     // A loop rather than four statements, because each one would be a line of
     // `unsafe` against this program's budget and they say the same thing.

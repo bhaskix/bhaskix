@@ -3060,6 +3060,34 @@ fi
 # the TCP defect in TRACKER §3, where it is a lever on something previously
 # called environmental. Until it is understood, this gate proves the path
 # without paying for it.
+# **An O_CLOEXEC descriptor must give its capability back at execve.**
+#
+# `Process::exec_into` closes every `FD_CLOEXEC` row and hands each released
+# entry to a closure; if that closure does nothing, one of `bin/linuxd`'s file
+# slots is gone for the rest of the boot. The fix was found by reading rather
+# than by a failure and was unreachable by any test in this tree, because
+# nothing set `O_CLOEXEC` and then exec'd. The hosted-exec probe does now, so
+# the peak rises by one when it opens and the count must come back down.
+#
+# The peak is the half that matters: a leak leaves the count *at* the peak, and
+# a boot that only printed a final number could not tell the two apart.
+if grep -qE "adapter files   [0-9]+ of [0-9]+ slot\(s\) held now, [0-9]+ at the peak" "$LOG"; then
+    files_line=$(grep -oE "adapter files   [0-9]+ of [0-9]+ slot\(s\) held now, [0-9]+ at the peak" "$LOG" | head -1)
+    files_now=$(echo "$files_line" | sed -E 's/adapter files   ([0-9]+) of.*/\1/')
+    files_peak=$(echo "$files_line" | sed -E 's/.*, ([0-9]+) at the peak/\1/')
+    if [ "$files_peak" -le "$files_now" ]; then
+        fail "the adapter's file slots never came back: $files_now held, peak $files_peak -- an execve's O_CLOEXEC descriptor kept its capability"
+        status=1
+    else
+        pass "an O_CLOEXEC descriptor gave its capability back at execve (peak $files_peak, now $files_now)"
+    fi
+elif grep -qF "hosted exec    skipped" "$LOG"; then
+    pass "no filesystem service on this machine, so nothing exec'd and no slot was claimed"
+else
+    fail "the boot report did not say how many adapter file slots were held"
+    status=1
+fi
+
 # **The console must not still be on its fatal path when the boot report runs.**
 # This is the assertion the tear below went six investigations without. Once
 # `enter_fatal` is set, `console::put_run` returns early into `write_fatal`,

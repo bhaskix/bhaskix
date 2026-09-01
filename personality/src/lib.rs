@@ -110,6 +110,16 @@ pub mod report {
     /// **1**, and a table with the three standard descriptors installed hands
     /// out **3**. So the occupancy at the moment of admission says whether the
     /// record the taker used had stdio at all.
+    /// Six words: four about `process_for`, and two about the adapter's file
+    /// slots — how many are held now and the most ever held at once.
+    ///
+    /// The file-slot pair is here because an `O_CLOEXEC` descriptor crossing an
+    /// `execve` has to give its capability back, and a leak there costs one of
+    /// thirty-two slots for the rest of the boot. That defect was found by
+    /// reading rather than by a failure, and was **unreachable by any test in
+    /// this tree** — nothing set `O_CLOEXEC` and then exec'd. The exec probe
+    /// does now, and these two words are what let a gate see whether the slot
+    /// came back.
     pub const PROCESS_AT: usize = SOCKET_AT + 16;
 
     /// Where bulk staging begins.
@@ -133,7 +143,7 @@ pub mod report {
     pub const PAGE: usize = 4096;
 
     /// Every record ends before the scratch begins.
-    const _: () = assert!(PROCESS_AT + 32 <= SCRATCH_AT);
+    const _: () = assert!(PROCESS_AT + 48 <= SCRATCH_AT);
     /// And the scratch ends inside the page.
     const _: () = assert!(SCRATCH_AT + SCRATCH_BYTES == PAGE);
     /// The fault log is past the traces, which is what it used to claim and

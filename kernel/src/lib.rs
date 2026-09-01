@@ -4073,18 +4073,18 @@ fn wait_for_probe_threads(realm: domain::DomainId) {
 /// `bhaskix_personality::report::PROCESS_AT` -- `process_for` is not a lookup,
 /// and until this existed a boot could not be asked how often it had quietly
 /// created a record where a caller believed it was reading one.
-fn adapter_process_record() -> (u64, u64, u64, u64) {
+fn adapter_process_record() -> [u64; 6] {
     let page = ADAPTER_REPORT.load(core::sync::atomic::Ordering::Acquire);
     if page == u64::MAX {
-        return (0, 0, 0, 0);
+        return [0; 6];
     }
     const FIRST_WORD: usize = bhaskix_personality::report::PROCESS_AT / 8;
     let object = shared::MemoryId::from_u64(page);
-    let mut record = [0u64; 4];
+    let mut record = [0u64; 6];
     let mut at = 0usize;
-    let taken = shared::drain_into(object, (FIRST_WORD + 4) * 8, &mut |chunk: &[u8]| {
+    let taken = shared::drain_into(object, (FIRST_WORD + 6) * 8, &mut |chunk: &[u8]| {
         for word in chunk.as_chunks::<8>().0 {
-            if at >= FIRST_WORD + 4 {
+            if at >= FIRST_WORD + 6 {
                 break;
             }
             if at >= FIRST_WORD {
@@ -4097,9 +4097,9 @@ fn adapter_process_record() -> (u64, u64, u64, u64) {
         chunk.len()
     });
     if taken.is_none() {
-        return (0, 0, 0, 0);
+        return [0; 6];
     }
-    (record[0], record[1], record[2], record[3])
+    record
 }
 
 fn adapter_file_record() -> (i64, i64, u64) {
@@ -6458,7 +6458,21 @@ const HOSTED_ENV0: &[u8] = b"GREETING=namaste\0";
 /// it — the same constraint the built-in exec probe lives under, one step
 /// further along.
 #[rustfmt::skip]
-const HOSTED_PROBE_CODE: [u8; 30] = [
+const HOSTED_PROBE_CODE: [u8; 51] = [
+    // **An `O_CLOEXEC` descriptor, opened so that the exec has one to close.**
+    // A descriptor carried across an `execve` with `FD_CLOEXEC` set is closed
+    // by the adapter, and the capability behind it has to go back to the pool
+    // -- a leak here costs one of `bin/linuxd`'s thirty-two file slots for the
+    // rest of the boot. That path was fixed by reading rather than by a
+    // failure, and it was unreachable by any test in this tree because nothing
+    // set `O_CLOEXEC` and then exec'd. These five instructions are what make it
+    // reachable. The path is the one this probe is about to exec, so it is a
+    // file that certainly exists and needs no second string.
+    0x48, 0xc7, 0xc7, 0, 0, 0, 0,        // mov rdi, <path>
+    0xbe, 0x00, 0x00, 0x08, 0x00,        // mov esi, 0o2000000    ; O_RDONLY|O_CLOEXEC
+    0x31, 0xd2,                          // xor edx, edx          ; mode, unused
+    0xb8, 0x02, 0x00, 0x00, 0x00,        // mov eax, 2            ; open
+    0x0f, 0x05,                          // syscall
     0x48, 0xc7, 0xc7, 0, 0, 0, 0,        // mov rdi, <path>
     0x48, 0xc7, 0xc6, 0, 0, 0, 0,        // mov rsi, <argv>
     0x48, 0xc7, 0xc2, 0, 0, 0, 0,        // mov rdx, <envp>
@@ -6525,9 +6539,14 @@ extern "C" fn ring3_hosted_execer(hhdm_base: u64) -> ! {
     // property this page's address is chosen to have rather than one it
     // happens to have.
     for (at, offset) in [
+        // The open's path, then the exec's three. Four now rather than three:
+        // the probe opens an `O_CLOEXEC` descriptor before it execs, so that
+        // the exec has one to close and the adapter's release of it is
+        // exercised rather than merely written.
         (3usize, HOSTED_PATH_AT),
-        (10, HOSTED_ARGV_AT),
-        (17, HOSTED_ENVP_AT),
+        (24, HOSTED_PATH_AT),
+        (31, HOSTED_ARGV_AT),
+        (38, HOSTED_ENVP_AT),
     ] {
         let address = (HOSTED_PROBE_CODE_AT + offset) as u32;
         instructions[at..at + 4].copy_from_slice(&address.to_le_bytes());
@@ -9313,10 +9332,23 @@ fn killed_domain_gives_its_socket_back(hhdm_base: u64, cpus: u32) -> bool {
     // because a number that only appears on the boot that fails has no
     // baseline to be compared against -- which is exactly how this gate came to
     // print a descriptor number for a week that nobody could read.
-    let (admitted, found, last_domain, held) = adapter_process_record();
+    let record = adapter_process_record();
     println!(
-        "    process records {admitted} admitted, {found} found; last admitted for domain \
-         {last_domain} holding {held} descriptor(s)"
+        "    process records {} admitted, {} found; last admitted for domain {} holding {} \
+         descriptor(s)",
+        record[0], record[1], record[2], record[3]
+    );
+    // **The file slots, and the peak beside the count.** A slot that an
+    // `O_CLOEXEC` descriptor never gave back at `execve` stays held for the
+    // rest of the boot, so the number that matters is whether the count came
+    // back *down* -- which a single ending figure cannot say and a peak beside
+    // it can. The exec probe opens such a descriptor on purpose, so this is a
+    // measurement rather than an assertion about a path nothing takes.
+    println!(
+        "    adapter files   {} of {} slot(s) held now, {} at the peak",
+        record[4],
+        bhaskix_abi::adapter::FILE_COUNT,
+        record[5]
     );
     if held_it && reaped && same_slot && bound_again {
         println!(
