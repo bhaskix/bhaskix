@@ -839,6 +839,30 @@ the distinction is in the table rather than in somebody's head.
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-09-01 (the descriptor number the reclaim gate had been printing for a week)
+
+The socket-reclaim gate prints `(fd {}, bind {})` and has since the defect was filed. Neither value
+had ever been compared against a healthy run, because a healthy run does not print them. Forcing the
+failure branch on a boot where the reclaim works gives the baseline, and it does not match: healthy
+is **fd 3**, the specimen is **fd 1**.
+
+A socket landing on descriptor 1 is a process with no stdio. Three is the first free number in a
+record holding 0, 1 and 2; one is the second free number in a record holding nothing. So the taker
+was talking to an empty descriptor table — which is the `process_for` path this hunt wrote down
+days ago and did not follow: it admits a fresh empty record when none matches `(domain, generation)`,
+and a `release_sockets_of` walking a record created moments ago releases nothing and reports success,
+which is exactly the shape of a failure where every counter reads clean.
+
+Not yet explained, and named rather than smoothed over: `bind 1`. `answer_bind` returns 0 or a
+negative errno and cannot return a positive 1, so either that value is not an `answer_bind` result
+or it did not come from the syscall the gate believes was made.
+
+The gate now reads the adapter's own file record on failure, which it never did although two other
+gates do. On a refused bind `answer_bind` records the errno, `STAGE_NOT_BOUND` and the service's own
+refusal word packed with the port; the gate printed a bare `bind {n}` and left the reason on the
+floor. The new line was armed by forcing the failure branch, so its decode is proven before the
+specimen it exists for arrives.
+
 ### 2026-09-01 (an instrument that reported the field it had destroyed)
 
 The socket-service observation added earlier today wrote its packed ports into the report page at

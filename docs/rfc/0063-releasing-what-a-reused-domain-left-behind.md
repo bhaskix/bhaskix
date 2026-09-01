@@ -264,6 +264,43 @@ boot*. It does **not** say the port was free at the moment the rebind was refuse
 is the one the defect lives in. A generation of 1 on every slot on both boots says only that each
 slot was closed once by the end.
 
+## The descriptor number, which nobody had compared (2026-09-01)
+
+The reclaim gate prints `(fd {}, bind {})` and has printed it since the defect was filed, but the
+two values had never been compared against a healthy run — because a healthy run does not print
+them. Forcing the failure branch on a boot where the reclaim *works* gives the baseline, and it does
+not match:
+
+| | fd | bind | the adapter's own record |
+|---|---|---|---|
+| healthy | **3** | 0 | `3 at stage -130 (the adapter thinks it bound port 7781)` |
+| the failing specimen | **1** | 1 | not captured — the gate did not read it |
+
+**A socket that lands on descriptor 1 is a process with no stdio.** Descriptor 3 is the first free
+number in a record that has 0, 1 and 2 already filled; descriptor 1 is the second free number in a
+record that has nothing at all. So on the failing boot the taker was talking to an *empty*
+descriptor table.
+
+That is not a new mechanism — it is one this investigation has already written down and not
+followed. `process_for` is not a lookup: **it admits a fresh empty record when none matches
+`(domain, generation)`**, which was recorded earlier in this hunt as "a silent path neither counter
+catches, and the one to instrument next if a specimen shows both at zero". A fresh record explains
+the descriptor number directly, and it would explain the reclaim failing while every counter reports
+success: `release_sockets_of` walking a record that was created moments ago releases nothing and
+says so honestly.
+
+What it does **not** yet explain is `bind 1`. `answer_bind` returns `Answer::ok(0)` or
+`Answer::error(-errno)`; it cannot return a positive 1, so either the value the taker stored is not
+an `answer_bind` result, or it did not come from the syscall the gate believes it made. That is the
+one loose end here, and it is named rather than smoothed over.
+
+**The gate now reads the adapter's record on failure**, which it never did although two other gates
+do. On a refused bind `answer_bind` writes the errno, `STAGE_NOT_BOUND` and *the service's own
+refusal word* packed with the port; the gate was printing a bare `bind {n}` and leaving the reason
+on the floor. The new line was armed by forcing the failure branch, so its decode is proven before
+the specimen it exists for arrives — twelve boots after adding it produced no failure, which is
+consistent with the rate this defect has always had.
+
 **So the next instrument samples at the failure rather than after it.** `bin/ipd` knows when it
 refuses a bind; latching the whole table at that instant would show what was held *then*, which is
 the question. That is a service-side change of a few lines and no new capability, and it is the

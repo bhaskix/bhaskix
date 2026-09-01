@@ -9283,6 +9283,33 @@ fn killed_domain_gives_its_socket_back(hhdm_base: u64, cpus: u32) -> bool {
             answers[1] as i64 - 1,
             syscall::FORGETS_SENT.load(Ordering::Relaxed) - forgets_before
         );
+        // **What the adapter itself recorded, which this gate never asked
+        // for.** `answer_bind` writes its outcome into the personality's file
+        // record on both paths — the descriptor and `STAGE_SOCKET` when it
+        // binds, and the errno, `STAGE_NOT_BOUND` and *the service's own
+        // refusal word* packed with the port when it does not. Two other gates
+        // read that record; this one printed a bare "bind {n}" and left the
+        // reason on the floor. It matters here because the value this gate has
+        // been reporting cannot come from `answer_bind` at all: that function
+        // returns 0 or a negative errno, and the taker has been seen answering
+        // a positive 1.
+        let (last, stage, detail) = adapter_file_record();
+        println!(
+            "\x1b[91m                   the adapter last recorded: {last} at stage {stage}\
+             {}\x1b[0m",
+            if stage == -132 {
+                // STAGE_NOT_BOUND packs the service's refusal above the port.
+                alloc::format!(
+                    " (refused by the service with word {}, for port {})",
+                    detail >> 16,
+                    detail & 0xffff
+                )
+            } else if stage == -130 {
+                alloc::format!(" (the adapter thinks it bound port {detail})")
+            } else {
+                alloc::format!(" (detail {detail}; not a bind, so something else wrote this last)")
+            }
+        );
         false
     }
 }
