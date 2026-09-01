@@ -11,7 +11,7 @@
 | | |
 |---|---|
 | RFCs accepted | **43** |
-| RFCs open | 18 |
+| RFCs open | 19 |
 | RFCs closed without shipping | 1 |
 | Milestone rows done | **92 of 95** |
 | Phase 2 bullets done | **12 of 13** |
@@ -82,6 +82,7 @@ gantt
     RFC 0052 a line that waits for its newline :done, r0052, 2026-08-27, 1d
     RFC 0059 an execve that runs a program with argv and... :done, r0059, 2026-08-30, 1d
     RFC 0060 a writable path for a hosted process :active, r0060, 2026-08-31, 2026-08-31
+    RFC 0063 releasing what a reused domain left behind :active, r0063, 2026-09-01, 2026-09-01
     section Process & tooling
     RFC 0001 License — Apache-2.0 :done, r0001, 2026-08-03, 1d
     RFC 0007 Live patching the nucleus :active, r0007, 2026-08-04, 2026-08-31
@@ -158,6 +159,7 @@ gantt
 | 0060 | a writable path for a hosted process | 2026-08-31 |
 | 0061 | a connection nobody accepted | 2026-08-31 |
 | 0062 | a thread may not run with a TLS base it did not set | 2026-09-01 |
+| 0063 | releasing what a reused domain left behind | 2026-09-01 |
 
 ## Annexes
 

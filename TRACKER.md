@@ -1383,7 +1383,7 @@ it *"arrives when the slot is reused"* — by which time the generation has adva
 record is a zombie or gone. Both filters exclude it. So the one path that exists to release a dead
 domain's socket cannot reach the record holding it, and fabricates an empty one rather than failing.
 `note_exit` works only because it runs *before* `processes.ended`, while the record is still live.
-**The fix is not written, deliberately**: it needs an accessor that finds records by domain across
+**The fix is specified in [RFC 0063](docs/rfc/0063-releasing-what-a-reused-domain-left-behind.md), drafted 2026-09-01 and not yet built.** Its rule is the part that needed writing down rather than coding: a `FORGET` for domain *d* releases for every record naming *d* at a generation **other than the current one**, in either state — the current generation is excluded whatever its state, because a live record there is the new occupant and a zombie there still owes its parent a `wait4`; and an older generation cannot have a living owner, since the destruction `FORGET` announces is what freed the slot. ~~The fix is not written, deliberately~~: it needs an accessor that finds records by domain across
 generations and states, and choosing which of those to release for is a design decision — release too
 broadly and a **live** program loses its network, which is the exact failure the comment beside
 `release_socket_slot` records having caused once already.
