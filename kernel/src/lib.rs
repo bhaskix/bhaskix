@@ -24276,6 +24276,15 @@ fn wait_queue_self_test(hhdm_base: u64) -> bool {
     PHASE.store(PHASE_WAIT + 1, Ordering::Release);
     RING.wake_all();
     let ring_retired = wait_until(|| sched::threads_present_exact(&spawned) == 0, 4_000);
+    // **Counted here, not where it is printed.** The failure message below used
+    // to call `threads_present_exact` again -- and between these two points the
+    // loader wait can spend a further four seconds, so the number it reported
+    // was taken about four seconds after the failure it described. A station
+    // retiring in that window changes it, and in the limit the message reads
+    // "0 ring stations did not retire", which is a sentence that cannot be
+    // true. Two reads are not one measurement; the console tear and the lock
+    // accounting were both this, on 2026-09-01.
+    let still_running = sched::threads_present_exact(&spawned);
     // The loaders retire on the same phase. Waited for separately so that a
     // loader that outlives the window is not counted as a station that did:
     // the gate above is about the ring, and folding the two together would let
@@ -24340,9 +24349,8 @@ fn wait_queue_self_test(hhdm_base: u64) -> bool {
 
     if !ring_retired {
         println!(
-            "\x1b[91m    wait queues    FAILED: {} ring stations did not retire, so the class \
-             phase would measure a machine they are still competing on\x1b[0m",
-            sched::threads_present_exact(&spawned)
+            "\x1b[91m    wait queues    FAILED: {still_running} ring stations did not retire, \
+             so the class phase would measure a machine they are still competing on\x1b[0m"
         );
         // **Indented to here so CI carries it.** `annotate_failure_detail`
         // keeps the lines after the marker that are indented past column 15
