@@ -609,6 +609,14 @@ run-uefi: $(ISO)
 # more cores may manage `-j2`, and the fixtures no longer stand in the way.
 # Measured 2026-09-02: serial 590 s, `-j2` failed at 460 s, `-j4` at 341 s.
 #
+# **`QEMU_SMP=8 make test` is the knob for hunting a concurrency defect**, and it
+# is what found two of them on 2026-09-02. Every lane takes `QEMU_SMP`; the
+# default is four. The socket reclaim failed 2 boots in 10 at eight and about 1
+# in 15 at four, which is most of why it took three days -- and the nine probes
+# that could be spawned into untagged domains were found from a specimen the
+# same setting produced. The whole suite passes at eight as of 2026-09-02, on a
+# host with eight cores, in one clean run.
+#
 # Serial is about 590 s here and the parallel prize is real -- but a suite that
 # fails for a reason that has nothing to do with the code is worse than a slow
 # one, and `gave up after 0.255s` says nothing about an image at all.

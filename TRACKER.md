@@ -869,6 +869,23 @@ This does not fix either defect. What it changes is where they would be caught: 
 number and the value, instead of three layers away in a gate that could only say the probe's report
 looked wrong.
 
+### 2026-09-02 (the whole suite at eight CPUs, green)
+
+`QEMU_SMP=8 make test` — every lane at double the usual concurrency — **passes**, in one clean run
+on an eight-core host.
+
+That is worth having as a number because it was not true this morning. At eight CPUs the socket
+reclaim failed 2 boots in 10, and the specimen that exposed nine probes able to run in untagged
+domains came from the same setting. Four CPUs hid both: the reclaim at about 1 in 15, and the probes
+entirely.
+
+The knob is now named beside the `test` target, because it is the cheapest instrument this project
+has for a concurrency defect and it cost nothing to add — every lane already read `QEMU_SMP`, and
+nobody had turned it up. The idea came from the SR550 reporting `cpus 16 online of 16` while the
+lanes ran four.
+
+One run is one run. It is recorded as that rather than as a rate.
+
 ### 2026-09-02 (two sweeps for the same bug elsewhere, both clean)
 
 The nine personality sites were one shape of one bug — an answer returned and not read. Two sweeps
