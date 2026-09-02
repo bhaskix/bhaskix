@@ -58,7 +58,9 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 LOG="${BHASKIX_BUSYBOX_LOG:-$(mktemp)}"
 FIFO="$(mktemp -u)"
 TIMEOUT="${BUSYBOX_TEST_TIMEOUT:-240}"
-ISO="$REPO_ROOT/build/bhaskix.iso"
+# This lane's own image, so it neither rewrites the shared one nor has to put it
+# back -- and so it can run beside the other lanes. See `boot-test.sh`.
+ISO="${BHASKIX_ISO:-$REPO_ROOT/build/busybox.iso}"
 
 status=0
 pass() { printf '\033[1;32mok\033[0m    %s\n' "$*"; }
@@ -68,14 +70,15 @@ cleanup() {
     exec 3>&- 2>/dev/null || true
     [[ -n "${qemu:-}" ]] && kill "$qemu" 2>/dev/null
     rm -f "$FIFO"
-    # The image carries a command line no other lane wants, so it is put back
-    # whatever happened here -- a lane that left `busybox=sh` behind would stop
-    # the next boot in the middle of its self-tests.
-    make -C "$REPO_ROOT" iso >/dev/null 2>&1 || true
+    # **Nothing to put back since 2026-09-02.** This built the shared image with
+    # `busybox=sh` and restored it here, so a lane that died between the two
+    # left a command line no other lane wants -- and, worse, no other lane could
+    # run beside it. It builds its own image now, so cleanup has nothing to undo.
 }
 trap cleanup EXIT
 
-if ! make -C "$REPO_ROOT" iso CMDLINE="busybox=sh" >/dev/null 2>&1; then
+if ! make -C "$REPO_ROOT" iso CMDLINE="busybox=sh" \
+        ISO="$ISO" ISO_ROOT="$REPO_ROOT/build/iso_root_busybox" >/dev/null 2>&1; then
     fail "could not build an image with busybox=sh"
     exit 1
 fi

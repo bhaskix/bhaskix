@@ -15,7 +15,12 @@ set -uo pipefail
 
 MODE="${1:-bios}"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-ISO="$REPO_ROOT/build/bhaskix.iso"
+# **Overridable, so a caller that needs its own image does not rebuild this
+# one.** `test-placements` and `test-busybox` each build an image with different
+# contents and used to do it *in place*, which is why the suite could not run
+# with `-j`: a lane would boot from a file another target was rewriting, and the
+# failure read `gave up after 0.255s` with nothing about an image in it.
+ISO="${BHASKIX_ISO:-$REPO_ROOT/build/bhaskix.iso}"
 # Overridable so a caller can keep the serial output. The test prints the log
 # only when something fails, which is right for a gate and unhelpful when the
 # thing you want is a number the machine measured.
@@ -265,12 +270,18 @@ DOMAIN_DISK="$REPO_ROOT/build/domain-disk-${BHASKIX_LANE}.img"
 # that will be reached for the first time on the machine that is already going
 # wrong. This one exists for M1-17's first boot on real hardware, which is
 # exactly the situation where finding out it never worked would be worst.
+# **Its own image, not the shared one rewritten.** This built `iommu=off` into
+# `build/bhaskix.iso` and put it back afterwards, which meant no other lane could
+# run beside it and a lane that died in between left a command line nobody else
+# wanted. Building elsewhere makes the restore unnecessary as well as the race
+# impossible.
 if [[ "$MODE" == "iommu-off" ]]; then
-    make -C "$REPO_ROOT" iso CMDLINE="iommu=off" >/dev/null 2>&1 || {
+    ISO="$REPO_ROOT/build/iso-iommu-off.iso"
+    make -C "$REPO_ROOT" iso CMDLINE="iommu=off" \
+        ISO="$ISO" ISO_ROOT="$REPO_ROOT/build/iso_root_iommu_off" >/dev/null 2>&1 || {
         fail "could not build an image with iommu=off"
         exit 1
     }
-    restore_image() { make -C "$REPO_ROOT" iso >/dev/null 2>&1 || true; }
 fi
 
 # The machine, from `devices.sh`, which both QEMU harnesses share.

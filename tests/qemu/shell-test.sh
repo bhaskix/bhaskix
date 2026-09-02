@@ -143,11 +143,15 @@ disk)
 esac
 
 if [[ -n "$cmdline" ]]; then
-    make -C "$REPO_ROOT" iso CMDLINE="$cmdline" >/dev/null 2>&1 || {
+    # Its own image, keyed on the mode, so two of these can run at once and
+    # neither has to put the shared one back. See `boot-test.sh`.
+    ISO="$REPO_ROOT/build/iso-shell-${MODE}.iso"
+    make -C "$REPO_ROOT" iso CMDLINE="$cmdline" \
+        ISO="$ISO" ISO_ROOT="$REPO_ROOT/build/iso_root_shell_${MODE}" >/dev/null 2>&1 || {
         fail "could not build an image with $cmdline"
         exit 1
     }
-    restore_image() { make -C "$REPO_ROOT" iso >/dev/null 2>&1 || true; }
+    restore_image() { :; }
 else
     restore_image() { :; }
 fi

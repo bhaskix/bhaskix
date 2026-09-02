@@ -845,6 +845,27 @@ the distinction is in the table rather than in somebody's head.
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-09-02 (four lanes stop rewriting the shared image; the suite is still serial)
+
+Having diagnosed why `-j` fails, the four targets that rebuilt `build/bhaskix.iso` in place now build
+their own: `test-placements`, `test-busybox`, `boot-test.sh iommu-off` and `shell-test.sh`. The two
+harnesses take an image path from `BHASKIX_ISO`, and each variant builds into its own `ISO` and
+`ISO_ROOT`.
+
+**That is worth having whether or not the suite ever runs parallel.** Every one of those built the
+shared image with its own command line and *put it back afterwards* — so a lane that died between the
+two left a command line no other lane wanted, and `test-busybox`'s cleanup comment said exactly that
+was the risk. There is nothing to put back now.
+
+**And the suite is still serial, which was measured rather than hoped.** `make -j4 test` went from
+failing at 140 s to failing at 380 s, in `test-placements` — a target that passes alone. Its
+recursive `$(MAKE) iso` rebuilds `$(KERNEL)`, `$(INITRD)` and the disk fixtures, all shared paths,
+while other lanes are using them. Isolating the image was necessary and is not sufficient; the rest
+of the build artifacts would have to follow, and that is a larger change than this.
+
+The `Makefile` note beside `test` says all of this, because that is where somebody will reach for
+`-j` and get `gave up after 0.255s`, which mentions no image at all.
+
 ### 2026-09-02 (why the suite is serial, and it is not an oversight)
 
 Finding that `make test` runs its lanes serially made the obvious next question worth asking: it took

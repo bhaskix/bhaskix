@@ -579,10 +579,23 @@ run-uefi: $(ISO)
 # with a different command line and puts the image back afterwards. Under `-j`
 # those rebuilds race every other lane's boot.
 #
-# Making this parallel means giving those targets an image path of their own,
-# not adding `-j`. Measured 2026-09-02: serial is about 590 s here, so the prize
-# is real -- but a suite that fails for a reason that has nothing to do with the
-# code is worse than a slow one.
+# **Four of those targets were given their own image on 2026-09-02** --
+# `test-placements`, `test-busybox`, `boot-test.sh iommu-off` and
+# `shell-test.sh` -- which removes the fragile half of the pattern regardless of
+# `-j`: each built the shared image with its own command line and *put it back
+# afterwards*, so a lane that died in between left a command line no other lane
+# wanted. There is nothing to put back now.
+#
+# **It is still not parallel-safe, and that was measured rather than hoped.**
+# `make -j4 test` gets from 140 s to 380 s of progress with those four fixed and
+# then fails in `test-placements`, which passes alone: its recursive `$(MAKE)
+# iso` rebuilds `$(KERNEL)`, `$(INITRD)` and the disk fixtures, all shared paths,
+# while other lanes are using them. Isolating the image was necessary and is not
+# sufficient; the rest of the build artifacts would have to follow.
+#
+# Serial is about 590 s here and the parallel prize is real -- but a suite that
+# fails for a reason that has nothing to do with the code is worse than a slow
+# one, and `gave up after 0.255s` says nothing about an image at all.
 test: fmt clippy test-host gates test-boot test-boot-uefi test-boot-iommu test-boot-iommu-off \
       test-boot-qemu64 test-boot-uefi-qemu64 test-boot-native test-boot-native-full \
       test-placements test-shell \
@@ -628,8 +641,10 @@ test-placements:
 	  for vfs in nucleus domain; do \
 	    echo "  console=$$console vfs=$$vfs"; \
 	    BHASKIX_PLACEMENT_CONSOLE=$$console BHASKIX_PLACEMENT_VFS=$$vfs \
-	        $(MAKE) --no-print-directory iso >/dev/null || exit 1; \
+	        $(MAKE) --no-print-directory iso ISO=build/placements.iso \
+	        ISO_ROOT=build/iso_root_placements >/dev/null || exit 1; \
 	    BHASKIX_PLACEMENT_CONSOLE=$$console BHASKIX_PLACEMENT_VFS=$$vfs \
+	        BHASKIX_ISO=$(CURDIR)/build/placements.iso \
 	        tests/qemu/boot-test.sh bios || exit 1; \
 	  done; \
 	done
