@@ -4781,8 +4781,7 @@ fn corpus_self_test(hhdm_base: u64, cpus: u32, busybox: bool) -> bool {
     };
     if domain::with(realm, |owner| {
         owner.set_personality(domain::Personality::Linux)
-    })
-    .is_none()
+    }) != Some(Ok(()))
     {
         println!("\x1b[91m    {label}      FAILED: the tag would not set\x1b[0m");
         return false;
@@ -5138,8 +5137,7 @@ fn clone_rendezvous_attempt(hhdm_base: u64, cpu: u32, foreign_before: u64) -> bo
     };
     if domain::with(realm, |owner| {
         owner.set_personality(domain::Personality::Linux)
-    })
-    .is_none()
+    }) != Some(Ok(()))
     {
         println!("\x1b[91m    linux clone    FAILED: the tag would not set\x1b[0m");
         return false;
@@ -5580,8 +5578,7 @@ fn thread_self_test(hhdm_base: u64, cpus: u32) -> bool {
     };
     if domain::with(realm, |owner| {
         owner.set_personality(domain::Personality::Linux)
-    })
-    .is_none()
+    }) != Some(Ok(()))
     {
         println!("\x1b[91m    linux futex    FAILED: the tag would not set\x1b[0m");
         return false;
@@ -5967,8 +5964,7 @@ fn poll_self_test(hhdm_base: u64, cpus: u32) -> bool {
     };
     if domain::with(realm, |owner| {
         owner.set_personality(domain::Personality::Linux)
-    })
-    .is_none()
+    }) != Some(Ok(()))
     {
         println!("\x1b[91m    linux poll     FAILED: the tag would not set\x1b[0m");
         domain::destroy(realm);
@@ -6043,8 +6039,7 @@ fn memory_self_test(hhdm_base: u64, cpus: u32) -> bool {
     };
     if domain::with(realm, |owner| {
         owner.set_personality(domain::Personality::Linux)
-    })
-    .is_none()
+    }) != Some(Ok(()))
     {
         println!("\x1b[91m    linux memory   FAILED: the tag would not set\x1b[0m");
         return false;
@@ -6277,8 +6272,7 @@ fn signal_self_test(hhdm_base: u64, cpus: u32) -> bool {
     };
     if domain::with(realm, |owner| {
         owner.set_personality(domain::Personality::Linux)
-    })
-    .is_none()
+    }) != Some(Ok(()))
     {
         println!("\x1b[91m    linux signal   FAILED: the tag would not set\x1b[0m");
         return false;
@@ -8052,8 +8046,7 @@ fn auxv_self_test(hhdm_base: u64, cpus: u32) -> bool {
     // *before* it makes any.
     if domain::with(realm, |owner| {
         owner.set_personality(domain::Personality::Linux)
-    })
-    .is_none()
+    }) != Some(Ok(()))
     {
         println!("\x1b[91m    linux stack    FAILED: the tag would not set\x1b[0m");
         return false;
@@ -9603,8 +9596,7 @@ fn bell_wakes_a_poller(hhdm_base: u64, cpus: u32) -> bool {
         realms[index] = Some(realm);
         if domain::with(realm, |owner| {
             owner.set_personality(domain::Personality::Linux)
-        })
-        .is_none()
+        }) != Some(Ok(()))
         {
             println!("\x1b[91m    datagram wake  FAILED: the tag would not set\x1b[0m");
             ok = false;
@@ -9754,8 +9746,7 @@ fn socket_poll_self_test(hhdm_base: u64, cpus: u32) -> bool {
     };
     if domain::with(realm, |owner| {
         owner.set_personality(domain::Personality::Linux)
-    })
-    .is_none()
+    }) != Some(Ok(()))
     {
         println!("\x1b[91m    linux socket poll FAILED: the tag would not set\x1b[0m");
         domain::destroy(realm);
