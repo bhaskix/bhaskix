@@ -869,6 +869,33 @@ This does not fix either defect. What it changes is where they would be caught: 
 number and the value, instead of three layers away in a gate that could only say the probe's report
 looked wrong.
 
+### 2026-09-02 (the 0.25 s failure was already documented, and I had guessed instead)
+
+`devices.sh` records the exact failure `make -j` produces, and it was read only after a wrong
+explanation had been written down:
+
+> Two harnesses booting at once both open this file, the second is refused, and the failure arrives
+> as `the machine did not finish booting` **0.25 s in** — which reads as a hung kernel and is a held
+> file.
+
+QEMU takes a write lock on a drive; the copies are named for the lane; and `BHASKIX_LANE` defaults to
+the **mode**. `test-placements` runs `boot-test.sh bios`, and so does `test-boot` — the same file,
+both open. That file's own comment says it: *"Two runs of the same mode still collide."*
+
+The fix is one environment variable, `BHASKIX_LANE=placements`, and `test-placements` then passes
+under `-j4`. **The earlier diagnosis — that the recursive `$(MAKE) iso` was rewriting shared
+artifacts under a running lane — was a guess from seeing `xorriso` in the log.** Isolating the image
+was worth doing for its own reasons and was not what blocked `-j`.
+
+**With both fixed, the host is the limit here.** `-j4` and `-j2` now reach a *genuine* `gave up after
+120.1s` — a real timeout, not the lock signature — because a lane wants four vCPUs and this machine
+has eight cores. Serial 590 s; `-j2` failed at 460 s; `-j4` at 341 s. That is a property of the
+machine rather than of the suite, and somewhere with more cores may manage `-j2` now that the
+fixtures do not stand in the way.
+
+**Fifth correction in two days, and this one was written down in the tree already.** The others
+needed a `grep` or a re-read; this needed only reading the file whose function was being called.
+
 ### 2026-09-02 (four lanes stop rewriting the shared image; the suite is still serial)
 
 Having diagnosed why `-j` fails, the four targets that rebuilt `build/bhaskix.iso` in place now build

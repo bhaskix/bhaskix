@@ -586,12 +586,28 @@ run-uefi: $(ISO)
 # afterwards*, so a lane that died in between left a command line no other lane
 # wanted. There is nothing to put back now.
 #
-# **It is still not parallel-safe, and that was measured rather than hoped.**
-# `make -j4 test` gets from 140 s to 380 s of progress with those four fixed and
-# then fails in `test-placements`, which passes alone: its recursive `$(MAKE)
-# iso` rebuilds `$(KERNEL)`, `$(INITRD)` and the disk fixtures, all shared paths,
-# while other lanes are using them. Isolating the image was necessary and is not
-# sufficient; the rest of the build artifacts would have to follow.
+# **And the second reason it was not parallel-safe was already written down in
+# `devices.sh`, which said so better than the guess it replaced.** That file
+# records the exact signature: "Two harnesses booting at once both open this
+# file, the second is refused, and the failure arrives as `the machine did not
+# finish booting` 0.25 s in -- which reads as a hung kernel and is a held file."
+# QEMU takes a write lock on a drive, the disk copies are named for the lane,
+# and `BHASKIX_LANE` defaults to the *mode* -- so `test-placements`, which runs
+# `boot-test.sh bios`, collided with `test-boot`, which is also `bios`. That
+# file's own comment says it: "Two runs of the same mode still collide."
+#
+# So `test-placements` names its lane, and the earlier diagnosis -- that the
+# recursive `$(MAKE) iso` was rewriting shared artifacts under a running lane --
+# was a guess from seeing `xorriso` in the log. Isolating the image was still
+# worth doing for its own reasons; it was not what blocked `-j`.
+#
+# **With both fixed, the host is what blocks it here.** `-j4` and `-j2` both
+# reach a genuine `gave up after 120.1s` -- a real timeout, not the 0.25 s lock
+# signature -- because a lane wants four vCPUs and this machine has eight cores.
+# Two lanes plus the host's own work is enough to push a boot past its budget.
+# That is a property of the machine rather than of the suite: somewhere with
+# more cores may manage `-j2`, and the fixtures no longer stand in the way.
+# Measured 2026-09-02: serial 590 s, `-j2` failed at 460 s, `-j4` at 341 s.
 #
 # Serial is about 590 s here and the parallel prize is real -- but a suite that
 # fails for a reason that has nothing to do with the code is worse than a slow
@@ -644,7 +660,7 @@ test-placements:
 	        $(MAKE) --no-print-directory iso ISO=build/placements.iso \
 	        ISO_ROOT=build/iso_root_placements >/dev/null || exit 1; \
 	    BHASKIX_PLACEMENT_CONSOLE=$$console BHASKIX_PLACEMENT_VFS=$$vfs \
-	        BHASKIX_ISO=$(CURDIR)/build/placements.iso \
+	        BHASKIX_ISO=$(CURDIR)/build/placements.iso BHASKIX_LANE=placements \
 	        tests/qemu/boot-test.sh bios || exit 1; \
 	  done; \
 	done
