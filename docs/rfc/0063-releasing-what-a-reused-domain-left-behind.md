@@ -590,6 +590,21 @@ different slot, which stops the `FORGET` and breaks the very thing being tested.
 **Measured at eight CPUs, where it reproduces**: 2 failures in 10 boots before, **0 in 12** after.
 Four CPUs hid it at roughly one in fifteen, which is why this took three days and five wrong answers.
 
+**The fix's placement was swept, and it is the only site with this shape.** Sixteen callers read
+`threads_counted_in`: ten are a probe waiting for its *own* domain to empty, which is a different
+question; one is `domain::create`'s free-slot predicate, whose window this is and which cannot be
+tightened without breaking the slot reuse the reclaim needs; one waits and then *destroys* rather
+than reusing. Only this gate waited on the counter and then created a successor expecting the same
+slot.
+
+**And the scan variant matters.** `threads_in_domain` treats a runqueue it could not lock as empty,
+which another self-test's comment warns about at length — the failure it hunts is a thread
+*spinning*, which keeps that very lock busy, so the scan was "blinded by the spin and reported the
+domain empty: a gate that passed because the bug was bad enough to hide itself". This fix uses
+`threads_in_domain_exact`, which takes the lock, and which `Domain::has_threads` already uses for the
+same stated reason: "safe for a caller that polls and wrong for one that decides. This decides." Had
+it used the polling variant it would have been the same class of defect it was written to close.
+
 The rule this RFC proposed is withdrawn. `Process::exec_into`, `release_sockets_of` and `process_for`
 are unchanged, and every instrument added along the way stays — the bind record, the process record,
 `ipd sockets`, and the foreign-return ring are what made the last step take an afternoon instead of
