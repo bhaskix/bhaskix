@@ -3650,6 +3650,7 @@ pub fn block_unless<T>(me: u32, ready: impl FnOnce() -> Option<T>) -> Option<T> 
             if thread.id != me {
                 MISMARKED_BLOCKS.fetch_add(1, Ordering::Relaxed);
                 MISMARKED_UNLESS.fetch_add(1, Ordering::Relaxed);
+                note_mismark(me, thread.id);
                 return taken;
             }
             if !thread.dying {
@@ -3728,6 +3729,7 @@ pub fn mark_blocked(id: u32) {
     // A missed sleep is a spin; a mis-marked sleep is a lost thread.
     if thread.id != id {
         MISMARKED_BLOCKS.fetch_add(1, Ordering::Relaxed);
+        note_mismark(id, thread.id);
         return;
     }
     if !thread.dying {
@@ -3750,6 +3752,38 @@ static MISMARKED_BLOCKS: AtomicU64 = AtomicU64::new(0);
 /// that can be chased. The total is what the boot report has always printed,
 /// so it keeps counting both.
 static MISMARKED_UNLESS: AtomicU64 = AtomicU64::new(0);
+
+/// Who was refused, and who they would have put to sleep -- the first time.
+///
+/// **A count cannot answer the question this defect is now stuck on.** CI run
+/// 548 (2026-09-03) is the first boot ever to report a non-zero mismark, `6`,
+/// and it wedged the ring anyway. So the mechanism is real and firing, and the
+/// refusal that was supposed to prevent the terminal state did not prevent
+/// this one. The next thing worth knowing is whether the stuck station is ever
+/// *either party*: the caller whose mark was refused, or the thread that would
+/// have been marked in its place.
+///
+/// Packed as `caller << 32 | victim`, written once with a compare-exchange so
+/// the first pair survives the thousands that a mis-addressed arming produces.
+/// `u64::MAX` means no refusal has happened.
+static FIRST_MISMARK: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// Keeps the **first** refused pair and discards the rest.
+///
+/// First rather than last for the reason the lock-ordering instrument keeps
+/// its first violation: the earliest one happened on a machine that was still
+/// behaving, so it describes the fault rather than the wreckage after it.
+fn note_mismark(caller: u32, victim: u32) {
+    let packed = (u64::from(caller) << 32) | u64::from(victim);
+    let _ = FIRST_MISMARK.compare_exchange(u64::MAX, packed, Ordering::Relaxed, Ordering::Relaxed);
+}
+
+/// The first refused `(caller, would-have-been-marked)` pair, if there was one.
+#[must_use]
+pub fn first_mismark() -> Option<(u32, u32)> {
+    let packed = FIRST_MISMARK.load(Ordering::Relaxed);
+    (packed != u64::MAX).then_some(((packed >> 32) as u32, packed as u32))
+}
 
 /// How many times a block was refused because the caller was not the thread
 /// about to be marked.

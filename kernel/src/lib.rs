@@ -19642,9 +19642,13 @@ fn user_shell(handoff: &Handoff) -> Result<(), &'static str> {
         let mismarked_unless = sched::mismarked_unless();
         let mismarked_total = sched::mismarked_blocks();
         if mismarked_total > 0 {
+            let pair = sched::first_mismark();
             println!(
                 "\x1b[91m    block mismark  {mismarked_total} block(s) refused for a caller that \
-                 was not the thread being marked ({mismarked_unless} in block_unless)\x1b[0m"
+                 was not the thread being marked ({mismarked_unless} in block_unless); the first \
+                 was thread {} refused a mark on thread {}\x1b[0m",
+                pair.map_or(0, |(caller, _)| caller),
+                pair.map_or(0, |(_, victim)| victim)
             );
         }
         println!(
@@ -24600,6 +24604,32 @@ fn wait_queue_self_test(hhdm_base: u64) -> bool {
             sched::mismarked_blocks(),
             sched::mismarked_unless()
         );
+        // **Names the two parties, because a count could not answer what this
+        // defect is now stuck on.** CI run 548 was the first boot ever to
+        // report a non-zero mismark -- `6` -- and it wedged the ring anyway.
+        // The mechanism is therefore real *and* not obviously the cause, and
+        // the question that separates those is whether the stuck station is
+        // ever either party: the caller whose mark was refused, or the thread
+        // that would have been marked in its place.
+        //
+        // Resolved against the station table so the answer is readable without
+        // cross-referencing thread numbers by hand, and explicit when the
+        // party is not a station at all -- which is itself the interesting
+        // reading, since it would put the fault outside this test's threads.
+        if let Some((caller, victim)) = sched::first_mismark() {
+            let name_of = |id: u32| -> &'static str {
+                match spawned.iter().position(|&s| s == id) {
+                    Some(i) => NAMES[i],
+                    None => "not a ring station",
+                }
+            };
+            println!(
+                "                   the first refusal was thread {caller} ({}) being refused a \
+                 mark on thread {victim} ({})",
+                name_of(caller),
+                name_of(victim)
+            );
+        }
         // **The number that separates the two readings left, and it was
         // computed here already without ever being printed.**
         //
