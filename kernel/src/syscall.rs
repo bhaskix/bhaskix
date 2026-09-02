@@ -2121,8 +2121,13 @@ fn check_impossible(number: u64, value: u64) {
     // not to police the boundary.
     const SMALL: u64 = 16;
     let forbidden = match number {
-        // `mmap`, `brk`, `mremap`: an address, or a negative errno.
-        9 | 12 | 25 => value != 0 && value < SMALL,
+        // `mmap`, `brk`, `mremap`: an address, or a negative errno. **Zero is
+        // impossible here too**, and the first draft exempted it -- correctly
+        // for `bind`, which answers zero on success, and wrongly for these.
+        // Found by a specimen the invariant then failed to flag: `linux memory
+        // FAILED: mmap 0x0` on 2026-09-02, which is precisely the value this
+        // was built to catch and precisely the one it let through.
+        9 | 12 | 25 => value < SMALL,
         // `bind`, `listen`, `connect`, `close`: zero, or a negative errno.
         49 | 50 | 42 | 3 => value != 0 && value < SMALL,
         _ => false,
@@ -2149,6 +2154,12 @@ pub fn impossible_returns() -> (u64, Option<(u64, u64)>) {
 }
 
 /// The recorded returns, oldest first, as `(number, value)`.
+///
+/// **Global, not per domain**, and a reader must allow for it: every hosted
+/// program's foreign calls land in one ring, so a `[9]` beside a failing probe
+/// may be the adapter's own or another program's. It says what this kernel
+/// answered, not who asked. Per-domain would need a ring each and is worth it
+/// only if this ambiguity ever costs a diagnosis.
 ///
 /// Skips slots nothing has written, so a boot that made three foreign calls
 /// reports three rather than thirteen zeroes and three.

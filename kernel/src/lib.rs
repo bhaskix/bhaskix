@@ -9343,7 +9343,29 @@ fn killed_domain_gives_its_socket_back(hhdm_base: u64, cpus: u32) -> bool {
     // until they have. Creating the successor immediately gave it a *different*
     // slot, so no `FORGET` was sent for this one and nothing was released --
     // which presented as the reclaim simply not working.
-    let reaped = wait_until(|| sched::threads_counted_in(leaked_slot) == 0, 20_000);
+    //
+    // **And both measures, because the counter is decremented early.**
+    // `sched::exit` records the departure and *then* takes the thread off its
+    // queue, so the counter reaches zero while the exact scan still finds the
+    // thread. Waiting on the counter alone lets this create the successor in
+    // that window -- `create` accepts the slot, and `set_personality` then
+    // refuses it with `HasThreads`, because `Domain::has_threads` uses the
+    // exact scan. Measured 2026-09-02 at eight CPUs: two boots in ten, both
+    // reporting `(fd 0, bind -1)` with `same slot true`, which is a taker that
+    // was never spawned because its domain would not take the Linux tag.
+    //
+    // Waiting for both keeps the slot reuse this gate depends on -- the reclaim
+    // rides on it -- and removes the refusal. It is the gate that was racing,
+    // not the allocator: refusing the slot in `domain::create` was tried and
+    // gives the successor a *different* slot, which stops the `FORGET` and
+    // breaks the mechanism this exists to test.
+    let reaped = wait_until(
+        || {
+            sched::threads_counted_in(leaked_slot) == 0
+                && sched::threads_in_domain_exact(leaked_slot) == 0
+        },
+        20_000,
+    );
 
     // The one that must be able to take the port back. It reuses the slot the
     // first left, which is what causes the kernel to send `FORGET`.

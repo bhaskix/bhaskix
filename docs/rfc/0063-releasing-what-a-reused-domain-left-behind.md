@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | 🔍 **Open, with a real defect fixed under it 2026-09-02** — the gate spawned its probes into domains whose Linux tag it never checked, so a refused tag ran the program on the native syscall path. Consistent with every measurement; not yet proven to be the cause. See "What the specimen said" |
+| **Status** | ✅ **Closed 2026-09-02 — the gate was racing its own precondition, and nothing this RFC proposed was needed.** It waited for a counter that is decremented before the thread leaves its queue, created the successor in that window, and the successor then refused the Linux tag. See "What it was" |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | libc / userspace (`bin/linuxd`) |
 | **Milestone** | Phase 2 — Linux personality (L1) |
@@ -548,3 +548,49 @@ consistent with it and proves nothing.
 
 What the fix does guarantee is that the next occurrence **names itself**: a refused tag now fails the
 gate as a domain that would not start, instead of arriving three layers later as `fd 1, bind 1`.
+
+
+---
+
+## What it was (2026-09-02)
+
+**The gate raced its own precondition, and no rule from this RFC was needed.**
+
+The reclaim rides on the successor reusing the dead domain's slot — that is the design, and the gate's
+own comment says a successor landing elsewhere sends no `FORGET` and releases nothing. So the gate
+kills the holder and waits for the slot to be free before creating the taker. It waited on
+`sched::threads_counted_in`, **a counter**, and `sched::exit` decrements that counter and *then*
+takes the thread off its queue.
+
+In that window the counter says the slot is free while `Domain::has_threads` — an **exact scan** of
+the run queues — still finds the thread. So `domain::create` accepts the slot and `set_personality`
+immediately refuses it with `HasThreads`. Two measures of one thing, and nothing checking they agree.
+
+**What made it unreadable for three days** is that the gate then spawned the program anyway:
+
+    domain::with(taker, |o| o.set_personality(Linux)).is_some()
+
+`.is_some()` asks whether the *domain was found* and discards whether the *tag was accepted*. An
+untagged domain's `syscall` takes the native path, where 41 and 49 are not `socket` and `bind` — so
+the probe reported `fd 1, bind 1`, values neither the kernel nor the adapter ever produced. Every
+instrument built for this pointed at `bin/linuxd` and `bin/ipd`, and every one of them was right: the
+adapter was never asked.
+
+**The evidence, in order.** The bind record showed `incarnation 5` and **3** binds served where a
+passing boot has 6 and 4 — the taker's call never arrived. The foreign-return ring showed `[41]=0x3
+[49]=0x0` every time and no `1` anywhere. Fixing `.is_some()` changed the symptom from `fd 1, bind 1`
+to `fd 0, bind -1`, which is a report page still full of zeroes: the taker was no longer spawned at
+all, which is what a refused tag should do. That is what named the refusal.
+
+**The fix is one wait.** The gate waits for the counter **and** the exact scan before reusing the
+slot. It keeps the slot reuse the mechanism depends on, and it is the gate that was racing rather
+than the allocator: refusing such a slot in `domain::create` was tried and gives the successor a
+different slot, which stops the `FORGET` and breaks the very thing being tested.
+
+**Measured at eight CPUs, where it reproduces**: 2 failures in 10 boots before, **0 in 12** after.
+Four CPUs hid it at roughly one in fifteen, which is why this took three days and five wrong answers.
+
+The rule this RFC proposed is withdrawn. `Process::exec_into`, `release_sockets_of` and `process_for`
+are unchanged, and every instrument added along the way stays — the bind record, the process record,
+`ipd sockets`, and the foreign-return ring are what made the last step take an afternoon instead of
+another week.
