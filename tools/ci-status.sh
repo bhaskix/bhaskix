@@ -5,6 +5,7 @@
 #
 # Usage:  tools/ci-status.sh [count]        # default 12 pushes
 #         tools/ci-status.sh --budgets      # what the newest run's lanes measured
+#         tools/ci-status.sh --why 515      # which job failed in run 515, and what its gate said
 #
 # # Why this exists
 #
@@ -49,7 +50,9 @@ set -uo pipefail
 
 REPO="${BHASKIX_CI_REPO:-bhaskix/bhaskix}"
 BUDGETS=0
+WHY=""
 [[ ${1:-} == "--budgets" ]] && { BUDGETS=1; shift; }
+[[ ${1:-} == "--why" ]] && { WHY="${2:-}"; shift 2 || true; }
 COUNT="${1:-12}"
 API="https://api.github.com/repos/$REPO/actions"
 CHECKS="https://api.github.com/repos/$REPO"
@@ -92,6 +95,74 @@ fetch() {
     fi
     curl -sS -m 30 -H 'Accept: application/vnd.github+json' "$1" 2>/dev/null
 }
+
+# **What a named run actually failed on, which the job name does not say.**
+#
+# The report below explains why for the *newest* red, and that was enough while
+# a red was read the day it happened. It is not enough afterwards: on 2026-09-02
+# four earlier reds were re-read by hand and three of them turned out to be
+# other defects than the job they appeared in -- run 515's `interactive shell`
+# was the ring-station lost wakeup, run 478's was too and its shell reached the
+# prompt, and run 489's was a real lock-ordering violation that had never been
+# recorded anywhere. A job is named after what it runs, not after what fails
+# inside it, so every per-boot defect can surface in any of them.
+#
+# Doing that reading by hand took an afternoon and four API calls per run. This
+# is those calls.
+if [[ -n "$WHY" ]]; then
+    why_json="$(fetch "$API/runs?per_page=60&branch=main&event=push")"
+    why_id="$(printf '%s' "$why_json" | python3 -c '
+import json, sys
+want = sys.argv[1]
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+for r in data.get("workflow_runs", []):
+    if str(r.get("run_number")) == want:
+        print(r["id"], r.get("head_sha", "")[:7], (r.get("display_title") or "")[:60], sep="\t")
+        break
+' "$WHY")"
+    if [[ -z "$why_id" ]]; then
+        echo "ci-status: run $WHY is not in the last 60 pushes to main" >&2
+        exit 2
+    fi
+    id="$(printf '%s' "$why_id" | cut -f1)"
+    printf '%s  run %s  %s\n' "$DIM" "$WHY" "$RESET$(printf '%s' "$why_id" | cut -f2-3 | tr '\t' ' ')"
+    jobs="$(fetch "$API/runs/$id/jobs")"
+    printf '%s' "$jobs" | python3 -c '
+import json, sys
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+for j in data.get("jobs", []):
+    if j.get("conclusion") == "failure":
+        print(j["id"], j.get("name", "")[:48], sep="\t")
+' | while IFS=$'\t' read -r jid jname; do
+        printf '  %sjob%s %s\n' "$RED" "$RESET" "$jname"
+        fetch "$CHECKS/check-runs/$jid/annotations" | python3 -c '
+import json, sys
+try:
+    anns = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+if not isinstance(anns, list):
+    sys.exit(0)
+for a in anns:
+    msg = (a.get("message") or "").strip()
+    if not msg or msg.startswith("Process completed with exit code"):
+        continue
+    if "Node.js" in msg and "deprecated" in msg:
+        continue
+    for line in msg.split("\n"):
+        line = line.strip()
+        if line:
+            print("      " + line[:150])
+'
+    done
+    exit 0
+fi
 
 runs_json="$(fetch "$API/runs?per_page=60&branch=main&event=push")"
 

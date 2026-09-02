@@ -845,6 +845,28 @@ the distinction is in the table rather than in somebody's head.
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-09-02 (`ci-status.sh --why <run>`, so the next red needs no archaeology)
+
+Three of the four `interactive shell` failures re-read this morning were other defects, and two of
+them had never been recorded anywhere. Finding that took an afternoon of hand-reading annotations,
+four API calls per run, and knowing that annotations are readable without a token at all.
+
+`tools/ci-status.sh --why 515` is those calls:
+
+    run 515  92cf6ca fs: RFC 0066 -- one commit for many blocks
+      job interactive shell
+          token 3, phase 3 (retire is above 2), 0 sleepers still queued, 0 overflowed
+          ring-3 (thread 15) asleep, 4757 laps, last saw token 1 at phase 2, ...
+
+The report already explained the *newest* red, which was enough while a red was read the day it
+happened and is not enough afterwards. This takes any run number from the last sixty pushes, prints
+every failing job, and prints what each one's gates actually said — so "which defect was that?" stops
+being a research task. Run 489 shows both of its failing jobs, and a green run prints its header and
+nothing else.
+
+The runner's own noise is filtered: the `Process completed with exit code` line every non-zero exit
+produces, and the Node.js deprecation warning, neither of which says anything a job name does not.
+
 ### 2026-09-02 (a story about eight CPUs, written and then refuted by four boots)
 
 Twelve more boots at `QEMU_SMP=8`, hunting the tag refusal filed earlier. It did not appear. What did
