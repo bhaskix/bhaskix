@@ -844,6 +844,33 @@ the distinction is in the table rather than in somebody's head.
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-09-02 (today's work, on the SR550 rather than only in QEMU)
+
+Everything since the console tear was closed had been proven in QEMU alone, so it was booted on the
+hardware: `bhaskix.iso` served over HTTP, mounted through the Lenovo RemoteMap Redfish endpoint, and
+read back over serial-over-LAN. **58,328 bytes of boot report, and no `FAILED` line anywhere in it.**
+
+The three lines that matter for today:
+
+    kaslr           applied and confirmed (kaslr=show prints the slide)
+    memory hygiene  a page written full of 0xa5 and freed comes back zeroed to its next owner
+    console fatal   false (set means put_run stopped holding the lock across a run)
+
+The last is the one worth having. The console tear was closed by making the kernel leave its fatal
+path after a report the machine survives, and until now that had been measured only on an emulator.
+On sixteen real cores, with real timing, the console is off its fatal path when the boot report runs.
+The two gates above it are the ones rewritten hours earlier to tell an absence from an accusation,
+and both take their positive arm on hardware as they do in QEMU.
+
+Ten skips, all expected and all documented: this machine has no virtio NIC and no disk the driver
+will take, so the network and filesystem gates take their skip arms. **RFC 0065 and RFC 0066 are
+therefore still QEMU-only** — the indirect block and the bulk write cannot be exercised where there
+is no writable disk, and saying so is better than letting "it booted on hardware" cover them.
+
+The machine was found **powered off**, which is worth recording: the caution about interrupting a
+live cluster node did not apply this time, and the check that established it cost one Redfish GET.
+It was returned to `Off` with the image unmounted and the one-time boot override self-cleared.
+
 ### 2026-09-02 (what the kernel answered, beside what the probe stored)
 
 Named twice as "the next instrument" and now built. The kernel records the last sixteen foreign
