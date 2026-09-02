@@ -565,6 +565,24 @@ run-uefi: $(ISO)
 
 # Everything CI runs. Ordered cheapest-first so a trivial mistake fails in
 # seconds rather than after a QEMU boot.
+# **Serial, and it must stay serial until the image stops being shared.**
+#
+# `make -j4 test` looks obviously right -- the lanes were given per-lane ports on
+# 2026-08-31 precisely so they could run together -- and it fails in 140 seconds
+# with `the machine did not finish booting within 120s (gave up after 0.255s)`,
+# which is not a timeout but a boot from an image being rewritten underneath it.
+# The log shows `xorriso` running while another lane boots.
+#
+# The ports were necessary and are not sufficient. `test-placements` runs
+# `$(MAKE) iso` **four times**, once per placement pair, rebuilding
+# `build/bhaskix.iso` in place and booting from it; `test-busybox` does the same
+# with a different command line and puts the image back afterwards. Under `-j`
+# those rebuilds race every other lane's boot.
+#
+# Making this parallel means giving those targets an image path of their own,
+# not adding `-j`. Measured 2026-09-02: serial is about 590 s here, so the prize
+# is real -- but a suite that fails for a reason that has nothing to do with the
+# code is worse than a slow one.
 test: fmt clippy test-host gates test-boot test-boot-uefi test-boot-iommu test-boot-iommu-off \
       test-boot-qemu64 test-boot-uefi-qemu64 test-boot-native test-boot-native-full \
       test-placements test-shell \

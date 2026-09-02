@@ -845,6 +845,30 @@ the distinction is in the table rather than in somebody's head.
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-09-02 (why the suite is serial, and it is not an oversight)
+
+Finding that `make test` runs its lanes serially made the obvious next question worth asking: it took
+**590 seconds** here, the lanes were given per-lane ports on 2026-08-31 precisely so they could run
+together, so why not `-j`?
+
+`make -j4 test` fails in 140 seconds with `the machine did not finish booting within 120s (gave up
+after 0.255s)` — which is not a timeout at all but a boot from an image being rewritten underneath
+it. The log shows `xorriso` running while another lane boots.
+
+**The ports were necessary and are not sufficient.** `test-placements` runs `$(MAKE) iso` **four
+times**, once per placement pair, rebuilding `build/bhaskix.iso` in place and booting from it;
+`test-busybox` does the same with a different command line and restores the image afterwards. Under
+`-j` those rebuilds race every other lane's boot — the same shape as the contaminated experiment an
+hour earlier, where two `make` invocations clobbered the ISO and produced a failure that looked like
+contention.
+
+So parallelising means giving those targets an image path of their own, not adding a flag. That is
+written into the `Makefile` beside the `test` target, where somebody reaching for `-j` will read it,
+rather than only here.
+
+Measured rather than assumed, and the failure was diagnosed from the log rather than from the
+plausible story — which after four corrections in two days is the point.
+
 ### 2026-09-02 (the "fires under load" lead, tested and withdrawn)
 
 The cookie flake's lead — it fails in `make test` and not alone, so contention — was tested rather
