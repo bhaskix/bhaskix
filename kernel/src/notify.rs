@@ -627,7 +627,7 @@ pub fn wait(id: NotificationId) -> Result<u64, NotifyError> {
         // sleeps for ever holding the event it was woken for. That is the
         // failure the IPC rendezvous had, in a place with an atomic instead of
         // a mailbox.
-        if let Some(outcome) = crate::sched::block_unless(|| {
+        if let Some(outcome) = crate::sched::block_unless(me, || {
             let word = slot.pending.swap(0, Ordering::AcqRel);
             if word != 0 {
                 Some(Ok(word))
@@ -698,7 +698,7 @@ pub fn wait_once(id: NotificationId) -> Result<u64, NotifyError> {
     // Look and mark together -- the rule, once more, and for the same reason:
     // the look takes the bits, so a thread preempted between taking them and
     // clearing its own blocked mark has nothing left to wake it.
-    if let Some(word) = crate::sched::block_unless(|| {
+    if let Some(word) = crate::sched::block_unless(me, || {
         let word = slot.pending.swap(0, Ordering::AcqRel);
         (word != 0).then_some(word)
     }) {

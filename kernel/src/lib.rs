@@ -13972,7 +13972,15 @@ fn disk_journal_self_test(hhdm: u64) -> bool {
         println!("\x1b[91m    disk journal   FAILED to create a domain to write from\x1b[0m");
         return false;
     };
-    let Ok(object) = shared::create(owner, bhaskix_mm::FRAME_SIZE) else {
+    // **Eight pages, of which one is used today** -- RFC 0067 step 2. The write
+    // path hands over one 4 KiB block per round trip to `bin/blkd`, and that
+    // round trip is what the boot report prices at 3.4-8.3 ms a block. The
+    // service can carry 64 sectors since step 1; what stops a caller asking for
+    // them is that its own object is a single frame. Growing it changes nothing
+    // by itself -- `DiskStore` still writes `frames[0]` and still asks for
+    // eight sectors -- which is the point: a size change and a behaviour change
+    // in one commit cannot be bisected apart.
+    let Ok(object) = shared::create(owner, RUN_PAGES * bhaskix_mm::FRAME_SIZE) else {
         println!("\x1b[91m    disk journal   FAILED to create a memory object\x1b[0m");
         domain::destroy(owner);
         return false;
@@ -14002,6 +14010,7 @@ fn disk_journal_self_test(hhdm: u64) -> bool {
 
     DISK_HHDM.store(hhdm, Ordering::Release);
     DISK_FRAME.store(frames[0], Ordering::Release);
+    DISK_OBJECT.store(object.as_u64(), Ordering::Release);
     DISK_JOURNAL.store(u64::MAX, Ordering::Release);
 
     let options = sched::SpawnOptions::new().in_domain(owner.as_u32());
@@ -14609,6 +14618,16 @@ static FS_TMP: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::ne
 static DISK_HHDM: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// The frame behind the memory that thread shares with the block service.
 static DISK_FRAME: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// The object those frames belong to, so a caller wanting more than the first
+/// can ask for them -- RFC 0067 step 2.
+static DISK_OBJECT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// How many pages the disk writer's shared object holds.
+///
+/// Eight, which is 32 KiB -- the payload `bhaskix_abi::block_ring::SECTORS`
+/// allows in one request since RFC 0067 step 1.
+const RUN_PAGES: u64 = 8;
 
 extern "C" fn block_asks(endpoint: u64) -> ! {
     use core::sync::atomic::Ordering;
@@ -19601,6 +19620,33 @@ fn user_shell(handoff: &Handoff) -> Result<(), &'static str> {
         // `put_run` stopped holding the console across a run and went to one
         // lock per byte, which is what tore the hosted line for weeks. It is
         // false here on a healthy boot, and a gate reads this line.
+        // **The mismark counter, read at the end rather than only at the ring.**
+        //
+        // It was printed in exactly one place: the wait-queue self-test, which
+        // runs early. A refusal in any later phase -- every service wait, every
+        // hosted `futex`, the whole rest of the boot -- incremented a number
+        // nobody printed again. Arming the guard on 2026-09-03 demonstrated
+        // that directly: mis-addressed marks broke the `linux clone` self-test
+        // and the ring line above still read `0`, because the refusals all
+        // happened after it.
+        //
+        // Silent on a healthy boot; loud once, at the end, when it is not.
+        // **The share is read before the total, and that order is load-bearing.**
+        //
+        // `block_unless` increments the total and then the share, so a reader
+        // taking the total first can see a share larger than it -- which the
+        // armed boot of 2026-09-03 printed: `49433477 ... (49433487 in
+        // block_unless)`. Both are monotonic, so sampling the share first
+        // makes the pair describable: the total read afterwards is at least
+        // the share read before it.
+        let mismarked_unless = sched::mismarked_unless();
+        let mismarked_total = sched::mismarked_blocks();
+        if mismarked_total > 0 {
+            println!(
+                "\x1b[91m    block mismark  {mismarked_total} block(s) refused for a caller that \
+                 was not the thread being marked ({mismarked_unless} in block_unless)\x1b[0m"
+            );
+        }
         println!(
             "    console fatal   {} (set means put_run stopped holding the lock across a run)",
             crate::console::is_fatal()
@@ -24418,12 +24464,15 @@ fn wait_queue_self_test(hhdm_base: u64) -> bool {
     // did **not** happen, which is what narrows the next search. A number
     // nobody reads costs a line; a number that cannot be distinguished from a
     // missing line costs an investigation.
+    // Share first, then total -- see the `block mismark` line's note.
+    let mismarked_unless = sched::mismarked_unless();
     let mismarked = sched::mismarked_blocks();
     if mismarked > 0 {
         println!(
             "\x1b[91m    wait queues    {mismarked} blocks were refused because the caller was not \
-             the thread about to be marked: a migration inside `mark_blocked` would have put an \
-             uninvolved thread to sleep with nothing to wake it\x1b[0m"
+             the thread about to be marked ({mismarked_unless} in block_unless): a migration \
+             inside the marking sequence would have put an uninvolved thread to sleep with \
+             nothing to wake it\x1b[0m"
         );
     } else {
         println!(
@@ -24547,8 +24596,9 @@ fn wait_queue_self_test(hhdm_base: u64) -> bool {
         // wakeup below as the reading.
         println!(
             "                   {} block(s) refused for a caller that was not the thread being \
-             marked",
-            sched::mismarked_blocks()
+             marked, {} of them in block_unless",
+            sched::mismarked_blocks(),
+            sched::mismarked_unless()
         );
         // **The number that separates the two readings left, and it was
         // computed here already without ever being printed.**
@@ -24585,6 +24635,23 @@ fn wait_queue_self_test(hhdm_base: u64) -> bool {
         //
         // `token` and `phase` are printed because a station legitimately
         // asleep on its turn looks identical to a stuck one without them.
+        // **Sampled before the states they are compared against, not after.**
+        //
+        // The branch a specimen belongs to is decided by pairing each
+        // station's state with the queue depth: `asleep` with an entry still
+        // queued is an ordering failure, `asleep` with none is a lost wakeup.
+        // These four reads used to happen *after* the per-station loop below,
+        // so the pair being reasoned about came from two different moments.
+        //
+        // Nothing is known to have been misclassified by it -- a wedged ring
+        // is static, which is why it survived twelve specimens -- but the
+        // discriminator for an open defect should not rest on that being true.
+        // Captured here, printed below, one moment for the whole report.
+        let token = TOKEN.load(Ordering::Acquire);
+        let phase = PHASE.load(Ordering::Acquire);
+        let waiting = RING.waiting();
+        let overflowed = RING.overflowed();
+
         for (id, name) in NAMES.iter().enumerate() {
             // **`is_blocked` alone mislabels a station that retired.** It
             // answers `Some(false)` for every state that is not `Blocked` --
@@ -24631,12 +24698,8 @@ fn wait_queue_self_test(hhdm_base: u64) -> bool {
             );
         }
         println!(
-            "\x1b[91m                   token {}, phase {} (retire is above {PHASE_WAIT}), \
-             {} sleepers still queued, {} overflowed\x1b[0m",
-            TOKEN.load(Ordering::Acquire),
-            PHASE.load(Ordering::Acquire),
-            RING.waiting(),
-            RING.overflowed()
+            "\x1b[91m                   token {token}, phase {phase} (retire is above \
+             {PHASE_WAIT}), {waiting} sleepers still queued, {overflowed} overflowed\x1b[0m"
         );
         ok = false;
     }

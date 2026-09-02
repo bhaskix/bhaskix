@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | 📋 **Specified 2026-09-02, not implemented.** The measurements and the three parts are established; the work is not started |
+| **Status** | 🔨 **Steps 1 and 2 landed 2026-09-02, inert and verified. Step 3 attempted and reverted the same day: a run of blocks needs one buffer the *device* sees as contiguous, which this RFC did not account for.** See "What step 3 found" |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | block (`bin/blkd`, `bhaskix_abi::block_ring`) / kernel |
 | **Milestone** | Phase 2 — Linux personality (L1) |
@@ -116,3 +116,32 @@ than a longer transfer, which is a larger question than this.
 1. The ring grows; nothing else changes and every gate stays green.
 2. The caller's object grows and `DiskStore` addresses it per frame.
 3. The format loop asks for a run, and the boot report says what it cost.
+
+
+---
+
+## What step 3 found (2026-09-02)
+
+Steps 1 and 2 landed and are inert by design: the ring carries 64 sectors, the caller's object holds
+eight pages, and nothing asks for more than eight sectors yet. Both were verified by a boot that
+behaves exactly as before.
+
+**Step 3 was written, failed, bisected, and reverted.** The format loop copied eight blocks into the
+object's eight frames and issued one `block::WRITE` for 64 sectors. The boot then failed at
+`disk journal FAILED at stage 3` — the image on the disk would not mount.
+
+The bisect is the useful part: **with the run forced to one block the new code path works**, so the
+copy, the IPC shape and the reply check are all right, and it is the multi-block case alone that
+fails. That leaves the payload.
+
+**What this RFC did not account for.** `bin/blkd` describes the payload to the device as *one*
+virtio descriptor, `queue.describe(1, device_address(ring::DATA), (count * 512) as u32, ..)`. One
+descriptor is one contiguous buffer as the device sees it. At eight sectors that is a single page and
+contiguity is free; at sixty-four it spans eight pages of a shared object whose frames need not be
+adjacent, and the device address is whatever the window gives. Making the transfer longer therefore
+needs either a descriptor **chain** — one entry per page, which virtio supports and this ring is
+already shaped for — or a payload area that is physically contiguous by construction.
+
+That is a real piece of work rather than a constant, and it is what the plan below now says. The
+measurement that motivated the RFC is unchanged: the format is the larger half of the disk's boot
+cost, at 3.4–8.3 ms a block, and 128 blocks of it.

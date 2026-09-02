@@ -3614,7 +3614,7 @@ pub fn current_thread_id() -> Option<u32> {
 /// It runs with this CPU's runqueue lock held. Reading atomics is what it is
 /// for. Taking another lock inside it either inverts an order or, for a second
 /// runqueue lock, closes a cycle against a lock of its own rank.
-pub fn block_unless<T>(ready: impl FnOnce() -> Option<T>) -> Option<T> {
+pub fn block_unless<T>(me: u32, ready: impl FnOnce() -> Option<T>) -> Option<T> {
     let cpu = percpu::cpu_id() as usize;
     if cpu >= MAX_CPUS {
         return ready();
@@ -3623,10 +3623,38 @@ pub fn block_unless<T>(ready: impl FnOnce() -> Option<T>) -> Option<T> {
     let taken = ready();
     if taken.is_none() {
         let current = queue.current;
-        if let Some(thread) = queue.threads[current].as_mut()
-            && !thread.dying
-        {
-            thread.state = State::Blocked;
+        if let Some(thread) = queue.threads[current].as_mut() {
+            // **The same check [`mark_blocked`] was given, for the same
+            // reason, in the second place that writes this state.**
+            //
+            // `mark_blocked` learned in 2026-08-31 that reading
+            // `percpu::cpu_id()`, taking that queue's lock and marking
+            // whatever is `current` are three separate instants, and that a
+            // caller migrated in between marks **an uninvolved thread on the
+            // old CPU** -- one that never enqueued, and so one that is
+            // `Blocked` with no queue entry and nothing that will ever wake
+            // it. That guard was added there and not here, and the comment
+            // beside it asserted `Blocked` "comes only from here", which was
+            // never true: this function and the IPC delivery path in
+            // [`Queue::deliver`] both write it too.
+            //
+            // So the counter built to catch the mechanism was watching one of
+            // three doors. Specimen twelve (2026-09-03) is the terminal state
+            // with `0 blocks refused` -- consistent with the mechanism firing
+            // here, where nothing was counting.
+            //
+            // Refusing is self-correcting, as it is there: [`wait`] loops and
+            // re-evaluates, and [`wait_once`] takes the same path a spurious
+            // return already takes. A missed sleep is a spin; a mis-marked
+            // sleep is a lost thread.
+            if thread.id != me {
+                MISMARKED_BLOCKS.fetch_add(1, Ordering::Relaxed);
+                MISMARKED_UNLESS.fetch_add(1, Ordering::Relaxed);
+                return taken;
+            }
+            if !thread.dying {
+                thread.state = State::Blocked;
+            }
         }
     }
     taken
@@ -3682,6 +3710,18 @@ pub fn mark_blocked(id: u32) {
     // One of those "always" claims had to be false, and this is a way for the
     // first one to be.
     //
+    // **CORRECTION, 2026-09-03: "`Blocked` comes only from here" was wrong
+    // when it was written.** Three production paths write `State::Blocked` --
+    // this one, [`block_unless`], and the IPC delivery path in
+    // [`Queue::deliver`], whose own comment records being "the third place
+    // that decides to block" and being missed when the other two learned the
+    // dying-thread rule. The same enumeration was got wrong again here: the
+    // guard below went on one door of three, so the counter that was supposed
+    // to catch this mechanism could not see it fire in the other two.
+    // `block_unless` now carries the identical check. `deliver` does not need
+    // it: it marks `target`, a thread it was handed, not whatever is running
+    // on a CPU it read earlier.
+    //
     // Refusing is safe and self-correcting rather than merely cautious: the
     // caller's entry is already queued, so `block_self` finds it not blocked
     // and returns, `wait_until` loops, removes its own entry and re-evaluates.
@@ -3703,11 +3743,25 @@ pub fn mark_blocked(id: u32) {
 /// rare enough that a boot which never sees it must still say so.
 static MISMARKED_BLOCKS: AtomicU64 = AtomicU64::new(0);
 
+/// The share of [`mismarked_blocks`] that [`block_unless`] refused.
+///
+/// Kept apart from the total because the two doors fail for the same reason
+/// but on different paths, and a specimen that names which one is a specimen
+/// that can be chased. The total is what the boot report has always printed,
+/// so it keeps counting both.
+static MISMARKED_UNLESS: AtomicU64 = AtomicU64::new(0);
+
 /// How many times a block was refused because the caller was not the thread
 /// about to be marked.
 #[must_use]
 pub fn mismarked_blocks() -> u64 {
     MISMARKED_BLOCKS.load(Ordering::Relaxed)
+}
+
+/// How many of [`mismarked_blocks`] were refused by [`block_unless`].
+#[must_use]
+pub fn mismarked_unless() -> u64 {
+    MISMARKED_UNLESS.load(Ordering::Relaxed)
 }
 
 /// Undoes a [`mark_blocked`] that turned out not to be needed.
