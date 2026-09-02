@@ -3152,6 +3152,25 @@ else
     status=1
 fi
 
+# **No syscall may answer what its own contract forbids.**
+#
+# `mmap` answers a mapping or a negative errno; `bind` answers zero or one. Two
+# open defects are values of exactly that kind -- `mmap 0x1` on CI run 489, and
+# the socket reclaim's `bind 1` -- and both were noticed downstream by gates
+# reading a probe's report much later, which is why each cost days of asking
+# whether the kernel returned it or the probe stored it. The kernel checks at
+# the moment the value is produced now, and this makes it a failure rather than
+# a line somebody has to notice.
+if grep -qF "syscall returns no call answered what its contract forbids" "$LOG"; then
+    pass "no syscall answered what its own contract forbids"
+elif grep -qF "syscall returns FAILED" "$LOG"; then
+    fail "a syscall answered what it cannot: $(grep -aoE 'syscall returns FAILED.*' "$LOG" | head -1)"
+    status=1
+else
+    fail "the boot did not say whether any syscall answered what it cannot"
+    status=1
+fi
+
 # **The console must not still be on its fatal path when the boot report runs.**
 # This is the assertion the tear below went six investigations without. Once
 # `enter_fatal` is set, `console::put_run` returns early into `write_fatal`,

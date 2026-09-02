@@ -19537,6 +19537,19 @@ fn user_shell(handoff: &Handoff) -> Result<(), &'static str> {
                     "UNTESTABLE (the record overflowed, so its silence proves nothing)",
             }
         );
+        // **A syscall answering what its own contract forbids** — the invariant
+        // behind two open defects, asked where the value is produced rather than by
+        // a gate reading a probe's report much later. Zero on a healthy boot, and a
+        // non-zero value names the first offender.
+        let (impossible, first) = crate::syscall::impossible_returns();
+        if impossible == 0 {
+            println!("    syscall returns no call answered what its contract forbids");
+        } else if let Some((number, value)) = first {
+            println!(
+                "\x1b[91m    syscall returns FAILED: {impossible} impossible answer(s); the first was \
+             syscall {number} answering {value:#x}, which it cannot\x1b[0m"
+            );
+        }
         // **The one assertion this defect needed and never had.** Set means
         // `put_run` stopped holding the console across a run and went to one
         // lock per byte, which is what tore the hosted line for weeks. It is

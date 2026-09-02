@@ -2092,6 +2092,60 @@ fn note_return(number: u64, value: u64) {
     RETURN_VALUE[at].store(value, Ordering::Relaxed);
     // The number last, so a reader that sees a number sees the value with it.
     RETURN_NR[at].store(number as u32, Ordering::Release);
+    check_impossible(number, value);
+}
+
+/// Counts returns a syscall's own contract says it cannot make.
+///
+/// **Two open defects are values of exactly this kind, and both were noticed
+/// downstream by gates that could not say where they came from.** `mmap`
+/// answered `1` on CI run 489 — it answers a mapping or a negative errno, and
+/// one is neither — and the socket reclaim's taker has reported `bind 1`, where
+/// `bind` answers 0 or a negative errno. Each was found by a gate reading a
+/// probe's report much later, and each cost days of asking whether the kernel
+/// returned it or the probe stored it.
+///
+/// This asks at the moment the value is produced. Narrow on purpose: only calls
+/// whose contract forbids a *small positive* answer, only the two shapes that
+/// have actually been seen, and no opinion about anything else. A counter and
+/// the first offender, not a panic — a machine that answers one wrong syscall
+/// should say so and keep going, because the interesting boot is the one that
+/// gets far enough to be looked at.
+pub static IMPOSSIBLE_RETURNS: AtomicU64 = AtomicU64::new(0);
+static FIRST_IMPOSSIBLE: AtomicU64 = AtomicU64::new(u64::MAX);
+
+fn check_impossible(number: u64, value: u64) {
+    // Below this a value is not a plausible address and not a negative errno
+    // read as unsigned; `mmap`'s floor is far above it and an errno is far
+    // below zero. Sixteen is arbitrary and generous: the point is to catch 1,
+    // not to police the boundary.
+    const SMALL: u64 = 16;
+    let forbidden = match number {
+        // `mmap`, `brk`, `mremap`: an address, or a negative errno.
+        9 | 12 | 25 => value != 0 && value < SMALL,
+        // `bind`, `listen`, `connect`, `close`: zero, or a negative errno.
+        49 | 50 | 42 | 3 => value != 0 && value < SMALL,
+        _ => false,
+    };
+    if forbidden {
+        IMPOSSIBLE_RETURNS.fetch_add(1, Ordering::Relaxed);
+        let _ = FIRST_IMPOSSIBLE.compare_exchange(
+            u64::MAX,
+            (number << 32) | (value & 0xffff_ffff),
+            Ordering::AcqRel,
+            Ordering::Relaxed,
+        );
+    }
+}
+
+/// How many impossible returns, and the first `(number, value)` if any.
+#[must_use]
+pub fn impossible_returns() -> (u64, Option<(u64, u64)>) {
+    let first = FIRST_IMPOSSIBLE.load(Ordering::Acquire);
+    (
+        IMPOSSIBLE_RETURNS.load(Ordering::Relaxed),
+        (first != u64::MAX).then_some((first >> 32, first & 0xffff_ffff)),
+    )
 }
 
 /// The recorded returns, oldest first, as `(number, value)`.

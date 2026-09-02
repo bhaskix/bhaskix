@@ -845,6 +845,30 @@ the distinction is in the table rather than in somebody's head.
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-09-02 (an invariant asked where the value is produced)
+
+Two open defects are values a syscall cannot answer: `mmap 0x1` on CI run 489 — it answers a mapping
+or a negative errno, and one is neither — and the socket reclaim's `bind 1`, where `bind` answers
+zero or a negative errno. Both were noticed **downstream**, by gates reading a probe's report long
+afterwards, which is why each cost days of asking whether the kernel returned the value or the probe
+stored it.
+
+The kernel checks at the moment the value reaches `rax` now. Narrow on purpose: only calls whose
+contract forbids a small positive answer, only the shapes actually seen, and no opinion about
+anything else. A counter and the first offender rather than a panic — a machine that answers one
+syscall wrongly should say so and keep going, because the interesting boot is the one that gets far
+enough to be looked at.
+
+    syscall returns no call answered what its contract forbids
+
+on every boot, and a gate requires it. Armed by making `write` flag a legitimate answer: the report
+became `syscall returns FAILED: 2 impossible answer(s); the first was syscall 1 answering 0x4, which
+it cannot`, and the gate failed.
+
+This does not fix either defect. What it changes is where they would be caught: at the call, with the
+number and the value, instead of three layers away in a gate that could only say the probe's report
+looked wrong.
+
 ### 2026-09-02 (four lanes stop rewriting the shared image; the suite is still serial)
 
 Having diagnosed why `-j` fails, the four targets that rebuilt `build/bhaskix.iso` in place now build
