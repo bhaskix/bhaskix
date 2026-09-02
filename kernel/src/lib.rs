@@ -9431,6 +9431,16 @@ fn killed_domain_gives_its_socket_back(hhdm_base: u64, cpus: u32) -> bool {
         // `answer_bind` cannot return, so the question is whether the taker's
         // bind reached that function at all. A domain here that is not the
         // taker's says it did not.
+        // **What the kernel answered this probe**, which is the other half of
+        // the same question the `linux memory` gate asks. The taker's `socket`
+        // is number 41 and its `bind` is 49, so a ring showing `[41]=0x3` and
+        // `[49]=0x0` says the kernel answered correctly and the probe stored
+        // something else — and one showing `[41]=0x1` says it did not.
+        print!("\x1b[91m                   the kernel answered:");
+        crate::syscall::foreign_returns(|number, value| {
+            print!(" [{number}]={value:#x}");
+        });
+        println!("\x1b[0m");
         let (bind_domain, outcome) = adapter_bind_record();
         println!(
             "\x1b[91m                   last bind: domain {} incarnation {}, errno {}, port {}, \

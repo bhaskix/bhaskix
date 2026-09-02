@@ -475,6 +475,22 @@ One reading **incarnation 6 with 4 served** says the taker's bind did arrive and
 `fd 1, bind 1` the gate reports came from somewhere that is not this adapter at all. There is no
 third answer, which is the first time this investigation has had a question shaped like that.
 
+**The question is now decidable, and the baseline is taken (2026-09-02).** The kernel records the
+last sixteen foreign syscall returns — the number and the value that reached `rax` — and this gate
+prints them on failure. On a healthy boot, forced through the failure branch:
+
+    socket reclaim FAILED: ... bound again true (fd 3, bind 0), forgets 2
+    the kernel answered: [41]=0x3 [49]=0x0 [7]=0x0 [44]=0x4 [7]=0x1 [45]=0x4 ...
+
+`socket` is 41 and `bind` is 49, so the kernel answered **3** and **0** — exactly what the gate
+reports. A failing boot showing the same pair while the gate says `fd 1, bind 1` puts the corruption
+between the kernel's answer and the probe's stored word, and one showing `[41]=0x1` puts it in or
+before the kernel's answer. There is no third reading.
+
+Worth noting from the baseline itself: `[7]=0x1` is `poll` answering one ready descriptor, correctly,
+a few calls away from the two under suspicion. Calls that legitimately answer `1` are common here,
+which is what makes a misdelivered reply plausible rather than exotic.
+
 **What is actually known**, and this part survives:
 
 - The gate reads `fd 1, bind 1` from the taker on a failing boot.
