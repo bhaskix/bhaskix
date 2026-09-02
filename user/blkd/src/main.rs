@@ -81,33 +81,14 @@ const CONFIG_AT: u64 = 0x2003_0000;
 
 /// Where each structure sits inside the four pages of rings.
 ///
-/// Laid out by hand because the device reads it: the descriptor table must be
-/// sixteen-byte aligned, the used ring four-byte aligned, and the whole lot
-/// has to be at offsets this program can turn into device addresses by adding
-/// them to one base. A page each keeps every alignment true by construction.
-mod ring {
-    /// Descriptor table: sixteen bytes per entry.
-    pub const DESCRIPTORS: u64 = 0x0000;
-    /// Available ring, where the driver publishes what it wants done.
-    pub const AVAILABLE: u64 = 0x0800;
-    /// Used ring, where the device publishes what it has done.
-    pub const USED: u64 = 0x1000;
-    /// The sixteen-byte request header the device reads.
-    pub const HEADER: u64 = 0x2000;
-    /// One byte, which the device writes when it is finished.
-    pub const STATUS: u64 = 0x2010;
-    /// Where the sectors land. Four kilobytes: eight of them at once.
-    ///
-    /// It held one sector until RFC 0016 step 3, which made every filesystem
-    /// block eight round trips to another domain and eight requests to a
-    /// device. `args[1]` had always said how many sectors were wanted and had
-    /// always been ignored.
-    pub const DATA: u64 = 0x2800;
-    /// The most sectors one request may carry.
-    pub const SECTORS: u64 = 8;
-    /// Where this program leaves its findings for the kernel.
-    pub const REPORT: u64 = 0x3800;
-}
+/// **The definition moved to `bhaskix_abi::block_ring` on 2026-09-02**, because
+/// the kernel expressed the same layout separately -- it read the report as
+/// `frames[3] + 0x800`, which is this module's `REPORT` written a second time.
+/// Two derivations of one layout in two rings is the shape
+/// `bhaskix_personality::report` exists to end, and its comment records the
+/// latent corruption that cost there. Re-exported rather than deleted so every
+/// use site here reads the same.
+use bhaskix_abi::block_ring as ring;
 
 /// Offsets into the common configuration structure, from the specification.
 mod common {

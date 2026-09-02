@@ -14812,8 +14812,12 @@ fn block_domain_reported(hhdm: u64) -> bool {
     if count < 4 {
         return true;
     }
+    // The report's own page, named by the shared layout rather than counted
+    // here -- see `bhaskix_abi::block_ring`. Indexed outside the block, because
+    // the budget counts every line inside one.
+    let report_page = frames[(bhaskix_abi::block_ring::REPORT / 4096) as usize];
     // SAFETY: a frame this object owns, through the direct map.
-    let marker = unsafe { core::ptr::read_volatile((hhdm + frames[3]) as *const u64) };
+    let marker = unsafe { core::ptr::read_volatile((hhdm + report_page) as *const u64) };
     marker == 0x424c_4b44_5250_5431
 }
 
@@ -17166,7 +17170,14 @@ fn report_block_domain(hhdm: u64) -> bool {
     // Half a page in, since the data area grew to four kilobytes: the report
     // moved out of its way rather than the transfer being kept small enough to
     // leave it where it was.
-    let raw = unsafe { core::slice::from_raw_parts((hhdm + frames[3] + 0x800) as *const u8, 104) };
+    // Addressed outside the block: the budget counts every line inside one, and
+    // an offset computed there costs the same as an unsafe operation.
+    let report_at = hhdm
+        + frames[(bhaskix_abi::block_ring::REPORT / 4096) as usize]
+        + bhaskix_abi::block_ring::REPORT % 4096;
+    // SAFETY: a frame this object owns, through the direct map, read as the
+    // thirteen little-endian words the service wrote at its report offset.
+    let raw = unsafe { core::slice::from_raw_parts(report_at as *const u8, 104) };
     for (index, word) in words.iter_mut().enumerate() {
         let mut buffer = [0u8; 8];
         buffer.copy_from_slice(&raw[index * 8..index * 8 + 8]);

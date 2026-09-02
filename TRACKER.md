@@ -869,6 +869,34 @@ This does not fix either defect. What it changes is where they would be caught: 
 number and the value, instead of three layers away in a gate that could only say the probe's report
 looked wrong.
 
+### 2026-09-02 (the block ring layout was derived twice, and nothing checked)
+
+Looking at what growing the block service's payload area would take found something latent first:
+**the ring layout has two owners.** `bin/blkd` had it as a private module — `REPORT = 0x3800` — and
+the kernel expressed the same offset as `frames[3] + 0x800`. Two independent statements of one
+layout, in two rings, with nothing checking that they agreed.
+
+That is exactly the shape `bhaskix_personality::report` was created to end, and that module's comment
+records what it cost there: `FAULT_LOG_OFFSET` stopped being true when the scratch grew, and the
+result was a latent corruption held off only by an invariant nobody had written down for the purpose.
+Here it has not bitten because nobody has moved the layout — and moving it is precisely the next
+change anyone would make.
+
+`bhaskix_abi::block_ring` owns it now, with two compile-time assertions that the payload ends before
+the report and the report is inside the object's pages. `bin/blkd` re-exports it as `ring` so its use
+sites are unchanged; both kernel readers name `block_ring::REPORT` rather than counting pages.
+Nothing moved: this is the same layout with one owner, verified by a boot.
+
+**Why it matters now.** The next change to the block path is to grow `DATA` so a request can carry
+more than one block — the disk format and the staging write are each one block per device round trip,
+and that round trip is what dominates both. That change moves `REPORT`. With two derivations it would
+have moved in one ring and not the other, and the failure would have been a service writing its
+findings where the kernel does not look.
+
+One process note, from walking into a trap this project already records: `cargo build` in a user
+crate's directory makes `make` skip its own recipe and ship a binary linked without its script. The
+boot said `bin/blkd is not an ELF`. `rm -rf user/blkd/target` and a build through `make` fixed it.
+
 ### 2026-09-02 (the 0.25 s failure was already documented, and I had guessed instead)
 
 `devices.sh` records the exact failure `make -j` produces, and it was read only after a wrong

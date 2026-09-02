@@ -1368,6 +1368,49 @@ pub mod tcp {
     }
 }
 
+/// Where each structure sits inside the block service's ring pages.
+///
+/// **In the ABI because both rings read it, and they were deriving it
+/// separately.** `bin/blkd` had these as a private module and the kernel
+/// expressed the same offset as `frames[3] + 0x800` — two independent
+/// statements of one layout, in two rings, with nothing checking that they
+/// agreed. That is exactly the shape `bhaskix_personality::report` was created
+/// to end, and its comment records what it cost there: an offset that stopped
+/// being true when the region moved, and a latent corruption held off only by
+/// an invariant nobody had written down for that purpose.
+///
+/// Nothing here has moved; this is the same layout with one owner. It matters
+/// now because the next change to the block path is to grow [`DATA`] so a
+/// request can carry more than one block — the format and the staging write are
+/// both one block per device round trip — and that change moves [`REPORT`].
+/// With two derivations it would move in one ring and not the other.
+pub mod block_ring {
+    /// Descriptor table: sixteen bytes per entry.
+    pub const DESCRIPTORS: u64 = 0x0000;
+    /// Available ring, where the driver publishes what it wants done.
+    pub const AVAILABLE: u64 = 0x0800;
+    /// Used ring, where the device publishes what it has done.
+    pub const USED: u64 = 0x1000;
+    /// The sixteen-byte request header the device reads.
+    pub const HEADER: u64 = 0x2000;
+    /// One byte, which the device writes when it is finished.
+    pub const STATUS: u64 = 0x2010;
+    /// Where a request's payload sits.
+    pub const DATA: u64 = 0x2800;
+    /// The most sectors one request may carry — what fits between [`DATA`] and
+    /// [`REPORT`], which is one 4 KiB block.
+    pub const SECTORS: u64 = 8;
+    /// Where the service leaves its findings for the kernel.
+    pub const REPORT: u64 = 0x3800;
+    /// How many pages the rings occupy.
+    pub const PAGES: u64 = 4;
+
+    /// The payload area ends where the report begins.
+    const _: () = assert!(DATA + SECTORS * 512 <= REPORT);
+    /// And the report is inside the pages the object has.
+    const _: () = assert!(REPORT < PAGES * 4096);
+}
+
 /// Methods a block service answers.
 ///
 /// Sector data never crosses in message registers. The caller names memory it
