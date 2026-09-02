@@ -2069,6 +2069,48 @@ mod linux {
     pub const ANSWERED: [u64; 0] = [];
 }
 
+/// The last sixteen foreign syscall returns: the number, and what went to `rax`.
+///
+/// **Because two specimens report a value their syscall cannot produce**, and
+/// nothing can currently say whether the kernel returned it or the probe stored
+/// it. `mmap` answered `1` on CI run 489, and the socket reclaim's taker
+/// reports `fd 1, bind 1` — while `bin/linuxd`'s own record proves it computed
+/// the right answer for that bind. One of those two statements is about a value
+/// this side of the boundary and the other is about a value the far side, and
+/// they have been read as one observation for days.
+///
+/// Two relaxed stores on the foreign path, which already costs a round trip to
+/// another domain.
+static RETURN_NR: [core::sync::atomic::AtomicU32; 16] =
+    [const { core::sync::atomic::AtomicU32::new(u32::MAX) }; 16];
+static RETURN_VALUE: [AtomicU64; 16] = [const { AtomicU64::new(0) }; 16];
+static RETURN_AT: AtomicU64 = AtomicU64::new(0);
+
+/// Remembers what a foreign call was answered.
+fn note_return(number: u64, value: u64) {
+    let at = RETURN_AT.fetch_add(1, Ordering::Relaxed) as usize % RETURN_NR.len();
+    RETURN_VALUE[at].store(value, Ordering::Relaxed);
+    // The number last, so a reader that sees a number sees the value with it.
+    RETURN_NR[at].store(number as u32, Ordering::Release);
+}
+
+/// The recorded returns, oldest first, as `(number, value)`.
+///
+/// Skips slots nothing has written, so a boot that made three foreign calls
+/// reports three rather than thirteen zeroes and three.
+pub fn foreign_returns(mut f: impl FnMut(u32, u64)) {
+    let at = RETURN_AT.load(Ordering::Acquire) as usize;
+    let len = RETURN_NR.len();
+    let seen = at.min(len);
+    for step in 0..seen {
+        let slot = (at + len - seen + step) % len;
+        let number = RETURN_NR[slot].load(Ordering::Acquire);
+        if number != u32::MAX {
+            f(number, RETURN_VALUE[slot].load(Ordering::Relaxed));
+        }
+    }
+}
+
 fn foreign_call(frame: &mut SyscallFrame) {
     // **The boundary, as a value.** RFC 0031's interface I1: the nucleus is
     // meant to carry a foreign call rather than understand it, and building
@@ -2176,6 +2218,7 @@ fn foreign_call(frame: &mut SyscallFrame) {
     // foreign system call has always been in this design.
     if let Some(value) = adapter_call(frame, &call) {
         frame.kind = value;
+        note_return(number, value);
         // **Not priced here**, and that is what keeps the comparison honest:
         // `adapter_call` prices its own round trips, and folding them into the
         // nucleus figure would average two different placements into one
@@ -2189,6 +2232,7 @@ fn foreign_call(frame: &mut SyscallFrame) {
     // `rax` alone. `arg0` (the caller's `rdx`) is left exactly as the stub
     // saved it, which is what preserves it.
     frame.kind = bhaskix_personality::call::ENOSYS.value;
+    note_return(number, bhaskix_personality::call::ENOSYS.value);
     price_foreign_call(started);
 }
 

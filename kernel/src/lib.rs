@@ -6115,6 +6115,16 @@ fn memory_self_test(hhdm_base: u64, cpus: u32) -> bool {
              {}\x1b[0m",
             answers[0], answers[1], answers[2] as i64, answers[3] as i64
         );
+        // **What the kernel actually returned, beside what the probe stored.**
+        // CI run 489 reported `mmap 0x1`, which `mmap` cannot answer — and
+        // nothing could say whether the kernel returned that or the probe
+        // recorded it. These are the values that went to `rax`, so the two
+        // stop being one observation. Indented so the annotation carries it.
+        print!("\x1b[91m                   the kernel answered:");
+        crate::syscall::foreign_returns(|number, value| {
+            print!(" [{number}]={value:#x}");
+        });
+        println!("\x1b[0m");
         false
     }
 }
