@@ -869,6 +869,33 @@ This does not fix either defect. What it changes is where they would be caught: 
 number and the value, instead of three layers away in a gate that could only say the probe's report
 looked wrong.
 
+### 2026-09-02 (two of today's signals would have been deleted with the log that held them)
+
+The soak harness keeps a boot's log when a **canary** appears — a line that says something is wrong
+on a boot that otherwise passes. Its own comment explains why: without those patterns such a run
+counts as a pass, and `keep=0` then *deletes the log that held the only specimen*.
+
+Two signals added today are exactly that shape and were not in the list:
+
+- **`console fatal   true`** — the console left `put_run` writing a byte at a time under a per-byte
+  lock, which is the tear closed this morning. The boot *gate* fails on it; the soak reads the boot
+  log and runs no gates, so a soak boot carrying it counted as a pass.
+- **a non-zero `blocks refused`** — `mark_blocked` asked to mark a thread that was not its caller.
+  Its own comment says zero is the only correct value, and it has read zero on every boot observed.
+
+Both are in the canary list now, and both were armed against synthetic lines: `console fatal   true`
+trips and `false` does not; `3 blocks refused` trips and `0 blocks refused` does not. Six soak boots
+confirm the harness still runs.
+
+**The general point is worth more than the two patterns.** A new instrument that reports through a
+line rather than a failure is invisible to every harness that greps for failure, and this project has
+two of those — the boot gates and the soak. Adding a signal means adding it to both, and nothing
+checks that anyone did.
+
+Also today: 24 soak boots at eight CPUs, no canary and no failure. At the ring station's rate of
+about one in 1,200 that is what 24 boots look like either way, and it is recorded so the number is
+not mistaken for evidence.
+
 ### 2026-09-02 (the whole suite at eight CPUs, green)
 
 `QEMU_SMP=8 make test` — every lane at double the usual concurrency — **passes**, in one clean run

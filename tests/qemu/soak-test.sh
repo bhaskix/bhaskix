@@ -162,7 +162,18 @@ done
 # patterns such a run counts as a pass, and `keep=0` then *deletes the log that
 # held the only specimen*. That is the exact failure this harness exists to
 # prevent, one level up.
-CANARIES='COUNT UNDERFLOW|COUNT MISMATCH|BLOCK HOLDING|SAVED HOLDING|SAVED COUNT|INVARIANT VIOLATED|LOCK ORDER|IT IS RUNNING IN SOMEBODY ELSE|frame check|FRAME CHANGED|kernel.s own bug'
+#
+# Two added 2026-09-02, both of which say nothing about failing and would
+# therefore have been deleted with the log that held them:
+#
+#   - `console fatal   true` -- the console left `put_run` writing a byte at a
+#     time under a per-byte lock, which is the tear closed that morning. The
+#     *gate* fails on it; this harness reads the boot log and runs no gates, so
+#     without a pattern here a soak boot carrying it counts as a pass.
+#   - a non-zero `blocks refused` -- `mark_blocked` asked to mark a thread that
+#     was not its caller. Its own comment says zero is the only correct value,
+#     and it has read zero on every boot ever observed.
+CANARIES='COUNT UNDERFLOW|COUNT MISMATCH|BLOCK HOLDING|SAVED HOLDING|SAVED COUNT|INVARIANT VIOLATED|LOCK ORDER|IT IS RUNNING IN SOMEBODY ELSE|frame check|FRAME CHANGED|kernel.s own bug|console fatal   true|[1-9][0-9]* blocks refused'
 
 failed=0
 truncated=0
