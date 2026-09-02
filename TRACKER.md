@@ -171,8 +171,19 @@ Architecture decisions. Once `Accepted`, a decision is not revisited without a s
 
 ## 3. Milestones in detail — newest first
 
-**Threads exist and the timer preempts them.** The exit criterion is not met and will not be until
-SMP lands — it requires N threads across M CPUs, and there is one CPU.
+**Threads exist and the timer preempts them.** The exit criterion is not met, and **the reason
+changed long ago without this paragraph changing with it.** It read "will not be until SMP lands — it
+requires N threads across M CPUs, and there is one CPU" until 2026-09-02, while the table immediately
+below said `M4-05 | SMP bring-up, per-CPU areas | ✅ DONE | 1, 2, 4 and 8 CPUs all come online`. A
+section heading contradicting its own table, in the file this project calls its single source of
+truth.
+
+What actually keeps the criterion open: **no lost wakeups** — the ring-station defect in §3 is
+precisely a lost wakeup and has eleven specimens — and the two `TODO` rows below, M4-06c
+(topology-aware balancing, which needs ACPI topology) and M4-07b (priority inheritance, domain-level
+fairness, EEVDF lag). Threads across CPUs is not among them: the machine runs four in QEMU by
+default, passed its whole suite at eight on 2026-09-02, and reported `cpus 16 online of 16` on the
+SR550.
 
 **Milestone exit criterion** ([docs/roadmap.md](docs/roadmap.md) M4): N threads across M CPUs,
 10⁷ ping-pong iterations, no lost wakeups, no stranded threads, lock-rank assertions clean;
@@ -868,6 +879,25 @@ it cannot`, and the gate failed.
 This does not fix either defect. What it changes is where they would be caught: at the call, with the
 number and the value, instead of three layers away in a gate that could only say the probe's report
 looked wrong.
+
+### 2026-09-02 (a section heading that contradicted its own table)
+
+§3's opening paragraph said M4's exit criterion "will not be met until SMP lands — it requires N
+threads across M CPUs, and **there is one CPU**". The table immediately below it says
+`M4-05 | SMP bring-up, per-CPU areas | ✅ DONE | 1, 2, 4 and 8 CPUs all come online`.
+
+A heading contradicting its own table, four lines apart, in the file this project calls its single
+source of truth — and it has been read past all day: every measurement in this section since the
+morning has been about running at four CPUs versus eight.
+
+Corrected to what is actually open. **No lost wakeups** is the criterion still unmet, and the
+ring-station defect is precisely a lost wakeup with eleven specimens; the two `TODO` rows are
+M4-06c (topology-aware balancing, which needs ACPI topology this machine does not read) and M4-07b
+(priority inheritance, domain-level fairness, EEVDF lag). Threads across CPUs is not among them: four
+by default in QEMU, the whole suite green at eight today, and `cpus 16 online of 16` on the SR550.
+
+Found by checking whether today's closures had left a summary stale — they had not, and this had been
+stale for far longer.
 
 ### 2026-09-02 (two of today's signals would have been deleted with the log that held them)
 
