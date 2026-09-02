@@ -2255,11 +2255,18 @@ pub static ADAPTER_REFUSAL: core::sync::atomic::AtomicU64 = core::sync::atomic::
 /// nothing at all would spin on a call that never returns.
 ///
 /// The Linux call number travels as the message's `method` and the first four
-/// arguments as its words. **Five and six do not fit**, and that is why the
-/// calls needing them — `mmap` above all — are still answered in the nucleus:
-/// moving them needs a page shared with the adapter rather than a message, and
-/// a page needs somewhere to put it *per thread*, which is RFC 0032 step 4's
-/// work rather than a thing to improvise here.
+/// arguments as its words. **Five and six do not fit**, which is why moving the
+/// calls needing them needed a page shared with the adapter rather than a
+/// message — RFC 0032 step 4's work, and it is done: `bin/linuxd` serves `mmap`
+/// and the other memory calls, and the body of this function has no `if` at all
+/// between a foreign call arriving and the adapter being asked.
+///
+/// **This paragraph said the opposite until 2026-09-02**, three RFC steps after
+/// it stopped being true — "the calls needing them, `mmap` above all, are still
+/// answered in the nucleus". A comment that outlived its code, and not
+/// harmlessly: it was read while attributing a `mmap` that answered `1`, and
+/// the conclusion drawn from it — that `mmap` and a misbehaving `bind` could
+/// not share the adapter's reply path — was published and had to be withdrawn.
 fn adapter_call(frame: &mut SyscallFrame, call: &PersonalityCall) -> Option<u64> {
     // **The loop is for one reply shape**: `BLOCK_ON_RETRY`, which parks the
     // caller and then asks the same question again. A blocking `read` needs

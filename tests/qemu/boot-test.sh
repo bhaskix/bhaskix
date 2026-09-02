@@ -2496,6 +2496,20 @@ fi
 if grep -qE "tcp client +did everything outcome 9 says" "$LOG"; then
     if grep -qE "tcpd cookies +[1-9][0-9]* connection\(s\) built from a verified SYN cookie" "$LOG"; then
         pass "every accepted connection was built from a verified SYN cookie, so no state is held for an unproven peer"
+    elif grep -qE "tcpd cookies +0 connection\(s\) built from a verified SYN cookie" "$LOG"; then
+        # **Zero is not the security failure this used to report.** The arm
+        # below says "a connection was served without a verified cookie -- the
+        # SYN path allocated state", which is a sentence about RFC 0022's
+        # property being broken. The condition it fired on was `cookies == 0`,
+        # which says the opposite: no connection reached the guest, so nothing
+        # was served at all and no state was held for anybody. Measured
+        # 2026-09-02 on two boots that then re-ran green twice.
+        #
+        # The client got as far as `outcome 9`, so this is a connection that
+        # completed for the client and left no cookie count behind -- worth a
+        # failure, and worth one that names what was seen.
+        fail "no connection was built from a verified SYN cookie, though the client says it connected: the inbound path did not reach bin/tcpd on this boot"
+        status=1
     else
         fail "a connection was served without a verified cookie -- the SYN path allocated state"
         grep -aE "tcpd" "$LOG" | sed 's/^/      /'
