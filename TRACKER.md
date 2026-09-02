@@ -869,6 +869,29 @@ This does not fix either defect. What it changes is where they would be caught: 
 number and the value, instead of three layers away in a gate that could only say the probe's report
 looked wrong.
 
+### 2026-09-02 (two sweeps for the same bug elsewhere, both clean)
+
+The nine personality sites were one shape of one bug — an answer returned and not read. Two sweeps
+asked whether it lives anywhere else, and **both came back empty**, which is worth recording so the
+ground is not covered twice.
+
+**Other `domain::with` callers: twelve candidates, none of them the bug.** Six have `.is_some()`
+*inside* the closure, on an `Option` from `cspace.get`, which is the right question asked of the right
+thing. Four are `domain::with(d, |_| ()).is_none()`, deliberately testing whether a domain still
+exists. One converts a `Result` to a `bool` inside the closure and filters on it. One flattens an
+`Option`. The `set_personality` sites were the outliers, and they are fixed.
+
+**Discarded results: 83 `let _ =` calls in the kernel, 79 of them not formatting** — too many to
+audit blind, so the audit went where this project has actually been bitten: IPC answers. All three
+`let _ = ipc::call(..)` sites are correct. Two are self-test setup whose failure would show up
+immediately in the step after; the third is documented as *"The call cannot succeed and is not meant
+to"* — a call that queues the thread as a sender and blocks, which is the state under test.
+
+A null result is a result. What it bounds is the next search: the remaining 76 discards are `pmm.free`
+on teardown paths, `irq::acknowledge`, `space.unmap` and similar, where a refusal is either
+impossible or unrecoverable — and if a fourth discarded-answer defect appears, it is unlikely to be
+among them.
+
 ### 2026-09-02 (the hypothesis I declined to write, checked — and true in nine places)
 
 The entry below stopped at what was established and named the tempting seventh speculation without
