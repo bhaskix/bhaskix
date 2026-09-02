@@ -1398,12 +1398,21 @@ pub mod block_ring {
     /// Where a request's payload sits.
     pub const DATA: u64 = 0x2800;
     /// The most sectors one request may carry — what fits between [`DATA`] and
-    /// [`REPORT`], which is one 4 KiB block.
-    pub const SECTORS: u64 = 8;
+    /// [`REPORT`].
+    ///
+    /// **Sixty-four since RFC 0067 step 1, eight before it.** Eight was one
+    /// 4 KiB block, and it was the payload area's size rather than any
+    /// statement about the protocol: `block::WRITE` has always taken a count,
+    /// the virtio descriptor has always been `count * 512`, and `DRAIN`/`FILL`
+    /// have always taken a length. Raising this alone changes nothing
+    /// observable — every caller still asks for eight — and that is deliberate:
+    /// it moves [`REPORT`], which is the part worth landing on its own while
+    /// the assertions below can check it.
+    pub const SECTORS: u64 = 64;
     /// Where the service leaves its findings for the kernel.
-    pub const REPORT: u64 = 0x3800;
+    pub const REPORT: u64 = 0xa800;
     /// How many pages the rings occupy.
-    pub const PAGES: u64 = 4;
+    pub const PAGES: u64 = 12;
 
     /// The payload area ends where the report begins.
     const _: () = assert!(DATA + SECTORS * 512 <= REPORT);

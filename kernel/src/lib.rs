@@ -9289,10 +9289,25 @@ fn killed_domain_gives_its_socket_back(hhdm_base: u64, cpus: u32) -> bool {
         println!("\x1b[91m    socket reclaim FAILED: no domain\x1b[0m");
         return false;
     };
+    // **`== Some(Ok(()))`, not `.is_some()`** -- and the difference is a program
+    // spawned into a domain that never got the tag.
+    //
+    // `domain::with` answers `Option<Result<..>>`: the outer says whether the
+    // domain was found, the inner whether `set_personality` accepted. This read
+    // the outer and discarded the inner, so a refused tag started the program
+    // anyway -- and a program in an untagged domain takes the *native* syscall
+    // path, where 41 and 49 are not `socket` and `bind` at all.
+    //
+    // That is the shape of the specimen this gate has been reporting: `fd 1,
+    // bind 1`, values neither the kernel nor the adapter produced. The boot of
+    // 2026-09-02 that failed it recorded `[41]=0x3 [49]=0x0` for every foreign
+    // call and **three** binds served where a passing boot serves four -- the
+    // taker's calls never reached the adapter, which is what an untagged domain
+    // looks like from here. Every other one of the twenty-two callers of
+    // `set_personality` in this file already reads it as `!= Some(Ok(()))`.
     let started = domain::with(leaker, |owner| {
         owner.set_personality(domain::Personality::Linux)
-    })
-    .is_some()
+    }) == Some(Ok(()))
         && sched::spawn_on_with(
             CPU,
             "leaker",
@@ -9342,10 +9357,11 @@ fn killed_domain_gives_its_socket_back(hhdm_base: u64, cpus: u32) -> bool {
         // landed elsewhere would prove nothing either way. Said out loud rather
         // than folded into the pass/fail.
         same_slot = taker.as_u32() == leaked_slot;
+        // As the leaker above: the inner `Result` decides whether this domain
+        // is a Linux one, and discarding it spawns a program that is not.
         if domain::with(taker, |owner| {
             owner.set_personality(domain::Personality::Linux)
-        })
-        .is_some()
+        }) == Some(Ok(()))
             && sched::spawn_on_with(
                 CPU,
                 "taker",
@@ -12006,8 +12022,15 @@ pub fn start_block_domain(
     // reading returned frames. `blk-keeper` runs nothing, so nothing ends it.
     let keeper = domain::create("blk-keeper", domain::ResourceEnvelope::new())
         .map_err(|_| "the block rings' owner would not be created")?;
-    let rings = shared::create(keeper, 4 * bhaskix_mm::FRAME_SIZE)
-        .map_err(|_| "the block domain's rings would not be created")?;
+    // Sized by the layout rather than by a literal, so growing the payload area
+    // moves one number -- RFC 0067 step 1. It read `4 * FRAME_SIZE` while
+    // `bin/blkd` said where the report was, which is the pair that had to agree
+    // and had nothing checking it.
+    let rings = shared::create(
+        keeper,
+        bhaskix_abi::block_ring::PAGES * bhaskix_mm::FRAME_SIZE,
+    )
+    .map_err(|_| "the block domain's rings would not be created")?;
     let named = shared::name(rings).map_err(|_| "the rings would not be named")?;
     if domain::with(realm, |owner| owner.cspace.install_at(3, named).is_ok()) != Some(true) {
         return Err("the rings capability would not install");

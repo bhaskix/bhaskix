@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | 🔍 **Open — reopened 2026-09-01, hours after being closed, because the cause given for closing it was false.** The page was never stale: `map_anonymous` zeroes every frame it allocates. See "The closure was wrong" |
+| **Status** | 🔍 **Open, with a real defect fixed under it 2026-09-02** — the gate spawned its probes into domains whose Linux tag it never checked, so a refused tag ran the program on the native syscall path. Consistent with every measurement; not yet proven to be the cause. See "What the specimen said" |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | libc / userspace (`bin/linuxd`) |
 | **Milestone** | Phase 2 — Linux personality (L1) |
@@ -505,3 +505,46 @@ wrongly" — it did not — but **who wrote `(1, 2)` into a page that starts zer
 reused, so `domain 18` on the failing boot may be the *leaker's* bind rather than the taker's, which
 would mean the taker's call never reached `answer_bind` at all. Distinguishing those needs the record
 to carry a boot-unique identity rather than a domain number, and that is the next instrument.
+
+
+---
+
+## What the specimen said (2026-09-02)
+
+The instruments built over three days finally had a failing boot to describe, and they agree with each
+other:
+
+    socket reclaim FAILED: ... bound again false (fd 1, bind 1), forgets 1
+    the kernel answered: [2]=0x…fe [1]=0x1c [41]=0x3 [49]=0x0 [7]=0x0 [44]=0x4 … [41]=0x3 [49]=0x0
+    last bind: domain 18 incarnation 5, errno 0, port 7781, service word 0, and 3 bind(s) served in all
+    the adapter last recorded: 3 at stage -130 (the adapter thinks it bound port 7781)
+
+against a healthy boot's `fd 3, bind 0`, `incarnation 6`, and **4** binds served.
+
+**Three things follow, and none needs an inference.** The kernel answered `[41]=0x3` and `[49]=0x0`
+every time it was asked — there is no `1` anywhere in the ring, so neither `socket` nor `bind` was
+answered `1` by anything on this side. **One bind is missing**: three served where a passing boot
+serves four. And the last one recorded belongs to **incarnation 5**, the leaker's, not the taker's
+6. So the taker's calls never reached the adapter at all.
+
+**And here is a way for that to be true.** The gate spawns each probe with
+
+    domain::with(leaker, |owner| owner.set_personality(Personality::Linux)).is_some()
+
+`domain::with` answers `Option<Result<..>>`: the outer says whether the domain was found, the inner
+whether the tag was accepted. This read the outer and **discarded the inner**, so a refused tag
+started the program anyway — and a program in an untagged domain takes the *native* syscall path,
+where 41 and 49 are not `socket` and `bind`. That produces answers the adapter never saw and the
+foreign-return ring never recorded, which is exactly the specimen. Every one of the twenty other
+callers of `set_personality` in that file already reads it as `!= Some(Ok(()))`; these two were the
+outliers, and they are fixed.
+
+**What is not claimed.** That `set_personality` *did* refuse on that boot. Its only error is
+`HasThreads`, which a freshly created domain should not have — unless a previous incarnation's thread
+is still counted against the slot, which is precisely the separate specimen filed today as *"a
+freshly created domain refused the Linux tag"*. The two may be one defect; that is a question, not a
+finding. Ten boots since the fix show no reclaim failure, which at roughly one in fifteen is
+consistent with it and proves nothing.
+
+What the fix does guarantee is that the next occurrence **names itself**: a refused tag now fails the
+gate as a domain that would not start, instead of arriving three layers later as `fd 1, bind 1`.

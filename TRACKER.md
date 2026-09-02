@@ -869,6 +869,40 @@ This does not fix either defect. What it changes is where they would be caught: 
 number and the value, instead of three layers away in a gate that could only say the probe's report
 looked wrong.
 
+### 2026-09-02 (the specimen arrived, and the probes were spawned without their tag)
+
+RFC 0067 step 1 grew the block ring — a change with nothing observable in it — and the boot that
+verified it failed the socket reclaim. Three days of instruments finally had something to describe,
+and they agree:
+
+    socket reclaim FAILED: ... bound again false (fd 1, bind 1), forgets 1
+    the kernel answered: ... [41]=0x3 [49]=0x0 ... [41]=0x3 [49]=0x0
+    last bind: domain 18 incarnation 5, errno 0, port 7781, and 3 bind(s) served in all
+
+against a healthy boot's `fd 3, bind 0`, incarnation **6**, and **4** binds served.
+
+**No inference needed for any of it.** The kernel answered 3 and 0 every time — there is no `1`
+anywhere in the ring. One bind is missing. And the last one recorded is the *leaker's* incarnation,
+not the taker's. The taker's calls never reached the adapter.
+
+**A way for that to be true, found by reading the gate.** It spawned each probe with
+`domain::with(d, |o| o.set_personality(Linux)).is_some()` — which reads whether the *domain was
+found* and discards whether the *tag was accepted*. A refused tag started the program anyway, into a
+domain with no Linux personality, whose syscalls take the **native** path where 41 and 49 are not
+`socket` and `bind`. Twenty other callers in that file already read `!= Some(Ok(()))`; these two were
+the outliers. Fixed.
+
+**What is not claimed:** that the tag *did* refuse on that boot. Its only error is `HasThreads`,
+which a fresh domain should not have — unless a previous incarnation's thread is still counted, which
+is the separate specimen filed today at eight CPUs. The two may be one defect; that is a question.
+Ten boots since show no reclaim failure, which at one in fifteen is consistent and proves nothing.
+
+What the fix guarantees is that the next occurrence **names itself** rather than arriving three
+layers away as `fd 1, bind 1`.
+
+This is the fourth time in this file that an answer discarded — `let _ =`, `.is_some()` — has hidden
+a fault, and the RFC 0058 entry that counted the third said so in almost these words.
+
 ### 2026-09-02 (RFC 0067 specified, and deliberately not started)
 
 The change with the largest measured payoff left on the disk path is writing more than one block per
