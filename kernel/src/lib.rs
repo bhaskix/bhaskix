@@ -24616,9 +24616,48 @@ fn wait_queue_self_test(hhdm_base: u64) -> bool {
         // `wakes landed` count says whether one was aimed at it. Neither
         // reading is available from a count of stuck stations, which is what
         // three sightings were reduced to before the per-station line existed.
+        //
+        // **What non-zero is not, measured 2026-09-03.** It is not by itself a
+        // finding. Three healthy boots of this lane on one host read **2, 7
+        // and 18** races in this phase, so the window is live on every boot
+        // and the aggregate separates nothing: specimen twelve's 10 sits in
+        // the middle of the healthy range. Only *zero* discriminates, in the
+        // direction above. What would discriminate the other way is a race
+        // count **per station**, which this counter cannot give -- the stuck
+        // station's own recheck firing is the interesting event, and it is
+        // summed here with three healthy stations'.
         println!(
             "                   {races} block/wake races caught by the recheck, {blocks} blocks \
              and {wakeups} wakeups in this phase"
+        );
+        // **The two fates a wake can have short of landing, which were counted
+        // and never printed.**
+        //
+        // `wake_all` classifies every entry it touches three ways, and keeps
+        // the entry for two of them. Both counters were added for this defect
+        // and neither has ever reached a report -- the same fault as the
+        // mismark counter above, in the same subsystem, found the same day.
+        //
+        // They say something no other number here does, and they say it about
+        // the queue scan rather than the sleeper:
+        //
+        // * `unseen` -- `sched::wake` found the thread in **no** run queue at
+        //   that instant. A scan that takes one queue lock at a time can miss
+        //   a thread being moved between two, so a non-zero reading beside a
+        //   wedged ring says wakes are being aimed at threads the scan cannot
+        //   see, and the entry was kept for a later waker that the ring's own
+        //   shape guarantees never comes.
+        // * `retained` -- the thread was found and was **not** `Blocked`, so
+        //   the wake had nothing to do.
+        //
+        // For a specimen whose entry is *gone*, both at zero says every wake
+        // aimed at that entry landed, which sharpens the contradiction rather
+        // than resolving it. Either being non-zero is a lead with a mechanism
+        // already attached.
+        println!(
+            "                   {} wake(s) found no queue holding the thread, {} found it awake",
+            wait::UNSEEN_WAKES.load(Ordering::Relaxed),
+            wait::LOST_WAKES.load(Ordering::Relaxed)
         );
         // **Which station, and what it was waiting on.** Three sightings of
         // this failure were counted rather than read, and a count cannot tell
