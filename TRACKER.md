@@ -869,6 +869,29 @@ This does not fix either defect. What it changes is where they would be caught: 
 number and the value, instead of three layers away in a gate that could only say the probe's report
 looked wrong.
 
+### 2026-09-02 (RFC 0067 specified, and deliberately not started)
+
+The change with the largest measured payoff left on the disk path is writing more than one block per
+round trip. It is specified now — three parts, each useless alone — and **not** implemented, which is
+the honest state at the end of a long day rather than a rushed driver edit.
+
+What reading established, and it is most of the work:
+
+- `block::WRITE` already takes a sector count; the virtio descriptor is already `(count * 512)`; and
+  `DRAIN`/`FILL` already take a length. Nothing on the service side hard-codes a block.
+- `bin/blkd` clamps to `SECTORS = 8` only because the payload area runs `DATA` `0x2800` → `REPORT`
+  `0x3800`: exactly one 4 KiB block.
+- **Raising `SECTORS` alone gains nothing** — every caller asks for eight, so the clamp never binds.
+  That is the tempting one-line version and the RFC says why it does not work.
+- The caller's object is one frame, and a larger one's frames are not contiguous, so the copy into
+  it becomes per frame. That is the part with real work in it.
+
+The layout having one owner as of this morning is what makes step 1 safe: it moves `REPORT`, and
+until today that offset was written in two places with nothing checking they agreed.
+
+Predicted 8× on the format's 128 calls, which is the larger half of the disk's boot cost — and
+predicted is all it is until the boot report says otherwise, which is step 3's gate.
+
 ### 2026-09-02 (the block ring layout was derived twice, and nothing checked)
 
 Looking at what growing the block service's payload area would take found something latent first:
