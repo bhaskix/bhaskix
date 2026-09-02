@@ -22725,6 +22725,21 @@ fn lock_ordering_self_test() -> bool {
         println!(
             "\x1b[91m    lock order     FAILED: {real} real ordering violations before the probe\x1b[0m"
         );
+        // **The first one's detail, here rather than only where it happened.**
+        // `record` prints rank, mask, file and line the moment it fires —
+        // hundreds of lines earlier. CI keeps a failing gate's own line and the
+        // indented lines after it, and job logs need admin rights even on a
+        // public repository, so run 489's real violation reached this project
+        // as "1 real ordering violations" and nothing else. Indented past
+        // column 15 so the annotation carries it.
+        if let Some((rank, mask, site)) = sync::first_violation() {
+            println!(
+                "\x1b[91m                   the first was rank {rank} against mask {mask:#08b}, \
+                 at {}:{}\x1b[0m",
+                site.file(),
+                site.line()
+            );
+        }
         return false;
     }
     if detected != 1 {

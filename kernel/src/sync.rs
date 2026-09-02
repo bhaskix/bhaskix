@@ -859,8 +859,55 @@ pub fn set_reporting(on: bool) {
     REPORT.store(on, Ordering::Relaxed);
 }
 
-fn record(held: u64, rank: Rank, site: &core::panic::Location<'_>) {
+/// The first ordering violation of the boot, kept for the gate to re-print.
+///
+/// **Because the detail exists and CI cannot see it.** `record` prints rank,
+/// mask, file and line the moment a violation happens — hundreds of lines
+/// before the gate that fails on it. CI keeps a failing gate's own line and the
+/// indented lines after it, and job logs need admin rights even on a public
+/// repository, so run 489's real violation reached this project as
+/// `1 real ordering violations before the probe` and nothing else. A second
+/// sighting without the ranks would be as unusable as that one.
+static FIRST_SITE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+static FIRST_RANK: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static FIRST_MASK: AtomicU64 = AtomicU64::new(0);
+
+/// The first violation's rank, the mask held against it, and where — if there
+/// was one.
+#[must_use]
+pub fn first_violation() -> Option<(u8, u64, &'static core::panic::Location<'static>)> {
+    let site = FIRST_SITE.load(Ordering::Acquire);
+    if site == 0 {
+        return None;
+    }
+    // SAFETY: written only by `record`, from `Location::caller()`, which is
+    // `&'static` — the pointer is to a static the compiler emitted and the
+    // store is released before this acquire can see a non-zero value.
+    let site: &'static core::panic::Location<'static> = unsafe { &*(site as *const _) };
+    Some((
+        FIRST_RANK.load(Ordering::Relaxed) as u8,
+        FIRST_MASK.load(Ordering::Relaxed),
+        site,
+    ))
+}
+
+fn record(held: u64, rank: Rank, site: &'static core::panic::Location<'static>) {
     VIOLATIONS.fetch_add(1, Ordering::Relaxed);
+    // The first one only: a boot with many is a boot whose first is the one to
+    // read, and a later one overwriting it would lose the beginning of the
+    // story.
+    if FIRST_SITE
+        .compare_exchange(
+            0,
+            site as *const _ as usize,
+            Ordering::AcqRel,
+            Ordering::Relaxed,
+        )
+        .is_ok()
+    {
+        FIRST_RANK.store(u32::from(rank as u8), Ordering::Relaxed);
+        FIRST_MASK.store(held, Ordering::Relaxed);
+    }
     if !REPORT.load(Ordering::Relaxed) {
         return;
     }

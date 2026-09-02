@@ -597,7 +597,16 @@ asm_budget = 10
 # is running on a different one. Everything around it is safe: the queue is
 # taken with `try_lock`, the record is read through a reference, and the guard
 # is dropped before the write.
-unsafe_budget = 1990
+#
+# 1991 on 2026-09-02: one line, and unlike the 1991 this file carried for an
+# hour yesterday, the reason is real. `sync::first_violation` turns the stored
+# `usize` back into the `&'static Location` that `record` put there. It exists
+# because CI keeps a failing gate's own line and the indented lines after it,
+# and job logs need admin rights even on a public repository -- so run 489's
+# genuine lock-ordering violation reached this project as a *count* and nothing
+# else, and sat unrecorded until 2026-09-02. The detail is printed by the gate
+# now, where CI can see it.
+unsafe_budget = 1991
 # Up thirty-one for RFC 0005 step 9's socket probe -- `ring3_socketeer`, which
 # is `ring3_lister` with a `sockaddr_in6` copied in beside its code instead of
 # two filenames. The same two blocks every hosted probe has: one
