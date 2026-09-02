@@ -845,6 +845,30 @@ the distinction is in the table rather than in somebody's head.
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-09-02 (the disk format is the larger half, and it had never been measured)
+
+RFC 0066 made the staging write cheap and the roadmap then said what remained for BusyBox was a disk
+and a filesystem large enough. It did not say what growing them would cost, because nobody had
+measured the *format* — which writes every block of the filesystem, used or not, one block per device
+call.
+
+    disk format    128 block(s) written in 947 ms; 7403 us per block
+    hosted stage   76992 bytes in 19 block(s), 96 ms; 5087 us per block
+
+Across three boots the format took **437–1,061 ms** for 128 blocks. So a 600-block filesystem would
+be roughly **2–5 seconds**, against **2.0–2.7 s** for staging BusyBox into it. **The format is the
+larger half**, and it is not where the effort went.
+
+**And the per-block costs overlap**: 3.4–8.3 ms for a raw device write against 3.8–5.1 ms for a
+*journalled* one. So the transaction RFC 0066 removed was never the whole story — a round trip to the
+block service dominates both, and a journal on top of it is comparatively cheap. That is worth
+knowing before optimising anything else here.
+
+`block::WRITE` already takes a sector **count** in `args[1]` — the comment beside it says the service
+"carries eight sectors in a request, which is what `args[1]` always meant and had never done". So
+writing many blocks per call needs no protocol change, and it would make both halves cheaper at once.
+That is the next thing, and the roadmap says so with these numbers rather than an estimate.
+
 ### 2026-09-02 (`ci-status.sh --why <run>`, so the next red needs no archaeology)
 
 Three of the four `interactive shell` failures re-read this morning were other defects, and two of

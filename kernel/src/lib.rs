@@ -10154,6 +10154,22 @@ fn hosted_exec_self_test(hhdm_base: u64, cpus: u32) -> bool {
     // here, where it happened, rather than left to be diagnosed there.
     // What the staging cost, and what that implies for a program the size of
     // BusyBox — the one number the roadmap's L1 row has been estimating.
+    // The format, beside the staging: together they are what a boot pays for
+    // the disk, and what a filesystem large enough for BusyBox would multiply.
+    let format_cycles = DISK_FORMAT_CYCLES.load(Ordering::Acquire);
+    let format_blocks = DISK_FORMAT_BLOCKS.load(Ordering::Acquire).max(1);
+    if let Some(hertz) = bhaskix_arch::tsc::hertz()
+        && hertz > 0
+        && format_cycles > 0
+    {
+        println!(
+            "    disk format    {format_blocks} block(s) written in {} ms; {} us per block, so a \
+             filesystem holding BusyBox would cost about {} ms at 600 blocks",
+            format_cycles * 1_000 / hertz,
+            format_cycles / format_blocks * 1_000_000 / hertz,
+            format_cycles / format_blocks * 600 * 1_000 / hertz
+        );
+    }
     let cycles = HOSTED_STAGE_CYCLES.load(Ordering::Acquire);
     let blocks = staged.div_ceil(4096).max(1);
     if let Some(hertz) = bhaskix_arch::tsc::hertz()
@@ -14150,6 +14166,10 @@ static HOSTED_WANTED: core::sync::atomic::AtomicU64 = core::sync::atomic::Atomic
 /// rather than estimated.
 static HOSTED_STAGE_CYCLES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
+/// Cycles the disk format took, and how many blocks it wrote.
+static DISK_FORMAT_CYCLES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static DISK_FORMAT_BLOCKS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 /// A block device reached by asking the block service for one sector at a time.
 ///
 /// The `Store` RFC 0015 step 6 introduced, finally over something that is not
@@ -14339,6 +14359,13 @@ extern "C" fn journal_on_disk(endpoint: u64) -> ! {
         DISK_JOURNAL.store(0, Ordering::Release);
         sched::exit()
     }
+    // **Priced, because it is the other half of what BusyBox on this disk would
+    // cost.** The staging write is measured by `hosted stage`; this is the
+    // format that precedes it, and it writes *every* block of the filesystem
+    // rather than only the used ones. Growing the filesystem to hold a
+    // 531-block program therefore costs here as well as there, and nothing has
+    // measured which of the two dominates.
+    let format_began = bhaskix_arch::tsc::read();
     {
         let mut device = store(u32::MAX);
         for block in 0..blocks {
@@ -14352,6 +14379,11 @@ extern "C" fn journal_on_disk(endpoint: u64) -> ! {
             }
         }
     }
+    DISK_FORMAT_CYCLES.store(
+        bhaskix_arch::tsc::read().saturating_sub(format_began),
+        Ordering::Release,
+    );
+    DISK_FORMAT_BLOCKS.store(u64::from(blocks), Ordering::Release);
 
     // A file, on the disk, through the journal. Nothing in memory is consulted
     // from here on: the cache is empty and every page it wants comes off the
