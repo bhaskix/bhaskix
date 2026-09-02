@@ -9861,12 +9861,33 @@ fn socket_self_test(hhdm_base: u64, cpus: u32) -> bool {
         println!("\x1b[91m    linux socket   FAILED: no domain\x1b[0m");
         return false;
     };
-    if domain::with(realm, |owner| {
+    // **Two refusals, not one** — the day's lesson, applied where it was found.
+    // `with` answers `None` when the realm does not resolve, and `Err` only
+    // for `HasThreads`; on a domain created three lines above, those are very
+    // different facts. A freshly created domain that already has threads means
+    // a previous incarnation's thread is still counted against this slot, which
+    // is a defect in domain reuse; a realm that does not resolve is one that
+    // went away. The old message said "the tag was refused" for both, and for a
+    // specimen found at `QEMU_SMP=8` on 2026-09-02 it could say no more.
+    match domain::with(realm, |owner| {
         owner.set_personality(domain::Personality::Linux)
-    }) != Some(Ok(()))
-    {
-        println!("\x1b[91m    linux socket   FAILED: the tag was refused\x1b[0m");
-        return false;
+    }) {
+        Some(Ok(())) => {}
+        Some(Err(error)) => {
+            println!(
+                "\x1b[91m    linux socket   FAILED: a domain created three lines ago refused the \
+                 Linux tag with {error:?} -- if that is HasThreads, a previous incarnation's \
+                 thread is still counted against this slot\x1b[0m"
+            );
+            return false;
+        }
+        None => {
+            println!(
+                "\x1b[91m    linux socket   FAILED: the realm just created does not resolve, so \
+                 the domain went away between `create` and `with`\x1b[0m"
+            );
+            return false;
+        }
     }
     let options = sched::SpawnOptions::new()
         .pinned()
