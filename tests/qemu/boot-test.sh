@@ -745,8 +745,19 @@ fi
 # the zeroing removed again on purpose, this gate reports the full 4,096.
 if grep -qF "memory hygiene a page written full of 0xa5 and freed comes back zeroed" "$LOG"; then
     pass "memory hygiene: a freed page reaches its next owner zeroed"
-else
+elif grep -qF "memory hygiene FAILED: no domain to charge" "$LOG"; then
+    # **Not a leak, and the old message called it one.** This arm inherited
+    # every case the `if` did not name, and its sentence was written for one of
+    # them. The self-test needs a domain to charge the frame to; failing to
+    # create one means it never ran, which is a failure of the boot and not
+    # evidence that a page carried anything.
+    fail "the memory-hygiene self-test could not run: no domain to charge, so nothing was proven either way"
+    status=1
+elif grep -qF "memory hygiene FAILED" "$LOG"; then
     fail "a freed page reached its next owner still carrying the previous owner's bytes"
+    status=1
+else
+    fail "the boot said nothing about memory hygiene: the self-test did not report, so a freed page's contents are unproven"
     status=1
 fi
 
@@ -3780,8 +3791,13 @@ fi
 if grep -qE "kaslr +(applied and confirmed|slid 0x[0-9a-f]+ bytes)" "$LOG" \
    && ! grep -qF "kaslr           NOT APPLIED" "$LOG"; then
     pass "KASLR applied (kernel image slid from its link-time base)"
-else
+elif grep -qF "kaslr           NOT APPLIED" "$LOG"; then
     fail "KASLR was not applied -- the kernel is at its link-time base"
+    status=1
+else
+    # Absence is not the same claim. Saying where the kernel sits, from a line
+    # that is not there, is the mistake three gates made in two days.
+    fail "the boot said nothing about KASLR, so whether the kernel was slid is unknown rather than known to be no"
     status=1
 fi
 

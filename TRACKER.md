@@ -844,6 +844,34 @@ the distinction is in the table rather than in somebody's head.
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-09-02 (a sweep for the else arm that inherits every unnamed case)
+
+Three gates in two days asserted a cause they had not measured, so `boot-test.sh` was searched for
+the shape rather than waiting for a fourth: an `else` arm whose `fail` message names a specific
+mechanism. 165 `else`-arm failures, and most are honest — *"did not pass"*, *"was not reported"* —
+because an absence reported as an absence is exactly right.
+
+**The dangerous ones are those whose message is a security claim**, because a merely *missing* line
+then reads as an accusation. Two were fixed:
+
+`memory hygiene` has three outcomes — the success line, `FAILED`, and `FAILED: no domain to charge` —
+and its `else` said *"a freed page reached its next owner still carrying the previous owner's bytes"*
+for all of them, plus for the line being absent entirely. The second of those is not a leak at all:
+the self-test needs a domain to charge the frame to, and failing to create one means it never ran.
+Three arms now, and only the genuine one makes the claim.
+
+`kaslr` said *"the kernel is at its link-time base"* from a line that might not be there. Saying where
+the kernel sits, on the strength of a missing line, is the same mistake in a different subsystem.
+Absence now reports as absence.
+
+Both were armed against synthetic logs, each arm fired its own message, and only the real case
+accuses the kernel of anything.
+
+The pattern is worth keeping in mind rather than only fixing: **an `else` arm inherits every case its
+`if` did not name, and its message is usually written for one of them.** A gate that cannot tell "the
+bad thing happened" from "the line is not there" will eventually report the first when it means the
+second, and a security claim is the worst place for that to happen.
+
 ### 2026-09-02 (a third gate naming a cause it had not measured)
 
 A `make test` in this change failed with `a connection was served without a verified cookie -- the
