@@ -872,17 +872,96 @@ static FIRST_SITE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicU
 static FIRST_RANK: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 static FIRST_MASK: AtomicU64 = AtomicU64::new(0);
 
+/// Whether the three above describe **one** violation yet.
+///
+/// **`FIRST_SITE` claims the slot; it does not publish the record.** The
+/// compare-exchange that wins the race stores the rank and the mask
+/// *afterwards*, so a reader acquiring on the site alone can see a valid file
+/// and line beside `rank 0` and `mask 0b000000` -- a reading that describes no
+/// violation that ever happened. The window is a few instructions and the
+/// reader is usually another CPU running the gate.
+///
+/// That is the same fault as the console tear, the lock accounting's withdrawn
+/// specimens and this session's mismark share-over-total: a report built from
+/// stores that are not ordered against the load cannot describe one moment.
+/// The winner sets this last, with `Release`; the reader takes it first, with
+/// `Acquire`, and reads nothing until it is set.
+static FIRST_READY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Every rank, at its own index.
+///
+/// **So a report can name a rank it only has the number of.** `Rank::name` is
+/// a method and the gate that CI actually reads has a `u8`: the violation is
+/// recorded as a discriminant, and the line CI keeps was printing `rank 0`
+/// where the live report prints `vm::ACTIVE`. Anyone reading an annotation was
+/// left to map the number against this file by hand -- which is exactly the
+/// work `name` exists to avoid, and the standing requirement that output be
+/// understandable says not to make them.
+///
+/// A rank added to the enum and not to this table degrades to
+/// `<unknown rank>`, which is honest rather than wrong; the host test below
+/// keeps the entries at their own discriminants.
+const ALL_RANKS: [Rank; 18] = [
+    Rank::AddressSpace,
+    Rank::AddressSpacePrevious,
+    Rank::DmaWindow,
+    Rank::Heap,
+    Rank::TlbSender,
+    Rank::Timers,
+    Rank::Domains,
+    Rank::Capabilities,
+    Rank::Endpoints,
+    Rank::WaitQueue,
+    Rank::SchedRunqueue,
+    Rank::Notifications,
+    Rank::SharedMemory,
+    Rank::IrqHandlers,
+    Rank::Vectors,
+    Rank::Block,
+    Rank::UsbKeyboard,
+    Rank::Console,
+];
+
+/// The name of a rank given its discriminant.
+#[must_use]
+pub fn rank_name(rank: u8) -> &'static str {
+    ALL_RANKS
+        .get(rank as usize)
+        .map_or("<unknown rank>", |rank| rank.name())
+}
+
+/// Renders a held-set mask as rank names, calling `each` once per held rank.
+///
+/// A mask is printed as bits everywhere else in this module, which is right at
+/// the point of the violation where the reader has the code open. It is wrong
+/// in a CI annotation, where `0b001000` is a puzzle and `heap::HEAP` is the
+/// answer.
+pub fn for_each_held(mask: u64, mut each: impl FnMut(&'static str)) {
+    for rank in &ALL_RANKS {
+        if mask & rank.bit() != 0 {
+            each(rank.name());
+        }
+    }
+}
+
 /// The first violation's rank, the mask held against it, and where — if there
 /// was one.
 #[must_use]
 pub fn first_violation() -> Option<(u8, u64, &'static core::panic::Location<'static>)> {
-    let site = FIRST_SITE.load(Ordering::Acquire);
+    // `FIRST_READY`, not `FIRST_SITE`: the site is the claim and this is the
+    // publication. See the static's own note for what reading the claim
+    // instead prints.
+    if !FIRST_READY.load(Ordering::Acquire) {
+        return None;
+    }
+    let site = FIRST_SITE.load(Ordering::Relaxed);
     if site == 0 {
         return None;
     }
     // SAFETY: written only by `record`, from `Location::caller()`, which is
-    // `&'static` — the pointer is to a static the compiler emitted and the
-    // store is released before this acquire can see a non-zero value.
+    // `&'static` — the pointer is to a static the compiler emitted, and the
+    // `Release` store of `FIRST_READY` that this `Acquire` load observed
+    // happens after it and after the rank and mask beside it.
     let site: &'static core::panic::Location<'static> = unsafe { &*(site as *const _) };
     Some((
         FIRST_RANK.load(Ordering::Relaxed) as u8,
@@ -907,6 +986,9 @@ fn record(held: u64, rank: Rank, site: &'static core::panic::Location<'static>) 
     {
         FIRST_RANK.store(u32::from(rank as u8), Ordering::Relaxed);
         FIRST_MASK.store(held, Ordering::Relaxed);
+        // Last, and with `Release`: everything above must be visible to
+        // whoever sees this set.
+        FIRST_READY.store(true, Ordering::Release);
     }
     if !REPORT.load(Ordering::Relaxed) {
         return;
@@ -1309,6 +1391,39 @@ pub fn count_underflows() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn every_rank_sits_at_its_own_index_in_the_name_table() {
+        // The table is what lets a report name a rank it only has the number
+        // of, so an entry out of position would name the *wrong* lock -- worse
+        // than naming none, because it reads as an answer.
+        for (index, rank) in super::ALL_RANKS.iter().enumerate() {
+            assert_eq!(
+                *rank as usize,
+                index,
+                "rank {} is at index {index}",
+                rank.name()
+            );
+        }
+    }
+
+    #[test]
+    fn a_rank_number_with_no_entry_says_so_rather_than_guessing() {
+        assert_eq!(super::rank_name(0), "vm::ACTIVE");
+        assert_eq!(super::rank_name(3), "heap::HEAP");
+        assert_eq!(super::rank_name(200), "<unknown rank>");
+    }
+
+    #[test]
+    fn a_held_mask_renders_as_the_names_of_what_is_held() {
+        let mask = super::Rank::Heap.bit() | super::Rank::Timers.bit();
+        let mut seen = alloc::vec::Vec::new();
+        super::for_each_held(mask, |name| seen.push(name));
+        assert_eq!(seen, ["heap::HEAP", "time::TIMERS"]);
+        let mut none = 0usize;
+        super::for_each_held(0, |_| none += 1);
+        assert_eq!(none, 0);
+    }
+
     use super::*;
 
     #[test]

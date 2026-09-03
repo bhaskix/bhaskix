@@ -22931,12 +22931,42 @@ fn lock_ordering_self_test() -> bool {
         // as "1 real ordering violations" and nothing else. Indented past
         // column 15 so the annotation carries it.
         if let Some((rank, mask, site)) = sync::first_violation() {
+            // **Named, not numbered.** This line is the one CI keeps, and it
+            // read `rank 0 against mask 0b001000` -- which is `vm::ACTIVE`
+            // taken while holding `heap::HEAP`, but only to a reader with this
+            // file open, decoding an enum and a bitmask by hand. The live
+            // report a few hundred lines earlier already says `blocking on
+            // vm::ACTIVE`; the annotation is where the name is worth most and
+            // was the one place without it.
             println!(
-                "\x1b[91m                   the first was rank {rank} against mask {mask:#08b}, \
-                 at {}:{}\x1b[0m",
+                "\x1b[91m                   the first was {} (rank {rank}) taken at {}:{}\x1b[0m",
+                sync::rank_name(rank),
                 site.file(),
                 site.line()
             );
+            // One line per held rank rather than one line listing them.
+            //
+            // Not a style choice: `annotate_failure_detail` keeps the lines
+            // after the marker that are indented past column 15, and the
+            // console is shared -- a `println!` from another CPU landing
+            // inside a line assembled from several `print!`s would break the
+            // indentation and drop the rest of the detail from the annotation.
+            // A whole line at a time cannot tear that way.
+            let mut held_any = false;
+            sync::for_each_held(mask, |name| {
+                held_any = true;
+                println!("\x1b[91m                   ...while holding {name}\x1b[0m");
+            });
+            if !held_any {
+                // **A violation with an empty held set is its own finding.**
+                // The detector fires on what the mask says is held, so a mask
+                // of zero here means the two disagree -- which is the open
+                // accounting defect in this file, seen from the other side.
+                println!(
+                    "\x1b[91m                   ...while holding nothing, which contradicts the \
+                     violation itself\x1b[0m"
+                );
+            }
         }
         return false;
     }
