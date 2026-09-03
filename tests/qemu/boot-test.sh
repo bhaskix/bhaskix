@@ -3716,12 +3716,35 @@ fi
 # 4294967295); the saturating release now lets such a boot finish and
 # report, so the gate is what turns the survivable report back into a
 # failure nobody can miss.
+#
+# **Both carry the totals now.** Each of these fails on an *event* line printed
+# where it happened, and `COUNT MISMATCH` prints only its first occurrence --
+# so a boot with five hundred of them failed with the same bare sentence as a
+# boot with one, and the annotation CI keeps carried no number at all. That is
+# run 489's lock-order line again: a real failure reduced to a sentence.
+#
+# The kernel now totals both in its report, and the summary is printed here
+# indented past column 15 so the annotation carries it. Matched on the summary
+# line, and keyed on the digit that follows it -- `COUNT MISMATCH`'s own
+# message contains the words "hold count of zero", so matching the words alone
+# picks up the event line and prints a fragment of it as the detail.
+#
+# Not anchored at the start of the line either, and that is the bug this comment
+# exists for: the summary is printed in red, so the line begins with an escape
+# sequence and `^ *` matches nothing. The first version of this printed no
+# detail at all and looked like it worked, because the gate above it still
+# failed.
+hold_count_detail() {
+    sed -n 's/.*hold count  *\([0-9].*\)/                   \1/p' "$LOG" | head -1
+}
 if grep -qa "COUNT UNDERFLOW" "$LOG"; then
     fail "a hold-count underflow was caught at a release"
+    hold_count_detail
     status=1
 fi
 if grep -qa "COUNT MISMATCH" "$LOG"; then
     fail "a CPU's rank mask and hold count disagreed"
+    hold_count_detail
     status=1
 fi
 

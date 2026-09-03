@@ -4625,6 +4625,20 @@ pub fn domain_scan_skips() -> u64 {
 /// a number.
 static COUNT_MISMATCHES: AtomicU64 = AtomicU64::new(0);
 
+/// How many times a rank mask was held against a hold count of zero.
+///
+/// **The line beside the increment is printed once and this is the total.**
+/// `preempt` reports the *first* mismatch and no other, so a boot with five
+/// hundred of them looks exactly like a boot with one. §3's lock-accounting
+/// row has waited since 2026-08-30 for "a specimen with one of them non-zero",
+/// on the belief that these counters "already exist and print" -- they print an
+/// event, in the middle of a boot, where no gate reads it and CI keeps no
+/// artifact. A number nobody totals is not a specimen.
+#[must_use]
+pub fn count_mismatches() -> u64 {
+    COUNT_MISMATCHES.load(Ordering::Relaxed)
+}
+
 /// Preemptions declined because this CPU's hold count read nonzero.
 static PREEMPT_VETO_HOLDS: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
 

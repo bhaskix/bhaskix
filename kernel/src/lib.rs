@@ -19654,6 +19654,30 @@ fn user_shell(handoff: &Handoff) -> Result<(), &'static str> {
         // block_unless)`. Both are monotonic, so sampling the share first
         // makes the pair describable: the total read afterwards is at least
         // the share read before it.
+        // **The two accounting counters, totalled.**
+        //
+        // Both already print at the moment they fire, and that is not the same
+        // as being reported: `COUNT MISMATCH` prints only its *first*
+        // occurrence, so five hundred read as one, and both land mid-boot
+        // where no gate looks and CI keeps no artifact. §3's lock-accounting
+        // row has waited since 2026-08-30 for "a specimen with one of them
+        // non-zero", believing they "already exist and print".
+        //
+        // A mismatch is a counted increment already lost, and the comment at
+        // its own site says the next release of that guard will underflow. An
+        // underflow is that happening. A CPU whose count has underflowed
+        // vetoes every preemption for ever, which is the disease the
+        // wake-delay row above has hunted since 2026-08-17 -- so these are the
+        // same fault at two stages, and neither stage was totalled anywhere.
+        let mismatches = sched::count_mismatches();
+        let underflows = crate::sync::count_underflows();
+        if mismatches > 0 || underflows > 0 {
+            println!(
+                "\x1b[91m    hold count     {mismatches} rank mask(s) held against a count of \
+                 zero, and {underflows} release(s) found the count already zero\x1b[0m"
+            );
+        }
+
         // **A switch abandoned after the accounting was handed over.**
         //
         // Both switch paths install the incoming thread's held mask and count,
