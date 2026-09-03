@@ -1308,6 +1308,31 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
         println!("    saved holding  no thread was switched out holding a rank");
     }
 
+    // **The other half of the same question, and nothing was asking it.**
+    //
+    // `saved_holding` counts a switch that stored a thread carrying *ranks*.
+    // `saved_count_only` counts one that stored a nonzero **count** beside an
+    // empty mask -- the two disagreeing, in the one place a switch writes them
+    // both. §3's wake-delay row names `SAVED COUNT` as one of three canaries
+    // built for the hold-count underflow and says "the next specimen names its
+    // owner"; this is the canary whose total nothing has ever read. It prints
+    // its first occurrence where it happens, mid-boot, and then a boot with
+    // five hundred looks exactly like a boot with one -- the same fault as the
+    // mismark counter and the wake fates, found the same way, by sweeping for
+    // public accessors with no call site.
+    //
+    // It is the poison moment rather than its consequence: a count without a
+    // mask is an increment the release path will not find a matching guard
+    // for, which is where `COUNT UNDERFLOW` comes from a few thousand
+    // acquisitions later.
+    let count_only = sched::saved_count_only();
+    if count_only > 0 {
+        println!(
+            "\x1b[91m    saved count    {count_only} switch(es) stored a counted hold with no \
+             rank -- the count and the mask disagree, which is where an underflow starts\x1b[0m"
+        );
+    }
+
     // RFC 0011 step 6: an interrupt a domain holds. Before the DMA tests,
     // because it hands the block device's interrupt to a domain and puts it
     // back — and a device with no interrupt is a driver on the timer.

@@ -3737,6 +3737,24 @@ fi
 hold_count_detail() {
     sed -n 's/.*hold count  *\([0-9].*\)/                   \1/p' "$LOG" | head -1
 }
+# **The count-side tear, which is where an underflow starts.**
+#
+# A switch that stores a nonzero hold *count* beside an empty rank *mask* has
+# written two numbers that disagree, in the one place a switch writes both. It
+# rides with that thread and flags every later block it makes, and a few
+# thousand acquisitions later it is a `COUNT UNDERFLOW`. §3 names `SAVED COUNT`
+# as one of three canaries built for that hunt and says "the next specimen names
+# its owner" -- but nothing failed on it and nothing totalled it, so a boot that
+# produced one printed a line mid-boot and went green.
+#
+# Gated because the baseline is zero: no occurrence in any of the boot logs kept
+# from this machine. A first sighting should stop a build, not scroll past.
+if grep -qa "SAVED COUNT" "$LOG" || grep -qE "^ +saved count +[0-9]" "$LOG"; then
+    fail "a switch stored a counted hold with no rank"
+    sed -n 's/.*saved count  *\([0-9].*\)/                   \1/p' "$LOG" | head -1
+    sed -n 's/.*SAVED COUNT  *\(.*\)/                   \1/p' "$LOG" | head -1
+    status=1
+fi
 if grep -qa "COUNT UNDERFLOW" "$LOG"; then
     fail "a hold-count underflow was caught at a release"
     hold_count_detail
