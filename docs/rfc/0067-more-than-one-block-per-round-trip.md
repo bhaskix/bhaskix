@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | 🔨 **Steps 1 and 2 landed 2026-09-02, inert and verified. Step 3 attempted and reverted the same day: a run of blocks needs one buffer the *device* sees as contiguous, which this RFC did not account for.** See "What step 3 found" |
+| **Status** | ✅ **All three steps landed. Steps 1 and 2 on 2026-09-02, inert; step 3 on 2026-09-03, after the defect that blocked it was found in `DRAIN` and fixed.** The format falls from 321 ms to 93 ms for 128 blocks. See "What step 3 found" — both of its earlier explanations were wrong and are kept, withdrawn, above the one that held |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | block (`bin/blkd`, `bhaskix_abi::block_ring`) / kernel |
 | **Milestone** | Phase 2 — Linux personality (L1) |
@@ -160,3 +160,41 @@ a batched request, and what `bin/fsd`'s journal expects of a write that covers e
 
 The measurement that motivated the RFC is unchanged: the format is the larger half of the disk's
 boot cost, at 3.4–8.3 ms a block, and 128 blocks of it.
+
+
+---
+
+## What actually blocked step 3 (2026-09-03)
+
+Two explanations were written for step 3's failure and both were wrong. The first said the service
+side needed "a bigger payload area and a larger `SECTORS`, and nothing else". The second said the
+device needed one physically contiguous buffer and that batching therefore wanted a descriptor
+chain. Both are withdrawn above, the second after checking it: `iommu::map_memory` allocates one
+contiguous device-address range and places each frame at its own offset in it, which is what an
+IOMMU is for.
+
+**The cause was in the nucleus, in the bulk copy this RFC never looked at.** `DRAIN` hands a closure
+to `shared::drain_into`, which walks the caller's object **one frame at a time** and calls the
+closure per frame. The closure captured `destination` and never advanced it, so every frame was
+written to the same service-side address while the returned length was the *sum* of them all. The
+data was wrong and the count was right, which is why `bin/blkd`'s own `got == count * 512` check
+passed and the failure surfaced three layers away as a filesystem that would not mount.
+
+Nothing had reached it before because nothing had ever asked for more than one frame in a single
+call: `SECTORS` was 8, and eight sectors is 4096 bytes — exactly one frame. That constant read like
+a device limit and was a page limit. Step 1 raising it to 64 is the first thing in this tree that
+could ask for eight frames, so this RFC did not merely trip over the defect, it was the first thing
+capable of doing so. `FILL` had the same bug in the other direction and is fixed with it.
+
+**Isolated rather than inferred.** With the per-frame copy correct and only the `DRAIN` advance
+disabled, the boot fails at `disk journal FAILED at stage 3` — the exact failure of 2026-09-02.
+Restored, it passes.
+
+**And the copy is through `fill_from`, not the direct map.** The first working version walked the
+object's frames itself with an `unsafe` slice per frame. `shared::fill_from` already does that walk
+and hands out a safe `&mut [u8]`, is the same code the `FILL` syscall uses, and cannot make the
+mistake the very first attempt made — one slice across the whole object, assuming frames are
+adjacent. It also kept the crate's unsafe budget at zero headroom rather than needing a raise.
+
+**Measured**, on the iommu lane: `disk format 128 block(s) written in 93 ms; 726 us per block`,
+against 321 ms and about 2.5 ms a block before. Roughly 3.5x, from eight blocks per round trip.

@@ -14364,7 +14364,7 @@ static mut DISK_FRAMES: [u8; 8 * bhaskix_fs::BLOCK] = [0; 8 * bhaskix_fs::BLOCK]
 /// interruption and it is the decisive one: the machine stops one device write
 /// **after** the commit, which is the only place recovery has work to do.
 extern "C" fn journal_on_disk(endpoint: u64) -> ! {
-    use bhaskix_fs::{Cache, Kind, Store, Volume};
+    use bhaskix_fs::{Cache, Kind, Volume};
     use core::sync::atomic::Ordering;
 
     let endpoint = ipc::EndpointId::from_u32(endpoint as u32);
@@ -14446,16 +14446,70 @@ extern "C" fn journal_on_disk(endpoint: u64) -> ! {
     // measured which of the two dominates.
     let format_began = bhaskix_arch::tsc::read();
     {
-        let mut device = store(u32::MAX);
-        for block in 0..blocks {
-            let at = (block as usize) * bhaskix_fs::BLOCK;
-            if device
-                .write(block, &image[at..at + bhaskix_fs::BLOCK])
-                .is_err()
-            {
+        // **RFC 0067 step 3: one request per run of blocks, not one per block.**
+        //
+        // The blocks go into the object's frames one apiece and leave in a
+        // single `block::WRITE`. Two things this had wrong on 2026-09-02 and
+        // both are fixed rather than worked around:
+        //
+        // * The copy walks `frames` and writes each block into *its own*
+        //   frame. The first attempt took one slice across the whole object
+        //   through the direct map, which assumes the frames are physically
+        //   adjacent -- and `iommu::map_memory` says in as many words that
+        //   they need not be, since making them contiguous to the *device* is
+        //   what the window is for.
+        // * `DRAIN`, which `bin/blkd` uses to take these bytes, wrote every
+        //   frame to the same service-side address and returned the full
+        //   length anyway. Eight sectors is exactly one frame, so nothing
+        //   before step 1 could reach it.
+        let raw = DISK_OBJECT.load(Ordering::Acquire);
+        let object = shared::MemoryId::from_u64(raw);
+        let Some((_, count)) = shared::frames_of(object) else {
+            DISK_JOURNAL.store(1, Ordering::Release);
+            sched::exit()
+        };
+        let per_run = u32::try_from(count)
+            .unwrap_or(1)
+            .min(u32::try_from(bhaskix_abi::block_ring::SECTORS / 8).unwrap_or(1));
+        let mut done = 0u32;
+        while done < blocks {
+            let run = (blocks - done).min(per_run).max(1);
+            // **Through `fill_from`, not through the direct map.** The
+            // first version walked the frames itself and needed an `unsafe`
+            // slice per frame; this is the helper that already does exactly
+            // that walk, hands out a safe `&mut [u8]` for each frame, and is
+            // the same code the `FILL` syscall uses. It also cannot repeat the
+            // mistake the first attempt made -- one slice across the whole
+            // object, which assumes frames are physically adjacent.
+            let from = (done as usize) * bhaskix_fs::BLOCK;
+            let mut fed = 0usize;
+            let put = shared::fill_from(
+                object,
+                0,
+                (run as usize) * bhaskix_fs::BLOCK,
+                &mut |bytes: &mut [u8]| {
+                    let take = bytes.len();
+                    bytes.copy_from_slice(&image[from + fed..from + fed + take]);
+                    fed += take;
+                    take
+                },
+            );
+            if put != Some((run as usize) * bhaskix_fs::BLOCK) {
                 DISK_JOURNAL.store(1, Ordering::Release);
                 sched::exit()
             }
+            let wrote = ipc::call(
+                endpoint,
+                0x00b2_0000,
+                bhaskix_abi::block::WRITE,
+                [u64::from(done) * 8, u64::from(run) * 8, 0, 0],
+            )
+            .map_or(0, |reply| reply.args[0]);
+            if wrote != u64::from(run) * 4096 {
+                DISK_JOURNAL.store(1, Ordering::Release);
+                sched::exit()
+            }
+            done += run;
         }
     }
     DISK_FORMAT_CYCLES.store(

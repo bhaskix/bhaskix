@@ -880,6 +880,29 @@ This does not fix either defect. What it changes is where they would be caught: 
 number and the value, instead of three layers away in a gate that could only say the probe's report
 looked wrong.
 
+### 2026-09-03 (RFC 0067 step 3 lands, and the defect that blocked it is isolated)
+
+The bulk-copy defect filed in the entry below is **the** cause of step 3's failure, not a candidate
+for it. With step 3's copy correct and only `DRAIN`'s advance disabled, the boot fails at
+`disk journal FAILED at stage 3` — the exact failure of 2026-09-02; restored, it passes. The
+second candidate this project recorded, `DiskStore::page()` returning one frame, does not arise:
+the copy now goes through `shared::fill_from`, which walks the frames itself.
+
+**Step 3 is in.** `disk format 128 block(s) written in 93 ms; 726 us per block`, against 321 ms and
+about 2.5 ms a block. Roughly 3.5x, from eight blocks per round trip instead of one.
+
+Three explanations were written for this failure across two days and the first two were wrong: that
+the service side needed only a bigger payload area, and that the device needed one physically
+contiguous buffer. Both are withdrawn in the RFC with the reasoning that killed them. The one that
+held was found by reading the far side — the nucleus's own bulk copy — rather than by another
+boot.
+
+Two smaller things worth keeping. The copy goes through `fill_from` rather than a hand-rolled walk
+over the frames, which removed the `unsafe` the first working version needed and kept the crate's
+budget at zero headroom instead of raising it. And a `Store` import went unused when the format loop
+stopped calling `device.write`, which clippy caught — the loop is now the only writer of these 128
+blocks and does not go through the trait at all.
+
 ### 2026-09-03 (a bulk copy that wrote every page to the same address)
 
 Setting out to write RFC 0067 step 3's descriptor chain -- which turned out not to be needed, see
