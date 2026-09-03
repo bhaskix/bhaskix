@@ -16386,6 +16386,53 @@ fn report_tcp_client(hhdm: u64) {
     }
 }
 
+/// `bin/tcpd`'s report page, as the ten little-endian words it writes there.
+///
+/// One reader, because there are two callers and the second must not cost a
+/// second `unsafe`: the budget counts every line inside one, and a duplicate
+/// of this would have raised it for a diagnostic.
+fn tcp_report_bytes(hhdm: u64, frame: u64) -> &'static [u8] {
+    // SAFETY: a frame the report object owns, through the direct map, read as
+    // the ten little-endian words the service wrote there.
+    unsafe { core::slice::from_raw_parts((hhdm + frame) as *const u8, 80) }
+}
+
+/// The cookie count again, at the end of the boot.
+///
+/// **Because the first reading is taken before the traffic it counts.**
+/// `report_tcp_domain` runs at a fixed point in the boot report and snapshots
+/// `bin/tcpd`'s page as it stands then. The host-driven inbound connections
+/// arrive asynchronously, and the loopback demonstration that `bin/tcpc` drives
+/// prints *four lines after* the cookie line in every boot -- so a count of
+/// zero there says "none had arrived yet", not "none ever did".
+///
+/// §3's SYN-cookie row has four sightings plus three more at eight CPUs, all
+/// of them `0 connection(s)` on boots whose every other TCP gate passed and
+/// whose host driver got its bytes back. This line is what tells a snapshot
+/// taken too early from a connection that never came.
+fn report_tcp_cookies_late(hhdm: u64) {
+    use core::sync::atomic::Ordering;
+
+    let raw = TCP_REPORT.load(Ordering::Acquire);
+    if raw == u64::MAX {
+        return;
+    }
+    let Some((pages, count)) = shared::frames_of(shared::MemoryId::from_u64(raw)) else {
+        return;
+    };
+    if count == 0 {
+        return;
+    }
+    let bytes = tcp_report_bytes(hhdm, pages[0]);
+    let mut cookies = [0u8; 8];
+    cookies.copy_from_slice(&bytes[56..64]);
+    let cookies = u64::from_le_bytes(cookies);
+    println!(
+        "    tcpd cookies*  {cookies} at the end of the boot, against what the line above read \
+         when it was taken"
+    );
+}
+
 fn report_tcp_domain(hhdm: u64) {
     use core::sync::atomic::Ordering;
 
@@ -16412,8 +16459,11 @@ fn report_tcp_domain(hhdm: u64) {
     // index `bytes[56..64]` of a 56-byte slice, and the boot died before
     // printing anything at all. Written as `words.len() * 8` so the next word
     // cannot repeat it.
-    let bytes =
-        unsafe { core::slice::from_raw_parts((hhdm + pages[0]) as *const u8, words.len() * 8) };
+    // Through the one reader, so the late cookie line below costs no second
+    // `unsafe`. It returns the ten words' worth of bytes; the assertion that
+    // the array and the length move together now lives there.
+    let bytes = tcp_report_bytes(hhdm, pages[0]);
+    debug_assert_eq!(bytes.len(), words.len() * 8);
     for (index, word) in words.iter_mut().enumerate() {
         let mut buffer = [0u8; 8];
         buffer.copy_from_slice(&bytes[index * 8..index * 8 + 8]);
@@ -19747,6 +19797,8 @@ fn user_shell(handoff: &Handoff) -> Result<(), &'static str> {
         // `put_run` stopped holding the console across a run and went to one
         // lock per byte, which is what tore the hosted line for weeks. It is
         // false here on a healthy boot, and a gate reads this line.
+        report_tcp_cookies_late(handoff.hhdm_base.as_u64());
+
         // **The mismark counter, read at the end rather than only at the ring.**
         //
         // It was printed in exactly one place: the wait-queue self-test, which
