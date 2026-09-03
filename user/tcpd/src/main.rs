@@ -551,6 +551,16 @@ struct Service {
     /// zero on a boot where a connection was accepted, the cookie path did not
     /// run and something older did.
     cookies_accepted: u64,
+    /// `SYN`s answered with a cookie, whether or not one ever came home.
+    ///
+    /// **The number that splits the open flake in §3.** `cookies_accepted` at
+    /// zero on a boot whose host-driven inbound connection was served says a
+    /// connection was built without the cookie path -- or that no inbound
+    /// `SYN` ever arrived and something else served it. Those are a serious
+    /// defect and an ordinary lost packet, and no counter told them apart.
+    /// This one does: offered above zero with accepted at zero is the `ACK`
+    /// not coming home; both at zero is the `SYN` never arriving.
+    cookies_offered: u64,
     connections: [Option<Connection>; MAX_CONNECTIONS],
     listener: Option<Listener>,
 }
@@ -1005,6 +1015,7 @@ fn answer_with_cookie(
     let Some(emit) = state::synack_for(parsed, cookie, WINDOW, state::DEFAULT_MSS) else {
         return;
     };
+    service.cookies_offered += 1;
     // The four-tuple, swapped: this end is the address the `SYN` arrived at and
     // the port it asked for.
     let back = FourTuple {
@@ -1608,10 +1619,15 @@ fn report(
     tcb_state: u64,
     accepted: u64,
     cookies: u64,
+    offered: u64,
     reclaimed: u64,
 ) {
+    // Eleven now: `offered` joined on 2026-09-03 to split §3's cookie flake
+    // into "the ACK never came home" and "the SYN never arrived". The kernel's
+    // reader sizes its slice from its own array, so the two move together.
     let words = [
         MARKER, state_bits, outcome, taken, sent, refused, tcb_state, cookies, reclaimed, accepted,
+        offered,
     ];
     // SAFETY: the page this program mapped writable, which nothing else
     // reaches. The marker is written last, so a kernel reading a partial report
@@ -1663,7 +1679,7 @@ extern "C" fn tcpd_main(hertz: u64) -> ! {
     }
     let mut bits = state_bits::ATTACHED;
     let networked = attach(BACK, BACK_AT, 1) && attach(CONFIG, CONFIG_AT, 0);
-    report(bits, outcome::PENDING, 0, 0, 0, 0, 0, 0, 0);
+    report(bits, outcome::PENDING, 0, 0, 0, 0, 0, 0, 0, 0);
 
     // **The refusal, before anything else.** A 128-bit secret from the
     // hardware, or nothing: `Key::draw` returns `None` if either half is
@@ -1677,11 +1693,11 @@ extern "C" fn tcpd_main(hertz: u64) -> ! {
         // exact bug the no-network arm below had already found and fixed.
         // The handover needs no key; only a sequence number does, and the
         // minted connection says so when asked.
-        report(bits, outcome::NO_ENTROPY, 0, 0, 0, 0, 0, 0, 0);
+        report(bits, outcome::NO_ENTROPY, 0, 0, 0, 0, 0, 0, 0, 0);
         serve_handover_only(tcp::NO_ENTROPY)
     };
     bits |= state_bits::KEYED;
-    report(bits, outcome::PENDING, 0, 0, 0, 0, 0, 0, 0);
+    report(bits, outcome::PENDING, 0, 0, 0, 0, 0, 0, 0, 0);
 
     if !networked {
         // No rings to a protocol service means no network, which is a state
@@ -1690,7 +1706,7 @@ extern "C" fn tcpd_main(hertz: u64) -> ! {
         // and mint connections — the handover needs no wire, and exiting
         // here would leave the endpoint dead with every caller queued
         // against it for ever.
-        report(bits, outcome::NO_NETWORK, 0, 0, 0, 0, 0, 0, 0);
+        report(bits, outcome::NO_NETWORK, 0, 0, 0, 0, 0, 0, 0, 0);
         serve_handover_only(tcp::UNREACHABLE)
     }
 
@@ -1721,7 +1737,7 @@ extern "C" fn tcpd_main(hertz: u64) -> ! {
         }
     }
     if me == Ipv4Addr::UNSPECIFIED {
-        report(bits, outcome::NO_NETWORK, 0, 0, 0, 0, 0, 0, 0);
+        report(bits, outcome::NO_NETWORK, 0, 0, 0, 0, 0, 0, 0, 0);
         serve_handover_only(tcp::UNREACHABLE)
     }
     bits |= state_bits::CONFIGURED;
@@ -1741,6 +1757,7 @@ extern "C" fn tcpd_main(hertz: u64) -> ! {
         refused: 0,
         unclaimed_reclaimed: 0,
         cookies_accepted: 0,
+        cookies_offered: 0,
         connections: [None, None],
         listener: None,
     };
@@ -1780,8 +1797,20 @@ extern "C" fn tcpd_main(hertz: u64) -> ! {
             service.connections[OUTBOUND]
                 .as_ref()
                 .map_or(0, |connection| state_number(&connection.tcb)),
-            service.cookies_accepted,
-            service.unclaimed_reclaimed,
+            // **In the parameter order, which they were not before 2026-09-03.**
+            //
+            // `report`'s `words` array indexes by parameter *name*, and this
+            // call passed `cookies_accepted` into `accepted`,
+            // `unclaimed_reclaimed` into `cookies`, and the accepted-slot word
+            // into `reclaimed`. The kernel reads that page by index, so it
+            // printed the reclaim count under "cookies", the slot's packed
+            // state as "N connection(s) ... reclaimed", and the real cookie
+            // count as the slot's state.
+            //
+            // `tcpd reclaim 65802 connection(s)` was the tell, on a boot that
+            // opened a handful: 0x1010A is a slot word -- occupied, claimed,
+            // state 10 -- printed as a count of connections ever since the
+            // cookie field was added.
             // **The accepted slot, which is the one that wedges** — RFC 0061.
             // `tcb_state` above is the *outbound* connection's, so the report
             // has never said anything about the slot this whole mechanism
@@ -1796,6 +1825,9 @@ extern "C" fn tcpd_main(hertz: u64) -> ! {
                 .map_or(0, |connection| {
                     state_number(&connection.tcb) | (u64::from(connection.claimed) << 8) | (1 << 16)
                 }),
+            service.cookies_accepted,
+            service.cookies_offered,
+            service.unclaimed_reclaimed,
         );
 
         declare_gift_slot(&connect_handover, &listen_handover);

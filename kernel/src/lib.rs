@@ -16394,7 +16394,7 @@ fn report_tcp_client(hhdm: u64) {
 fn tcp_report_bytes(hhdm: u64, frame: u64) -> &'static [u8] {
     // SAFETY: a frame the report object owns, through the direct map, read as
     // the ten little-endian words the service wrote there.
-    unsafe { core::slice::from_raw_parts((hhdm + frame) as *const u8, 80) }
+    unsafe { core::slice::from_raw_parts((hhdm + frame) as *const u8, 88) }
 }
 
 /// The cookie count again, at the end of the boot.
@@ -16450,7 +16450,7 @@ fn report_tcp_domain(hhdm: u64) {
     // reclaimed: word 9 carries the accepted slot's state and whether an
     // application holds it. The slice below is `words.len() * 8`, so this is
     // the only number to change.
-    let mut words = [0u64; 10];
+    let mut words = [0u64; 11];
     // SAFETY: a frame this object owns, through the direct map, read as the
     // **nine** little-endian words the service wrote there.
     //
@@ -16503,6 +16503,15 @@ fn report_tcp_domain(hhdm: u64) {
         "    tcpd cookies   {} connection(s) built from a verified SYN cookie; no state is held \
          for a peer that has proved nothing",
         words[7]
+    );
+    // **Offered against accepted, which is what tells the two apart.** A `SYN`
+    // answered with a cookie is counted here whether or not the `ACK` ever
+    // comes home. So `offered` above zero with `cookies` at zero is a handshake
+    // that started and did not finish; both at zero is a `SYN` that never
+    // arrived. §3's flake has only ever shown the second number.
+    println!(
+        "    tcpd offered   {} SYN(s) answered with a cookie, of which {} came home",
+        words[10], words[7]
     );
     // **RFC 0061, and a counter whose healthy value is zero.**
     //
