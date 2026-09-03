@@ -2999,6 +2999,27 @@ fn preempt_reporting() -> bool {
                 WAKE_TO_RUN_BUCKETS[bucket].fetch_add(1, Ordering::Relaxed);
             }
         }
+        // **Both slots checked before anything is handed over.**
+        //
+        // Everything below this point moves a piece of this CPU from the
+        // outgoing thread to the incoming one: the kernel stack, `current`,
+        // the floating-point file, the `FS` base, and the held-lock
+        // accounting. The two raw-pointer extractions at the end are fallible
+        // in the type system -- the slots are re-borrowed -- and their `else`
+        // arms used to `return false` from the middle of that sequence,
+        // leaving this CPU running the *outgoing* thread with five pieces of
+        // the *incoming* one installed.
+        //
+        // Restoring the accounting there is not enough, and that is measured
+        // rather than argued: forcing the arm with only the accounting undone
+        // faults the kernel outright. There is no partial undo, so the arms
+        // must not be reachable -- which this check makes true by
+        // construction, declining before the first handover instead of in the
+        // middle of the last.
+        if queue.threads[current].is_none() || queue.threads[next].is_none() {
+            restore_interrupts(interrupts_were_enabled);
+            return false;
+        }
         // A new thread starts a new quantum.
         if let Some((slice, stack)) = queue.threads[next]
             .as_ref()
@@ -3043,9 +3064,12 @@ fn preempt_reporting() -> bool {
         // lock so the swap cannot be observed half-done.
         let incoming_locks = queue.threads[next].as_ref().map_or(0, |t| t.held_locks);
         let incoming_count = queue.threads[next].as_ref().map_or(0, |t| t.held_count);
+        // Kept, not just stored: the decline paths below hand these back.
+        let outgoing_locks = crate::sync::held_mask();
+        let outgoing_count = crate::sync::holds_count();
         if let Some(thread) = queue.threads[current].as_mut() {
-            thread.held_locks = crate::sync::held_mask();
-            thread.held_count = crate::sync::holds_count();
+            thread.held_locks = outgoing_locks;
+            thread.held_count = outgoing_count;
             if thread.held_locks != 0 {
                 note_saved_holding(thread.id, thread.name, thread.held_locks, "preempt");
             } else if thread.held_count != 0 {
@@ -3127,6 +3151,17 @@ fn preempt_reporting() -> bool {
             .as_mut()
             .map(|thread| &raw mut thread.context)
         else {
+            // **Unreachable by the guard above, and counted in case that is
+            // wrong.** This is not an undo: four other pieces of this CPU have
+            // already gone to the incoming thread and cannot be handed back
+            // from here. Restoring the accounting and lowering `switching` is
+            // what *can* be done, and forcing this arm with only that done
+            // faults the kernel -- which is why the guard exists rather than
+            // this. A non-zero `HALF_SWITCHES` means the guard is wrong.
+            HALF_SWITCHES.fetch_add(1, Ordering::Relaxed);
+            crate::sync::set_held_mask(outgoing_locks);
+            crate::sync::set_holds_count(outgoing_count);
+            queue.switching = false;
             restore_interrupts(interrupts_were_enabled);
             return false;
         };
@@ -3134,6 +3169,10 @@ fn preempt_reporting() -> bool {
             .as_ref()
             .map(|thread| &raw const thread.context)
         else {
+            HALF_SWITCHES.fetch_add(1, Ordering::Relaxed);
+            crate::sync::set_held_mask(outgoing_locks);
+            crate::sync::set_holds_count(outgoing_count);
+            queue.switching = false;
             restore_interrupts(interrupts_were_enabled);
             return false;
         };
@@ -3773,6 +3812,40 @@ pub fn mark_blocked(id: u32) {
     }
 }
 
+/// Switches abandoned after this CPU's accounting had already been handed over.
+///
+/// **Zero is the only value seen, and the point is that it is now checked.**
+/// Both switch paths install the *incoming* thread's held mask and count, set
+/// `switching`, and only then take raw pointers to the two contexts. Those two
+/// steps are fallible in the type system -- the slots are re-borrowed, so each
+/// needs an `else` -- and their `else` arms used to return having done neither
+/// the switch nor an undo. This CPU would then keep running the **outgoing**
+/// thread while carrying the **incoming** thread's accounting, and the next
+/// guard the outgoing thread dropped would decrement a count that never
+/// counted it: the per-CPU hold count underflows to `u32::MAX`, and a CPU
+/// whose count reads -1 vetoes every preemption for ever.
+///
+/// That is the exact disease §3's wake-delay row has been hunting since
+/// 2026-08-17 and has never found a producer for. This is a producer. It is
+/// **not** a demonstrated one -- both slots were `Some` a few lines earlier
+/// under the same lock with interrupts off, so the arms look unreachable.
+///
+/// **And the accounting is only one of five.** By the time those arms are
+/// reached this CPU has also handed over its kernel stack, `queue.current`,
+/// the floating-point file and the `FS` base. Forcing the arm with the
+/// accounting restored and nothing else faults the kernel, measured
+/// 2026-09-03, so there is no undo to write: the arms have to be unreachable,
+/// and a guard before the first handover now makes them so. This counter says
+/// whether that guard is wrong, which is the only remaining question about
+/// them.
+static HALF_SWITCHES: AtomicU64 = AtomicU64::new(0);
+
+/// Switches abandoned between handing the accounting over and switching.
+#[must_use]
+pub fn half_switches() -> u64 {
+    HALF_SWITCHES.load(Ordering::Relaxed)
+}
+
 /// Times `mark_blocked` was asked to mark a thread that was not its caller.
 ///
 /// **Zero is the only correct value**, and a non-zero one is a thread put to
@@ -3967,6 +4040,13 @@ pub fn block_self() {
                 // capacity a thief would want.
                 None
             } else {
+                // As in `preempt`: both slots checked before the first
+                // handover, because there is no partial undo of the five that
+                // follow. See that guard's note.
+                if queue.threads[current].is_none() || queue.threads[next].is_none() {
+                    restore_interrupts(interrupts_were_enabled);
+                    return;
+                }
                 if let Some(thread) = queue.threads[next].as_mut() {
                     thread.state = State::Running;
                     thread.runs += 1;
@@ -4021,9 +4101,12 @@ pub fn block_self() {
                 }
                 let incoming_locks = queue.threads[next].as_ref().map_or(0, |t| t.held_locks);
                 let incoming_count = queue.threads[next].as_ref().map_or(0, |t| t.held_count);
+                // Kept, not just stored: the decline paths below hand these back.
+                let outgoing_locks = crate::sync::held_mask();
+                let outgoing_count = crate::sync::holds_count();
                 if let Some(thread) = queue.threads[current].as_mut() {
-                    thread.held_locks = crate::sync::held_mask();
-                    thread.held_count = crate::sync::holds_count();
+                    thread.held_locks = outgoing_locks;
+                    thread.held_count = outgoing_count;
                     if thread.held_locks != 0 {
                         note_saved_holding(thread.id, thread.name, thread.held_locks, "block_self");
                     } else if thread.held_count != 0 {
@@ -4038,6 +4121,12 @@ pub fn block_self() {
                     .as_mut()
                     .map(|thread| &raw mut thread.context)
                 else {
+                    // As in `preempt`: unreachable by the guard above, not an
+                    // undo, and counted in case the guard is wrong.
+                    HALF_SWITCHES.fetch_add(1, Ordering::Relaxed);
+                    crate::sync::set_held_mask(outgoing_locks);
+                    crate::sync::set_holds_count(outgoing_count);
+                    queue.switching = false;
                     restore_interrupts(interrupts_were_enabled);
                     return;
                 };
@@ -4045,6 +4134,10 @@ pub fn block_self() {
                     .as_ref()
                     .map(|thread| &raw const thread.context)
                 else {
+                    HALF_SWITCHES.fetch_add(1, Ordering::Relaxed);
+                    crate::sync::set_held_mask(outgoing_locks);
+                    crate::sync::set_holds_count(outgoing_count);
+                    queue.switching = false;
                     restore_interrupts(interrupts_were_enabled);
                     return;
                 };

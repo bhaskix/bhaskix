@@ -19654,6 +19654,28 @@ fn user_shell(handoff: &Handoff) -> Result<(), &'static str> {
         // block_unless)`. Both are monotonic, so sampling the share first
         // makes the pair describable: the total read afterwards is at least
         // the share read before it.
+        // **A switch abandoned after the accounting was handed over.**
+        //
+        // Both switch paths install the incoming thread's held mask and count,
+        // set `switching`, and only then take raw pointers to the two
+        // contexts. If either of those re-borrows had come back `None`, the
+        // old code returned having done neither the switch nor an undo -- this
+        // CPU running the outgoing thread with the incoming thread's
+        // accounting, so the next guard it dropped underflowed the hold count
+        // to `u32::MAX` and that CPU vetoed every preemption for ever. That is
+        // the disease §3's wake-delay row has hunted since 2026-08-17.
+        //
+        // The arms now hand the accounting back and lower `switching`. Zero is
+        // expected -- both slots were `Some` under this lock a few lines
+        // earlier -- and this line exists because "expected" and "checked" are
+        // different words.
+        let half = sched::half_switches();
+        if half > 0 {
+            println!(
+                "\x1b[91m    half switch    {half} switch(es) abandoned after this CPU's \
+                 accounting had been handed to the incoming thread\x1b[0m"
+            );
+        }
         let mismarked_unless = sched::mismarked_unless();
         let mismarked_total = sched::mismarked_blocks();
         if mismarked_total > 0 {
