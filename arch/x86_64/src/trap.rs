@@ -437,3 +437,124 @@ isr_common:
     iretq
 "#
 );
+
+#[cfg(test)]
+mod tests {
+    use super::{TrapFrame, implausible};
+
+    /// A frame the processor could have written, returning to ring 0.
+    fn kernel_frame() -> TrapFrame {
+        TrapFrame {
+            r15: 0,
+            r14: 0,
+            r13: 0,
+            r12: 0,
+            r11: 0,
+            r10: 0,
+            r9: 0,
+            r8: 0,
+            rbp: 0,
+            rdi: 0,
+            rsi: 0,
+            rdx: 0,
+            rcx: 0,
+            rbx: 0,
+            rax: 0,
+            vector: 14,
+            error_code: 0,
+            rip: 0xffff_ffff_8000_1234,
+            cs: 0x08,
+            rflags: 0x202,
+            rsp: 0xffff_8000_0ec8_d000,
+            ss: 0x10,
+        }
+    }
+
+    /// The same, returning to ring 3.
+    fn user_frame() -> TrapFrame {
+        TrapFrame {
+            rip: 0x0000_0000_0040_1234,
+            cs: 0x23,
+            ss: 0x1b,
+            rsp: 0x0000_7fff_ffff_e000,
+            ..kernel_frame()
+        }
+    }
+
+    /// **The half that matters most.** A check that rejects something the
+    /// machine does legitimately gets switched off, and then the fault it was
+    /// built for arrives unwitnessed. Both rings must pass untouched.
+    #[test]
+    fn the_frames_this_machine_actually_writes_are_not_rejected() {
+        assert_eq!(implausible(&kernel_frame()), None);
+        assert_eq!(implausible(&user_frame()), None);
+    }
+
+    #[test]
+    fn a_selector_the_kernel_never_installs_is_rejected() {
+        // The 2026-08-29 specimen: `#GP` at `iretq`, "referencing selector
+        // index 0x1325 in the GDT". Ring bits clear, so it claims ring 0, and
+        // it is not this kernel's one code selector.
+        let mut frame = kernel_frame();
+        frame.cs = 0x9928;
+        assert!(implausible(&frame).is_some());
+    }
+
+    #[test]
+    fn a_ring_zero_return_through_a_foreign_stack_selector_is_rejected() {
+        let mut frame = kernel_frame();
+        frame.ss = 0x28;
+        assert!(implausible(&frame).is_some());
+        // Zero is allowed on purpose: the processor writes it for a ring-0
+        // interrupt that did not change stacks, and rejecting it would fire on
+        // ordinary kernel faults.
+        frame.ss = 0;
+        assert_eq!(implausible(&frame), None);
+    }
+
+    #[test]
+    fn a_non_canonical_rip_or_rsp_is_rejected() {
+        let mut frame = kernel_frame();
+        frame.rip = 0x0001_0000_0000_0000;
+        assert!(implausible(&frame).is_some());
+
+        let mut frame = kernel_frame();
+        frame.rsp = 0xdead_0000_0000_0000;
+        assert!(implausible(&frame).is_some());
+    }
+
+    #[test]
+    fn flags_no_processor_writes_are_rejected() {
+        // Bit 1 reads as one on every x86 since the 8086, so a frame without
+        // it was not written by the processor.
+        let mut frame = kernel_frame();
+        frame.rflags = 0x200;
+        assert!(implausible(&frame).is_some());
+    }
+
+    /// Each rejection names a *different* field, so a witness line says which
+    /// one rather than only that something was wrong.
+    #[test]
+    fn each_rejection_names_the_field_it_found() {
+        let mut cs = kernel_frame();
+        cs.cs = 0x9928;
+        let mut ss = kernel_frame();
+        ss.ss = 0x28;
+        let mut rip = kernel_frame();
+        rip.rip = 1 << 63;
+        let mut rflags = kernel_frame();
+        rflags.rflags = 0;
+
+        let reasons = [
+            implausible(&cs).unwrap(),
+            implausible(&ss).unwrap(),
+            implausible(&rip).unwrap(),
+            implausible(&rflags).unwrap(),
+        ];
+        for (index, reason) in reasons.iter().enumerate() {
+            for other in &reasons[index + 1..] {
+                assert_ne!(reason, other, "two fields share one message");
+            }
+        }
+    }
+}

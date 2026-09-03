@@ -3799,6 +3799,29 @@ else
     status=1
 fi
 
+# **An interrupt frame this machine could not have returned through.**
+#
+# `implausible` brackets every dispatch: it checks the frame on the way in and
+# again on the way out, and records the first that fails either end. It exists
+# for §3's open fault -- a `#GP` at `isr_common`'s `iretq`, "referencing
+# selector index 0x1325 in the GDT", five sightings since 2026-08-25, whose
+# whole difficulty is that the fault lands at the one address every interrupt
+# returns through and so names nobody.
+#
+# The kernel printed that witness in red and **nothing failed on it**, so a
+# boot that caught the evidence for an open kernel fault went green and CI kept
+# no annotation. This is that gate. Absence is the assertion, so it is written
+# against the line the kernel only prints when the count is non-zero, and the
+# witness follows the marker indented past column 15 so the annotation carries
+# the fields rather than the count alone.
+if grep -q "frame check" "$LOG"; then
+    fail "an interrupt frame failed the plausibility check"
+    sed -n 's/.*frame check *\(.*\)/                   \1/p' "$LOG" | head -2
+    status=1
+else
+    pass "every interrupt frame was one this machine could return through"
+fi
+
 # Balancing. The previous assertion requires threads to stay where they were
 # created; this one requires them to move. They are not in tension: the first
 # runs with one thread per CPU, where there is no imbalance to correct, and
