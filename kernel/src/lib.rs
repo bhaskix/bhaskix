@@ -4512,10 +4512,25 @@ fn personality_boundary_report() {
         // above zero and `by_ipi` at zero is the old behaviour, and would mean
         // the IPI is not arriving or the handler is losing the race for the
         // queue lock.
+        //
+        // **Those two were named and not separable, which is the whole reason
+        // the third and fourth numbers are here (2026-09-03, RFC 0062 step 4).**
+        // `contended` counts the handler losing that lock; `idle` counts it
+        // running with no base to load, which is the ordinary case because
+        // `RESCHEDULE_VECTOR` is shared and this runs for every reschedule.
+        // So `by_ipi == 0` now reads three ways rather than one: with
+        // `contended` up, the handler is arriving and losing the lock; with
+        // `idle` up and `contended` zero, it is arriving and finding another
+        // thread current; with both zero, the IPI never reached the CPU at
+        // all. RFC 0062 called either of the first two "a bug in this RFC
+        // rather than a mystery" -- a sentence nothing could act on while the
+        // numbers behind it did not exist.
         let by_ipi = sched::fs_bases_loaded_by_ipi();
+        let (contended, idle) = sched::fs_base_ipi_misses();
         println!(
             "    linux tls      {elsewhere} FS base(s) set for a thread running on another cpu; \
-             {by_ipi} loaded there by RFC 0062's IPI rather than waiting for a switch"
+             {by_ipi} loaded there by RFC 0062's IPI rather than waiting for a switch \
+             ({contended} lost the queue lock, {idle} had nothing to load)"
         );
     }
     // **And every park that did not happen** — RFC 0054. A refused park loses a

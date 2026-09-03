@@ -1496,6 +1496,14 @@ pub(crate) fn refresh_fs_base_here() {
         return;
     }
     let Some(queue) = QUEUES[cpu].try_lock() else {
+        // **Counted, because RFC 0062 named this as one of two readings and
+        // could not tell them apart.** That RFC says a boot with `elsewhere`
+        // above zero and `by_ipi` at zero "would mean the IPI is not arriving
+        // or the handler is losing the race for the queue lock", and calls
+        // either "a bug in this RFC rather than a mystery" -- but nothing
+        // distinguished them, so the sentence could not be acted on. A miss
+        // here is the second reading, and only this counter shows it.
+        FS_BASE_IPI_CONTENDED.fetch_add(1, Ordering::Relaxed);
         return;
     };
     let current = queue.current;
@@ -1509,11 +1517,39 @@ pub(crate) fn refresh_fs_base_here() {
         // SAFETY: as `load_fs_base` — a user-mode segment base for the thread
         // this CPU is about to return to.
         unsafe { load_fs_base(base) };
+    } else {
+        // **The handler ran and had nothing to do**, which is the *expected*
+        // outcome most of the time and is not a failure: `RESCHEDULE_VECTOR`
+        // is shared, so this runs for every reschedule IPI and not only for a
+        // base. Counted so that `by_ipi == 0` can be read: with this above
+        // zero the handler is arriving and finding another thread current, and
+        // with both this and the contended count at zero the IPI itself never
+        // reached the CPU -- which is the first reading RFC 0062 named.
+        FS_BASE_IPI_NO_CHANGE.fetch_add(1, Ordering::Relaxed);
     }
 }
 
 /// Bases put in the register by RFC 0062's IPI rather than by a switch.
 static FS_BASES_LOADED_BY_IPI: AtomicU64 = AtomicU64::new(0);
+
+/// Times the IPI handler could not take this CPU's runqueue lock.
+static FS_BASE_IPI_CONTENDED: AtomicU64 = AtomicU64::new(0);
+
+/// Times the IPI handler ran with no base to load.
+static FS_BASE_IPI_NO_CHANGE: AtomicU64 = AtomicU64::new(0);
+
+/// What the IPI handler did when it did not load a base — RFC 0062 step 4.
+///
+/// `(contended, no_change)`. Together with [`fs_bases_loaded_by_ipi`] these
+/// separate the two readings that RFC 0062 could only name: the handler losing
+/// the queue lock, and the IPI never arriving at all.
+#[must_use]
+pub fn fs_base_ipi_misses() -> (u64, u64) {
+    (
+        FS_BASE_IPI_CONTENDED.load(Ordering::Relaxed),
+        FS_BASE_IPI_NO_CHANGE.load(Ordering::Relaxed),
+    )
+}
 
 /// How many bases the IPI loaded — RFC 0062.
 #[must_use]

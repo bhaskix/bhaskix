@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | 🔨 **Draft 2026-09-01 — steps 1–3 built, step 4 partly.** The mechanism is proven end to end; the race it closes was **not** reproduced, so the fix is reasoned rather than demonstrated, and the counter is what will settle it |
+| **Status** | 🔨 **Draft 2026-09-01 — steps 1–4 built as of 2026-09-03.** The mechanism is proven end to end; the race it closes was **not** reproduced, so the fix is reasoned rather than demonstrated. Step 4's counters now make this RFC's own two readings separable, and the first thing they measured is that the handler loses the queue lock about 4% of the times it runs — see "What step 4 measured" |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | kernel / scheduler |
 | **Milestone** | Phase 2 — core operating system |
@@ -96,3 +96,54 @@ must stop being the last word on the window.
 - It does not touch `LoadedHere` or `NotRunning`, which were already correct.
 - It adds an IPI to a path that runs once or twice per hosted process start.
   That is the price, and it is paid only when the target is running elsewhere.
+
+
+---
+
+## What step 4 measured (2026-09-03)
+
+Step 4 asked for the boot report to gain the count of bases loaded by IPI, and for
+`FS_BASE_SET_ELSEWHERE` to "stop being the last word on the window". It had one number, and this
+RFC's own text names two readings behind it:
+
+> `elsewhere > 0` with `by_ipi` still zero would mean the IPI is not arriving or the handler is
+> losing the queue lock, and either is a bug in this RFC rather than a mystery.
+
+Nothing distinguished them, so that sentence could not be acted on. Two counters now do:
+`contended` when `refresh_fs_base_here` cannot take this CPU's runqueue lock, and `idle` when it
+runs with no base to load — the ordinary case, because `RESCHEDULE_VECTOR` is shared and the
+handler runs for every reschedule. `by_ipi == 0` therefore reads three ways: `contended` up means
+the handler arrives and loses the lock; `idle` up with `contended` zero means it arrives and finds
+another thread current; both zero means the IPI never reached the CPU.
+
+**The measurement.** On an unforced boot the line does not print at all — `elsewhere` is zero, so
+the window never opened, which is consistent with "once or twice in three hundred boots". Forcing
+every `set_fs_base` to take the `FollowsAtNextSwitch` path, as this RFC's earlier verification did,
+gives:
+
+```
+linux tls      3 FS base(s) set for a thread running on another cpu; 0 loaded there by RFC 0062's
+               IPI rather than waiting for a switch (177 lost the queue lock, 4410 had nothing to
+               load)
+```
+
+**177 losses in 4,587 handler runs — about 3.9%.** That is the second reading, measured for the
+first time.
+
+**What follows, and what does not.** Step 3 says a miss "falls back to the old behaviour — the
+base arrives at the next switch — which is strictly no worse than today", and that remains true:
+this is not a regression, and the fix is still an improvement on every attempt that lands. What is
+now known is that it is **not airtight** — roughly one attempt in twenty-five is expected to be
+dropped by `try_lock`, so the window this RFC closes "by construction" is closed about 96% of the
+time rather than always.
+
+Two limits on that number, stated rather than left for a reader to find. It was taken with the
+branch forced, so the three `set_fs_base` calls are not themselves the population; and the handler
+runs on every reschedule, so 4,587 is dominated by ordinary IPI traffic rather than by base-carrying
+ones. The 3.9% is therefore the handler's general lock-loss rate, and applying it to a base-carrying
+IPI is an inference from that rate, not a direct measurement of one.
+
+**The next step this suggests, unimplemented.** Making the load not depend on winning a lock — a
+per-CPU pending-base slot the interrupt-return path can consume without taking the runqueue — would
+close the remaining 4%. That is a design change rather than a constant, and it is named here so it
+is a known cost rather than a surprise.
