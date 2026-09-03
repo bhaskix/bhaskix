@@ -134,14 +134,29 @@ The bisect is the useful part: **with the run forced to one block the new code p
 copy, the IPC shape and the reply check are all right, and it is the multi-block case alone that
 fails. That leaves the payload.
 
-**What this RFC did not account for.** `bin/blkd` describes the payload to the device as *one*
-virtio descriptor, `queue.describe(1, device_address(ring::DATA), (count * 512) as u32, ..)`. One
-descriptor is one contiguous buffer as the device sees it. At eight sectors that is a single page and
-contiguity is free; at sixty-four it spans eight pages of a shared object whose frames need not be
-adjacent, and the device address is whatever the window gives. Making the transfer longer therefore
-needs either a descriptor **chain** — one entry per page, which virtio supports and this ring is
-already shaped for — or a payload area that is physically contiguous by construction.
+**What this RFC did not account for — WITHDRAWN 2026-09-03, it was wrong.** The explanation
+written here on the day was that `bin/blkd` describes the payload as *one* virtio descriptor, so a
+sixty-four-sector transfer would span eight pages of a shared object whose frames need not be
+adjacent, and that batching therefore needed a descriptor chain or a physically contiguous payload
+area. It was recorded as unchecked. It has now been checked, and every part of it is false.
 
-That is a real piece of work rather than a constant, and it is what the plan below now says. The
-measurement that motivated the RFC is unchanged: the format is the larger half of the disk's boot
-cost, at 3.4–8.3 ms a block, and 128 blocks of it.
+* **The device already sees the object contiguously.** `iommu::map_memory` allocates one contiguous
+  device-address range and places each frame at its own offset inside it, and says why in its own
+  comment: *"the object's frames need not be contiguous in physical memory, and the device needs
+  them contiguous in its address space — which is most of what an IOMMU is for."* Physical
+  adjacency is exactly what the window makes irrelevant.
+* **The ring layout already fits sixty-four sectors**, and says so at compile time:
+  `assert!(DATA + SECTORS * 512 <= REPORT)` holds with no slack — `0x2800 + 0x8000 == 0xa800`.
+* **The object is already big enough.** Step 1 made the kernel size it from
+  `block_ring::PAGES`, twelve frames, rather than the literal four it used before.
+
+So there is no descriptor chain to write and no contiguity problem to solve. **Step 3's failure is
+unexplained again**, and this section is left saying that rather than carrying a mechanism that
+reads like an answer. What remains true and measured is the bisect — one block works, eight do not
+— and everything it eliminates: the copy, the IPC shape and the reply check are all correct.
+
+The next diagnosis has to start from the parts this never examined: the sector number computed for
+a batched request, and what `bin/fsd`'s journal expects of a write that covers eight blocks at once.
+
+The measurement that motivated the RFC is unchanged: the format is the larger half of the disk's
+boot cost, at 3.4–8.3 ms a block, and 128 blocks of it.

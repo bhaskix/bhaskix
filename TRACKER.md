@@ -1096,6 +1096,26 @@ larger `SECTORS`, and nothing else". That was wrong, and it was wrong in the dir
 keeps being wrong in: the near side read carefully, the far side — here the device's view of a
 buffer — assumed.
 
+**And the replacement was wrong too — withdrawn 2026-09-03.** The paragraph above was recorded as
+an unchecked hypothesis. It is now checked, and all three of its parts are false.
+`iommu::map_memory` allocates one contiguous device-address range and places each frame at its own
+offset inside it, saying in its own comment that *"the object's frames need not be contiguous in
+physical memory, and the device needs them contiguous in its address space — which is most of what
+an IOMMU is for"* — so physical adjacency is exactly what the window makes irrelevant. The ring
+layout already fits sixty-four sectors and asserts it at compile time with no slack at all,
+`0x2800 + 0x8000 == 0xa800`. And step 1 already sized the object from `block_ring::PAGES`, twelve
+frames. There is no descriptor chain to write and no contiguity problem to solve.
+
+So **step 3 is unexplained again**, which is a worse position than the one this entry claimed and an
+honest one. What survives is the bisect — one block works, eight do not — and what it eliminates:
+the copy, the IPC shape and the reply check. The next diagnosis starts where this never looked: the
+sector number computed for a batched request, and what `bin/fsd`'s journal expects of a write
+covering eight blocks at once.
+
+The lesson does not change, it repeats — the far side assumed twice over the same defect, the
+second time about the IOMMU's entire purpose. What is new is how it was caught: not by another
+boot, but by reading the far side before building on the guess.
+
 ### 2026-09-02 (a section heading that contradicted its own table)
 
 §3's opening paragraph said M4's exit criterion "will not be met until SMP lands — it requires N
