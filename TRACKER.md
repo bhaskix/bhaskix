@@ -880,6 +880,36 @@ This does not fix either defect. What it changes is where they would be caught: 
 number and the value, instead of three layers away in a gate that could only say the probe's report
 looked wrong.
 
+### 2026-09-03 (a bulk copy that wrote every page to the same address)
+
+Setting out to write RFC 0067 step 3's descriptor chain -- which turned out not to be needed, see
+the entry below -- meant reading the far side properly for once, and the far side had a defect.
+
+`DRAIN` and `FILL` are the bulk-copy syscalls between a service and its caller's shared object.
+Both hand a closure to a helper (`shared::drain_into`, `shared::fill_from`) that walks the object
+**one frame at a time**, calling the closure per frame. Both closures captured the service-side
+address -- `destination` for `DRAIN`, `source` for `FILL` -- and **never advanced it**. So a call
+spanning more than one frame wrote every frame to the same address, and returned the *sum* of the
+lengths, so the caller saw a full-length success. One frame was correct; anything larger was
+silently wrong in the data and right in the count.
+
+**Why nothing had caught it.** No caller asked for more than a frame in one call. `bin/blkd`'s
+`SECTORS` was 8, and eight sectors is 4096 bytes -- exactly one frame, which is why that constant
+looked like a device limit and was really a page limit. RFC 0067 step 1 raised `SECTORS` to 64,
+which is the first thing in this tree that could ask for eight. `FILL`'s own comment records the
+symptom from outside without naming it: a service *"wrote the first page and reported that as the
+whole file"*, and `arg3` was added so a caller could iterate a page at a time rather than fixing
+this.
+
+Both now advance by the bytes already moved, with `checked_add`.
+
+**What this does not claim.** Whether it is what broke step 3 is **not verified**. There is a
+second candidate with the same shape: `DiskStore::page()` returns *one* frame through the direct
+map, so step 3's copy of eight blocks into "the object's frames" assumed those frames are
+physically adjacent -- which `iommu::map_memory` says in as many words they need not be. Either
+would produce the observed bisect, one block working and eight not. Step 3 stays reverted and both
+candidates are now written down, which is more than it had this morning.
+
 ### 2026-09-03 (a sweep for counters nothing reads, and what it found)
 
 Five separate findings today shared one shape: an instrument built for an open defect, landing its

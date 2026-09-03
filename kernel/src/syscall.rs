@@ -1715,6 +1715,20 @@ fn dispatch_inner(frame: &mut SyscallFrame) -> Outcome {
 
         let destination = frame.arg1;
         let limit = frame.arg2 as usize;
+        // **Advanced per frame, because the sink is called once per frame.**
+        //
+        // `drain_into` walks the object a frame at a time and hands each one
+        // to this closure. `destination` is captured, so without this every
+        // frame was written to the *same* address: the service saw the last
+        // page of the object repeated, and the returned length was the full
+        // sum, so it had no way to tell. One page was correct and everything
+        // larger was silently wrong.
+        //
+        // Found on 2026-09-03 from the other end -- RFC 0067 step 3 batches
+        // eight blocks into one `block::WRITE`, and eight blocks is eight
+        // pages. The old `SECTORS = 8` limit is exactly 4096 bytes, one frame,
+        // which is why nothing had ever exercised this.
+        let mut moved = 0usize;
         let taken = crate::shared::drain_into(object, limit, &mut |bytes: &[u8]| {
             // Into the service's own address space, through the exception
             // table: a service that named an address it does not own gets a
@@ -1725,9 +1739,22 @@ fn dispatch_inner(frame: &mut SyscallFrame) -> Outcome {
             // fault-protected write -- an unmapped or read-only destination is
             // a failure it reports rather than a fault it takes. `destination`
             // is not dereferenced anywhere else.
-            let copied =
-                unsafe { bhaskix_arch::uaccess::copy_to_user(destination, bytes.as_ptr(), len) };
-            if copied.is_ok() { len } else { 0 }
+            let Some(at) = destination.checked_add(moved as u64) else {
+                return 0;
+            };
+            // SAFETY: `bytes` is a kernel-visible view of frames the caller's
+            // object owns, of `len` bytes, and `copy_to_user` is the
+            // fault-protected write -- an unmapped or read-only destination is
+            // a failure it reports rather than a fault it takes. `at` is
+            // `destination` advanced by the bytes already moved, and is not
+            // dereferenced anywhere else.
+            let copied = unsafe { bhaskix_arch::uaccess::copy_to_user(at, bytes.as_ptr(), len) };
+            if copied.is_ok() {
+                moved += len;
+                len
+            } else {
+                0
+            }
         });
         return match taken {
             Some(taken) => Outcome::ok(taken as u64),
@@ -1766,6 +1793,14 @@ fn dispatch_inner(frame: &mut SyscallFrame) -> Outcome {
         // the whole file. The nucleus placement, calling `fill_from` directly,
         // spanned every frame. Two placements, two answers, silently.
         let offset = frame.arg3 as usize;
+        // Advanced per frame, for the reason given at `DRAIN` above: this
+        // closure is called once per frame and `source` is captured, so
+        // without it every frame was filled from the same user address. The
+        // comment above about a service that "wrote the first page and
+        // reported that as the whole file" is this defect seen from outside,
+        // and `arg3` let a caller work around it one page at a time rather
+        // than fixing it.
+        let mut moved = 0usize;
         let written = crate::shared::fill_from(object, offset, limit, &mut |bytes: &mut [u8]| {
             // From the domain's own address space, through the exception
             // table: a service that passed an address it does not own gets a
@@ -1775,9 +1810,22 @@ fn dispatch_inner(frame: &mut SyscallFrame) -> Outcome {
             // `copy_from_user` is the fault-protected read -- an unmapped or
             // unreadable source is a failure it reports rather than a fault it
             // takes. `source` is not dereferenced anywhere else.
+            let Some(at) = source.checked_add(moved as u64) else {
+                return 0;
+            };
+            // SAFETY: `bytes` is a kernel buffer of `taken` bytes, and
+            // `copy_from_user` is the fault-protected read -- an unmapped or
+            // unreadable source is a failure it reports rather than a fault it
+            // takes. `at` is `source` advanced by the bytes already moved, and
+            // is not dereferenced anywhere else.
             let copied =
-                unsafe { bhaskix_arch::uaccess::copy_from_user(bytes.as_mut_ptr(), source, taken) };
-            if copied.is_ok() { taken } else { 0 }
+                unsafe { bhaskix_arch::uaccess::copy_from_user(bytes.as_mut_ptr(), at, taken) };
+            if copied.is_ok() {
+                moved += taken;
+                taken
+            } else {
+                0
+            }
         });
         return match written {
             Some(written) => Outcome::ok(written as u64),
