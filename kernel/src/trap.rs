@@ -315,6 +315,35 @@ fn handle(frame: &mut TrapFrame) {
         end_faulting_domain();
     }
 
+    // **The frame witness, here as well as in the boot report.**
+    //
+    // `implausible_frames` carries the first interrupt frame this machine
+    // could not have returned through, and its own documentation says the
+    // kernel "reads these and says so in its boot report *and in its own fault
+    // path*". Only the first half was true: nothing in this file read it. A
+    // boot that dies never reaches the boot report, which is precisely the
+    // boot where §3's five-sighting frame fault is happening -- one on
+    // 2026-09-03 halted here with the witness recorded and unprinted.
+    //
+    // Printed before the halt banner so it is the last thing above it, and
+    // only when there is something to say.
+    let (count, witness, on_entry) = bhaskix_arch::trap::implausible_frames();
+    if count > 0 {
+        let [vector, rip, cs, rflags, rsp, ss] = witness;
+        println!(
+            "  {count} interrupt frame(s) failed the plausibility check; the first was {}",
+            if on_entry {
+                "already wrong on arrival, so it was written before that dispatch"
+            } else {
+                "wrong on the way out, so it was written during that handler"
+            }
+        );
+        println!(
+            "    vector {vector:#x} rip {rip:#018x} cs {cs:#x} rflags {rflags:#x} rsp \
+             {rsp:#018x} ss {ss:#x}"
+        );
+    }
+
     println!("  Halting. A fault in the kernel is the kernel's own bug: there is");
     println!("  no other domain to blame, and no state left worth trusting.");
     println!("==================================================================");

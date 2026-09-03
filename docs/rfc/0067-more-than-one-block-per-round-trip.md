@@ -198,3 +198,36 @@ adjacent. It also kept the crate's unsafe budget at zero headroom rather than ne
 
 **Measured**, on the iommu lane: `disk format 128 block(s) written in 93 ms; 726 us per block`,
 against 321 ms and about 2.5 ms a block before. Roughly 3.5x, from eight blocks per round trip.
+
+
+---
+
+## Which half dominates, answered (2026-09-03)
+
+This RFC's motivation says the format *"writes every block of the filesystem rather than only the
+used ones"*, that growing the filesystem to hold BusyBox costs there as well as in staging, and that
+**nothing has measured which of the two dominates**. Step 3 made the format fast enough for the
+question to be worth asking, so it was measured.
+
+**Staging dominates, in every boot, and the margin is not a number.** Five boots of the iommu lane
+on one host, one unchanged image:
+
+| | `disk format` (128 blocks) | `hosted stage` (19 blocks) |
+|---|---|---|
+| | 72 ms | 130 ms |
+| | 74 ms | 588 ms |
+| | 74 ms | 134 ms |
+| | 93 ms | 120 ms |
+| | — | 298 ms, 2033 ms |
+
+The format holds a 30% band. Staging spans **seventeenfold** for the same nineteen blocks. Both go
+through the same block service and the same ring, so a busy host would move them together and does
+not.
+
+So the answer to "which dominates" is staging, and the answer worth having is that its cost is not
+a constant. That is filed as its own defect in `TRACKER.md` §3 rather than treated as a tuning
+target here: batching a path whose cost varies by 17x would be optimising the wrong half of the
+problem, and the difference between the two paths — staging goes through the filesystem, the
+format writes blocks directly — is where to look.
+
+The `hosted stage` line no longer prints its extrapolation as though it were the machine's cost.

@@ -10239,9 +10239,23 @@ fn hosted_exec_self_test(hhdm_base: u64, cpus: u32) -> bool {
         && hertz > 0
     {
         let per_block = cycles / blocks;
+        // **"At this boot's rate", because this number is not a property of
+        // the machine.** Five boots of the iommu lane on one host on
+        // 2026-09-03 measured this path at 120, 130, 298, 588 and 2033 ms for
+        // the same nineteen blocks -- a seventeenfold spread, against a `disk
+        // format` that held 72-93 ms across the same boots. Extrapolating
+        // 531 blocks from one sample of it therefore ranges from about three
+        // and a half seconds to nearly a minute, and the line used to state
+        // whichever one it drew as though it were the cost.
+        //
+        // The projection is kept because it is the only thing that says
+        // whether BusyBox is minutes or milliseconds away, and it is now
+        // labelled as what it is: one sample, extrapolated. The spread itself
+        // is the open question, recorded in §3.
         println!(
             "    hosted stage   {staged} bytes in {blocks} block(s), {} ms; {} us per block, so \
-             BusyBox's 531 blocks would cost about {} ms here",
+             at this boot's rate BusyBox's 531 blocks would cost about {} ms -- one sample, and \
+             this path is not steady across boots",
             cycles * 1_000 / hertz,
             per_block * 1_000_000 / hertz,
             per_block * 531 * 1_000 / hertz
