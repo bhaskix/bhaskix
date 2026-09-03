@@ -3213,6 +3213,25 @@ fn two_wake_sources_self_test(cpu: u32, hhdm_base: u64) -> bool {
                 None => " (the hand signal was accepted, so it lost the race)",
             }
         );
+        // **Which notification the sleeper actually parked on**, indented past
+        // column 15 so CI's annotation carries it.
+        //
+        // `TWO_SOURCE_ID` has been written by `parks_on_two` since this test
+        // was built and read by nothing -- found by sweeping for static
+        // atomics that are stored and never loaded. It is the one number that
+        // separates "this notification woke wrongly" from "a different
+        // notification woke it", which is what this row's open question --
+        // *whatever sets `BY_TIMER` in round one arrives by another route* --
+        // is asking. The count of deadlines still armed goes with it, because
+        // a route through a second armed deadline would show as one.
+        let parked_on = TWO_SOURCE_ID.load(core::sync::atomic::Ordering::Acquire);
+        println!(
+            "\x1b[91m                   the sleeper parked on notification {}.{}, and {} \
+             deadline(s) were armed when this was read\x1b[0m",
+            parked_on as u32,
+            (parked_on >> 32) as u32,
+            notify::armed_deadlines()
+        );
         if let Some(error) = signal_refused {
             println!("\x1b[91m    two sources    the refusal was {error:?}\x1b[0m");
         }
