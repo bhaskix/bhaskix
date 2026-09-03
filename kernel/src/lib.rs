@@ -3257,6 +3257,16 @@ fn two_wake_sources_self_test(cpu: u32, hhdm_base: u64) -> bool {
             (parked_on >> 32) as u32,
             notify::armed_deadlines()
         );
+        // **Whose those deadlines are**, which is the half that answers the
+        // row rather than describing it: a deadline owned by the notification
+        // the sleeper parked on is this test's own arriving early, and one
+        // owned by any other is the "other route" §3 has been looking for.
+        notify::armed_deadline_owners(|index, generation| {
+            println!(
+                "\x1b[91m                   a deadline is armed on notification \
+                 {index}.{generation}\x1b[0m"
+            );
+        });
         if let Some(error) = signal_refused {
             println!("\x1b[91m    two sources    the refusal was {error:?}\x1b[0m");
         }

@@ -505,6 +505,23 @@ pub fn earliest_deadline() -> Option<u64> {
         .min()
 }
 
+/// Calls `each` with the `(index, generation)` of every armed deadline's owner.
+///
+/// **The half `armed_deadlines` leaves out, and the half §3 needs.** That row's
+/// open question is whether a `BY_TIMER` badge in round one comes from the
+/// test's own deadline arriving early or from *another* notification's. A count
+/// cannot say; an owner can. CI run 568 is the first specimen to carry the
+/// sleeper's notification -- `29.1`, with one deadline armed -- and the only
+/// thing still missing is whose that deadline was.
+pub fn armed_deadline_owners(mut each: impl FnMut(u32, u32)) {
+    for slot in &DEADLINES {
+        let who = slot.who.load(Ordering::Acquire);
+        if who != 0 {
+            each(who - 1, slot.generation.load(Ordering::Acquire));
+        }
+    }
+}
+
 /// How many deadlines are armed, for reporting.
 #[must_use]
 pub fn armed_deadlines() -> usize {
