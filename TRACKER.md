@@ -880,6 +880,35 @@ This does not fix either defect. What it changes is where they would be caught: 
 number and the value, instead of three layers away in a gate that could only say the probe's report
 looked wrong.
 
+### 2026-09-03 (auditing yesterday's fix found a buffer it had just made reachable)
+
+Fixing `DRAIN`/`FILL` to advance the service-side address changes what an **oversized** length does.
+Before, a length larger than the service's buffer was harmless nonsense: every frame was written to
+the same address, so nothing could reach past one frame. After, the copy walks forward, and a
+caller that asks for more than its buffer holds overruns it. So every caller of both syscalls was
+audited against the new invariant -- **`limit` must not exceed the destination buffer** -- rather
+than assuming the fix was free.
+
+Four of five hold it by construction and say so in their own code. `bin/fsd` refuses `length > 4096`
+against a 4096-byte buffer, with the comment *"a limit announced beats a truncation discovered"*.
+`bin/ipd` clamps to `DATAGRAM`, its buffer's own size. `bin/blkd`'s `count * 512` is bounded by
+`ring::SECTORS` at exactly the payload area the layout asserts room for. `bin/vfsd` passes a length
+bounded by its buffer and uses `arg3` for the object-side offset.
+
+**`bin/ahcid` did not.** Its length is `sectors * identity.sector_bytes`; `clamp_sectors` caps the
+count at one, but `sector_bytes` comes from the **device** -- `ahci::identify` accepts any power of
+two at or above 512 and sets no ceiling -- while the staging area is one page, `BUFFER_AT` to
+`REPORT_AT`. A disk announcing 8192-byte sectors would have had the kernel copy 8192 bytes into it,
+over the report page that follows. Harmless while the nucleus could not advance past one frame;
+a driver-side overrun the moment it could.
+
+Now bounded by `BUFFER_BYTES`, and **refused rather than truncated** on the write path -- a short
+write to a disk is a corrupted sector -- using the same `block::REFUSED` answer the out-of-range
+check beside it already gives. Neither path is reachable on any emulator lane here: the SR550 is the
+only machine with a SATA controller this driver drives, and its disks are on a RAID-mode controller
+it refuses by name. So this is a fix that compiles and is reasoned, with no boot behind it, and it
+is recorded that way.
+
 ### 2026-09-03 (RFC 0067 step 3 lands, and the defect that blocked it is isolated)
 
 The bulk-copy defect filed in the entry below is **the** cause of step 3's failure, not a candidate

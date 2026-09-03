@@ -107,6 +107,21 @@ const TABLE_AT: u64 = 0x1000;
 /// buffer a *device* writes and nothing else may share a page with it.
 const BUFFER_AT: u64 = 0x2000;
 
+/// How many bytes the data buffer at [`BUFFER_AT`] can hold.
+///
+/// **A bound the transfer length needs and did not have.** The length handed
+/// to `FILL`/`DRAIN` is `sectors * identity.sector_bytes`, and `sector_bytes`
+/// comes from the *device*: `ahci::identify` accepts any power of two at or
+/// above 512 and sets no ceiling. `clamp_sectors` caps the count at one, so a
+/// disk announcing 8192-byte sectors asks the kernel to move 8192 bytes into
+/// the page that starts here -- and the report lives in the next one.
+///
+/// It was harmless while the nucleus wrote every frame of a bulk copy to the
+/// same address, because that could never advance past this page. Fixing that
+/// on 2026-09-03 turned a wrong-data bug into a buffer this driver would
+/// overrun, on a device it has never met. Bounded here rather than trusted.
+const BUFFER_BYTES: u64 = 0x3000 - 0x2000;
+
 /// Where in it the report sits: the **last** of the four pages.
 ///
 /// Every earlier one becomes a command list, a received-FIS area or a data
@@ -355,7 +370,7 @@ fn serve(
                     // Into the caller's memory, named by a slot in the
                     // *caller's* CSpace -- which the kernel re-checks and which
                     // this service could not have chosen.
-                    Some(bytes) => {
+                    Some(bytes) if bytes <= BUFFER_BYTES => {
                         let (filled, landed) = call(
                             syscall::INVOKE,
                             BLOCK_ENDPOINT,
@@ -364,7 +379,8 @@ fn serve(
                         );
                         if filled == status::OK { landed } else { 0 }
                     }
-                    None => 0,
+                    // A sector this driver's buffer cannot hold, or no plan.
+                    _ => 0,
                 }
             }
             block::WRITE => {
@@ -373,10 +389,16 @@ fn serve(
                 // in a way the *device* cannot imitate: a disk refuses an
                 // out-of-range write too, so answering zero would make this
                 // check and its absence indistinguishable from outside.
-                if ahci::plan_write(identity, args[0], sectors, ahci::IDENTIFY_BYTES).is_err() {
+                let bytes = u64::from(sectors) * u64::from(identity.sector_bytes);
+                // A sector larger than the staging page is refused with the
+                // out-of-range answer rather than truncated: a short write to a
+                // disk is a corrupted sector, and this driver cannot stage the
+                // whole of one it was never sized for. See `BUFFER_BYTES`.
+                if ahci::plan_write(identity, args[0], sectors, ahci::IDENTIFY_BYTES).is_err()
+                    || bytes > BUFFER_BYTES
+                {
                     block::REFUSED
                 } else {
-                    let bytes = u64::from(sectors) * u64::from(identity.sector_bytes);
                     let (taken, got) = call(
                         syscall::INVOKE,
                         BLOCK_ENDPOINT,
