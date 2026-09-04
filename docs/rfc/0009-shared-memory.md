@@ -111,6 +111,21 @@ sixteen `MAP` calls to place it, each of which can fail separately — leaving a
 partially mapped buffer nobody named. One object with a length is one
 allocation, one map, one failure mode, and one thing to revoke.
 
+**The bulk syscalls did not deliver that until 2026-09-04, and this is where it
+should be written down.** "One object with a length is one allocation, one map,
+one failure mode" is the argument above, and `DRAIN` and `FILL` are how a
+service moves such an object's bytes. Both walked the object one frame at a time
+— correctly — and handed each frame to a closure that wrote it to the *same*
+service-side address, because the address was captured and never advanced. A
+call spanning more than one frame therefore wrote every frame over the last, and
+returned the sum of their lengths, so the caller saw a full-length success with
+the wrong data.
+
+Nothing had reached it because nothing had asked for more than a frame in one
+call: `bin/blkd`'s `SECTORS` was 8, and eight sectors is 4096 bytes, exactly one
+frame. That constant read like a device limit and was a page limit. RFC 0067
+raising it is what first asked this design to keep the promise made here.
+
 `ObjectKind::Frame` and `ObjectKind::Untyped` are declared and unused. This
 RFC proposes **deleting `Untyped`** and keeping `Frame` for the one case that
 genuinely wants a single page (a device register window). See *Unresolved
