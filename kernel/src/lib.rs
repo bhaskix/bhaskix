@@ -19679,7 +19679,18 @@ fn user_shell(handoff: &Handoff) -> Result<(), &'static str> {
         // every boot at about 3.03 seconds while p99 stayed near 3,489 us.
         let (task_ticks, task_thread) = sched::wake_to_run_worst_task();
         if task_ticks > 0 {
-            let task_name = sched::describe(task_thread).map_or("?", |(name, _)| name);
+            // **Named from what was recorded when it waited**, not looked up
+            // now: a test thread that waited and exited is in no runqueue by
+            // the time this prints, and the first version of this line said
+            // `thread 15 (?)` and left the owner to be inferred from other
+            // boots' thread numbering.
+            let (name_bytes, name_len) = sched::wake_to_run_worst_name();
+            let recorded = core::str::from_utf8(&name_bytes[..name_len]).unwrap_or("?");
+            let task_name = if recorded.is_empty() {
+                sched::describe(task_thread).map_or("?", |(name, _)| name)
+            } else {
+                recorded
+            };
             println!(
                 "                   worst for any other thread {} us, thread {task_thread} \
                  ({task_name})",

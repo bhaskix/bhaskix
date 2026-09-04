@@ -804,6 +804,15 @@ static WAKE_TO_RUN_WORST: AtomicU64 = AtomicU64::new(0);
 /// it for why the boot thread's wait is a phase rather than a delay.
 static WAKE_TO_RUN_WORST_TASK: AtomicU64 = AtomicU64::new(0);
 
+/// That thread's name, copied when it won, so a thread that has since exited
+/// can still be named.
+///
+/// Bytes rather than a `&'static str`, because reading a pointer back would
+/// cost an `unsafe` for a diagnostic. Two CPUs both winning could interleave
+/// their names; it is a report line, and the id beside it is authoritative.
+static WAKE_WORST_NAME: [core::sync::atomic::AtomicU8; 16] =
+    [const { core::sync::atomic::AtomicU8::new(0) }; 16];
+
 /// The wake-to-dispatch tallies: `(count, total cycles, worst cycles)`.
 #[must_use]
 pub fn wake_to_run() -> (u64, u64, u64) {
@@ -828,6 +837,22 @@ pub fn wake_to_run_worst() -> (u64, u32) {
 pub fn wake_to_run_worst_task() -> (u64, u32) {
     let packed = WAKE_TO_RUN_WORST_TASK.load(Ordering::Relaxed);
     (packed >> 16, (packed & 0xffff) as u32)
+}
+
+/// The name that thread had when it waited, as bytes and a length.
+#[must_use]
+pub fn wake_to_run_worst_name() -> ([u8; 16], usize) {
+    let mut bytes = [0u8; 16];
+    let mut len = 0;
+    for (slot, byte) in WAKE_WORST_NAME.iter().zip(bytes.iter_mut()) {
+        let value = slot.load(Ordering::Relaxed);
+        if value == 0 {
+            break;
+        }
+        *byte = value;
+        len += 1;
+    }
+    (bytes, len)
 }
 
 /// The delay, in cycles, below which `percent` of wakes dispatched.
@@ -3024,10 +3049,23 @@ fn preempt_reporting() -> bool {
                 // 14-second reading of the old number that is very likely the
                 // same artifact with a longer phase behind it.
                 if thread.name != "boot" {
-                    WAKE_TO_RUN_WORST_TASK.fetch_max(
-                        (waited.min((1 << 48) - 1) << 16) | u64::from(thread.id & 0xffff),
-                        Ordering::Relaxed,
-                    );
+                    let packed = (waited.min((1 << 48) - 1) << 16) | u64::from(thread.id & 0xffff);
+                    // **The name is kept here, not looked up at the end.**
+                    //
+                    // `describe` answers from the runqueues, and a test thread
+                    // that waited and then exited is not in one by the time the
+                    // report runs -- the first reading of this line said
+                    // `thread 15 (?)` and left the owner to be guessed from
+                    // other boots' numbering. `fetch_max` returns the previous
+                    // value, so the winner is the one that writes the name.
+                    if WAKE_TO_RUN_WORST_TASK.fetch_max(packed, Ordering::Relaxed) < packed {
+                        for (slot, byte) in WAKE_WORST_NAME
+                            .iter()
+                            .zip(thread.name.bytes().chain(core::iter::repeat(0)))
+                        {
+                            slot.store(byte, Ordering::Relaxed);
+                        }
+                    }
                 }
                 let bucket = (63 - waited.max(1).leading_zeros() as usize).min(47);
                 WAKE_TO_RUN_BUCKETS[bucket].fetch_add(1, Ordering::Relaxed);
