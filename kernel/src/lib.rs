@@ -4739,6 +4739,16 @@ fn switched_holding_report() {
     }
 }
 
+/// Total cycles, count and worst for `block::WRITE` round trips.
+fn sched_disk_writes() -> (u64, u64, u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    (
+        DISK_WRITE_CYCLES.load(Relaxed),
+        DISK_WRITE_COUNT.load(Relaxed),
+        DISK_WRITE_WORST.load(Relaxed),
+    )
+}
+
 fn implausible_frame_report() {
     let (count, witness, on_entry) = bhaskix_arch::trap::implausible_frames();
     if count == 0 {
@@ -10295,6 +10305,19 @@ fn hosted_exec_self_test(hhdm_base: u64, cpus: u32) -> bool {
             per_block * 1_000_000 / hertz,
             per_block * 531 * 1_000 / hertz
         );
+        // **Where those milliseconds went.** One `block::WRITE` per block, and
+        // the worst beside the mean says which shape the variance has: close
+        // together is a uniformly slower path, far apart is one wait that went
+        // wrong. §3 has the row this is for.
+        let writes = sched_disk_writes();
+        if writes.1 > 0 {
+            println!(
+                "    disk writes    {} round trip(s) to bin/blkd, {} us each on average, worst {} us",
+                writes.1,
+                writes.0 / writes.1 * 1_000_000 / hertz,
+                writes.2 * 1_000_000 / hertz
+            );
+        }
     }
     let wanted = HOSTED_WANTED.load(Ordering::Acquire);
     if staged != wanted {
@@ -14375,6 +14398,13 @@ impl bhaskix_fs::Store for DiskStore {
         }
         self.page()
             .copy_from_slice(from.get(..4096).ok_or(bhaskix_fs::FsError::OutOfRange)?);
+        // **Timed, because "how long did staging take" is not the same
+        // question as "was one write slow".** `hosted stage` varies
+        // seventeenfold boot to boot (§3), and a total cannot say whether that
+        // is every write costing a little more or one write costing fifty
+        // milliseconds. This pair can: a worst near the mean is a uniformly
+        // slower path, and a worst far above it is one wait that went wrong.
+        let sent_at = bhaskix_arch::tsc::read();
         let reply = ipc::call(
             self.endpoint,
             0x00b2_0000,
@@ -14382,6 +14412,11 @@ impl bhaskix_fs::Store for DiskStore {
             [u64::from(block) * 8, 8, self.slot, 0],
         )
         .map_err(|_| bhaskix_fs::FsError::OutOfRange)?;
+        let took = bhaskix_arch::tsc::read().saturating_sub(sent_at);
+        use core::sync::atomic::Ordering::Relaxed;
+        DISK_WRITE_CYCLES.fetch_add(took, Relaxed);
+        DISK_WRITE_COUNT.fetch_add(1, Relaxed);
+        DISK_WRITE_WORST.fetch_max(took, Relaxed);
         if reply.args[0] != 4096 {
             return Err(bhaskix_fs::FsError::OutOfRange);
         }
@@ -14754,6 +14789,16 @@ static FS_TMP: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::ne
 /// Where the direct map is, for the thread above.
 static DISK_HHDM: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// The frame behind the memory that thread shares with the block service.
+/// Cycles spent inside `block::WRITE` calls, how many there were, and the worst.
+///
+/// One round trip per block: the IPC to `bin/blkd`, its virtio write, the
+/// device's interrupt, and the reply. §3's staging row varies seventeenfold
+/// across boots of one image, and these three separate the two shapes that
+/// could be -- a uniformly slower path, or one wait that went wrong.
+static DISK_WRITE_CYCLES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static DISK_WRITE_COUNT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static DISK_WRITE_WORST: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 static DISK_FRAME: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// The object those frames belong to, so a caller wanting more than the first
