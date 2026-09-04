@@ -247,13 +247,21 @@ $(FS_IMAGE): $(MKFS) $(INITRD_DIR)/etc/hostname
 $(DOMAIN_DISK):
 	@mkdir -p $(dir $@)
 	@printf 'BHASKIX-DOMAIN-DISK-SECTOR-0' > $@
-# 1 MiB since 2026-09-01, 256 KiB before. RFC 0065 let a file exceed ten
-# blocks, and RFC 0064's gate needs a program larger than the loader's
-# 64 KiB window to mean anything -- `bin/hosted` is 109,760 bytes. On the
-# old disk that program and a package install did not both fit, and the
+# 4 MiB since 2026-09-04, 1 MiB since 2026-09-01, 256 KiB before. RFC 0065 let
+# a file exceed ten blocks, and RFC 0064's gate needs a program larger than the
+# loader's 64 KiB window to mean anything -- `bin/hosted` is 109,760 bytes. On
+# the 256 KiB disk that program and a package install did not both fit, and the
 # install failed with `no space` rather than anything about itself. The disk
 # is a fixture, so its size is a test's business and not a design limit.
-	@dd if=/dev/zero bs=1 count=1048548 >> $@ 2>/dev/null
+#
+# **4 MiB is RFC 0068 step 1**: BusyBox is 2,172,376 bytes and did not fit in
+# 1 MiB, which was the one number stopping a hosted `sh` from running a command.
+# The rest of the margin is the filesystem's own metadata and the room a package
+# install needs, which is the same reason the last raise left one.
+#
+# Costs nothing on a boot that does not stage BusyBox: the kernel formats a
+# fixed 128 blocks whatever the disk's size, and `dd` writes sparse zeroes.
+	@dd if=/dev/zero bs=1 count=4194276 >> $@ 2>/dev/null
 	@echo "built $@"
 
 # The AHCI disk. Same size and shape as the domain disk and a **different first

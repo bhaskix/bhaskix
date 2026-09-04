@@ -985,8 +985,13 @@ file in pieces, and `answer_execve`'s own comment says so in as many words: *"`E
 larger than the staging object is gone -- RFC 0064."* The row was three days stale on the project's
 headline application milestone.
 
-**What actually stops it is one number.** `build/domain-disk.img` is **1,048,576** bytes and
-BusyBox is **2,172,376**. It does not fit. Everything else is already there: BusyBox is staged into
+**~~What actually stops it is one number.~~ Two, and the second was found by building the first —
+2026-09-04.** `build/domain-disk.img` was **1,048,576** bytes against BusyBox's **2,172,376**, and it
+is 4 MiB now. BusyBox still does not fit, because the disk was never the binding limit: the kernel
+formats a fixed **128 blocks** into `JOURNAL_IMAGE`, a `[u8; 128 * BLOCK]` static, so the
+*filesystem* is 524,288 bytes on however large a disk. Staging BusyBox behind the new
+`bhaskix.busybox=1` flag reports `364544 of 2172376 bytes reached the disk` -- 89 blocks, which is
+what remains of 128 after the metadata and the three files already there. Everything else is already there: BusyBox is staged into
 the initrd by two `--file bin/busybox=` lines, the filesystem can hold a file that size since RFC
 0065 took one past ten blocks, and the loader no longer cares how big the program is.
 

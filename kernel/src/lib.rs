@@ -420,6 +420,22 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
             // turns a hunt into a hang, and a hang reports nothing at all.
             RING_SOAK_MS.store(ms.min(600_000), core::sync::atomic::Ordering::Relaxed);
         }
+        // `busybox=1` — RFC 0068 step 2, and off by default on purpose.
+        //
+        // Staging BusyBox costs 2.1 to 3.4 seconds on the lanes that have a
+        // filesystem: 531 blocks at the 3,977 to 6,424 us a block this path
+        // now runs at. That is affordable and it is not free, and which of
+        // those matters is a scope decision rather than an engineering one --
+        // so the mechanism ships switched off and the decision stays with
+        // whoever makes it. `bhaskix.busybox=1` turns it on for one image.
+        // Both spellings, because this file already has two conventions:
+        // `ringsoak=` and `tearprobe=` are bare, `bhaskix.fault=` is
+        // prefixed, and the first version of this matched only the bare one
+        // while every harness writes the prefixed form. A flag that is
+        // accepted and does nothing is the failure this file keeps recording.
+        if word == "busybox=1" || word == "bhaskix.busybox=1" {
+            STAGE_BUSYBOX.store(true, core::sync::atomic::Ordering::Relaxed);
+        }
         // `tearprobe=<runs>` — tries to reproduce the console tear on demand
         // rather than waiting for it at one boot in twenty-five.
         if let Some(value) = word.strip_prefix("tearprobe=")
@@ -10321,6 +10337,29 @@ fn hosted_exec_self_test(hhdm_base: u64, cpus: u32) -> bool {
             );
         }
     }
+    // **BusyBox on the disk, when this boot staged it — RFC 0068.**
+    //
+    // Silent by default, because by default it is not staged. When it is, this
+    // is the line that says whether the one number stopping L1's shell -- a
+    // 1 MiB disk against a 2,172,376-byte program -- is actually gone.
+    let busybox_wanted = BUSYBOX_WANTED.load(Ordering::Acquire);
+    if busybox_wanted > 0 {
+        let staged = BUSYBOX_STAGED.load(Ordering::Acquire);
+        let cycles = BUSYBOX_STAGE_CYCLES.load(Ordering::Acquire);
+        let millis = bhaskix_arch::tsc::hertz().map_or(0, |hertz| cycles * 1_000 / hertz.max(1));
+        if staged == busybox_wanted {
+            println!(
+                "    busybox disk   {staged} bytes of BusyBox staged onto the filesystem in \
+                 {millis} ms, so a hosted execve has a real shell to resolve"
+            );
+        } else {
+            println!(
+                "\x1b[91m    busybox disk   FAILED: {staged} of {busybox_wanted} bytes reached the \
+                 disk in {millis} ms -- a truncated program is not a program\x1b[0m"
+            );
+        }
+    }
+
     let wanted = HOSTED_WANTED.load(Ordering::Acquire);
     if staged != wanted {
         println!(
@@ -14296,6 +14335,18 @@ static DISK_JOURNAL: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU
 /// The program a hosted `execve` loads, as it is named in the archive.
 const HOSTED_PROGRAM: &[u8] = b"bin/hosted";
 
+/// Whether this boot was asked to stage BusyBox onto the disk.
+///
+/// Off unless `bhaskix.busybox=1` is on the command line. See the parse for
+/// why the default is off: the cost is real and bounded, and choosing to pay
+/// it on every lane is not this file's decision to make.
+static STAGE_BUSYBOX: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// How many bytes of BusyBox reached the disk, and how many it has.
+static BUSYBOX_STAGED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static BUSYBOX_WANTED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static BUSYBOX_STAGE_CYCLES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 /// How many bytes of it reached the disk, or zero if it never did.
 ///
 /// Read by the exec gate, which must tell two absences apart: an image with no
@@ -14691,6 +14742,42 @@ extern "C" fn journal_on_disk(endpoint: u64) -> ! {
                     HOSTED_STAGED.store(done as u64, Ordering::Release);
                     HOSTED_WANTED.store(bytes.len() as u64, Ordering::Release);
                     HOSTED_STAGE_CYCLES.store(
+                        bhaskix_arch::tsc::read().saturating_sub(began),
+                        Ordering::Release,
+                    );
+                }
+            }
+
+            // **BusyBox, when this boot was asked for it — RFC 0068 step 2.**
+            //
+            // The same write, to the same directory, by the same loop. What
+            // stopped it until 2026-09-04 was the disk: 1 MiB against a
+            // 2,172,376-byte program. The disk is 4 MiB now and every other
+            // limit went earlier -- RFC 0064 took the loader's 64 KiB window
+            // away, RFC 0065 took the filesystem's ten-block file away, and
+            // RFC 0059 made `execve` resolve a real path.
+            //
+            // Off unless `bhaskix.busybox=1`, because it costs 2.1 to 3.4
+            // seconds on the lanes that have a filesystem and paying that
+            // everywhere is a scope decision rather than an engineering one.
+            if STAGE_BUSYBOX.load(Ordering::Relaxed)
+                && let Ok(file) = vfs::open(BUSYBOX_PROGRAM)
+            {
+                let bytes = file.bytes();
+                BUSYBOX_WANTED.store(bytes.len() as u64, Ordering::Release);
+                if !bytes.is_empty()
+                    && let Ok(busybox) = volume.create(sub, b"busybox", Kind::File)
+                {
+                    let began = bhaskix_arch::tsc::read();
+                    let mut done = 0usize;
+                    while done < bytes.len() {
+                        match volume.write_run(busybox, done as u64, &bytes[done..]) {
+                            Ok(0) | Err(_) => break,
+                            Ok(moved) => done += moved,
+                        }
+                    }
+                    BUSYBOX_STAGED.store(done as u64, Ordering::Release);
+                    BUSYBOX_STAGE_CYCLES.store(
                         bhaskix_arch::tsc::read().saturating_sub(began),
                         Ordering::Release,
                     );

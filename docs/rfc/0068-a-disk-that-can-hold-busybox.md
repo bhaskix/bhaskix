@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | 📋 **Specified 2026-09-04, not implemented — and re-costed the same day after the staging variance was fixed.** The price fell from an unpredictable 3.6–57 s to a bounded **2.1–3.4 s**, which changes the recommendation from "fix the variance first" to "Option A is affordable". What is left is a scope decision, not an engineering one |
+| **Status** | 📋 **Specified 2026-09-04; step 1 attempted the same day and found the premise wrong.** The disk was necessary and is not sufficient: the filesystem is formatted to a fixed 128 blocks in a 512 KiB kernel static, so BusyBox cannot fit whatever the disk holds. See "What implementing step 1 found". Re-costed too, after the staging variance was fixed — The price fell from an unpredictable 3.6–57 s to a bounded **2.1–3.4 s**, which changes the recommendation from "fix the variance first" to "Option A is affordable". What is left is a scope decision, not an engineering one |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | fs (`build/domain-disk.img`, `bin/fsd`) / kernel staging |
 | **Milestone** | Phase 2 — Linux personality, application milestone **L1** |
@@ -167,3 +167,44 @@ The table above, and nothing else: no lane that does not stage BusyBox changes a
 2. Stage `bin/busybox` into `sub/` at format time, behind the flag chosen above.
 3. The gate, armed both ways.
 4. Update the roadmap's L1 row and §4's libc row to say what is left after this.
+
+
+---
+
+## What implementing step 1 found (2026-09-04)
+
+**The premise of this RFC was wrong, and building it is what showed that.** It said one number stops
+a hosted BusyBox — the disk being 1,048,576 bytes against a 2,172,376-byte program. The disk is now
+4 MiB, `bin/fsd` mounts 8192 sectors, and BusyBox still does not fit.
+
+**The limit is the formatted filesystem, not the disk image.** The kernel formats a fixed **128
+blocks** — `bhaskix_fs::format(image, 128)` — into `JOURNAL_IMAGE`, a `[u8; 128 * BLOCK]` static:
+524,288 bytes of filesystem on however large a disk. BusyBox is 531 blocks and cannot fit in 128
+whatever the image underneath is.
+
+Staging it behind the new flag says so exactly:
+
+```
+busybox disk   FAILED: 364544 of 2172376 bytes reached the disk in 234 ms
+               -- a truncated program is not a program
+```
+
+364,544 bytes is 89 blocks, which is what remains of 128 after the superblock, the bitmap, the inode
+table, `greeting`, `sub/inner` and `hosted`'s own 27. The number is consistent with the mechanism,
+which is why it is quoted rather than summarised.
+
+**So the real cost is larger than this RFC priced.** Holding BusyBox needs a filesystem of about 540
+blocks, which needs:
+
+* a static image buffer of **2.2 MiB** in the kernel, against 512 KiB today — this is `.bss`, so it
+  is memory every boot pays whether or not it stages anything; and
+* formatting those blocks, at the 477 us a block the format now runs at, which is about **260 ms**
+  on every boot that formats — a cost the "the format is bounded" note in §Design assumed away.
+
+Both are new numbers and neither was in the table above. **The staging cost this RFC spent its
+length on — 2.1 to 3.4 seconds — is real and is no longer the binding constraint.**
+
+**What is kept and what is not.** The 4 MiB disk stays: it is necessary, sparse, and costs nothing.
+The `bhaskix.busybox=1` flag stays and is off by default, because what it now does is *measure this
+limit* — it is the only thing in the tree that says how much of BusyBox fits and why not. Nothing
+here claims a hosted shell runs a command; it claims the opposite, with the number attached.
