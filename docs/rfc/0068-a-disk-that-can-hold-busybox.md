@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | 📋 **Specified 2026-09-04, not implemented.** The measurements are done and the decision is the cost, not the mechanism |
+| **Status** | 📋 **Specified 2026-09-04, not implemented — and re-costed the same day after the staging variance was fixed.** The price fell from an unpredictable 3.6–57 s to a bounded **2.1–3.4 s**, which changes the recommendation from "fix the variance first" to "Option A is affordable". What is left is a scope decision, not an engineering one |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | fs (`build/domain-disk.img`, `bin/fsd`) / kernel staging |
 | **Milestone** | Phase 2 — Linux personality, application milestone **L1** |
@@ -82,9 +82,30 @@ The 17× spread is an open defect. Optimising a path whose cost is not a constan
 wrong half; and if staging settles near its *best* observed rate the whole question shrinks to three
 and a half seconds, which Option A could carry.
 
-**Recommended: C, then B.** The variance is a defect with an open row; closing it costs nothing that
-is not already owed, and it changes the price of every option here. B is what to do if C does not
-land, because it makes L1 provable without making the suite unrunnable.
+~~**Recommended: C, then B.**~~ **Superseded 2026-09-04 — C landed, and it changes the answer to A.**
+
+The variance was a defect with an open row, and closing it was the recommendation because it changes
+the price of every option here. It closed the same day: a wake deferred from an interrupt handler
+now pokes the other CPUs instead of waiting for the idle backstop, and the staging path's
+half-second stalls went with it.
+
+**Re-measured, six boots:**
+
+| | per block | 531 blocks |
+|---|---|---|
+| before the fix | 6,318 – 107,015 us | 3.4 s – **57 s** |
+| after | 3,977 – **6,424 us** | 2.1 s – **3.4 s** |
+
+Staging now runs 75 to 122 ms for its nineteen blocks -- a spread of **1.6x**, against seventeen.
+
+**So Option A is affordable, and that is the recommendation now.** Three and a half seconds is the
+*worst* case rather than an unknown one, it lands on the lanes that have a filesystem rather than
+all of them, and `make test` runs for about twenty minutes. The argument against A was never the
+mean; it was that nobody could say which end of a seventeenfold range a given boot would pay. That
+argument is gone.
+
+B remains the right answer if the decision is that no per-boot cost is acceptable at all, which is a
+scope call rather than an engineering one and is left to whoever makes it.
 
 ## Alternatives considered
 
@@ -136,7 +157,7 @@ The table above, and nothing else: no lane that does not stage BusyBox changes a
 
 ## Unresolved questions
 
-* Whether the staging variance (§3) is fixable, which decides between A and B.
+* ~~Whether the staging variance (§3) is fixable, which decides between A and B.~~ **Answered 2026-09-04: it was, and A is now the recommendation.** See the note under §Design.
 * Whether a 4 MiB disk changes the format cost measurably — 128 blocks are formatted today, and a
   bigger disk formats more of them unless the format stays bounded.
 

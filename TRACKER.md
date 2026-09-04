@@ -1003,6 +1003,15 @@ seventeenfold is optimising the wrong half, and if it settles near its best obse
 question shrinks from 57 seconds to three and a half. Failing that, stage BusyBox behind a flag so
 L1 is provable without making `make test` unrunnable.
 
+**Re-costed 2026-09-04, and the recommendation flipped.** That RFC's advice was "close the staging
+variance first", because optimising a path whose cost swings seventeenfold is optimising the wrong
+half. The variance closed the same day -- a deferred wake now pokes the other CPUs instead of
+waiting out the idle backstop -- and six boots put staging at **75 to 122 ms** for nineteen blocks,
+a spread of 1.6x. BusyBox's 531 blocks therefore cost **2.1 to 3.4 seconds**, bounded, against
+3.6 to 57 unbounded. The argument against staging it on every filesystem lane was never the mean; it
+was that nobody could say which end of that range a boot would pay. Option A is now the
+recommendation and what remains is a scope call.
+
 The RFC also rejects the tempting shortcut of exec'ing BusyBox straight out of the initrd, where it
 already sits: `execve` resolves through the adapter's directory capability, and reaching past that
 would be a second path into the loader with different authority -- which is the thing RFC 0031
