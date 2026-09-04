@@ -1035,6 +1035,36 @@ already sits: `execve` resolves through the adapter's directory capability, and 
 would be a second path into the loader with different authority -- which is the thing RFC 0031
 exists to prevent.
 
+### 2026-09-04 (the filesystem is the disk's size now, and BusyBox is on it)
+
+[RFC 0069](docs/rfc/0069-a-format-that-need-not-hold-the-filesystem.md) landed, all three steps.
+`format_sized(bytes, inodes, blocks)` separates the filesystem's declared size from the buffer that
+lays it out, and `format` is a wrapper over it, so the existing 1,141 host tests exercise the new
+function through the old name.
+
+The kernel's disk format now sizes the filesystem from the device and writes only its metadata:
+
+    fs domain      mounted the disk: 8192 sectors, 1024 blocks
+    disk format    13 block(s) written in 5 ms
+
+against 128 blocks in 36 to 93 ms. **Raising the ceiling eightfold made the format about twelve
+times faster**, because the cost was never the filesystem's size -- it was writing a filesystem's
+worth of blocks nothing was going to read.
+
+And RFC 0068's flag now reports what it was built to report: `2172376 bytes of BusyBox staged onto
+the filesystem in 1567 ms`. All of it, on a passing boot, inside the 2.1 to 3.4 seconds predicted
+once the staging variance was fixed.
+
+**What is not claimed:** that a hosted `sh` runs a command. BusyBox is on the filesystem the
+adapter's directory capability resolves through, and nothing yet execs it. The number that stopped
+it is gone and the demonstration is the next piece of work.
+
+Worth recording how the number was arrived at, because it was wrong twice on the way. Two days ago
+§4 said a 64 KiB staging object stopped it -- stale since RFC 0064. Then RFC 0068 said the 1 MiB
+disk -- built, and it was not that either. It was the filesystem, formatted to a constant 128 blocks
+in a 512 KiB static, and the fix for *that* made the kernel smaller and the format faster. Each
+wrong answer was found by building the previous one.
+
 ### 2026-09-04 (a third sweep, an honest negative, and two detector bugs of my own)
 
 Two gates this week turned out to assert on something the machine could not produce -- RFC 0061's

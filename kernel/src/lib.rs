@@ -14568,10 +14568,28 @@ extern "C" fn journal_on_disk(endpoint: u64) -> ! {
     // by two installed packages, then by a 109,760-byte hosted program that
     // exists to prove a file may now exceed ten blocks.
     //
-    // Kept in step with `JOURNAL_IMAGE` above, which is the same count and the
-    // reason this is not simply `sectors / 8`.
-    let blocks = 128u32;
-    if bhaskix_fs::format(image, 128).is_err() || u64::from(blocks) > sectors / 8 {
+    // **Sized from the disk, laid out in the buffer — RFC 0069 step 2.**
+    //
+    // This used to read `let blocks = 128` and format the whole of
+    // `JOURNAL_IMAGE`, because `format` took the filesystem's size from the
+    // buffer's length: the image *was* the filesystem. So the disk held 4 MiB
+    // and the filesystem held 128 blocks, which is the number RFC 0068 found
+    // stopping a hosted BusyBox -- 531 blocks of program against 89 free.
+    //
+    // `format_sized` separates them. The filesystem is as large as the device,
+    // and what gets written is its metadata: a superblock, a bitmap, an inode
+    // table and a journal. Data blocks are free in the bitmap and nothing reads
+    // one before it is allocated.
+    let declared = (sectors / 8).min(u64::from(u32::MAX));
+    let Ok(superblock) = bhaskix_fs::format_sized(image, 128, declared) else {
+        DISK_JOURNAL.store(0, Ordering::Release);
+        sched::exit()
+    };
+    // **What is written is the prefix, not the filesystem.** Thirteen blocks
+    // for a thousand-block filesystem, against the hundred and twenty-eight
+    // this wrote before -- so raising the ceiling made the format *faster*.
+    let blocks = u32::try_from(superblock.data_start).unwrap_or(0);
+    if blocks == 0 || u64::from(blocks) > sectors / 8 {
         DISK_JOURNAL.store(0, Ordering::Release);
         sched::exit()
     }

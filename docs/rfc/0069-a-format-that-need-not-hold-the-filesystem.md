@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | 🔨 **Step 1 landed 2026-09-04.** `format_sized` is in with `format` delegating to it, four host tests including one that lays out a 540-block filesystem in a 13-block buffer, and the existing 1,141 host tests unchanged. Steps 2 and 3 — the kernel's callers, and BusyBox actually fitting — are next |
+| **Status** | ✅ **All three steps landed 2026-09-04.** The filesystem is now the disk's size, the format writes 13 blocks instead of 128, and 2,172,376 bytes of BusyBox are on it. See "Steps 2 and 3" |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | fs (`bhaskix_fs::format`) / kernel |
 | **Milestone** | Phase 2 — Linux personality, application milestone **L1** |
@@ -161,3 +161,37 @@ The one thing worth noting from writing it: `if (bytes.len() / BLOCK) as u64 < s
 does not parse — `as u64 <` is read as the start of generic arguments. It needs the cast
 parenthesised, and the compiler says so clearly enough that this is a footnote rather than a
 finding.
+
+
+## Steps 2 and 3, landed (2026-09-04)
+
+The kernel's disk format now declares a filesystem the size of the device and writes only its
+metadata:
+
+```
+fs domain      mounted the disk through the block service: 8192 sectors, 1024 blocks
+disk format    13 block(s) written in 5 ms
+```
+
+Against 128 blocks in 36 to 93 ms before. **Raising the ceiling eightfold made the format about
+twelve times faster**, which is the shape this RFC argued for: the cost was never the filesystem's
+size, it was writing a filesystem's worth of blocks that nothing was going to read.
+
+And RFC 0068's flag now says what it was built to say:
+
+```
+busybox disk   2172376 bytes of BusyBox staged onto the filesystem in 1567 ms,
+               so a hosted execve has a real shell to resolve
+```
+
+All 2,172,376 bytes, on a passing boot, in 1.567 seconds — inside the 2.1 to 3.4 seconds RFC 0068
+predicted after the staging variance was fixed.
+
+**What this does not claim.** BusyBox is *on the filesystem the adapter's directory capability
+resolves through*. Whether a hosted `execve` of it returns a running shell is untested here: nothing
+in the tree yet execs it, and RFC 0068's step 3 gate — a hosted `sh` running one command — is not
+written. The number that stopped it is gone; the demonstration is the next piece of work.
+
+The unresolved question above is answered by step 2 rather than left open: the filesystem is sized
+from the device, `(sectors / 8)`, because the alternative is a constant that has now been wrong
+twice.
