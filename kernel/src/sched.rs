@@ -800,6 +800,10 @@ static WAKE_TO_RUN_BUCKETS: [AtomicU64; 48] = [const { AtomicU64::new(0) }; 48];
 /// could say whether it mattered. Now it can.
 static WAKE_TO_RUN_WORST: AtomicU64 = AtomicU64::new(0);
 
+/// The same, for every thread except the boot thread. See the site that writes
+/// it for why the boot thread's wait is a phase rather than a delay.
+static WAKE_TO_RUN_WORST_TASK: AtomicU64 = AtomicU64::new(0);
+
 /// The wake-to-dispatch tallies: `(count, total cycles, worst cycles)`.
 #[must_use]
 pub fn wake_to_run() -> (u64, u64, u64) {
@@ -814,6 +818,15 @@ pub fn wake_to_run() -> (u64, u64, u64) {
 #[must_use]
 pub fn wake_to_run_worst() -> (u64, u32) {
     let packed = WAKE_TO_RUN_WORST.load(Ordering::Relaxed);
+    (packed >> 16, (packed & 0xffff) as u32)
+}
+
+/// The worst wake-to-run for any thread but the boot thread, and whose it was.
+///
+/// Zero when nothing but the boot thread was ever kept waiting.
+#[must_use]
+pub fn wake_to_run_worst_task() -> (u64, u32) {
+    let packed = WAKE_TO_RUN_WORST_TASK.load(Ordering::Relaxed);
     (packed >> 16, (packed & 0xffff) as u32)
 }
 
@@ -2995,6 +3008,27 @@ fn preempt_reporting() -> bool {
                     (waited.min((1 << 48) - 1) << 16) | u64::from(thread.id & 0xffff),
                     Ordering::Relaxed,
                 );
+                // **And the worst that is not the boot thread's.**
+                //
+                // The boot thread runs these self-tests one after another and
+                // waits through the timed ones, so its "marked ready to
+                // dispatched" is a phase's *duration* rather than a delay.
+                // Measured 2026-09-04: it owns the worst on every boot at about
+                // **3.03 seconds**, clustered within 7 ms across twelve boots,
+                // while the same report's p99 is 3,489 us. One outlier, from
+                // the one thread whose waiting is the schedule working.
+                //
+                // Reported apart rather than filtered away: the overall worst
+                // still names whoever it was, and this one says what the worst
+                // was for a thread that was actually kept waiting. §3 records a
+                // 14-second reading of the old number that is very likely the
+                // same artifact with a longer phase behind it.
+                if thread.name != "boot" {
+                    WAKE_TO_RUN_WORST_TASK.fetch_max(
+                        (waited.min((1 << 48) - 1) << 16) | u64::from(thread.id & 0xffff),
+                        Ordering::Relaxed,
+                    );
+                }
                 let bucket = (63 - waited.max(1).leading_zeros() as usize).min(47);
                 WAKE_TO_RUN_BUCKETS[bucket].fetch_add(1, Ordering::Relaxed);
             }

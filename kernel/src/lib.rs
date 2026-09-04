@@ -19672,6 +19672,20 @@ fn user_shell(handoff: &Handoff) -> Result<(), &'static str> {
             micros(wake_cycles / wakes),
             micros(worst_ticks.max(wake_worst)),
         );
+        // **And the worst that was not the boot thread's**, which is the one
+        // that means what this metric is for. The boot thread runs the
+        // self-tests one after another and waits through the timed ones, so
+        // its wait is a phase's duration; it has owned this line's worst on
+        // every boot at about 3.03 seconds while p99 stayed near 3,489 us.
+        let (task_ticks, task_thread) = sched::wake_to_run_worst_task();
+        if task_ticks > 0 {
+            let task_name = sched::describe(task_thread).map_or("?", |(name, _)| name);
+            println!(
+                "                   worst for any other thread {} us, thread {task_thread} \
+                 ({task_name})",
+                micros(task_ticks)
+            );
+        }
     }
 
     // RFC 0019 step 4, the second half: the same measurement on a machine with
