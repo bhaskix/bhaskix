@@ -3189,7 +3189,15 @@ else
     status=1
 fi
 
-if grep -qF "hosted open refused errno 2" "$LOG"; then
+# **Anchored past the digit, because `errno 2` is a prefix of `errno 20`.**
+#
+# `grep -F` here matched any errno from 20 to 29 and reported the ENOENT pass,
+# so a refusal this gate exists to notice could have been read as the thing it
+# was checking for. The kernel's own copy of this check, three files away, ends
+# the pattern with a newline and was always exact; this one was not. Two
+# detectors in this file have already been wrong for the neighbouring reason --
+# grepping a string that also occurs in a passing message.
+if grep -qE "hosted open refused errno 2(\r|\s|$)" "$LOG"; then
     pass "a hosted program's open resolved through the writable directory (ENOENT, not EROFS)"
 elif grep -qF "hosted open refused errno 30" "$LOG"; then
     fail "a hosted writable open was refused EROFS: the routing or the grant regressed"

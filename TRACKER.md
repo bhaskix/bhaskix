@@ -965,6 +965,32 @@ physically adjacent -- which `iommu::map_memory` says in as many words they need
 would produce the observed bisect, one block working and eight not. Step 3 stays reverted and both
 candidates are now written down, which is more than it had this morning.
 
+### 2026-09-04 (a third sweep, an honest negative, and two detector bugs of my own)
+
+Two gates this week turned out to assert on something the machine could not produce -- RFC 0061's
+wedge arm, and the frame check nothing failed on. That is a sweep shape: **find strings the harness
+greps for that no boot has ever printed**, then ask of each whether it is unreachable or merely
+untriggered.
+
+**The sweep found no second instance, and that is the result.** 189 literal patterns extracted from
+`boot-test.sh`, tested against 895 kept logs. Twenty-one never matched, and every one is explained:
+"skipped" and failure arms that simply have not occurred, one lane whose serial logs are not kept
+here, and runtime-assembled strings that no source contains literally. Nothing in the class the
+sweep was built for.
+
+**Two detector bugs of mine on the way, both recorded because they are the same mistake this file
+keeps recording.** The first pass extracted patterns from `grep -qE` calls and tested them with
+`grep -F`, so every regex "never matched" -- 120 of 189 false positives, and a list that looked
+alarming until it was read. The second flagged `hosted open refused errno 30` as producible by no
+source; it is assembled at runtime by `bin/hosted`, `line.put(b"refused errno ")` then
+`line.number(..)`, and no source contains it literally by design.
+
+**One real find, narrow.** The gate beside it greps `hosted open refused errno 2` as a *fixed*
+string, so any errno from 20 to 29 matches and is reported as the ENOENT pass -- a refusal this
+gate exists to notice, read as the thing it was checking for. The kernel's own copy of the same
+check ends its pattern with a newline and was always exact. The harness one is now anchored past
+the digit.
+
 ### 2026-09-03 (a sweep for counters nothing reads, and what it found)
 
 Five separate findings today shared one shape: an instrument built for an open defect, landing its
