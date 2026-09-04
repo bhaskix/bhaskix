@@ -1055,9 +1055,16 @@ And RFC 0068's flag now reports what it was built to report: `2172376 bytes of B
 the filesystem in 1567 ms`. All of it, on a passing boot, inside the 2.1 to 3.4 seconds predicted
 once the staging variance was fixed.
 
-**What is not claimed:** that a hosted `sh` runs a command. BusyBox is on the filesystem the
-adapter's directory capability resolves through, and nothing yet execs it. The number that stopped
-it is gone and the demonstration is the next piece of work.
+**And then it did run.** `bin/hosted` execs `/busybox` with `["busybox", "echo",
+"bhaskix-busybox-ran"]`, and the boot that staged it prints that text: **a hosted program replaced
+itself with an unmodified 2 MB binary this project did not write, read off a filesystem through a
+directory capability, and that binary ran a command.** `busybox echo` is BusyBox dispatching on
+`argv[0]`'s basename and then on `argv[1]`, so the output says the initial process image this kernel
+builds is the one a foreign program expected to read -- argv, envp and auxiliary vector included.
+
+Gated, keyed on whether BusyBox was staged so the eleven lanes without it take a `skipped` arm
+rather than failing for a file they were never given, and **watched red** by looking for a string
+the program does not print.
 
 Worth recording how the number was arrived at, because it was wrong twice on the way. Two days ago
 §4 said a 64 KiB staging object stopped it -- stale since RFC 0064. Then RFC 0068 said the 1 MiB

@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | 📋 **Specified 2026-09-04; step 1 attempted the same day and found the premise wrong.** The disk was necessary and is not sufficient: the filesystem is formatted to a fixed 128 blocks in a 512 KiB kernel static, so BusyBox cannot fit whatever the disk holds. See "What implementing step 1 found". Re-costed too, after the staging variance was fixed — The price fell from an unpredictable 3.6–57 s to a bounded **2.1–3.4 s**, which changes the recommendation from "fix the variance first" to "Option A is affordable". What is left is a scope decision, not an engineering one |
+| **Status** | ✅ **Done 2026-09-04.** The premise was wrong -- the disk was necessary, the filesystem's fixed 128 blocks were the limit, and [RFC 0069](0069-a-format-that-need-not-hold-the-filesystem.md) removed those. BusyBox is staged whole and a hosted `execve` of it runs a command. Behind `bhaskix.busybox=1`, off by default |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | fs (`build/domain-disk.img`, `bin/fsd`) / kernel staging |
 | **Milestone** | Phase 2 — Linux personality, application milestone **L1** |
@@ -242,3 +242,33 @@ this arithmetic plus the one thing this section did not think about: a filesyste
 were never written hands out a *first* allocation that was not zeroed, where a format had zeroed it
 before. That is a confidentiality question, it is the same position every reallocated block is
 already in, and it is priced there rather than assumed away.
+
+
+---
+
+## The demonstration (2026-09-04)
+
+`bin/hosted` now `execve`s `/busybox` with `["busybox", "echo", "bhaskix-busybox-ran"]`, and on a
+boot that staged it the log carries:
+
+```
+busybox disk        2172376 bytes of BusyBox staged onto the filesystem in 1782 ms
+bhaskix-busybox-ran
+```
+
+**A hosted program replaced itself with an unmodified 2 MB binary this project did not write, read
+off a filesystem through a directory capability, and that binary ran a command.**
+
+What the output proves is more than "a program ran". `busybox echo <text>` is BusyBox dispatching on
+`argv[0]`'s basename and then on `argv[1]`, so the text appearing at all says the initial process
+image this kernel builds is the one a program from outside expected to read — argv, envp and the
+auxiliary vector included.
+
+Gated, and keyed on whether BusyBox was staged: demanding the output unconditionally would fail four
+lanes for a file they were never given. **Watched red** by looking for a string the program does not
+print, which gives `FAIL BusyBox was staged but the hosted execve of it produced no output`. The
+default path takes the third arm on eleven lanes: *no BusyBox staged on this machine, so no hosted
+execve of it was tried*.
+
+`exec_busybox` returns where BusyBox is absent — `execve` answers `ENOENT` and the program exits as
+it always did — which is why the default lanes are untouched rather than merely passing.

@@ -38,6 +38,8 @@ mod nr {
     pub const OPEN: u64 = 2;
     /// `close(fd)`.
     pub const CLOSE: u64 = 3;
+    /// `execve(path, argv, envp)`.
+    pub const EXECVE: u64 = 59;
 }
 
 /// `open` flags, from this machine's own headers.
@@ -328,11 +330,63 @@ extern "C" fn hosted_main(stack: *const u64) -> ! {
     // half does it was never established -- so this half runs alone.
     open_only();
 
+    // **RFC 0068's demonstration: run a command through somebody else's
+    // shell.** Everything below this line was built for it -- RFC 0059 made
+    // `execve` resolve a real path, RFC 0064 took away the loader's window,
+    // RFC 0065 took away the ten-block file, RFC 0069 made the filesystem the
+    // disk's size, and RFC 0068's flag put 2,172,376 bytes of BusyBox on it.
+    //
+    // Harmless where BusyBox is not staged, which is every lane by default:
+    // `execve` answers `ENOENT`, this returns, and the program exits as it
+    // always did. A gate that asserted the output unconditionally would fail
+    // four lanes for a file they were never given.
+    exec_busybox();
+
     syscall(nr::EXIT_GROUP, 0, 0, 0);
     // `exit_group` does not return. If it somehow does, stopping here is the
     // only honest thing left.
     #[allow(clippy::empty_loop)]
     loop {}
+}
+
+/// Replaces this program with BusyBox, running one command.
+///
+/// Returns only if the `execve` failed, which on a machine without BusyBox
+/// staged is what happens and is not an error: `/busybox` is put on the disk
+/// only when the kernel is asked for it.
+///
+/// The argument vector is the interesting part. `busybox echo <text>` is
+/// BusyBox dispatching on `argv[0]`'s basename and then on `argv[1]`, so the
+/// output appearing at all proves the vector this kernel built was the one a
+/// program from outside the project expected to read.
+fn exec_busybox() {
+    const PATH: &[u8] = b"/busybox\0";
+    const ARG0: &[u8] = b"busybox\0";
+    const ARG1: &[u8] = b"echo\0";
+    const ARG2: &[u8] = b"bhaskix-busybox-ran\0";
+
+    let argv = [
+        ARG0.as_ptr() as u64,
+        ARG1.as_ptr() as u64,
+        ARG2.as_ptr() as u64,
+        0,
+    ];
+    let envp = [0u64];
+
+    let mut line = Line::new();
+    line.put(b"hosted exec busybox ");
+    let failed = syscall(
+        nr::EXECVE,
+        PATH.as_ptr() as u64,
+        argv.as_ptr() as u64,
+        envp.as_ptr() as u64,
+    );
+    // Reached only on failure: a successful `execve` never returns here,
+    // because there is no here to return to.
+    line.put(b"refused errno ");
+    line.number(failed.wrapping_neg());
+    line.put(b"\n");
+    line.flush();
 }
 
 /// Bytes that exist only to make this program larger than the loader's window.

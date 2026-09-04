@@ -3197,6 +3197,28 @@ fi
 # the pattern with a newline and was always exact; this one was not. Two
 # detectors in this file have already been wrong for the neighbouring reason --
 # grepping a string that also occurs in a passing message.
+# **RFC 0068's demonstration: somebody else's shell, run from this filesystem.**
+#
+# Keyed on whether BusyBox was staged, because it is staged only when the kernel
+# is asked for it -- `bhaskix.busybox=1`. A gate that demanded the output
+# unconditionally would fail four lanes for a file they were never given, which
+# is how a gate gets a `|| true` added to it.
+#
+# What the output proves is more than "a program ran". `busybox echo <text>` is
+# BusyBox dispatching on `argv[0]`'s basename and then on `argv[1]`, so the text
+# appearing at all says the initial process image this kernel built is the one a
+# program from outside this project expected to read -- argv, envp and the
+# auxiliary vector included.
+if grep -qF "bhaskix-busybox-ran" "$LOG"; then
+    pass "a hosted execve ran BusyBox off the filesystem and it executed a command"
+elif grep -qE "busybox disk +[0-9]+ bytes of BusyBox staged" "$LOG"; then
+    fail "BusyBox was staged but the hosted execve of it produced no output"
+    grep -aE "hosted exec busybox|busybox disk" "$LOG" | sed 's/^/                   /'
+    status=1
+else
+    pass "no BusyBox staged on this machine, so no hosted execve of it was tried"
+fi
+
 if grep -qE "hosted open refused errno 2(\r|\s|$)" "$LOG"; then
     pass "a hosted program's open resolved through the writable directory (ENOENT, not EROFS)"
 elif grep -qF "hosted open refused errno 30" "$LOG"; then
