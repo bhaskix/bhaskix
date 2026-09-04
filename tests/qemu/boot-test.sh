@@ -3204,17 +3204,22 @@ fi
 # unconditionally would fail four lanes for a file they were never given, which
 # is how a gate gets a `|| true` added to it.
 #
-# What the output proves is more than "a program ran". `busybox sh -c '<command>'`
-# is BusyBox dispatching on `argv[1]` to its shell, which parses the string in
-# `argv[3]` and runs what it finds. So the text appearing says the initial
-# process image this kernel built is the one a program from outside this project
-# expected to read -- argv, envp and the auxiliary vector included -- and that
-# what it reached was a shell rather than an applet that happens to echo.
+# What the output proves is three things, not one. The command is
+# `busybox sh -c '/busybox echo <text>'`:
 #
-# `echo` inside `sh -c` is a builtin, so this does not prove the shell can
-# `fork` and `exec` a child. That is a separate assertion and is not made here.
-if grep -qF "bhaskix-busybox-ran" "$LOG"; then
-    pass "L1: a hosted execve ran BusyBox's sh off the filesystem, and it parsed and ran a command"
+#   1. BusyBox dispatches on `argv[1]` to its **shell**, so the initial process
+#      image this kernel built is the one a program from outside this project
+#      expected to read -- argv, envp and the auxiliary vector included.
+#   2. That shell **parses** the string in `argv[3]`, so what was reached is a
+#      shell rather than an applet that happens to echo.
+#   3. The command it finds is a **path**, not a builtin, so the shell `fork`s
+#      and `execve`s a child and waits for it. The text is printed by a process
+#      the shell created, not by the shell.
+#
+# Three is why the string says "forked": an earlier version ran `echo` as a
+# builtin, which proved the first two and was written up as proving only those.
+if grep -qF "bhaskix-busybox-forked" "$LOG"; then
+    pass "L1: a hosted execve ran BusyBox's sh, which forked and exec'd a child that printed"
 elif grep -qE "busybox disk +[0-9]+ bytes of BusyBox staged" "$LOG"; then
     fail "BusyBox was staged but the hosted execve of it produced no output"
     grep -aE "hosted exec busybox|busybox disk" "$LOG" | sed 's/^/                   /'

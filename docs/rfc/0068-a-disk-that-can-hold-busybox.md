@@ -259,15 +259,18 @@ bhaskix-busybox-ran
 **A hosted program replaced itself with an unmodified 2 MB binary this project did not write, read
 off a filesystem through a directory capability, and that binary ran a command.**
 
-What the output proves is more than "a program ran". The command is `busybox sh -c 'echo
-bhaskix-busybox-ran'`: BusyBox dispatches on `argv[1]` to its **shell**, which then *parses* the
-string in `argv[3]` and runs what it finds. So the text appearing says the initial process image
-this kernel builds is the one a program from outside expected to read — argv, envp and the
-auxiliary vector included — and that what it reached was a shell rather than an applet that happens
-to echo.
+The command is `busybox sh -c '/busybox echo bhaskix-busybox-forked'`, and the one line of output
+proves three things:
 
-**What it does not prove:** `echo` inside `sh -c` is a builtin, so the shell has not been shown to
-`fork` and `exec` a child. That is the next thing to ask of it, and it is not claimed.
+1. BusyBox dispatches on `argv[1]` to its **shell**, so the initial process image this kernel builds
+   is the one a program from outside expected to read — argv, envp and the auxiliary vector.
+2. That shell **parses** the string in `argv[3]`, so what was reached is a shell rather than an
+   applet that happens to echo.
+3. The command it finds is a **path**, not a builtin, so the shell `fork`s, `execve`s a child and
+   waits for it. **The text is printed by a process the shell created.**
+
+An earlier version ran `echo` as a builtin and proved the first two; the third is what makes this
+RFC's own sentence — *"a hosted `sh` runs one command"* — true in the sense a reader would take it.
 
 Gated, and keyed on whether BusyBox was staged: demanding the output unconditionally would fail four
 lanes for a file they were never given. **Watched red** by looking for a string the program does not

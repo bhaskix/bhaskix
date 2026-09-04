@@ -355,22 +355,21 @@ extern "C" fn hosted_main(stack: *const u64) -> ! {
 /// staged is what happens and is not an error: `/busybox` is put on the disk
 /// only when the kernel is asked for it.
 ///
-/// The argument vector is the interesting part. `busybox sh -c '<command>'` is
-/// BusyBox dispatching on `argv[1]` to its shell, which then **parses** the
-/// string in `argv[3]` and runs what it finds. So the output appearing at all
-/// proves two things at once: the vector this kernel built is the one a program
-/// from outside the project expected to read, and what it reached was a shell
-/// rather than an applet that happens to echo.
+/// The argument vector is the interesting part. `busybox sh -c '/busybox echo
+/// <text>'` proves three things in one line: BusyBox dispatches on `argv[1]` to
+/// its **shell**, so the vector this kernel built is the one a foreign program
+/// expected to read; that shell **parses** `argv[3]`, so what was reached is a
+/// shell and not an applet; and the command it finds is a **path** rather than
+/// a builtin, so the shell `fork`s, `execve`s a child and waits for it.
 ///
-/// `echo` inside `sh -c` is a builtin, so this does not yet prove the shell can
-/// `fork` and `exec` a child. That is the next thing to ask of it and is not
-/// claimed here.
+/// The text is printed by a process the shell created. An earlier version ran
+/// `echo` as a builtin, which proved the first two.
 fn exec_busybox() {
     const PATH: &[u8] = b"/busybox\0";
     const ARG0: &[u8] = b"busybox\0";
     const ARG1: &[u8] = b"sh\0";
     const ARG2: &[u8] = b"-c\0";
-    const ARG3: &[u8] = b"echo bhaskix-busybox-ran\0";
+    const ARG3: &[u8] = b"/busybox echo bhaskix-busybox-forked\0";
 
     let argv = [
         ARG0.as_ptr() as u64,
