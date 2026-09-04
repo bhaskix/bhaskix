@@ -3805,11 +3805,63 @@ pub fn mark_blocked(id: u32) {
     if thread.id != id {
         MISMARKED_BLOCKS.fetch_add(1, Ordering::Relaxed);
         note_mismark(id, thread.id);
+        // **Refusing was the safe half; finding the caller is the fix.**
+        //
+        // The guard above stops an uninvolved thread being marked, and that
+        // was worth having on its own. What it left behind is the caller: its
+        // mark is dropped, so `block_self` finds it unblocked, returns, and
+        // `wait_until` goes round again. Self-correcting, and not free -- CI
+        // run 567 counted **1188** refusals in one boot, each one a lap
+        // through the scheduler, and specimen fifteen named the *stuck*
+        // station as the caller being refused rather than the bystander.
+        //
+        // The caller's identity is known: it is `id`. Nothing about this
+        // function needs to guess which CPU it is on, and guessing is the only
+        // reason it could be wrong. So the queues are scanned for that thread
+        // and it is marked where it actually is -- exactly what `wake_with`
+        // does for the opposite transition, one queue lock at a time so two of
+        // the same rank are never held together.
+        //
+        // Dropping this CPU's lock first, because the thread may be current on
+        // a queue this one already holds.
+        drop(queue);
+        mark_blocked_anywhere(id);
         return;
     }
     if !thread.dying {
         thread.state = State::Blocked;
     }
+}
+
+/// Marks `thread` blocked wherever it is, for a caller that has migrated.
+///
+/// One queue lock at a time, as `wake_with` does: two runqueue locks are the
+/// same rank and have no order between them.
+fn mark_blocked_anywhere(thread: u32) {
+    let online = percpu::online_count() as usize;
+    for queue in QUEUES.iter().take(online.min(MAX_CPUS)) {
+        let mut queue = queue.lock();
+        if let Some(found) = queue.threads.iter_mut().flatten().find(|t| t.id == thread) {
+            if !found.dying {
+                found.state = State::Blocked;
+            }
+            MARKED_ELSEWHERE.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+    }
+}
+
+/// Marks that were completed by finding the caller on another queue.
+///
+/// Zero means no caller migrated inside `mark_blocked` on this boot. Non-zero
+/// is the window still opening -- it is no longer a lost mark, but it is still
+/// the migration this defect turns on, and the count is what says how often.
+static MARKED_ELSEWHERE: AtomicU64 = AtomicU64::new(0);
+
+/// How many blocks were completed on another CPU's queue.
+#[must_use]
+pub fn marked_elsewhere() -> u64 {
+    MARKED_ELSEWHERE.load(Ordering::Relaxed)
 }
 
 /// Switches abandoned after this CPU's accounting had already been handed over.

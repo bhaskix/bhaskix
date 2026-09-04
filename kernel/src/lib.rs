@@ -24890,6 +24890,15 @@ fn wait_queue_self_test(hhdm_base: u64) -> bool {
         // cross-referencing thread numbers by hand, and explicit when the
         // party is not a station at all -- which is itself the interesting
         // reading, since it would put the fault outside this test's threads.
+        // **And how many of those refusals were then completed elsewhere.**
+        // A refusal is no longer a lost mark: the caller is found on whatever
+        // queue it migrated to and marked there. This says the window still
+        // opens, and how often, without the lap through the scheduler it used
+        // to cost.
+        println!(
+            "                   {} of them were completed by finding the caller on another queue",
+            sched::marked_elsewhere()
+        );
         if let Some((caller, victim)) = sched::first_mismark() {
             let name_of = |id: u32| -> &'static str {
                 match spawned.iter().position(|&s| s == id) {
