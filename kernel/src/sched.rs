@@ -3724,6 +3724,27 @@ pub fn running_now() -> Running {
     }
 }
 
+/// How many times `thread` has been moved between run queues.
+///
+/// **For the ring report, and for one question.** Two specimens of §3's
+/// ring-station defect name the stuck station as the caller whose
+/// `mark_blocked` was refused, and a refusal *is* a detected migration -- the
+/// caller moved between reading its CPU and taking that queue's lock. So the
+/// surviving hypothesis is that the stuck station is one that migrated at a
+/// delicate moment, and this is the number that says whether it had migrated
+/// at all. `wake`'s own comment records the shape from the other side: a
+/// station that stalled was marked `(migrated)` in the thread table.
+#[must_use]
+pub fn migrations_of(thread: u32) -> Option<u64> {
+    for queue in QUEUES.iter().take(percpu::online_count() as usize) {
+        let queue = queue.lock();
+        if let Some(found) = queue.threads.iter().flatten().find(|t| t.id == thread) {
+            return Some(found.migrations);
+        }
+    }
+    None
+}
+
 /// [`describe`], for a path that must never block.
 ///
 /// Worse than the one above if left blocking: `describe` locks *every* queue,

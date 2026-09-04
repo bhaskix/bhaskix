@@ -25118,7 +25118,7 @@ fn wait_queue_self_test(hhdm_base: u64) -> bool {
             println!(
                 "\x1b[91m                   {name} (thread {}) {state}, {} laps, last saw token \
                  {} at phase {}, {} predicate evaluations; recent wakes: {woken} landed, {missed} \
-                 not found, {busy} contended\x1b[0m",
+                 not found, {busy} contended, {} migration(s)\x1b[0m",
                 spawned[id],
                 LAPS[id].load(Ordering::Relaxed),
                 if seen == u64::MAX { -1 } else { seen as i64 },
@@ -25127,7 +25127,20 @@ fn wait_queue_self_test(hhdm_base: u64) -> bool {
                 } else {
                     seen_phase as i64
                 },
-                PREDICATE_EVALS[id].load(Ordering::Relaxed)
+                PREDICATE_EVALS[id].load(Ordering::Relaxed),
+                // **Whether this station ever moved between queues.**
+                //
+                // Two specimens name the stuck station as the caller whose
+                // `mark_blocked` was refused, and a refusal *is* a detected
+                // migration -- the caller moved between reading its CPU and
+                // taking that queue's lock. So the surviving hypothesis is
+                // that the stuck station is one that migrated at a delicate
+                // moment. This is the number that says whether it migrated at
+                // all, per station, so the next specimen answers it without
+                // another instrument being added first. `-1` means the thread
+                // is no longer in any queue, which is what a retired station
+                // looks like.
+                sched::migrations_of(spawned[id]).map_or(-1, |count| count as i64)
             );
         }
         println!(

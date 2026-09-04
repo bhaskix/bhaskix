@@ -293,6 +293,36 @@ fn implausible(frame: &TrapFrame) -> Option<&'static str> {
     if frame.rflags & 0x2 == 0 {
         return Some("rflags bit 1 is clear, which no processor writes");
     }
+    // **`VM` set, which is what would make `iretq` fault the way it does.**
+    //
+    // Every specimen of the open interrupt-frame fault is a `#GP` at
+    // `isr_common+0x57` -- `iretq` -- with an error code naming a selector
+    // index far outside this kernel's GDT: `0x9928` on 2026-08-29, `0xed00` on
+    // 2026-09-04. The checks above pass `cs` and `ss`, and the witness printed
+    // nothing on the 2026-09-04 boots, so the two selectors `iretq` normally
+    // loads were both fine and it faulted anyway.
+    //
+    // `iretq` loads *more* than those two if the frame's `rflags` has `VM`
+    // (bit 17) set: it takes a virtual-8086 return and loads `ES`, `DS`, `FS`
+    // and `GS` from words further up the stack, which in a corrupted frame are
+    // whatever happened to be there. That produces exactly this shape -- a
+    // fault at `iretq`, naming a selector that appears in no descriptor table,
+    // while `cs` and `ss` themselves are ordinary.
+    //
+    // This kernel never returns to virtual-8086 mode, so `VM` set is
+    // impossible rather than merely unusual. Checked here, where it is cheap,
+    // and named so a specimen says it outright instead of leaving the error
+    // code to be decoded.
+    //
+    // `NT` (bit 14) goes with it for the same reason: a nested-task return
+    // through a task gate is not a thing this kernel does, and it changes what
+    // `iretq` reads.
+    if frame.rflags & (1 << 17) != 0 {
+        return Some("rflags has VM set, so iretq would take a virtual-8086 return");
+    }
+    if frame.rflags & (1 << 14) != 0 {
+        return Some("rflags has NT set, so iretq would take a nested-task return");
+    }
     None
 }
 
@@ -521,6 +551,26 @@ mod tests {
         let mut frame = kernel_frame();
         frame.rsp = 0xdead_0000_0000_0000;
         assert!(implausible(&frame).is_some());
+    }
+
+    #[test]
+    fn a_frame_iretq_would_take_a_v8086_or_task_return_through_is_rejected() {
+        // The open `#GP` at `iretq` names a selector in no descriptor table
+        // while `cs` and `ss` are ordinary. `VM` is how `iretq` comes to load
+        // selectors that are not those two.
+        let mut vm = kernel_frame();
+        vm.rflags |= 1 << 17;
+        assert!(implausible(&vm).is_some());
+
+        let mut nt = kernel_frame();
+        nt.rflags |= 1 << 14;
+        assert!(implausible(&nt).is_some());
+
+        // And the flags this machine really does set stay acceptable:
+        // interrupts enabled, plus the always-one bit.
+        let mut ordinary = kernel_frame();
+        ordinary.rflags = 0x202;
+        assert_eq!(implausible(&ordinary), None);
     }
 
     #[test]
