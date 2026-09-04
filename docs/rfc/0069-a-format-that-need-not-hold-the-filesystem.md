@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | 📋 **Specified 2026-09-04.** The arithmetic is done in RFC 0068; this is the contract change it names and declines to make |
+| **Status** | 🔨 **Step 1 landed 2026-09-04.** `format_sized` is in with `format` delegating to it, four host tests including one that lays out a 540-block filesystem in a 13-block buffer, and the existing 1,141 host tests unchanged. Steps 2 and 3 — the kernel's callers, and BusyBox actually fitting — are next |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | fs (`bhaskix_fs::format`) / kernel |
 | **Milestone** | Phase 2 — Linux personality, application milestone **L1** |
@@ -138,3 +138,26 @@ every lane.
 2. The kernel's two callers pass a declared size; the format loop's count comes from the buffer.
 3. RFC 0068's flag stages BusyBox into a filesystem that can hold it, and its `busybox disk` line
    stops being a measurement of the limit and becomes a demonstration.
+
+
+---
+
+## Step 1, landed (2026-09-04)
+
+`format_sized(bytes, inodes, blocks)` is in, and `format` is `format_sized(bytes, inodes,
+bytes.len() / BLOCK)` — so the whole existing suite exercises the new function through the old
+name, which is what says the behaviour is preserved rather than a comment claiming it.
+
+Four host tests, each watched red:
+
+* a filesystem of **540 blocks laid out in a 13-block buffer**, which is the case this RFC exists
+  for, asserting both that the superblock declares 540 and that the prefix fits what was written;
+* a buffer too small for the metadata is **refused, not truncated** — half an inode table mounts and
+  then loses files;
+* a declared size too small for its own layout is refused, at both ends;
+* `format` and `format_sized` over the same buffer produce **byte-identical images**.
+
+The one thing worth noting from writing it: `if (bytes.len() / BLOCK) as u64 < superblock.data_start`
+does not parse — `as u64 <` is read as the start of generic arguments. It needs the cast
+parenthesised, and the compiler says so clearly enough that this is a footnote rather than a
+finding.

@@ -762,7 +762,28 @@ impl Entry {
 /// [`FsError::OutOfRange`] if the image is too small to hold a superblock, a
 /// bitmap, an inode table and at least one data block.
 pub fn format(bytes: &mut [u8], inodes: u64) -> Result<Superblock, FsError> {
-    let blocks = (bytes.len() / BLOCK) as u64;
+    format_sized(bytes, inodes, (bytes.len() / BLOCK) as u64)
+}
+
+/// Lays out a filesystem of `blocks` blocks, writing only its metadata.
+///
+/// **The image need not be the filesystem — RFC 0069.** [`format`] derives the
+/// size from the buffer's length, so declaring a larger filesystem meant
+/// holding all of it in memory and writing all of it to the device. A format
+/// writes a superblock, a bitmap, an inode table and a journal; data blocks are
+/// marked free in the bitmap and nothing reads one before it has been allocated
+/// and written, which is why `mkfs` does not zero a disk either.
+///
+/// `bytes` must hold the metadata prefix — everything below `data_start`. The
+/// caller writes `bytes.len() / BLOCK` blocks to the device, not `blocks`, and
+/// that is the whole saving: for the 540 blocks RFC 0068 wants, 53,248 bytes
+/// and thirteen writes instead of 2,211,840 and 540.
+///
+/// # Errors
+///
+/// [`FsError::OutOfRange`] if `blocks` is too small to hold the layout, or if
+/// `bytes` is too small to hold its metadata.
+pub fn format_sized(bytes: &mut [u8], inodes: u64, blocks: u64) -> Result<Superblock, FsError> {
     if blocks < 4 + JOURNAL_BLOCKS || inodes == 0 {
         return Err(FsError::OutOfRange);
     }
@@ -784,6 +805,13 @@ pub fn format(bytes: &mut [u8], inodes: u64) -> Result<Superblock, FsError> {
         root: 0,
     };
     if superblock.data_start >= blocks {
+        return Err(FsError::OutOfRange);
+    }
+    // **And the buffer must hold what is about to be laid out.** Everything
+    // below `data_start` is written here; everything above it is the caller's
+    // and is never touched. Refused rather than truncated: a filesystem whose
+    // inode table was half written is one that mounts and then loses files.
+    if ((bytes.len() / BLOCK) as u64) < superblock.data_start {
         return Err(FsError::OutOfRange);
     }
     superblock.write(bytes)?;
@@ -1010,11 +1038,58 @@ mod tests {
 
     use super::{
         BLOCK, Bitmap, ENTRY, Entry, Filesystem, FsError, Image, Inode, JOURNAL_BLOCKS, Kind,
-        Superblock, format,
+        Superblock, format, format_sized,
     };
 
     fn image(blocks: usize) -> Vec<u8> {
         vec![0u8; blocks * BLOCK]
+    }
+
+    #[test]
+    fn a_filesystem_may_be_larger_than_the_buffer_that_lays_it_out() {
+        // RFC 0069: the metadata prefix is what `bytes` must hold. 540 blocks
+        // is what a filesystem holding BusyBox needs, and thirteen blocks is
+        // what laying it out actually writes.
+        let mut bytes = [0u8; 13 * BLOCK];
+        let superblock =
+            format_sized(&mut bytes, 128, 540).expect("the prefix fits in thirteen blocks");
+        assert_eq!(
+            superblock.blocks, 540,
+            "the filesystem is the declared size"
+        );
+        assert!(
+            superblock.data_start <= 13,
+            "the prefix must fit what was written, got {}",
+            superblock.data_start
+        );
+    }
+
+    #[test]
+    fn a_buffer_too_small_for_the_metadata_is_refused() {
+        // Refused rather than truncated: half an inode table mounts and then
+        // loses files.
+        let mut bytes = [0u8; 4 * BLOCK];
+        assert!(format_sized(&mut bytes, 128, 540).is_err());
+    }
+
+    #[test]
+    fn a_declared_size_too_small_for_its_own_layout_is_refused() {
+        let mut bytes = [0u8; 64 * BLOCK];
+        assert!(format_sized(&mut bytes, 128, 4 + JOURNAL_BLOCKS - 1).is_err());
+        assert!(format_sized(&mut bytes, 128, 0).is_err());
+    }
+
+    #[test]
+    fn format_is_format_sized_over_its_own_buffer() {
+        // The wrapper must not change behaviour: this is what says every
+        // existing caller and host test is unaffected.
+        let mut one = [0u8; 64 * BLOCK];
+        let mut two = [0u8; 64 * BLOCK];
+        let a = format(&mut one, 128).unwrap();
+        let b = format_sized(&mut two, 128, 64).unwrap();
+        assert_eq!(a.blocks, b.blocks);
+        assert_eq!(a.data_start, b.data_start);
+        assert_eq!(one, two, "the same bytes, laid out the same way");
     }
 
     #[test]
