@@ -991,7 +991,16 @@ is 4 MiB now. BusyBox still does not fit, because the disk was never the binding
 formats a fixed **128 blocks** into `JOURNAL_IMAGE`, a `[u8; 128 * BLOCK]` static, so the
 *filesystem* is 524,288 bytes on however large a disk. Staging BusyBox behind the new
 `bhaskix.busybox=1` flag reports `364544 of 2172376 bytes reached the disk` -- 89 blocks, which is
-what remains of 128 after the metadata and the three files already there. Everything else is already there: BusyBox is staged into
+what remains of 128 after the metadata and the three files already there. <br><br>**And the cost of
+fixing that is not inherent, which is worth knowing before anyone pays it.** Both new numbers -- a
+2.2 MiB kernel static and 260 ms of formatting -- follow from `format` taking a buffer and deriving
+the filesystem's size from its length: the image *is* the filesystem. A format needs to write a
+superblock, a bitmap, an inode table and a journal; data blocks are free in the bitmap and nothing
+reads one before it is allocated. For 540 blocks with this filesystem's own constants that is **13
+metadata blocks, 53,248 bytes** -- against 540 blocks and 2,211,840 -- so about **6 ms** of
+formatting and *less* `.bss` than the kernel carries today. RFC 0068 records the shape,
+`format_sized(bytes, inodes, blocks)`, and says it belongs in its own RFC because it changes a core
+crate's contract. Everything else is already there: BusyBox is staged into
 the initrd by two `--file bin/busybox=` lines, the filesystem can hold a file that size since RFC
 0065 took one past ten blocks, and the loader no longer cares how big the program is.
 

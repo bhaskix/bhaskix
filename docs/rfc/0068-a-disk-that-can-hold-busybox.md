@@ -208,3 +208,32 @@ length on — 2.1 to 3.4 seconds — is real and is no longer the binding constr
 The `bhaskix.busybox=1` flag stays and is off by default, because what it now does is *measure this
 limit* — it is the only thing in the tree that says how much of BusyBox fits and why not. Nothing
 here claims a hosted shell runs a command; it claims the opposite, with the number attached.
+
+
+## The step that removes both new costs (2026-09-04)
+
+The two numbers above — a 2.2 MiB static buffer and 260 ms of formatting — are both consequences of
+one line: `format` takes `bytes: &mut [u8]` and derives the filesystem's size from
+`bytes.len() / BLOCK`. **The image is the filesystem.** So declaring a bigger filesystem means
+materialising every one of its blocks in kernel memory and writing every one to the device.
+
+A format does not need to do either. It needs to write a superblock, a bitmap, an inode table and a
+journal; data blocks are marked free in the bitmap and nothing reads one until it has been allocated
+and written. `mkfs` does not zero a disk, for the same reason.
+
+**Priced for the 540 blocks BusyBox needs, with this filesystem's own constants** — `BLOCK` 4096,
+`INODE` 64, `JOURNAL_BLOCKS` 9, 128 inodes:
+
+| | whole image | metadata only |
+|---|---|---|
+| kernel buffer | 2,211,840 bytes | **53,248** |
+| blocks written at format | 540 | **13** |
+
+Thirteen blocks at the 477 us the format now runs at is about **6 ms**, against 260. And 52 KiB of
+`.bss` is *less* than the 512 KiB the kernel carries today for a 128-block image.
+
+**So the shape is `format_sized(bytes, inodes, blocks)`** — the buffer holds the metadata prefix,
+the argument declares how large the filesystem is, and the caller writes only what was laid out.
+That is a change to a core crate's contract with host tests behind it, so it belongs in its own RFC
+rather than as a step here; this section exists to say that the cost this RFC discovered is not
+inherent, and roughly what removing it is worth.
