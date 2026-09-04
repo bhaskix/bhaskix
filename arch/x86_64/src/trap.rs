@@ -274,13 +274,41 @@ fn implausible(frame: &TrapFrame) -> Option<&'static str> {
     const KERNEL_CS: u64 = 0x08;
     /// Its stack selector.
     const KERNEL_SS: u64 = 0x10;
+    /// The ring-3 pair, as `sysret` builds them: `gdt::USER_CODE | 3` and
+    /// `gdt::USER_DATA | 3`. Written here rather than imported so this file
+    /// has no dependency on the descriptor module for a check.
+    const USER_CS: u64 = (crate::gdt::USER_CODE | 3) as u64;
+    /// See [`USER_CS`].
+    const USER_SS: u64 = (crate::gdt::USER_DATA | 3) as u64;
 
+    // **Both rings, which the comment above always claimed and the code did
+    // not do.** This said it rejects "a selector that is neither of the two
+    // this kernel installs", and then checked only the ring-0 case: a frame
+    // whose `cs` merely had its ring bits set passed whatever else was in it,
+    // and so did its `ss`. A corrupted frame claiming ring 3 was accepted
+    // whole.
+    //
+    // That matters for the fault this check exists for. Every specimen is a
+    // `#GP` at `iretq` naming a selector index in no descriptor table, and the
+    // witness has printed nothing on the boots that produced them -- which,
+    // with the ring-3 arm checking nothing, is what a garbage `cs` of `0xed03`
+    // would also look like. This kernel installs exactly two selectors per
+    // ring and returns through no others.
     let user = frame.cs & 3 != 0;
-    if !user && frame.cs != KERNEL_CS {
-        return Some("cs is neither the kernel's nor a user selector");
-    }
-    if !user && frame.ss != KERNEL_SS && frame.ss != 0 {
-        return Some("ss is not the kernel's, returning to ring 0");
+    if user {
+        if frame.cs != USER_CS {
+            return Some("cs claims ring 3 but is not this kernel's user code selector");
+        }
+        if frame.ss != USER_SS {
+            return Some("ss claims ring 3 but is not this kernel's user stack selector");
+        }
+    } else {
+        if frame.cs != KERNEL_CS {
+            return Some("cs is neither the kernel's nor a user selector");
+        }
+        if frame.ss != KERNEL_SS && frame.ss != 0 {
+            return Some("ss is not the kernel's, returning to ring 0");
+        }
     }
     if !canonical(frame.rip) {
         return Some("rip is not a canonical address");
@@ -504,8 +532,8 @@ mod tests {
     fn user_frame() -> TrapFrame {
         TrapFrame {
             rip: 0x0000_0000_0040_1234,
-            cs: 0x23,
-            ss: 0x1b,
+            cs: (crate::gdt::USER_CODE | 3) as u64,
+            ss: (crate::gdt::USER_DATA | 3) as u64,
             rsp: 0x0000_7fff_ffff_e000,
             ..kernel_frame()
         }
@@ -518,6 +546,19 @@ mod tests {
     fn the_frames_this_machine_actually_writes_are_not_rejected() {
         assert_eq!(implausible(&kernel_frame()), None);
         assert_eq!(implausible(&user_frame()), None);
+    }
+
+    #[test]
+    fn a_ring_three_frame_with_selectors_this_kernel_never_installs_is_rejected() {
+        // The arm that checked nothing until 2026-09-04: ring bits set was
+        // enough to pass whatever else the frame held.
+        let mut cs = user_frame();
+        cs.cs = 0xed03;
+        assert!(implausible(&cs).is_some());
+
+        let mut ss = user_frame();
+        ss.ss = 0xed03;
+        assert!(implausible(&ss).is_some());
     }
 
     #[test]
