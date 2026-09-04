@@ -236,4 +236,9 @@ Thirteen blocks at the 477 us the format now runs at is about **6 ms**, against 
 the argument declares how large the filesystem is, and the caller writes only what was laid out.
 That is a change to a core crate's contract with host tests behind it, so it belongs in its own RFC
 rather than as a step here; this section exists to say that the cost this RFC discovered is not
-inherent, and roughly what removing it is worth.
+inherent, and roughly what removing it is worth. **That RFC is
+[0069](0069-a-format-that-need-not-hold-the-filesystem.md)**, specified the same day, and it carries
+this arithmetic plus the one thing this section did not think about: a filesystem whose data blocks
+were never written hands out a *first* allocation that was not zeroed, where a format had zeroed it
+before. That is a confidentiality question, it is the same position every reallocated block is
+already in, and it is priced there rather than assumed away.

@@ -998,9 +998,13 @@ the filesystem's size from its length: the image *is* the filesystem. A format n
 superblock, a bitmap, an inode table and a journal; data blocks are free in the bitmap and nothing
 reads one before it is allocated. For 540 blocks with this filesystem's own constants that is **13
 metadata blocks, 53,248 bytes** -- against 540 blocks and 2,211,840 -- so about **6 ms** of
-formatting and *less* `.bss` than the kernel carries today. RFC 0068 records the shape,
-`format_sized(bytes, inodes, blocks)`, and says it belongs in its own RFC because it changes a core
-crate's contract. Everything else is already there: BusyBox is staged into
+formatting and *less* `.bss` than the kernel carries today. That shape, `format_sized(bytes, inodes, blocks)`, is now
+**[RFC 0069](docs/rfc/0069-a-format-that-need-not-hold-the-filesystem.md)**, specified the same day:
+the buffer holds the metadata prefix, the argument declares the size, and `format` becomes a wrapper
+so every existing caller and host test is untouched. It also names the one cost the arithmetic did
+not -- a data block that was never written is handed out unzeroed on its *first* allocation, where a
+format had zeroed it before, which is the position every reallocated block is already in and is
+priced rather than assumed away. Everything else is already there: BusyBox is staged into
 the initrd by two `--file bin/busybox=` lines, the filesystem can hold a file that size since RFC
 0065 took one past ten blocks, and the loader no longer cares how big the program is.
 
