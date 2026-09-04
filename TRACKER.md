@@ -1058,9 +1058,12 @@ once the staging variance was fixed.
 **And then it did run.** `bin/hosted` execs `/busybox` with `["busybox", "echo",
 "bhaskix-busybox-ran"]`, and the boot that staged it prints that text: **a hosted program replaced
 itself with an unmodified 2 MB binary this project did not write, read off a filesystem through a
-directory capability, and that binary ran a command.** `busybox echo` is BusyBox dispatching on
-`argv[0]`'s basename and then on `argv[1]`, so the output says the initial process image this kernel
-builds is the one a foreign program expected to read -- argv, envp and auxiliary vector included.
+directory capability, and that binary ran a command.** The command is `busybox sh -c 'echo
+bhaskix-busybox-ran'`, so BusyBox dispatches on `argv[1]` to its **shell**, which parses the string
+in `argv[3]` and runs what it finds: the output says the initial process image this kernel builds is
+the one a foreign program expected to read -- argv, envp and auxiliary vector included -- and that
+what it reached was a shell rather than an applet that happens to echo. **Not proven:** `echo` in
+`sh -c` is a builtin, so the shell has not been shown to `fork` and `exec` a child.
 
 Gated, keyed on whether BusyBox was staged so the eleven lanes without it take a `skipped` arm
 rather than failing for a file they were never given, and **watched red** by looking for a string

@@ -3204,13 +3204,17 @@ fi
 # unconditionally would fail four lanes for a file they were never given, which
 # is how a gate gets a `|| true` added to it.
 #
-# What the output proves is more than "a program ran". `busybox echo <text>` is
-# BusyBox dispatching on `argv[0]`'s basename and then on `argv[1]`, so the text
-# appearing at all says the initial process image this kernel built is the one a
-# program from outside this project expected to read -- argv, envp and the
-# auxiliary vector included.
+# What the output proves is more than "a program ran". `busybox sh -c '<command>'`
+# is BusyBox dispatching on `argv[1]` to its shell, which parses the string in
+# `argv[3]` and runs what it finds. So the text appearing says the initial
+# process image this kernel built is the one a program from outside this project
+# expected to read -- argv, envp and the auxiliary vector included -- and that
+# what it reached was a shell rather than an applet that happens to echo.
+#
+# `echo` inside `sh -c` is a builtin, so this does not prove the shell can
+# `fork` and `exec` a child. That is a separate assertion and is not made here.
 if grep -qF "bhaskix-busybox-ran" "$LOG"; then
-    pass "a hosted execve ran BusyBox off the filesystem and it executed a command"
+    pass "L1: a hosted execve ran BusyBox's sh off the filesystem, and it parsed and ran a command"
 elif grep -qE "busybox disk +[0-9]+ bytes of BusyBox staged" "$LOG"; then
     fail "BusyBox was staged but the hosted execve of it produced no output"
     grep -aE "hosted exec busybox|busybox disk" "$LOG" | sed 's/^/                   /'

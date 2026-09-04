@@ -259,10 +259,15 @@ bhaskix-busybox-ran
 **A hosted program replaced itself with an unmodified 2 MB binary this project did not write, read
 off a filesystem through a directory capability, and that binary ran a command.**
 
-What the output proves is more than "a program ran". `busybox echo <text>` is BusyBox dispatching on
-`argv[0]`'s basename and then on `argv[1]`, so the text appearing at all says the initial process
-image this kernel builds is the one a program from outside expected to read — argv, envp and the
-auxiliary vector included.
+What the output proves is more than "a program ran". The command is `busybox sh -c 'echo
+bhaskix-busybox-ran'`: BusyBox dispatches on `argv[1]` to its **shell**, which then *parses* the
+string in `argv[3]` and runs what it finds. So the text appearing says the initial process image
+this kernel builds is the one a program from outside expected to read — argv, envp and the
+auxiliary vector included — and that what it reached was a shell rather than an applet that happens
+to echo.
+
+**What it does not prove:** `echo` inside `sh -c` is a builtin, so the shell has not been shown to
+`fork` and `exec` a child. That is the next thing to ask of it, and it is not claimed.
 
 Gated, and keyed on whether BusyBox was staged: demanding the output unconditionally would fail four
 lanes for a file they were never given. **Watched red** by looking for a string the program does not
