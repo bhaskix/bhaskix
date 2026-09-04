@@ -351,8 +351,32 @@ fn implausible(frame: &TrapFrame) -> Option<&'static str> {
     if frame.rflags & (1 << 14) != 0 {
         return Some("rflags has NT set, so iretq would take a nested-task return");
     }
+    // **The bits no processor sets**, which is a far wider net than bit 1.
+    //
+    // Bits 3, 5 and 15 read zero on every x86, and bits 22 and above are
+    // reserved in 64-bit mode. A frame whose flags have any of them set was
+    // not written by this machine. Bit 1 alone catches a *cleared* word;
+    // corruption that leaves stack contents behind is far more likely to set
+    // something up here, so this is the arm that would notice it.
+    const RFLAGS_RESERVED: u64 = (1 << 3) | (1 << 5) | (1 << 15) | 0xffff_ffff_ffc0_0000;
+    if frame.rflags & RFLAGS_RESERVED != 0 {
+        return Some("rflags has bits set that no processor writes");
+    }
+    // **A ring-3 frame whose addresses are the kernel's.**
+    //
+    // `iretq` to ring 3 with a kernel `rip` or `rsp` is a return this machine
+    // cannot make: user space is the low half and everything this kernel
+    // executes is the high one. Checked only for ring 3, deliberately -- the
+    // ring-0 case has no equivalent bound worth asserting, and a check that
+    // guessed at one would fire on something legitimate.
+    if user && (frame.rip >= HIGH_HALF || frame.rsp >= HIGH_HALF) {
+        return Some("a ring-3 frame whose rip or rsp is a kernel address");
+    }
     None
 }
+
+/// Where the kernel half of the address space begins.
+const HIGH_HALF: u64 = 0xffff_8000_0000_0000;
 
 /// Whether `address` is one this processor could load — the halves of the
 /// address space, with the hole between them excluded.
@@ -546,6 +570,36 @@ mod tests {
     fn the_frames_this_machine_actually_writes_are_not_rejected() {
         assert_eq!(implausible(&kernel_frame()), None);
         assert_eq!(implausible(&user_frame()), None);
+    }
+
+    #[test]
+    fn flags_bits_no_processor_sets_are_rejected() {
+        // Bit 1 alone catches a cleared word. Corruption that leaves stack
+        // contents behind sets bits instead, and these are the ones that
+        // cannot legitimately be set.
+        for bit in [3u32, 5, 15, 22, 40, 63] {
+            let mut frame = kernel_frame();
+            frame.rflags |= 1 << bit;
+            assert!(
+                implausible(&frame).is_some(),
+                "rflags bit {bit} should be impossible"
+            );
+        }
+    }
+
+    #[test]
+    fn a_ring_three_frame_returning_to_a_kernel_address_is_rejected() {
+        let mut rip = user_frame();
+        rip.rip = 0xffff_ffff_8000_1234;
+        assert!(implausible(&rip).is_some());
+
+        let mut rsp = user_frame();
+        rsp.rsp = 0xffff_8000_0000_1000;
+        assert!(implausible(&rsp).is_some());
+
+        // And a ring-0 frame keeps its kernel addresses, which is the whole
+        // reason that check is not applied to both rings.
+        assert_eq!(implausible(&kernel_frame()), None);
     }
 
     #[test]
