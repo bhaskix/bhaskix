@@ -813,6 +813,9 @@ static WAKE_TO_RUN_WORST_TASK: AtomicU64 = AtomicU64::new(0);
 static WAKE_WORST_NAME: [core::sync::atomic::AtomicU8; 16] =
     [const { core::sync::atomic::AtomicU8::new(0) }; 16];
 
+/// When that worst wait ended, on the same clock the boot report reads.
+static WAKE_WORST_AT: AtomicU64 = AtomicU64::new(0);
+
 /// The wake-to-dispatch tallies: `(count, total cycles, worst cycles)`.
 #[must_use]
 pub fn wake_to_run() -> (u64, u64, u64) {
@@ -837,6 +840,12 @@ pub fn wake_to_run_worst() -> (u64, u32) {
 pub fn wake_to_run_worst_task() -> (u64, u32) {
     let packed = WAKE_TO_RUN_WORST_TASK.load(Ordering::Relaxed);
     (packed >> 16, (packed & 0xffff) as u32)
+}
+
+/// When that worst wait ended, in TSC ticks on the boot report's own clock.
+#[must_use]
+pub fn wake_to_run_worst_at() -> u64 {
+    WAKE_WORST_AT.load(Ordering::Relaxed)
 }
 
 /// The name that thread had when it waited, as bytes and a length.
@@ -3059,6 +3068,16 @@ fn preempt_reporting() -> bool {
                     // other boots' numbering. `fetch_max` returns the previous
                     // value, so the winner is the one that writes the name.
                     if WAKE_TO_RUN_WORST_TASK.fetch_max(packed, Ordering::Relaxed) < packed {
+                        // **And when it ended**, because "a ring station waits
+                        // a full backstop on every boot" does not say *which*
+                        // wait. The ring test publishes a token, and then a
+                        // phase to retire on; a second lost at the retire is a
+                        // station that still makes its four-second window, and
+                        // the same second lost mid-ring is the machine not
+                        // turning. The timestamp against the ring's own window
+                        // tells those apart, and nothing else in this report
+                        // can.
+                        WAKE_WORST_AT.store(now, Ordering::Relaxed);
                         for (slot, byte) in WAKE_WORST_NAME
                             .iter()
                             .zip(thread.name.bytes().chain(core::iter::repeat(0)))

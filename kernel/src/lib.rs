@@ -19693,8 +19693,9 @@ fn user_shell(handoff: &Handoff) -> Result<(), &'static str> {
             };
             println!(
                 "                   worst for any other thread {} us, thread {task_thread} \
-                 ({task_name})",
-                micros(task_ticks)
+                 ({task_name}), ending {} ms into the boot",
+                micros(task_ticks),
+                sched::wake_to_run_worst_at() * 1_000 / bhaskix_arch::tsc::hertz().unwrap_or(1)
             );
         }
     }
@@ -24792,7 +24793,15 @@ fn wait_queue_self_test(hhdm_base: u64) -> bool {
     // reaching it and not the next one puts the hang in the window or the
     // counter reads that follow it.
     let watch_ms = RING_SOAK_MS.load(Ordering::Relaxed);
-    println!("    wait queues    {RING_SIZE} stations spawned; watching for {watch_ms} ms");
+    // **Timestamped, so the ring's window can be compared with the one wait
+    // that costs a second.** `wake to run` reports a ring station losing about
+    // 988 ms on every passing boot and says when it ended; without a mark here
+    // that reading has to be placed against the ring by inference, which is
+    // what it was until 2026-09-04.
+    println!(
+        "    wait queues    {RING_SIZE} stations spawned at {} ms; watching for {watch_ms} ms",
+        bhaskix_arch::tsc::read() * 1_000 / bhaskix_arch::tsc::hertz().unwrap_or(1)
+    );
 
     // Generous, because the budget has to cover the slowest configuration
     // rather than the fastest. A cross-CPU wake waits for the target CPU's
