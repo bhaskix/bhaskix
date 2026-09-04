@@ -10312,10 +10312,12 @@ fn hosted_exec_self_test(hhdm_base: u64, cpus: u32) -> bool {
         let writes = sched_disk_writes();
         if writes.1 > 0 {
             println!(
-                "    disk writes    {} round trip(s) to bin/blkd, {} us each on average, worst {} us",
+                "    disk writes    {} round trip(s) to bin/blkd, {} us each on average, worst {} us; \
+                 {} wake(s) this boot waited for a tick instead of a device",
                 writes.1,
                 writes.0 / writes.1 * 1_000_000 / hertz,
-                writes.2 * 1_000_000 / hertz
+                writes.2 * 1_000_000 / hertz,
+                sched::deferred_wakes_taken()
             );
         }
     }

@@ -4333,6 +4333,32 @@ pub fn wake_from_interrupt(id: u32) -> bool {
         WakeResult::Woken => true,
         WakeResult::Contended => {
             defer_wake(id);
+            // **And make the tick come now, rather than waiting for one.**
+            //
+            // The comment above prices this path honestly: "at most the idle
+            // backstop, one second". Measured on 2026-09-04 it is not a corner
+            // -- 38 to 71 wakes a boot come here, and the block service's 108
+            // round trips catch one badly enough to cost **470 to 939 ms** in
+            // about half of all boots, which is §3's staging variance and, by
+            // its shape, the wake-delay row beside it.
+            //
+            // The retry already exists and runs in two places: the timer tick,
+            // and the idle arm of `block_self`, which drains before it halts.
+            // Both need the CPU to be *in* the scheduler. So the deferral now
+            // sends `RESCHEDULE_VECTOR` to the other CPUs, which is what makes
+            // a halted one loop and drain instead of sleeping to its backstop.
+            // The same move RFC 0062 made for a `FS` base, for the same
+            // reason: the mechanism to arrive early already existed and the
+            // path was waiting for a clock instead.
+            //
+            // Not to this CPU: it is inside an interrupt handler and will
+            // return to the scheduler on its own.
+            let here = percpu::cpu_id();
+            for cpu in 0..percpu::online_count().min(MAX_CPUS as u32) {
+                if cpu != here {
+                    notify(cpu);
+                }
+            }
             false
         }
         // Nothing to retry: no queue holds a blocked thread by that name.
@@ -4387,11 +4413,40 @@ pub fn drain_deferred_wakes() -> bool {
 ///   deferred twice took two slots, so the eight were spent faster than there
 ///   were threads to spend them.
 ///
+/// Wakes handed to the tick because an interrupt handler could not take the
+/// runqueue lock.
+///
+/// Zero would mean every wake was delivered where it was raised. Non-zero is
+/// the count of threads that waited for a timer instead of a device.
+static DEFERRED_TAKEN: AtomicU64 = AtomicU64::new(0);
+
+/// How many wakes were deferred to a tick.
+#[must_use]
+pub fn deferred_wakes_taken() -> u64 {
+    DEFERRED_TAKEN.load(Ordering::Relaxed)
+}
+
 /// Sized to the live-thread bound and deduplicated, losing one is now
 /// unreachable rather than unlikely: a thread occupies at most one slot and
 /// there are as many slots as threads. The counter stays, and says so out loud
 /// if it is ever wrong.
 fn defer_wake(id: u32) {
+    // **Counted, because a deferred wake is a wake that waits for a tick.**
+    //
+    // An interrupt handler that loses `try_lock` on a runqueue records the
+    // wake here for the tick to retry. That is correct and it is not free: the
+    // thread stays blocked until the next timer interrupt on that CPU, and a
+    // tickless CPU's next interrupt can be its idle backstop -- `time` puts
+    // that at `IDLE_BACKSTOP_MS`, a full second.
+    //
+    // §3's staging row measured the consequence on 2026-09-04 without being
+    // able to name it: 108 `block::WRITE` round trips a boot, of which one in
+    // roughly two boots takes **473 or 702 milliseconds** while the rest take
+    // two, with two of those landing 352 microseconds apart. A wait ended by a
+    // clock rather than by the device is what that looks like, and this is the
+    // one path in this kernel that does it by design. Whether it is *this*
+    // path is what the count says.
+    DEFERRED_TAKEN.fetch_add(1, Ordering::Relaxed);
     // Already waiting to be retried. A second entry would wake it twice, which
     // is harmless, and spend a slot, which is not.
     for slot in &DEFERRED_WAKES {
