@@ -985,8 +985,17 @@ would add between about **3.6 and 57 seconds to every boot**. That is why growin
 obviously right and wants an RFC rather than a one-line constant: the cost lands on every lane, and
 the variance means nobody can say in advance which end of that range a given boot pays.
 
-Recorded rather than acted on. What was wrong is fixed; what to do about the real limit is a
-decision with a price attached, and it belongs in an RFC with these two numbers in it.
+Recorded rather than acted on, and then written up: **[RFC 0068](docs/rfc/0068-a-disk-that-can-hold-busybox.md)**,
+specified the same day. It carries the two numbers, three options, and a recommendation that is not
+the obvious one -- close the staging variance first, because optimising a path whose cost swings
+seventeenfold is optimising the wrong half, and if it settles near its best observed rate the whole
+question shrinks from 57 seconds to three and a half. Failing that, stage BusyBox behind a flag so
+L1 is provable without making `make test` unrunnable.
+
+The RFC also rejects the tempting shortcut of exec'ing BusyBox straight out of the initrd, where it
+already sits: `execve` resolves through the adapter's directory capability, and reaching past that
+would be a second path into the loader with different authority -- which is the thing RFC 0031
+exists to prevent.
 
 ### 2026-09-04 (a third sweep, an honest negative, and two detector bugs of my own)
 
