@@ -22644,7 +22644,7 @@ fn iommu_bringup(handoff: &Handoff) -> Option<(iommu::Report, iommu::Window)> {
         let delegated = (second.bus, second.device, second.function);
         match iommu::attach_device(&window, delegated, 1, hhdm) {
             Some(second_window) => {
-                if iommu::verify_window(&second_window, iommu::windows() + 1, hhdm)
+                if iommu::verify_window(&second_window, iommu::windows_on(delegated.0) + 1, hhdm)
                     && iommu::install(delegated, found, second_window)
                 {
                     // The unit is already translating, and it caches context
@@ -22690,7 +22690,7 @@ fn iommu_bringup(handoff: &Handoff) -> Option<(iommu::Report, iommu::Window)> {
         let delegated = (net.bus, net.device, net.function);
         match iommu::attach_device(&window, delegated, 2, hhdm) {
             Some(net_window) => {
-                if iommu::verify_window(&net_window, iommu::windows() + 1, hhdm)
+                if iommu::verify_window(&net_window, iommu::windows_on(delegated.0) + 1, hhdm)
                     && iommu::install(delegated, found, net_window)
                 {
                     // SAFETY: the unit these windows are programmed into. The
@@ -22741,7 +22741,7 @@ fn iommu_bringup(handoff: &Handoff) -> Option<(iommu::Report, iommu::Window)> {
         let delegated = (nic.bus, nic.device, nic.function);
         match iommu::attach_device(&window, delegated, 5, hhdm) {
             Some(nic_window) => {
-                if iommu::verify_window(&nic_window, iommu::windows() + 1, hhdm)
+                if iommu::verify_window(&nic_window, iommu::windows_on(delegated.0) + 1, hhdm)
                     && iommu::install(delegated, found, nic_window)
                 {
                     // SAFETY: the unit these windows are programmed into. The
@@ -22789,8 +22789,11 @@ fn iommu_bringup(handoff: &Handoff) -> Option<(iommu::Report, iommu::Window)> {
     if let Some(controller) = unsafe { xhci::probe() } {
         match iommu::attach_device(&window, controller, 3, hhdm) {
             Some(controller_window) => {
-                if iommu::verify_window(&controller_window, iommu::windows() + 1, hhdm)
-                    && iommu::install(controller, found, controller_window)
+                if iommu::verify_window(
+                    &controller_window,
+                    iommu::windows_on(controller.0) + 1,
+                    hhdm,
+                ) && iommu::install(controller, found, controller_window)
                 {
                     // SAFETY: the unit these windows are programmed into. The
                     // unit caches context entries, so without this it goes on
@@ -22850,8 +22853,11 @@ fn iommu_bringup(handoff: &Handoff) -> Option<(iommu::Report, iommu::Window)> {
     if let Some(controller) = ahci_controller.filter(|c| *c != first_device) {
         match iommu::attach_device(&window, controller, 4, hhdm) {
             Some(controller_window) => {
-                if iommu::verify_window(&controller_window, iommu::windows() + 1, hhdm)
-                    && iommu::install(controller, found, controller_window)
+                if iommu::verify_window(
+                    &controller_window,
+                    iommu::windows_on(controller.0) + 1,
+                    hhdm,
+                ) && iommu::install(controller, found, controller_window)
                 {
                     // SAFETY: the unit these windows are programmed into. The
                     // unit caches context entries, so without this it goes on

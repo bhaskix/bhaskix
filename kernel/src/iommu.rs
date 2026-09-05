@@ -1380,6 +1380,30 @@ pub fn passed_through(bus: u8) -> usize {
     PASSED_THROUGH[bus as usize].load(core::sync::atomic::Ordering::Acquire)
 }
 
+/// How many devices are translating **on one bus**.
+///
+/// **[`verify_window`] needs this and was given the global count.** Its
+/// invariant compares context entries *present in one bus's table* against the
+/// devices attached to it, and `passed_through` is already per-bus for exactly
+/// that reason -- but every caller passed `windows() + 1`, which counts every
+/// bus. That was correct only because every device this project drove lived on
+/// bus `00`, where the two numbers are equal.
+///
+/// RFC 0072 step 2 attached a NIC on bus `b1` and the check failed: one entry
+/// present on that bus, against a global count that already included the AHCI
+/// controller's window on bus `00`. The window was correct and the verification
+/// was wrong, which is the worse way round -- a check that rejects good work
+/// teaches people to remove the check.
+#[must_use]
+pub fn windows_on(bus: u8) -> usize {
+    WINDOWS
+        .lock()
+        .iter()
+        .flatten()
+        .filter(|(held, ..)| (*held >> 16) as u8 == bus)
+        .count()
+}
+
 /// How many devices are translating.
 #[must_use]
 pub fn windows() -> usize {
