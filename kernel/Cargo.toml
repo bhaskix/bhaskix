@@ -606,7 +606,18 @@ asm_budget = 10
 # genuine lock-ordering violation reached this project as a *count* and nothing
 # else, and sat unrecorded until 2026-09-02. The detail is printed by the gate
 # now, where CI can see it.
-unsafe_budget = 1991
+#
+# 1993 on 2026-09-05: two lines for RFC 0072 step 1, the PCI inventory --
+# `pci::for_each` and `pci::for_each_capability`, each an `unsafe fn` because
+# configuration reads require the bootstrap CPU with nothing else driving a
+# cycle, which is the condition `virtio::find_nth_of` already states for the
+# identical walk. Two lines and not more because the gate said so: the first
+# version wrote both closures *inside* their `unsafe` blocks and cost
+# twenty-seven lines, of which twenty-five were `println!`. Binding each closure
+# first leaves the unsafe scope as the two calls that are actually unsafe. The
+# lines could not be avoided -- the calls are unsafe and there is no safe
+# wrapper for them -- but their scope could be, and was.
+unsafe_budget = 1993
 # Up thirty-one for RFC 0005 step 9's socket probe -- `ring3_socketeer`, which
 # is `ring3_lister` with a `sockaddr_in6` copied in beside its code instead of
 # two filenames. The same two blocks every hosted probe has: one

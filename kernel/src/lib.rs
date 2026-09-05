@@ -1119,6 +1119,10 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
     if !ecam_bringup(handoff) {
         println!("\x1b[91m    ecam           FAILED\x1b[0m");
     }
+    // RFC 0072 step 1, and it goes here because it needs exactly what the line
+    // above establishes and nothing else: configuration space as memory. It
+    // reports rather than decides, so nothing below depends on it.
+    report_pci_inventory();
     if !journal_self_test() {
         println!("\x1b[91m    journal        FAILED\x1b[0m");
     }
@@ -17258,6 +17262,92 @@ const IPD_MARKER: u64 = 0x3154_5052_4450_4931;
 /// so a gate satisfied by one could not tell a working receive loop from the
 /// old behaviour with a ring bolted to the side of it. A receive queue that is
 /// drained and never refilled works precisely once.
+/// Every PCI function on the bus, said out loud — RFC 0072 step 1.
+///
+/// **This writes no driver and knows no device.** Every PCI lookup in this
+/// kernel is virtio-specific — `virtio::find_nth`, `find_nth_of` — so nothing
+/// has ever printed what is simply *there*. On an unfamiliar machine that is
+/// the first thing anyone needs, and it costs a walk of configuration space.
+///
+/// It exists because RFC 0072 needs the SR550's X722 identifiers, its BARs and
+/// its MSI-X layout, and **writing those down from memory is how a day is lost
+/// at step 3**. The machine can be asked instead.
+///
+/// MSI-X presence is reported because it decides the shape of a driver here: a
+/// ring-3 driver cannot program its own table, so the kernel routes one vector
+/// per handler and a first driver is single-queue.
+/// The PCI capability identifier for MSI-X.
+///
+/// `irq.rs` has its own copy for the same value; this one is here so the
+/// inventory does not reach into that module's private constants.
+const MSIX_CAPABILITY: u8 = 0x11;
+
+/// Whether a function offers MSI-X, which decides a driver's shape here.
+///
+/// Its own function so the `unsafe` is one line rather than the block it would
+/// otherwise wrap: a ring-3 driver cannot program its own table, so the kernel
+/// routes one vector per handler and a first driver is single-queue.
+fn function_has_msix(address: bhaskix_arch::pci::Address) -> bool {
+    let mut present = false;
+    let mut look = |capability: bhaskix_arch::pci::Capability| {
+        if capability.id == MSIX_CAPABILITY {
+            present = true;
+            return false;
+        }
+        true
+    };
+    // SAFETY: bootstrap CPU during the boot report; nothing else is driving a
+    // configuration cycle, and this reads the capability list only.
+    unsafe { bhaskix_arch::pci::for_each_capability(address, &mut look) };
+    present
+}
+
+/// Every PCI function on the bus, said out loud — RFC 0072 step 1.
+///
+/// **This writes no driver and knows no device.** Every PCI lookup in this
+/// kernel is virtio-specific — `virtio::find_nth`, `find_nth_of` — so nothing
+/// has ever printed what is simply *there*. On an unfamiliar machine that is
+/// the first thing anyone needs, and it costs a walk of configuration space.
+///
+/// It exists because RFC 0072 needs the SR550's X722 identifiers, its BARs and
+/// its MSI-X layout, and **writing those down from memory is how a day is lost
+/// at step 3**. The machine can be asked instead.
+///
+/// The closure is bound before the `unsafe` rather than written inside it, so
+/// the unsafe scope is the configuration-space walk and not the printing. The
+/// budget gate is what asked for that, and it was right to: the first version
+/// put twenty-seven lines of `println!` inside an `unsafe` block.
+fn report_pci_inventory() {
+    if !bhaskix_arch::pci::ecam_present() {
+        println!("    pci inventory  no ecam; configuration space is behind the port pair");
+        return;
+    }
+    let mut found = 0usize;
+    let mut each = |address: bhaskix_arch::pci::Address, identity: bhaskix_arch::pci::Identity| {
+        println!(
+            "    pci device     {:02x}:{:02x}.{} {:04x}:{:04x} class {:02x}.{:02x}{}",
+            address.bus,
+            address.device,
+            address.function,
+            identity.vendor,
+            identity.device,
+            identity.class,
+            identity.subclass,
+            if function_has_msix(address) {
+                " msi-x"
+            } else {
+                ""
+            }
+        );
+        found += 1;
+        true
+    };
+    // SAFETY: as `function_has_msix`, and the same condition
+    // `virtio::find_nth_of` states for the identical walk.
+    unsafe { bhaskix_arch::pci::for_each(&mut each) };
+    println!("    pci inventory  {found} function(s) present");
+}
+
 fn report_net_ring(hhdm: u64) -> bool {
     use core::sync::atomic::Ordering;
 

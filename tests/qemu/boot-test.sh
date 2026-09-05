@@ -2629,6 +2629,23 @@ printf '      inbound: host tried %s and opened %s, guest answered %s SYN(s), %s
 # once. That shortfall was read as lost handshakes -- by me, for twenty-two
 # boots, having read this comment's own warning about denominators first.
 
+# **What is on the bus, said out loud** -- RFC 0072 step 1.
+#
+# Asserts the walk ran and found something, not what it found: the point of the
+# line is that an unfamiliar machine can be asked, and every machine has a
+# different answer. On this lane it names a virtio NIC at class 02.00 and an
+# AHCI controller at 01.06, which is a q35 with the devices `devices.sh` asks
+# for -- so the count is checked here and the identities are left to a reader,
+# because a gate that pins them would fail the moment the lane gains a device.
+pci_found="$(grep -aoE "pci inventory  [0-9]+ function" "$LOG" | grep -oE "[0-9]+" | head -1)"
+if [[ -z "$pci_found" ]]; then
+    fail "the PCI inventory never printed, so nothing said what is on this bus"
+elif [[ "$pci_found" == "0" ]]; then
+    fail "the PCI inventory walked the bus and found nothing, on a machine with devices"
+else
+    pass "the PCI inventory named $pci_found function(s) on the bus"
+fi
+
 if grep -qE "no network this machine can drive" "$LOG"; then
     pass "wedge probe skipped: this machine has no network"
 elif [[ "$wedge_made" == "0" ]]; then
