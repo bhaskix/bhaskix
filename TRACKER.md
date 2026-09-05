@@ -1086,6 +1086,40 @@ disk -- built, and it was not that either. It was the filesystem, formatted to a
 in a 512 KiB static, and the fix for *that* made the kernel smaller and the format faster. Each
 wrong answer was found by building the previous one.
 
+### 2026-09-05 (a census of what actually fails, on 72 clean boots)
+
+Three rows were advanced this week by evidence generated for something else, so the habit was made
+deliberate: after a batch of boots, ask what *else* those logs settle. Seventy-two boots at
+`QEMU_SMP=8`, all unarmed, one harness, tallied by the failure lines the kernel printed.
+
+**Four failure kinds, and one of them is a rollup.**
+
+| kind | boots |
+|---|---|
+| `no connection was built from a verified SYN cookie` | 4 |
+| `wait queues FAILED: 1 ring stations did not retire` | 1 |
+| `lock order FAILED: 1 real ordering violations` | 1 |
+| `scheduler FAILED` | 1 |
+
+The last is not a fourth defect: the wait-queue test is part of the scheduler self-test, so
+`scheduler FAILED` is the same boot's ring-station failure counted again in the rollup. Worth
+knowing before anyone tallies these rows by grepping for `FAILED`.
+
+**So there is no unknown failure mode in this population.** Every failure maps to a row in §3 above,
+each of which was worked on this week: the cookie flake reproduces here at about one boot in eight
+and its gate turned out to be reading a mislabelled field; the ring station is specimens fifteen and
+sixteen; the lock-order violation is the specimen the named-ranks instrument caught.
+
+That is a smaller claim than "the defect list is complete" and a useful one: on this host, at this
+CPU count, on this tree, the open list accounts for everything that failed. A signature outside it
+would be new, and none appeared in 72 boots.
+
+The first attempt at this tally was contaminated and is worth recording as the reason the population
+is stated so precisely. Grepping all 986 logs kept from the week gave 53 `scheduler FAILED` and 39
+`sched classes FAILED` -- almost all of them from boots *deliberately armed* to force a failure,
+which is most of what this week's logs are. A census over a population that includes your own
+injections measures your injections.
+
 ### 2026-09-04 (a third sweep, an honest negative, and two detector bugs of my own)
 
 Two gates this week turned out to assert on something the machine could not produce -- RFC 0061's
