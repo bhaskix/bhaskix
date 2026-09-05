@@ -85,6 +85,34 @@ datasheet. Not a reading of the Linux driver.
 device reports. A device that says its own firmware version is a device that is
 talking.
 
+### What step 1 answered, on the machine, 2026-09-05
+
+Booted on the SR550. **115 functions**, across buses `00 01 02 07 5a ad ae af b0
+b1`. The NICs:
+
+    pci device     b1:00.0 8086:37d1 class 02.00 msi-x
+    pci device     b1:00.1 8086:37d1 class 02.00 msi-x
+    pci device     b1:00.2 8086:37d1 class 02.00 msi-x
+    pci device     b1:00.3 8086:37d1 class 02.00 msi-x
+
+So: device **`8086:37d1`**, at `b1:00.0` through `b1:00.3`, **four separate
+functions**, each advertising MSI-X.
+
+That settles unresolved question 3 below — the four ports are four functions, not
+one function with four ports, which means **four domains** and not one. It is
+also the identifier this RFC refused to write from memory, and it is now a
+measurement rather than a recollection.
+
+Two other things the walk showed without being asked, both useful:
+
+* **Two RAID-class controllers**, `00:17.0 8086:2826` and `ae:00.0 1000:0017` --
+  the second an LSI/Broadcom part. The storage gap on this machine is a *pair* of
+  controllers, which the roadmap's one-line note about "a RAID-mode controller"
+  does not convey.
+* The kernel already prints `dma unknown ... no driver here, so no window` for
+  each of them and for all four NICs, so it sees these devices and declines them
+  correctly. Step 2 is about turning one of those refusals into a window.
+
 ### Step 4 — one receive queue
 
 A single receive queue pair: descriptor ring in memory the domain owns, buffers
