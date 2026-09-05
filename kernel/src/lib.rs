@@ -22723,6 +22723,58 @@ fn iommu_bringup(handoff: &Handoff) -> Option<(iommu::Report, iommu::Window)> {
         }
     }
 
+    // **A foreign NIC, on the same terms and for the fifth domain id** --
+    // RFC 0072 step 2.
+    //
+    // Not passing it through is only half of containing it: `claimed` keeps
+    // `pass_through_undrivable` from handing it untranslated DMA, and this is
+    // what actually gives it a page table. Without both, `present_for` answers
+    // no and the driver cannot be given a window -- which is exactly what the
+    // SR550 reported on 2026-09-05.
+    //
+    // Its own domain id, for the reason the virtio NIC's comment gives and more
+    // so: a device that *initiates* should not share a translation, because an
+    // unsolicited frame arrives at a moment nobody chose.
+    //
+    // Silent where there is no such device, which is every lane in QEMU.
+    if let Some((nic, _)) = find_foreign_nic() {
+        let delegated = (nic.bus, nic.device, nic.function);
+        match iommu::attach_device(&window, delegated, 5, hhdm) {
+            Some(nic_window) => {
+                if iommu::verify_window(&nic_window, iommu::windows() + 1, hhdm)
+                    && iommu::install(delegated, found, nic_window)
+                {
+                    // SAFETY: the unit these windows are programmed into. The
+                    // unit caches context entries, so without this it goes on
+                    // believing this device has none.
+                    let invalidated = unsafe { iommu::invalidate_contexts() };
+                    if !invalidated {
+                        println!(
+                            "\x1b[91m    iommu window   FAILED: the context cache did not \
+                             invalidate for the foreign NIC\x1b[0m"
+                        );
+                    }
+                    println!(
+                        "    iommu window   {:02x}:{:02x}.{} translating too, a foreign NIC's own \
+                         page table and domain, {} in use",
+                        delegated.0,
+                        delegated.1,
+                        delegated.2,
+                        iommu::windows()
+                    );
+                } else {
+                    println!(
+                        "\x1b[91m    iommu window   FAILED: the foreign NIC's tables did not \
+                         read back\x1b[0m"
+                    );
+                }
+            }
+            None => println!(
+                "\x1b[91m    iommu window   FAILED: no page table for the foreign NIC\x1b[0m"
+            ),
+        }
+    }
+
     // The **first** xHCI controller, on the same terms and for the fourth
     // domain id. RFC 0041 step 3: a controller is a bus master with unmediated
     // access to all of memory, so it gets a translation or it is not driven.

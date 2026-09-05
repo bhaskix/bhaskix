@@ -549,6 +549,32 @@ fn drivable(identity: &bhaskix_arch::pci::Identity, prog_if: u8) -> bool {
     usb || ahci || virtio
 }
 
+/// Devices this project intends to **contain**, whether or not it drives them.
+///
+/// **Deliberately wider than [`drivable`], and used only by the pass-through
+/// decision.** `drivable` answers "is there a driver for this", which is what
+/// [`survey`] must keep counting and what keeps the survey and the drivers from
+/// disagreeing. This answers a different question: should the device be given a
+/// translated domain rather than untranslated DMA.
+///
+/// Containing a device nobody drives is **strictly safer than passing it
+/// through**. A translated domain with no mappings lets the device reach
+/// nothing; pass-through lets it reach everything. The only reason to pass a
+/// device through at all is that firmware may still be using it, and that
+/// argument does not apply to a device this project is about to take.
+///
+/// RFC 0072 step 2 found this the hard way: the X722 was passed through because
+/// no driver existed, so `present_for` answered no and the containment step
+/// could not succeed before the driver step. The dependency ran backwards.
+///
+/// Named by exact identifier and not by family. `8086:37d1` is what the SR550
+/// reports for all four of its ports, measured in step 1; the other i40e
+/// identifiers are not something to write down from memory, and a wrong one here
+/// would silently contain the wrong device or fail to contain the right one.
+fn claimed(identity: &bhaskix_arch::pci::Identity) -> bool {
+    identity.vendor == 0x8086 && identity.device == 0x37d1
+}
+
 /// Walks the bus and says what is on it.
 ///
 /// **Reporting only — this changes nothing.** RFC 0043's question is whether
@@ -938,7 +964,7 @@ pub unsafe fn pass_through_undrivable(
         // function `for_each` has already found present.
         let prog_if =
             unsafe { bhaskix_arch::pci::read8(address, bhaskix_arch::pci::PROG_IF_OFFSET) };
-        if drivable(&identity, prog_if) || identity.class == CLASS_BRIDGE {
+        if drivable(&identity, prog_if) || claimed(&identity) || identity.class == CLASS_BRIDGE {
             return true;
         }
         let device = (address.bus, address.device, address.function);

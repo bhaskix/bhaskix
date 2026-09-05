@@ -623,7 +623,15 @@ asm_budget = 10
 # reads afterwards cost nothing, because `pci::read32_ecam` is safe; only the
 # enumeration is not. One line and not more for the reason the entry above
 # gives: the closure is bound before the `unsafe` rather than written inside it.
-unsafe_budget = 1994
+#
+# 1995 on 2026-09-05: one line for RFC 0072 step 2's second half -- the
+# `iommu::invalidate_contexts()` that follows attaching a window to a foreign
+# NIC. Every other `attach_device` here pays the same line for the same reason,
+# stated at each of them: the unit caches context entries, so without the
+# invalidation it goes on believing the device has none and drops every request
+# it makes, with the entry sitting correct in memory. Unavoidable, and identical
+# to the four already in this file.
+unsafe_budget = 1995
 # Up thirty-one for RFC 0005 step 9's socket probe -- `ring3_socketeer`, which
 # is `ring3_lister` with a `sockaddr_in6` copied in beside its code instead of
 # two filenames. The same two blocks every hosted probe has: one
