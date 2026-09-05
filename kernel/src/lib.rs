@@ -10000,10 +10000,29 @@ fn socket_self_test(hhdm_base: u64, cpus: u32) -> bool {
     }) {
         Some(Ok(())) => {}
         Some(Err(error)) => {
+            // The witness, just after the refusal. A count says a thread was
+            // found; this says which one and what it was doing, and prints the
+            // reuse guard's counter beside it. A `Running` thread in this slot
+            // while the counter reads zero is the exit window described on
+            // `sched::first_thread_in_domain` -- see §3.
+            //
+            // **`None` here is a result, not a broken instrument**, and it is
+            // worth saying because it will look like one. This scan runs after
+            // `set_personality`'s, so a thread that was not `Finished` during
+            // the check can be `Finished` by now and no longer counted. That
+            // outcome -- refused for `HasThreads`, nothing found a moment later
+            // -- is the window closing while it was being looked at, which is
+            // evidence for it rather than against. What would argue the other
+            // way is a thread found in a state the window does not explain, or
+            // a non-zero reuse counter, which would mean the slot was handed
+            // out while the guard that exists to prevent exactly that said no.
+            let found = sched::first_thread_in_domain(realm.as_u32());
+            let counted = sched::threads_counted_in(realm.as_u32());
             println!(
                 "\x1b[91m    linux socket   FAILED: a domain created three lines ago refused the \
                  Linux tag with {error:?} -- if that is HasThreads, a previous incarnation's \
-                 thread is still counted against this slot\x1b[0m"
+                 thread is still counted against this slot; the scan found {found:?} and the \
+                 reuse counter reads {counted}\x1b[0m"
             );
             return false;
         }

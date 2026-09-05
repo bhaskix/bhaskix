@@ -5043,6 +5043,44 @@ pub fn threads_present_exact(ids: &[u32]) -> usize {
     present
 }
 
+/// The first thread [`threads_in_domain_exact`] would count, and its state.
+///
+/// **For a refusal message, not for a decision.** `set_personality` refuses a
+/// tag when this scan finds anything, and on a domain created three lines
+/// earlier that refusal has one interesting explanation and no way to state it:
+/// a previous incarnation's thread still carrying this slot's number.
+///
+/// The two guards around a reused slot read different sources. `create_under`
+/// refuses a slot while `threads_counted_in` -- the atomic `DOMAIN_LIVE_THREADS`
+/// -- is non-zero; `has_threads` scans the queues for anything not `Finished`.
+/// Thread exit decrements that counter at `domain_thread_departs` and sets
+/// `State::Finished` about ninety lines later, deliberately: `Finished` used to
+/// be set first and stranded callers, since a `Finished` thread is never
+/// scheduled again. So between those two points the counter reads zero while
+/// the thread is still queued and still not `Finished` -- and a slot handed out
+/// in that window belongs to a domain whose tag this scan will refuse.
+///
+/// That is a mechanism, not a diagnosis: the one recorded sighting captured no
+/// queue contents, and 72 boots at eight CPUs since have not reproduced it. A
+/// refusal naming a `Running` thread in this slot while the counter reads zero
+/// is this window and nothing else, which is what this exists to say.
+#[must_use]
+pub fn first_thread_in_domain(domain: u32) -> Option<(u32, State)> {
+    let online = percpu::online_count() as usize;
+    for queue in QUEUES.iter().take(online.min(MAX_CPUS)) {
+        let queue = queue.lock();
+        if let Some(found) = queue
+            .threads
+            .iter()
+            .flatten()
+            .find(|thread| thread.domain == domain && thread.state != State::Finished)
+        {
+            return Some((found.id, found.state));
+        }
+    }
+    None
+}
+
 /// Like [`threads_in_domain`], but **blocks** for each queue rather than
 /// skipping one it cannot take.
 ///
