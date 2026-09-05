@@ -83,6 +83,50 @@ On the SR550 it finds four. A gate that says "no such device here" on every lane
 and does the work on one machine is unusual for this project and is the honest
 shape: the device only exists in one place.
 
+### What step 2 answered, on the machine, 2026-09-05 — and it inverts the order
+
+Booted. The register half worked exactly as intended:
+
+    nic domain     b1:00.0 8086:37d1 delegated: registers at 0x23ffd000000, 64-bit BAR
+    nic domain     no dma window: nothing would contain this NIC, so it was not given one
+
+The BAR is 64-bit and lives at `0x23ffd000000`, well above 4 GiB -- reading it as
+32 bits would have named a wrong page silently, which is why that case was
+handled rather than assumed.
+
+**The containment half failed, and the reason is a policy, not a defect.**
+Elsewhere in the same boot:
+
+    dma untranslated b1:00.0 8086:37d1 passed through deliberately -- it reaches ...
+
+`iommu::pass_through_undrivable` passes through every function that
+`iommu::drivable` does not claim, and `drivable` claims exactly three things:
+xHCI (class 0c.03, prog-if 0x30), AHCI, and virtio. An X722 is none of them, so
+it is deliberately given untranslated DMA, and `iommu::present_for` therefore
+answers **no**.
+
+**So the dependency runs the other way from the one this RFC assumed.**
+Containment is keyed on *having a driver*, and step 2 was written as though it
+could be proven before step 3. It cannot: as long as the NIC is undrivable it is
+passed through by design, and a passed-through device is the one thing a window
+cannot be named for.
+
+**How big that policy is on this machine: 105 of 115 functions are passed
+through.** Ten are drivable or bridges. That is not an argument against the
+policy -- an undrivable device that firmware still uses has to keep working --
+but it is a much larger surface than the roadmap's IOMMU work implies, and it
+was invisible before step 1 counted the bus.
+
+**The fix, and it is a small one.** A device this project *intends* to claim
+should be contained rather than passed through, because containing an undriven
+device is strictly safer than passing it through: a translated domain with no
+mappings lets it reach nothing, while passthrough lets it reach everything. So
+`drivable` needs a notion of "claimed" that is broader than "already driven" --
+the X722 named, before the driver that drives it exists.
+
+That is step 2's real work, it is a change to `iommu`'s policy rather than to any
+driver, and it is what unblocks the rest of this RFC.
+
 ### Step 3 — bring the device up
 
 The part with real risk, and the reason it is its own step. An i40e-class device
