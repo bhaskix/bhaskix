@@ -896,6 +896,14 @@ hooks:
 # class of mistake that review reliably misses.
 gates:
 	tools/check-containment.sh
+# A defect row's status cell still agrees with its own body.
+#
+# The table carries the status twice, and the two drift: on 2026-09-05 two of
+# the five rows reading `OPEN` had bodies announcing their own closure, one of
+# them for four days. A reader who trusts the cell hunts a fixed defect; one who
+# trusts the body stops hunting a live one. Prose has no gate; this one does.
+	@tools/check-defect-status.py \
+	    || { printf '  \033[1;31mFAIL\033[0m  a defect row contradicts itself\n'; exit 1; }
 # The progress chart still matches the tracker it is drawn from.
 #
 # `docs/progress.md` is generated, and a generated file that nobody
