@@ -270,6 +270,31 @@ them by reading the code again:
 * verifying a window against every bus rather than its own -- caught by a check
   that rejected correct work.
 
+### The queues are free to take — measured, 2026-09-06
+
+    nic reset  the device completed a PF reset; admin queues read 32 and 32
+               descriptor(s), and are disabled -- the reset released them
+
+The question the previous boot raised is answered. The PF reset **does** clear
+`ATQENABLE` and `ARQENABLE`, exactly as the datasheet says of that flag, while
+the *length* fields keep firmware's 32. So the device arrives with firmware's
+sizing and nobody's ownership.
+
+**And the risk that made this worth measuring did not materialise.** This NIC is
+a LOM; firmware uses it and the BMC's management path may share it, so a reset
+that took the queues could have cut off the console this work reaches the machine
+through. It did not: the queues went disabled, the boot completed, and
+serial-over-LAN stayed up throughout. That is an observation on one machine and
+not a guarantee about every platform, but it is the observation that was missing.
+
+So step 3's second half is unblocked and is what it looked like before the
+firmware question appeared: allocate rings, map them into the window step 2 gave
+this device, write the base addresses, and set the enable bits last.
+
+One thing it must **not** do is assume the length field is zero. Firmware's 32 is
+still there after the reset, so writing an enable bit without writing a length
+would enable a queue at somebody else's size.
+
 ### Step 4 — one receive queue
 
 A single receive queue pair: descriptor ring in memory the domain owns, buffers
