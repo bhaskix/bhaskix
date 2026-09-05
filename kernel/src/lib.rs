@@ -12621,9 +12621,28 @@ fn start_nic_domain(hhdm: u64) -> Result<(), &'static str> {
         let nic = unsafe { i40e::Device::new(mapped) };
         if nic.reset(1_000_000) {
             let (transmit, receive) = nic.admin_queue_lengths();
+            // **Whether firmware still holds the queues, which the first boot
+            // raised and could not answer.** That boot read lengths of 32 that
+            // this code never wrote -- `enable_admin_queues` is the only writer
+            // and it is not called -- so firmware had configured them and the
+            // PF reset did not clear the length. What it could not say is
+            // whether the *enable* bits survived too, and that is the
+            // difference between a device this kernel may take and one the
+            // platform is still using.
+            //
+            // Read and reported, not acted on. This NIC is a LOM: the firmware
+            // uses it, and on this machine the BMC's management path may share
+            // it. Taking queues away from firmware is a decision to make
+            // deliberately, with the console that would be lost if it is wrong.
+            let held = nic.admin_queues_enabled();
             println!(
                 "    nic reset      the device completed a PF reset; admin queues read {transmit} \
-                 and {receive} descriptor(s)"
+                 and {receive} descriptor(s), {}",
+                if held {
+                    "and are still enabled -- firmware holds them"
+                } else {
+                    "and are disabled -- the reset released them"
+                }
             );
         } else {
             println!(
