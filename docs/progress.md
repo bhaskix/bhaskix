@@ -11,7 +11,7 @@
 | | |
 |---|---|
 | RFCs accepted | **46** |
-| RFCs open | 23 |
+| RFCs open | 24 |
 | RFCs closed without shipping | 1 |
 | Milestone rows done | **92 of 95** |
 | Phase 2 bullets done | **12 of 13** |
@@ -106,6 +106,7 @@ gantt
     RFC 0054 a hosted read that waits :done, r0054, 2026-08-28, 1d
     RFC 0055 a poll that tells the truth about a descriptor :done, r0055, 2026-08-28, 1d
     RFC 0057 a park that names two wake sources :done, r0057, 2026-08-28, 1d
+    RFC 0071 drivers for hardware that already exists :active, r0071, 2026-09-05, 2026-09-05
 ```
 
 `done` is accepted, `active` is open, `crit` is closed without shipping.
@@ -171,6 +172,7 @@ gantt
 | 0068 | a disk that can hold BusyBox | 2026-09-04 |
 | 0069 | a format that need not hold the filesystem | 2026-09-04 |
 | 0070 | a badge that can never ring is refused where it is committed | 2026-09-05 |
+| 0071 | drivers for hardware that already exists | 2026-09-05 |
 
 ## Annexes
 
