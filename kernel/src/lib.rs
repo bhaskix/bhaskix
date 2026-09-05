@@ -24541,6 +24541,20 @@ fn class_self_test(hhdm_base: u64, cpus: u32) -> bool {
     let heavy_start = sched::cycles_of(heavy_id).unwrap_or(0);
     let light_start = sched::cycles_of(light_id).unwrap_or(0);
 
+    // **When this window opens, so a long wait elsewhere can be placed against
+    // it.** For 1500 ms two burner threads compete on purpose, and a fair
+    // thread woken during it can legitimately wait most of that -- which is
+    // exactly the shape of the 1,114 ms `bin/consoled` wait the SR550 reported
+    // on 2026-09-05. Whether that wait is inside this window or outside it is
+    // the difference between the test starving a service by design and a
+    // scheduling fault, and no number printed today can tell them apart.
+    //
+    // The same one line settled the ring station's lost second, which turned
+    // out to begin at its spawn rather than mid-ring.
+    println!(
+        "    sched classes  burning for 1500 ms from {} ms",
+        bhaskix_arch::tsc::read() * 1_000 / bhaskix_arch::tsc::hertz().unwrap_or(1)
+    );
     wait_millis(1500);
 
     let heavy_cycles = sched::cycles_of(heavy_id).unwrap_or(0) - heavy_start;

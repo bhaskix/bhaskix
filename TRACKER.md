@@ -1171,7 +1171,16 @@ worst wake-to-run that is *not* the boot thread's, reads:
 
     worst for any other thread 1114160 us, thread 68 (consoled), ending 237362 ms into the boot
 
-**1.114 seconds, and the thread is `bin/consoled` — a service, not a test thread.** On QEMU that
+**1.114 seconds, and the thread is `bin/consoled` — a service, not a test thread.** <br><br>**One
+candidate was raised and left open rather than assumed away.** The scheduler-class test burns two
+competing threads for **1500 ms** on purpose, and a fair thread woken inside that window can
+legitimately wait most of it -- which is the shape of a 1,114 ms wait exactly. Whether `consoled`'s
+wait is inside that window or outside it is the difference between a test starving a service by
+design and a scheduling fault, and nothing printed on that boot could tell them apart. The window is
+timestamped now, the same one line that settled the ring station's lost second. On QEMU the answer
+is already clear -- `sched classes burning for 1500 ms from 6328 ms` against a worst wait *ending at
+5297 ms*, before the window opens -- and the next hardware boot will say the same for `consoled` in
+one reading. On QEMU that
 line has only ever named a ring station, which is a thread built to sleep in a loop; here it names
 one of the machine's own services, and the wait is *past* the 1,000 ms idle backstop rather than
 just under it. So the backstop wait reaches real work on real hardware, which the eight-CPU QEMU
