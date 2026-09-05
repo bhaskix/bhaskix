@@ -104,11 +104,25 @@ bitmap says they are free — the same position every allocated-but-unwritten bl
 the same one `mkfs` leaves. Nothing reads a free block: `Volume::read` resolves through an inode,
 and an inode names only blocks the allocator has given it.
 
-Worth stating plainly because it is the one place this change touches confidentiality: a block
-freed by `remove` and reallocated is already handed out without zeroing, so this introduces no new
-exposure — but it does make the *first* allocation of a block after a format share that property,
-where before a format had zeroed it. If that is not acceptable the answer is to zero on allocation,
-which is a separate decision and priced separately.
+Worth stating plainly because it is the one place this change touches confidentiality: this change
+introduces no new exposure, because a block is zeroed when it is **allocated**. The write path
+clears a block on the `fresh` arm — the one taken when the block has just been claimed from the
+bitmap — before the writer's own bytes land in it, so a block reaching a file carries nothing of
+whatever held it before, whether that was another file or the image the format never wrote.
+
+> **This paragraph originally argued the same conclusion from a false premise, and the correction
+> stays here rather than only in the changelog.** It read: *"a block freed by `remove` and
+> reallocated is already handed out without zeroing, so this introduces no new exposure — but it
+> does make the first allocation of a block after a format share that property, where before a
+> format had zeroed it. If that is not acceptable the answer is to zero on allocation, which is a
+> separate decision and priced separately."* Zero-on-allocation was not a decision waiting to be
+> made; it was already the behaviour, and had been. The claim was reasoned from `remove` — which
+> genuinely does not clear the blocks it frees — without reading the path that hands one out. The
+> conclusion survives and is stronger than stated; the reasoning did not.
+>
+> Both halves are now asserted by `a_data_block_is_zeroed_when_it_is_allocated_not_when_it_is_freed`
+> (`fs/src/volume.rs`), and `docs/security.md` states the property beside the matching one for
+> memory frames.
 
 ## Performance implications
 

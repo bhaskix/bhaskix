@@ -957,6 +957,33 @@ the distinction is in the table rather than in somebody's head.
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-09-05 (a confidentiality property nobody had asked the code about)
+
+RFC 0069 left a note saying a filesystem block freed by `remove` and then reallocated "is already
+handed out without zeroing", and reasoned from it that the RFC added no exposure. The premise was
+wrong. It was reached by reading `remove` — which really does free only the bitmap bits — and not
+reading the path that hands a block out.
+
+`Volume`'s write path zeroes a block on the `fresh` arm, the one taken when the block has just been
+claimed. So disk blocks behave exactly as memory frames do, and `docs/security.md`'s "Frames are
+zeroed on allocation, not on free" now has its disk counterpart written beside it instead of being
+silent about the second allocator. The conclusion RFC 0069 drew survives and is stronger than it
+claimed; the argument for it did not, and both documents are corrected where the wrong claim lives.
+
+This matters because `bin/linuxd` holds one directory capability for **every** hosted process: two
+hosted processes are separated by what the filesystem guarantees, not by a capability boundary.
+
+`a_data_block_is_zeroed_when_it_is_allocated_not_when_it_is_freed` asserts both halves — the bytes
+survive the free, and are gone once another file can address them — and it was armed by deleting the
+zeroing and watching the second half go red.
+
+The first three versions of the test proved nothing, which is the part worth keeping. Create, write,
+remove, create, write never reuses the data block: the *directory* takes the freed block first, and
+the directory path zeroes what it allocates, so the test passed for a reason unrelated to its
+subject. It was only visible because a deliberately-failing assertion was used to print the block
+numbers — 14 freed, 15 taken. Both files are now created before anything is freed, and the reuse is
+asserted rather than assumed, so the test cannot quietly stop testing.
+
 ### 2026-09-02 (an invariant asked where the value is produced)
 
 Two open defects are values a syscall cannot answer: `mmap 0x1` on CI run 489 — it answers a mapping

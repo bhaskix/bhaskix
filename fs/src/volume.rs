@@ -1110,6 +1110,96 @@ mod tests {
     }
 
     #[test]
+    fn a_data_block_is_zeroed_when_it_is_allocated_not_when_it_is_freed() {
+        // **Data remanence between files, which is a confidentiality question
+        // rather than a correctness one**, and one worth a test because it is
+        // not visible from the free path: `remove` clears bits in the bitmap
+        // and does not touch the blocks themselves.
+        //
+        // The answer turns out to match what `docs/security.md` already says
+        // about *memory*: "Frames are zeroed on allocation, not on free."
+        // Disk blocks behave the same way, by `page.fill(0)` on the `fresh`
+        // arm of the write path, and both halves of that sentence are asserted
+        // below -- the bytes survive the free, and are gone by the time
+        // another file can address them.
+        //
+        // Getting the block genuinely reused took care, and the care is the
+        // reason this is written down. The obvious version -- create, write,
+        // remove, create, write -- never reuses the data block at all: the
+        // *directory* grows into the freed block first, and the directory path
+        // zeroes what it allocates, so the test passes while proving nothing.
+        // Both files are created up front so the directory has its room before
+        // anything is freed, and the reuse is asserted rather than assumed.
+        const SECRET: &[u8] = b"SECRET-DO-NOT-LEAK-THIS-ACROSS-FILES-0123456789";
+        let found = |bytes: &[u8]| bytes.windows(6).any(|w| w == b"SECRET");
+
+        let mut bytes = image(64);
+        let freed = core::cell::Cell::new(0u32);
+        let second = core::cell::Cell::new(0u32);
+
+        run(&mut bytes, FRAMES, None, |volume| {
+            let root = volume.superblock().root;
+            let first = volume
+                .create(root, b"secret", Kind::File)
+                .expect("a file is created");
+            second.set(
+                volume
+                    .create(root, b"innocent", Kind::File)
+                    .expect("and a second, before anything is freed"),
+            );
+
+            let mut page = [0u8; BLOCK];
+            for (slot, byte) in page.iter_mut().zip(SECRET.iter().cycle()) {
+                *slot = *byte;
+            }
+            assert_eq!(volume.write(first, 0, &page).expect("written full"), BLOCK);
+            freed.set(volume.inode(first).expect("its inode").direct[0]);
+            volume.remove(root, b"secret").expect("and removed");
+        });
+
+        // Half one: freeing does not erase. The block is off the bitmap and
+        // its contents are still on the device, which is why the zeroing has
+        // to happen on the other side.
+        assert!(
+            found(&bytes),
+            "a freed block keeps its bytes; zeroing is on allocation, not free"
+        );
+
+        // Half two: allocating does erase. The same block, handed to another
+        // file, comes back zeroed before that file's own bytes land in it.
+        run(&mut bytes, FRAMES, None, |volume| {
+            volume
+                .write(second.get(), 0, b"hello")
+                .expect("and written short");
+            let took = volume.inode(second.get()).expect("its inode").direct[0];
+            assert_eq!(took, freed.get(), "the freed data block is the one reused");
+        });
+        assert!(
+            !found(&bytes),
+            "a reallocated block must not still hold the previous file"
+        );
+
+        // And through a reader that has never seen the cache, because a cache
+        // holding zeroes would hide exactly the defect being looked for.
+        let mut pages = Image::new(&bytes);
+        let mut mounted = Filesystem::mount(&mut pages).expect("and mounts afterwards");
+        let root = mounted.root().unwrap();
+        let (_, inode) = mounted
+            .lookup(&root, b"innocent")
+            .expect("with the second file in it");
+
+        // `Filesystem::read`'s own comment claims this: "Never reads past the
+        // size the inode declares, whatever its block pointers say -- a file
+        // whose blocks outlast its length would otherwise hand back whatever
+        // those blocks held before." That is a second, independent guard on
+        // the same exposure, and this is a test of it rather than a reading.
+        let mut into = [0u8; BLOCK];
+        let got = mounted.read(&inode, 0, &mut into);
+        assert_eq!(got, 5, "a reader sees the file's size, not the block's");
+        assert_eq!(&into[..5], b"hello");
+    }
+
+    #[test]
     fn a_file_created_and_written_reads_back() {
         let mut bytes = image(64);
         run(&mut bytes, FRAMES, None, |volume| {

@@ -630,6 +630,32 @@ depends on it. A frame never reaches a domain carrying another domain's data.
 > in [memory.md](memory.md) §2, which is where the code had been citing a section that did not
 > contain it.
 
+**Filesystem data blocks follow the same rule, and for once the code was ahead of the document.**
+The paragraph above is about memory frames; disk blocks are a separate allocator with the same
+exposure, and nothing here said which way they went. They go the same way: `Volume`'s write path
+zeroes a block on the `fresh` arm — the one taken when a block has just been claimed from the
+bitmap — before any of the writer's own bytes land in it. `remove` does not clear the blocks it
+frees, only their bits in the bitmap, so the bytes of a deleted file stay on the device until
+something else is given that block. That is zero-on-allocation, arrived at for the same reason:
+the receiving file's correctness depends on it, so it cannot be skipped.
+
+This matters here because `bin/linuxd` holds one directory capability on behalf of *every* hosted
+process, so two hosted processes are separated by the filesystem's guarantees and not by a
+capability boundary. Both halves are now asserted by
+`a_data_block_is_zeroed_when_it_is_allocated_not_when_it_is_freed` (`fs/src/volume.rs`) — the bytes
+survive the free, and are gone by the time another file can address them — and the test was armed
+by deleting the zeroing and watching it go red on the second half. A second, independent guard sits
+above it: `Filesystem::read` refuses to read past the size an inode declares, whatever its block
+pointers say.
+
+> **RFC 0069 asserted the opposite and was wrong.** Its confidentiality paragraph reads *"a block
+> freed by `remove` and reallocated is already handed out without zeroing"*, and concluded from
+> that premise that the RFC introduced no new exposure while making the first allocation after a
+> format share the same weakness. The premise was never checked against the write path. The
+> conclusion — no new exposure — happens to hold, and holds more strongly than the RFC claimed, but
+> it was reached from a false statement about how the allocator behaves. The RFC's own paragraph is
+> corrected in place rather than only here.
+
 **The Time row said "fine-grained timers are rate-limited per domain (side-channel hygiene)" until
 2026-08-26, and no such limit has ever existed.** There is no rate limiter anywhere in this kernel,
 per domain or otherwise. The finest-grained clock on the machine is `rdtsc`, and `arch/x86_64`'s own
