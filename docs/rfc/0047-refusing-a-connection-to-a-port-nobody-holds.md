@@ -197,6 +197,15 @@ SR550.
 > cannot be driven"* — while the SR550's four units are off pending
 > [RFC 0043](0043-an-iommu-on-a-machine-with-no-virtio.md).
 >
+> **Half of that is no longer true, corrected 2026-09-05.** The second reason was
+> removed by [RFC 0049](0049-every-unit-the-firmware-named.md), accepted
+> 2026-08-25: the SR550 **programs all four units**, measured on the machine. The
+> note above says "two independent reasons, either sufficient" and only one
+> survives, so the remaining blocker is not a pair — it is exactly one thing,
+> **no driver for the X722**. That is a sharper statement than the paragraph it
+> corrects, and it is the case [RFC 0071](0071-drivers-for-hardware-that-already-exists.md)
+> was written for.
+>
 > The general form of that is worth more than this RFC: **every networking
 > claim this project makes rests on one machine**, QEMU's `intel-iommu` lane,
 > because that is the only machine in existence with both halves. It is

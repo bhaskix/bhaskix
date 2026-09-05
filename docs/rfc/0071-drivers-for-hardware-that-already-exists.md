@@ -45,6 +45,13 @@ One server, three device classes, zero coverage. The IOMMU work
 hardware, so the *containment* half of driving real devices is built. What is
 missing is the drivers themselves, and they are missing one device at a time.
 
+**For the network that makes it exactly one blocker, which is worth stating
+precisely.** RFC 0047 records two independent reasons the SR550 cannot be tested
+on the network — no X722 driver, and its IOMMU units off. The second was removed
+by RFC 0049 eleven days later and that note went stale; it is corrected there
+now. So hardware networking on the only physical machine this project has waits
+on a single missing driver, and nothing else.
+
 ### Writing them is the current plan, and it is not a plan
 
 [RFC 0014](0014-driver-framework.md) made the second driver cheaper than the first
@@ -172,6 +179,54 @@ So the practical route, cheapest first:
 *None of the above is legal advice, and this RFC is not the place that settles it.
 Before any code derived from a GPL source is carried here in any form, including
 a translation, it needs counsel.*
+
+### What the framework already gives a NIC driver, and what it does not
+
+Checked rather than assumed, because "port a driver" is only cheap if the thing
+it ports *into* is ready.
+
+**Already there.** A device in its own ring-3 domain; a DMA window through the
+IOMMU (RFC 0049, measured on the SR550); PCIe/ECAM discovery and register blocks
+(RFC 0014); interrupt delivery as a capability -- the holder gets `BIND`, `ACK`
+and `RELEASE`, and a notification it can wait on. `bin/netd` uses exactly this
+surface today: `ATTACH`, `MAP`, `WAIT`, `SIGNAL`, `ACK`.
+
+**Deliberately not there: the driver cannot program its own MSI-X.** `irq.rs`
+says so and says why -- *"What the holder gets is `BIND`, `ACK` and `RELEASE`. It
+does not get the MSI-X table, and there is no method that would let it program
+one"*, because *"a domain that wedges its own device is its own problem; one that
+wedges somebody else's is the kernel's"*. The kernel programs the table, through
+`Source::MessageSignalled { device, entry }`.
+
+**What that means for a first X722 driver, concretely.** The kernel's source type
+already carries an *entry index*, so routing any single MSI-X vector is supported
+today. What ring 3 cannot do is ask for a *particular* one, or for several. So:
+
+* **single queue pair, one vector** -- fits the framework as it stands, needs no
+  kernel change, and is the right shape for a first driver on real hardware.
+* **multi-queue** -- needs the kernel to claim several entries for one device and
+  hand each to the driver as its own handler. That is an incremental change to a
+  path that already takes an entry index, not a redesign, and it should be its
+  own RFC when throughput justifies it.
+
+A first driver should therefore be scoped to one queue pair and judged on whether
+it moves a packet on the SR550, not on how fast.
+
+**And it is a bounded amount of code**, which matters because "write a driver"
+reads as unbounded. The ring-3 drivers here are all one size:
+
+| driver | device | lines |
+|---|---|---|
+| `bin/netd` | virtio-net | 1,295 |
+| `bin/ahcid` | AHCI/SATA | 1,018 |
+| `bin/blkd` | virtio-blk | 951 |
+
+`bin/ahcid` is the comparator that counts: a **real** controller, on real
+hardware, written natively, in about a thousand lines of this project's
+comment-heavy style. An i40e is a more complicated device than AHCI and a
+single-queue driver for it will be larger -- but it is the same order of work,
+not a different one, and it is the work that turns the only physical machine this
+project owns into a machine with a network.
 
 ## Alternatives considered
 
