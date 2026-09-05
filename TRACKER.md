@@ -1055,6 +1055,15 @@ And RFC 0068's flag now reports what it was built to report: `2172376 bytes of B
 the filesystem in 1567 ms`. All of it, on a passing boot, inside the 2.1 to 3.4 seconds predicted
 once the staging variance was fixed.
 
+**A correction to how this was written up, made before anyone reads it as more than it is.** The
+roadmap's L1 row already said *"Its **shell** runs too: `sh -c 'echo hi from sh'` prints in
+twenty-nine calls, gated and watched red"* — BusyBox loaded by the kernel's corpus loader from the
+**initrd**. So this is not the first hosted BusyBox shell and the commits that called it "L1's
+headline" overstated it. **What is actually new is two narrower things**, and both are real: BusyBox
+now runs from the **filesystem**, resolved by a hosted `execve` through the adapter's **directory
+capability**, which is the path a real program takes rather than the kernel placing it; and its
+shell **forks and execs a child**, where the existing demonstration's `echo` is a builtin.
+
 **And then it did run.** `bin/hosted` execs `/busybox` with `["busybox", "echo",
 "bhaskix-busybox-ran"]`, and the boot that staged it prints that text: **a hosted program replaced
 itself with an unmodified 2 MB binary this project did not write, read off a filesystem through a
