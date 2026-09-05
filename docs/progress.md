@@ -11,7 +11,7 @@
 | | |
 |---|---|
 | RFCs accepted | **46** |
-| RFCs open | 24 |
+| RFCs open | 25 |
 | RFCs closed without shipping | 1 |
 | Milestone rows done | **92 of 95** |
 | Phase 2 bullets done | **12 of 13** |
@@ -63,6 +63,7 @@ gantt
     RFC 0056 asking a socket whether anything arrived without... :done, r0056, 2026-08-28, 1d
     RFC 0058 what a service learns without being called :done, r0058, 2026-08-28, 1d
     RFC 0061 a connection nobody accepted :active, r0061, 2026-08-31, 2026-09-05
+    RFC 0072 a driver for the NIC this machine has :active, r0072, 2026-09-05, 2026-09-05
     section Drivers & IOMMU
     RFC 0011 IrqHandler — who may receive an interrupt :done, r0011, 2026-08-04, 1d
     RFC 0012 The IOMMU and what a device is allowed to reach :done, r0012, 2026-08-04, 1d
@@ -173,6 +174,7 @@ gantt
 | 0069 | a format that need not hold the filesystem | 2026-09-04 |
 | 0070 | a badge that can never ring is refused where it is committed | 2026-09-05 |
 | 0071 | drivers for hardware that already exists | 2026-09-05 |
+| 0072 | a driver for the NIC this machine has | 2026-09-05 |
 
 ## Annexes
 
