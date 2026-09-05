@@ -12602,7 +12602,18 @@ fn start_nic_domain(hhdm: u64) -> Result<(), &'static str> {
     // is not answering; that must be said rather than hang the boot. A million
     // spins is generous for a reset the datasheet describes as microseconds of
     // work, and cheap to be wrong about in the direction of waiting.
-    if let Some(mapped) = mmio::map(registers & !0xfff, 0x1000, hhdm) {
+    // **A megabyte, not a page.** The first version mapped `0x1000` and the
+    // SR550 answered with a page fault at `cr2 0xffff823ffd092400` -- which is
+    // this BAR plus `PFGEN_CTRL`'s `0x92400`, nearly six hundred kilobytes past
+    // the single page that was mapped. An i40e's register space is megabytes;
+    // the highest offset this module touches is that reset register, so a
+    // megabyte covers every one of them with room and is still a small mapping.
+    //
+    // Sizing the BAR properly means writing all-ones and reading the mask back,
+    // which disturbs a device this code has not reset yet. That is worth doing
+    // when a second driver needs it; it is not worth doing to learn a number the
+    // datasheet's own register map already bounds.
+    if let Some(mapped) = mmio::map(registers & !0xfff, 0x10_0000, hhdm) {
         // SAFETY: `mmio::map` returned a device mapping of this function's
         // BAR0, it is never unmapped, and nothing else drives this device --
         // `bin/netd` drives virtio and `claimed` kept this one out of
