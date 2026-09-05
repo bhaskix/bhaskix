@@ -1610,7 +1610,26 @@ fn dispatch_inner(frame: &mut SyscallFrame) -> Outcome {
                 let bytes = crate::console::recorded_at(frame.arg0 as usize);
                 Outcome::ok(u64::from_le_bytes(bytes))
             }
-            _ => match crate::input::try_read() {
+            // **`take_or_service` and not `try_read`, for the reason RFC 0054
+            // step 2 gives beside the hosted `POLL_INPUT`.** `service` is what
+            // calls `irq::acknowledge`, and `irq::acknowledge` is what unmasks
+            // the line; the handler masks its source on every interrupt. So a
+            // reader that takes bytes through this arm and never services can
+            // consume a byte belonging to a *freshly masked* interrupt and
+            // leave the line masked with nobody to wake -- `input.rs` states
+            // the rule as *every wake is followed by a service*, and
+            // `peek_or_service`'s own comment says a caller that only ever
+            // peeked "would eventually stop the interrupts".
+            //
+            // This is reachable rather than theoretical. `services/console`
+            // blocks for the first byte and then drains the rest through this
+            // arm -- "block for the first byte, then take whatever else is
+            // already waiting" -- so a keystroke arriving inside that loop is
+            // masked by its own interrupt and taken here without an unmask.
+            // The identical change was made for the hosted path at RFC 0054
+            // step 2 and not for this one; the comment there names `try_read`
+            // as the wrong choice in as many words.
+            _ => match crate::input::take_or_service() {
                 Some(byte) => {
                     crate::service::counted(0, 1);
                     Outcome::ok(u64::from(byte))
