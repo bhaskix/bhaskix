@@ -10358,42 +10358,6 @@ with {} deferred wake(s) during that write",
             );
         }
     }
-    // **Deferred wakes, on their own line — and this is a correction.**
-    //
-    // The count was reported only inside `disk writes` above, which prints when
-    // a boot wrote blocks. The SR550 has no block service, so the first
-    // hardware boot carrying this counter said nothing about it: a machine that
-    // waited **1.114 seconds** to dispatch `bin/consoled` could not say whether
-    // the deferral path was involved.
-    //
-    // That is the fault this week has been finding in other people's
-    // instruments -- a number reported in one place, absent where it is needed
-    // -- committed here three days after the third time it was written down.
-    // Reported unconditionally, because the boots where it matters most are the
-    // ones with nothing else to hang it on.
-    println!(
-        "    deferred wakes {} wake(s) waited for a tick because an interrupt handler could not \
-         take a runqueue",
-        sched::deferred_wakes_taken()
-    );
-    // **Wakes that were refused rather than delayed**, which is the other way a
-    // wake goes missing and the one nothing reported until 2026-09-05.
-    //
-    // `notify::signal` refuses an empty badge and a notification already gone,
-    // and the three callers that matter run where there is nobody to return an
-    // answer to -- an interrupt, a deadline expiring, a domain ending -- so all
-    // three discard it. `cap.rs` put the badge-zero check in `signal` on the
-    // grounds that it is "the only moment the distinction is real"; this is
-    // what makes that moment observable.
-    //
-    // Zero on every boot measured so far. Printed unconditionally anyway: a
-    // number that only appears when it is non-zero is a number nobody knows to
-    // look for.
-    let (empty, gone) = notify::signals_refused();
-    println!(
-        "    wake refused   {empty} for a badge that rings nobody, {gone} for a notification that \
-         was already gone"
-    );
     // **BusyBox on the disk, when this boot staged it — RFC 0068.**
     //
     // Silent by default, because by default it is not staged. When it is, this
@@ -19932,6 +19896,59 @@ fn user_shell(handoff: &Handoff) -> Result<(), &'static str> {
             );
         }
     }
+
+    // **Moved here 2026-09-05, and moved twice.** Both lines say a wake went
+    // missing, and both were printed inside `hosted_exec_self_test`, so
+    // `test-boot-native-full` -- the lane that produced ring specimen 17,
+    // itself a lost wake -- could print neither.
+    //
+    // The first attempt put them in `kernel_main` beside the lock-order
+    // report, which is unconditional and **far too early**: `deferred wakes`
+    // read 0 where it had read 49, because the counters were sampled before
+    // the work they count. That is the mistake `bin/linuxd`'s socket record
+    // already made and wrote down -- "it would have read an empty record and
+    // printed a reassuring zero on every boot including the failing ones".
+    //
+    // Here instead: inside `user_shell`, after the services are up, beside a
+    // measurement that already prints on every lane, and before the shell
+    // starts -- the call site warns that printing after `user_shell` returns
+    // tears the shell's first line.
+    // **Deferred wakes, on their own line — and this is a correction.**
+    //
+    // The count was reported only inside `disk writes` above, which prints when
+    // a boot wrote blocks. The SR550 has no block service, so the first
+    // hardware boot carrying this counter said nothing about it: a machine that
+    // waited **1.114 seconds** to dispatch `bin/consoled` could not say whether
+    // the deferral path was involved.
+    //
+    // That is the fault this week has been finding in other people's
+    // instruments -- a number reported in one place, absent where it is needed
+    // -- committed here three days after the third time it was written down.
+    // Reported unconditionally, because the boots where it matters most are the
+    // ones with nothing else to hang it on.
+    println!(
+        "    deferred wakes {} wake(s) waited for a tick because an interrupt handler could not \
+         take a runqueue",
+        sched::deferred_wakes_taken()
+    );
+    // **Wakes that were refused rather than delayed**, which is the other way a
+    // wake goes missing and the one nothing reported until 2026-09-05.
+    //
+    // `notify::signal` refuses an empty badge and a notification already gone,
+    // and the three callers that matter run where there is nobody to return an
+    // answer to -- an interrupt, a deadline expiring, a domain ending -- so all
+    // three discard it. `cap.rs` put the badge-zero check in `signal` on the
+    // grounds that it is "the only moment the distinction is real"; this is
+    // what makes that moment observable.
+    //
+    // Zero on every boot measured so far. Printed unconditionally anyway: a
+    // number that only appears when it is non-zero is a number nobody knows to
+    // look for.
+    let (empty, gone) = notify::signals_refused();
+    println!(
+        "    wake refused   {empty} for a badge that rings nobody, {gone} for a notification that \
+         was already gone"
+    );
 
     // RFC 0019 step 4, the second half: the same measurement on a machine with
     // its services running. The first ran during bring-up, where a tickless

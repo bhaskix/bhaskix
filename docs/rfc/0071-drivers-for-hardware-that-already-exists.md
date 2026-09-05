@@ -125,6 +125,54 @@ never a Linux reimplementation"*. A Linux driver-API shim inside a service is a
 Linux reimplementation inside a service — the precise thing that principle
 forbids. It was written about syscalls; nothing about it is specific to syscalls.
 
+### "Linux is open source -- can we not just read the driver?"
+
+The first question anyone asks, and it deserves a direct answer rather than an
+inference from the licence table above. The answer is **yes to writing a native
+driver, with care about what is taken from where**, and the line that matters is
+**code versus facts**.
+
+**Code is code, and translating it does not change that.** A C driver rewritten
+line by line in Rust is a derivative work of the original, and GPL-2.0 travels
+with it -- which is the collision [RFC 0001](0001-license-apache-2.0.md) names
+when it rejects GPLv2 as *"incompatible with Apache-2.0"*. Transliteration is not
+a laundering step, and a reviewer comparing the two files afterwards will see
+what happened.
+
+**Hardware facts are not code.** Register offsets, the meaning of each bit, the
+order a device must be brought up in, the errata and the "wait for this before
+touching that" quirks -- these are facts about silicon, not creative expression,
+and a driver written from them is the author's own.
+
+So the practical route, cheapest first:
+
+1. **The vendor datasheet is the clean primary source**, and this project has
+   already proved the point. RFC 0043 was recorded as blocked on the VT-d memory
+   layout until somebody looked: *"The Intel VT-d Architecture Specification is a
+   public document; it was fetched and read, and it answers this directly."* The
+   IOMMU work that now runs on the SR550 came from that document. Intel publishes
+   equivalent datasheets for the X722 family.
+
+2. **Where a permissively licensed driver exists, port it and skip the argument.**
+   FreeBSD drives the same X722 under BSD terms, which permit a direct port into
+   an Apache-2.0 tree with attribution. There is no clean-room question, no
+   translation question, and no derivative-work question -- the licence already
+   grants what is needed. This is option B, and for this specific device it is
+   strictly cheaper than reimplementing from the datasheet.
+
+3. **Reading the Linux driver is where the risk concentrates**, because "I read it
+   to learn what the hardware needs" and "I transcribed it" are easy to conflate
+   and hard to distinguish afterwards, particularly when one person does both. The
+   conventional answer is a clean-room split -- one person writes a factual
+   specification from the GPL source, another writes the driver from that
+   specification alone -- which a single-maintainer project cannot perform
+   honestly. **Where option 2 is available, this question does not arise at all,**
+   which is the strongest practical argument for preferring BSD sources.
+
+*None of the above is legal advice, and this RFC is not the place that settles it.
+Before any code derived from a GPL source is carried here in any form, including
+a translation, it needs counsel.*
+
 ## Alternatives considered
 
 **Do nothing and keep writing drivers.** The status quo, and the honest reading of
