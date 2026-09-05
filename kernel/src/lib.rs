@@ -4755,13 +4755,15 @@ fn switched_holding_report() {
     }
 }
 
-/// Total cycles, count and worst for `block::WRITE` round trips.
-fn sched_disk_writes() -> (u64, u64, u64) {
+/// Total cycles, count, worst, and deferred wakes during the worst, for
+/// `block::WRITE` round trips.
+fn sched_disk_writes() -> (u64, u64, u64, u64) {
     use core::sync::atomic::Ordering::Relaxed;
     (
         DISK_WRITE_CYCLES.load(Relaxed),
         DISK_WRITE_COUNT.load(Relaxed),
         DISK_WRITE_WORST.load(Relaxed),
+        DISK_WRITE_WORST_DEFERRED.load(Relaxed),
     )
 }
 
@@ -10328,10 +10330,12 @@ fn hosted_exec_self_test(hhdm_base: u64, cpus: u32) -> bool {
         let writes = sched_disk_writes();
         if writes.1 > 0 {
             println!(
-                "    disk writes    {} round trip(s) to bin/blkd, {} us each on average, worst {} us",
+                "    disk writes    {} round trip(s) to bin/blkd, {} us each on average, worst {} us, \
+with {} deferred wake(s) during that write",
                 writes.1,
                 writes.0 / writes.1 * 1_000_000 / hertz,
-                writes.2 * 1_000_000 / hertz
+                writes.2 * 1_000_000 / hertz,
+                writes.3
             );
         }
     }
@@ -14473,6 +14477,14 @@ impl bhaskix_fs::Store for DiskStore {
         // is every write costing a little more or one write costing fifty
         // milliseconds. This pair can: a worst near the mean is a uniformly
         // slower path, and a worst far above it is one wait that went wrong.
+        // **The counter is sampled across the call, because the question is
+        // not how many wakes were deferred on this boot but whether one was
+        // deferred *during the write that stalled*.** §3's staging row has two
+        // candidate explanations -- a uniformly slower path, or one wait ended
+        // by a clock -- and `defer_wake`'s own comment names this as the one
+        // path in the kernel that ends a wait by a clock. A count for the boot
+        // cannot tell them apart; a count for this write can.
+        let deferred_before = sched::deferred_wakes_taken();
         let sent_at = bhaskix_arch::tsc::read();
         let reply = ipc::call(
             self.endpoint,
@@ -14482,10 +14494,16 @@ impl bhaskix_fs::Store for DiskStore {
         )
         .map_err(|_| bhaskix_fs::FsError::OutOfRange)?;
         let took = bhaskix_arch::tsc::read().saturating_sub(sent_at);
+        let deferred_here = sched::deferred_wakes_taken().saturating_sub(deferred_before);
         use core::sync::atomic::Ordering::Relaxed;
         DISK_WRITE_CYCLES.fetch_add(took, Relaxed);
         DISK_WRITE_COUNT.fetch_add(1, Relaxed);
-        DISK_WRITE_WORST.fetch_max(took, Relaxed);
+        // Stored only when this write *becomes* the worst, so the number
+        // printed belongs to the write whose duration is printed beside it.
+        // `fetch_max` answers the previous value, which is what says so.
+        if took > DISK_WRITE_WORST.fetch_max(took, Relaxed) {
+            DISK_WRITE_WORST_DEFERRED.store(deferred_here, Relaxed);
+        }
         if reply.args[0] != 4096 {
             return Err(bhaskix_fs::FsError::OutOfRange);
         }
@@ -14493,6 +14511,15 @@ impl bhaskix_fs::Store for DiskStore {
         Ok(())
     }
 }
+
+/// Deferred wakes counted during the slowest `block::WRITE` of the boot.
+///
+/// A global counter sampled around one call, so a wake deferred on *another*
+/// CPU inside the same window is counted here too. That is a real limit and
+/// the reason the boot's total is printed next to it: a worst write holding
+/// the boot's only deferred wake means something, and one of forty does not.
+static DISK_WRITE_WORST_DEFERRED: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
 
 static BLOCK_CALLER: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(u32::MAX);
 static BLOCK_READ: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
