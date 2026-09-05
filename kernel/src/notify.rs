@@ -222,6 +222,34 @@ pub fn live(id: NotificationId) -> bool {
     resolve(id).is_some()
 }
 
+/// Signals refused for a badge of zero, and for a notification already gone.
+///
+/// **Counted because the callers cannot report it.** `cap.rs` records the
+/// decision that puts the badge-zero check here rather than at derivation:
+/// waiters legitimately hold badge-zero capabilities, "a waiter has no use for
+/// a badge", and enforcing RFC 0010's rule at derivation stops the machine
+/// booting. So this is *"the only moment the distinction is real"* -- and three
+/// of the callers that reach this moment discard the answer, because they run
+/// where there is nobody to return it to: an interrupt delivering to its driver
+/// (`irq.rs`), a deadline expiring (`time.rs`), and a domain's death reaching
+/// its supervisor (`domain.rs`). Each refusal there is a wake that silently
+/// never happens, which is the hardest kind of missing wake to see.
+///
+/// Reported rather than gated to begin with: `Gone` on a teardown path may be
+/// ordinary, and a gate asserting zero before anyone has measured it is a gate
+/// that gets switched off.
+static REFUSED_EMPTY: AtomicU64 = AtomicU64::new(0);
+static REFUSED_GONE: AtomicU64 = AtomicU64::new(0);
+
+/// Signals refused: for an empty badge, and for a notification already gone.
+#[must_use]
+pub fn signals_refused() -> (u64, u64) {
+    (
+        REFUSED_EMPTY.load(Ordering::Relaxed),
+        REFUSED_GONE.load(Ordering::Relaxed),
+    )
+}
+
 /// ORs `badge` into the pending word and wakes the waiter, if there is one.
 ///
 /// **Callable from an interrupt handler.** It takes no lock, allocates
@@ -235,9 +263,13 @@ pub fn live(id: NotificationId) -> bool {
 /// [`NotifyError::EmptyBadge`] for a badge of zero.
 pub fn signal(id: NotificationId, badge: u64) -> Result<(), NotifyError> {
     if badge == 0 {
+        REFUSED_EMPTY.fetch_add(1, Ordering::Relaxed);
         return Err(NotifyError::EmptyBadge);
     }
-    let slot = resolve(id).ok_or(NotifyError::Gone)?;
+    let Some(slot) = resolve(id) else {
+        REFUSED_GONE.fetch_add(1, Ordering::Relaxed);
+        return Err(NotifyError::Gone);
+    };
 
     // Bits first, waiter second. A reader woken before the bits were published
     // would look, find nothing, and sleep again holding an event that had

@@ -10357,6 +10357,24 @@ with {} deferred wake(s) during that write",
          take a runqueue",
         sched::deferred_wakes_taken()
     );
+    // **Wakes that were refused rather than delayed**, which is the other way a
+    // wake goes missing and the one nothing reported until 2026-09-05.
+    //
+    // `notify::signal` refuses an empty badge and a notification already gone,
+    // and the three callers that matter run where there is nobody to return an
+    // answer to -- an interrupt, a deadline expiring, a domain ending -- so all
+    // three discard it. `cap.rs` put the badge-zero check in `signal` on the
+    // grounds that it is "the only moment the distinction is real"; this is
+    // what makes that moment observable.
+    //
+    // Zero on every boot measured so far. Printed unconditionally anyway: a
+    // number that only appears when it is non-zero is a number nobody knows to
+    // look for.
+    let (empty, gone) = notify::signals_refused();
+    println!(
+        "    wake refused   {empty} for a badge that rings nobody, {gone} for a notification that \
+         was already gone"
+    );
     // **BusyBox on the disk, when this boot staged it — RFC 0068.**
     //
     // Silent by default, because by default it is not staged. When it is, this
