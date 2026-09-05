@@ -539,6 +539,16 @@ INBOUND_DRIVER=$!
 # pass on a boot where these connections never completed at all.
 WEDGE_ATTEMPTS=$(mktemp)
 echo 0 > "$WEDGE_ATTEMPTS"
+# **What the prober tried**, which it has never recorded.
+#
+# `WEDGE_ATTEMPTS` counts connects that succeeded; the `if` below has no `else`
+# and the loop's trip count goes nowhere, so `host opened 5` could be five of
+# five or five of fourteen and the line cannot say. §3's cookie row has spent
+# four sightings without a clean denominator, and this is the one measurement
+# in the whole path that is independent of anything the guest reports: the
+# host's own connect either returned a socket or it did not.
+WEDGE_TRIED=$(mktemp)
+echo 0 > "$WEDGE_TRIED"
 (
     made=0
     # **Waits for the echo before it starts, and that ordering is a bug fix.**
@@ -559,7 +569,10 @@ echo 0 > "$WEDGE_ATTEMPTS"
     until [[ -f "$INBOUND_VERDICT" ]]; do
         sleep 0.25
     done
+    tried=0
     for _ in $(seq 1 14); do
+        tried=$((tried + 1))
+        echo "$tried" > "$WEDGE_TRIED"
         if { exec 5<>/dev/tcp/127.0.0.1/$BHASKIX_INBOUND_PORT; } 2>/dev/null; then
             exec 5>&- 5<&- || true
             made=$((made + 1))
@@ -2605,10 +2618,16 @@ rm -f "$INBOUND_VERDICT" 2>/dev/null || true
 # breaks cannot establish what normal looks like, and this row's whole problem
 # was not knowing that.
 wedge_made="$(cat "$WEDGE_ATTEMPTS" 2>/dev/null || echo 0)"
+wedge_tried="$(cat "$WEDGE_TRIED" 2>/dev/null || echo 0)"
 wedge_seen="$(grep -aoE "tcpd offered +[0-9]+" "$LOG" | grep -oE "[0-9]+$" | head -1)"
 wedge_home="$(grep -aoE "of which [0-9]+ came home" "$LOG" | grep -oE "[0-9]+" | head -1)"
-printf '      inbound: host opened %s, guest answered %s, %s completed\n' \
-    "$wedge_made" "${wedge_seen:-?}" "${wedge_home:-?}"
+printf '      inbound: host tried %s and opened %s, guest answered %s SYN(s), %s came home\n' \
+    "$wedge_tried" "$wedge_made" "${wedge_seen:-?}" "${wedge_home:-?}"
+# Renamed as well as extended. "guest answered N, M completed" read as a count
+# of connections and is a count of *segments*: a retransmitted `SYN` is answered
+# with its own cookie, so one connection can be answered twice and come home
+# once. That shortfall was read as lost handshakes -- by me, for twenty-two
+# boots, having read this comment's own warning about denominators first.
 
 if grep -qE "no network this machine can drive" "$LOG"; then
     pass "wedge probe skipped: this machine has no network"

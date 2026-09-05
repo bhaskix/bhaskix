@@ -1027,6 +1027,7 @@ fn answer_with_cookie(
     let built = emit.segment(back, &[]);
     let mut bytes = [0u8; segment::MAX_HEADER];
     let Ok(written) = segment::write(&mut bytes, &built, destination, source) else {
+        SYNACK_UNSENT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         return;
     };
     // SAFETY: the back ring, mapped writable at `BACK_AT` -- the same ring
@@ -1034,6 +1035,11 @@ fn answer_with_cookie(
     let sent = unsafe { send_entry(destination, source, &bytes[..written]) };
     if sent {
         service.sent += 1;
+    } else {
+        // The ring would not take it. The cookie is already counted as offered
+        // and the peer will never see it, so it can never come home -- which is
+        // exactly the shortfall `offered` minus `cookies` has been showing.
+        SYNACK_UNSENT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -1050,6 +1056,48 @@ fn answer_with_cookie(
 /// nothing listens on, one whose number this key did not mint, and one that
 /// arrives when the single accepted slot is genuinely occupied by a live
 /// connection.
+/// ACKs discarded because the one accepted slot was already occupied.
+///
+/// **A static, and this program had none until 2026-09-05.** The natural place
+/// is two more parameters on `report`, which already takes ten positional ones
+/// -- and a call-site misalignment in exactly that list printed three numbers
+/// under the wrong names for days, fixed 2026-09-04. Call sites read
+/// `report(bits, outcome::PENDING, 0, 0, 0, 0, 0, 0, 0, 0)`; a run of zeros is
+/// where a twelfth argument goes wrong silently. Loaded inside `report`
+/// instead, the way `bin/ipd` carries most of its words, so no call site moves.
+static ACK_WHILE_BUSY: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Cookies counted as offered whose `SYN`/`ACK` never reached the back ring.
+///
+/// **`cookies_offered` is incremented before the segment is built, written or
+/// sent**, and two failure paths sit after it: `segment::write` returning early,
+/// and `send_entry` answering `false` because the ring would not take the bytes
+/// -- the second discarded by an `if sent` with no `else`. So `offered` has
+/// always meant "a cookie was minted", not "a peer was answered", and the
+/// difference is invisible.
+///
+/// This is the same defect this project fixed in `bin/linuxd` on 2026-09-04,
+/// where `FORGETS_SENT` was incremented before `let _ = ipc::call(..)` so that
+/// "a FORGET the adapter never received still counted as one sent". Same shape,
+/// different service, found because the inbound counters said the lost
+/// handshakes never arrived and something had to explain a peer that never
+/// answered: it was never asked.
+static SYNACK_UNSENT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// ACKs from the peer already in the slot -- a retransmission, costing nothing.
+///
+/// Separated from [`ACK_WHILE_BUSY`] because the two look identical at the
+/// refusal and mean opposite things: this one is a peer whose connection is
+/// already up saying so again.
+static ACK_DUPLICATE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// ACKs whose cookie did not verify.
+///
+/// The age window is 64 to 128 seconds (`MAX_AGE_TICKS` at `TICK_NANOS`), which
+/// no handshake in a boot approaches, so a count here is the keyed hash failing
+/// and points at the four-tuple or the key rather than at timing.
+static ACK_REJECTED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 fn accept_cookie(
     service: &mut Service,
     parsed: &Segment<'_>,
@@ -1081,6 +1129,16 @@ fn accept_cookie(
     {
         service.connections[ACCEPTED] = None;
     }
+    // **Whose ACK is being refused, which the first version of this counter
+    // could not say.** The slot being occupied covers two different events: a
+    // *different* peer turned away, which is a handshake lost, and *this same*
+    // peer retransmitting an ACK for the connection already in the slot, which
+    // costs nothing because its connection is up. Counting both under one name
+    // made `busy 2` unreadable -- two refusals or two duplicates, and the
+    // number could not say. Only a stranger is counted.
+    let refusing_a_stranger = service.connections[ACCEPTED].as_ref().is_some_and(|held| {
+        held.tcb.connection.remote != source || held.tcb.connection.remote_port != parsed.source
+    });
     if service.connections[ACCEPTED].is_some() {
         // Still one accepted connection at a time. A peer whose cookie
         // arrives now will retransmit its `ACK`, and the cookie stays valid
@@ -1097,6 +1155,16 @@ fn accept_cookie(
         // never build on one. RFC 0061 reclaims it in `drive_at`. The
         // sentence was written while looking at this function, and the case it
         // missed was three lines further on.
+        //
+        // **Counted since 2026-09-05.** Ten green boots at eight CPUs offered 64
+        // cookies and saw 45 come home -- a 30% loss on boots the gate calls
+        // green, because the gate passes on any non-zero count. This is one of
+        // the two places that loss can happen and neither could say so.
+        if refusing_a_stranger {
+            ACK_WHILE_BUSY.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        } else {
+            ACK_DUPLICATE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        }
         return None;
     }
 
@@ -1106,12 +1174,17 @@ fn accept_cookie(
         remote: source,
         remote_port: parsed.source,
     };
-    let accepted = cookie::verify(
+    let Some(accepted) = cookie::verify(
         &service.key,
         connection,
         acknowledgement,
         now_nanos(service.hertz),
-    )?;
+    ) else {
+        // The `?` that was here discarded the one fact that separates "the ACK
+        // never arrived" from "the ACK arrived and was refused".
+        ACK_REJECTED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        return None;
+    };
 
     // The peer's initial sequence is one below where its `ACK` sits: byte `k`
     // of its stream is `irs + 1 + k`, so the number this segment is at *is*
@@ -1626,8 +1699,24 @@ fn report(
     // into "the ACK never came home" and "the SYN never arrived". The kernel's
     // reader sizes its slice from its own array, so the two move together.
     let words = [
-        MARKER, state_bits, outcome, taken, sent, refused, tcb_state, cookies, reclaimed, accepted,
+        MARKER,
+        state_bits,
+        outcome,
+        taken,
+        sent,
+        refused,
+        tcb_state,
+        cookies,
+        reclaimed,
+        accepted,
         offered,
+        // Twelve and thirteen: where an ACK went when it did not build a
+        // connection. Loaded here rather than passed, so the positional list
+        // above stops growing -- see `ACK_WHILE_BUSY`.
+        ACK_WHILE_BUSY.load(core::sync::atomic::Ordering::Relaxed),
+        ACK_REJECTED.load(core::sync::atomic::Ordering::Relaxed),
+        ACK_DUPLICATE.load(core::sync::atomic::Ordering::Relaxed),
+        SYNACK_UNSENT.load(core::sync::atomic::Ordering::Relaxed),
     ];
     // SAFETY: the page this program mapped writable, which nothing else
     // reaches. The marker is written last, so a kernel reading a partial report

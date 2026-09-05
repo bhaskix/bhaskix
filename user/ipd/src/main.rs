@@ -96,10 +96,7 @@ const DATAGRAM_BELL: u64 = 10;
 
 /// Rings the datagram bell. Called wherever a datagram becomes readable.
 fn ring_datagram_bell() {
-    DATAGRAMS_ANNOUNCED.store(
-        DATAGRAMS_ANNOUNCED.load(core::sync::atomic::Ordering::Relaxed) + 1,
-        core::sync::atomic::Ordering::Relaxed,
-    );
+    DATAGRAMS_ANNOUNCED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     call(syscall::INVOKE, DATAGRAM_BELL, method::SIGNAL, [0; 4]);
 }
 
@@ -739,6 +736,8 @@ fn refresh() {
         BOUND_PORTS.load(Relaxed),
         SLOT_GENERATIONS.load(Relaxed),
         UPPER_SLOTS.load(Relaxed),
+        TCP_FORWARDED.load(Relaxed),
+        TCP_RETURNED.load(Relaxed),
     ]);
 }
 
@@ -850,10 +849,7 @@ unsafe fn forward_tcp(source: Ipv4Addr, destination: Ipv4Addr, segment: &[u8]) -
     }
     // Index first, wake second, as every doorbell in this system orders it.
     call(syscall::INVOKE, TCP_BELL, method::SIGNAL, [0; 4]);
-    TCP_FORWARDED.store(
-        TCP_FORWARDED.load(core::sync::atomic::Ordering::Relaxed) + 1,
-        core::sync::atomic::Ordering::Relaxed,
-    );
+    TCP_FORWARDED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     true
 }
 
@@ -911,10 +907,7 @@ unsafe fn forward_tcp6(source: Ipv6Addr, destination: Ipv6Addr, segment: &[u8]) 
     }
     // Index first, wake second, as every doorbell in this system orders it.
     call(syscall::INVOKE, TCP_BELL, method::SIGNAL, [0; 4]);
-    TCP_FORWARDED.store(
-        TCP_FORWARDED.load(core::sync::atomic::Ordering::Relaxed) + 1,
-        core::sync::atomic::Ordering::Relaxed,
-    );
+    TCP_FORWARDED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     true
 }
 
@@ -979,10 +972,7 @@ fn drain_tcp_back(
             if destination6 == LOOPBACK6 {
                 // SAFETY: the forward ring is mapped writable.
                 if unsafe { forward_tcp6(source6, destination6, segment) } {
-                    TCP_RETURNED.store(
-                        TCP_RETURNED.load(core::sync::atomic::Ordering::Relaxed) + 1,
-                        core::sync::atomic::Ordering::Relaxed,
-                    );
+                    TCP_RETURNED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 }
                 continue;
             }
@@ -1011,10 +1001,7 @@ fn drain_tcp_back(
                 // SAFETY: the return ring is mapped writable.
                 && unsafe { send(&outgoing[..at + body_length]) }
             {
-                TCP_RETURNED.store(
-                    TCP_RETURNED.load(core::sync::atomic::Ordering::Relaxed) + 1,
-                    core::sync::atomic::Ordering::Relaxed,
-                );
+                TCP_RETURNED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             }
             continue;
         }
@@ -1043,10 +1030,7 @@ fn drain_tcp_back(
             // SAFETY: the return ring is mapped writable.
             && unsafe { send(&outgoing[..at + body_length]) }
         {
-            TCP_RETURNED.store(
-                TCP_RETURNED.load(core::sync::atomic::Ordering::Relaxed) + 1,
-                core::sync::atomic::Ordering::Relaxed,
-            );
+            TCP_RETURNED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         }
     }
 }
@@ -2715,6 +2699,14 @@ fn report(
         BOUND_PORTS.load(core::sync::atomic::Ordering::Relaxed),
         SLOT_GENERATIONS.load(core::sync::atomic::Ordering::Relaxed),
         UPPER_SLOTS.load(core::sync::atomic::Ordering::Relaxed),
+        // Words 26 and 27: TCP segments handed to `bin/tcpd` and taken back.
+        // Both counters have existed since TCP did and **neither had a reader**
+        // -- they were incremented on every segment and printed nowhere, which
+        // is why §3's cookie row has spent four sightings unable to say whether
+        // the third leg of a handshake reached the service at all. Appended,
+        // for the reason written at 23.
+        TCP_FORWARDED.load(core::sync::atomic::Ordering::Relaxed),
+        TCP_RETURNED.load(core::sync::atomic::Ordering::Relaxed),
     ];
     V6_PREFIX.store(v6_prefix, core::sync::atomic::Ordering::Relaxed);
     V6_STATE.store(v6_state, core::sync::atomic::Ordering::Relaxed);
@@ -2733,8 +2725,14 @@ fn report(
     write_report(words);
 }
 
-/// Puts ten words on the report page.
-fn write_report(words: [u64; 26]) {
+/// Puts the report's words on the report page.
+///
+/// The count has moved four times and this comment said "ten" until 2026-09-05,
+/// which is a small thing that costs a reader the one fact they came for. It is
+/// whatever the array says: the type is the documentation, and both builders --
+/// `report` and `refresh` -- are forced to agree with it by the compiler, which
+/// is the only reason the v6 words' silent overwrite could not happen twice.
+fn write_report(words: [u64; 28]) {
     // SAFETY: the page this program mapped writable, which nothing else
     // reaches. The marker is written last, so a kernel reading a partial report
     // sees no marker rather than half the fields.

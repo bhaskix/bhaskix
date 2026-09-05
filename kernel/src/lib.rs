@@ -5688,7 +5688,7 @@ fn thread_self_test(hhdm_base: u64, cpus: u32) -> bool {
         return false;
     }
 
-    // The marker, written last by the probe, is what says the seven words
+    // The marker, written last by the probe, is what says the nine words
     // under it are its own. Without it this loop reads a frame that may
     // have been recycled from an earlier domain and finds a plausible-looking
     // set of numbers -- which is exactly what happened on the first run of
@@ -15889,14 +15889,19 @@ fn report_net_after_exchange(hhdm: u64) {
     if count == 0 {
         return;
     }
-    // Twenty-five words, 200 bytes. Twenty-one until RFC 0063 appended what
+    // Twenty-eight words, 224 bytes. Twenty-one until RFC 0063 appended what
     // the service holds and how often each slot has been reused at 23 and 24 --
     // appended, because the two words this instrument first used were the
-    // delivery count and the refusal reason the "ipd after" line prints.
-    let mut ipd = [0u64; 26];
+    // delivery count and the refusal reason the "ipd after" line prints -- and
+    // twenty-six until the TCP hand-off counts joined them at 26 and 27.
+    //
+    // The comment above this one said "twenty-five words, 200 bytes" while the
+    // array read 26 and the slice read 208. Corrected while adding to it: a
+    // length written in three places is wrong in at least one of them.
+    let mut ipd = [0u64; 28];
     // SAFETY: a frame this object owns, through the direct map, read as the
-    // twenty-six little-endian words the service wrote there.
-    let bytes = unsafe { core::slice::from_raw_parts((hhdm + pages[0]) as *const u8, 208) };
+    // twenty-eight little-endian words the service wrote there.
+    let bytes = unsafe { core::slice::from_raw_parts((hhdm + pages[0]) as *const u8, 224) };
     for (index, word) in ipd.iter_mut().enumerate() {
         let mut buffer = [0u8; 8];
         buffer.copy_from_slice(&bytes[index * 8..index * 8 + 8]);
@@ -15905,6 +15910,19 @@ fn report_net_after_exchange(hhdm: u64) {
     if ipd[0] != IPD_MARKER {
         return;
     }
+    // **What reached `bin/tcpd`, which nothing could see until 2026-09-05.**
+    //
+    // §3's cookie row narrowed its defect to the third leg of the handshake:
+    // `offered` says a SYN was answered with a cookie, `cookies` says none was
+    // built from one, and between those two facts is an ACK whose fate nobody
+    // could observe. `bin/ipd` has counted segments handed to `bin/tcpd` since
+    // TCP existed here and never reported the number. A failing boot with this
+    // moving says the ACK arrived and the service lost it; not moving says it
+    // never arrived and the hunt is below this line.
+    println!(
+        "    ipd tcp        {} segment(s) forwarded to bin/tcpd, {} returned and transmitted",
+        ipd[26], ipd[27]
+    );
     println!(
         "    ipd state      {:#x} (send/configured/tcp-rings)",
         ipd[7]
@@ -16635,8 +16653,11 @@ fn report_tcp_client(hhdm: u64) {
 /// of this would have raised it for a diagnostic.
 fn tcp_report_bytes(hhdm: u64, frame: u64) -> &'static [u8] {
     // SAFETY: a frame the report object owns, through the direct map, read as
-    // the ten little-endian words the service wrote there.
-    unsafe { core::slice::from_raw_parts((hhdm + frame) as *const u8, 88) }
+    // the thirteen little-endian words the service wrote there.
+    //
+    // This said "ten" while the slice read 88 bytes for eleven words, and now
+    // reads 120 for fifteen.
+    unsafe { core::slice::from_raw_parts((hhdm + frame) as *const u8, 120) }
 }
 
 /// The cookie count again, at the end of the boot.
@@ -16692,7 +16713,7 @@ fn report_tcp_domain(hhdm: u64) {
     // reclaimed: word 9 carries the accepted slot's state and whether an
     // application holds it. The slice below is `words.len() * 8`, so this is
     // the only number to change.
-    let mut words = [0u64; 11];
+    let mut words = [0u64; 15];
     // SAFETY: a frame this object owns, through the direct map, read as the
     // **nine** little-endian words the service wrote there.
     //
@@ -16754,6 +16775,33 @@ fn report_tcp_domain(hhdm: u64) {
     println!(
         "    tcpd offered   {} SYN(s) answered with a cookie, of which {} came home",
         words[10], words[7]
+    );
+    // **And where the rest went.** Ten green boots at eight CPUs offered 64
+    // cookies and saw 45 come home: a 30% loss on boots the gate calls green,
+    // because it passes on any non-zero count. The nineteen that vanished had
+    // two possible fates and `bin/tcpd` recorded neither -- an `ACK` arriving
+    // while the one accepted slot was occupied, and an `ACK` whose cookie did
+    // not verify. Both are counted now.
+    //
+    // `busy` is expected to carry most of it: the service holds **one**
+    // inbound connection at a time (`ACCEPTED` is a single slot) and the
+    // harness opens five, so some are refused by construction rather than by a
+    // defect. A boot where `busy` accounts for the shortfall says this is
+    // capacity; one where `rejected` does says the keyed hash is failing, which
+    // would be a different and worse thing. Neither could be said before.
+    println!(
+        "    tcpd ack       {} stranger(s) refused for a busy slot, {} whose cookie did not \
+         verify, {} retransmission(s) from the peer already in it",
+        words[11], words[12], words[13]
+    );
+    // **A cookie counted as offered whose answer never left.** `offered` is
+    // incremented before the segment is built and sent, and both failure paths
+    // after it were silent, so a peer that was never asked looked exactly like
+    // a peer that did not reply. Non-zero here accounts for part of the
+    // `offered` minus `cookies` shortfall without any packet being lost.
+    println!(
+        "    tcpd unsent    {} cookie(s) offered whose SYN/ACK never reached the ring",
+        words[14]
     );
     // **RFC 0061, and a counter whose healthy value is zero.**
     //
