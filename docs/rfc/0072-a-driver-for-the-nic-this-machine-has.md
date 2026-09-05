@@ -127,6 +127,39 @@ the X722 named, before the driver that drives it exists.
 That is step 2's real work, it is a change to `iommu`'s policy rather than to any
 driver, and it is what unblocks the rest of this RFC.
 
+### Step 2 is done — the NIC is contained, 2026-09-06
+
+    iommu window   b1:00.0 translating too, a foreign NIC's own page table and domain, 2 in use
+    nic domain     b1:00.0 8086:37d1 delegated: registers at 0x23ffd000000, 64-bit BAR
+    nic domain     dma window granted; this NIC translates through its own
+
+The X722 has its own page table, its own domain id, and a register window a
+domain holds as a capability. Pass-through on that machine fell from **105
+functions to 101**, the four NICs no longer among them.
+
+It took two fixes, and the second was in code that was already there.
+
+**`iommu::claimed`.** `pass_through_undrivable` hands untranslated DMA to
+anything `drivable` does not claim, and `drivable` claims xHCI, AHCI and virtio.
+So containment was keyed on *already having a driver*, and this step could not
+precede step 3. `claimed` is a separate predicate -- `drivable` keeps its meaning
+for `survey` -- answering whether a device should be contained rather than passed
+through. Containing a device nobody drives is strictly safer than passing it
+through: a translated domain with no mappings reaches nothing.
+
+**`iommu::windows_on`.** The first attempt attached a correct window and
+`verify_window` rejected it. Its invariant compares context entries present in
+*one bus's* table against the devices attached to it -- `passed_through(bus)` was
+already per-bus for that reason -- but every caller passed the count across *all*
+buses. That was right only because every device this project drove lived on bus
+`00`. The X722 is on `b1`, so a correct window failed a wrong check, which is the
+worse way round: a check that rejects good work is how checks get deleted. All
+five call sites count their own bus now, not just the new one.
+
+**Neither fault could have been found in QEMU.** Its devices are all on bus `00`,
+where the two counts agree, and it has no undrivable NIC to pass through. The
+iommu lane passed before both fixes and passes after them, unchanged.
+
 ### Step 3 — bring the device up
 
 The part with real risk, and the reason it is its own step. An i40e-class device
