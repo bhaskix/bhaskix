@@ -12471,6 +12471,126 @@ pub fn start_block_domain(
     Ok(())
 }
 
+/// The first Ethernet function that is not virtio — RFC 0072 step 2.
+///
+/// Virtio is excluded because `bin/netd` owns it and the test lanes have nothing
+/// else, so this finds **nothing on QEMU and four functions on the SR550**,
+/// where step 1 measured them: `8086:37d1` at `b1:00.0` through `b1:00.3`,
+/// class 02.00, each advertising MSI-X.
+fn find_foreign_nic() -> Option<(bhaskix_arch::pci::Address, bhaskix_arch::pci::Identity)> {
+    const ETHERNET: u8 = 0x02;
+    const VIRTIO: u16 = 0x1af4;
+    let mut found = None;
+    let mut each = |address: bhaskix_arch::pci::Address, identity: bhaskix_arch::pci::Identity| {
+        if identity.class == ETHERNET && identity.subclass == 0 && identity.vendor != VIRTIO {
+            found = Some((address, identity));
+            return false;
+        }
+        true
+    };
+    // SAFETY: bootstrap CPU during boot; nothing else is driving a
+    // configuration cycle, as `virtio::find_nth_of` states for the same walk.
+    unsafe { bhaskix_arch::pci::for_each(&mut each) };
+    found
+}
+
+/// Gives one foreign NIC a domain and a DMA window — RFC 0072 step 2.
+///
+/// **What this proves is containment, not a driver.** The question the step
+/// exists to answer is whether `iommu::present_for` says yes for a function on
+/// the SR550's `b1` bus and whether `iommu::name` produces a window capability
+/// for it. Both are answered here, in the kernel, with no queues and no traffic.
+///
+/// The register window is granted `READ | WRITE | DERIVE` and **not** `GRANT`,
+/// for the reason the AHCI path states: a register window is the whole device,
+/// and `DERIVE` without `GRANT` lets a holder weaken a copy for itself and hand
+/// nothing on.
+///
+/// Inert where there is no such device, which is every lane in QEMU.
+fn start_nic_domain() -> Result<(), &'static str> {
+    let Some((address, identity)) = find_foreign_nic() else {
+        return Ok(());
+    };
+    let Some(configuration) = configuration_page(address) else {
+        println!("    nic domain     a NIC is present but its configuration page is not named");
+        return Ok(());
+    };
+    let _ = configuration;
+
+    // BAR0, through the safe ECAM reader, so this costs no unsafe. A memory BAR
+    // marks its width in bits 2:1, and `10` means the address continues into
+    // BAR1 -- reported rather than assumed, because a 64-bit BAR read as 32
+    // names the wrong page and the mistake is silent.
+    let Some(bar0) = bhaskix_arch::pci::read32_ecam(address, 0x10) else {
+        println!("    nic domain     BAR0 would not read");
+        return Ok(());
+    };
+    let sixty_four = (bar0 >> 1) & 0b11 == 0b10;
+    let high = if sixty_four {
+        bhaskix_arch::pci::read32_ecam(address, 0x14).unwrap_or(0)
+    } else {
+        0
+    };
+    let registers = (u64::from(high) << 32) | u64::from(bar0 & !0xf);
+    if registers == 0 {
+        println!("    nic domain     BAR0 is unassigned; nothing to map");
+        return Ok(());
+    }
+
+    let realm = domain::create("nic", domain::ResourceEnvelope::new())
+        .map_err(|_| "the nic domain would not be created")?;
+    let window = cap::with_arena(|arena| {
+        arena
+            .insert_root(
+                cap::ObjectRef::new(
+                    cap::ObjectKind::Frame,
+                    registers & !(bhaskix_mm::FRAME_SIZE - 1),
+                ),
+                cap::Rights::READ
+                    .union(cap::Rights::WRITE)
+                    .union(cap::Rights::DERIVE),
+                0,
+            )
+            .ok()
+    })
+    .ok_or("a nic register window would not be created")?;
+    if domain::with(realm, |owner| owner.cspace.install_at(1, window).is_ok()) != Some(true) {
+        return Err("a nic register window would not install");
+    }
+
+    let delegated = (address.bus, address.device, address.function);
+    let contained = if iommu::present_for(delegated) {
+        let dma = iommu::name(delegated).map_err(|_| "the nic dma window would not be named")?;
+        if domain::with(realm, |owner| owner.cspace.install_at(3, dma).is_ok()) != Some(true) {
+            return Err("the nic dma window capability would not install");
+        }
+        true
+    } else {
+        false
+    };
+
+    println!(
+        "    nic domain     {:02x}:{:02x}.{} {:04x}:{:04x} delegated: registers at {:#x}, \
+         {}-bit BAR",
+        address.bus,
+        address.device,
+        address.function,
+        identity.vendor,
+        identity.device,
+        registers,
+        if sixty_four { 64 } else { 32 }
+    );
+    if contained {
+        println!("    nic domain     dma window granted; this NIC translates through its own");
+    } else {
+        println!(
+            "\x1b[93m    nic domain     no dma window: nothing would contain this NIC, so it \
+             was not given one\x1b[0m"
+        );
+    }
+    Ok(())
+}
+
 /// Hands the AHCI controller to a domain in ring 3.
 ///
 /// RFC 0046 step 3b. The same delegation `start_block_domain` performs, for a
@@ -19078,6 +19198,13 @@ fn user_shell(handoff: &Handoff) -> Result<(), &'static str> {
     // is the machine's *other* storage, and a machine whose virtio disk is
     // missing is exactly the machine where knowing what is on the SATA ports
     // matters most.
+    // RFC 0072 step 2, beside the AHCI grant because it is the same sequence on
+    // a different class: find the device, hand its register window to a domain,
+    // and ask the IOMMU to contain it. Silent on every lane in QEMU, where the
+    // only class 02 device is virtio and `bin/netd` owns it.
+    if let Err(reason) = start_nic_domain() {
+        println!("\x1b[91m    nic domain     FAILED: {reason}\x1b[0m");
+    }
     if let Err(reason) = start_ahci_domain(cpu, hhdm) {
         println!("\x1b[91m    ahci domain    FAILED: {reason}\x1b[0m");
     } else {

@@ -617,7 +617,13 @@ asm_budget = 10
 # first leaves the unsafe scope as the two calls that are actually unsafe. The
 # lines could not be avoided -- the calls are unsafe and there is no safe
 # wrapper for them -- but their scope could be, and was.
-unsafe_budget = 1993
+#
+# 1994 on 2026-09-05: one line for RFC 0072 step 2's `find_foreign_nic` --
+# another `pci::for_each`, the same walk with a different predicate. The BARs it
+# reads afterwards cost nothing, because `pci::read32_ecam` is safe; only the
+# enumeration is not. One line and not more for the reason the entry above
+# gives: the closure is bound before the `unsafe` rather than written inside it.
+unsafe_budget = 1994
 # Up thirty-one for RFC 0005 step 9's socket probe -- `ring3_socketeer`, which
 # is `ring3_lister` with a `sockaddr_in6` copied in beside its code instead of
 # two filenames. The same two blocks every hosted probe has: one

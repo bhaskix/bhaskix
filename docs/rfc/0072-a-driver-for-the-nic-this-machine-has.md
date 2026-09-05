@@ -60,13 +60,28 @@ unfamiliar machine, and it costs a walk of config space.
 
 ### Step 2 — give one to a domain, and prove containment holds
 
-The `bin/ahcid` sequence, applied to a NIC: `iommu::present_for`, `iommu::name`
-for the window, map its BAR, spawn a program that attaches, reports what it can
-see of the device, and exits. No queues, no traffic.
+The `bin/ahcid` sequence, applied to a NIC: find the device, read its register
+BAR, create a domain, install the register window as a capability, and ask the
+IOMMU to name a DMA window for it.
 
 What this proves is that the containment that works for AHCI works for this
-device, on this machine, with bus mastering enabled behind a window it cannot
-escape. If step 2 fails, nothing after it is worth writing.
+device, on this machine: that `iommu::present_for` answers yes for a function on
+bus `b1`, and that `iommu::name` produces a window capability for it. If that
+fails, nothing after it is worth writing.
+
+**Amended 2026-09-05: the stub program moves to step 3.** This step first said it
+would also spawn a program that attaches, reports and exits. That program proves
+domain plumbing, which `bin/ahcid` already proves generally, and it proves
+nothing about *this device*. The unknown here is whether the IOMMU contains a
+b1-bus NIC, and that is answered entirely in the kernel. Step 3 needs a real
+program regardless, so the stub is one there rather than a throwaway here.
+
+**It is inert on QEMU by construction, and that is deliberate.** The only class
+02 device on the test lanes is virtio-net, which `bin/netd` already owns, so this
+path matches a class 02 function whose vendor is *not* virtio and finds none.
+On the SR550 it finds four. A gate that says "no such device here" on every lane
+and does the work on one machine is unusual for this project and is the honest
+shape: the device only exists in one place.
 
 ### Step 3 — bring the device up
 
