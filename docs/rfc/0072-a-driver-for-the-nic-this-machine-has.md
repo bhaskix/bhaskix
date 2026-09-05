@@ -169,9 +169,35 @@ capabilities, link state.
 
 This is where [RFC 0071](0071-drivers-for-hardware-that-already-exists.md)'s
 question is settled in practice, and it must be settled **before** this step is
-written, not during it: either a port of FreeBSD's BSD-licensed driver for this
-device with attribution, or a native implementation from Intel's public
-datasheet. Not a reading of the Linux driver.
+written, not during it.
+
+**Settled 2026-09-06: native, from Intel's public datasheet.** The X722's
+register specification is in the *Intel C620 Series Chipset Platform Controller
+Hub Datasheet*, a public download of 3,854 pages, and it carries the registers
+this step needs -- `PFGEN_CTRL` and its `PFSWR` reset bit, `GLGEN_RSTCTL`,
+`PF_ATQBAL` / `PF_ATQLEN` / `PF_ARQBAL` for the admin queues -- along with the
+reset semantics and their ordering against bus-master enable.
+
+Three checks got there, and the first two failed, which is why they are recorded:
+
+* The *X710/XXV710/XL710 datasheet* is public and register-level, and **does not
+  cover the X722**. The parts are the same family and not the same document.
+* The X722's own public documents are feature-support matrices and product
+  briefs, which describe capability rather than registers.
+* The C620 PCH datasheet is where the X722's registers actually live, because
+  the X722 is the integrated controller in that chipset rather than a discrete
+  adapter.
+
+So there is **no licence question to answer here at all**: no GPL source is read,
+no clean-room split is needed, and nothing is carried whose provenance would have
+to be argued. This is the same route that unblocked
+[RFC 0043](0043-an-iommu-on-a-machine-with-no-virtio.md), whose own note reads
+*"The Intel VT-d Architecture Specification is a public document; it was fetched
+and read, and it answers this directly."*
+
+FreeBSD's `ixl` remains the fallback if the datasheet turns out to omit something
+this step needs, and it would be a port with attribution rather than a reading.
+Not a reading of the Linux driver, either way.
 
 **Gate:** the boot report states the firmware version and the link state the
 device reports. A device that says its own firmware version is a device that is
