@@ -10328,15 +10328,31 @@ fn hosted_exec_self_test(hhdm_base: u64, cpus: u32) -> bool {
         let writes = sched_disk_writes();
         if writes.1 > 0 {
             println!(
-                "    disk writes    {} round trip(s) to bin/blkd, {} us each on average, worst {} us; \
-                 {} wake(s) this boot waited for a tick instead of a device",
+                "    disk writes    {} round trip(s) to bin/blkd, {} us each on average, worst {} us",
                 writes.1,
                 writes.0 / writes.1 * 1_000_000 / hertz,
-                writes.2 * 1_000_000 / hertz,
-                sched::deferred_wakes_taken()
+                writes.2 * 1_000_000 / hertz
             );
         }
     }
+    // **Deferred wakes, on their own line — and this is a correction.**
+    //
+    // The count was reported only inside `disk writes` above, which prints when
+    // a boot wrote blocks. The SR550 has no block service, so the first
+    // hardware boot carrying this counter said nothing about it: a machine that
+    // waited **1.114 seconds** to dispatch `bin/consoled` could not say whether
+    // the deferral path was involved.
+    //
+    // That is the fault this week has been finding in other people's
+    // instruments -- a number reported in one place, absent where it is needed
+    // -- committed here three days after the third time it was written down.
+    // Reported unconditionally, because the boots where it matters most are the
+    // ones with nothing else to hang it on.
+    println!(
+        "    deferred wakes {} wake(s) waited for a tick because an interrupt handler could not \
+         take a runqueue",
+        sched::deferred_wakes_taken()
+    );
     // **BusyBox on the disk, when this boot staged it — RFC 0068.**
     //
     // Silent by default, because by default it is not staged. When it is, this

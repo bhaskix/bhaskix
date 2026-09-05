@@ -1177,6 +1177,14 @@ one of the machine's own services, and the wait is *past* the 1,000 ms idle back
 just under it. So the backstop wait reaches real work on real hardware, which the eight-CPU QEMU
 runs could not show.
 
+**And it exposed one of my own instruments doing exactly what this week has been about.** The
+deferred-wake count was printed only inside the `disk writes` line, which appears on boots that
+wrote blocks. The SR550 has no block service, so the first hardware boot carrying that counter said
+**nothing** about it -- a machine that took 1.114 seconds to dispatch a service could not say
+whether the deferral path was involved. It is on its own line now, printed unconditionally, because
+the boots where it matters most are the ones with nothing else to hang it on. Three days after the
+third time this pattern was written down, committed by the person writing it down.
+
 **What this boot did not test, and the row says so rather than implying coverage:** the SR550 has no
 block service — `fs domain  no block service on this machine, so no disk to mount` — so
 `format_sized`, the disk-sized filesystem, the 4 MiB disk and the batched `block::WRITE` were **not
