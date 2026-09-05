@@ -1152,6 +1152,36 @@ disk -- built, and it was not that either. It was the filesystem, formatted to a
 in a 512 KiB static, and the fix for *that* made the kernel smaller and the format faster. Each
 wrong answer was found by building the previous one.
 
+### 2026-09-05 (the SR550, with a week of changes on it, and one finding QEMU could not give)
+
+A day that changed the scheduler's deferred wakes, the nucleus bulk copy, the filesystem format and
+the disk layout is a day to boot the hardware. Found powered **off**, booted from a fresh image over
+the BMC's HTTP remote-map, and **returned to off** afterwards.
+
+**Zero `FAILED` lines.** The whole week's work boots clean on the one physical machine available.
+
+Two numbers that are simply better than the emulator's, and worth knowing as the machine's own:
+
+* `rt latency  50 wakeups, worst **1.930 us**` — against 112 to 224 us on QEMU.
+* `lock order  **14,291,554** acquisitions checked, detector verified, 0 violations` — two orders of
+  magnitude more than a QEMU lane checks, and clean.
+
+**And one finding the emulator could not have given.** The line added yesterday, which reports the
+worst wake-to-run that is *not* the boot thread's, reads:
+
+    worst for any other thread 1114160 us, thread 68 (consoled), ending 237362 ms into the boot
+
+**1.114 seconds, and the thread is `bin/consoled` — a service, not a test thread.** On QEMU that
+line has only ever named a ring station, which is a thread built to sleep in a loop; here it names
+one of the machine's own services, and the wait is *past* the 1,000 ms idle backstop rather than
+just under it. So the backstop wait reaches real work on real hardware, which the eight-CPU QEMU
+runs could not show.
+
+**What this boot did not test, and the row says so rather than implying coverage:** the SR550 has no
+block service — `fs domain  no block service on this machine, so no disk to mount` — so
+`format_sized`, the disk-sized filesystem, the 4 MiB disk and the batched `block::WRITE` were **not
+exercised**. The bulk-copy fix was, only in as much as any service used it.
+
 ### 2026-09-05 (a census of what actually fails, on 72 clean boots)
 
 Three rows were advanced this week by evidence generated for something else, so the habit was made
