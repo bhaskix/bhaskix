@@ -231,6 +231,45 @@ Two other things the walk showed without being asked, both useful:
   each of them and for all four NICs, so it sees these devices and declines them
   correctly. Step 2 is about turning one of those refusals into a window.
 
+### Step 3's first half is done — the device resets, 2026-09-06
+
+    nic domain     b1:00.0 8086:37d1 delegated: registers at 0x23ffd000000, 64-bit BAR
+    nic reset      the device completed a PF reset; admin queues read 32 and 32 descriptor(s)
+    nic domain     dma window granted; this NIC translates through its own
+
+`PFSWR` was set and **hardware cleared it**, which is the datasheet's own
+definition of a completed PF reset. That is the first time this project has made
+a real network device do anything.
+
+**And the second number is not this code's, which is the more interesting
+result.** `RING_DESCRIPTORS` is 32 and it is written only by
+`enable_admin_queues`, which the boot never calls -- the wiring resets and reads.
+So the device reported admin queue lengths of 32 that **firmware wrote**, and a
+PF reset did not clear them. The datasheet gives `PF_ATQLEN` an `Init` of `0x0`,
+so "init" there means power-on and not PFR.
+
+Two things follow for the rest of this step:
+
+* **The admin queue setup cannot assume a clean slate.** Something already owns
+  these rings -- plausibly the platform, since this NIC is a LOM the firmware
+  uses for its own purposes -- and enabling them means taking them over rather
+  than starting them. Writing base addresses under a firmware-configured queue
+  is how a machine's management path stops working.
+* **A reset is not enough to take the device.** The `ATQENABLE` bit is cleared by
+  PFR per the datasheet, but the length is not, and neither is whatever firmware
+  put in the rings. Step 3's second half has to read the enable bits and decide,
+  not assume.
+
+Three defects were found getting here, each by a different mechanism, and none of
+them by reading the code again:
+
+* matching *any* non-virtio Ethernet function ran an i40e reset against the
+  shell lane's e1000e -- caught by `make test`, before hardware;
+* mapping one page of a BAR whose registers reach `0x92400` -- caught by the
+  fault handler printing `cr2`, which named the address and therefore the bug;
+* verifying a window against every bus rather than its own -- caught by a check
+  that rejected correct work.
+
 ### Step 4 — one receive queue
 
 A single receive queue pair: descriptor ring in memory the domain owns, buffers
