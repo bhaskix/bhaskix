@@ -631,7 +631,24 @@ asm_budget = 10
 # invalidation it goes on believing the device has none and drops every request
 # it makes, with the entry sitting correct in memory. Unavoidable, and identical
 # to the four already in this file.
-unsafe_budget = 1995
+#
+# 1997 on 2026-09-06: two lines for the whole X722 bring-up module -- the
+# `read_volatile` and `write_volatile` in `i40e.rs`. A driver is MMIO and MMIO
+# is unsafe, so the question was never whether to pay but how much: the first
+# version cost **twenty-three**, because each driver step wrapped its own
+# `unsafe` block and `enable_admin_queues` wrapped ten writes in one.
+#
+# Moving the invariant onto `Device::new` -- which is `unsafe` and says what it
+# requires -- makes every method below it safe, and leaves the unsafe as the two
+# accesses that genuinely are. That is better design as well as a smaller
+# number, and the budget gate is what asked for it, twice in two days.
+#
+# 1998 on 2026-09-06: one line for the `i40e::Device::new` call that wires the
+# bring-up in. That is the constructor whose invariant the whole module rests
+# on -- a device mapping of this function BAR0, never unmapped, nothing else
+# driving it -- so the line asserting it is exactly where the unsafe belongs,
+# and the module below it stays safe.
+unsafe_budget = 1998
 # Up thirty-one for RFC 0005 step 9's socket probe -- `ring3_socketeer`, which
 # is `ring3_lister` with a `sockaddr_in6` copied in beside its code instead of
 # two filenames. The same two blocks every hosted probe has: one

@@ -39,6 +39,7 @@ pub mod font;
 pub mod framebuffer;
 pub mod frames;
 pub mod heap;
+pub mod i40e;
 pub mod input;
 pub mod iommu;
 pub mod ipc;
@@ -12471,18 +12472,27 @@ pub fn start_block_domain(
     Ok(())
 }
 
-/// The first Ethernet function that is not virtio — RFC 0072 step 2.
+/// The first X722 on the bus — RFC 0072 steps 2 and 3.
 ///
-/// Virtio is excluded because `bin/netd` owns it and the test lanes have nothing
-/// else, so this finds **nothing on QEMU and four functions on the SR550**,
-/// where step 1 measured them: `8086:37d1` at `b1:00.0` through `b1:00.3`,
-/// class 02.00, each advertising MSI-X.
+/// **By exact identifier, and that was learned the hard way.** The first version
+/// matched any Ethernet function that was not virtio, reasoning that the lanes
+/// have nothing else. The shell lane has an Intel e1000e -- `8086:10d3`, class
+/// 02.00 -- so this claimed it, delegated its registers, and then ran an **i40e
+/// reset on an entirely different device**: X722 offsets written into an e1000e,
+/// then a million spins waiting for a bit that could never clear there. `make
+/// test` caught it before any hardware did.
+///
+/// A driver may only touch a device it can name. `8086:37d1` is what step 1
+/// measured on the SR550 for all four ports, and it is the identifier
+/// `iommu::claimed` uses to keep that device out of pass-through. **The two must
+/// agree**: containing one device and driving another is a defect that would
+/// present as hardware misbehaving.
 fn find_foreign_nic() -> Option<(bhaskix_arch::pci::Address, bhaskix_arch::pci::Identity)> {
-    const ETHERNET: u8 = 0x02;
-    const VIRTIO: u16 = 0x1af4;
+    const INTEL: u16 = 0x8086;
+    const X722: u16 = 0x37d1;
     let mut found = None;
     let mut each = |address: bhaskix_arch::pci::Address, identity: bhaskix_arch::pci::Identity| {
-        if identity.class == ETHERNET && identity.subclass == 0 && identity.vendor != VIRTIO {
+        if identity.vendor == INTEL && identity.device == X722 {
             found = Some((address, identity));
             return false;
         }
@@ -12507,7 +12517,7 @@ fn find_foreign_nic() -> Option<(bhaskix_arch::pci::Address, bhaskix_arch::pci::
 /// nothing on.
 ///
 /// Inert where there is no such device, which is every lane in QEMU.
-fn start_nic_domain() -> Result<(), &'static str> {
+fn start_nic_domain(hhdm: u64) -> Result<(), &'static str> {
     let Some((address, identity)) = find_foreign_nic() else {
         return Ok(());
     };
@@ -12580,6 +12590,40 @@ fn start_nic_domain() -> Result<(), &'static str> {
         registers,
         if sixty_four { 64 } else { 32 }
     );
+    // **RFC 0072 step 3, the first half: ask the device to reset.**
+    //
+    // Done here because this is where the register window's address is known
+    // and the device has just been contained -- and done *after* the window is
+    // granted, so a reset happens to a device something is already translating
+    // for rather than to one that is not.
+    //
+    // The bound is spins rather than time because this runs before any clock a
+    // driver could park on, and a device that never clears `PFSWR` is one that
+    // is not answering; that must be said rather than hang the boot. A million
+    // spins is generous for a reset the datasheet describes as microseconds of
+    // work, and cheap to be wrong about in the direction of waiting.
+    if let Some(mapped) = mmio::map(registers & !0xfff, 0x1000, hhdm) {
+        // SAFETY: `mmio::map` returned a device mapping of this function's
+        // BAR0, it is never unmapped, and nothing else drives this device --
+        // `bin/netd` drives virtio and `claimed` kept this one out of
+        // pass-through precisely so that this kernel owns it.
+        let nic = unsafe { i40e::Device::new(mapped) };
+        if nic.reset(1_000_000) {
+            let (transmit, receive) = nic.admin_queue_lengths();
+            println!(
+                "    nic reset      the device completed a PF reset; admin queues read {transmit} \
+                 and {receive} descriptor(s)"
+            );
+        } else {
+            println!(
+                "\x1b[91m    nic reset      FAILED: PFSWR never cleared, so the device did not \
+                 finish a reset\x1b[0m"
+            );
+        }
+    } else {
+        println!("    nic reset      the register window would not map; no reset attempted");
+    }
+
     if contained {
         println!("    nic domain     dma window granted; this NIC translates through its own");
     } else {
@@ -19202,7 +19246,7 @@ fn user_shell(handoff: &Handoff) -> Result<(), &'static str> {
     // a different class: find the device, hand its register window to a domain,
     // and ask the IOMMU to contain it. Silent on every lane in QEMU, where the
     // only class 02 device is virtio and `bin/netd` owns it.
-    if let Err(reason) = start_nic_domain() {
+    if let Err(reason) = start_nic_domain(hhdm) {
         println!("\x1b[91m    nic domain     FAILED: {reason}\x1b[0m");
     }
     if let Err(reason) = start_ahci_domain(cpu, hhdm) {
