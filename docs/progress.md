@@ -11,7 +11,7 @@
 | | |
 |---|---|
 | RFCs accepted | **46** |
-| RFCs open | 22 |
+| RFCs open | 23 |
 | RFCs closed without shipping | 1 |
 | Milestone rows done | **92 of 95** |
 | Phase 2 bullets done | **12 of 13** |
@@ -53,6 +53,7 @@ gantt
     RFC 0044 Revocation that reaches the mapping :active, r0044, 2026-08-23, 2026-09-05
     RFC 0045 One adapter per workload and the three failures... :active, r0045, 2026-08-23, 2026-09-05
     RFC 0053 input a domain was given :done, r0053, 2026-08-27, 1d
+    RFC 0070 a badge that can never ring is refused where it... :active, r0070, 2026-09-05, 2026-09-05
     section Networking
     RFC 0018 A network stack outside the kernel and a socket... :done, r0018, 2026-08-12, 2026-08-13
     RFC 0020 TCP as a state machine that can be tested... :done, r0020, 2026-08-14, 2026-08-16
@@ -169,6 +170,7 @@ gantt
 | 0067 | more than one block per round trip | 2026-09-02 |
 | 0068 | a disk that can hold BusyBox | 2026-09-04 |
 | 0069 | a format that need not hold the filesystem | 2026-09-04 |
+| 0070 | a badge that can never ring is refused where it is committed | 2026-09-05 |
 
 ## Annexes
 
