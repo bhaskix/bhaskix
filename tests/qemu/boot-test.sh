@@ -2592,9 +2592,27 @@ rm -f "$INBOUND_VERDICT" 2>/dev/null || true
 # the echo *and* reports at least one reclaim is a boot where the wedge was
 # created and undone, which is the property. A served echo alone would also
 # pass on a boot where the prober's connections never reached the guest.
+# **What the driver opened, printed beside what the guest saw.**
+#
+# The harness has counted its own attempts since this gate was written and has
+# never said the number out loud, so every reading of `tcpd offered` has been
+# against an unknown denominator -- which is why §3 spent four days deciding
+# whether "6 offered, 5 accepted" was a defect. One line makes the comparison
+# possible: attempts are what the host tried, `offered` is what reached the
+# guest and was answered, `cookies` is what came home.
+#
+# Printed always, not only on failure. A number that appears only when something
+# breaks cannot establish what normal looks like, and this row's whole problem
+# was not knowing that.
+wedge_made="$(cat "$WEDGE_ATTEMPTS" 2>/dev/null || echo 0)"
+wedge_seen="$(grep -aoE "tcpd offered +[0-9]+" "$LOG" | grep -oE "[0-9]+$" | head -1)"
+wedge_home="$(grep -aoE "of which [0-9]+ came home" "$LOG" | grep -oE "[0-9]+" | head -1)"
+printf '      inbound: host opened %s, guest answered %s, %s completed\n' \
+    "$wedge_made" "${wedge_seen:-?}" "${wedge_home:-?}"
+
 if grep -qE "no network this machine can drive" "$LOG"; then
     pass "wedge probe skipped: this machine has no network"
-elif [[ "$(cat "$WEDGE_ATTEMPTS" 2>/dev/null || echo 0)" == "0" ]]; then
+elif [[ "$wedge_made" == "0" ]]; then
     pass "wedge probe never opened a connection: nothing to conclude (see the inbound gate above)"
 # **The property, not a proxy for it.** This demanded `reclaim >= 1` and failed
 # with "the accepted slot is held by a connection" -- a cause it never measured.
