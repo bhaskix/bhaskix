@@ -63,12 +63,32 @@ const PF_ARQT: u64 = 0x0008_0480;
 /// `PF_ATQLEN.ATQENABLE` / `PF_ARQLEN.ARQENABLE`, bit 31.
 const QUEUE_ENABLE: u32 = 1 << 31;
 
+/// One admin queue descriptor, in bytes -- Table 38-339, *Admin Queue
+/// Descriptor Structure (in LE 32 Order)*.
+///
+/// Eight 32-bit words: opcode and flags, return value and data length, cookie
+/// high and low, `Param0` and `Param1`, and the data address split high and
+/// low. Read off the table rather than inferred, because the text extraction of
+/// that page renders a bit-field diagram as a column of loose digits and an
+/// inferred size would have been a guess dressed as a citation.
+pub const DESCRIPTOR_BYTES: u64 = 32;
+
 /// How many descriptors each admin ring holds.
 ///
 /// The datasheet allows up to 1024. Thirty-two is chosen because this step asks
 /// the device a handful of questions and never queues more than one at a time,
 /// and a ring is a page's worth of memory the domain has to lend either way.
 pub const RING_DESCRIPTORS: u32 = 32;
+
+/// Bytes one admin ring occupies.
+pub const RING_BYTES: u64 = DESCRIPTOR_BYTES * RING_DESCRIPTORS as u64;
+
+/// Where the receive ring sits in the page holding both.
+///
+/// Both rings fit one 4 KiB page -- 1 KiB each -- and sharing a page keeps this
+/// to a single object to create, map and revoke. The transmit ring is at offset
+/// zero and the receive ring follows it.
+pub const RECEIVE_RING_OFFSET: u64 = RING_BYTES;
 
 /// One mapped X722 function, far enough along to be asked questions.
 pub struct Device {

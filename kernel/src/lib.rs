@@ -12472,6 +12472,31 @@ pub fn start_block_domain(
     Ok(())
 }
 
+/// A page for the admin rings, mapped where the device can reach it.
+///
+/// Returns the **device** addresses of the transmit and receive rings, which is
+/// what `PF_ATQBAL` and `PF_ARQBAL` want. They are not physical addresses: this
+/// NIC translates through the IOMMU domain RFC 0072 step 2 gave it, so a
+/// physical address here would name a page the device cannot reach and the
+/// failure would be silence rather than a fault.
+///
+/// One page holds both rings -- 1 KiB each at 32 descriptors of 32 bytes -- so
+/// there is one object to create, map and revoke rather than two.
+fn admin_ring_address(device: (u8, u8, u8), hhdm: u64) -> Option<(u64, u64)> {
+    let owner = domain::create("nic-rings", domain::ResourceEnvelope::new()).ok()?;
+    let rings = shared::create(owner, bhaskix_mm::FRAME_SIZE).ok()?;
+    let base = iommu::map_memory(
+        device,
+        rings,
+        bhaskix_arch::vtd::Rights::READ_WRITE,
+        false,
+        hhdm,
+        owner.as_u32(),
+    )?;
+    let transmit = base.as_u64();
+    Some((transmit, transmit + i40e::RECEIVE_RING_OFFSET))
+}
+
 /// The first X722 on the bus — RFC 0072 steps 2 and 3.
 ///
 /// **By exact identifier, and that was learned the hard way.** The first version
@@ -12635,6 +12660,40 @@ fn start_nic_domain(hhdm: u64) -> Result<(), &'static str> {
             // it. Taking queues away from firmware is a decision to make
             // deliberately, with the console that would be lost if it is wrong.
             let held = nic.admin_queues_enabled();
+            // **Take the queues, now that a boot has shown they are free.**
+            //
+            // Measured 2026-09-06: a PF reset clears `ATQENABLE` and
+            // `ARQENABLE` while the length fields keep firmware's 32, and the
+            // machine's console survived that -- which is why this is written
+            // as a takeover rather than an initialisation, and why it was worth
+            // a boot to find out before writing it.
+            //
+            // The length is written explicitly for the same reason. Firmware's
+            // 32 survives the reset, so setting an enable bit without setting a
+            // length would enable a ring at somebody else's size, and the
+            // register would read back plausible either way.
+            if !held {
+                match admin_ring_address(delegated, hhdm) {
+                    Some((transmit, receive)) => {
+                        nic.enable_admin_queues(transmit, receive);
+                        let taken = nic.admin_queues_enabled();
+                        let (after, _) = nic.admin_queue_lengths();
+                        println!(
+                            "    nic admin      rings at {transmit:#x} and {receive:#x}; {}",
+                            if taken {
+                                "both queues enabled and read back"
+                            } else {
+                                "the enable bits did not read back"
+                            }
+                        );
+                        let _ = after;
+                    }
+                    None => println!(
+                        "\x1b[93m    nic admin      no ring memory the device can reach; queues \
+                         left disabled\x1b[0m"
+                    ),
+                }
+            }
             println!(
                 "    nic reset      the device completed a PF reset; admin queues read {transmit} \
                  and {receive} descriptor(s), {}",
