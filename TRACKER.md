@@ -958,9 +958,9 @@ the distinction is in the table rather than in somebody's head.
 
 Newest first. One entry per meaningful change of project state.
 
-### 2026-09-06 (a receive queue on real hardware, and the frame that did not come)
+### 2026-09-06 (a receive queue on real hardware, and where the frames actually go)
 
-Three boots of the SR550, RFC 0072 step 4. **The step's gate is not met**: a frame did not arrive,
+Four boots of the SR550, RFC 0072 step 4. **The step's gate is not met**: a frame did not arrive,
 and that is the sentence to keep. What did happen is everything up to it.
 
 The first boot asked and wrote nothing. It answered five things the code would otherwise have
@@ -1010,16 +1010,32 @@ ran ahead fits; four lost completions do not.
 boot is the long-known xHCI read of `0xaa95f000`; the NIC caused none), and a frame landing at an
 index nobody watched (all sixteen scanned).
 
-What is left is one question: **does this port receive anything at all?** Nothing yet has asked the
-device how many frames its *port* has seen as opposed to how many reached this queue. The next
-instrument is read-only and is the statistics counters — 38.30's own initialisation flow reads them
-all at start-up as a baseline, and `GLV_REPC` counts frames a VSI dropped for exceeding `RXMAX`.
-Port counters moving with an empty queue means steering or filtering; port counters at zero means
-nothing is being sent here, the driver may be right as written, and the gate needs a frame this
-machine provokes — which is step 5, and would fold the two steps into one.
+**A fourth boot added the port statistics and answered it: the port receives, this queue does not.**
+Four frames entered port 0 during the same sixty-second window and none reached the ring, with
+`GLPRT_RDPC` at zero — so they were taken in cleanly and went somewhere that is not here. The
+quiet-wire reading is dead.
 
-No fourth boot was taken. Three reboots of a live cluster node in a morning is enough, and the
-counters are a change to make deliberately.
+**The traffic's shape is the part that matters.** Since power-on this port has seen **21 packets and
+every one was multicast** — not one unicast frame, not one broadcast, ever; four in sixty seconds at
+about 151 bytes each. That is switch control traffic on a segment where no hosts are talking, and it
+makes the leading explanation one in which **this driver is not at fault**: reserved multicast
+destinations such as spanning tree at `01:80:C2:00:00:00` and LLDP at `01:80:C2:00:00:0E` are
+consumed by a bridge rather than forwarded to a host, and this port's internal switch is a bridge. A
+correct driver would see nothing on this wire forever. The alternative is still live — the
+promiscuous setting not taking, or this VSI not being the default for unmatched traffic — and the
+report's verdict line covers both by saying "steering or filtering" without calling it a bug.
+
+**So the queue cannot be proven by waiting; it has to be provoked**, because nothing on this segment
+is addressed to this machine. Cheapest first: ask for the VSI's true statistics index (the `0
+packets` above is read at the VSI's *number* and the datasheet assigns the set at Add VSI, so it is
+an assumption); set the Default VSI flag; and then **step 5**, which this result promotes ahead of
+finishing step 4 — an ARP out of this port draws a reply addressed to this port's own MAC, and a
+unicast frame aimed at us is the one thing this segment has never carried.
+
+Four boots have established, none of it testable in QEMU: the device resets, answers commands,
+reports link and switch, hands over its queue allocation, runs a queue context this kernel wrote
+through the host memory cache, prefetches from a ring this kernel posted, and counts what its port
+receives. One step is unproven — a frame crossing from the port into the queue.
 
 **The negative arm is inside every one of these boots**, which the testing plan asks for: with
 everything in place but the enable, descriptor zero was watched for 100 ms and stayed untouched. So

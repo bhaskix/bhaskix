@@ -634,6 +634,77 @@ No further boot was taken. Three reboots of a live cluster node in a morning is
 enough, and the statistics reading is a change worth making deliberately rather
 than at the end of a session.
 
+#### The counters answer it: the port receives, the queue does not — 2026-09-06
+
+The statistics registers were added and a fourth boot read them either side of
+the same sixty-second window:
+
+    nic stats      port 0 baseline: 21 packet(s) received since power-on (0 unicast, 21 multicast, 0 broadcast), 0 discarded
+    nic rx frame   FAILED: no frame in 60 s with the queue enabled and the link up
+    nic rx ring    none of the 16 posted descriptors completed, so the ring is untouched rather than filled elsewhere
+    nic stats      port 0 over the window: 4 packet(s) (0 unicast, 4 multicast, 0 broadcast), 606 octet(s), 0 discarded
+    nic stats      VSI 19 over the window (index assumed to be the VSI number): 0 packet(s), 0 discarded
+    nic stats      the port saw traffic and this queue got none -- steering or filtering, not a quiet wire
+
+**The quiet-wire reading is dead.** Four frames entered this port during the
+window and none reached the queue. `GLPRT_RDPC` is zero, so the port did not
+discard them either -- they were received cleanly and went somewhere that is
+not here.
+
+**And the traffic has a shape worth reading carefully.** Since power-on this
+port has seen **21 packets, every one of them multicast** -- not a single
+unicast frame and not a single broadcast, ever. Four arrived in sixty seconds,
+averaging 151 bytes. That is the signature of switch control traffic on a
+segment with no hosts conversing: spanning-tree and discovery frames at a few
+per minute, and nothing else at all.
+
+**Which makes the leading explanation one where this driver is not at fault**,
+and it deserves to be stated before anybody hunts a bug:
+
+* **The frames may be ones no host VSI is ever given.** Reserved multicast
+  destinations -- spanning tree at `01:80:C2:00:00:00`, LLDP at
+  `01:80:C2:00:00:0E` -- are consumed by a bridge rather than forwarded, and
+  this port's internal switch is a bridge. If the only frames arriving are
+  exactly the class that never reaches a host, a perfectly correct driver sees
+  nothing, forever, on this wire.
+* **Or the steering really is wrong**: the promiscuous setting did not take
+  effect, this VSI is not the default VSI for unmatched traffic, or the VSI's
+  queue mapping is not what `VSILAN_QBASE` implied.
+
+The boot report's own verdict line says *"steering or filtering"*, and that is
+accurate for both readings -- the frames are being steered away from this queue.
+What it does not say, and what this section does, is that being steered away may
+be the **correct** behaviour for the only frames this segment carries.
+
+**So the queue cannot be proven by waiting; it has to be provoked.** Nothing on
+this wire is addressed to this machine, so no amount of listening will produce a
+frame that is. The tests that would settle it, cheapest first:
+
+1. **Ask for the VSI's real statistics index.** The `0 packets` above is read at
+   the VSI's *number*, and the datasheet assigns a statistics set when a VSI is
+   added -- firmware added this one. Get VSI Parameters returns the true index
+   and turns that line from an assumption into a measurement.
+2. **Make this VSI the default VSI**, Table 38-253's flag 3: *"accept packets
+   within the switch ID not matching any specific address to this VSI"*. If
+   frames are being dropped for matching no filter, this is the one bit that
+   changes it.
+3. **Send something and make the wire answer.** That is step 5, and this result
+   argues for doing it *before* finishing step 4 rather than after: an ARP
+   request out of this port draws a reply addressed to this port's own MAC, and
+   a unicast frame aimed at us is the one thing this segment has never carried.
+
+**Step 4's gate stays open, and step 5 is now the way to close it.** That is a
+change to this RFC's order and it is made on evidence: the receive path is built
+and the device is running it, and the only thing missing is a frame that was
+meant for this machine.
+
+**What four boots have established, and none of it was testable in QEMU:** the
+device resets, answers commands, reports its link and its switch, hands over its
+queue allocation, runs a queue context this kernel wrote through the host memory
+cache, prefetches from a ring this kernel posted, and counts what its port
+receives. What is unproven is one step: a frame crossing from the port into the
+queue.
+
 
 ### Step 5 — one transmit queue
 
