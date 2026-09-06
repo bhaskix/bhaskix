@@ -345,6 +345,20 @@ were read as PDF pages because their text extraction is a column of loose digits
 RFC 0071's licence question never had to be answered, because no licensed code
 was read.
 
+**Corrected 2026-09-06, the same day: the gate has two halves and the section
+above read only one.** Step 3's gate says *"the firmware version and the link
+state the device reports"*. The version was read; the link state was not, and the
+step was called complete on the version alone. The next boot asked, with
+`Get Link Status` (Table 38-63):
+
+    nic link       UP at 1000 Mb/s over 1000BASE-T; media available, signal detected; max frame 9728
+
+So the gate is met in full now, and the half that was missing turns out to be the
+one step 4 cannot do without: a receive queue on a port with no link is a queue
+that never fills, and this port has link, cable and signal. Recorded here rather
+than silently folded into the paragraph above, because the claim was made and a
+reader of the history should see that it was made early.
+
 ## What step 3 cost, and what found each fault
 
 Four defects, none of them found by re-reading the code:
@@ -400,6 +414,66 @@ a comment twice and faulted twice on this machine: first at `PFGEN_CTRL`
 whose comment claimed room it did not have. `REGISTER_WINDOW_BYTES` lives beside
 the offsets now, with assertions that fail the build if any named register falls
 outside it.
+
+#### What step 4 asked before writing anything, 2026-09-06
+
+One boot, every line a question, nothing written to the device that step 3 had
+not already written. The answers are what the queue's programming is computed
+from:
+
+    nic link       UP at 1000 Mb/s over 1000BASE-T; media available, signal detected; max frame 9728
+    nic switch     1 element(s) reported of 1 in the switch
+                   VSI  seid 0x018c  uplink 0x0002  downlink 0x0010  connection 1  number 19
+                   VSI 19 starts at PF queue 0
+    nic queues     this PF owns absolute queues 0..=383, 384 pair(s); PXE mode still set
+    nic fpm        function 0: segment descriptors 0..+16 at 2 MB each; object sizes tx 2^7 rx 2^5 bytes; queue max 1536
+    nic fpm        LAN registers as left: tx base 0 count 0, rx base 0 count 0 -- bases in 512-byte units, and this driver's to write
+    nic rx queue   absolute queue 0 reads QENA_REQ=0 QENA_STAT=0 -- off, and free to take
+    nic hmc        no error recorded
+
+Five facts, each of which the code would otherwise have had to assume:
+
+* **The port is live** -- link, media and signal, at 1 Gb/s on copper. A frame
+  can arrive.
+* **Frames are steered to VSI 19, SEID `0x18c`, and its queues start at this
+  PF's queue 0.** A received frame reaches a *VSI* first and the VSI's
+  `VSILAN_QBASE` says which queue; a driver that took queue 0 without asking
+  would have been right here by luck. The Set VSI Promiscuous Modes command,
+  which is how the datasheet says broadcast is forwarded, wants the SEID.
+* **This PF's first absolute queue is 0**, so its queue 0 and the device's queue
+  0 are the same queue, and `QRX_ENA[0]` was the right register to have read.
+  On the other three functions that will not be so, which is why the number is
+  read from `PFLAN_QALLOC` and not assumed.
+* **The device is still in PXE mode** -- the flag a core reset sets and only the
+  Clear PXE Mode command clears. It changes the queue-length rule (a multiple of
+  32 outside it) and the tail granularity (eight descriptors), so it is cleared
+  first.
+* **The four LAN private-memory registers read zero, and they are software's to
+  write.** The uncommitted first draft of this reading called `GLHMC_LANRXBASE`
+  and `GLHMC_LANRXCNT` read-only and firmware-assigned, on the strength of the
+  register heading, which says RO. The field tables say RW, and 38.26.3.1 says
+  in words: *"Host software is responsible for setting up the GLHMC_{object}CNT
+  and GLHMC_{object}BASE registers for LAN objects."* The prose corrected the
+  code before any boot had to, and the zeros confirm it. `GLHMC_SDPART` -- the
+  segment descriptor range -- is the one that really is firmware's, and this
+  function has sixteen segments, 32 MB of private memory space, of which one
+  page will be backed.
+
+**Two things this boot did not do.** It did not print a frame -- that is the
+gate, and it needs everything the next increment builds. And it did not verify
+Table 38-419's two ambiguities on hardware; they were settled by the datasheet's
+own worked example instead. The table gives the ring base *"in 12-byte units"*
+while its example only decodes to a page-aligned address in 128-byte units; and
+the example sets a bit the table calls reserved. The encoder reproduces the
+example bit for bit under host test, and the hardware boot is what will say
+whether the example was right.
+
+**What the boot cost to read: one general command path.** `Get Version` had been
+a one-off with the descriptor bytes poked by hand; a second command was the
+moment the commit message said to build a typed descriptor, and it was built --
+eight words, Table 38-340's byte numbering, a ring position that advances, and
+a buffer flag for the one indirect command here. The unsafe line count went
+*down* by one.
 
 
 ### Step 5 — one transmit queue
