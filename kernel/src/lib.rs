@@ -12482,7 +12482,7 @@ pub fn start_block_domain(
 ///
 /// One page holds both rings -- 1 KiB each at 32 descriptors of 32 bytes -- so
 /// there is one object to create, map and revoke rather than two.
-fn admin_ring_address(device: (u8, u8, u8), hhdm: u64) -> Option<(u64, u64)> {
+fn admin_ring_address(device: (u8, u8, u8), hhdm: u64) -> Option<(u64, u64, u64)> {
     let owner = domain::create("nic-rings", domain::ResourceEnvelope::new()).ok()?;
     let rings = shared::create(owner, bhaskix_mm::FRAME_SIZE).ok()?;
     let base = iommu::map_memory(
@@ -12493,8 +12493,21 @@ fn admin_ring_address(device: (u8, u8, u8), hhdm: u64) -> Option<(u64, u64)> {
         hhdm,
         owner.as_u32(),
     )?;
+    // **Two addresses for one page, and they are not the same number.** The
+    // device reaches the ring at what `map_memory` returned, through the
+    // translation step 2 gave it; this kernel writes descriptors into it
+    // through the direct map. Confusing the two is a driver that programs a
+    // device correctly and then writes its commands somewhere else.
+    let (frames, count) = shared::frames_of(rings)?;
+    if count == 0 {
+        return None;
+    }
     let transmit = base.as_u64();
-    Some((transmit, transmit + i40e::RECEIVE_RING_OFFSET))
+    Some((
+        transmit,
+        transmit + i40e::RECEIVE_RING_OFFSET,
+        hhdm + frames[0],
+    ))
 }
 
 /// The first X722 on the bus — RFC 0072 steps 2 and 3.
@@ -12660,6 +12673,15 @@ fn start_nic_domain(hhdm: u64) -> Result<(), &'static str> {
             // it. Taking queues away from firmware is a decision to make
             // deliberately, with the console that would be lost if it is wrong.
             let held = nic.admin_queues_enabled();
+            println!(
+                "    nic reset      the device completed a PF reset; admin queues read {transmit} \
+                 and {receive} descriptor(s), {}",
+                if held {
+                    "and are still enabled -- firmware holds them"
+                } else {
+                    "and are disabled -- the reset released them"
+                }
+            );
             // **Take the queues, now that a boot has shown they are free.**
             //
             // Measured 2026-09-06: a PF reset clears `ATQENABLE` and
@@ -12674,10 +12696,9 @@ fn start_nic_domain(hhdm: u64) -> Result<(), &'static str> {
             // register would read back plausible either way.
             if !held {
                 match admin_ring_address(delegated, hhdm) {
-                    Some((transmit, receive)) => {
+                    Some((transmit, receive, host)) => {
                         nic.enable_admin_queues(transmit, receive);
                         let taken = nic.admin_queues_enabled();
-                        let (after, _) = nic.admin_queue_lengths();
                         println!(
                             "    nic admin      rings at {transmit:#x} and {receive:#x}; {}",
                             if taken {
@@ -12686,7 +12707,27 @@ fn start_nic_domain(hhdm: u64) -> Result<(), &'static str> {
                                 "the enable bits did not read back"
                             }
                         );
-                        let _ = after;
+                        // **The first thing this driver asks that the device has
+                        // to answer.** Everything before it was a write the
+                        // hardware could accept in silence; a version that comes
+                        // back is firmware executing a command from a ring this
+                        // kernel placed, which is the whole of step 3.
+                        //
+                        if taken {
+                            // SAFETY: `host` is the direct-map address of the
+                            // ring just mapped and enabled -- writable, a page
+                            // long, and nothing else writes it.
+                            match unsafe { nic.get_version(host, 2_000_000) } {
+                                Some((major, minor)) => println!(
+                                    "    nic firmware   the device answered: firmware {major}.\
+                                     {minor}"
+                                ),
+                                None => println!(
+                                    "\x1b[93m    nic firmware   no answer to Get Version; the \
+                                     queue is enabled and firmware did not complete it\x1b[0m"
+                                ),
+                            }
+                        }
                     }
                     None => println!(
                         "\x1b[93m    nic admin      no ring memory the device can reach; queues \
@@ -12694,15 +12735,6 @@ fn start_nic_domain(hhdm: u64) -> Result<(), &'static str> {
                     ),
                 }
             }
-            println!(
-                "    nic reset      the device completed a PF reset; admin queues read {transmit} \
-                 and {receive} descriptor(s), {}",
-                if held {
-                    "and are still enabled -- firmware holds them"
-                } else {
-                    "and are disabled -- the reset released them"
-                }
-            );
         } else {
             println!(
                 "\x1b[91m    nic reset      FAILED: PFSWR never cleared, so the device did not \

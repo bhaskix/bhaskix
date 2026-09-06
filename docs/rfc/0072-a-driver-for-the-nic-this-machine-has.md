@@ -295,6 +295,30 @@ One thing it must **not** do is assume the length field is zero. Firmware's 32 i
 still there after the reset, so writing an enable bit without writing a length
 would enable a queue at somebody else's size.
 
+### Step 3 is done — the device has a command channel, 2026-09-06
+
+    nic reset      the device completed a PF reset; admin queues read 32 and 32
+                   descriptor(s), and are disabled -- the reset released them
+    nic admin      rings at 0x100000000 and 0x100000400; both queues enabled and read back
+
+The rings sit `0x400` apart, which is 1024 bytes -- 32 descriptors of the 32
+bytes Table 38-339 defines -- so the geometry taken off that table is right, and
+the device addresses are the ones `iommu::map_memory` returned rather than
+physical addresses this NIC could not have reached.
+
+**Both enable bits read back**, which is the part that distinguishes a configured
+queue from a write into a device that is not listening.
+
+No exception anywhere in the boot, and the console stayed up while the queues
+were taken from a LOM the platform uses -- the risk that was worth a boot to
+measure before writing this, and worth confirming again while doing it.
+
+What is *not* done is the rest of what this step's heading promises: a command
+has not been posted, so the firmware version and link state are still unread.
+That needs a descriptor written into the transmit ring and the tail advanced,
+which is the next increment and the first thing this driver will do that the
+device has to answer.
+
 ### Step 4 — one receive queue
 
 A single receive queue pair: descriptor ring in memory the domain owns, buffers

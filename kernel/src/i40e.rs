@@ -90,6 +90,28 @@ pub const RING_BYTES: u64 = DESCRIPTOR_BYTES * RING_DESCRIPTORS as u64;
 /// zero and the receive ring follows it.
 pub const RECEIVE_RING_OFFSET: u64 = RING_BYTES;
 
+/// `Get Version`, the opcode -- Table 38-353, *Get Version Command*.
+///
+/// The datasheet is emphatic about its place: *"This must be the first command
+/// that the software device driver issues before it can use the queue for other
+/// purposes."* Its `Datalen` is 0 -- *"no external response buffer"* -- so the
+/// answer comes back **in the descriptor**, which is why this needs no buffer
+/// mapped for the reply.
+const OPCODE_GET_VERSION: u16 = 0x0001;
+
+/// `Flags.DD`, byte 0 bit 0 -- Table 38-340: *"Set by firmware to mark entry
+/// done."* This is the completion test, and firmware is what sets it.
+const FLAG_DD: u16 = 1 << 0;
+/// `Flags.ERR`, byte 0 bit 2 -- *"Set by firmware to mark entry as an error
+/// indication."*
+const FLAG_ERR: u16 = 1 << 2;
+
+/// Where `Get Version`'s answer sits in the completed descriptor -- Table
+/// 38-353. Major at bytes 24-25 and minor at 26-27, which in a normal command
+/// descriptor are the data address; a command with no external buffer reuses
+/// them for its reply.
+const VERSION_MAJOR_AT: usize = 24;
+
 /// One mapped X722 function, far enough along to be asked questions.
 pub struct Device {
     /// The register window, through the direct map.
@@ -197,5 +219,60 @@ impl Device {
     #[must_use]
     pub fn admin_queue_lengths(&self) -> (u32, u32) {
         (self.read(PF_ATQLEN) & 0x3ff, self.read(PF_ARQLEN) & 0x3ff)
+    }
+
+    /// Posts `Get Version` and waits for firmware to answer it.
+    ///
+    /// `ring` is the transmit ring **as this kernel sees it** -- the direct-map
+    /// address of the same page the device reaches at its own address. Both are
+    /// needed and they are not the same number: the device was told where the
+    /// ring is in its own translation, and the descriptor has to be written
+    /// where the writer can reach it.
+    ///
+    /// Returns the firmware's major and minor version, or `None` if the
+    /// descriptor never came back done or came back flagged as an error.
+    ///
+    /// # Safety
+    ///
+    /// `ring` must be the transmit ring's direct-map address, mapped for
+    /// writing, at least [`RING_BYTES`] long, and the queues must be enabled.
+    pub unsafe fn get_version(&self, ring: u64, spins: u32) -> Option<(u16, u16)> {
+        // Descriptor zero, cleared first: firmware writes its answer over the
+        // command, and a stale `DD` from a previous owner would read as an
+        // answer that never came. Firmware left these rings configured, so this
+        // is not a hypothetical.
+        // SAFETY: per the caller -- a writable mapping of at least one
+        // descriptor, and nothing else is writing this ring.
+        unsafe {
+            core::ptr::write_bytes(ring as *mut u8, 0, DESCRIPTOR_BYTES as usize);
+            core::ptr::write_volatile((ring + 2) as *mut u16, OPCODE_GET_VERSION);
+        }
+
+        // The tail is what tells firmware a descriptor is there -- Table 38-341
+        // calls `ATQT` the pointer "software device driver updates". One
+        // descriptor posted, so the tail moves to one.
+        self.write(PF_ATQT, 1);
+
+        for _ in 0..spins {
+            // SAFETY: per the caller.
+            let flags = unsafe { core::ptr::read_volatile(ring as *const u16) };
+            if flags & FLAG_DD != 0 {
+                if flags & FLAG_ERR != 0 {
+                    return None;
+                }
+                // SAFETY: per the caller; the descriptor is complete.
+                let (major, minor) = unsafe {
+                    (
+                        core::ptr::read_volatile((ring + VERSION_MAJOR_AT as u64) as *const u16),
+                        core::ptr::read_volatile(
+                            (ring + VERSION_MAJOR_AT as u64 + 2) as *const u16,
+                        ),
+                    )
+                };
+                return Some((major, minor));
+            }
+            core::hint::spin_loop();
+        }
+        None
     }
 }

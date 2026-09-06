@@ -648,7 +648,19 @@ asm_budget = 10
 # on -- a device mapping of this function BAR0, never unmapped, nothing else
 # driving it -- so the line asserting it is exactly where the unsafe belongs,
 # and the module below it stays safe.
-unsafe_budget = 1998
+#
+# 2012 on 2026-09-06: fourteen lines for `get_version`, which is the first
+# command this driver posts. They are raw reads and writes of a descriptor ring
+# through the direct map, and there is no safe way to write bytes at an address
+# a device will fetch: clearing the descriptor, writing the opcode, polling the
+# `DD` flag firmware sets, and reading the version out of the completed entry.
+# Each block carries what it relies on.
+#
+# The alternative -- a typed descriptor mapped over the ring -- is worth having
+# when there is more than one command, and buys nothing while there is one. It
+# is noted so the next command is the moment to build it rather than to pay this
+# again.
+unsafe_budget = 2012
 # Up thirty-one for RFC 0005 step 9's socket probe -- `ring3_socketeer`, which
 # is `ring3_lister` with a `sockaddr_in6` copied in beside its code instead of
 # two filenames. The same two blocks every hosted probe has: one
