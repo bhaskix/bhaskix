@@ -12602,27 +12602,75 @@ fn ask_nic(nic: &mut i40e::Device, transmit: u64, host: u64) -> NicFacts {
                     element.connection,
                     element.number
                 );
-                if element.kind_name() == "VSI" {
-                    // The first VSI reported is the one a frame reaches; its
-                    // SEID is what the filter command wants.
-                    if vsi.is_none() {
-                        vsi = Some((element.seid, element.number));
-                    }
-                    match nic.vsi_queue_base(element.number) {
-                        Some((base, true)) => println!(
-                            "                   VSI {} takes a scattered queue set through \
-                             VSILAN_QTABLE; base field {base}",
-                            element.number
-                        ),
-                        Some((base, false)) => println!(
-                            "                   VSI {} starts at PF queue {base}",
-                            element.number
-                        ),
-                        None => println!(
-                            "                   VSI {} is outside the register file's range",
-                            element.number
-                        ),
-                    }
+                if element.kind_name() == "VSI" && vsi.is_none() {
+                    // **The number to index registers by is asked of firmware,
+                    // not taken from here.** This field and `Get VSI
+                    // Parameters` disagreed on the SR550 -- 19 against 12 --
+                    // and `VSILAN_QBASE` is indexed by the VSI *number*, so
+                    // reading it at the wrong one names the wrong queue and
+                    // the driver then waits on a queue nothing steers to.
+                    // That is not a hypothetical: it is what the first four
+                    // boots did.
+                    // SAFETY: `host` is the direct-map address of the admin
+                    // ring page, a page long and writable; the VSI buffer's
+                    // offset keeps it inside that page after the rings and the
+                    // switch buffer, which `i40e` asserts at compile time.
+                    let asked = unsafe {
+                        nic.vsi_parameters(
+                            element.seid,
+                            transmit + i40e::VSI_BUFFER_OFFSET,
+                            host + i40e::VSI_BUFFER_OFFSET,
+                            SPINS,
+                        )
+                    };
+                    let (number, queue_set) = match asked {
+                        Ok(parameters) => {
+                            println!(
+                                "                   seid {:#x} is VSI number {} (the element \
+                                 field says {}), queue set handle {:#x}",
+                                element.seid,
+                                parameters.number,
+                                element.number,
+                                parameters.queue_set
+                            );
+                            (parameters.number, parameters.queue_set)
+                        }
+                        Err(error) => {
+                            println!(
+                                "\x1b[93m                   Get VSI Parameters: {error}; falling \
+                                 back to the element's own number {}\x1b[0m",
+                                element.number
+                            );
+                            (element.number, 0)
+                        }
+                    };
+                    let (queue_base, scattered) = match nic.vsi_queue_base(number) {
+                        Some((base, true)) => {
+                            println!(
+                                "                   VSI {number} takes a scattered queue set \
+                                 through VSILAN_QTABLE; base field {base}"
+                            );
+                            (base, true)
+                        }
+                        Some((base, false)) => {
+                            println!("                   VSI {number} starts at PF queue {base}");
+                            (base, false)
+                        }
+                        None => {
+                            println!(
+                                "                   VSI {number} is outside the register file's \
+                                 range"
+                            );
+                            (0, false)
+                        }
+                    };
+                    vsi = Some(VsiFacts {
+                        seid: element.seid,
+                        number,
+                        queue_set,
+                        queue_base,
+                        scattered,
+                    });
                 }
             }
         }
@@ -12703,16 +12751,37 @@ fn ask_nic(nic: &mut i40e::Device, transmit: u64, host: u64) -> NicFacts {
     }
 }
 
+/// One VSI, as three different sources describe it.
+///
+/// **Three numbers, none interchangeable**, which is the shape of the defect
+/// the first four boots had: a SEID for the admin commands, a VSI *number* for
+/// the register file, and a queue base within the PF's space. The switch
+/// element carries a field that looks like the second and is not.
+#[derive(Clone, Copy, Debug)]
+struct VsiFacts {
+    /// The switch element id -- what `Set VSI Promiscuous Modes` and
+    /// `Get VSI Parameters` take.
+    seid: u16,
+    /// The VSI number from `Get VSI Parameters` -- what `VSILAN_QBASE` and the
+    /// per-VSI statistics are indexed by.
+    number: u16,
+    /// `QS_Handle 0`, the transmit context's `RDYList`.
+    queue_set: u16,
+    /// `VSILAN_QBASE.VSIBASE`: where this VSI's queues start **within the PF's
+    /// queue space**, so the absolute queue is this plus `PFLAN_QALLOC.FIRSTQ`.
+    queue_base: u16,
+    /// `VSILAN_QBASE.VSIQTABLE_ENA`: the VSI's queues are scattered through
+    /// `VSILAN_QTABLE` rather than contiguous from `queue_base`.
+    scattered: bool,
+}
+
 /// What [`ask_nic`] learned that the receive queue's programming depends on.
 #[derive(Clone, Copy, Debug, Default)]
 struct NicFacts {
     /// `Get Link Status` said the link is up.
     link_up: bool,
-    /// The first VSI the switch reported, as `(seid, number)`. The SEID is
-    /// what the admin commands take; the number is what `VSILAN_QBASE` and the
-    /// per-VSI statistics registers are indexed by. They are different values
-    /// and using one for the other is silent.
-    vsi: Option<(u16, u16)>,
+    /// The first VSI the switch reported, if one was.
+    vsi: Option<VsiFacts>,
     /// `PFLAN_QALLOC`'s first and last absolute queue, if valid.
     allocation: Option<(u16, u16)>,
 }
@@ -12842,9 +12911,12 @@ unsafe fn wait_for_first_frame(
 struct QueueTarget {
     /// The VSI's SEID -- what the admin commands take.
     vsi: u16,
-    /// The VSI's number -- what `VSILAN_QBASE` and the per-VSI statistics
-    /// registers are indexed by. Not the SEID.
+    /// The VSI's number, from `Get VSI Parameters` -- what `VSILAN_QBASE` and
+    /// the per-VSI statistics registers are indexed by. Not the SEID, and on
+    /// the SR550 not the switch element's own field either.
     vsi_number: u16,
+    /// The VSI's queue set handle, the transmit context's `RDYList`.
+    queue_set: u16,
     /// The absolute index of the queue taken.
     queue: u32,
     /// How many queues this PF owns, which sizes the private memory layout.
@@ -12902,10 +12974,6 @@ struct TransmitSetup {
     packet_device: u64,
     /// As above, through the direct map.
     packet_host: u64,
-    /// The admin ring page, so the VSI parameter buffer can be placed in it.
-    admin_device: u64,
-    /// As above, through the direct map.
-    admin_host: u64,
     /// Which port, for the MAC address and the counters.
     port: u32,
 }
@@ -12933,49 +13001,13 @@ fn send_frames(
     /// below 32.
     const DESCRIPTORS: u16 = 8;
 
-    // **The queue set, which cannot be invented.** A transmit context carries
-    // an `RDYList` naming the arbitration queue set, firmware owns that
-    // allocation, and it hands the value out as a VSI's `QS_Handle`. This is
-    // the first command in this driver that exists because a *number* was
-    // needed rather than a fact for the report.
-    // SAFETY: `admin_host` is the direct-map address of the admin ring page,
-    // a page long and writable; the VSI buffer's offset keeps it inside that
-    // page after the rings and the switch buffer, which `i40e` asserts at
-    // compile time; nothing else writes it.
-    let parameters = match unsafe {
-        nic.vsi_parameters(
-            target.vsi,
-            setup.admin_device + i40e::VSI_BUFFER_OFFSET,
-            setup.admin_host + i40e::VSI_BUFFER_OFFSET,
-            SPINS,
-        )
-    } {
-        Ok(parameters) => {
-            println!(
-                "    nic vsi        seid {:#x} is VSI number {}, queue set handle {:#x} -- \
-                 RDYList {}",
-                target.vsi,
-                parameters.number,
-                parameters.queue_set,
-                parameters.queue_set & 0x3ff
-            );
-            if parameters.number != target.vsi_number {
-                println!(
-                    "\x1b[93m                   the switch reported VSI number {} and this \
-                     reports {} -- the statistics index above was read at the switch's\x1b[0m",
-                    target.vsi_number, parameters.number
-                );
-            }
-            parameters
-        }
-        Err(error) => {
-            println!(
-                "\x1b[93m    nic vsi        Get VSI Parameters: {error}; without a queue set \
-                 handle no transmit context can be written\x1b[0m"
-            );
-            return false;
-        }
-    };
+    // The queue set handle was asked of firmware when the switch was walked;
+    // a transmit context's `RDYList` is that handle's low ten bits.
+    println!(
+        "    nic tx rdylist queue set handle {:#x} -- RDYList {}",
+        target.queue_set,
+        target.queue_set & 0x3ff
+    );
 
     let Some(mac) = nic.mac_address(setup.port) else {
         println!(
@@ -13010,7 +13042,7 @@ fn send_frames(
     let context = i40e::TransmitContext {
         ring: setup.ring_device,
         descriptors: DESCRIPTORS,
-        ready_list: parameters.queue_set & 0x3ff,
+        ready_list: target.queue_set & 0x3ff,
     };
     // SAFETY: `context_host` is the direct-map address of the zeroed backing
     // page just named; the offset is inside it; the queue is not enabled, so
@@ -13149,14 +13181,15 @@ fn bring_up_receive_queue(
     device: (u8, u8, u8),
     hhdm: u64,
     target: &QueueTarget,
-    admin: (u64, u64),
 ) {
     let &QueueTarget {
         vsi,
         vsi_number,
         queue,
         queues,
+        ..
     } = target;
+
     const SPINS: u32 = 2_000_000;
     /// `QLEN`: a whole multiple of 32 once PXE mode is off.
     const DESCRIPTORS: u16 = 32;
@@ -13215,8 +13248,6 @@ fn bring_up_receive_queue(
         ring_host: control_host[4],
         packet_device: control_device + 5 * FRAME,
         packet_host: control_host[5],
-        admin_device: admin.0,
-        admin_host: admin.1,
         port,
     };
 
@@ -13427,6 +13458,8 @@ fn bring_up_receive_queue(
                 if let Some(tag) = header.vlan {
                     println!("                   VLAN tag control {tag:#06x}");
                 }
+                // SAFETY: as the header read above.
+                unsafe { dump_frame(buffers_host[0], completion.length as usize) };
             }
             None => println!(
                 "\x1b[91m    nic rx frame   FAILED: no frame in 60 s with the queue enabled and \
@@ -13554,6 +13587,10 @@ fn bring_up_receive_queue(
                     MacAddress(header.destination),
                     MacAddress(header.source)
                 );
+                // SAFETY: as the header read above.
+                unsafe {
+                    dump_frame(buffers_host[index as usize], completion.length as usize);
+                }
             }
         }
     }
@@ -13618,6 +13655,39 @@ fn bring_up_receive_queue(
         println!(
             "\x1b[93m    nic filter     could not restore the VSI's filtering: {error}\x1b[0m"
         );
+    }
+}
+
+/// Prints the first bytes of a received frame as hex.
+///
+/// **The point is decoding it afterwards.** A frame that arrives on this port
+/// is most likely a switch's own control traffic, and its bytes name the
+/// switch: LLDP carries the neighbour's system name, port and management
+/// address as TLVs. Writing an LLDP parser into the kernel to learn one fact
+/// about one cable would be the wrong trade; printing the bytes and reading
+/// them off the log is the right one.
+///
+/// # Safety
+///
+/// `buffer_host` must be the direct-map address of a buffer hardware has
+/// finished writing, at least `bytes` long.
+unsafe fn dump_frame(buffer_host: u64, bytes: usize) {
+    const PER_LINE: usize = 16;
+    let bytes = bytes.min(128);
+    for offset in (0..bytes).step_by(PER_LINE) {
+        let mut line = [0u8; PER_LINE];
+        let take = PER_LINE.min(bytes - offset);
+        for (index, slot) in line.iter_mut().enumerate().take(take) {
+            // SAFETY: per the caller; `offset + index` is below `bytes`.
+            *slot = unsafe {
+                core::ptr::read_volatile((buffer_host + (offset + index) as u64) as *const u8)
+            };
+        }
+        print!("                   {offset:04x}  ");
+        for slot in line.iter().take(take) {
+            print!("{slot:02x} ");
+        }
+        println!();
     }
 }
 
@@ -13853,21 +13923,35 @@ fn start_nic_domain(hhdm: u64) -> Result<(), &'static str> {
                             // frame needs a live link to arrive on, a VSI to
                             // be steered through, and a queue this PF owns.
                             match (facts.link_up, facts.vsi, facts.allocation) {
-                                (true, Some((vsi, vsi_number)), Some((first, last))) => {
+                                (true, Some(facts), Some((first, last))) => {
+                                    // **The absolute queue a frame for this
+                                    // VSI would land in**, which is the PF's
+                                    // first plus the VSI's own base -- not the
+                                    // PF's first alone, which is what the
+                                    // earlier boots enabled and waited on.
+                                    let queue = u32::from(first) + u32::from(facts.queue_base);
+                                    if facts.scattered {
+                                        println!(
+                                            "\x1b[93m    nic rx queue   VSI {} scatters its \
+                                             queues through VSILAN_QTABLE, which this step does \
+                                             not read; taking its base anyway\x1b[0m",
+                                            facts.number
+                                        );
+                                    }
                                     bring_up_receive_queue(
                                         &mut nic,
                                         owner,
                                         delegated,
                                         hhdm,
                                         &QueueTarget {
-                                            vsi,
-                                            vsi_number,
-                                            queue: u32::from(first),
+                                            vsi: facts.seid,
+                                            vsi_number: facts.number,
+                                            queue_set: facts.queue_set,
+                                            queue,
                                             queues: u32::from(last)
                                                 .saturating_sub(u32::from(first))
                                                 + 1,
                                         },
-                                        (transmit, host),
                                     );
                                 }
                                 (false, _, _) => println!(

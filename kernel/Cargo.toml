@@ -697,7 +697,13 @@ asm_budget = 10
 # The frame itself is *not* laid out here: `bhaskix-net` builds it, so the
 # bytes on the wire come from the crate the network services already use and
 # its fuzz targets, not from a second definition in the kernel.
-unsafe_budget = 2065
+#
+# 2072 on 2026-09-06: seven lines for the hex dump of a received frame. A frame
+# arriving on this port is most likely a switch's own control traffic, whose
+# bytes name the switch -- LLDP carries the neighbour's system name and port as
+# TLVs. Printing the bytes and decoding them off the log beats writing an LLDP
+# parser into the kernel to learn one fact about one cable.
+unsafe_budget = 2072
 # Up thirty-one for RFC 0005 step 9's socket probe -- `ring3_socketeer`, which
 # is `ring3_lister` with a `sockaddr_in6` copied in beside its code instead of
 # two filenames. The same two blocks every hosted probe has: one
