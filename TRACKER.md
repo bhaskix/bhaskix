@@ -958,9 +958,9 @@ the distinction is in the table rather than in somebody's head.
 
 Newest first. One entry per meaningful change of project state.
 
-### 2026-09-06 (a receive queue on real hardware, and a frame that left it)
+### 2026-09-06 (a receive queue, a frame that left, and the VSI number that was wrong)
 
-Five boots of the SR550, RFC 0072 steps 4 and 5. **Step 4's gate is not met**: a frame did not arrive,
+Six boots of the SR550, RFC 0072 steps 4 and 5. **Step 4's gate is not met**: a frame did not arrive,
 and that is the sentence to keep. What did happen is everything up to it.
 
 The first boot asked and wrote nothing. It answered five things the code would otherwise have
@@ -1052,7 +1052,29 @@ untouched, and they are what the conclusion rested on. A frame addressed to the 
 went nowhere: descriptor completed, not counted out, not looped back — so proving both directions
 inside one machine is not available either.
 
-Five boots have established, none of it testable in QEMU: the device resets, answers commands,
+**A sixth boot corrected the VSI number and moved the fault a layer.** The switch element's field
+says VSI 19; `Get VSI Parameters` says **12** for the same SEID, and the per-VSI statistics are
+indexed by the number — so the earlier reading was taken at the wrong index. At the right one the
+VSI counter reads **4 packets over the window**, the same four the port took in. **The frames reach
+the VSI**; they stop between the VSI and the queue. The previous entry was right that the queue got
+none and wrong to leave the impression the VSI never saw them.
+
+**And the network the port sits on is narrowed to a third segment, with two ruled out.** The BMC's
+inventory names the function independently — onboard Intel X722 LOM, physical port 1, `NIC1`, MAC
+`08:94:EF:7A:FC:8E`, the same address the driver read from the NVM. It is **not** the management
+network: the BMC's own port reports `Dedicated` on `10.5.5.103/24` and does not share this LOM. It
+is **not** this workstation's segment: `tcpdump` on `10.17.17.0/24` watched for that MAC across the
+boot in which the machine transmitted a broadcast and saw nothing. The BMC exposes no LLDP or VLAN
+for the port. What is left is a segment carrying only control-plane multicast — 21 packets since
+power-on, every one multicast, no unicast and no broadcast ever — and naming it needs one of those
+frames read, which is why the boot report now dumps a received frame's bytes.
+
+**The counter that would settle the last gap does not exist in this datasheet.** *"Packets received
+to invalid queues are dropped and counted by the GLV_REPC counter"* — and `GLV_REPC` has three
+mentions in prose and no register definition in §38.39.2.16. A gap in the document rather than in
+the reading, recorded so the next person does not go looking for it.
+
+Six boots have established, none of it testable in QEMU: the device resets, answers commands,
 reports link and switch, hands over its queue allocation, runs a receive context this kernel wrote
 through the host memory cache, prefetches from a ring this kernel posted, counts what its port
 receives, and **puts a frame this kernel built onto the wire**. One step is unproven — a frame

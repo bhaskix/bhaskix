@@ -770,6 +770,69 @@ aimed at `08:94:ef:7a:fc:8e` from a machine on that segment -- which means
 finding out what that segment is, and is a question about cabling rather than
 about this driver.
 
+#### What network is that port on, and where the frames actually stop — 2026-09-06
+
+Two questions were asked of the machine rather than of the driver: which
+network this port is plugged into, and — once the VSI number was corrected —
+where the frames stop.
+
+**The port is identified beyond doubt, and two candidate networks are ruled
+out.** The BMC's own inventory names it independently of anything this driver
+reads:
+
+| | |
+|---|---|
+| adapter | `Intel X722 LOM (onboard)`, Redfish `ob-4` |
+| this function | physical port 1, `NIC1` |
+| MAC | `08:94:EF:7A:FC:8E` — the same address the driver read from the NVM |
+| link | up, 1 Gb/s, all four ports up |
+| addresses | none configured, by anything |
+
+* **Not the management network.** The BMC's interface reports
+  `InterfaceNicMode: "Dedicated"`, MAC `08:94:ef:7a:f4:bf` on `10.5.5.103/24`.
+  It does not share this LOM, so the X722 is not on the segment the console
+  arrives over.
+* **Not this workstation's segment.** `tcpdump` on `10.17.17.0/24` watched for
+  `08:94:ef:7a:fc:8e` across a whole boot -- the boot in which the machine
+  transmitted a broadcast ARP -- and saw **nothing**. The frame left the port's
+  MAC and did not arrive here, so the two are not in one broadcast domain.
+* **The BMC knows nothing more.** Its Redfish port records carry link speed and
+  MAC and no LLDP neighbour, no VLAN, no management address.
+
+**So the segment is a third one, and its traffic describes it.** Across five
+boots this port has taken in **21 packets, every one multicast**, at about four
+a minute and 151 bytes each -- and *no unicast and no broadcast, ever*. That is
+a switch port with no other host conversing on it, carrying only control-plane
+multicast. **Naming it needs one of those frames read**, which is why the hex
+dump was added: LLDP carries the neighbour's system name, port and management
+address as TLVs, and one captured frame would answer the question outright.
+
+**And correcting the VSI number moved the fault a whole layer.** The switch
+element's field says 19; `Get VSI Parameters` says **12** for the same SEID,
+and the per-VSI statistics are indexed by the number:
+
+    nic stats      port 0 over the window: 4 packet(s) (0 unicast, 4 multicast, 0 broadcast)
+    nic stats      VSI 12 over the window: 4 packet(s), 0 discarded
+    nic rx ring    none of the 16 posted descriptors completed
+
+At index 19 that middle line read `0`. At the right index it reads **4** -- the
+same four frames the port took in. **The frames reach the VSI.** They stop
+between the VSI and the queue, and the previous section's conclusion is
+corrected accordingly: it was right that the queue got none and wrong to leave
+the impression the VSI never saw them.
+
+**What that leaves, and the one counter that would settle it.** The VSI's queue
+base reads 0 and the queue enabled was 0, so the obvious mapping is right. Two
+readings remain: the VSI spreads frames across several queues by hash and only
+queue 0 is enabled, or the queue context is right in every field this driver
+checks and wrong in one it does not. The datasheet names the counter that
+distinguishes them -- *"packets received to invalid queues are dropped and
+counted by the GLV_REPC counter"* -- and **`GLV_REPC` has no register
+definition in this document**: three mentions in prose and no entry in
+38.39.2.16. That is a gap in the datasheet rather than in the reading, and it
+is written down because the obvious next instrument turns out not to exist
+here.
+
 #### The original step, for the record
 
 The other half. A frame this machine builds leaves the wire.
