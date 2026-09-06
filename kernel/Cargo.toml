@@ -714,7 +714,13 @@ asm_budget = 10
 # Copying the reply out of the buffer the device filled, so `bhaskix-net` can
 # parse it as an offer, is the only new raw access -- the DISCOVER itself is
 # built by that crate and merely written where the device fetches it.
-unsafe_budget = 2082
+#
+# 2087 on 2026-09-06: RFC 0073 step 1 routes slow protocols to a VSI with
+# `Add Control Packet Filter`, which is direct -- every field is in the
+# descriptor, so it needs no buffer and no raw write at all. The MAC-filter
+# attempt it replaces cost fourteen lines and an EINVAL from firmware; the
+# command stays in the driver for the unicast filters it is actually for.
+unsafe_budget = 2087
 # Up thirty-one for RFC 0005 step 9's socket probe -- `ring3_socketeer`, which
 # is `ring3_lister` with a `sockaddr_in6` copied in beside its code instead of
 # two filenames. The same two blocks every hosted probe has: one

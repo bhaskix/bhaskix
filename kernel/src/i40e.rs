@@ -502,6 +502,64 @@ const OPCODE_SET_VSI_PROMISCUOUS: u16 = 0x0254;
 const PROMISCUOUS_MULTICAST: u16 = 1 << 1;
 /// Table 38-253, modes bit 2: promiscuous broadcast.
 const PROMISCUOUS_BROADCAST: u16 = 1 << 2;
+/// `Add MAC, VLAN Pair` -- Table 38-237, opcode `0x0250`: *"used to add a set
+/// of MAC or MAC, VLAN pairs to a set of VSIs"*. Indirect, with one 16-byte
+/// entry per address.
+///
+/// **This is how an address a bridge would otherwise terminate is directed at
+/// a VSI.** RFC 0073 step 1 uses it for `01:80:C2:00:00:02`, the LACP group
+/// address, which arrives at this port four times a minute and reaches no
+/// queue.
+const OPCODE_ADD_MAC_VLAN: u16 = 0x0250;
+/// One entry of the Add MAC, VLAN buffer -- Table 38-238.
+const MAC_VLAN_ENTRY_BYTES: u16 = 16;
+/// Table 38-238 flags bit 0: *"use perfect match"*.
+const MAC_VLAN_PERFECT_MATCH: u16 = 1 << 0;
+/// Table 38-238 flags bit 2: *"ignore VLAN -- if set, the VLAN tag is ignored
+/// and the MAC address is used to forward packets from all VLANs"*. Required
+/// on a trunk, where every frame worth having carries a tag.
+const MAC_VLAN_IGNORE_VLAN: u16 = 1 << 2;
+
+/// `Add Control Packet Filter` -- Table 38-261, opcode `0x025A`: *"used to add
+/// a control filter to forward packets to a control VSI"*. Direct: every field
+/// is in the descriptor.
+///
+/// **This is the command for link-local traffic, and `Add MAC, VLAN Pair` is
+/// not.** The first attempt at RFC 0073 step 1 asked for the LACP group
+/// address as an ordinary MAC filter and firmware answered `EINVAL`; the
+/// datasheet says twice, in the control-VSI section and again under `Stop LLDP
+/// Agent`, that a driver *"should request forwarding of the relevant packets
+/// using the Add Control Packet Filter admin command"*. A reserved group
+/// address is the bridge's own, and only this command takes it away.
+const OPCODE_ADD_CONTROL_PACKET_FILTER: u16 = 0x025A;
+/// Table 38-261 flags bit 0: *"ignore MAC. If set, forwarding is based only on
+/// EtherType."* Which is what a protocol identified by its EtherType wants.
+const CONTROL_FILTER_IGNORE_MAC: u16 = 1 << 0;
+
+/// `Stop LLDP Agent` -- Table 38-390, opcode `0x0A05`, direct.
+///
+/// **This is how a driver takes the control port from firmware.** The
+/// datasheet's control-VSI section says the MAC's control VSI *"is assigned to
+/// the EMP"* at initialisation, and that a PF taking ownership means the EMP
+/// *"should be notified of the change using Stop LLDP Agent command and should
+/// disconnect the EMP control port"*. Stopping also *"directs all untagged
+/// ingress LLDP frames received on the port to the default queue of the
+/// control VSI"* -- which is the behaviour a control packet filter is supposed
+/// to have and, on this machine, did not.
+const OPCODE_STOP_LLDP_AGENT: u16 = 0x0A05;
+/// `Stop LLDP Agent` byte 16 bit 0: 0 stops the agent, 1 shuts it down.
+///
+/// **Stop, not shutdown.** Shutdown *"sends a last LLDP PDU on the wire with
+/// TTL = 0"*, which announces to the neighbour that this station is going
+/// away -- a visible change to somebody else's network, on a live cluster
+/// node, to answer a question about our own receive path. Stop is the
+/// reversible half.
+const LLDP_SHUTDOWN: u8 = 1 << 0;
+
+/// The Slow Protocols EtherType -- IEEE 802.3 Clause 57. LACP rides on it, and
+/// it is neither an L2 tag nor IP, which Table 38-261 requires.
+pub const ETHERTYPE_SLOW_PROTOCOLS: u16 = 0x8809;
+
 /// Table 38-253, modes bit 4: promiscuous VLAN.
 ///
 /// **The flag a trunk port needs.** Without it the unicast, multicast and
@@ -1985,6 +2043,97 @@ impl Device {
             broadcast: self.read64(GLPRT_BPTCL + at),
             octets: self.read64(GLPRT_GOTCL + at),
         }
+    }
+
+    /// Adds one MAC filter to a VSI -- `Add MAC, VLAN Pair`, Table 38-237.
+    ///
+    /// The entry is a perfect match that ignores VLAN, so the address is
+    /// forwarded to this VSI from every VLAN on a trunk. `device` and `host`
+    /// are the 16-byte buffer as the device issues it and as this kernel
+    /// reaches it.
+    ///
+    /// # Safety
+    ///
+    /// `host` must be the direct-map address of the buffer the device reaches
+    /// at `device`, writable, at least [`MAC_VLAN_ENTRY_BYTES`] long, and
+    /// written by nothing else while this runs.
+    ///
+    /// # Errors
+    ///
+    /// As [`Device::command`]. `ENOSPC` means the filter table is full.
+    pub unsafe fn add_mac_filter(
+        &mut self,
+        seid: u16,
+        address: [u8; 6],
+        device: u64,
+        host: u64,
+        spins: u32,
+    ) -> Result<(), CommandError> {
+        let mut entry = [0u8; MAC_VLAN_ENTRY_BYTES as usize];
+        entry[0..6].copy_from_slice(&address);
+        // Bytes 6-7 are the VLAN, left zero because the ignore flag makes it
+        // meaningless; 8-9 the flags; 10-11 a queue, only meaningful with
+        // `ToQueue`, which is not set -- the VSI's own steering decides.
+        let flags = MAC_VLAN_PERFECT_MATCH | MAC_VLAN_IGNORE_VLAN;
+        entry[8..10].copy_from_slice(&flags.to_le_bytes());
+        // SAFETY: per the caller -- a writable mapping of at least
+        // `MAC_VLAN_ENTRY_BYTES`, written by nothing else.
+        unsafe {
+            for (offset, byte) in entry.iter().enumerate() {
+                core::ptr::write_volatile((host + offset as u64) as *mut u8, *byte);
+            }
+        }
+        let mut request =
+            Descriptor::with_buffer(OPCODE_ADD_MAC_VLAN, device, MAC_VLAN_ENTRY_BYTES);
+        // Bytes 16-17 the count, 18-19 the SEID with its valid bit.
+        request.words[4] = 1 | (u32::from(seid & 0x3ff) | 0x8000) << 16;
+        self.command(request, spins).map(|_| ())
+    }
+
+    /// Asks firmware to stop its LLDP agent, releasing the port's control VSI.
+    ///
+    /// `shutdown` chooses the louder variant, which also emits a final LLDP
+    /// PDU announcing this station's departure; [`LLDP_SHUTDOWN`] says why
+    /// this driver passes `false`.
+    ///
+    /// # Errors
+    ///
+    /// As [`Device::command`]. A firmware with no agent running may answer
+    /// `EEXIST` or `ENOENT`, and either is an answer rather than a failure.
+    pub fn stop_lldp_agent(&mut self, shutdown: bool, spins: u32) -> Result<(), CommandError> {
+        let mut request = Descriptor::direct(OPCODE_STOP_LLDP_AGENT);
+        // Byte 16 is the command; the rest of the descriptor is reserved.
+        request.words[4] = u32::from(if shutdown { LLDP_SHUTDOWN } else { 0 });
+        self.command(request, spins).map(|_| ())
+    }
+
+    /// Routes a control protocol to a VSI by EtherType -- `Add Control Packet
+    /// Filter`, Table 38-261.
+    ///
+    /// Matches on EtherType alone, ignoring the destination address, on
+    /// received traffic. That is what gets link-local frames -- the ones a
+    /// bridge would otherwise terminate -- delivered to a queue.
+    ///
+    /// # Errors
+    ///
+    /// As [`Device::command`]. `EEXIST` means a filter for this flow type is
+    /// already installed, which the datasheet says these filters are exclusive
+    /// about: *"if a request to set a filter on an existing flow type is
+    /// received, it is rejected with an EEXIST reason code"*. Firmware's own
+    /// agent holding one is exactly the case worth telling apart.
+    pub fn add_control_packet_filter(
+        &mut self,
+        seid: u16,
+        ethertype: u16,
+        spins: u32,
+    ) -> Result<(), CommandError> {
+        let mut request = Descriptor::direct(OPCODE_ADD_CONTROL_PACKET_FILTER);
+        // Bytes 16-21 are the MAC, ignored by the flag below; 22-23 the
+        // EtherType; 24-25 the flags; 26-27 the SEID; 28-29 a queue, only
+        // meaningful with `ToQueue`, which is not set.
+        request.words[5] = u32::from(ethertype) << 16;
+        request.words[6] = u32::from(CONTROL_FILTER_IGNORE_MAC) | (u32::from(seid & 0x3ff) << 16);
+        self.command(request, spins).map(|_| ())
     }
 
     /// Asks `Get VSI Parameters` about a VSI this function controls.

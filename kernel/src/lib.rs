@@ -13467,6 +13467,51 @@ fn bring_up_receive_queue(
         ),
     }
 
+    // **RFC 0073 step 1: ask for the one address this wire actually carries.**
+    // The four ports are an LACP aggregate, so the frames arriving here are
+    // LACPDUs to `01:80:C2:00:00:02` -- a reserved group address a bridge
+    // terminates rather than forwards, which is why the VSI counts them and no
+    // queue has ever seen one. `Add MAC, VLAN Pair` is the datasheet's own way
+    // to point an address at a VSI, and the ignore-VLAN flag is what makes it
+    // work on a trunk.
+    //
+    // If this works, RFC 0072 step 4's gate is met by RFC 0073's step 1, which
+    // is an odd dependency and is written down in both.
+    //
+    // **Firmware owns the control port until it is asked not to.** The
+    // control-VSI section says the MAC's control VSI is the EMP's at
+    // initialisation, and that a PF taking it over notifies firmware with
+    // `Stop LLDP Agent`. Without this the control filter below is installed
+    // against a control port this driver does not hold, which is the shape of
+    // the previous boot: the command was accepted and no frame arrived.
+    match nic.stop_lldp_agent(false, SPINS) {
+        Ok(()) => println!(
+            "    nic lldp       firmware's LLDP agent stopped; its control port is released"
+        ),
+        Err(error) => println!(
+            "\x1b[93m    nic lldp       Stop LLDP Agent: {error} -- firmware may be running no \
+             agent, which is an answer rather than a failure\x1b[0m"
+        ),
+    }
+
+    // **By EtherType, through the command the datasheet names for it.** The
+    // first attempt used `Add MAC, VLAN Pair` for `01:80:C2:00:00:02` and
+    // firmware answered `EINVAL`: a reserved group address is the bridge's
+    // own, and an ordinary MAC filter cannot claim it. `Add Control Packet
+    // Filter` is what the control-VSI section and the `Stop LLDP Agent`
+    // section both point at, and it matches on EtherType with the address
+    // ignored.
+    match nic.add_control_packet_filter(vsi, i40e::ETHERTYPE_SLOW_PROTOCOLS, SPINS) {
+        Ok(()) => println!(
+            "    nic filter     slow protocols ({:#06x}) routed to VSI seid {vsi:#x} -- LACP rides \
+             on it",
+            i40e::ETHERTYPE_SLOW_PROTOCOLS
+        ),
+        Err(error) => println!(
+            "\x1b[93m    nic filter     Add Control Packet Filter for slow protocols: {error}\x1b[0m"
+        ),
+    }
+
     // **Armed before enabled.** With everything in place but the enable, the
     // first descriptor must stay untouched.
     // SAFETY: `rings` describes the posted rings.
