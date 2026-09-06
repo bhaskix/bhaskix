@@ -958,6 +958,73 @@ the distinction is in the table rather than in somebody's head.
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-09-06 (a receive queue on real hardware, and the frame that did not come)
+
+Three boots of the SR550, RFC 0072 step 4. **The step's gate is not met**: a frame did not arrive,
+and that is the sentence to keep. What did happen is everything up to it.
+
+The first boot asked and wrote nothing. It answered five things the code would otherwise have
+assumed: the port has link (1 Gb/s, 1000BASE-T, media and signal); frames are steered through
+**VSI 19, SEID `0x18c`, whose queues start at this PF's queue 0**; this PF owns absolute queues
+`0..=383`; the device is **still in PXE mode**, which changes the legal queue length and the tail
+granularity; and the four LAN private-memory registers read zero. It also closed a hole in step 3's
+own claim — that step's gate names the firmware version *and the link state*, and only the version
+had been read when it was called complete. Corrected in the RFC where the claim was made.
+
+**A wrong reading caught by prose rather than by a boot.** The uncommitted first draft called
+`GLHMC_LANRXBASE` and `GLHMC_LANRXCNT` read-only and firmware-assigned, on the strength of the
+register heading, which says RO. The field tables say RW and 38.26.3.1 says host software sets the
+LAN base and count registers. The zeros on the machine, and then the read-back after writing them,
+both agree with the prose. `GLHMC_SDPART` is the register that really is firmware's.
+
+The second boot built the queue: PXE mode cleared through the admin command, the FPM layout
+programmed and **read back as written**, one backing page named through one page descriptor through
+one segment descriptor that **round-trips through `PFHMC_SDCMD`**, a 32-byte context written where
+the HMC fetches it, sixteen descriptors posted, the VSI set to forward broadcast and multicast, and
+`QENA_STAT` following `QENA_REQ`. No HMC error, no exception, console up, lock order clean over
+529,240 acquisitions. **Every FPM number the machine printed matches what the host tests compute
+from 38.26.4 and Table 38-337 to the digit** — base 96, context 0 at `0xc000`, segment 0, page
+descriptor 12, a layout ending at `0xf000` across 15 pages.
+
+Then five seconds of a live port produced nothing, and the run says so in red.
+
+**The third boot raised the window to sixty seconds and scanned the whole ring, and it turned an
+ambiguous negative into a narrow one.** Still no frame. But the context read-back, which at five
+seconds had said `CTX_MISS` beside a base belonging to nothing, now reads **`head 4`, base
+`0x100003000` — this driver's own ring — `qlen 32`, resident in the cache.**
+
+So the device is running a queue context that came out of a backing page this kernel allocated,
+through a page descriptor it wrote, in a segment it programmed. **The entire HMC path works**, which
+is the machinery step 4 predicted would cost more than steps 2 and 3 together. It also settles a
+datasheet contradiction *by measurement*: Table 38-419 calls the ring base *"12-byte units"* and its
+own worked example only decodes in 128-byte units; the device reports a base that times 128 is
+exactly this ring, so the example is right and the table's text is wrong.
+
+`head 4` proves the device is working on this ring, not that four frames landed — the same table
+says *"during dynamic operation it is not guaranteed that all descriptors below the head
+complete"*, and all sixteen posted descriptors were scanned with none marked done. A prefetch that
+ran ahead fits; four lost completions do not.
+
+**Three candidates died on measurement rather than argument**: the context never reaching the device
+(it is resident and correct), the write-back being refused by the IOMMU (the only bring-up fault all
+boot is the long-known xHCI read of `0xaa95f000`; the NIC caused none), and a frame landing at an
+index nobody watched (all sixteen scanned).
+
+What is left is one question: **does this port receive anything at all?** Nothing yet has asked the
+device how many frames its *port* has seen as opposed to how many reached this queue. The next
+instrument is read-only and is the statistics counters — 38.30's own initialisation flow reads them
+all at start-up as a baseline, and `GLV_REPC` counts frames a VSI dropped for exceeding `RXMAX`.
+Port counters moving with an empty queue means steering or filtering; port counters at zero means
+nothing is being sent here, the driver may be right as written, and the gate needs a frame this
+machine provokes — which is step 5, and would fold the two steps into one.
+
+No fourth boot was taken. Three reboots of a live cluster node in a morning is enough, and the
+counters are a change to make deliberately.
+
+**The negative arm is inside every one of these boots**, which the testing plan asks for: with
+everything in place but the enable, descriptor zero was watched for 100 ms and stayed untouched. So
+the frame line, when it prints, cannot be a completion written for some other reason.
+
 ### 2026-09-05 (a confidentiality property nobody had asked the code about)
 
 RFC 0069 left a note saying a filesystem block freed by `remove` and then reallocated "is already

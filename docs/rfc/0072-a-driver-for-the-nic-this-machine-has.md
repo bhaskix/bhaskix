@@ -475,6 +475,165 @@ eight words, Table 38-340's byte numbering, a ring position that advances, and
 a buffer flag for the one indirect command here. The unsafe line count went
 *down* by one.
 
+#### The queue comes up and no frame arrives — step 4's gate is NOT met, 2026-09-06
+
+The second boot built the queue. Everything the device will confirm without
+traffic is correct, and the one thing the step exists to show did not happen:
+
+    nic pxe        cleared: the device left PXE mode; GLLAN_RCTL_0.PXE_MODE reads 0
+    nic fpm        programmed tx base 0 count 384, rx base 96 count 384; read back tx 0 / 384, rx 96 / 384 -- as written
+    nic fpm        receive context 0 at private address 0xc000: segment 0, page descriptor 12, offset 0; the layout ends at 0xf000, 15 page(s)
+    nic hmc        segment 0 -> page descriptor page at 0x100001000, 15 backing page(s); page descriptor 12 -> 0x100002000; the segment reads back as written
+    nic rx ring    32 descriptors at 0x100003000, 16 posted with 4096-byte buffers from 0x100004000; frames up to 1536 bytes
+    nic filter     VSI seid 0x18c now forwards multicast and broadcast to its queues
+    nic rx armed   with the queue still disabled, no descriptor completed in 100 ms
+    nic rx queue   absolute queue 0 enable requested; QENA_STAT set (REQ=1 STAT=1)
+    nic rx frame   FAILED: no frame in 5 s with the queue enabled and the link up
+    nic rx context the device holds head 1, base 0x8fb0f000 (NOT this ring), qlen 0; CTX_MISS -- not resident
+    nic hmc        no error recorded
+    nic rx queue   disabled again: QENA_STAT clear
+
+**The gate is a frame arriving, and no frame arrived. The step is not done.**
+That is the headline, and nothing below softens it.
+
+**What the boot does establish**, none of it previously tested on hardware:
+
+* **The FPM arithmetic is right on the machine, to the digit.** Every number the
+  report printed is what the host tests compute from 38.26.4 and Table 38-337:
+  a receive base of 96 (512-byte units) after 384 transmit contexts of 128
+  bytes, context 0 at private address `0xc000`, segment 0, page descriptor 12,
+  offset 0, a layout ending at `0xf000` and spanning 15 pages. The four LAN
+  registers **read back as written**, which also settles the read-only question
+  the first draft got wrong: they are software's.
+* **The segment descriptor round-trips.** Written through `PFHMC_SDCMD` and read
+  back through the same register, identical. A write past this function's range
+  *"is dropped"* silently, so the read-back is the only proof it landed, and it
+  did.
+* **The HMC recorded no error.** An invalid segment or page descriptor, or an
+  object index past its count register, sets `PFHMC_ERRORINFO`. Nothing did.
+* **The device accepted the queue.** `QENA_STAT` followed `QENA_REQ`, which
+  38.30.3.3.2 says happens *"not more than 10 µs"* after the request, and the
+  queue disabled cleanly afterwards.
+* **The negative arm held.** With everything in place but the enable, descriptor
+  zero was watched for 100 ms and stayed untouched. So the frame line, when one
+  finally prints, cannot be a completion the device wrote for some other reason.
+  This is the arming the testing plan asks for, and it is *in the boot* rather
+  than in a separate run.
+* **The console survived**, the boot reached its shell, lock-order checking was
+  clean over 529,240 acquisitions, and no exception fired anywhere.
+
+**Why no frame — and the honest answer is that this boot cannot say.** Two
+readings survive, and they are distinguished by a cheaper experiment than either
+would suggest:
+
+1. **The wire is quiet.** Five seconds is a short window on an enterprise access
+   port. Spanning-tree BPDUs arrive about every two seconds *if* the switch
+   sends them to this port, LLDP every thirty, and a port with no other host
+   behind it may carry no broadcast at all in five seconds. The link is up with
+   media and signal, which proves a cable and a partner, **not** that anything is
+   being sent to this port.
+2. **The receive path is not receiving.** The context may not have been fetched
+   from the backing page, the filter may not actually forward to this queue, or
+   the descriptors may not be where the device looks.
+
+**The context read-back is not evidence for either, and it would be easy to
+misread as evidence for the second.** `CTX_MISS` means the queue *"was not
+resident in the context cache"* at the moment of the read -- so the four words
+returned beside it describe whatever line the cache held, not this queue. A base
+of `0x8fb0f000` with `qlen 0` is therefore an artefact of asking a cache that had
+nothing, not a device pointing at somebody else's ring. Recorded because the line
+is printed and the next reader will see it: **it says less than it appears to.**
+
+**The next instrument is one longer window, not one more theory.** Raise the wait
+from five seconds to a minute and re-boot. If a frame lands, reading (1) was
+right, the path works, and the gate is met by a change of one constant. If sixty
+seconds of a live 1 Gb/s port produce nothing, reading (2) is real and the
+investigation has somewhere to go: the queue context can be programmed directly
+through `PFCM_LANCTXCTL` instead of through FPM -- the datasheet's own pre-boot
+path, bypassing the HMC entirely -- which splits "the context is wrong" from "the
+FPM plumbing is wrong" in a single boot.
+
+That is deliberately not done here. A second reboot of a live cluster node to
+change a timeout is worth asking for rather than assuming, and a five-second
+negative is too weak to build the next fix on.
+
+#### A minute, and the device is running this driver's queue — still no frame, 2026-09-06
+
+The window went to sixty seconds and the ring gained a full scan. The gate is
+**still not met**, and almost everything else changed:
+
+    nic rx armed   with the queue still disabled, no descriptor completed in 100 ms
+    nic rx queue   absolute queue 0 enable requested; QENA_STAT set (REQ=1 STAT=1)
+    nic rx frame   FAILED: no frame in 60 s with the queue enabled and the link up
+    nic rx ring    none of the 16 posted descriptors completed, so the ring is untouched rather than filled elsewhere
+    nic rx context the device holds head 4, base 0x100003000 (this ring), qlen 32; resident in the cache
+    nic hmc        no error recorded
+
+**The context line is the result.** In the five-second boot it read
+`base 0x8fb0f000 (NOT this ring), qlen 0; CTX_MISS`. It now reads **this ring**,
+`qlen 32`, resident. So:
+
+* **The whole HMC path works.** The device fetched a queue context out of a
+  backing page this kernel allocated, named through a page descriptor this
+  kernel wrote, in a segment this kernel programmed, and it came back holding
+  the ring address and length this kernel put there. Every layer between
+  `PFHMC_SDCMD` and the device's context cache is carrying real data. That is
+  the machinery step 4 said would be *"more than steps 2 and 3 together"*, and
+  it is working.
+* **Table 38-419's disputed `BASE` units are settled, on hardware.** The table
+  says *"12-byte units"*; the encoder used 128 because only that made the
+  datasheet's own example decode to a page-aligned address. The device now
+  reports a base which, multiplied by 128, is exactly the ring's device
+  address. **The example was right and the table's text is wrong**, and this is
+  a measurement rather than a reading.
+* **The earlier `CTX_MISS` caveat was correct.** The previous section said that
+  read *"says less than it appears to"* and described an unrelated cache line.
+  The same read taken later returns the truth, which is what a stale cache line
+  looks like from the other side. Kept as written.
+
+**`head 4`, and what it does and does not prove.** The head has moved off zero,
+so the device is not idle with respect to this ring -- it is operating on the
+descriptors. It does **not** prove four packets arrived, and the table says so
+itself: *"During dynamic operation it is not guaranteed that all descriptors
+below the head complete."* Descriptors are prefetched in cache-line batches
+before any packet needs them. With every one of the sixteen scanned and none
+carrying `DD`, the reading that fits is a prefetch that ran ahead, not four
+completions that went missing.
+
+**Three explanations are now dead**, each by a measurement rather than an
+argument:
+
+| was possible | why it is not |
+|---|---|
+| the context never reached the device | it is resident and holds this ring |
+| the write-back was refused by the IOMMU | the only bring-up fault is the long-known xHCI one at `0xaa95f000`; the NIC caused none |
+| a frame landed at an index nobody watched | all sixteen scanned, none completed |
+
+**What is left is narrow: does this port receive anything at all?** Sixty
+seconds of a live 1 Gb/s port with promiscuous multicast and broadcast set on
+its VSI produced nothing, which makes *"the wire is quiet"* much less
+comfortable than it was at five seconds -- but it does not kill it, because
+nothing here has yet asked the device how many frames its **port** has seen, as
+distinct from how many reached this queue.
+
+**That is the next instrument, and it is read-only.** The device keeps receive
+statistics per port and per VSI -- 38.30's LAN initialisation flow has a driver
+read them all at start-up precisely because *"the values of these counters is
+the baseline for any statistics collected later"*, and `GLV_REPC` counts frames
+a VSI dropped for exceeding `RXMAX`. One boot that prints them splits the two
+remaining worlds cleanly:
+
+* port counters moving while the queue stays empty ⇒ frames arrive and the
+  **steering or filtering** is wrong, and the VSI/queue mapping is where to
+  look;
+* port counters at zero ⇒ **nothing is being sent to this port**, the driver may
+  be correct as written, and the gate needs a switch that talks or a frame this
+  machine provokes -- which is step 5, and would make the two steps one.
+
+No further boot was taken. Three reboots of a live cluster node in a morning is
+enough, and the statistics reading is a change worth making deliberately rather
+than at the end of a session.
+
 
 ### Step 5 — one transmit queue
 
