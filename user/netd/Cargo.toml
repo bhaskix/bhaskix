@@ -78,4 +78,11 @@ asm_budget = 3
 # brace balance, so `if let Some(x) = unsafe { f() } {` read as still-open and
 # charged the outer block's body to this crate. See the changelog; the
 # scanner now walks from the block's own brace and has a self-test.
-unsafe_budget = 308
+# 327 at RFC 0074 step 4, and every added line is a *second port*. This driver
+# drove one device with its windows welded into constants; a bond has two, so
+# the constants became a parameter and the register touches doubled -- the
+# second device's status write, its address read, its own link register, and the
+# five report words the bond publishes. Nineteen lines for a member, and the
+# alternative was a second driver domain that would have needed its own ring to
+# `bin/ipd` and its own copy of everything above.
+unsafe_budget = 327

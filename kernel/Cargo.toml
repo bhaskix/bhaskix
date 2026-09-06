@@ -739,7 +739,15 @@ asm_budget = 10
 # call one method -- which is both less `unsafe` and the fix for a real defect:
 # a loop that restarted at slot zero while the device's head stood at two wrote
 # forty-five frames behind the head and moved the tail backwards.
-unsafe_budget = 2116
+# 2137 at RFC 0074 step 4: delegating a second NIC. Fourteen of the twenty-one
+# are `delegate_second_port` -- enabling memory space, enabling bus mastering,
+# and claiming a vector, each of which the *first* port already pays for and
+# neither of which can be shared: they name a device. The rest is the second
+# port's IOMMU attachment, which is the first port's block with a different
+# device and a different domain id. A helper serving both would have needed a
+# parameter for every difference between them, which is a worse way of saying
+# they are not the same job.
+unsafe_budget = 2137
 # Up thirty-one for RFC 0005 step 9's socket probe -- `ring3_socketeer`, which
 # is `ring3_lister` with a `sockaddr_in6` copied in beside its code instead of
 # two filenames. The same two blocks every hosted probe has: one

@@ -166,6 +166,89 @@ address on the VLAN, and the existing network gates running over it.
 > **Gate:** the UDP, TCP, IPv6 and DHCP gates pass with the stack sitting on a
 > VLAN over a bond rather than on a device.
 
+## Step 4, met 2026-09-07 — a member taken away underneath a bond
+
+**The gate is met.** `make test-bond` boots the two-port machine, reaches in
+over QEMU's monitor and takes the first member's link down while the machine is
+running:
+
+    net bond       2 member(s), active-backup; traffic on port 0, link up on both
+    net bond       failed over 1 time(s): traffic on port 1 now, and 8 frame(s) have crossed since
+
+Before and after, from one boot, which is what the gate asks for. **Watched
+red** by making the driver ignore the link register: it then prints `no member
+went down inside the window; traffic is still on port 0, link up on 0b11`, and
+the harness names that as the failure.
+
+### What had to be built
+
+**The kernel delegates a second NIC**, at slots 10 to 15, with its own rings,
+its own IOMMU domain and its own vector. The page table is not shared with the
+first port's, and the reason is stronger here than anywhere else in the tree:
+the two ports of a bond are on the *same network*, so one translation would let
+a frame arriving on the backup land in the buffers of the member carrying
+traffic.
+
+**Both vectors raise one notification**, with different badges. A driver that
+had to park on two notifications would need a wait that names two sources; it
+does not need one, because a wake means "look at both ports" — which is the same
+answer this driver already gives for its two queues.
+
+**`bin/netd` drives more than one device**, which is what [RFC
+0074](0074-what-a-network-interface-is.md)'s design section said it would have
+to. Every window address was welded into a function; they became one `Windows`
+parameter, and nothing about *how* a port is driven changed. That is the whole
+refactor: the difference between a driver with a device and a driver with ports.
+
+**Link state comes from the device**, not from silence. `VIRTIO_NET_F_STATUS` is
+negotiated when offered, and bit 0 of the `u16` six bytes into the device
+configuration is the link — both read off `/usr/include/linux/virtio_net.h` on
+the machine this was written on rather than remembered. A device that never
+offered a link state is treated as **up**: it has not said otherwise, and a bond
+that read silence as failure would refuse a working port.
+
+**A failover announces itself.** The member taking over sends the driver's probe
+frame immediately. A switch learns which port an address is on from the frames
+it sees, and after a failover everything it learned is wrong — Linux's bonding
+sends gratuitous ARP here for the same reason. It is also what makes "traffic
+continues" a measurement: the answer comes back on the new member and crosses to
+`bin/ipd`, so the report can say a frame arrived *after* the failover rather
+than that nothing has gone wrong yet.
+
+**Selection is sticky.** A member that comes back does not take the link back:
+that is churn and reordering bought for nothing. And a bond whose every member
+is down keeps the one it has, because a down member and no member carry the same
+traffic, while staying put means a link coming back needs no second decision.
+
+**Frames from a backup member are dropped and counted.** Both members are on the
+wire and both receive; a frame taken from the backup would be a duplicate of one
+the active member already delivered, and a bond that delivered both would be a
+bond that reordered.
+
+### The address survives, and that is the part worth measuring
+
+**Everything the bond sends carries the first member's address**, whichever
+member carries it. That is what makes this one interface rather than two:
+`bin/ipd` is told an address once and never has to be told again, so a failover
+costs no ARP, no DHCP and no reconfiguration above the driver.
+
+It is also the part a failover can quietly break, so it is measured rather than
+assumed. The eight frames that crossed after the failover are answers to probes
+sent **from the bond's address out of the member that does not own it**, and
+they were delivered to that member's queue and handed across. A bond that had
+silently become two ports would have shown exactly nothing there.
+
+### What this does not prove
+
+**That this holds on hardware that filters.** Some devices drop a received frame
+whose destination is not their own address, and some switches will not accept a
+source address that moves; that is what Linux's bonding offers `fail_over_mac`
+for, and this has none. What is measured is a virtio-net device model and QEMU's
+user-mode network, on which it works.
+
+**And no lane has more than two members.** `MAX_MEMBERS` is eight in the model
+and two on the wire, because QEMU gives this lane two NICs.
+
 ## Step 5, met 2026-09-06 — two guests, one wire, and a bond that formed
 
 **The gate is met.** `tests/qemu/lacp-test.sh` boots two Bhaskix guests joined

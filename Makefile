@@ -202,7 +202,7 @@ OVMF_VARS    := $(firstword $(wildcard $(OVMF_DIR)OVMF_VARS$(OVMF_SUFFIX).fd))
 
 .PHONY: FORCE all kernel iso demo run run-uefi progress test test-host test-boot test-boot-uefi test-boot-uefi-qemu64 test-boot-iommu test-keyboard \
         test-boot-iommu-off test-boot-qemu64 test-boot-native test-boot-native-full \
-        test-placements mkfs test-shell test-faults test-usb-keyboard test-lacp fmt clippy gates hooks clean distclean help
+        test-placements mkfs test-shell test-faults test-usb-keyboard test-lacp test-bond fmt clippy gates hooks clean distclean help
 
 all: iso
 
@@ -631,7 +631,7 @@ run-uefi: $(ISO)
 test: fmt clippy test-host gates test-boot test-boot-uefi test-boot-iommu test-boot-iommu-off \
       test-boot-qemu64 test-boot-uefi-qemu64 test-boot-native test-boot-native-full \
       test-placements test-shell \
-      test-keyboard test-usb-keyboard test-busybox test-lacp test-faults
+      test-keyboard test-usb-keyboard test-busybox test-bond test-lacp test-faults
 	@echo
 	@echo "  all checks passed"
 
@@ -707,6 +707,16 @@ test-busybox: $(ISO)
 # for the bond rather than glance at it -- and puts the default back afterwards.
 test-lacp: $(ISO)
 	tests/qemu/lacp-test.sh
+
+# A bond with a member taken away underneath it -- RFC 0074 step 4.
+#
+# The only lane that changes the machine while it is running: it reaches in over
+# QEMU's monitor and takes the first port's link down, which is the one thing a
+# gate inside the guest cannot arrange for itself. Like `test-lacp` it builds
+# the image it needs -- one told to wait for the failover rather than glance at
+# the bond -- and puts the default back afterwards.
+test-bond: $(ISO)
+	tests/qemu/bond-test.sh
 
 test-boot: $(ISO)
 	tests/qemu/boot-test.sh bios

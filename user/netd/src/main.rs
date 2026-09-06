@@ -66,11 +66,37 @@ const BACK: u64 = 8;
 /// wakes it directly. Write only: a driver rings, it does not listen.
 const INBOX: u64 = 9;
 
+/// Slots the **second** port arrives in, when the machine has one.
+///
+/// RFC 0074 step 4: a bond needs two members driven, and the kernel delegates
+/// the second at slots 10 upward so that "which slot is this?" has an answer
+/// that does not depend on how many ports were found. A machine with one NIC
+/// leaves them empty and the attach below simply fails, which is how this
+/// program discovers there is no second port -- asked of the capability space
+/// rather than told in a word somewhere.
+///
+/// There is no second signal: both ports' vectors raise the notification at
+/// [`SIGNAL`] with different badges, so this program parks once and looks at
+/// both devices when it wakes.
+const COMMON_1: u64 = 10;
+const NOTIFY_1: u64 = 11;
+const DEVICE_1: u64 = 12;
+const RINGS_1: u64 = 13;
+const WINDOW_1: u64 = 14;
+const HANDLER_1: u64 = 15;
+
 /// Where this program maps what it holds.
 const COMMON_AT: u64 = 0x2000_0000;
 const NOTIFY_AT: u64 = 0x2001_0000;
 const DEVICE_AT: u64 = 0x2002_0000;
 const RINGS_AT: u64 = 0x2010_0000;
+/// And where the second port's windows go, a megabyte clear of the first's so
+/// that a mistaken base reads as an unmapped address rather than as the other
+/// port's registers.
+const COMMON_1_AT: u64 = 0x2100_0000;
+const NOTIFY_1_AT: u64 = 0x2101_0000;
+const DEVICE_1_AT: u64 = 0x2102_0000;
+const RINGS_1_AT: u64 = 0x2110_0000;
 /// Where the ring to `bin/ipd` is mapped. Not the device's rings: those are
 /// memory a *device* reads, this is memory another *domain* reads, and the two
 /// are deliberately different objects with different owners.
@@ -80,6 +106,30 @@ const BACK_AT: u64 = 0x2030_0000;
 
 /// Bytes in the ring to `bin/ipd`, matching what the kernel granted.
 const RING_BYTES: usize = 16 * 4096;
+
+/// Where one port's four windows are, and where its device looks for its rings.
+///
+/// **This program drove one device and named its windows in constants**, which
+/// is what a driver with one device does. A bond has two, and every function
+/// that touched a register had the first port's address welded into it -- so
+/// this is the parameter those constants became. Nothing else changed about
+/// them: `PORT_0` below holds exactly the values that used to be spelled
+/// inline.
+#[derive(Clone, Copy)]
+struct Windows {
+    /// The common configuration structure.
+    common: u64,
+    /// The queue notification area.
+    notify: u64,
+    /// The device-specific configuration: the MAC, and the link status.
+    device: u64,
+    /// The rings, as *this program* sees them.
+    rings: u64,
+    /// The rings, as the *device* sees them -- what the DMA window returned.
+    at_device: u64,
+    /// The capability slot whose interrupt this port raises, to acknowledge.
+    handler: u64,
+}
 
 /// Entries per queue. Four, like the block driver's: this program sends one
 /// frame and posts a handful of receive buffers, and a ring larger than the
@@ -197,6 +247,19 @@ mod device_status {
 mod feature {
     /// Low word: the device-class bits.
     pub const MAC: u32 = 1 << 5;
+    /// Low word: the device says whether its link is up.
+    ///
+    /// Bit 16, and the config field it unlocks is a `u16` six bytes into the
+    /// device configuration -- after the MAC and before everything else. Both
+    /// facts are from `/usr/include/linux/virtio_net.h` on the machine this was
+    /// written on (`VIRTIO_NET_F_STATUS 16`, `VIRTIO_NET_S_LINK_UP 1`, and
+    /// `struct virtio_net_config`), not from memory.
+    ///
+    /// **Negotiated only when offered.** A device told it agreed to a feature
+    /// it never offered is within its rights to clear `FEATURES_OK` and refuse
+    /// the whole handshake -- which would cost a working network to learn a
+    /// link state.
+    pub const STATUS: u32 = 1 << 16;
     /// High word: bits 32 and 33 of the transport.
     pub const VERSION_1_AND_ACCESS_PLATFORM: u32 = 0b11;
 }
@@ -364,15 +427,15 @@ unsafe fn write64(at: u64, value: u64) {
 /// # Safety
 ///
 /// The notify window must be mapped and `index` must be an enabled queue.
-unsafe fn kick(index: u16) {
+unsafe fn kick(w: Windows, index: u16) {
     // SAFETY: the common window is mapped; selecting a queue and reading its
     // notify offset changes nothing.
     unsafe {
-        write16(COMMON_AT + common::QUEUE_SELECT, index);
-        let offset = u64::from(read16(COMMON_AT + common::QUEUE_NOTIFY_OFF));
+        write16(w.common + common::QUEUE_SELECT, index);
+        let offset = u64::from(read16(w.common + common::QUEUE_NOTIFY_OFF));
         // Times four: the notification multiplier this transport reports, the
         // same constant `user/blkd` uses and for the same device model.
-        write16(NOTIFY_AT + offset * 4, index);
+        write16(w.notify + offset * 4, index);
     }
 }
 
@@ -418,15 +481,15 @@ static VECTORED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool
 /// The common window must be mapped, and the three offsets must name distinct
 /// page-aligned regions inside the rings this program holds.
 unsafe fn configure(
+    w: Windows,
     index: u16,
     descriptors: u64,
     available: u64,
     used: u64,
-    rings_at_device: u64,
 ) -> Virtqueue<Volatile> {
     // SAFETY: the caller guarantees the window and the offsets.
     let vectored = unsafe {
-        write16(COMMON_AT + common::QUEUE_SELECT, index);
+        write16(w.common + common::QUEUE_SELECT, index);
         // **The size, which this driver never told the device.** Both sides
         // index the same three rings, and they were indexing them differently:
         // the driver wrapping at four and the device at its own default of
@@ -442,24 +505,18 @@ unsafe fn configure(
         // three of four buffers sat free. None of them were about descriptors
         // or addresses or buffers; the two sides simply disagreed about how
         // long the rings were.
-        write16(COMMON_AT + common::QUEUE_SIZE, QUEUE_ENTRIES);
+        write16(w.common + common::QUEUE_SIZE, QUEUE_ENTRIES);
         // Which MSI-X entry this queue uses is this driver's to say, in a
         // register it holds. What that entry *contains* is the kernel's, and
         // this program has no way to write it. Both queues share entry zero,
         // which is one interrupt for two directions -- correct, because the
         // driver looks at both used rings when it wakes.
-        write16(COMMON_AT + common::QUEUE_MSIX_VECTOR, 0);
-        let taken = read16(COMMON_AT + common::QUEUE_MSIX_VECTOR) == 0;
-        write64(
-            COMMON_AT + common::QUEUE_DESC,
-            rings_at_device + descriptors,
-        );
-        write64(
-            COMMON_AT + common::QUEUE_DRIVER,
-            rings_at_device + available,
-        );
-        write64(COMMON_AT + common::QUEUE_DEVICE, rings_at_device + used);
-        write16(COMMON_AT + common::QUEUE_ENABLE, 1);
+        write16(w.common + common::QUEUE_MSIX_VECTOR, 0);
+        let taken = read16(w.common + common::QUEUE_MSIX_VECTOR) == 0;
+        write64(w.common + common::QUEUE_DESC, w.at_device + descriptors);
+        write64(w.common + common::QUEUE_DRIVER, w.at_device + available);
+        write64(w.common + common::QUEUE_DEVICE, w.at_device + used);
+        write16(w.common + common::QUEUE_ENABLE, 1);
         taken
     };
     if !vectored {
@@ -472,40 +529,38 @@ unsafe fn configure(
     unsafe {
         Virtqueue::<Volatile>::new(
             virtqueue::Ring {
-                at: (RINGS_AT + descriptors) as usize,
-                device: rings_at_device + descriptors,
+                at: (w.rings + descriptors) as usize,
+                device: w.at_device + descriptors,
             },
             virtqueue::Ring {
-                at: (RINGS_AT + available) as usize,
-                device: rings_at_device + available,
+                at: (w.rings + available) as usize,
+                device: w.at_device + available,
             },
             virtqueue::Ring {
-                at: (RINGS_AT + used) as usize,
-                device: rings_at_device + used,
+                at: (w.rings + used) as usize,
+                device: w.at_device + used,
             },
             QUEUE_ENTRIES,
         )
     }
 }
 
-/// Brings the device up and returns its two queues.
+/// Brings the device up and returns its two queues, and whether it offered a
+/// link state.
 ///
 /// `None` if the device refused the feature set, which is the one failure worth
 /// distinguishing: going on from there configures queues nobody will service.
-fn bring_up(rings_at_device: u64) -> Option<(Virtqueue<Volatile>, Virtqueue<Volatile>)> {
+fn bring_up(w: Windows) -> Option<(Virtqueue<Volatile>, Virtqueue<Volatile>, bool)> {
     VECTORED.store(true, core::sync::atomic::Ordering::Relaxed);
 
-    // SAFETY: `COMMON_AT` is the common configuration window this program
+    // SAFETY: `w.common` is the common configuration window this program
     // mapped writable, and every offset below is inside it. The values and
     // their order are the specification's.
     let mac_offered = unsafe {
-        write8(COMMON_AT + common::DEVICE_STATUS, 0);
+        write8(w.common + common::DEVICE_STATUS, 0);
+        write8(w.common + common::DEVICE_STATUS, device_status::ACKNOWLEDGE);
         write8(
-            COMMON_AT + common::DEVICE_STATUS,
-            device_status::ACKNOWLEDGE,
-        );
-        write8(
-            COMMON_AT + common::DEVICE_STATUS,
+            w.common + common::DEVICE_STATUS,
             device_status::ACKNOWLEDGE | device_status::DRIVER,
         );
 
@@ -514,68 +569,73 @@ fn bring_up(rings_at_device: u64) -> Option<(Virtqueue<Volatile>, Virtqueue<Vola
         // told it was negotiated is within its rights to clear `FEATURES_OK`,
         // and the whole handshake then fails for a field this driver only
         // wanted in order to print it.
-        write32(COMMON_AT + common::DEVICE_FEATURE_SELECT, 0);
-        let low = read32(COMMON_AT + common::DEVICE_FEATURE);
+        write32(w.common + common::DEVICE_FEATURE_SELECT, 0);
+        let low = read32(w.common + common::DEVICE_FEATURE);
         let mac = low & feature::MAC;
+        // Asked for the same way and for a better reason than the MAC: a bond
+        // that cannot tell a live member from a dead one is not a bond. See
+        // `feature::STATUS`.
+        let status = low & feature::STATUS;
 
-        write32(COMMON_AT + common::DRIVER_FEATURE_SELECT, 1);
+        write32(w.common + common::DRIVER_FEATURE_SELECT, 1);
         write32(
-            COMMON_AT + common::DRIVER_FEATURE,
+            w.common + common::DRIVER_FEATURE,
             feature::VERSION_1_AND_ACCESS_PLATFORM,
         );
-        write32(COMMON_AT + common::DRIVER_FEATURE_SELECT, 0);
-        write32(COMMON_AT + common::DRIVER_FEATURE, mac);
+        write32(w.common + common::DRIVER_FEATURE_SELECT, 0);
+        write32(w.common + common::DRIVER_FEATURE, mac | status);
 
         write8(
-            COMMON_AT + common::DEVICE_STATUS,
+            w.common + common::DEVICE_STATUS,
             device_status::ACKNOWLEDGE | device_status::DRIVER | device_status::FEATURES_OK,
         );
         // Read back: a device that will not accept the feature set clears this
         // bit, and a driver that did not look would build queues for a device
         // that had already given up on it.
-        if read8(COMMON_AT + common::DEVICE_STATUS) & device_status::FEATURES_OK == 0 {
+        if read8(w.common + common::DEVICE_STATUS) & device_status::FEATURES_OK == 0 {
             return None;
         }
 
         // Config-change interrupts go to the same entry as the queues. A
         // network device signals link state this way, and an entry left
         // unassigned means the device has nowhere to send one.
-        write16(COMMON_AT + common::CONFIG_MSIX_VECTOR, 0);
+        write16(w.common + common::CONFIG_MSIX_VECTOR, 0);
 
         // Two queues at least, or there is no transmit queue to put a frame on.
         // Checked rather than assumed because it is one read, and because a
         // device offering one queue would otherwise be configured as though it
         // had two and fail somewhere less obvious.
-        if read16(COMMON_AT + common::NUM_QUEUES) < 2 {
+        if read16(w.common + common::NUM_QUEUES) < 2 {
             return None;
         }
-        mac != 0
+        (mac != 0, status != 0)
     };
+    let (mac_offered, status_offered) = mac_offered;
     let _ = mac_offered;
 
     // SAFETY: the window is mapped and the offsets are distinct pages of the
     // rings object this program holds.
     let receive = unsafe {
         configure(
+            w,
             queue::RECEIVE,
             ring::RX_DESCRIPTORS,
             ring::RX_AVAILABLE,
             ring::RX_USED,
-            rings_at_device,
         )
     };
     // SAFETY: as above, with the transmit queue's own three pages.
     let transmit = unsafe {
         configure(
+            w,
             queue::TRANSMIT,
             ring::TX_DESCRIPTORS,
             ring::TX_AVAILABLE,
             ring::TX_USED,
-            rings_at_device,
         )
     };
 
-    Some((receive, transmit))
+    Some((receive, transmit, status_offered))
 }
 
 /// Gives the device every receive buffer this program owns.
@@ -584,12 +644,12 @@ fn bring_up(rings_at_device: u64) -> Option<(Virtqueue<Volatile>, Virtqueue<Vola
 /// reason to exist.** A network device delivers unbidden: the answer to the
 /// frame sent below can arrive before the next instruction runs, and a receive
 /// queue with nothing posted drops it without saying so.
-fn post_receive_buffers(receive: &mut Virtqueue<Volatile>, rings_at_device: u64) {
+fn post_receive_buffers(receive: &mut Virtqueue<Volatile>, w: Windows) {
     for index in 0..QUEUE_ENTRIES {
         let offset = ring::RX_BUFFERS + u64::from(index) * ring::RX_BUFFER;
         receive.describe(
             index,
-            rings_at_device + offset,
+            w.at_device + offset,
             ring::RX_BUFFER as u32,
             // The device writes this one. Without the flag it would read a
             // buffer this program never filled and send it.
@@ -610,10 +670,10 @@ fn post_receive_buffers(receive: &mut Virtqueue<Volatile>, rings_at_device: u64)
 ///
 /// # Safety
 ///
-/// The rings must be mapped writable at [`RINGS_AT`].
-unsafe fn fill_transmit(mac: [u8; 6]) -> u64 {
+/// The port's rings must be mapped writable at `w.rings`.
+unsafe fn fill_transmit(w: Windows, mac: [u8; 6]) -> u64 {
     const FRAME: u64 = 42;
-    let at = RINGS_AT + ring::TX_BUFFER;
+    let at = w.rings + ring::TX_BUFFER;
 
     // SAFETY: the caller guarantees the mapping; `VIRTIO_NET_HEADER + FRAME` is
     // far inside one page.
@@ -653,12 +713,33 @@ unsafe fn fill_transmit(mac: [u8; 6]) -> u64 {
     VIRTIO_NET_HEADER + FRAME
 }
 
+/// Whether the device says its link is up.
+///
+/// RFC 0074 step 4: a bond selects a member that can carry traffic, and the
+/// only thing that knows whether a member can is the device. The `u16` six
+/// bytes into the device configuration, bit 0 -- `virtio_net_config.status` and
+/// `VIRTIO_NET_S_LINK_UP` in `/usr/include/linux/virtio_net.h`, read off the
+/// machine rather than remembered.
+///
+/// **`true` when the feature was not negotiated**, which is the honest answer
+/// rather than the convenient one: a device that never offered a link state has
+/// not said its link is down, and a bond that treated silence as failure would
+/// refuse to use a working port. `status_offered` is what the caller passes.
+fn link_up(w: Windows, status_offered: bool) -> bool {
+    if !status_offered {
+        return true;
+    }
+    // SAFETY: the device configuration window this program mapped read-only,
+    // two bytes at an offset inside it.
+    unsafe { read16(w.device + 6) & 1 != 0 }
+}
+
 /// Waits for something to complete on `queue`, returning its used-ring length.
 ///
 /// Bounded, and honest about being a spin where there is no vector. A wait with
 /// no bound would hang the machine on a device that never answers, which is a
 /// worse failure than reporting that nothing came.
-fn await_completion(queue: &mut Virtqueue<Volatile>) -> Option<(u16, u32)> {
+fn await_completion(w: Windows, queue: &mut Virtqueue<Volatile>) -> Option<(u16, u32)> {
     // Looked at before waited on, and that order is deliberate. `WAIT` has no
     // timeout — RFC 0008 leaves that open and `kernel/src/ipc.rs` says so — so
     // a driver that waits first blocks for ever on any device that completes
@@ -678,7 +759,7 @@ fn await_completion(queue: &mut Virtqueue<Volatile>) -> Option<(u16, u32)> {
     // a vector to be woken by.
     if VECTORED.load(core::sync::atomic::Ordering::Relaxed) {
         let (status, _) = call(syscall::INVOKE, SIGNAL, method::WAIT, [0; 4]);
-        let _ = call(syscall::INVOKE, HANDLER, method::ACK, [0; 4]);
+        let _ = call(syscall::INVOKE, w.handler, method::ACK, [0; 4]);
         if status == self::status::OK {
             return queue.completed_with_length();
         }
@@ -817,7 +898,7 @@ unsafe fn read_runs_into(into: *mut u8, runs: (chan::Run, chan::Run)) {
 /// # Safety
 ///
 /// The return ring must be mapped at [`BACK_AT`] and the rings at [`RINGS_AT`].
-unsafe fn take_from_ipd() -> Option<usize> {
+unsafe fn take_from_ipd(w: Windows) -> Option<usize> {
     let layout = chan::Layout::for_region(RING_BYTES)?;
     // SAFETY: the ring's header, in the region this program mapped. Volatile
     // because the producer is another domain and takes no lock.
@@ -850,13 +931,13 @@ unsafe fn take_from_ipd() -> Option<usize> {
     // it is tested.
     let framed = chan::frame_to_read(layout, cursor, length)?;
 
-    let into = RINGS_AT + ring::TX_BUFFER + VIRTIO_NET_HEADER;
+    let into = w.rings + ring::TX_BUFFER + VIRTIO_NET_HEADER;
     // SAFETY: the ring is mapped, and the destination is inside a transmit
     // buffer this program mapped writable, bounded by the check above.
     unsafe {
         // The virtio header this device expects in front of every frame.
         for offset in 0..VIRTIO_NET_HEADER {
-            core::ptr::write_volatile((RINGS_AT + ring::TX_BUFFER + offset) as *mut u8, 0);
+            core::ptr::write_volatile((w.rings + ring::TX_BUFFER + offset) as *mut u8, 0);
         }
         read_runs_into(into as *mut u8, framed.payload);
         // Outbound, copy two of two: the ring into the transmit buffer.
@@ -883,6 +964,27 @@ fn poll_completion(queue: &mut Virtqueue<Volatile>) -> Option<(u16, u32)> {
     queue.completed_with_length()
 }
 
+/// One driven NIC, and everything this program knows about it.
+///
+/// **A bond needs two of these** — RFC 0074 step 4 — and until it did, every
+/// field here was a local in `netd_main` or an address welded into a function.
+/// That is the whole of what changed: nothing about how a port is driven, only
+/// that there can be more than one.
+struct Port {
+    /// Its windows, and where its device looks for its rings.
+    at: Windows,
+    receive: Virtqueue<Volatile>,
+    transmit: Virtqueue<Volatile>,
+    /// How many bytes the device puts in front of a received frame.
+    header: u64,
+    /// A descriptor handed to the device is the device's until it comes back.
+    outstanding: bool,
+    /// Whether the device offered a link state at all. See [`link_up`].
+    reports_link: bool,
+    /// What its link was, the last time it was looked at.
+    up: bool,
+}
+
 /// The entry point.
 #[unsafe(no_mangle)]
 extern "C" fn netd_main() -> ! {
@@ -905,7 +1007,16 @@ extern "C" fn netd_main() -> ! {
         exit()
     }
 
-    let Some((mut receive, mut transmit)) = bring_up(rings_at_device) else {
+    let first = Windows {
+        common: COMMON_AT,
+        notify: NOTIFY_AT,
+        device: DEVICE_AT,
+        rings: RINGS_AT,
+        at_device: rings_at_device,
+        handler: HANDLER,
+    };
+
+    let Some((mut receive, mut transmit, reports_link)) = bring_up(first) else {
         report(0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
         exit()
     };
@@ -922,7 +1033,7 @@ extern "C" fn netd_main() -> ! {
     };
 
     // Receive buffers first, then `DRIVER_OK`. See `post_receive_buffers`.
-    post_receive_buffers(&mut receive, rings_at_device);
+    post_receive_buffers(&mut receive, first);
 
     // SAFETY: the common window is mapped and the queues are enabled.
     unsafe {
@@ -933,24 +1044,24 @@ extern "C" fn netd_main() -> ! {
                 | device_status::FEATURES_OK
                 | device_status::DRIVER_OK,
         );
-        kick(queue::RECEIVE);
+        kick(first, queue::RECEIVE);
     }
 
     // SAFETY: the rings are mapped writable.
-    let length = unsafe { fill_transmit(mac) };
+    let length = unsafe { fill_transmit(first, mac) };
     transmit.describe(0, rings_at_device + ring::TX_BUFFER, length as u32, 0, 0);
     transmit.publish(0);
     // SAFETY: the notify window is mapped and the queue is enabled.
-    unsafe { kick(queue::TRANSMIT) };
+    unsafe { kick(first, queue::TRANSMIT) };
 
-    let sent = if await_completion(&mut transmit).is_some() {
+    let sent = if await_completion(first, &mut transmit).is_some() {
         length
     } else {
         0
     };
 
     // What came back, if anything.
-    let (received, source, header, first_index) = match await_completion(&mut receive) {
+    let (received, source, header, first_index) = match await_completion(first, &mut receive) {
         Some((index, written)) => {
             let buffer = RINGS_AT + ring::RX_BUFFERS + u64::from(index) * ring::RX_BUFFER;
             // The header size, measured rather than assumed. The frame is an
@@ -1023,6 +1134,103 @@ extern "C" fn netd_main() -> ! {
         0,
     );
 
+    // **The bond's members.** RFC 0074 step 4.
+    //
+    // The first port is the one everything above measured, and it is member
+    // zero. The second is delegated at slots 10 upward when the machine has a
+    // NIC to spare; a machine with one leaves them empty, the attach fails, and
+    // this program drives one port exactly as it always did. Asked of the
+    // capability space rather than told in a word somewhere: a slot either
+    // holds a device or it does not.
+    let mut ports: [Option<Port>; 2] = [
+        Some(Port {
+            at: first,
+            receive,
+            transmit,
+            header,
+            outstanding: false,
+            reports_link,
+            up: link_up(first, reports_link),
+        }),
+        None,
+    ];
+
+    if attach(COMMON_1, COMMON_1_AT, 1)
+        && attach(NOTIFY_1, NOTIFY_1_AT, 1)
+        && attach(DEVICE_1, DEVICE_1_AT, 0)
+        && attach(RINGS_1, RINGS_1_AT, 1)
+    {
+        let (mapped, at_device) = call(syscall::INVOKE, WINDOW_1, method::MAP, [RINGS_1, 0, 0, 0]);
+        let second = Windows {
+            common: COMMON_1_AT,
+            notify: NOTIFY_1_AT,
+            device: DEVICE_1_AT,
+            rings: RINGS_1_AT,
+            at_device,
+            handler: HANDLER_1,
+        };
+        if mapped == status::OK
+            && let Some((mut receive, transmit, reports_link)) = bring_up(second)
+        {
+            // **This member's own address is read by nobody**, and that is
+            // the bond saying what it is: every frame leaves under the first
+            // member's address whichever member carries it, so a second address
+            // would be a fact with no consumer. See `bond_mac`.
+            post_receive_buffers(&mut receive, second);
+            // SAFETY: the second common window is mapped and its queues are
+            // enabled.
+            unsafe {
+                write8(
+                    COMMON_1_AT + common::DEVICE_STATUS,
+                    device_status::ACKNOWLEDGE
+                        | device_status::DRIVER
+                        | device_status::FEATURES_OK
+                        | device_status::DRIVER_OK,
+                );
+                kick(second, queue::RECEIVE);
+            }
+            ports[1] = Some(Port {
+                at: second,
+                receive,
+                transmit,
+                // The header size is the transport's, not the device's, and the
+                // first port measured it against a frame addressed to itself.
+                // This port has had no frame yet, so it takes that answer
+                // rather than guessing from nothing.
+                header,
+                outstanding: false,
+                reports_link,
+                up: link_up(second, reports_link),
+            });
+        }
+    }
+
+    // **Which member carries traffic.** Active-backup, which is RFC 0074's
+    // first mode because it needs no protocol and no cooperation from the
+    // switch.
+    //
+    // Sticky: a member that comes back does *not* take the link back, because
+    // that is churn and reordering bought for nothing. The selection changes
+    // only when the member carrying traffic stops being able to.
+    let mut active = 0usize;
+    let mut failovers = 0u64;
+    // **The bond's address, which is the first member's**, and everything the
+    // bond sends carries it whichever member carries the frame. That is what
+    // makes this one interface rather than two: `bin/ipd` is told this address
+    // once and never has to be told again, so a failover costs no ARP, no DHCP
+    // and no reconfiguration above the driver.
+    //
+    // It is also the thing a failover can quietly break. Linux's bonding calls
+    // the alternative `fail_over_mac` and offers it for hardware that cannot
+    // send from an address that is not its own; this sends from the bond's, and
+    // whether the answer comes back is what the failover gate measures.
+    let bond_mac = mac;
+    // Frames a member that is not carrying traffic delivered, and which were
+    // therefore dropped. Counted rather than ignored: on a bond both members
+    // are on the wire and both receive, and a frame taken from the backup would
+    // be a duplicate of one the active member already handed across.
+    let mut off_member = 0u64;
+
     // Everything after this is step 3: frames go to `bin/ipd` rather than into
     // a report. Without a ring there is nowhere to put them, and this program
     // idles rather than exiting -- a domain that ended would take the rings the
@@ -1051,16 +1259,18 @@ extern "C" fn netd_main() -> ! {
         // Back to the device. **A receive queue that is drained and not
         // refilled works exactly once**, which is the failure a self-test
         // needing one frame could never have found.
-        receive.describe(
-            first_index,
-            rings_at_device + ring_buffer_of(first_index),
-            ring::RX_BUFFER as u32,
-            virtqueue::WRITE,
-            0,
-        );
-        receive.publish(first_index);
-        // SAFETY: the notify window is mapped and the queue is enabled.
-        unsafe { kick(queue::RECEIVE) };
+        if let Some(port) = ports[0].as_mut() {
+            port.receive.describe(
+                first_index,
+                rings_at_device + ring_buffer_of(first_index),
+                ring::RX_BUFFER as u32,
+                virtqueue::WRITE,
+                0,
+            );
+            port.receive.publish(first_index);
+            // SAFETY: the notify window is mapped and the queue is enabled.
+            unsafe { kick(port.at, queue::RECEIVE) };
+        }
     }
 
     // From here on: whatever arrives, handed across and the buffer given back.
@@ -1075,16 +1285,52 @@ extern "C" fn netd_main() -> ! {
         received,
         source,
         header,
-        u64::from(receive.seen()),
+        u64::from(receive_seen(&ports)),
         handed,
         sent_for_ipd,
         took,
         took_length,
     );
+    bond_report(&ports, active, failovers, off_member);
     let mut probes = 0u32;
-    let mut outstanding = false;
     let mut idle = 0u32;
     loop {
+        // **What each member's link is doing**, asked every pass because it is
+        // two reads of a register the device owns and because a bond that
+        // noticed a failure late would drop everything sent in between.
+        for port in ports.iter_mut().flatten() {
+            port.up = link_up(port.at, port.reports_link);
+        }
+        // The member carrying traffic has stopped being able to: select
+        // another, if there is one that can. If there is not, the bond keeps
+        // the member it has -- a down member and a bond with no members are the
+        // same amount of traffic, and staying put means the link coming back
+        // needs no second decision.
+        if !ports[active].as_ref().is_some_and(|port| port.up) {
+            for (index, port) in ports.iter().enumerate() {
+                if index != active && port.as_ref().is_some_and(|port| port.up) {
+                    active = index;
+                    failovers += 1;
+                    // **Announce on the member that has taken over.** A switch
+                    // learns which port an address is on from the frames it
+                    // sees, and after a failover everything it learned is
+                    // wrong: it goes on sending this station's traffic to a
+                    // port that has gone away, until something arrives from the
+                    // new one. Linux's bonding sends gratuitous ARP here for
+                    // this reason; this driver has one frame it knows how to
+                    // send, so it sends that.
+                    //
+                    // It is also what makes "traffic continues" measurable
+                    // rather than hoped for: the answer comes back on the new
+                    // member and crosses to `bin/ipd`, so the report can say a
+                    // frame arrived *after* the failover rather than that
+                    // nothing has gone wrong yet.
+                    probes = 0;
+                    break;
+                }
+            }
+        }
+
         // **One transmit outstanding at a time.** A descriptor handed to the
         // device is the device's until it appears in the used ring, and this
         // loop was republishing descriptor zero every pass without waiting --
@@ -1092,112 +1338,141 @@ extern "C" fn netd_main() -> ! {
         // survived it because every probe is the same bytes; the first frame
         // that differed, `ipd`'s, was published into a queue already being
         // mishandled and never reached the wire.
-        if poll_completion(&mut transmit).is_some() {
-            outstanding = false;
+        for port in ports.iter_mut().flatten() {
+            if poll_completion(&mut port.transmit).is_some() {
+                port.outstanding = false;
+            }
         }
 
-        // One probe per pass, and only when the last one is done.
-        if probes < 8 && !outstanding {
-            transmit.describe(0, rings_at_device + ring::TX_BUFFER, length as u32, 0, 0);
-            transmit.publish(0);
-            // SAFETY: the notify window is mapped and the queue is enabled.
-            unsafe { kick(queue::TRANSMIT) };
-            probes += 1;
-            outstanding = true;
-        }
-
-        // Anything `bin/ipd` has built goes out. One per pass, and the
-        // completion collected on a later pass -- this program is pinned, and
-        // step 3 established that a spin here trips the bring-up watchdog.
-        if back_mapped && !outstanding {
-            // SAFETY: both rings are mapped and the transmit buffer is inside
-            // the rings object this program holds.
-            // **Descriptor zero, and it was descriptor two.** Every frame this
-            // program sent for `bin/ipd` reached the wire truncated to exactly
-            // 42 bytes -- the probe's length, 54, less the virtio header --
-            // however long the frame actually was. The headers were correct
-            // because they are the first 42 bytes of a correct frame, so the
-            // damage was invisible from this side: the ring said 59 bytes taken
-            // and `filter-dump` said 42 on the wire, which is what finally
-            // named it. A server cannot answer a datagram whose IP header
-            // promises 272 bytes and whose frame carries 28.
-            //
-            // **Why descriptor two behaved that way is now known**, and it was
-            // not descriptor two: this driver never wrote `QUEUE_SIZE`, so the
-            // device wrapped the rings at 256 while this side wrapped them at
-            // four. Past the fourth request the device was reading available
-            // entries nobody had written. Descriptor two would work today.
-            // Descriptor zero is kept because it is simpler and `outstanding`
-            // already allows one transmit at a time, so there is never a second
-            // one to name.
-            if let Some(from_ipd) = unsafe { take_from_ipd() } {
-                idle = 0;
-                // SAFETY: the transmit buffer this program mapped, just filled.
-                took = unsafe {
-                    let mut value = 0u64;
-                    for octet in 0..6u64 {
-                        value = (value << 8)
-                            | u64::from(read8(
-                                RINGS_AT + ring::TX_BUFFER + VIRTIO_NET_HEADER + octet,
-                            ));
-                    }
-                    value
-                };
-                took_length = from_ipd as u64;
-                transmit.describe(
-                    0,
-                    rings_at_device + ring::TX_BUFFER,
-                    (VIRTIO_NET_HEADER + from_ipd as u64) as u32,
-                    0,
-                    0,
-                );
-                transmit.publish(0);
+        // Everything that goes out, goes out of the member carrying traffic.
+        if let Some(port) = ports[active].as_mut() {
+            // One probe per pass, and only when the last one is done.
+            if probes < 8 && !port.outstanding {
+                // SAFETY: this member's rings are mapped writable.
+                let length = unsafe { fill_transmit(port.at, bond_mac) };
+                port.transmit
+                    .describe(0, port.at.at_device + ring::TX_BUFFER, length as u32, 0, 0);
+                port.transmit.publish(0);
                 // SAFETY: the notify window is mapped and the queue is enabled.
-                unsafe { kick(queue::TRANSMIT) };
-                sent_for_ipd += 1;
-                outstanding = true;
+                unsafe { kick(port.at, queue::TRANSMIT) };
+                probes += 1;
+                port.outstanding = true;
+            }
+
+            // Anything `bin/ipd` has built goes out. One per pass, and the
+            // completion collected on a later pass -- this program is pinned,
+            // and step 3 established that a spin here trips the bring-up
+            // watchdog.
+            if back_mapped && !port.outstanding {
+                // SAFETY: both rings are mapped and the transmit buffer is
+                // inside the rings object this program holds.
+                //
+                // **Descriptor zero, and it was descriptor two.** Every frame
+                // this program sent for `bin/ipd` reached the wire truncated to
+                // exactly 42 bytes -- the probe's length, 54, less the virtio
+                // header -- however long the frame actually was. The headers
+                // were correct because they are the first 42 bytes of a correct
+                // frame, so the damage was invisible from this side: the ring
+                // said 59 bytes taken and `filter-dump` said 42 on the wire,
+                // which is what finally named it. A server cannot answer a
+                // datagram whose IP header promises 272 bytes and whose frame
+                // carries 28.
+                //
+                // **Why descriptor two behaved that way is now known**, and it
+                // was not descriptor two: this driver never wrote `QUEUE_SIZE`,
+                // so the device wrapped the rings at 256 while this side
+                // wrapped them at four. Past the fourth request the device was
+                // reading available entries nobody had written. Descriptor two
+                // would work today. Descriptor zero is kept because it is
+                // simpler and `outstanding` already allows one transmit at a
+                // time, so there is never a second one to name.
+                if let Some(from_ipd) = unsafe { take_from_ipd(port.at) } {
+                    idle = 0;
+                    // SAFETY: the transmit buffer this program mapped, just
+                    // filled.
+                    took = unsafe {
+                        let mut value = 0u64;
+                        for octet in 0..6u64 {
+                            value = (value << 8)
+                                | u64::from(read8(
+                                    port.at.rings + ring::TX_BUFFER + VIRTIO_NET_HEADER + octet,
+                                ));
+                        }
+                        value
+                    };
+                    took_length = from_ipd as u64;
+                    port.transmit.describe(
+                        0,
+                        port.at.at_device + ring::TX_BUFFER,
+                        (VIRTIO_NET_HEADER + from_ipd as u64) as u32,
+                        0,
+                        0,
+                    );
+                    port.transmit.publish(0);
+                    // SAFETY: the notify window is mapped and the queue is
+                    // enabled.
+                    unsafe { kick(port.at, queue::TRANSMIT) };
+                    sent_for_ipd += 1;
+                    port.outstanding = true;
+                }
             }
         }
 
         idle = idle.saturating_add(1);
-        if let Some((index, written)) = poll_completion(&mut receive) {
+        // Every member's receive queue, because both are on the wire whether
+        // or not either is carrying traffic. A frame from a member that is not
+        // the active one is given back to the device and *not* handed across:
+        // it is a duplicate of one the active member has already delivered, and
+        // a bond that delivered both would be a bond that reordered.
+        for index in 0..ports.len() {
+            let Some(port) = ports[index].as_mut() else {
+                continue;
+            };
+            let Some((slot, written)) = poll_completion(&mut port.receive) else {
+                continue;
+            };
             idle = 0;
             if u64::from(written) > WIDEST.load(core::sync::atomic::Ordering::Relaxed) {
                 WIDEST.store(u64::from(written), core::sync::atomic::Ordering::Relaxed);
             }
             OUTSTANDING.store(
-                u64::from(receive.posted().wrapping_sub(receive.seen())),
+                u64::from(port.receive.posted().wrapping_sub(port.receive.seen())),
                 core::sync::atomic::Ordering::Relaxed,
             );
-            let buffer = RINGS_AT + ring_buffer_of(index) + header;
-            let length = u64::from(written).saturating_sub(header) as usize;
-            // SAFETY: as above.
-            if length > 0 && unsafe { hand_to_ipd(buffer, length) } {
-                handed += 1;
+            let buffer = port.at.rings + ring_buffer_of(slot) + port.header;
+            let length = u64::from(written).saturating_sub(port.header) as usize;
+            if index == active {
+                // SAFETY: as above.
+                if length > 0 && unsafe { hand_to_ipd(buffer, length) } {
+                    handed += 1;
+                }
+            } else if length > 0 {
+                off_member += 1;
             }
+            port.receive.describe(
+                slot,
+                port.at.at_device + ring_buffer_of(slot),
+                ring::RX_BUFFER as u32,
+                virtqueue::WRITE,
+                0,
+            );
+            port.receive.publish(slot);
+            // SAFETY: the notify window is mapped and the queue is enabled.
+            unsafe { kick(port.at, queue::RECEIVE) };
             report(
                 own,
                 sent,
                 received,
                 source,
                 header,
-                u64::from(receive.seen()),
+                u64::from(receive_seen(&ports)),
                 handed,
                 sent_for_ipd,
                 took,
                 took_length,
             );
-            receive.describe(
-                index,
-                rings_at_device + ring_buffer_of(index),
-                ring::RX_BUFFER as u32,
-                virtqueue::WRITE,
-                0,
-            );
-            receive.publish(index);
-            // SAFETY: the notify window is mapped and the queue is enabled.
-            unsafe { kick(queue::RECEIVE) };
         }
+        bond_report(&ports, active, failovers, off_member);
         // **Quiesce rather than spin.** This loop polled for ever, and a pinned
         // program that never stops polling is a processor the rest of the
         // machine cannot have -- which showed up as the shell test timing out
@@ -1208,12 +1483,66 @@ extern "C" fn netd_main() -> ! {
         // notification the kernel binds to the device's vector, and the device
         // wakes it when there is a frame. That is what the interrupt was
         // delegated for, and until now this program only used it as a fallback.
+        //
+        // **Both members raise the same notification**, with different badges,
+        // so one park covers the bond and the wake is followed by a look at
+        // every port.
+        //
+        // **Parking is safe for a link, and that was worth checking rather than
+        // assuming.** A device with no link has no frames to signal, so the
+        // first version of this stayed awake on a two-port machine to read the
+        // link registers -- a pinned domain spinning for the life of every boot
+        // that has two NICs, which is the cost this park exists to avoid. It is
+        // not necessary: a network device signals a *configuration change* on
+        // the same MSI-X entry as its queues (see `CONFIG_MSIX_VECTOR` in
+        // `bring_up`), and a link going down is one. The wake arrives, the loop
+        // reads both links, and the bond selects.
         if idle > 200 && VECTORED.load(core::sync::atomic::Ordering::Relaxed) {
             let _ = call(syscall::INVOKE, SIGNAL, method::WAIT, [0; 4]);
-            let _ = call(syscall::INVOKE, HANDLER, method::ACK, [0; 4]);
+            for port in ports.iter().flatten() {
+                let _ = call(syscall::INVOKE, port.at.handler, method::ACK, [0; 4]);
+            }
             idle = 0;
         } else {
             call(syscall::YIELD, 0, 0, [0; 4]);
+        }
+    }
+}
+
+/// What the first port's receive queue has seen, for the report.
+///
+/// The report's `rx_seen` word predates the bond and names one queue. It stays
+/// the first port's, so the number means what it has always meant; the bond's
+/// own counts are in [`bond_report`].
+fn receive_seen(ports: &[Option<Port>; 2]) -> u16 {
+    ports[0].as_ref().map_or(0, |port| port.receive.seen())
+}
+
+/// Leaves the bond's own state where the kernel reads the rest of the report.
+///
+/// Words 17 to 20, appended rather than folded into [`report`]'s arguments:
+/// that function already takes ten and clippy's limit is not the only reason to
+/// stop -- a caller passing four more positional numbers is a caller that will
+/// pass them in the wrong order.
+fn bond_report(ports: &[Option<Port>; 2], active: usize, failovers: u64, off_member: u64) {
+    let at = RINGS_AT + ring::REPORT;
+    let members = ports.iter().flatten().count() as u64;
+    // One bit per member, so "the bond is up on one leg" and "both are up" are
+    // different numbers rather than the same count.
+    let mut links = 0u64;
+    for (index, port) in ports.iter().enumerate() {
+        if port.as_ref().is_some_and(|port| port.up) {
+            links |= 1 << index;
+        }
+    }
+    let words = [members, active as u64, links, failovers, off_member];
+    // SAFETY: the report page this program mapped writable, at the five words
+    // that follow the seventeen `report` writes. The marker is not touched:
+    // this is an addition to a report that is already published, and a reader
+    // that stops at seventeen words is unaffected.
+    unsafe {
+        for (index, word) in words.iter().enumerate() {
+            core::ptr::write_volatile((at + (17 + index as u64) * 8) as *mut u64, *word);
         }
     }
 }

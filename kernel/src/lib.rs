@@ -443,6 +443,15 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
         // reason the comment above `busybox=1` gives: this file has two
         // conventions and a flag that is accepted and does nothing is the
         // failure it keeps recording.
+        // `bhaskix.bond=<ms>` — RFC 0074 step 4, and the same bargain as the
+        // line below it.
+        if let Some(value) = word
+            .strip_prefix("bhaskix.bond=")
+            .or_else(|| word.strip_prefix("bond="))
+            && let Ok(ms) = value.parse::<u64>()
+        {
+            BOND_PATIENCE_MS.store(ms.min(120_000), core::sync::atomic::Ordering::Relaxed);
+        }
         if let Some(value) = word
             .strip_prefix("bhaskix.lacp=")
             .or_else(|| word.strip_prefix("lacp="))
@@ -3966,6 +3975,18 @@ static RING_SOAK_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU
 /// spend the whole window learning that, which is why the default is not to
 /// wait at all.
 static LACP_PATIENCE_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// How long the boot report will wait for a bond to fail over, in milliseconds.
+///
+/// Zero on every ordinary boot, and for the reason [`LACP_PATIENCE_MS`] gives:
+/// a member goes down when something takes it down, which on these lanes is a
+/// harness reaching in over QEMU's monitor several seconds into the boot. A
+/// report that glanced once would print the bond it started with and never the
+/// bond it became.
+///
+/// `bhaskix.bond=<ms>` sets it, and one harness does. Every other lane has
+/// nobody to pull its cable and would spend the window finding that out.
+static BOND_PATIENCE_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// Extra runnable threads spawned alongside the ring — `ringload=<n>`.
 ///
@@ -15072,6 +15093,13 @@ pub fn start_net_domain(
     // authority to program one -- an MSI is a memory write of an arbitrary
     // vector to an arbitrary CPU.
     const NET_BADGE: u64 = 1 << 2;
+    // **Kept, because a second port shares it.** RFC 0074 step 4: a bond needs
+    // both members driven, and a driver that had to park on two notifications
+    // would need a wait that names two sources. It does not need one -- two
+    // vectors can raise the *same* notification with different badges, so the
+    // driver parks once and looks at both devices when it wakes. The badge says
+    // which port rang, and nothing yet needs to ask.
+    let mut shared_signal = None;
     let signalled = match crate::notify::create() {
         Ok(notification) => {
             // Kept so `bin/ipd` can be given a doorbell onto it. **The kernel
@@ -15112,6 +15140,11 @@ pub fn start_net_domain(
                                 && owner.cspace.install_at(6, notify_cap).is_ok()
                         }) == Some(true)
                     {
+                        // Only on the path where it survives: every other arm
+                        // below destroys it, and a second port binding a
+                        // destroyed notification would arm a vector that wakes
+                        // nobody.
+                        shared_signal = Some(notification);
                         true
                     } else {
                         irq::release(handler);
@@ -15146,6 +15179,29 @@ pub fn start_net_domain(
         );
     } else {
         println!("    net domain     no interrupt delegated; the driver polls its used rings");
+    }
+
+    // **The second member of a bond** -- RFC 0074 step 4.
+    //
+    // Delegated only when there is one, and the driver is written to find its
+    // absence: a machine with one NIC hands `bin/netd` nothing at slots 10 to
+    // 15 and it drives one port, which is every lane that is not the bond's.
+    //
+    // At slots 10..=15 rather than interleaved with the first port's, so that
+    // "which slot is this?" has an answer that does not depend on how many
+    // ports were found. Slots 7, 8 and 9 are the rings to `bin/ipd` and its
+    // doorbell, which belong to the driver and not to either port.
+    if ports > 1 {
+        match delegate_second_port(realm, keeper, shared_signal, apic_id, rsdp, hhdm_base) {
+            Ok(true) => println!(
+                "    net domain     port 1 delegated as well: a bond has two members to select from"
+            ),
+            Ok(false) => println!(
+                "\x1b[93m    net domain     port 1 not delegated; the bond has one member and \
+                 cannot fail over\x1b[0m"
+            ),
+            Err(why) => println!("\x1b[91m    net domain     port 1 FAILED: {why}\x1b[0m"),
+        }
     }
 
     // RFC 0018 step 3: the other half of the stack, and the ring between them.
@@ -15195,6 +15251,145 @@ pub fn start_net_domain(
 
     NET_RINGS.store(rings.as_u64(), core::sync::atomic::Ordering::Release);
     Ok(())
+}
+
+/// Hands the net domain a second NIC, so a bond has something to fail over to.
+///
+/// RFC 0074 step 4. The first port is delegated inline in [`start_net_domain`]
+/// and this is deliberately *not* a shared helper for both: the first port's
+/// path prints what it found, decides whether the machine has a network at all,
+/// and its slots are read by three other places. Making one function serve both
+/// would have meant a parameter for every one of those differences, which is a
+/// worse way of saying "these are not the same job".
+///
+/// Returns whether the port was delegated with everything a driver needs. A
+/// port with registers and no DMA window is **not** delegated: without one the
+/// device cannot be made to send or receive at all, so a bond would select a
+/// member that can carry nothing — which is worse than a bond with one member,
+/// because it looks like it worked.
+///
+/// # Errors
+///
+/// A capability that would not be created or installed. The first port is
+/// already delegated by the time this runs, so every error here leaves a
+/// working single-port network rather than no network.
+fn delegate_second_port(
+    realm: domain::DomainId,
+    keeper: domain::DomainId,
+    signal: Option<crate::notify::NotificationId>,
+    apic_id: u32,
+    rsdp: Option<bhaskix_boot::PhysAddr>,
+    hhdm_base: u64,
+) -> Result<bool, &'static str> {
+    /// The badge this port's vector raises. One bit up from the first port's,
+    /// on the notification they share.
+    const NET_BADGE_1: u64 = 1 << 3;
+
+    let Some((address, _)) = virtio::find_nth_of(virtio::Class::NET, 1) else {
+        return Ok(false);
+    };
+    let layout =
+        virtio::layout(address).ok_or("the second network device is not a modern virtio")?;
+
+    // SAFETY: this device belongs to nobody either -- the walk above counted it
+    // and no driver in this kernel claims it.
+    unsafe { bhaskix_arch::pci::enable_memory(address) };
+
+    for (index, (base, length)) in [layout.common, layout.notify, layout.device]
+        .iter()
+        .enumerate()
+    {
+        if *length > bhaskix_mm::FRAME_SIZE {
+            return Err("a virtio structure spans more than one page");
+        }
+        let window = cap::with_arena(|arena| {
+            arena
+                .insert_root(
+                    cap::ObjectRef::new(
+                        cap::ObjectKind::Frame,
+                        base & !(bhaskix_mm::FRAME_SIZE - 1),
+                    ),
+                    cap::Rights::READ
+                        .union(cap::Rights::WRITE)
+                        .union(cap::Rights::DERIVE),
+                    0,
+                )
+                .ok()
+        })
+        .ok_or("a second device window capability would not be created")?;
+        if domain::with(realm, |owner| {
+            owner.cspace.install_at(10 + index, window).is_ok()
+        }) != Some(true)
+        {
+            return Err("a second device window capability would not install");
+        }
+    }
+
+    // Rings of its own, the same eight pages the first port has and for the
+    // same arithmetic. Shared rings would be two devices writing one descriptor
+    // table, which is not a bond but a fault.
+    let rings = shared::create(keeper, 8 * bhaskix_mm::FRAME_SIZE)
+        .map_err(|_| "the second port's rings would not be created")?;
+    let named = shared::name(rings).map_err(|_| "the second port's rings would not be named")?;
+    if domain::with(realm, |owner| owner.cspace.install_at(13, named).is_ok()) != Some(true) {
+        return Err("the second port's rings capability would not install");
+    }
+
+    let delegated = (address.bus, address.device, address.function);
+    if !iommu::present_for(delegated) {
+        return Ok(false);
+    }
+    let window = iommu::name(delegated).map_err(|_| "the second dma window would not be named")?;
+    if domain::with(realm, |owner| owner.cspace.install_at(14, window).is_ok()) != Some(true) {
+        return Err("the second dma window capability would not install");
+    }
+
+    // The vector, onto the notification the first port already raises. A driver
+    // that parks on one thing and wakes for either device is the whole reason
+    // these share: see `shared_signal`.
+    if let Some(notification) = signal {
+        // SAFETY: as the first port's -- `trap` dispatches claimed vectors to
+        // `irq::on_interrupt`, and this device is the net domain's.
+        let claimed = unsafe {
+            irq::claim_for(
+                irq::Source::MessageSignalled {
+                    device: address,
+                    entry: 0,
+                },
+                realm.as_u32(),
+                "netd",
+                apic_id,
+                rsdp,
+                hhdm_base,
+            )
+        };
+        match claimed {
+            Ok(handler) if irq::bind(handler, notification, NET_BADGE_1).is_ok() => {
+                if let Ok(handler_cap) = irq::name(handler)
+                    && domain::with(realm, |owner| {
+                        owner.cspace.install_at(15, handler_cap).is_ok()
+                    }) == Some(true)
+                {
+                    // Bound and installed. The driver acknowledges this one
+                    // through slot 15 and the first through slot 5.
+                } else {
+                    irq::release(handler);
+                }
+            }
+            Ok(handler) => {
+                irq::release(handler);
+            }
+            // No vector for this port. It still receives -- the driver polls
+            // both used rings whenever anything wakes it -- so this is a cost
+            // rather than a refusal.
+            Err(_) => {}
+        }
+    }
+
+    // SAFETY: this device is the net domain's; nothing else drives it, and it
+    // translates through the window installed above.
+    unsafe { bhaskix_arch::pci::enable(address) };
+    Ok(true)
 }
 
 /// Creates the ring between `bin/netd` and `bin/ipd`, and starts `bin/ipd`.
@@ -18118,6 +18313,81 @@ fn time_the_burst(hhdm: u64) {
 ///
 /// This prints what the driver saw by the end, which is the only version of
 /// those numbers that can say whether the offer was ever delivered.
+/// Prints what the bond is made of, and — where a lane asked for it — what it
+/// became.
+///
+/// RFC 0074 step 4's gate is that traffic continues across a member being
+/// downed and that the report names which member is active before and after.
+/// Both halves come from one boot: the line below is *before*, and where
+/// [`BOND_PATIENCE_MS`] is set this waits for the failover the harness is about
+/// to cause and prints *after*.
+///
+/// **Waiting for the traffic and not only for the failover.** A selection that
+/// changed proves the driver noticed; a frame handed across afterwards proves
+/// the bond still carries. So this waits for both, and says which one it got —
+/// a failover with no traffic after it is a bond that failed over into silence,
+/// and it must not print as a pass.
+fn report_bond(words: &mut [u64; 22], take: impl Fn(&mut [u64; 22])) {
+    /// Which member the bond is on, and what each member's link says.
+    fn members(words: &[u64; 22]) -> (u64, u64, u64) {
+        (words[17], words[18], words[19])
+    }
+
+    let (count, active, links) = members(words);
+    if count == 0 {
+        return;
+    }
+    println!(
+        "    net bond       {count} member(s), active-backup; traffic on port {active}, \
+         link up on {}",
+        if links == 0 {
+            "no member at all"
+        } else if links == 0b11 {
+            "both"
+        } else if links & 1 != 0 {
+            "port 0 only"
+        } else {
+            "port 1 only"
+        }
+    );
+
+    let patience = BOND_PATIENCE_MS.load(core::sync::atomic::Ordering::Relaxed);
+    if patience == 0 {
+        return;
+    }
+    let handed = words[9];
+    let mut failed_over = false;
+    let mut carried = false;
+    for _ in 0..(patience / 50) {
+        take(words);
+        failed_over = words[20] != 0;
+        carried = words[9] > handed;
+        if failed_over && carried {
+            break;
+        }
+        wait_millis(50);
+    }
+    let (_, active, links) = members(words);
+    if failed_over && carried {
+        println!(
+            "    net bond       \x1b[92mfailed over {} time(s): traffic on port {active} now, \
+             and {} frame(s) have crossed since\x1b[0m",
+            words[20],
+            words[9] - handed
+        );
+    } else if failed_over {
+        println!(
+            "\x1b[91m    net bond       failed over to port {active} and nothing has crossed \
+             since: the bond selected a member that carries nothing\x1b[0m"
+        );
+    } else {
+        println!(
+            "    net bond       no member went down inside the window; traffic is still on \
+             port {active}, link up on {links:#b}"
+        );
+    }
+}
+
 fn report_net_after_exchange(hhdm: u64) {
     use core::sync::atomic::Ordering;
 
@@ -18131,16 +18401,32 @@ fn report_net_after_exchange(hhdm: u64) {
     if count <= NETD_REPORT_PAGE {
         return;
     }
-    let mut words = [0u64; 16];
+    // **Twenty-two words**, seventeen of which are the driver's original
+    // report and five of which are the bond's -- members, which one carries
+    // traffic, each member's link, how many times it has failed over, and
+    // frames dropped from a member that is not carrying traffic. The length is
+    // derived from the array, for the reason the `bin/ipd` report below gives
+    // at length: a length written twice is wrong in one of the two places.
+    let mut words = [0u64; 22];
     // SAFETY: a frame this object owns, through the direct map, read as the
-    // sixteen little-endian words the driver wrote there.
-    let raw =
-        unsafe { core::slice::from_raw_parts((hhdm + frames[NETD_REPORT_PAGE]) as *const u8, 128) };
-    for (index, word) in words.iter_mut().enumerate() {
-        let mut buffer = [0u8; 8];
-        buffer.copy_from_slice(&raw[index * 8..index * 8 + 8]);
-        *word = u64::from_le_bytes(buffer);
-    }
+    // little-endian words the driver wrote there -- `words.len() * 8` bytes of
+    // a page, so the read cannot reach past the frame.
+    let raw = unsafe {
+        core::slice::from_raw_parts(
+            (hhdm + frames[NETD_REPORT_PAGE]) as *const u8,
+            words.len() * 8,
+        )
+    };
+    // Read again rather than once: the driver writes this page while it is
+    // read, and a bond that fails over does so *after* the first look.
+    let take = |words: &mut [u64; 22]| {
+        for (index, word) in words.iter_mut().enumerate() {
+            let mut buffer = [0u8; 8];
+            buffer.copy_from_slice(&raw[index * 8..index * 8 + 8]);
+            *word = u64::from_le_bytes(buffer);
+        }
+    };
+    take(&mut words);
     if words[0] != NETD_MARKER {
         return;
     }
@@ -18149,6 +18435,7 @@ fn report_net_after_exchange(hhdm: u64) {
          the device wrote {} bytes, {} buffers left with it",
         words[8], words[9], words[10], words[13], words[14]
     );
+    report_bond(&mut words, take);
 
     let raw = NET_RING_REPORT.load(Ordering::Acquire);
     if raw == u64::MAX {
@@ -24994,6 +25281,51 @@ fn iommu_bringup(handoff: &Handoff) -> Option<(iommu::Report, iommu::Window)> {
             }
             None => println!(
                 "\x1b[91m    iommu window   FAILED: no page table for the network device\x1b[0m"
+            ),
+        }
+    }
+
+    // **The bond's second member, and the sixth domain id** -- RFC 0074 step 4.
+    //
+    // Its own page table for the reason the first NIC's has one, and the reason
+    // is stronger here rather than weaker: the two ports of a bond are the same
+    // network, so a shared translation would let a frame arriving on the backup
+    // land in the buffers of the member carrying traffic.
+    //
+    // Silent where there is no second NIC, which is most lanes.
+    if let Some((net, _)) = virtio::find_nth_of(virtio::Class::NET, 1) {
+        let delegated = (net.bus, net.device, net.function);
+        match iommu::attach_device(&window, delegated, 6, hhdm) {
+            Some(net_window) => {
+                if iommu::verify_window(&net_window, iommu::windows_on(delegated.0) + 1, hhdm)
+                    && iommu::install(delegated, found, net_window)
+                {
+                    // SAFETY: as the first port's -- the unit caches context
+                    // entries and goes on believing this device has none.
+                    let invalidated = unsafe { iommu::invalidate_contexts() };
+                    if !invalidated {
+                        println!(
+                            "\x1b[91m    iommu window   FAILED: the context cache did not \
+                             invalidate for the second port\x1b[0m"
+                        );
+                    }
+                    println!(
+                        "    iommu window   {:02x}:{:02x}.{} translating too, the second port's \
+                         own page table and domain, {} in use",
+                        delegated.0,
+                        delegated.1,
+                        delegated.2,
+                        iommu::windows()
+                    );
+                } else {
+                    println!(
+                        "\x1b[91m    iommu window   FAILED: the second port's tables did not \
+                         read back\x1b[0m"
+                    );
+                }
+            }
+            None => println!(
+                "\x1b[91m    iommu window   FAILED: no page table for the second port\x1b[0m"
             ),
         }
     }
