@@ -166,6 +166,45 @@ address on the VLAN, and the existing network gates running over it.
 > **Gate:** the UDP, TCP, IPv6 and DHCP gates pass with the stack sitting on a
 > VLAN over a bond rather than on a device.
 
+## Step 5, attempted 2026-09-06 — the mechanism is built and the gate is NOT met
+
+`bin/ipd` speaks LACP over the virtio path now: it starts a machine once it
+knows its own address, opens with a bounded burst of LACPDUs, answers every one
+that arrives, and publishes what the machine believes. All of it passes fmt,
+clippy, the host tests and every boot lane.
+
+**What is not proven is that two guests aggregate**, and the reason is the
+observation point rather than the protocol.
+
+* **The boot report is a snapshot, and it races.** The kernel reads `bin/ipd`'s
+  report page during bring-up; the LACP machine lives in `serve`, which the
+  service enters *after* the demonstration. Whether a state established in
+  `serve` appears in the report is therefore a race, and it was seen to fall
+  both ways across runs — one guest printed `state 0x07 -- speaking, and
+  nothing has answered`, and later runs printed nothing at all. **A gate that
+  reports differently on identical input is not a gate.**
+* **A harness must go through `tests/qemu/devices.sh`.** The two-guest script
+  written for this built its own QEMU command line and the invariant checker
+  refused it, correctly. It was removed rather than left in the tree.
+
+**What the attempt did establish**, and both are worth keeping:
+
+* **A real defect in `bin/ipd`, unrelated to LACP.** Its configuration was read
+  *only* during the demonstration phase. On a link with no gateway that phase
+  ends before `bin/netd` has read the device's address, so the service held an
+  unspecified address for the life of the boot and could send nothing at all.
+  It is read from the serve loop and once more before entering it now.
+* **The IOMMU is not optional for any networked lane.** Four two-guest runs
+  read as "LACP failed" when the guests simply had no DMA window, so no address
+  was ever published. The `net config` line is what said so.
+
+**What would meet the gate**, in the order worth trying: give the report a
+later reader, or a second one, so a state reached in `serve` is observable at
+all; then build the two-guest harness through `devices.sh` as the rule
+requires. The protocol underneath is host-tested against the standard's layout
+and its convergence rules, and none of that is in question here — what is
+missing is a way to watch two machines do it.
+
 ## Alternatives considered
 
 **Put bonding in the driver.** Each driver aggregates its own ports. **Rejected:**

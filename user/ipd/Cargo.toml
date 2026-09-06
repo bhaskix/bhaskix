@@ -96,4 +96,9 @@ asm_budget = 4
 #
 # 159 at step 6: one more, the port count. A bond is a thing this service can
 # only build if it is told how many ports were found.
-unsafe_budget = 159
+#
+# 161 at RFC 0074 step 5: the two LACPDU sends -- the opening frame and the
+# reply to a partner. Each is the return ring's existing `send`, which is the
+# one unsafe line a frame leaving this service has always cost; the LACPDU
+# inside them is built by `bhaskix-net` and costs none.
+unsafe_budget = 161

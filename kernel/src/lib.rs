@@ -18142,7 +18142,7 @@ fn report_net_after_exchange(hhdm: u64) {
     // stayed at 224: the kernel panicked reading past the end and the boot
     // stalled. The length is derived from the array now, so there is one place
     // to be wrong instead of three.
-    let mut ipd = [0u64; 29];
+    let mut ipd = [0u64; 30];
     // SAFETY: a frame this object owns, through the direct map, read as the
     // little-endian words the service wrote there -- `ipd.len() * 8` bytes of
     // a page, so the read cannot reach past the frame.
@@ -18192,6 +18192,30 @@ fn report_net_after_exchange(hhdm: u64) {
         ipd[28] >> 32,
         ipd[28] & 0xffff_ffff
     );
+    // **What LACP has reached** -- RFC 0074 step 5. The low byte is this
+    // station's own state flags; bit 48 says a partner has been heard from at
+    // all, which is the difference between "nobody answered" and "we have not
+    // spoken".
+    if ipd[29] != 0 {
+        let flags = ipd[29] & 0xff;
+        let heard = ipd[29] >> 32 & (1 << 16) != 0;
+        println!(
+            "    ipd lacp       state {flags:#04x} -- {}",
+            if flags & 0x38 == 0x38 {
+                "\x1b[92maggregated: synchronised, collecting and distributing\x1b[0m"
+            } else if heard {
+                "a partner is heard but the link is not yet aggregated"
+            } else {
+                "speaking, and nothing has answered"
+            }
+        );
+        if heard {
+            println!(
+                "                   the partner's key is {}",
+                ipd[29] >> 32 & 0xffff
+            );
+        }
+    }
     // **What the socket service says it is holding** — RFC 0063.
     //
     // Printed only when it holds something, because the interesting boot is the

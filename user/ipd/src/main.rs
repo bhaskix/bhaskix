@@ -125,17 +125,120 @@ const MAX_FRAME: usize = 2048;
 /// The marker the kernel looks for before believing the report.
 const MARKER: u64 = 0x3154_5052_4450_4931;
 
+/// This port's LACP machine, and what it has learned.
+///
+/// **Responsive rather than periodic, and that is a deliberate limit.** The
+/// standard sends an LACPDU every one or thirty seconds, and this service has
+/// no clock -- its cycle counter was retired at RFC 0026 step 5 and its loop
+/// blocks in `receive` until a frame or a call arrives. So it sends when it
+/// wakes and has something to say: a bounded burst at startup so an early
+/// frame cannot be lost to a peer that is not up yet, and a reply to every
+/// LACPDU that arrives. Two active peers converge in three exchanges that way.
+///
+/// What that does **not** do is expire a partner that goes quiet, which needs
+/// the timer. `bhaskix_net::lacp::Machine` implements the expiry and a service
+/// with a clock will drive it; nothing here pretends to.
+/// Reads the interface the kernel published, if it has published one yet.
+///
+/// **Called from the serve loop as well as the demonstration**, because a
+/// service that starts before its configuration arrives must still pick it up.
+/// This was read only during the demonstration until 2026-09-06, and on a link
+/// with no gateway that phase finishes before `bin/netd` has read the device's
+/// address -- so `me` stayed unspecified for the life of the boot and nothing
+/// this service might have sent was ever built. Two guests on a private link
+/// is exactly that shape, and it is how the gap was found.
+///
+/// Sets the VLAN and the interface shape for the report as a side effect,
+/// because both are derived from this page and neither has another source.
+fn read_interface() -> Option<(MacAddr, Ipv4Addr)> {
+    // SAFETY: the configuration page, mapped read-only by this program.
+    let (marker, mac, address, vlan, mtu, ports) = unsafe {
+        (
+            core::ptr::read_volatile(CONFIG_AT as *const u64),
+            core::ptr::read_volatile((CONFIG_AT + 8) as *const u64),
+            core::ptr::read_volatile((CONFIG_AT + 16) as *const u64),
+            core::ptr::read_volatile((CONFIG_AT + 24) as *const u64),
+            core::ptr::read_volatile((CONFIG_AT + 32) as *const u64),
+            core::ptr::read_volatile((CONFIG_AT + 40) as *const u64),
+        )
+    };
+    if marker != CONFIG_MARKER {
+        return None;
+    }
+    let mut octets = [0u8; 6];
+    for (index, octet) in octets.iter_mut().enumerate() {
+        *octet = (mac >> (40 - index * 8)) as u8;
+    }
+    // **RFC 0074: an address lives on an interface.** One port is a port;
+    // several are a bond over them, and the address goes on the bond. Only the
+    // first is driven -- `bin/netd` holds one device -- so the rest are
+    // members whose link is down, which is what a real bond looks like when a
+    // member's cable is out, and active-backup picks the live one.
+    let mtu = if mtu == 0 { 1500 } else { mtu as u16 };
+    let mut faces = bhaskix_net::interface::Interfaces::new();
+    if let Ok(first) = faces.add_physical(0, MacAddr(octets), mtu) {
+        faces.set_link(first, true);
+        let mut on = first;
+        if ports > 1
+            && let Ok(bond) = faces.add_bond(bhaskix_net::interface::BondMode::ActiveBackup)
+        {
+            let mut joined = faces.enslave(bond, first).is_ok();
+            for port in 1..ports.min(u64::from(u8::MAX)) {
+                // A member whose address this service does not know: it is not
+                // driven, so nothing here can read one, and it is down anyway.
+                if let Ok(other) = faces.add_physical(port as u16, MacAddr([0; 6]), mtu) {
+                    joined |= faces.enslave(bond, other).is_ok();
+                }
+            }
+            if joined {
+                on = bond;
+            }
+        }
+        if vlan != 0
+            && let Ok(tagged) = faces.add_vlan(on, vlan as u16)
+        {
+            on = tagged;
+        }
+        BOUND_VLAN.store(
+            faces.egress_tag(on).map_or(NO_VLAN, u32::from),
+            core::sync::atomic::Ordering::Relaxed,
+        );
+        // High half: the ports the kernel said there were. Low half: the
+        // members the interface ended up with. Both, because "the address is
+        // on a port" has two causes and one number cannot tell them apart.
+        BOUND_SHAPE.store(
+            (ports << 32) | faces.get(on).map_or(0, |f| f.member_count() as u64),
+            core::sync::atomic::Ordering::Relaxed,
+        );
+    }
+    Some((MacAddr(octets), Ipv4Addr(address as u32)))
+}
+
+/// How many unsolicited LACPDUs to send before waiting to be spoken to.
+///
+/// A peer whose driver is not up yet drops the first frames, and with no timer
+/// there is no second chance -- so there are a few first chances instead.
+const LACP_OPENINGS: u32 = 8;
+
+/// What the machine has reached, for the report: the partner's key in the high
+/// half and our own state flags in the low, or zero before one is running.
+static LACP_STATE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Publishes what the machine believes, so the boot report can say it.
+fn lacp_publish(machine: &bhaskix_net::lacp::Machine) {
+    let partner = machine.partner.map_or(0, |p| u64::from(p.key) | 1 << 16);
+    LACP_STATE.store(
+        (partner << 32) | u64::from(machine.actor.state.0),
+        core::sync::atomic::Ordering::Relaxed,
+    );
+}
+
 /// What the bound interface is made of, for the report: the number of members
 /// under it, or zero when the address sits straight on a port.
 ///
 /// The gates read this to say whether the stack is running over a bond, which
 /// is the whole of RFC 0074 step 6's claim.
 static BOUND_SHAPE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-
-/// How many members the interface an address sits on has.
-fn shape_of(faces: &bhaskix_net::interface::Interfaces, on: bhaskix_net::interface::Index) -> u64 {
-    faces.get(on).map_or(0, |face| face.member_count() as u64)
-}
 
 /// The VLAN the bound interface carries, or `NO_VLAN`.
 ///
@@ -773,6 +876,8 @@ fn refresh() {
         TCP_RETURNED.load(Relaxed),
         // Word 28, as the builder above: what the address is sitting on.
         BOUND_SHAPE.load(Relaxed),
+        // Word 29, as the builder above.
+        LACP_STATE.load(Relaxed),
     ]);
 }
 
@@ -1095,11 +1200,14 @@ fn publish_tcp_tail(tail: u64) {
 /// destination is accepted as well as this interface's own address: a client
 /// with no address yet is answered by broadcast, which is the whole reason
 /// DHCP works at all.
+#[allow(clippy::too_many_arguments)]
 fn drain_ring(
     sockets: &mut [Socket; SOCKETS],
     me: (MacAddr, Ipv4Addr),
     tail: &mut u64,
     can_tcp: bool,
+    lacp: &mut Option<bhaskix_net::lacp::Machine>,
+    openings: &mut u32,
 ) {
     let Some(layout) = ring::Layout::for_region(RING_BYTES) else {
         return;
@@ -1160,6 +1268,40 @@ fn drain_ring(
             refuse(why::NOT_A_FRAME, length, seen);
             continue;
         };
+        // **Slow protocols, which is LACP** -- RFC 0074 step 5. An LACPDU
+        // goes to a reserved group address, so it reaches here like any other
+        // group frame; what makes it ours is the EtherType. The machine
+        // decides what to believe, and a reply goes back on the same wake,
+        // which is how two peers converge without either holding a clock.
+        if parsed.ethertype.0 == bhaskix_net::lacp::ETHERTYPE {
+            if let Some(machine) = lacp.as_mut()
+                && machine.received(parsed.payload)
+            {
+                lacp_publish(machine);
+                // Answer while awake. A partner that has just told us
+                // something is a partner that will want our view of it.
+                let pdu = machine.sending();
+                let mut body = [0u8; bhaskix_net::lacp::PDU];
+                let mut out = [0u8; eth::HEADER + bhaskix_net::lacp::PDU];
+                // `crate::frame`, because the local buffer above shadows
+                // the builder's name in this function.
+                if pdu.write(&mut body).is_ok()
+                        && let Some(length) = crate::frame(
+                            &mut out,
+                            bhaskix_net::lacp::GROUP_ADDRESS,
+                            me.0,
+                            EtherType(bhaskix_net::lacp::ETHERTYPE),
+                            &body,
+                        )
+                        // SAFETY: the return ring is mapped writable.
+                        && unsafe { send(&out[..length]) }
+                {
+                    *openings = openings.saturating_sub(1);
+                }
+            }
+            continue;
+        }
+
         // RFC 0029 step 4: a v6 datagram, delivered by the same discipline
         // as the v4 one below — family-matched to the socket, one held
         // datagram, the newest wins.
@@ -1268,7 +1410,7 @@ fn drain_ring(
 #[allow(clippy::too_many_arguments)]
 fn serve(
     sockets: &mut [Socket; SOCKETS],
-    me: (MacAddr, Ipv4Addr),
+    mut me: (MacAddr, Ipv4Addr),
     gateway: MacAddr,
     v6_from: Option<Ipv6Addr>,
     router6: Option<MacAddr>,
@@ -1277,7 +1419,54 @@ fn serve(
     mut tail: u64,
     mut tcp_tail: u64,
 ) -> ! {
+    // **RFC 0074 step 5's machine, and it lives here.** One port is driven, so
+    // one machine; it starts as soon as this service knows its own address,
+    // because the system id an LACPDU carries is that address.
+    let mut lacp: Option<bhaskix_net::lacp::Machine> = None;
+    let mut openings = LACP_OPENINGS;
     loop {
+        // The configuration may arrive after serving begins -- see
+        // `read_interface`. Without this the service would hold an
+        // unspecified address for ever on any link whose demonstration ended
+        // before `bin/netd` read the device.
+        if can_send
+            && me.0 == MacAddr::UNSPECIFIED
+            && let Some(identity) = read_interface()
+        {
+            me = identity;
+        }
+
+        // Start it, and open the conversation. A peer whose driver is not up
+        // yet drops what it is sent, and with no clock there is no retry --
+        // so there are a few opening frames rather than one.
+        if can_send && me.0 != MacAddr::UNSPECIFIED {
+            let machine = lacp.get_or_insert_with(|| {
+                let mut fresh = bhaskix_net::lacp::Machine::new(me.0, 1, 1);
+                // Ask for the short timeout: a peer that honours it answers
+                // promptly, which is what a boot-length gate needs.
+                fresh.actor.state = fresh.actor.state.with(bhaskix_net::lacp::State::TIMEOUT);
+                fresh
+            });
+            if openings > 0 && !machine.aggregated() {
+                let pdu = machine.sending();
+                let mut body = [0u8; bhaskix_net::lacp::PDU];
+                let mut out = [0u8; eth::HEADER + bhaskix_net::lacp::PDU];
+                if pdu.write(&mut body).is_ok()
+                    && let Some(length) = frame(
+                        &mut out,
+                        bhaskix_net::lacp::GROUP_ADDRESS,
+                        me.0,
+                        EtherType(bhaskix_net::lacp::ETHERTYPE),
+                        &body,
+                    )
+                    // SAFETY: the return ring is mapped writable.
+                    && unsafe { send(&out[..length]) }
+                {
+                    openings -= 1;
+                }
+            }
+            lacp_publish(machine);
+        }
         // The rings may land after serving has begun — a boot whose
         // demonstration ends early reaches here first — and a serve loop
         // that froze the answer it was constructed with refused `SYN·ACK`s
@@ -1303,7 +1492,7 @@ fn serve(
                 NOTIFIED_WAKES.load(core::sync::atomic::Ordering::Relaxed) + 1,
                 core::sync::atomic::Ordering::Relaxed,
             );
-            drain_ring(sockets, me, &mut tail, can_tcp);
+            drain_ring(sockets, me, &mut tail, can_tcp, &mut lacp, &mut openings);
             if can_tcp {
                 drain_tcp_back(me, gateway, v6_from, router6, &mut tcp_tail);
             }
@@ -1417,7 +1606,7 @@ fn serve(
                 // this would answer "nothing waiting" for a datagram already in
                 // the ring, and a program polling the socket would be told for
                 // ever that nothing had arrived while its datagrams piled up.
-                drain_ring(sockets, me, &mut tail, can_tcp);
+                drain_ring(sockets, me, &mut tail, can_tcp, &mut lacp, &mut openings);
                 // The length, and **nothing taken**: the datagram stays where
                 // it is for the `recvfrom` that follows.
                 reply(socket::OK, u64::from(sockets[index as usize].length), 0);
@@ -1529,7 +1718,7 @@ fn serve(
                 // asking for a datagram is the only event it can act on. Not a
                 // workaround: the alternative is a poll loop, and this system
                 // has already paid for one of those today.
-                drain_ring(sockets, me, &mut tail, can_tcp);
+                drain_ring(sockets, me, &mut tail, can_tcp, &mut lacp, &mut openings);
 
                 let waiting = sockets[index as usize];
                 if waiting.length == 0 {
@@ -1568,7 +1757,7 @@ fn serve(
                 reply(socket::WRONG_FAMILY, 0, 0);
             }
             socket::RECV_FROM6 => {
-                drain_ring(sockets, me, &mut tail, can_tcp);
+                drain_ring(sockets, me, &mut tail, can_tcp, &mut lacp, &mut openings);
                 let waiting = sockets[index as usize];
                 if waiting.length == 0 {
                     reply(socket::EMPTY, 0, 0);
@@ -1646,10 +1835,6 @@ extern "C" fn ipd_main() -> ! {
         exit()
     }
     let can_send = attach(BACK, BACK_AT, 1) && attach(CONFIG, CONFIG_AT, 0);
-    // The interfaces this service knows about. The address it holds lives on
-    // one of them, and which one decides how arriving frames are parsed.
-    let mut faces = bhaskix_net::interface::Interfaces::new();
-
     // RFC 0020 step 4: the rings to and from `bin/tcpd`. **Retried in the
     // demonstration loop rather than attached once here**, because the kernel
     // installs them *after* this program has started — the TCP domain is set
@@ -1799,78 +1984,11 @@ extern "C" fn ipd_main() -> ! {
         // What this interface is, once the kernel has been able to say. It
         // cannot say until `bin/netd` has read the address out of the device,
         // so this waits for a marker rather than believing a page of zeroes.
-        if can_send && me.0 == MacAddr::UNSPECIFIED {
-            // SAFETY: the configuration page, mapped read-only by this program.
-            let (marker, mac, address, vlan, mtu, ports) = unsafe {
-                (
-                    core::ptr::read_volatile(CONFIG_AT as *const u64),
-                    core::ptr::read_volatile((CONFIG_AT + 8) as *const u64),
-                    core::ptr::read_volatile((CONFIG_AT + 16) as *const u64),
-                    core::ptr::read_volatile((CONFIG_AT + 24) as *const u64),
-                    core::ptr::read_volatile((CONFIG_AT + 32) as *const u64),
-                    core::ptr::read_volatile((CONFIG_AT + 40) as *const u64),
-                )
-            };
-            if marker == CONFIG_MARKER {
-                let mut octets = [0u8; 6];
-                for (index, octet) in octets.iter_mut().enumerate() {
-                    *octet = (mac >> (40 - index * 8)) as u8;
-                }
-                me = (MacAddr(octets), Ipv4Addr(address as u32));
-                // **RFC 0074 step 3: an address lives on an interface.** The
-                // table is built here rather than assumed -- a port, and a
-                // VLAN above it when the kernel names one -- and the frames
-                // below are classified through it. That is what makes a tag a
-                // segmentation boundary rather than four bytes to step over.
-                let mtu = if mtu == 0 { 1500 } else { mtu as u16 };
-                // **The shape the machine actually has.** One port is a port;
-                // several are a bond over them, and the address goes on the
-                // bond. Only the first is driven -- `bin/netd` holds one
-                // device -- so the rest are members whose link is down, which
-                // is what a real bond looks like when a member's cable is out.
-                // The bond selects the live one and traffic goes through the
-                // model rather than around it.
-                if let Ok(first) = faces.add_physical(0, MacAddr(octets), mtu) {
-                    faces.set_link(first, true);
-                    let mut on = first;
-                    if ports > 1
-                        && let Ok(bond) =
-                            faces.add_bond(bhaskix_net::interface::BondMode::ActiveBackup)
-                    {
-                        let mut joined = faces.enslave(bond, first).is_ok();
-                        for port in 1..ports.min(u64::from(u8::MAX)) {
-                            // A member whose address this service does not
-                            // know: it is not driven, so nothing here can
-                            // read one, and it is down either way.
-                            if let Ok(other) = faces.add_physical(port as u16, MacAddr([0; 6]), mtu)
-                            {
-                                joined |= faces.enslave(bond, other).is_ok();
-                            }
-                        }
-                        if joined {
-                            on = bond;
-                        }
-                    }
-                    if vlan != 0
-                        && let Ok(tagged) = faces.add_vlan(on, vlan as u16)
-                    {
-                        on = tagged;
-                    }
-                    BOUND_VLAN.store(
-                        faces.egress_tag(on).map_or(NO_VLAN, u32::from),
-                        core::sync::atomic::Ordering::Relaxed,
-                    );
-                    // High half: the ports the kernel said there were. Low
-                    // half: the members the interface actually ended up with.
-                    // Both, because "the address is on a port" has two causes
-                    // -- a count that never arrived, and a bond that would not
-                    // build -- and one number cannot tell them apart.
-                    BOUND_SHAPE.store(
-                        (ports << 32) | shape_of(&faces, on),
-                        core::sync::atomic::Ordering::Relaxed,
-                    );
-                }
-            }
+        if can_send
+            && me.0 == MacAddr::UNSPECIFIED
+            && let Some(identity) = read_interface()
+        {
+            me = identity;
         }
 
         // One request of this program's own, so that something on the wire can
@@ -2257,6 +2375,20 @@ extern "C" fn ipd_main() -> ! {
                     // snapshot None on any boot whose demonstration phase
                     // outlived the entry's lifetime, which was all of them.
                     let router6_mac = router6_link;
+                    // **One last read before blocking.** `serve` parks in
+                    // `receive` and is woken by a frame; on a link with no
+                    // gateway there is no frame until this service sends one,
+                    // and it cannot send without knowing its own address. A
+                    // demonstration that ended before the configuration landed
+                    // therefore left the service asleep for ever, holding an
+                    // unspecified address. Deterministic here, where the
+                    // configuration has certainly arrived.
+                    if can_send
+                        && me.0 == MacAddr::UNSPECIFIED
+                        && let Some(identity) = read_interface()
+                    {
+                        me = identity;
+                    }
                     serve(
                         &mut sockets,
                         me,
@@ -2812,6 +2944,8 @@ fn report(
         // a port directly, which is every machine with one NIC. Appended, for
         // the reason written at 23.
         BOUND_SHAPE.load(core::sync::atomic::Ordering::Relaxed),
+        // Word 29: what the LACP machine believes -- RFC 0074 step 5.
+        LACP_STATE.load(core::sync::atomic::Ordering::Relaxed),
     ];
     V6_PREFIX.store(v6_prefix, core::sync::atomic::Ordering::Relaxed);
     V6_STATE.store(v6_state, core::sync::atomic::Ordering::Relaxed);
@@ -2837,7 +2971,7 @@ fn report(
 /// whatever the array says: the type is the documentation, and both builders --
 /// `report` and `refresh` -- are forced to agree with it by the compiler, which
 /// is the only reason the v6 words' silent overwrite could not happen twice.
-fn write_report(words: [u64; 29]) {
+fn write_report(words: [u64; 30]) {
     // SAFETY: the page this program mapped writable, which nothing else
     // reaches. The marker is written last, so a kernel reading a partial report
     // sees no marker rather than half the fields.
