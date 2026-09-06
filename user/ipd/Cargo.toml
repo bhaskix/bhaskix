@@ -88,4 +88,9 @@ asm_budget = 4
 # writers carry, which is how every other counter in this program reaches the
 # kernel. A raise that turns out to be unnecessary is worth undoing in the same
 # day rather than leaving as headroom.
-unsafe_budget = 156
+#
+# 158 on 2026-09-06: two lines for RFC 0074 step 3. The kernel's configuration
+# page grew two fields -- the VLAN this interface carries and its MTU -- and
+# each is one more volatile read of a page mapped read-only, beside the three
+# already there. An address that lives on an interface has to be told which.
+unsafe_budget = 158

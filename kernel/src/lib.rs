@@ -14897,6 +14897,39 @@ pub fn start_net_domain(
     apic_id: u32,
     rsdp: Option<bhaskix_boot::PhysAddr>,
 ) -> Result<(), &'static str> {
+    // **Every NIC on the bus, not only the one that gets driven.** RFC 0074
+    // step 1: an interface is something this system can name, and it cannot
+    // name what it never counted. Until now the walk stopped at the first
+    // match, so a machine with four ports and a machine with one looked
+    // identical from here -- which is how eight boots went by before the
+    // SR550's cabling could be described at all.
+    let mut ports = 0;
+    while virtio::find_nth_of(virtio::Class::NET, ports).is_some() {
+        ports += 1;
+    }
+    for port in 0..ports {
+        if let Some((at, identity)) = virtio::find_nth_of(virtio::Class::NET, port) {
+            println!(
+                "    net interface  port {port}: {:02x}:{:02x}.{} {:04x}:{:04x}, virtio-net",
+                at.bus, at.device, at.function, identity.vendor, identity.device
+            );
+        }
+    }
+    let foreign = find_foreign_nic().is_some();
+    println!(
+        "    net interface  {ports} virtio port(s){} -- a bond may be built over {}",
+        if foreign {
+            ", and an X722 this kernel drives itself"
+        } else {
+            ""
+        },
+        if ports + usize::from(foreign) > 1 {
+            "them"
+        } else {
+            "nothing yet: one port is not a bond"
+        }
+    );
+
     let Some((address, _)) = virtio::find_nth_of(virtio::Class::NET, 0) else {
         println!("    net domain     no device on the bus; nothing delegated");
         return Ok(());
@@ -16222,6 +16255,17 @@ const NET_DOORBELL_BADGE: u64 = 1 << 3;
 /// The marker `bin/ipd` waits for before believing its configuration.
 const NET_CONFIG_MARKER: u64 = 0x3146_4e43_5049_5f4e;
 
+/// The VLAN this interface's frames carry, or zero for untagged.
+///
+/// Zero on every lane, because QEMU's built-in network is untagged. It is a
+/// field rather than an assumption so that a tagged interface is a
+/// configuration change rather than a code change -- which is the point of
+/// RFC 0074's model.
+const NET_VLAN: u16 = 0;
+
+/// The largest frame this interface carries.
+const NET_MTU: u16 = 1500;
+
 /// This interface's IPv4 address.
 ///
 /// Static, and RFC 0018 says why: *what owns the interface's address* is one of
@@ -16249,7 +16293,18 @@ fn publish_net_config(hhdm: u64, mac: u64) -> bool {
         return false;
     }
     let address = u32::from_be_bytes(NET_ADDRESS);
-    let words = [NET_CONFIG_MARKER, mac, u64::from(address)];
+    // **What the interface is, not only what address it holds.** RFC 0074:
+    // `bin/ipd` binds to an interface, so it needs the VLAN its frames carry
+    // and the largest one it may build. A VLAN of zero means untagged, which
+    // is what QEMU's network gives and what every lane has always assumed --
+    // said explicitly now rather than assumed by there being no field for it.
+    let words = [
+        NET_CONFIG_MARKER,
+        mac,
+        u64::from(address),
+        u64::from(NET_VLAN),
+        u64::from(NET_MTU),
+    ];
     // SAFETY: a frame this object owns, through the direct map. The marker goes
     // last, so a reader that catches this half-written sees no marker rather
     // than half a configuration.

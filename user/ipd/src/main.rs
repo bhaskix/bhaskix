@@ -125,6 +125,27 @@ const MAX_FRAME: usize = 2048;
 /// The marker the kernel looks for before believing the report.
 const MARKER: u64 = 0x3154_5052_4450_4931;
 
+/// The VLAN the bound interface carries, or `NO_VLAN`.
+///
+/// A static because the receive path is two calls below where the interface
+/// table lives, and this file already carries its cross-function state this
+/// way rather than threading a parameter through signatures that are near
+/// clippy's limit. Written once, when the kernel says what this interface is.
+static BOUND_VLAN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(NO_VLAN);
+
+/// What [`BOUND_VLAN`] holds before an interface is known, and for an untagged
+/// one. Both mean the same thing to `EthFrame::parse_on`: take untagged frames
+/// and refuse tagged ones.
+const NO_VLAN: u32 = u32::MAX;
+
+/// The VLAN to parse arriving frames for.
+fn bound_vlan() -> Option<u16> {
+    match BOUND_VLAN.load(core::sync::atomic::Ordering::Relaxed) {
+        NO_VLAN => None,
+        id => Some(id as u16),
+    }
+}
+
 /// The marker the kernel writes before this program's configuration is true.
 const CONFIG_MARKER: u64 = 0x3146_4e43_5049_5f4e;
 
@@ -1117,7 +1138,11 @@ fn drain_ring(
         } else {
             0
         };
-        let Ok(parsed) = EthFrame::parse(&frame[..length]) else {
+        // **Parsed for the interface this address lives on**, not for whatever
+        // arrived. On an untagged interface that is exactly what `parse` did
+        // before; on a VLAN one it accepts that VLAN's tag and refuses every
+        // other, which is the boundary RFC 0074 exists to draw.
+        let Ok(parsed) = EthFrame::parse_on(&frame[..length], bound_vlan()) else {
             refuse(why::NOT_A_FRAME, length, seen);
             continue;
         };
@@ -1607,6 +1632,10 @@ extern "C" fn ipd_main() -> ! {
         exit()
     }
     let can_send = attach(BACK, BACK_AT, 1) && attach(CONFIG, CONFIG_AT, 0);
+    // The interfaces this service knows about. The address it holds lives on
+    // one of them, and which one decides how arriving frames are parsed.
+    let mut faces = bhaskix_net::interface::Interfaces::new();
+
     // RFC 0020 step 4: the rings to and from `bin/tcpd`. **Retried in the
     // demonstration loop rather than attached once here**, because the kernel
     // installs them *after* this program has started — the TCP domain is set
@@ -1758,11 +1787,13 @@ extern "C" fn ipd_main() -> ! {
         // so this waits for a marker rather than believing a page of zeroes.
         if can_send && me.0 == MacAddr::UNSPECIFIED {
             // SAFETY: the configuration page, mapped read-only by this program.
-            let (marker, mac, address) = unsafe {
+            let (marker, mac, address, vlan, mtu) = unsafe {
                 (
                     core::ptr::read_volatile(CONFIG_AT as *const u64),
                     core::ptr::read_volatile((CONFIG_AT + 8) as *const u64),
                     core::ptr::read_volatile((CONFIG_AT + 16) as *const u64),
+                    core::ptr::read_volatile((CONFIG_AT + 24) as *const u64),
+                    core::ptr::read_volatile((CONFIG_AT + 32) as *const u64),
                 )
             };
             if marker == CONFIG_MARKER {
@@ -1771,6 +1802,25 @@ extern "C" fn ipd_main() -> ! {
                     *octet = (mac >> (40 - index * 8)) as u8;
                 }
                 me = (MacAddr(octets), Ipv4Addr(address as u32));
+                // **RFC 0074 step 3: an address lives on an interface.** The
+                // table is built here rather than assumed -- a port, and a
+                // VLAN above it when the kernel names one -- and the frames
+                // below are classified through it. That is what makes a tag a
+                // segmentation boundary rather than four bytes to step over.
+                let mtu = if mtu == 0 { 1500 } else { mtu as u16 };
+                if let Ok(port) = faces.add_physical(0, MacAddr(octets), mtu) {
+                    faces.set_link(port, true);
+                    let mut on = port;
+                    if vlan != 0
+                        && let Ok(tagged) = faces.add_vlan(port, vlan as u16)
+                    {
+                        on = tagged;
+                    }
+                    BOUND_VLAN.store(
+                        faces.egress_tag(on).map_or(NO_VLAN, u32::from),
+                        core::sync::atomic::Ordering::Relaxed,
+                    );
+                }
             }
         }
 
