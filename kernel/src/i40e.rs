@@ -268,6 +268,91 @@ const VSI_QTABLE_ENABLED: u32 = 1 << 11;
 /// The highest VSI index -- 38.39.2.18.18 gives `VSI = 0..383`.
 const MAX_VSI: u64 = 383;
 
+/// Global Receive Queue Tail -- 38.39.2.18.14, `QRX_TAIL[Q]`
+/// (`0x00128000 + 0x4*Q`). `TAIL` bits 12:0: *"the first descriptor that
+/// software hands to hardware (it is the last valid descriptor plus one)"*.
+/// 38.30.3.1.1 adds that once PXE mode is cleared *"software should bump the
+/// tail at the entire 8 x descriptors granularity"*.
+const QRX_TAIL: u64 = 0x0012_8000;
+
+/// Private Memory Space Segment Descriptor Command -- 38.39.2.13.4,
+/// `PFHMC_SDCMD` (`0x000C0000`, RW). `PMSDIDX` bits 11:0 is the descriptor
+/// index *relative to this function's `PMSDBASE`*, and bit 31 `PMSDWR` makes
+/// it a write; *"the PFHMC_SDDATALOW and PFHMC_SDDATAHIGH registers must be
+/// written before writing PFHMC_SDCMD"*. A write past `PMSDSIZE` *"is
+/// dropped"*, silently, which is why every write here is read back.
+const PFHMC_SDCMD: u64 = 0x000C_0000;
+/// `PFHMC_SDCMD.PMSDWR`, bit 31.
+const SD_WRITE: u32 = 1 << 31;
+/// Segment Descriptor Data Low -- 38.39.2.13.5, `PFHMC_SDDATALOW`
+/// (`0x000C0100`). Bit 0 `PMSDVALID`, bit 1 `PMSDTYPE` (0 paged, 1 direct),
+/// bits 11:2 `PMSDBPCOUNT` -- *"every SD entry in a given FPM space must be
+/// set to 512 except the last SD. The last SD can have a value from 1 to
+/// 512"* -- and bits 31:12 the page descriptor page's address bits 31:12.
+const PFHMC_SDDATALOW: u64 = 0x000C_0100;
+/// Segment Descriptor Data High -- 38.39.2.13.6, `PFHMC_SDDATAHIGH`
+/// (`0x000C0200`): *"most significant 32 bits of a segment descriptor"*.
+const PFHMC_SDDATAHIGH: u64 = 0x000C_0200;
+/// `PFHMC_SDDATALOW.PMSDVALID`, bit 0.
+const SD_VALID: u32 = 1 << 0;
+
+/// CMLAN Context Data -- 38.39.2.14.1, `PFCM_LANCTXDATA[n]`
+/// (`0x0010C100 + 0x80*n`, n = 0..3): the four words of one 128-bit context
+/// sub-line, *"word index 0 is the least significant word"*.
+const PFCM_LANCTXDATA: u64 = 0x0010_C100;
+/// CMLAN Context Control -- 38.39.2.14.2, `PFCM_LANCTXCTL` (`0x0010C300`):
+/// `QUEUE_NUM` bits 11:0 (*"an absolute queue number"*), `SUB_LINE` 14:12,
+/// `QUEUE_TYPE` 16:15 (00 a receive context), `OP_CODE` 18:17 (00 read, 01
+/// write, 10 invalidate). The datasheet describes it as *"an interface into
+/// the context cache for pre-boot context initialization"*; this driver uses
+/// it only to **read**, which is the one way to see whether the HMC fetched
+/// what was written into private memory rather than something else.
+const PFCM_LANCTXCTL: u64 = 0x0010_C300;
+/// CMLAN Context Status -- 38.39.2.14.3, `PFCM_LANCTXSTAT` (`0x0010C380`):
+/// bit 0 `CTX_DONE`, bit 1 `CTX_MISS` -- *"the requested queue number was not
+/// resident in the context cache"*.
+const PFCM_LANCTXSTAT: u64 = 0x0010_C380;
+
+/// `Clear PXE Mode` -- Table 38-402, opcode `0x0110`, a direct command the
+/// datasheet marks *"operating system driver only"*. Firmware disables the two
+/// PXE receive queues of every PF and clears `GLLAN_RCTL_0.PXE_MODE`; if the
+/// flag was already clear it answers `EEXIST`, which is not a failure.
+const OPCODE_CLEAR_PXE_MODE: u16 = 0x0110;
+/// Table 38-403: *"0xD = EEXIST (no action, the device is already in non-PXE
+/// mode)"*.
+const RETURN_EEXIST: u16 = 0xd;
+
+/// `Set VSI Promiscuous Modes` -- Table 38-253, opcode `0x0254`, direct. Bytes
+/// 16-17 are the modes (bit 0 unicast, 1 multicast, 2 broadcast, 3 default
+/// VSI, 4 VLAN), bytes 18-19 which of them this command changes, bytes 20-21
+/// the VSI's SEID. The Add MAC, VLAN Pair command's own text sends broadcast
+/// here: *"The Set VSI Promiscuous Modes command should be used if broadcast
+/// forwarding without VLAN filtering is required"*.
+const OPCODE_SET_VSI_PROMISCUOUS: u16 = 0x0254;
+/// Table 38-253, modes bit 1: promiscuous multicast.
+const PROMISCUOUS_MULTICAST: u16 = 1 << 1;
+/// Table 38-253, modes bit 2: promiscuous broadcast.
+const PROMISCUOUS_BROADCAST: u16 = 1 << 2;
+
+/// Bytes one segment descriptor covers -- 38.26.1: *"each SD represents 2 MB
+/// of HMC PM address space"*.
+pub const SEGMENT_BYTES: u64 = 2 * 1024 * 1024;
+/// The unit of the FPM base registers -- see [`GLHMC_LANRXBASE`].
+const FPM_BASE_UNITS: u64 = 512;
+/// A page descriptor's page: 4 KB, 512 to a segment -- 38.26.1.
+pub const HMC_PAGE_BYTES: u64 = 4096;
+/// Page descriptors per page -- Table 38-330's *"512 PDs that are 64-bit"*.
+pub const PAGE_DESCRIPTORS: u32 = 512;
+
+/// A receive descriptor -- Table 38-406, sixteen bytes: the packet buffer
+/// address, then a header buffer address whose bit 0 must be zero because the
+/// write-back reuses it for `DD`.
+pub const RECEIVE_DESCRIPTOR_BYTES: u64 = 16;
+/// Write-back status bit 0, `DD` -- Table 38-408: *"Descriptor done"*.
+const RX_DD: u64 = 1 << 0;
+/// Write-back status bit 1, `EOP` -- *"the last one of a packet"*.
+const RX_EOP: u32 = 1 << 1;
+
 /// The highest queue index `QRX_ENA` covers -- 38.39.2.18.13 gives `Q = 0..1535`.
 const MAX_RECEIVE_QUEUE: u64 = 1535;
 
@@ -304,6 +389,9 @@ const _: () = assert!(REGISTER_WINDOW_BYTES > PF_ARQT);
 const _: () = assert!(REGISTER_WINDOW_BYTES > GLHMC_LANRXCNT + 4 * 15);
 const _: () = assert!(REGISTER_WINDOW_BYTES > PFHMC_ERRORDATA);
 const _: () = assert!(REGISTER_WINDOW_BYTES > PF_FUNC_RID);
+const _: () = assert!(REGISTER_WINDOW_BYTES > QRX_TAIL + 4 * MAX_RECEIVE_QUEUE);
+const _: () = assert!(REGISTER_WINDOW_BYTES > PFCM_LANCTXSTAT);
+const _: () = assert!(REGISTER_WINDOW_BYTES > PFHMC_SDDATAHIGH);
 
 /// One admin queue descriptor -- Table 38-339, as its eight little-endian
 /// 32-bit words.
@@ -641,6 +729,337 @@ impl HmcError {
     }
 }
 
+/// Where an object lives in private memory -- 38.26.4's decomposition of an
+/// FPM address.
+///
+/// `FPM_object_address = (GLHMC_{object}BASE*512) + (2^GLHMC_{object}OBJSZ *
+/// element_index)`, `SD_index = INT(FPM_object_address / 2 MB)`, `PD_index =
+/// INT(FPM_object_address / 4 KB) and 0x1FF`, and what is left is the offset
+/// in the backing page. `element_index` is the **absolute** queue number --
+/// 38.26.3 step 5: *"HMC PM LAN objects are indexed with the absolute queue
+/// number"*.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ContextLocation {
+    /// The private memory address itself.
+    pub address: u64,
+    /// Which 2 MB segment, relative to this function's first.
+    pub segment: u32,
+    /// Which of that segment's 512 page descriptors.
+    pub page: u32,
+    /// Where in that page the object starts.
+    pub offset: u32,
+}
+
+/// 38.26.4's arithmetic for one object.
+#[must_use]
+pub const fn context_location(
+    base_units: u32,
+    object_size_log2: u32,
+    index: u32,
+) -> ContextLocation {
+    let address = base_units as u64 * FPM_BASE_UNITS + (1u64 << object_size_log2) * index as u64;
+    ContextLocation {
+        address,
+        segment: (address / SEGMENT_BYTES) as u32,
+        page: ((address / HMC_PAGE_BYTES) % PAGE_DESCRIPTORS as u64) as u32,
+        offset: (address % HMC_PAGE_BYTES) as u32,
+    }
+}
+
+/// The receive base that follows a transmit area -- Table 38-337's example:
+/// `GLHMC_LANRXBASE = ROUNDUP512((GLHMC_LANTXBASE*512) +
+/// (GLHMC_LANTXCNT*2^GLHMC_LANTXOBJSZ)) / 512`.
+#[must_use]
+pub const fn receive_base_after(
+    tx_base_units: u32,
+    tx_count: u32,
+    tx_object_size_log2: u32,
+) -> u32 {
+    let end =
+        tx_base_units as u64 * FPM_BASE_UNITS + tx_count as u64 * (1u64 << tx_object_size_log2);
+    end.div_ceil(FPM_BASE_UNITS) as u32
+}
+
+/// Where a LAN object area ends, in bytes of private memory.
+#[must_use]
+pub const fn object_area_end(base_units: u32, count: u32, object_size_log2: u32) -> u64 {
+    base_units as u64 * FPM_BASE_UNITS + count as u64 * (1u64 << object_size_log2)
+}
+
+/// How many 4 KB pages an FPM layout ending at `end` spans -- what the last
+/// segment descriptor's `PMSDBPCOUNT` states, *"used to calculate the end of
+/// the FPM space"*.
+#[must_use]
+pub const fn backing_pages_to(end: u64) -> u32 {
+    end.div_ceil(HMC_PAGE_BYTES) as u32
+}
+
+/// The static half of a LAN receive queue context -- Table 38-419, packed as
+/// the eight little-endian dwords of the 32-byte vector the HMC reads.
+///
+/// Every position is from the table read as a page image, because its text
+/// extraction dropped digits: BASE 32-88, QLEN 89-101, DBUFF 102-108, HBUFF
+/// 109-113, DTYPE 114-115, DSIZE 116, CRCSTRIP 117, L2TSEL 119, HSPLIT_0
+/// 120-123, HSPLIT_1 124-125, SHOWIV 127, RXMAX 174-187, the four TPH enables
+/// 193-196, LRXQTRESH 198-200. Bits 0-31 are HEAD and CPUID, which hardware
+/// owns and software initialises to zero.
+///
+/// **Two places the table and its own example disagree, and how each is
+/// settled.** The table says BASE is *"defined in 12-byte units"*; the example
+/// in 38.30.3.4.3 gives BASE = `0x1579A0` for a ring, and only in 128-byte
+/// units does that decode to a page-aligned address (`0xABCD000`), so 128 is
+/// what a ring's address is divided by here. And the example's dword 6 reads
+/// `0x0000021E` with LRXQTRESH said to be 2: bits 193-196 are the four TPH
+/// enables, and the one other set bit is 201, which the table lists as
+/// reserved with a software init of `RSV` -- not bit 199, where a threshold of
+/// 2 at 198-200 would land. The threshold is left at zero, where both readings
+/// agree, and bit 201 is set because the datasheet's own example sets it. The
+/// test below holds the encoder to that example bit for bit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReceiveContext {
+    /// The descriptor ring's address as the device issues it, 128-byte aligned.
+    pub ring: u64,
+    /// Descriptors in the ring -- a whole multiple of 32 once PXE mode is off.
+    pub descriptors: u16,
+    /// Each packet buffer's size in bytes: at least 1 KB, a multiple of 128.
+    pub buffer_bytes: u16,
+    /// The largest frame accepted, *"starting at the L2 header up to including
+    /// the Ethernet CRC"*, at most five buffers' worth.
+    pub max_frame: u16,
+}
+
+impl ReceiveContext {
+    /// The 32 bytes as the HMC reads them.
+    #[must_use]
+    pub const fn words(&self) -> [u32; 8] {
+        let mut words = [0u32; 8];
+        // BASE, bits 32-88, in 128-byte units.
+        let base = self.ring / 128;
+        words[1] = base as u32;
+        words[2] = ((base >> 32) & 0x1ff_ffff) as u32;
+        // QLEN, bits 89-101: seven bits at the top of dword 2, six at the
+        // bottom of dword 3.
+        let qlen = self.descriptors as u64 & 0x1fff;
+        words[2] |= ((qlen & 0x7f) << 25) as u32;
+        words[3] = ((qlen >> 7) & 0x3f) as u32;
+        // DBUFF, bits 102-108, in 128-byte units. HBUFF and DTYPE stay zero:
+        // no header split. DSIZE stays zero: 16-byte descriptors.
+        let dbuff = (self.buffer_bytes / 128) as u32 & 0x7f;
+        words[3] |= dbuff << 6;
+        // CRCSTRIP, bit 117.
+        words[3] |= 1 << 21;
+        // RXMAX, bits 174-187.
+        words[5] = ((self.max_frame as u32) & 0x3fff) << 14;
+        // Bit 201, per the datasheet's own example -- see above.
+        words[6] = 1 << 9;
+        words
+    }
+}
+
+/// A page descriptor -- Table 38-330: bits 63:12 the backing page's address
+/// as the device issues it, bit 0 valid.
+#[must_use]
+pub const fn page_descriptor(backing: u64) -> u64 {
+    (backing & !(HMC_PAGE_BYTES - 1)) | 1
+}
+
+/// What a segment descriptor reads as, `(low, high)`, for a paged segment
+/// whose page descriptor page is at `pd_page` and whose FPM space spans
+/// `backing_pages` -- 38.26.4 step 6 and 38.39.2.13.5's fields.
+#[must_use]
+pub const fn segment_descriptor(pd_page: u64, backing_pages: u32) -> (u32, u32) {
+    (
+        (pd_page as u32 & 0xffff_f000) | ((backing_pages & 0x3ff) << 2) | SD_VALID,
+        (pd_page >> 32) as u32,
+    )
+}
+
+/// Writes one page descriptor into a page descriptor page.
+///
+/// # Safety
+///
+/// `page_host` must be the direct-map address of a page descriptor page,
+/// writable and not yet named to the device, and `index` below
+/// [`PAGE_DESCRIPTORS`].
+pub unsafe fn write_page_descriptor(page_host: u64, index: u32, backing: u64) {
+    // SAFETY: per the caller; eight bytes at an index inside the page.
+    unsafe {
+        core::ptr::write_volatile(
+            (page_host + 8 * index as u64) as *mut u64,
+            page_descriptor(backing),
+        );
+    }
+}
+
+/// Writes a receive context where the HMC will fetch it.
+///
+/// # Safety
+///
+/// `host` must be the direct-map address of the context's 32 bytes in a
+/// backing page, writable, and the device must not be fetching it yet.
+pub unsafe fn write_receive_context(host: u64, context: &ReceiveContext) {
+    for (index, word) in context.words().iter().enumerate() {
+        // SAFETY: per the caller; 32 bytes, written a word at a time.
+        unsafe { core::ptr::write_volatile((host + 4 * index as u64) as *mut u32, *word) };
+    }
+}
+
+/// Posts receive descriptors, one per buffer, from descriptor zero -- Table
+/// 38-406: the packet buffer address, and a header address left zero because
+/// the queue does no header split and bit 0 must stay clear for `DD`.
+///
+/// # Safety
+///
+/// `ring_host` must be the direct-map address of a ring with at least
+/// `buffers.len()` descriptors, writable, and the queue must not be enabled.
+pub unsafe fn post_receive_descriptors(ring_host: u64, buffers: &[u64]) {
+    for (index, buffer) in buffers.iter().enumerate() {
+        let at = ring_host + RECEIVE_DESCRIPTOR_BYTES * index as u64;
+        // SAFETY: per the caller; two quad-words inside the ring.
+        unsafe {
+            core::ptr::write_volatile(at as *mut u64, *buffer);
+            core::ptr::write_volatile((at + 8) as *mut u64, 0);
+        }
+    }
+}
+
+/// What hardware wrote back into a receive descriptor -- the 16-byte
+/// write-back's second quad-word once `DD` is set: status bits 18:0 (Table
+/// 38-408), error bits 26:19 (Table 38-409), packet type 37:30 (Table
+/// 38-412), length 63:38 with `PKTL` in its low fourteen bits (Table 38-411).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReceiveCompletion {
+    /// Table 38-408's nineteen status bits.
+    pub status: u32,
+    /// Table 38-409's eight error bits; bit 0 `RXE` is a MAC error.
+    pub error: u8,
+    /// Table 38-412's packet type -- 11 is `MAC, ARP`, 1 is `MAC, PAY2`.
+    pub packet_type: u8,
+    /// `PKTL`: bytes in the packet buffer.
+    pub length: u16,
+}
+
+impl ReceiveCompletion {
+    /// The write-back's second quad-word, decoded.
+    #[must_use]
+    pub const fn decode(qword: u64) -> Self {
+        Self {
+            status: (qword & 0x7_ffff) as u32,
+            error: ((qword >> 19) & 0xff) as u8,
+            packet_type: ((qword >> 30) & 0xff) as u8,
+            length: ((qword >> 38) & 0x3fff) as u16,
+        }
+    }
+
+    /// `EOP`: the whole packet is in this descriptor's buffer.
+    #[must_use]
+    pub const fn end_of_packet(&self) -> bool {
+        self.status & RX_EOP != 0
+    }
+
+    /// `UMBCAST`, status bits 10:9, as Table 38-408 names the four values.
+    #[must_use]
+    pub const fn cast_name(&self) -> &'static str {
+        match (self.status >> 9) & 0b11 {
+            0 => "unicast",
+            1 => "multicast",
+            2 => "broadcast",
+            _ => "mirrored",
+        }
+    }
+
+    /// `RXE`: *"CRC, alignment, oversize, undersize, or length error"*.
+    #[must_use]
+    pub const fn mac_error(&self) -> bool {
+        self.error & 1 != 0
+    }
+}
+
+/// Reads a receive descriptor's write-back, if hardware has completed it.
+///
+/// # Safety
+///
+/// `ring_host` as [`post_receive_descriptors`], and `index` inside the ring.
+pub unsafe fn completed_descriptor(ring_host: u64, index: u32) -> Option<ReceiveCompletion> {
+    let at = ring_host + RECEIVE_DESCRIPTOR_BYTES * index as u64 + 8;
+    // SAFETY: per the caller; the second quad-word, which hardware writes.
+    let qword = unsafe { core::ptr::read_volatile(at as *const u64) };
+    if qword & RX_DD == 0 {
+        return None;
+    }
+    Some(ReceiveCompletion::decode(qword))
+}
+
+/// An Ethernet header, as far as the boot report needs one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FrameHeader {
+    /// The destination address.
+    pub destination: [u8; 6],
+    /// The source address.
+    pub source: [u8; 6],
+    /// The EtherType -- the one behind the tag, if there is an 802.1Q tag.
+    pub ethertype: u16,
+    /// The 802.1Q tag control field, if the frame carried one.
+    pub vlan: Option<u16>,
+}
+
+impl FrameHeader {
+    /// How many bytes [`FrameHeader::parse`] looks at.
+    pub const BYTES: usize = 18;
+
+    /// The first eighteen bytes of a frame: destination, source, and the
+    /// EtherType -- or, at `0x8100`, the tag and the EtherType behind it.
+    #[must_use]
+    pub fn parse(bytes: &[u8; Self::BYTES]) -> Self {
+        let mut destination = [0; 6];
+        destination.copy_from_slice(&bytes[0..6]);
+        let mut source = [0; 6];
+        source.copy_from_slice(&bytes[6..12]);
+        let first = u16::from_be_bytes([bytes[12], bytes[13]]);
+        if first == 0x8100 {
+            Self {
+                destination,
+                source,
+                ethertype: u16::from_be_bytes([bytes[16], bytes[17]]),
+                vlan: Some(u16::from_be_bytes([bytes[14], bytes[15]])),
+            }
+        } else {
+            Self {
+                destination,
+                source,
+                ethertype: first,
+                vlan: None,
+            }
+        }
+    }
+
+    /// The EtherType by name, for the few the report is likely to meet.
+    #[must_use]
+    pub const fn ethertype_name(&self) -> &'static str {
+        match self.ethertype {
+            0x0800 => "IPv4",
+            0x0806 => "ARP",
+            0x86dd => "IPv6",
+            0x88cc => "LLDP",
+            0x8809 => "slow protocols",
+            0x0000..=0x05ff => "an 802.3 length",
+            _ => "other",
+        }
+    }
+}
+
+/// Copies a frame's first eighteen bytes out of a buffer hardware filled.
+///
+/// # Safety
+///
+/// `buffer_host` must be the direct-map address of a buffer at least
+/// [`FrameHeader::BYTES`] long that hardware has finished writing.
+pub unsafe fn frame_header(buffer_host: u64) -> FrameHeader {
+    // SAFETY: per the caller.
+    let bytes = unsafe { core::ptr::read_volatile(buffer_host as *const [u8; FrameHeader::BYTES]) };
+    FrameHeader::parse(&bytes)
+}
+
 /// One mapped X722 function, far enough along to be asked questions.
 pub struct Device {
     /// The register window, through the direct map.
@@ -845,6 +1264,162 @@ impl Device {
             function: (info & 0x1f) as u8,
             data: self.read(PFHMC_ERRORDATA),
         })
+    }
+
+    /// Asks `Clear PXE Mode` -- Table 38-402. `Ok(true)` if the device left
+    /// PXE mode on this command, `Ok(false)` if firmware answered `EEXIST`
+    /// because it was already out.
+    ///
+    /// The datasheet's own sequence for the command has firmware disable the
+    /// PXE receive queues first and clear the flag last, which is why this is
+    /// a command and not a write to `GLLAN_RCTL_0`.
+    ///
+    /// # Errors
+    ///
+    /// As [`Device::command`], except that `EEXIST` is an answer.
+    pub fn clear_pxe_mode(&mut self, spins: u32) -> Result<bool, CommandError> {
+        match self.command(Descriptor::direct(OPCODE_CLEAR_PXE_MODE), spins) {
+            Ok(_) => Ok(true),
+            Err(CommandError::Refused(RETURN_EEXIST)) => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Sets a VSI's multicast and broadcast promiscuity -- Table 38-253, with
+    /// both modes named in the valid mask every time, so that clearing is the
+    /// same command as setting and nothing is left half-changed.
+    ///
+    /// # Errors
+    ///
+    /// As [`Device::command`].
+    pub fn set_promiscuous(
+        &mut self,
+        seid: u16,
+        multicast: bool,
+        broadcast: bool,
+        spins: u32,
+    ) -> Result<(), CommandError> {
+        let mut request = Descriptor::direct(OPCODE_SET_VSI_PROMISCUOUS);
+        let mut modes = 0;
+        if multicast {
+            modes |= PROMISCUOUS_MULTICAST;
+        }
+        if broadcast {
+            modes |= PROMISCUOUS_BROADCAST;
+        }
+        let valid = PROMISCUOUS_MULTICAST | PROMISCUOUS_BROADCAST;
+        // Bytes 16-17 the modes, 18-19 the valid mask, 20-21 the SEID.
+        request.words[4] = u32::from(modes) | (u32::from(valid) << 16);
+        request.words[5] = u32::from(seid & 0x3ff);
+        self.command(request, spins).map(|_| ())
+    }
+
+    /// Programs where the LAN objects live in this function's private memory
+    /// -- 38.26.3.1: transmit contexts first, at base zero; receive contexts
+    /// after them at the next 512-byte boundary; both counted to `queues`,
+    /// which is the PF's whole allocation because the objects are indexed by
+    /// absolute queue number -- and reads the four registers back.
+    pub fn program_lan_private_memory(&self, queues: u32) -> PrivateMemory {
+        let function = self.read(PF_FUNC_RID) & 0b111;
+        let at = 4 * u64::from(function);
+        let tx_size = self.read(GLHMC_LANTXOBJSZ) & 0xf;
+        self.write(GLHMC_LANTXBASE + at, 0);
+        self.write(GLHMC_LANTXCNT + at, queues & 0x7ff);
+        self.write(
+            GLHMC_LANRXBASE + at,
+            receive_base_after(0, queues, tx_size) & 0x00ff_ffff,
+        );
+        self.write(GLHMC_LANRXCNT + at, queues & 0x7ff);
+        self.private_memory()
+    }
+
+    /// Writes one segment descriptor and reads it back through the same
+    /// command register -- 38.26.4 step 6: paged, valid, the page descriptor
+    /// page's address split high and low, and `PMSDBPCOUNT` in the low word.
+    ///
+    /// `pd_page` is the page descriptor page **as the device issues it**.
+    /// Returns what the entry reads back as, `(low, high)`, for the caller to
+    /// hold against [`segment_descriptor`]: a write past this function's range
+    /// *"is dropped"*, and dropped silently.
+    pub fn write_segment_descriptor(
+        &self,
+        index: u32,
+        pd_page: u64,
+        backing_pages: u32,
+    ) -> (u32, u32) {
+        let (low, high) = segment_descriptor(pd_page, backing_pages);
+        self.write(PFHMC_SDDATAHIGH, high);
+        self.write(PFHMC_SDDATALOW, low);
+        self.write(PFHMC_SDCMD, (index & 0xfff) | SD_WRITE);
+        // A read command for the same index, and a read of the command
+        // register between it and the data so the posted writes have landed.
+        self.write(PFHMC_SDCMD, index & 0xfff);
+        let _ = self.read(PFHMC_SDCMD);
+        (self.read(PFHMC_SDDATALOW), self.read(PFHMC_SDDATAHIGH))
+    }
+
+    /// Enables a receive queue -- 38.30.3.3.2: the tail cleared and then set,
+    /// `QENA_REQ` set, `QENA_STAT` polled, which *"follows the QENA_REQ
+    /// almost instantly and not more than 10 µs after that"*.
+    ///
+    /// `tail` is the first descriptor software has not handed over -- the
+    /// count posted -- and a multiple of eight outside PXE mode.
+    pub fn enable_receive_queue(&self, queue: u32, tail: u32, spins: u32) -> bool {
+        let at = 4 * u64::from(queue);
+        self.write(QRX_TAIL + at, 0);
+        self.write(QRX_TAIL + at, tail & 0x1fff);
+        let enable = self.read(QRX_ENA + at);
+        self.write(QRX_ENA + at, enable | QENA_REQ);
+        for _ in 0..spins {
+            if self.read(QRX_ENA + at) & QENA_STAT != 0 {
+                return true;
+            }
+            core::hint::spin_loop();
+        }
+        false
+    }
+
+    /// Disables a receive queue -- 38.30.3.3.3: `QENA_REQ` cleared, then
+    /// `QENA_STAT` polled clear, after which *"software can release all memory
+    /// structures of the queue"*.
+    pub fn disable_receive_queue(&self, queue: u32, spins: u32) -> bool {
+        let at = 4 * u64::from(queue);
+        let enable = self.read(QRX_ENA + at);
+        self.write(QRX_ENA + at, enable & !QENA_REQ);
+        for _ in 0..spins {
+            if self.read(QRX_ENA + at) & QENA_STAT == 0 {
+                return true;
+            }
+            core::hint::spin_loop();
+        }
+        false
+    }
+
+    /// The context the device holds for a receive queue, read out of its
+    /// cache -- `PFCM_LANCTXCTL` with a read of sub-line 0, which is bits
+    /// 0-127: `HEAD`, `BASE`, `QLEN`, the buffer sizes and the flags.
+    ///
+    /// Returns the four words and whether the queue was resident (`CTX_MISS`
+    /// clear), or `None` if `CTX_DONE` never set. This is the one way to see
+    /// the context **the device** has, as distinct from the one this driver
+    /// wrote into private memory: a `HEAD` that moved is a device that fetched
+    /// descriptors from the ring the context names.
+    #[must_use]
+    pub fn cached_receive_context(&self, queue: u32, spins: u32) -> Option<([u32; 4], bool)> {
+        // Sub-line 0, queue type 00 (receive), op code 00 (read).
+        self.write(PFCM_LANCTXCTL, queue & 0xfff);
+        for _ in 0..spins {
+            let status = self.read(PFCM_LANCTXSTAT);
+            if status & 1 != 0 {
+                let mut words = [0; 4];
+                for (index, word) in words.iter_mut().enumerate() {
+                    *word = self.read(PFCM_LANCTXDATA + 0x80 * index as u64);
+                }
+                return Some((words, status & 0b10 == 0));
+            }
+            core::hint::spin_loop();
+        }
+        None
     }
 
     /// What a receive queue's enable handshake currently reads.
@@ -1091,6 +1666,133 @@ mod tests {
         assert_eq!(
             SwitchConfiguration::parse(&buffer).count,
             SWITCH_ELEMENTS_MAX
+        );
+    }
+
+    /// 38.30.3.4.3's worked example, reproduced bit for bit.
+    #[test]
+    fn the_receive_context_matches_the_datasheets_example() {
+        // The example: BASE 0x1579A0, QLEN 0x80, DBUFF 12 (1536 bytes), RXMAX
+        // 0x600, CRCStrip 1, DSize 0, HSPLIT 0, TPH 0xF; its dwords 7..0 read
+        // 00000000 0000021E 01800000 00000000 00200301 00000000 001579A0 00000000.
+        let context = ReceiveContext {
+            ring: 0x1579A0 * 128,
+            descriptors: 0x80,
+            buffer_bytes: 1536,
+            max_frame: 0x600,
+        };
+        let mut words = context.words();
+        // The example enables all four TPH flags, bits 193-196; this driver
+        // leaves them clear, so they are added for the comparison only.
+        words[6] |= 0b1_1110;
+        assert_eq!(
+            words,
+            [
+                0x0000_0000,
+                0x0015_79A0,
+                0x0000_0000,
+                0x0020_0301,
+                0x0000_0000,
+                0x0180_0000,
+                0x0000_021E,
+                0x0000_0000
+            ]
+        );
+    }
+
+    /// 38.26.4's example arithmetic, and Table 38-337's rounding.
+    #[test]
+    fn private_memory_addresses_follow_38_26_4() {
+        // 512 transmit contexts of 128 bytes end at 64 KiB, which is 128 units.
+        assert_eq!(receive_base_after(0, 512, 7), 128);
+        // One context rounds up to one 512-byte unit; 384 need exactly 96.
+        assert_eq!(receive_base_after(0, 1, 7), 1);
+        assert_eq!(receive_base_after(0, 384, 7), 96);
+        // Receive context 0 at base 128 units: address 64 KiB, so SD 0, PD 16.
+        let at = context_location(128, 5, 0);
+        assert_eq!(
+            (at.address, at.segment, at.page, at.offset),
+            (65536, 0, 16, 0)
+        );
+        // Receive context 384 there is 12 KiB further: PD 19.
+        assert_eq!(context_location(128, 5, 384).page, 19);
+        // Receive context 3 at base 1 unit: 512 + 96, so PD 0 at offset 608.
+        let at = context_location(1, 5, 3);
+        assert_eq!((at.segment, at.page, at.offset), (0, 0, 608));
+        // Past 2 MB the segment index moves and the page index wraps.
+        let at = context_location(4096, 5, 0);
+        assert_eq!((at.segment, at.page), (1, 0));
+        // The SR550's layout: 384 queues, so receive contexts at 48 KiB and
+        // the whole thing spans 15 pages.
+        let end = object_area_end(96, 384, 5);
+        assert_eq!(end, 48 * 1024 + 12 * 1024);
+        assert_eq!(backing_pages_to(end), 15);
+        assert_eq!(context_location(96, 5, 0).page, 12);
+    }
+
+    /// Table 38-330 and 38.39.2.13.5's fields, from an address above 4 GiB
+    /// because that is where this device's window puts them.
+    #[test]
+    fn descriptors_carry_the_address_bits_the_tables_name() {
+        assert_eq!(page_descriptor(0x1_0000_2000), 0x1_0000_2001);
+        assert_eq!(
+            page_descriptor(0x1_0000_2fff),
+            0x1_0000_2001,
+            "low bits are not an address"
+        );
+        let (low, high) = segment_descriptor(0x1_0000_1000, 15);
+        assert_eq!(high, 1);
+        assert_eq!(low, 0x1000 | (15 << 2) | 1);
+        let (low, _) = segment_descriptor(0x1_0000_1000, 512);
+        assert_eq!(
+            (low >> 2) & 0x3ff,
+            512,
+            "a full segment's count fits its ten bits"
+        );
+    }
+
+    /// Tables 38-408, 38-409, 38-411 and 38-412: the write-back's second word.
+    #[test]
+    fn a_receive_completion_is_decoded_from_the_second_quad_word() {
+        // DD and EOP set, broadcast, no error, packet type 11 (MAC, ARP),
+        // 60 bytes.
+        let qword = 0b11 | (0b10 << 9) | (11u64 << 30) | (60u64 << 38);
+        let completion = ReceiveCompletion::decode(qword);
+        assert!(completion.end_of_packet());
+        assert_eq!(completion.cast_name(), "broadcast");
+        assert!(!completion.mac_error());
+        assert_eq!(completion.packet_type, 11);
+        assert_eq!(completion.length, 60);
+        let bad = ReceiveCompletion::decode(0b1 | (1 << 19));
+        assert!(bad.mac_error());
+        assert!(!bad.end_of_packet());
+    }
+
+    /// An Ethernet header, tagged and untagged.
+    #[test]
+    fn a_frame_header_finds_the_ethertype_behind_a_tag() {
+        let mut bytes = [0u8; FrameHeader::BYTES];
+        bytes[0..6].copy_from_slice(&[0xff; 6]);
+        bytes[6..12].copy_from_slice(&[0x00, 0x11, 0x22, 0x33, 0x44, 0x55]);
+        bytes[12..14].copy_from_slice(&[0x08, 0x06]);
+        let plain = FrameHeader::parse(&bytes);
+        assert_eq!(plain.ethertype, 0x0806);
+        assert_eq!(plain.ethertype_name(), "ARP");
+        assert_eq!(plain.vlan, None);
+        assert_eq!(plain.destination, [0xff; 6]);
+
+        bytes[12..14].copy_from_slice(&[0x81, 0x00]);
+        bytes[14..16].copy_from_slice(&[0x00, 0x64]);
+        bytes[16..18].copy_from_slice(&[0x86, 0xdd]);
+        let tagged = FrameHeader::parse(&bytes);
+        assert_eq!(tagged.ethertype, 0x86dd);
+        assert_eq!(tagged.ethertype_name(), "IPv6");
+        assert_eq!(tagged.vlan, Some(100));
+
+        bytes[12..14].copy_from_slice(&[0x00, 0x26]);
+        assert_eq!(
+            FrameHeader::parse(&bytes).ethertype_name(),
+            "an 802.3 length"
         );
     }
 }

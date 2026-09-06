@@ -660,7 +660,22 @@ asm_budget = 10
 # when there is more than one command, and buys nothing while there is one. It
 # is noted so the next command is the moment to build it rather than to pay this
 # again.
-unsafe_budget = 2012
+#
+# 2031 on 2026-09-06: nineteen lines for RFC 0072 step 4's receive queue --
+# the writes into memory the device fetches from and the reads of memory it
+# writes: a page descriptor, a 32-byte queue context, sixteen receive
+# descriptors, the write-back word that says a frame landed, and the first
+# eighteen bytes of the frame. Each is a raw access to a page this kernel
+# created, zeroed and mapped for the device, and each block says so. The
+# typed descriptor the 2012 note asked for was built, and took one line back.
+#
+# 2032 on 2026-09-06: one line for the scan of every posted descriptor after
+# the receive wait. The wait watches descriptor zero, which is where a queue
+# starting at head zero puts its first frame; the scan tells "the ring is
+# untouched" apart from "a frame landed at an index nobody was watching",
+# which is a distinction worth having inside the boot that fails rather than
+# in the boot after it.
+unsafe_budget = 2032
 # Up thirty-one for RFC 0005 step 9's socket probe -- `ring3_socketeer`, which
 # is `ring3_lister` with a `sockaddr_in6` copied in beside its code instead of
 # two filenames. The same two blocks every hosted probe has: one

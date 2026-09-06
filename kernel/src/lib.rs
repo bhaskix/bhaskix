@@ -12482,8 +12482,11 @@ pub fn start_block_domain(
 ///
 /// One page holds both rings -- 1 KiB each at 32 descriptors of 32 bytes -- so
 /// there is one object to create, map and revoke rather than two.
-fn admin_ring_address(device: (u8, u8, u8), hhdm: u64) -> Option<(u64, u64, u64)> {
-    let owner = domain::create("nic-rings", domain::ResourceEnvelope::new()).ok()?;
+fn admin_ring_address(
+    owner: domain::DomainId,
+    device: (u8, u8, u8),
+    hhdm: u64,
+) -> Option<(u64, u64, u64)> {
     let rings = shared::create(owner, bhaskix_mm::FRAME_SIZE).ok()?;
     let base = iommu::map_memory(
         device,
@@ -12523,7 +12526,7 @@ fn admin_ring_address(device: (u8, u8, u8), hhdm: u64) -> Option<(u64, u64, u64)
 ///
 /// `transmit` and `host` are the admin ring page as the device and this
 /// kernel reach it; the switch buffer lives in the same page after the rings.
-fn ask_nic(nic: &mut i40e::Device, transmit: u64, host: u64) {
+fn ask_nic(nic: &mut i40e::Device, transmit: u64, host: u64) -> NicFacts {
     const SPINS: u32 = 2_000_000;
 
     match nic.get_version(SPINS) {
@@ -12532,7 +12535,7 @@ fn ask_nic(nic: &mut i40e::Device, transmit: u64, host: u64) {
         }
         Err(error) => {
             println!("\x1b[93m    nic firmware   no answer to Get Version: {error}\x1b[0m");
-            return;
+            return NicFacts::default();
         }
     }
 
@@ -12540,33 +12543,37 @@ fn ask_nic(nic: &mut i40e::Device, transmit: u64, host: u64) {
     // unread when step 3 was called complete.** A receive queue on a port with
     // no link is a queue that will never fill, and the report should say which
     // of those it is watching before it waits for a frame.
-    match nic.link_status(SPINS) {
-        Ok(link) => println!(
-            "    nic link       {} at {} over {}; media {}, signal {}{}; max frame {}",
-            if link.up() { "UP" } else { "down" },
-            link.speed_name(),
-            link.phy_name(),
-            if link.media_available() {
-                "available"
-            } else {
-                "absent"
-            },
-            if link.signal_detected() {
-                "detected"
-            } else {
-                "none"
-            },
-            if link.faulted() {
-                ", fault reported"
-            } else {
-                ""
-            },
-            link.max_frame,
-        ),
+    let link_up = match nic.link_status(SPINS) {
+        Ok(link) => {
+            println!(
+                "    nic link       {} at {} over {}; media {}, signal {}{}; max frame {}",
+                if link.up() { "UP" } else { "down" },
+                link.speed_name(),
+                link.phy_name(),
+                if link.media_available() {
+                    "available"
+                } else {
+                    "absent"
+                },
+                if link.signal_detected() {
+                    "detected"
+                } else {
+                    "none"
+                },
+                if link.faulted() {
+                    ", fault reported"
+                } else {
+                    ""
+                },
+                link.max_frame,
+            );
+            link.up()
+        }
         Err(error) => {
             println!("\x1b[93m    nic link       no answer to Get Link Status: {error}\x1b[0m");
+            false
         }
-    }
+    };
 
     // **The switch, because a frame is steered to a VSI before any queue sees
     // it.** The VSI's number indexes `VSILAN_QBASE`, which says where its
@@ -12574,6 +12581,7 @@ fn ask_nic(nic: &mut i40e::Device, transmit: u64, host: u64) {
     // the queue a frame would actually reach rather than the one numbered zero.
     let buffer_device = transmit + i40e::SWITCH_BUFFER_OFFSET;
     let buffer_host = host + i40e::SWITCH_BUFFER_OFFSET;
+    let mut vsi = None;
     // SAFETY: `host` is the direct-map address of the ring page, a page long
     // and writable; the buffer's offset keeps it inside that page after both
     // rings, which `i40e` asserts at compile time; nothing else writes it.
@@ -12595,6 +12603,11 @@ fn ask_nic(nic: &mut i40e::Device, transmit: u64, host: u64) {
                     element.number
                 );
                 if element.kind_name() == "VSI" {
+                    // The first VSI reported is the one a frame reaches; its
+                    // SEID is what the filter command wants.
+                    if vsi.is_none() {
+                        vsi = Some(element.seid);
+                    }
                     match nic.vsi_queue_base(element.number) {
                         Some((base, true)) => println!(
                             "                   VSI {} takes a scattered queue set through \
@@ -12620,7 +12633,8 @@ fn ask_nic(nic: &mut i40e::Device, transmit: u64, host: u64) {
 
     // **Which queue is this PF's first.** Absolute numbering is what the HMC
     // and the queue registers use; the PF's own is an offset from here.
-    let first = match nic.queue_allocation() {
+    let allocation = nic.queue_allocation();
+    let first = match allocation {
         Some((first, last)) => {
             println!(
                 "    nic queues     this PF owns absolute queues {first}..={last}, {} pair(s); \
@@ -12681,6 +12695,23 @@ fn ask_nic(nic: &mut i40e::Device, transmit: u64, host: u64) {
             error.data
         ),
     }
+
+    NicFacts {
+        link_up,
+        vsi,
+        allocation,
+    }
+}
+
+/// What [`ask_nic`] learned that the receive queue's programming depends on.
+#[derive(Clone, Copy, Debug, Default)]
+struct NicFacts {
+    /// `Get Link Status` said the link is up.
+    link_up: bool,
+    /// The SEID of the first VSI the switch reported, if any.
+    vsi: Option<u16>,
+    /// `PFLAN_QALLOC`'s first and last absolute queue, if valid.
+    allocation: Option<(u16, u16)>,
 }
 
 /// One receive queue's enable handshake, as the boot report states it.
@@ -12701,6 +12732,462 @@ fn report_receive_queue(nic: &i40e::Device, queue: u32) {
             (false, true) => "a disable is in flight",
         }
     );
+}
+
+/// Pages the device can reach, and where this kernel reaches each of them.
+///
+/// One `Memory` object of `pages` frames, charged to `owner`, mapped
+/// contiguously in the device's translation and zeroed on allocation. Returns
+/// the device address of the first page and the direct-map address of each:
+/// the frames need not be physically contiguous, so the host side is a list
+/// rather than a base.
+fn nic_pages(
+    owner: domain::DomainId,
+    device: (u8, u8, u8),
+    hhdm: u64,
+    pages: u64,
+) -> Option<(u64, [u64; shared::MAX_FRAMES], usize)> {
+    let object = shared::create(owner, pages * bhaskix_mm::FRAME_SIZE).ok()?;
+    let base = iommu::map_memory(
+        device,
+        object,
+        bhaskix_arch::vtd::Rights::READ_WRITE,
+        false,
+        hhdm,
+        owner.as_u32(),
+    )?;
+    let (frames, count) = shared::frames_of(object)?;
+    if count < pages as usize {
+        return None;
+    }
+    let mut hosts = [0; shared::MAX_FRAMES];
+    for (host, frame) in hosts.iter_mut().zip(frames.iter()).take(count) {
+        *host = hhdm + *frame;
+    }
+    Some((base.as_u64(), hosts, count))
+}
+
+/// Spins for at least `millis`, on the calibrated clock when there is one.
+///
+/// Returns whether the wait was timed. Without a calibrated TSC the fallback
+/// is a spin count that is only an order of magnitude, which the caller
+/// should say rather than hide.
+fn pause_millis(millis: u64) -> bool {
+    match time::now_nanos() {
+        Some(start) => {
+            while time::now_nanos()
+                .is_some_and(|now| now.saturating_sub(start) < millis * 1_000_000)
+            {
+                core::hint::spin_loop();
+            }
+            true
+        }
+        None => {
+            for _ in 0..millis.saturating_mul(200_000) {
+                core::hint::spin_loop();
+            }
+            false
+        }
+    }
+}
+
+/// Polls the first receive descriptor for a completion, for up to `millis`.
+///
+/// Returns the completion and how long it took, in milliseconds on the
+/// calibrated clock -- or `u64::MAX` for an untimed wait.
+///
+/// # Safety
+///
+/// `ring_host` must be the direct-map address of a posted receive ring.
+unsafe fn wait_for_first_frame(
+    ring_host: u64,
+    millis: u64,
+) -> Option<(i40e::ReceiveCompletion, u64)> {
+    let start = time::now_nanos();
+    let mut spins: u64 = 0;
+    loop {
+        // SAFETY: per the caller; descriptor zero of the ring.
+        if let Some(completion) = unsafe { i40e::completed_descriptor(ring_host, 0) } {
+            let elapsed = match (start, time::now_nanos()) {
+                (Some(start), Some(now)) => now.saturating_sub(start) / 1_000_000,
+                _ => u64::MAX,
+            };
+            return Some((completion, elapsed));
+        }
+        match (start, time::now_nanos()) {
+            (Some(start), Some(now)) => {
+                if now.saturating_sub(start) >= millis * 1_000_000 {
+                    return None;
+                }
+            }
+            _ => {
+                spins += 1;
+                if spins >= millis.saturating_mul(200_000) {
+                    return None;
+                }
+            }
+        }
+        core::hint::spin_loop();
+    }
+}
+
+/// One receive queue: private memory programmed, one context page backed, the
+/// context written, buffers posted, the queue enabled, and a bounded wait for
+/// a frame -- RFC 0072 step 4.
+///
+/// `vsi` is the SEID of the VSI whose queues this PF's start with, `queue` the
+/// absolute index of the queue taken, and `queues` how many this PF owns,
+/// which is what the private memory layout is sized to.
+///
+/// **Armed within the boot.** Before the queue is enabled, descriptor zero is
+/// watched for a tenth of a second and must stay untouched; the frame line
+/// therefore cannot be a completion the device wrote for some other reason.
+/// A separate boot with the enable left out is the fuller arming, and the RFC
+/// records whether it was taken.
+fn bring_up_receive_queue(
+    nic: &mut i40e::Device,
+    owner: domain::DomainId,
+    device: (u8, u8, u8),
+    hhdm: u64,
+    vsi: u16,
+    queue: u32,
+    queues: u32,
+) {
+    const SPINS: u32 = 2_000_000;
+    /// `QLEN`: a whole multiple of 32 once PXE mode is off.
+    const DESCRIPTORS: u16 = 32;
+    /// Posted: a multiple of eight, which is the tail's granularity outside
+    /// PXE mode, and one page each so a buffer is a frame.
+    const BUFFERS: usize = 16;
+    const BUFFER_BYTES: u16 = 4096;
+    /// A standard frame with a tag and its CRC fits; jumbo frames are dropped.
+    const MAX_FRAME: u16 = 1536;
+    const FRAME: u64 = bhaskix_mm::FRAME_SIZE;
+
+    // **Out of PXE mode first** -- 38.30.2.1's *"operating system driver only
+    // step"*, and the queue-length rule depends on it.
+    match nic.clear_pxe_mode(SPINS) {
+        Ok(true) => println!(
+            "    nic pxe        cleared: the device left PXE mode; GLLAN_RCTL_0.PXE_MODE reads {}",
+            u8::from(nic.pxe_mode())
+        ),
+        Ok(false) => println!("    nic pxe        already clear -- firmware answered EEXIST"),
+        Err(error) => {
+            println!(
+                "\x1b[93m    nic pxe        Clear PXE Mode: {error}; no queue is taken\x1b[0m"
+            );
+            return;
+        }
+    }
+
+    // **Memory the device can reach**: a page of page descriptors, a backing
+    // page for the receive contexts, a page for the ring; then the buffers.
+    let Some((control_device, control_host, _)) = nic_pages(owner, device, hhdm, 3) else {
+        println!(
+            "\x1b[93m    nic rx ring    no control pages the device can reach; no queue is taken\x1b[0m"
+        );
+        return;
+    };
+    let Some((buffers_device, buffers_host, _)) = nic_pages(owner, device, hhdm, BUFFERS as u64)
+    else {
+        println!(
+            "\x1b[93m    nic rx ring    no buffer pages the device can reach; no queue is taken\x1b[0m"
+        );
+        return;
+    };
+    let (pd_page_device, pd_page_host) = (control_device, control_host[0]);
+    let (backing_device, backing_host) = (control_device + FRAME, control_host[1]);
+    let (ring_device, ring_host) = (control_device + 2 * FRAME, control_host[2]);
+
+    // **The layout, written and read back.** Transmit contexts first at base
+    // zero, receive contexts after them; both sized to the PF's allocation
+    // because the objects are indexed by absolute queue number.
+    let memory = nic.program_lan_private_memory(queues);
+    let rx_base = i40e::receive_base_after(0, queues, memory.tx_object_size);
+    let layout_held = memory.tx_base == 0
+        && memory.tx_count == queues
+        && memory.rx_base == rx_base
+        && memory.rx_count == queues;
+    println!(
+        "    nic fpm        programmed tx base 0 count {queues}, rx base {rx_base} count {queues}; \
+         read back tx {} / {}, rx {} / {} -- {}",
+        memory.tx_base,
+        memory.tx_count,
+        memory.rx_base,
+        memory.rx_count,
+        if layout_held {
+            "as written"
+        } else {
+            "NOT as written"
+        }
+    );
+    let at = i40e::context_location(memory.rx_base, memory.rx_object_size, queue);
+    let end = i40e::object_area_end(memory.rx_base, memory.rx_count, memory.rx_object_size);
+    let backing_pages = i40e::backing_pages_to(end);
+    println!(
+        "    nic fpm        receive context {queue} at private address {:#x}: segment {}, page \
+         descriptor {}, offset {}; the layout ends at {:#x}, {backing_pages} page(s)",
+        at.address, at.segment, at.page, at.offset, end
+    );
+    if !layout_held
+        || at.segment != 0
+        || memory.sd_size == 0
+        || backing_pages > i40e::PAGE_DESCRIPTORS
+    {
+        println!(
+            "\x1b[93m    nic fpm        the layout is not one this step backs (one page in segment \
+             0); no queue is taken\x1b[0m"
+        );
+        return;
+    }
+
+    // **One backing page, named through one page descriptor, through one
+    // segment descriptor** -- 38.26.4's steps 3 to 6 for exactly the page the
+    // context lives in. Both addresses are the device's: the HMC fetches
+    // through them.
+    // SAFETY: `pd_page_host` is the direct-map address of a page this kernel
+    // just created and zeroed, not yet named to the device, and `at.page` is
+    // below `PAGE_DESCRIPTORS`.
+    unsafe { i40e::write_page_descriptor(pd_page_host, at.page, backing_device) };
+    let read_back = nic.write_segment_descriptor(at.segment, pd_page_device, backing_pages);
+    let asked = i40e::segment_descriptor(pd_page_device, backing_pages);
+    println!(
+        "    nic hmc        segment {} -> page descriptor page at {pd_page_device:#x}, \
+         {backing_pages} backing page(s); page descriptor {} -> {backing_device:#x}; the segment \
+         reads back {}",
+        at.segment,
+        at.page,
+        if read_back == asked {
+            "as written"
+        } else {
+            "NOT as written"
+        }
+    );
+    if read_back != asked {
+        println!(
+            "                   asked low {:#010x} high {:#010x}, read low {:#010x} high {:#010x}",
+            asked.0, asked.1, read_back.0, read_back.1
+        );
+        return;
+    }
+
+    // **The context and the ring.** The context goes where the HMC will fetch
+    // it; the descriptors name one buffer each, and only `BUFFERS` of the
+    // ring's `DESCRIPTORS` are handed over.
+    let context = i40e::ReceiveContext {
+        ring: ring_device,
+        descriptors: DESCRIPTORS,
+        buffer_bytes: BUFFER_BYTES,
+        max_frame: MAX_FRAME,
+    };
+    // SAFETY: `backing_host` is the direct-map address of the zeroed backing
+    // page just named; the offset is inside it; the device has not fetched
+    // from it because the queue is not enabled.
+    unsafe { i40e::write_receive_context(backing_host + u64::from(at.offset), &context) };
+    let mut buffers = [0u64; BUFFERS];
+    for (index, buffer) in buffers.iter_mut().enumerate() {
+        *buffer = buffers_device + index as u64 * FRAME;
+    }
+    // SAFETY: `ring_host` is the direct-map address of a zeroed page, so the
+    // ring has room for `DESCRIPTORS`; the queue is not enabled.
+    unsafe { i40e::post_receive_descriptors(ring_host, &buffers) };
+    println!(
+        "    nic rx ring    {DESCRIPTORS} descriptors at {ring_device:#x}, {BUFFERS} posted with \
+         {BUFFER_BYTES}-byte buffers from {buffers_device:#x}; frames up to {MAX_FRAME} bytes"
+    );
+
+    // **What the VSI forwards.** Its own MAC filter takes only frames sent to
+    // this port; what a switch sends unprompted is multicast and broadcast,
+    // and the command the datasheet names for forwarding broadcast is this.
+    match nic.set_promiscuous(vsi, true, true, SPINS) {
+        Ok(()) => println!(
+            "    nic filter     VSI seid {vsi:#x} now forwards multicast and broadcast to its queues"
+        ),
+        Err(error) => println!(
+            "\x1b[93m    nic filter     Set VSI Promiscuous Modes: {error}; only frames to this \
+             port's own address can arrive\x1b[0m"
+        ),
+    }
+
+    // **Armed before enabled.** With everything in place but the enable, the
+    // first descriptor must stay untouched.
+    // SAFETY: `ring_host` is the posted ring's direct-map address.
+    let early = unsafe { wait_for_first_frame(ring_host, 100) };
+    println!(
+        "    nic rx armed   with the queue still disabled, {}",
+        match early {
+            Some(_) =>
+                "\x1b[91ma descriptor completed anyway -- which nothing should have done\x1b[0m",
+            None => "no descriptor completed in 100 ms",
+        }
+    );
+
+    // **Enable** -- after the 50 ms 38.30.3.3.2 asks for since the last
+    // disable, which the PF reset and the PXE-mode clear both were.
+    let timed = pause_millis(50);
+    let enabled = nic.enable_receive_queue(queue, BUFFERS as u32, SPINS);
+    let (requested, active) = nic.receive_queue_state(queue);
+    println!(
+        "    nic rx queue   absolute queue {queue} enable requested{}; QENA_STAT {} (REQ={} STAT={})",
+        if timed { "" } else { " after an untimed pause" },
+        if enabled {
+            "set"
+        } else {
+            "\x1b[91mnever set\x1b[0m"
+        },
+        u8::from(requested),
+        u8::from(active)
+    );
+
+    // **The gate: a frame from the switch arrives, and the report prints its
+    // length and EtherType.**
+    //
+    // **A minute, and the reason it is not five seconds.** The first run of
+    // this waited five, found nothing, and could not say whether the receive
+    // path was broken or the wire was simply quiet -- link-up proves a cable
+    // and a partner, not that anything is being sent here, and an access port
+    // with one host behind it can carry no broadcast at all for five seconds.
+    // A minute covers spanning-tree hellos at their usual two, LLDP at thirty,
+    // and any ordinary ARP. If nothing lands in a minute on a live 1 Gb/s
+    // port, "the wire was quiet" stops being the comfortable explanation.
+    if enabled {
+        // SAFETY: as above.
+        match unsafe { wait_for_first_frame(ring_host, 60_000) } {
+            Some((completion, elapsed)) => {
+                // SAFETY: `buffers_host[0]` is the direct-map address of the
+                // buffer descriptor zero named, a page long, and the device
+                // has marked the descriptor done.
+                let header = unsafe { i40e::frame_header(buffers_host[0]) };
+                println!(
+                    "\x1b[92m    nic rx frame   a frame arrived after {} ms: {} bytes, EtherType {:#06x} \
+                     ({}){}, {} to {} from {}, packet type {}{}{}\x1b[0m",
+                    if elapsed == u64::MAX { 0 } else { elapsed },
+                    completion.length,
+                    header.ethertype,
+                    header.ethertype_name(),
+                    match header.vlan {
+                        Some(_) => " behind a VLAN tag",
+                        None => "",
+                    },
+                    completion.cast_name(),
+                    MacAddress(header.destination),
+                    MacAddress(header.source),
+                    completion.packet_type,
+                    if completion.end_of_packet() {
+                        ""
+                    } else {
+                        ", NOT end of packet"
+                    },
+                    if completion.mac_error() {
+                        ", MAC ERROR flagged"
+                    } else {
+                        ""
+                    },
+                );
+                if let Some(tag) = header.vlan {
+                    println!("                   VLAN tag control {tag:#06x}");
+                }
+            }
+            None => println!(
+                "\x1b[91m    nic rx frame   FAILED: no frame in 60 s with the queue enabled and \
+                 the link up\x1b[0m"
+            ),
+        }
+
+        // **Every posted descriptor, not just the first.** The wait watches
+        // descriptor zero because that is where a queue starting at head zero
+        // puts its first frame. If the device disagreed about where to start,
+        // that wait would report nothing while the ring held something, and
+        // the two are worth telling apart in the same boot rather than in the
+        // next one. Free to ask, and it says nothing when there is nothing.
+        let mut completed = 0;
+        let mut first_at = None;
+        for index in 0..BUFFERS as u32 {
+            // SAFETY: as above; `index` is inside the posted ring.
+            if let Some(completion) = unsafe { i40e::completed_descriptor(ring_host, index) } {
+                completed += 1;
+                if first_at.is_none() {
+                    first_at = Some((index, completion));
+                }
+            }
+        }
+        match first_at {
+            None => println!(
+                "    nic rx ring    none of the {BUFFERS} posted descriptors completed, so the \
+                 ring is untouched rather than filled elsewhere"
+            ),
+            Some((index, completion)) => println!(
+                "    nic rx ring    {completed} of {BUFFERS} descriptor(s) completed, the first at \
+                 index {index}: {} bytes, {}",
+                completion.length,
+                completion.cast_name()
+            ),
+        }
+    }
+
+    // **What the device holds**, read out of its context cache: a head that
+    // moved is a device that fetched descriptors from this ring, and a base
+    // that matches is a context fetched from the page this kernel backed.
+    match nic.cached_receive_context(queue, SPINS) {
+        Some((words, resident)) => {
+            let head = words[0] & 0x1fff;
+            let base = u64::from(words[1]) | (u64::from(words[2] & 0x1ff_ffff) << 32);
+            let qlen = ((words[2] >> 25) & 0x7f) | ((words[3] & 0x3f) << 7);
+            println!(
+                "    nic rx context the device holds head {head}, base {:#x} ({}), qlen {qlen}; {}",
+                base * 128,
+                if base * 128 == ring_device {
+                    "this ring"
+                } else {
+                    "NOT this ring"
+                },
+                if resident {
+                    "resident in the cache"
+                } else {
+                    "CTX_MISS -- not resident"
+                }
+            );
+        }
+        None => println!("    nic rx context CTX_DONE never set; the cache would not answer"),
+    }
+    match nic.hmc_error() {
+        None => println!("    nic hmc        no error recorded"),
+        Some(error) => println!(
+            "\x1b[93m    nic hmc        error recorded: {} (type {}, object {:#x}, function {}, \
+             data {:#x})\x1b[0m",
+            error.kind_name(),
+            error.kind,
+            error.object,
+            error.function,
+            error.data
+        ),
+    }
+
+    // **Put back what can be**: the queue disabled and the VSI's filtering as
+    // it was. The private memory layout stays programmed and its pages stay
+    // mapped, as the admin rings do.
+    if enabled {
+        let disabled = nic.disable_receive_queue(queue, SPINS);
+        println!(
+            "    nic rx queue   disabled again: QENA_STAT {}",
+            if disabled { "clear" } else { "still set" }
+        );
+    }
+    if let Err(error) = nic.set_promiscuous(vsi, false, false, SPINS) {
+        println!(
+            "\x1b[93m    nic filter     could not restore the VSI's filtering: {error}\x1b[0m"
+        );
+    }
+}
+
+/// Six bytes, colon-separated, for the boot report.
+struct MacAddress([u8; 6]);
+
+impl core::fmt::Display for MacAddress {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let [a, b, c, d, e, g] = self.0;
+        write!(f, "{a:02x}:{b:02x}:{c:02x}:{d:02x}:{e:02x}:{g:02x}")
+    }
 }
 
 /// The first X722 on the bus — RFC 0072 steps 2 and 3.
@@ -12889,8 +13376,11 @@ fn start_nic_domain(hhdm: u64) -> Result<(), &'static str> {
             // length would enable a ring at somebody else's size, and the
             // register would read back plausible either way.
             if !held {
-                match admin_ring_address(delegated, hhdm) {
-                    Some((transmit, receive, host)) => {
+                let owner = domain::create("nic-rings", domain::ResourceEnvelope::new()).ok();
+                match owner.and_then(|owner| {
+                    admin_ring_address(owner, delegated, hhdm).map(|rings| (owner, rings))
+                }) {
+                    Some((owner, (transmit, receive, host))) => {
                         // SAFETY: `host` is the direct-map address of the page
                         // `admin_ring_address` just created and mapped for this
                         // device -- writable, a page long, so it holds both
@@ -12917,7 +13407,34 @@ fn start_nic_domain(hhdm: u64) -> Result<(), &'static str> {
                         // slate assumed is a ring enabled at somebody else's
                         // size.
                         if taken {
-                            ask_nic(&mut nic, transmit, host);
+                            let facts = ask_nic(&mut nic, transmit, host);
+                            // **Then the queue, if the facts allow one.** A
+                            // frame needs a live link to arrive on, a VSI to
+                            // be steered through, and a queue this PF owns.
+                            match (facts.link_up, facts.vsi, facts.allocation) {
+                                (true, Some(vsi), Some((first, last))) => {
+                                    bring_up_receive_queue(
+                                        &mut nic,
+                                        owner,
+                                        delegated,
+                                        hhdm,
+                                        vsi,
+                                        u32::from(first),
+                                        u32::from(last).saturating_sub(u32::from(first)) + 1,
+                                    );
+                                }
+                                (false, _, _) => println!(
+                                    "    nic rx queue   not taken: the link is down, so no frame \
+                                     could arrive"
+                                ),
+                                (_, None, _) => println!(
+                                    "    nic rx queue   not taken: no VSI was reported, so nothing \
+                                     would steer a frame to a queue"
+                                ),
+                                (_, _, None) => println!(
+                                    "    nic rx queue   not taken: no queues are allocated to this PF"
+                                ),
+                            }
                         }
                     }
                     None => println!(
