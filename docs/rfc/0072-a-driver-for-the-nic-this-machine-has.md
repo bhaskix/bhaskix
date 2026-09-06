@@ -319,6 +319,48 @@ That needs a descriptor written into the transmit ring and the tail advanced,
 which is the next increment and the first thing this driver will do that the
 device has to answer.
 
+### Step 3 is complete — the device answered, 2026-09-06
+
+    nic reset      the device completed a PF reset; admin queues read 32 and 32
+                   descriptor(s), and are disabled -- the reset released them
+    nic admin      rings at 0x100000000 and 0x100000400; both queues enabled and read back
+    nic firmware   the device answered: firmware 3.10
+
+**Firmware executed a command out of a ring this kernel placed.** That is the
+step's own gate -- *"a device that says its own firmware version is a device that
+is talking"* -- and it is met. Everything before it was a write the hardware
+could accept in silence; this is the first exchange where the device had to do
+something and say so.
+
+The whole path is Bhaskix's: a device it found by walking ECAM, contained in an
+IOMMU domain it created, reset through a register window it mapped, with rings it
+allocated and addressed in the device's own translation, and a descriptor it
+wrote and a tail it advanced. No exception anywhere in the boot, and the console
+stayed up throughout.
+
+**Nothing here came from another driver.** Every offset, flag, opcode and field
+offset is cited to its table in the public C620 datasheet, and the two tables
+that matter -- 38-340 for the descriptor fields and 38-353 for `Get Version` --
+were read as PDF pages because their text extraction is a column of loose digits.
+RFC 0071's licence question never had to be answered, because no licensed code
+was read.
+
+## What step 3 cost, and what found each fault
+
+Four defects, none of them found by re-reading the code:
+
+| fault | found by |
+|---|---|
+| matching any non-virtio NIC, so an i40e reset ran against an e1000e | `make test`, before hardware |
+| mapping one page of a BAR whose registers reach `0x92400` | the fault handler printing `cr2` |
+| verifying a window against every bus rather than its own | a check that rejected correct work |
+| assuming the admin queues were free | a boot taken to measure it first |
+
+The last one is the one worth keeping. Taking queues from a LOM the platform uses
+could have cut the console this work reaches the machine through, and the honest
+move was one passive boot to find out rather than a confident write. It cost ten
+minutes and the answer changed how the takeover was written.
+
 ### Step 4 — one receive queue
 
 A single receive queue pair: descriptor ring in memory the domain owns, buffers
