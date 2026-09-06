@@ -833,6 +833,75 @@ definition in this document**: three mentions in prose and no entry in
 is written down because the obvious next instrument turns out not to exist
 here.
 
+#### The wire is a LACP aggregate, and that explains all of it — 2026-09-06
+
+The cabling was described after the seventh boot: **the four ports are a trunk
+with VLANs, aggregated with LACP**, and VLAN 17 carries a network with DHCP on
+it. Two boots were spent on that information before it arrived, and both are
+worth keeping because of what they eliminate.
+
+**Boot seven: eight queues, and promiscuous VLAN.** The reading before it was
+that the VSI spreads frames across its queues by hash and only queue zero was
+enabled. Eight queues were set up and enabled -- eight is what fits, since
+`QLEN` must be a whole multiple of 32 and eight 512-byte rings are one page --
+and `Set VSI Promiscuous Modes` gained its **VLAN** flag, without which the
+multicast and broadcast flags are scoped per-VLAN and a tagged frame is counted
+at the VSI and dropped.
+
+    nic rx queue   absolute queues 0..=7 enabled: 8 answered QENA_STAT
+    nic rx frame   FAILED: no frame in 60 s in any of the 8 queues, with the link up
+    nic stats      port 0 over the window: 4 packet(s) ... VSI 12: 4 packet(s), 0 discarded
+
+**All eight enabled, none filled.** Both hypotheses dead in one boot.
+
+**Boot eight: a DHCP DISCOVER tagged for VLAN 17**, built by `bhaskix-net` --
+the crate the network services use -- with the 802.1Q tag written by hand
+because that crate writes untagged headers.
+
+    nic tx frame   290 bytes, a DHCP DISCOVER on VLAN 17: the device reported the descriptor done
+    nic tx stats   port 0 sent 2 packet(s) (0 unicast, 0 multicast, 2 broadcast), 354 octet(s)
+    nic rx after   nothing in any receive ring in 10 s after transmitting, the DHCP DISCOVER included
+
+The frame was built, posted, completed, and **counted out of the port's MAC**.
+Nothing answered.
+
+**LACP is why, and it accounts for every observation across eight boots.** A
+switch running 802.3ad keeps a member port *unselected* until the host
+participates in the protocol. An unselected member carries control-plane frames
+and no data. So:
+
+| observation | what LACP says about it |
+|---|---|
+| no unicast or broadcast **ever** received, in eight boots | the switch is not forwarding data to an unaggregated member |
+| ~4-5 multicast per minute, ~150 bytes | LACPDUs: EtherType `0x8809` slow protocols, 124-byte payload, tagged |
+| the VSI counts them and no queue gets them | they go to `01:80:C2:00:00:02`, a reserved address a bridge terminates rather than forwards |
+| a DHCP DISCOVER drew no reply | the switch will not forward data on, or accept it from, an unselected member |
+| all four ports link-up, none carrying data | four members of a LAG that has never formed |
+
+**So the receive path is probably not broken.** That is the most useful thing
+eight boots produced, and it took the cabling to see it: the driver programs a
+context the device fetches, posts descriptors the device prefetches, and waits
+on a wire that has no deliverable traffic to give it. Every "FAILED" line above
+is the gate reporting a fact about the network, not a defect in the code -- and
+the gate was right to keep failing, because a driver that had *claimed* success
+here would have been wrong.
+
+**What would finish step 4, in order of cost.** Neither is done, and the first
+is not this project's to do:
+
+1. **One switch-side change.** A single member configured as a plain access or
+   trunk port, outside the aggregate, and the existing driver should receive
+   immediately -- the queue is already built, enabled and waiting.
+2. **Speak LACP.** 802.3ad in Bhaskix: a state machine, periodic PDUs on all
+   four ports, and aggregation logic. That belongs in a service above the
+   driver, not in this RFC, and it is a larger piece of work than steps 4 and 5
+   together.
+
+**A warning that goes with the second.** Emitting LACPDUs from one member while
+the other three stay silent would half-form an aggregate on a live cluster
+switch. This machine is a production node; that is a change to make
+deliberately, with the network's owner, and not as the next experiment.
+
 #### The original step, for the record
 
 The other half. A frame this machine builds leaves the wire.

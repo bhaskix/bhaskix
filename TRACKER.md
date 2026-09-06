@@ -958,9 +958,9 @@ the distinction is in the table rather than in somebody's head.
 
 Newest first. One entry per meaningful change of project state.
 
-### 2026-09-06 (a receive queue, a frame that left, and the VSI number that was wrong)
+### 2026-09-06 (a receive queue, a frame that left, and a wire that was never going to answer)
 
-Six boots of the SR550, RFC 0072 steps 4 and 5. **Step 4's gate is not met**: a frame did not arrive,
+Eight boots of the SR550, RFC 0072 steps 4 and 5. **Step 4's gate is not met**: a frame did not arrive,
 and that is the sentence to keep. What did happen is everything up to it.
 
 The first boot asked and wrote nothing. It answered five things the code would otherwise have
@@ -1074,7 +1074,35 @@ to invalid queues are dropped and counted by the GLV_REPC counter"* — and `GLV
 mentions in prose and no register definition in §38.39.2.16. A gap in the document rather than in
 the reading, recorded so the next person does not go looking for it.
 
-Six boots have established, none of it testable in QEMU: the device resets, answers commands,
+**Boots seven and eight, and then the cabling, which settles it.** Eight receive queues were enabled
+instead of one — killing the "a hash spreads frames across queues" reading — and `Set VSI Promiscuous
+Modes` gained its **VLAN** flag, without which multicast and broadcast promiscuity is scoped
+per-VLAN and a tagged frame is counted at the VSI and dropped. Neither changed anything. A DHCP
+`DISCOVER` tagged for VLAN 17 was then built by `bhaskix-net`, posted, completed and **counted out
+of the port's MAC**, and nothing answered.
+
+**Then the cabling was described: the four ports are a trunk with VLANs, aggregated with LACP.** That
+accounts for every observation across eight boots. A switch running 802.3ad keeps a member port
+*unselected* until the host speaks the protocol, and an unselected member carries control frames and
+no data. Hence: no unicast or broadcast ever received; ~4-5 multicast a minute at ~150 bytes, which
+is the size and cadence of LACPDUs; those frames counted by the VSI and handed to no queue, because
+they go to `01:80:C2:00:00:02`, a reserved address a bridge terminates; a DHCP DISCOVER drawing no
+reply; and four ports link-up with none carrying data.
+
+**So the receive path is probably not broken**, which is the most useful thing these boots produced.
+The driver programs a context the device fetches, posts descriptors it prefetches, and waits on a
+wire with no deliverable traffic. Every `FAILED` line is the gate reporting a fact about the network
+rather than a defect — and the gate was right to keep failing, because a driver that had claimed
+success here would have been wrong.
+
+**What would finish step 4**, cheapest first: one switch-side change, a single member configured
+outside the aggregate, and the existing queue should receive immediately; or 802.3ad in Bhaskix,
+which belongs in a service above the driver and is more work than steps 4 and 5 together. **A
+warning goes with the second**: emitting LACPDUs from one member while three stay silent would
+half-form an aggregate on a live cluster switch, and that is a change to make with the network's
+owner rather than as the next experiment.
+
+Eight boots have established, none of it testable in QEMU: the device resets, answers commands,
 reports link and switch, hands over its queue allocation, runs a receive context this kernel wrote
 through the host memory cache, prefetches from a ring this kernel posted, counts what its port
 receives, and **puts a frame this kernel built onto the wire**. One step is unproven — a frame
