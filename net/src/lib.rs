@@ -58,6 +58,8 @@ pub mod dhcp;
 pub mod eth;
 pub mod icmp;
 pub mod icmpv6;
+/// Interfaces — ports, bonds and VLANs, and the rules between them.
+pub mod interface;
 pub mod ipv4;
 pub mod ipv6;
 /// LACP — 802.3ad link aggregation, so a switch will forward to a bonded port.
