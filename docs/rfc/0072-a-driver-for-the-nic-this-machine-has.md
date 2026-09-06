@@ -376,6 +376,32 @@ RFC when throughput justifies it.
 **Gate:** a frame sent from the switch arrives, and the boot report prints its
 length and EtherType.
 
+#### What step 4 has so far, 2026-09-06
+
+    nic rx queue   queue 0 reads QENA_REQ=0 QENA_STAT=0 -- off, and free to take
+
+Measured before anything is written to it, which is the habit step 3 paid for:
+firmware had left the admin queues *sized*, and assuming a clean slate there
+would have enabled a ring at somebody else's size. Queue 0 is not in that
+position -- both handshake bits are clear, so no handover is needed and the rest
+of this step can proceed against a queue nobody owns.
+
+**What is still ahead is the larger part**, and reading the datasheet changed the
+estimate. A receive queue is not a ring and a register: *"most of the queue
+context parameters are stored in FPM, fetched to an internal cache when
+required"*, and that context is 174 bits packed into 25 bytes (Table 38-419). So
+Function Private Memory and its HMC programming come before any ring exists,
+which is more machinery than steps 2 and 3 together. Enabling is then a request
+and a wait -- `QENA_REQ` set, `QENA_STAT` polled -- rather than a write.
+
+**And the register window is now a compile error to get wrong.** It was sized by
+a comment twice and faulted twice on this machine: first at `PFGEN_CTRL`
+(`0x92400`) against one page, then at `QRX_ENA` (`0x120000`) against a megabyte
+whose comment claimed room it did not have. `REGISTER_WINDOW_BYTES` lives beside
+the offsets now, with assertions that fail the build if any named register falls
+outside it.
+
+
 ### Step 5 — one transmit queue
 
 The other half. A frame this machine builds leaves the wire.
