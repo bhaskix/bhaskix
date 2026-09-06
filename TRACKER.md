@@ -1103,6 +1103,29 @@ warning goes with the second**: emitting LACPDUs from one member while three sta
 half-form an aggregate on a live cluster switch, and that is a change to make with the network's
 owner rather than as the next experiment.
 
+**RFC 0073, and a wall that moved.** LACP is built as pure logic in `net/src/lacp.rs` — the PDU
+layout, the state flags, and a per-port machine driven by bytes and elapsed seconds, seven host
+tests, three watched red by breaking the rule they guard. On the wire, step 1 has failed four ways
+(promiscuous VLAN; `Add MAC, VLAN Pair`, refused `EINVAL` because a reserved group address is the
+bridge's own; `Add Control Packet Filter` for slow protocols; `Stop LLDP Agent`), each accepted by
+firmware and none delivering.
+
+**And step 3 found the better fact: the LACPDUs never left.** Forty-five posted, **zero counted out
+of the MAC**, in a boot where an ARP and a tagged DHCP `DISCOVER` were counted out normally from the
+same ring. The datasheet's remedy — the VSI flagged *Allow Destination Override* and a transmit
+context descriptor carrying the uplink switch tag — was implemented and accepted, and the count
+stayed at zero. So the control plane is closed in **both** directions for this driver, which is a
+smaller and better-posed problem than "receive is broken".
+
+**One gap is recorded because it decides what to chase next**: the loop counts LACPDUs *posted*, not
+*completed*, so it is unknown whether the device refused those descriptors or took them and the MAC
+declined to send. Those want different fixes. Reporting completions is a two-line change and belongs
+before the next hardware experiment, not after it. The leading candidate once it is known is a
+firmware-installed control packet filter in the **transmit** direction — Table 38-261 has both a
+`Direction` flag and a `Drop filter` bit, so such a rule is expressible and firmware keeping the
+host out of its own LACP handling is reason to install one; `Remove Control Packet Filter` would
+clear it. A candidate, not a diagnosis: nothing has read back what filters exist.
+
 Eight boots have established, none of it testable in QEMU: the device resets, answers commands,
 reports link and switch, hands over its queue allocation, runs a receive context this kernel wrote
 through the host memory cache, prefetches from a ring this kernel posted, counts what its port

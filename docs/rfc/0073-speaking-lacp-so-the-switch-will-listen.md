@@ -157,6 +157,70 @@ member does not.
 None in `net/`, which forbids it. The driving path's `unsafe` is the existing
 kind — writing frames where a device fetches them — and adds no new category.
 
+## What the hardware said, 2026-09-06
+
+Three boots against steps 1 and 3, and the wall moved but did not fall.
+
+**Step 1 — get one LACPDU delivered to a queue — has failed four ways**, each
+accepted by firmware and none delivering a frame:
+
+| asked for | answer |
+|---|---|
+| promiscuous multicast, broadcast and VLAN on the VSI | accepted, nothing arrived |
+| `Add MAC, VLAN Pair` for `01:80:C2:00:00:02` | **refused, `EINVAL`** |
+| `Add Control Packet Filter` for slow protocols | accepted, nothing arrived |
+| `Stop LLDP Agent`, releasing firmware's control port | accepted, nothing arrived |
+
+The `EINVAL` was the useful one: a reserved group address is the bridge's own,
+and the datasheet says twice that control flows are routed with the
+control-packet filter instead. That correction was made and *lowered* the
+`unsafe` budget, the command being direct rather than buffered.
+
+**Step 3 found something better than a gate: the frames never left.**
+
+    nic lacp       45 LACPDU(s) posted with an uplink switch tag, 0 counted out of the MAC; 0 heard back
+    nic lacp       the port received 4 packet(s) in those 45 s (4 multicast), against a baseline of about four a minute
+
+Forty-five LACPDUs, and the port's transmit counter did not move once — in the
+same boot where an ARP and a tagged DHCP `DISCOVER` were counted out normally,
+from the same queue and the same ring. **So the silence that followed says
+nothing about the switch. We never spoke.**
+
+The datasheet's explanation was found and acted on, and did not help. A frame
+with no switch control tag is *"routed according to hardware filters"*, and the
+internal switch consumes one addressed to a reserved group address; reaching
+the wire needs the VSI flagged *Allow Destination Override* and a transmit
+context descriptor carrying `SWTCH = 01b`, *"uplink packet... transmitted to
+the network bypassing hardware filters"*. Both were implemented — the override
+by reading the VSI's own configuration, setting one bit and writing it back, so
+nothing firmware chose is replaced by a guess — and firmware accepted the
+update. **The count stayed at zero.**
+
+### What is left, and one thing that should have been measured first
+
+**An instrumentation gap, stated because it changes which candidate to chase.**
+The loop counts LACPDUs *posted*, not *completed*: it waits for each
+descriptor's write-back but does not report whether it arrived. So it is not
+known whether the device **refused** these descriptors or **took them and the
+MAC declined to send**. Those want different fixes and the boot cannot tell
+them apart. Reporting completions separately is a two-line change and belongs
+before the next hardware experiment rather than after it.
+
+**The leading candidate, once that is known:** a firmware-installed control
+packet filter in the *transmit* direction. Table 38-261's flags include
+`Direction` — *"0 = apply to Rx traffic, 1 = apply to Tx traffic"* — and a
+`Drop filter` bit, so a rule that discards host-originated slow protocols is
+expressible, and firmware keeping the host out of its own LACP handling is
+exactly the reason to install one. `Remove Control Packet Filter` (`0x025B`)
+would clear it. This is a candidate, not a diagnosis: nothing has read back
+what filters exist.
+
+**What the eight-boot arc has established**, and it is not nothing: transmit
+works for ordinary frames, the receive queue is built and the device runs it,
+and the reason no frame arrives is a wire whose data plane is closed. What is
+newly known is that the control plane is closed in *both* directions for this
+driver, which is a smaller and better-posed problem than "receive is broken".
+
 ## Alternatives considered
 
 **Change the switch port.** The cheapest fix by a wide margin: one member

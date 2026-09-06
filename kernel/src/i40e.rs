@@ -556,6 +556,37 @@ const OPCODE_STOP_LLDP_AGENT: u16 = 0x0A05;
 /// reversible half.
 const LLDP_SHUTDOWN: u8 = 1 << 0;
 
+/// `Update VSI` -- Table 38-220, opcode `0x0211`. Indirect, taking the same
+/// 128-byte buffer `Get VSI Parameters` returns, so a change is made by
+/// reading the VSI's own configuration, altering one bit and writing it back
+/// rather than by asserting a whole configuration from nothing.
+const OPCODE_UPDATE_VSI: u16 = 0x0211;
+/// The VSI buffer's *Valid Sections* mask, bytes 0-1, bit 0: the switching
+/// section is the one being written.
+const VSI_SECTION_SWITCHING: u16 = 1 << 0;
+/// Byte 6 bit 0 of the VSI buffer: *"allow the VSI to override the switching
+/// decision and fix the destination of a transmit packet. This bit should be
+/// set only for control ports."*
+const VSI_ALLOW_DESTINATION_OVERRIDE: u8 = 1 << 0;
+/// Where that byte sits in the buffer.
+const VSI_SWITCHING_FLAGS_AT: usize = 6;
+
+/// A LAN transmit **context** descriptor -- 38.31.2.2.1, `DTYP` `0x1`.
+const TX_DTYP_CONTEXT: u64 = 0x1;
+/// `SWTCH`, the Switch Control Tag, at CMD bits 5:4 -- descriptor qword 1 bits
+/// 9:8. *"Can be set to non-zero only by control VSI as programmed by the
+/// Allow Destination Override flag per VSI."*
+const TX_SWTCH_SHIFT: u32 = 8;
+/// `SWTCH` = `01b`: *"uplink packet. The packet is transmitted to the network
+/// bypassing hardware filters."*
+///
+/// **What a control frame needs to reach the wire.** With no switch control
+/// tag a frame is *"routed according to hardware filters"*, and the internal
+/// switch consumes one addressed to a reserved group address rather than
+/// sending it out -- which is exactly what forty-five LACPDUs did on
+/// 2026-09-06, posted and completed and never counted out of the MAC.
+pub const TX_SWTCH_UPLINK: u64 = 0b01;
+
 /// The Slow Protocols EtherType -- IEEE 802.3 Clause 57. LACP rides on it, and
 /// it is neither an L2 tag nor IP, which Table 38-261 requires.
 pub const ETHERTYPE_SLOW_PROTOCOLS: u16 = 0x8809;
@@ -1513,6 +1544,31 @@ pub const fn transmit_descriptor(buffer: u64, bytes: u16) -> (u64, u64) {
     (buffer, TX_CMD_EOP | TX_CMD_RS | length)
 }
 
+/// A transmit context descriptor carrying a switch control tag.
+///
+/// Qword 0 is entirely reserved for what this uses it for; qword 1 carries the
+/// type and the tag. It precedes the data descriptor it applies to, and the
+/// context *"is lost"* after that packet, so one is posted per frame.
+#[must_use]
+pub const fn transmit_context_descriptor(switch_tag: u64) -> (u64, u64) {
+    (0, TX_DTYP_CONTEXT | (switch_tag & 0b11) << TX_SWTCH_SHIFT)
+}
+
+/// Writes a transmit context descriptor into a ring.
+///
+/// # Safety
+///
+/// As [`post_transmit_descriptor`].
+pub unsafe fn post_transmit_context(ring_host: u64, index: u32, switch_tag: u64) {
+    let (low, high) = transmit_context_descriptor(switch_tag);
+    let at = ring_host + TRANSMIT_DESCRIPTOR_BYTES * u64::from(index);
+    // SAFETY: per the caller; two quad-words inside the ring.
+    unsafe {
+        core::ptr::write_volatile(at as *mut u64, low);
+        core::ptr::write_volatile((at + 8) as *mut u64, high);
+    }
+}
+
 /// Whether hardware has completed a transmit descriptor -- its `DTYP` field
 /// reading `0xF`.
 ///
@@ -2104,6 +2160,47 @@ impl Device {
         let mut request = Descriptor::direct(OPCODE_STOP_LLDP_AGENT);
         // Byte 16 is the command; the rest of the descriptor is reserved.
         request.words[4] = u32::from(if shutdown { LLDP_SHUTDOWN } else { 0 });
+        self.command(request, spins).map(|_| ())
+    }
+
+    /// Lets a VSI fix a transmit packet's destination itself -- the *Allow
+    /// Destination Override* flag, without which a switch control tag in a
+    /// transmit context descriptor is not permitted.
+    ///
+    /// **Read, modify, write.** The VSI's own configuration is fetched with
+    /// `Get VSI Parameters` first and written back with one bit changed, so
+    /// nothing else about a VSI firmware created is asserted or lost. Writing
+    /// a switching section from zeroes would replace its switch id and its
+    /// loopback setting with guesses.
+    ///
+    /// # Safety
+    ///
+    /// As [`Device::vsi_parameters`].
+    ///
+    /// # Errors
+    ///
+    /// As [`Device::command`].
+    pub unsafe fn allow_destination_override(
+        &mut self,
+        seid: u16,
+        device: u64,
+        host: u64,
+        spins: u32,
+    ) -> Result<(), CommandError> {
+        // SAFETY: per the caller.
+        unsafe { self.vsi_parameters(seid, device, host, spins) }?;
+        // SAFETY: per the caller -- the buffer firmware just filled, which is
+        // at least `VSI_BUFFER_BYTES` and written by nothing else.
+        unsafe {
+            let sections = core::ptr::read_volatile(host as *const u16);
+            core::ptr::write_volatile(host as *mut u16, sections | VSI_SECTION_SWITCHING);
+            let at = host + VSI_SWITCHING_FLAGS_AT as u64;
+            let flags = core::ptr::read_volatile(at as *const u8);
+            core::ptr::write_volatile(at as *mut u8, flags | VSI_ALLOW_DESTINATION_OVERRIDE);
+        }
+        let mut request = Descriptor::with_buffer(OPCODE_UPDATE_VSI, device, VSI_BUFFER_BYTES);
+        // Bytes 16-17 are the SEID.
+        request.words[4] = u32::from(seid);
         self.command(request, spins).map(|_| ())
     }
 

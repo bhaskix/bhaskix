@@ -13052,6 +13052,39 @@ fn run_lacp(
     // measured in a counter over forty-five seconds.
     machine.actor.state = machine.actor.state.with(lacp::State::TIMEOUT);
 
+    // **Ask to be allowed to override the switching decision**, without which
+    // a switch control tag is not permitted and a frame to a reserved group
+    // address is consumed by the internal switch instead of leaving. That is
+    // not a theory: forty-five LACPDUs went out of this loop on 2026-09-06 and
+    // the port's transmit counter did not move once.
+    // SAFETY: `admin_host` is the direct-map address of the admin ring page, a
+    // page long and writable; the VSI buffer's offset keeps it inside that
+    // page after the rings and the switch buffer, which `i40e` asserts at
+    // compile time; nothing else writes it.
+    let overriding = match unsafe {
+        nic.allow_destination_override(
+            target.vsi,
+            setup.admin_device + i40e::VSI_BUFFER_OFFSET,
+            setup.admin_host + i40e::VSI_BUFFER_OFFSET,
+            SPINS,
+        )
+    } {
+        Ok(()) => {
+            println!(
+                "    nic lacp       VSI seid {:#x} may now fix a packet's destination itself",
+                target.vsi
+            );
+            true
+        }
+        Err(error) => {
+            println!(
+                "\x1b[93m    nic lacp       Update VSI for destination override: {error}; a control \
+                 frame will be routed by the switch's filters and swallowed\x1b[0m"
+            );
+            false
+        }
+    };
+
     let before = nic.port_counters(setup.port);
     let sent_before = nic.transmit_counters(setup.port);
     println!(
@@ -13072,22 +13105,31 @@ fn run_lacp(
             };
             let bytes = build_lacpdu(buffer, mac, &pdu);
             if bytes > 0 {
-                let slot = sent % RING;
+                // **A context descriptor before the data one.** It carries the
+                // switch control tag that says "uplink: transmit to the
+                // network bypassing hardware filters", and the context is lost
+                // after the packet it precedes, so each frame gets its own.
+                // Two descriptors per frame, so the pair index wraps at half
+                // the ring's depth.
+                let pair = (sent % (RING / 2)) * 2;
                 // SAFETY: `ring_host` is the transmit ring's direct-map
-                // address and `slot` is inside its depth; the previous use of
-                // this slot completed before the tail was advanced past it.
+                // address and both `pair` and `pair + 1` are inside its depth;
+                // the previous use of these slots completed before the tail
+                // was advanced past them.
                 unsafe {
+                    i40e::post_transmit_context(setup.ring_host, pair, i40e::TX_SWTCH_UPLINK);
                     i40e::post_transmit_descriptor(
                         setup.ring_host,
-                        slot,
+                        pair + 1,
                         setup.packet_device,
                         bytes as u16,
                     );
                 }
-                nic.transmit_doorbell(target.queue, slot + 1);
+                nic.transmit_doorbell(target.queue, pair + 2);
                 for _ in 0..SPINS {
-                    // SAFETY: as the post above.
-                    if unsafe { i40e::transmit_completed(setup.ring_host, slot) } {
+                    // SAFETY: as the post above; the data descriptor is the
+                    // one carrying `RS`, so it is the one written back.
+                    if unsafe { i40e::transmit_completed(setup.ring_host, pair + 1) } {
                         break;
                     }
                     core::hint::spin_loop();
@@ -13147,7 +13189,12 @@ fn run_lacp(
     let delta = nic.port_counters(setup.port).since(&before);
     let out = nic.transmit_counters(setup.port).since(&sent_before);
     println!(
-        "    nic lacp       {sent} LACPDU(s) posted, {} counted out of the MAC; {heard} heard back",
+        "    nic lacp       {sent} LACPDU(s) posted{}, {} counted out of the MAC; {heard} heard back",
+        if overriding {
+            " with an uplink switch tag"
+        } else {
+            " with no switch tag, which the internal switch will swallow"
+        },
         out.packets()
     );
     println!(
@@ -13185,6 +13232,11 @@ struct TransmitSetup {
     ring_device: u64,
     /// As above, through the direct map.
     ring_host: u64,
+    /// The admin ring page, device and host: the VSI parameter buffer lives
+    /// in it, and updating the VSI needs it back.
+    admin_device: u64,
+    /// As above, through the direct map.
+    admin_host: u64,
     /// The packet buffer, device and host.
     packet_device: u64,
     /// As above, through the direct map.
@@ -13408,6 +13460,7 @@ fn bring_up_receive_queue(
     device: (u8, u8, u8),
     hhdm: u64,
     target: &QueueTarget,
+    admin: (u64, u64),
 ) {
     let &QueueTarget {
         vsi,
@@ -13494,6 +13547,8 @@ fn bring_up_receive_queue(
         context_host: control_host[3],
         ring_device: control_device + 4 * FRAME,
         ring_host: control_host[4],
+        admin_device: admin.0,
+        admin_host: admin.1,
         packet_device: control_device + 5 * FRAME,
         packet_host: control_host[5],
         port,
@@ -14490,6 +14545,7 @@ fn start_nic_domain(hhdm: u64) -> Result<(), &'static str> {
                                                 .saturating_sub(u32::from(first))
                                                 + 1,
                                         },
+                                        (transmit, host),
                                     );
                                 }
                                 (false, _, _) => println!(

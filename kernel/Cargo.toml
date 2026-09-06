@@ -727,7 +727,13 @@ asm_budget = 10
 # `bhaskix-net`'s state machine can parse it. The protocol itself is in `net/`,
 # which forbids `unsafe` and has a budget of zero; what is counted here is only
 # the moving of bytes to and from the device.
-unsafe_budget = 2106
+#
+# 2127 on 2026-09-06: twenty-one lines to make a control frame actually leave.
+# The VSI's own configuration is read back, one bit set and written again --
+# read-modify-write, so nothing firmware chose is replaced by a guess -- and a
+# transmit context descriptor carrying the uplink switch tag is posted ahead of
+# each data descriptor.
+unsafe_budget = 2127
 # Up thirty-one for RFC 0005 step 9's socket probe -- `ring3_socketeer`, which
 # is `ring3_lister` with a `sockaddr_in6` copied in beside its code instead of
 # two filenames. The same two blocks every hosted probe has: one
