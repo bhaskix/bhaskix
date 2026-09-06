@@ -12989,6 +12989,188 @@ fn build_dhcp_discover(out: &mut [u8], from: [u8; 6], transaction: u32) -> usize
     TAGGED_HEADER + header + udp_bytes
 }
 
+/// Builds an LACPDU frame, returning its length.
+///
+/// Untagged and to the slow-protocols group address, which is what 802.3ad
+/// says: LACPDUs are link-local and are not carried on a VLAN even when the
+/// port is a trunk.
+fn build_lacpdu(out: &mut [u8], from: [u8; 6], pdu: &bhaskix_net::lacp::Pdu) -> usize {
+    use bhaskix_net::{addr::MacAddr, eth, lacp};
+    out.fill(0);
+    let Ok(header) = eth::write_header(
+        out,
+        lacp::GROUP_ADDRESS,
+        MacAddr(from),
+        eth::EtherType(lacp::ETHERTYPE),
+    ) else {
+        return 0;
+    };
+    let Some(body) = out.get_mut(header..) else {
+        return 0;
+    };
+    match pdu.write(body) {
+        Ok(written) => header + written,
+        Err(_) => 0,
+    }
+}
+
+/// Speaks LACP at the switch for a while, and reports what changed.
+///
+/// **The evidence here is counters, not frames.** No LACPDU has ever reached a
+/// queue on this machine, so the state machine will very likely learn nothing
+/// — but a switch configured *passive* never speaks first, and one that begins
+/// answering shows up as a rise in the port's received multicast whether or
+/// not this driver can read the frames. Asking for the short timeout makes
+/// that unmistakable: a partner that honours it sends every second instead of
+/// every thirty.
+///
+/// The receive rings are polled anyway, because the day the control filter
+/// starts working this is what turns it into a formed aggregate.
+fn run_lacp(
+    nic: &mut i40e::Device,
+    setup: &TransmitSetup,
+    target: &QueueTarget,
+    rings: &ReceiveRings,
+    buffers: &ReceiveBuffers,
+) {
+    use bhaskix_net::lacp;
+    const SPINS: u32 = 2_000_000;
+    /// Long enough for a partner honouring the short timeout to answer many
+    /// times over, and short enough not to double the boot.
+    const SECONDS: u32 = 45;
+    /// The transmit ring's depth, which the slot index wraps within.
+    const RING: u32 = 8;
+
+    let Some(mac) = nic.mac_address(setup.port) else {
+        return;
+    };
+    // One key for the aggregate, and this port's number within it. The port
+    // number is one-based by convention and this is the first member.
+    let mut machine = lacp::Machine::new(bhaskix_net::addr::MacAddr(mac), 1, 1);
+    // **Ask for the short timeout.** It is the difference between a partner
+    // answering every second and every thirty, and this experiment is
+    // measured in a counter over forty-five seconds.
+    machine.actor.state = machine.actor.state.with(lacp::State::TIMEOUT);
+
+    let before = nic.port_counters(setup.port);
+    let sent_before = nic.transmit_counters(setup.port);
+    println!(
+        "    nic lacp       speaking for {SECONDS} s as system {}, key 1, port 1, short timeout",
+        MacAddress(mac)
+    );
+
+    let mut sent = 0u32;
+    let mut refused_before = machine.refused;
+    let mut heard = 0u32;
+    for second in 0..SECONDS {
+        if machine.should_send() {
+            let pdu = machine.sending();
+            // SAFETY: `packet_host` is the direct-map address of a page this
+            // kernel owns, and an LACPDU frame is far shorter than it.
+            let buffer = unsafe {
+                core::slice::from_raw_parts_mut(setup.packet_host as *mut u8, i40e::PACKET_BYTES)
+            };
+            let bytes = build_lacpdu(buffer, mac, &pdu);
+            if bytes > 0 {
+                let slot = sent % RING;
+                // SAFETY: `ring_host` is the transmit ring's direct-map
+                // address and `slot` is inside its depth; the previous use of
+                // this slot completed before the tail was advanced past it.
+                unsafe {
+                    i40e::post_transmit_descriptor(
+                        setup.ring_host,
+                        slot,
+                        setup.packet_device,
+                        bytes as u16,
+                    );
+                }
+                nic.transmit_doorbell(target.queue, slot + 1);
+                for _ in 0..SPINS {
+                    // SAFETY: as the post above.
+                    if unsafe { i40e::transmit_completed(setup.ring_host, slot) } {
+                        break;
+                    }
+                    core::hint::spin_loop();
+                }
+                sent += 1;
+            }
+        }
+
+        // **Anything that arrives is fed to the machine**, which is the only
+        // path by which this could actually aggregate.
+        // SAFETY: `rings` describes the posted rings.
+        if let Some((index, slot, completion)) = unsafe { first_completion(rings) } {
+            let host = buffers.host_at(index, slot);
+            // SAFETY: the device marked this descriptor done.
+            let header = unsafe { i40e::frame_header(host) };
+            if header.ethertype == lacp::ETHERTYPE {
+                let mut body = [0u8; lacp::PDU];
+                let take = (completion.length as usize)
+                    .saturating_sub(bhaskix_net::eth::HEADER)
+                    .min(body.len());
+                for (offset, byte) in body.iter_mut().enumerate().take(take) {
+                    // SAFETY: inside the buffer the device filled.
+                    *byte = unsafe {
+                        core::ptr::read_volatile(
+                            (host + (bhaskix_net::eth::HEADER + offset) as u64) as *const u8,
+                        )
+                    };
+                }
+                if machine.received(&body[..take]) {
+                    heard += 1;
+                    if let Some(partner) = machine.partner {
+                        println!(
+                            "\x1b[92m    nic lacp       partner {} key {} port {} state {:#04x}\x1b[0m",
+                            MacAddress(partner.system.octets()),
+                            partner.key,
+                            partner.port,
+                            partner.state.0
+                        );
+                    }
+                }
+            }
+        }
+
+        machine.elapsed(1);
+        let _ = second;
+        pause_millis(1_000);
+    }
+    if machine.refused > refused_before {
+        println!(
+            "    nic lacp       {} frame(s) refused as malformed",
+            machine.refused - refused_before
+        );
+    }
+    refused_before = machine.refused;
+    let _ = refused_before;
+
+    let delta = nic.port_counters(setup.port).since(&before);
+    let out = nic.transmit_counters(setup.port).since(&sent_before);
+    println!(
+        "    nic lacp       {sent} LACPDU(s) posted, {} counted out of the MAC; {heard} heard back",
+        out.packets()
+    );
+    println!(
+        "    nic lacp       the port received {} packet(s) in those {SECONDS} s ({} multicast), \
+         against a baseline of about four a minute",
+        delta.packets(),
+        delta.multicast
+    );
+    let expected = SECONDS / 15;
+    println!(
+        "    nic lacp       \x1b[1m{}\x1b[0m",
+        if machine.aggregated() {
+            "the link is aggregated -- collecting and distributing"
+        } else if delta.multicast > u64::from(expected) + 2 {
+            "the port's multicast rate rose while we spoke -- something answered, even though no \
+             frame reached a queue"
+        } else {
+            "the multicast rate did not change -- the switch is not answering, or its answers go \
+             where the earlier ones went"
+        }
+    );
+}
+
 /// Everything the transmit half needs that the receive bring-up already holds.
 struct TransmitSetup {
     /// The page-descriptor page, as this kernel writes it: the transmit
@@ -13758,6 +13940,13 @@ fn bring_up_receive_queue(
                  transmitting, the DHCP DISCOVER included\x1b[0m"
             ),
         }
+    }
+
+    // **RFC 0073 step 3: say something and see whether the switch answers.**
+    // Both queues are still enabled and the rings still posted, so an answer
+    // has somewhere to land if the control filter ever starts working.
+    if sent {
+        run_lacp(nic, &transmit, target, &rings, &buffers);
     }
 
     if nic.transmit_queue_state(target.queue).1 {
