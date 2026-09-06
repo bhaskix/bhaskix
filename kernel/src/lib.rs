@@ -12994,16 +12994,39 @@ fn build_dhcp_discover(out: &mut [u8], from: [u8; 6], transaction: u32) -> usize
 /// Untagged and to the slow-protocols group address, which is what 802.3ad
 /// says: LACPDUs are link-local and are not carried on a VLAN even when the
 /// port is a trunk.
-fn build_lacpdu(out: &mut [u8], from: [u8; 6], pdu: &bhaskix_net::lacp::Pdu) -> usize {
+fn build_lacpdu(
+    out: &mut [u8],
+    from: [u8; 6],
+    pdu: &bhaskix_net::lacp::Pdu,
+    vlan: Option<u16>,
+) -> usize {
     use bhaskix_net::{addr::MacAddr, eth, lacp};
     out.fill(0);
-    let Ok(header) = eth::write_header(
-        out,
-        lacp::GROUP_ADDRESS,
-        MacAddr(from),
-        eth::EtherType(lacp::ETHERTYPE),
-    ) else {
-        return 0;
+    // **Tagged or not, and it is worth trying both.** 802.3ad carries LACPDUs
+    // untagged because they are link-local, and that is what this sends by
+    // default. But this port is a trunk, and a trunk with no native VLAN can
+    // drop untagged frames before anything looks at them -- so the tagged form
+    // is tried too rather than assumed impossible.
+    let header = if let Some(id) = vlan {
+        if out.len() < TAGGED_HEADER {
+            return 0;
+        }
+        out[0..6].copy_from_slice(&lacp::GROUP_ADDRESS.octets());
+        out[6..12].copy_from_slice(&MacAddr(from).octets());
+        out[12..14].copy_from_slice(&eth::EtherType::VLAN.0.to_be_bytes());
+        out[14..16].copy_from_slice(&(id & 0x0fff).to_be_bytes());
+        out[16..18].copy_from_slice(&lacp::ETHERTYPE.to_be_bytes());
+        TAGGED_HEADER
+    } else {
+        let Ok(plain) = eth::write_header(
+            out,
+            lacp::GROUP_ADDRESS,
+            MacAddr(from),
+            eth::EtherType(lacp::ETHERTYPE),
+        ) else {
+            return 0;
+        };
+        plain
     };
     let Some(body) = out.get_mut(header..) else {
         return 0;
@@ -13108,7 +13131,11 @@ fn run_lacp(
             let buffer = unsafe {
                 core::slice::from_raw_parts_mut(setup.packet_host as *mut u8, i40e::PACKET_BYTES)
             };
-            let bytes = build_lacpdu(buffer, mac, &pdu);
+            // **First half untagged, second half tagged for the trunk's
+            // VLAN**, with the received counter read at the boundary so an
+            // answer can be attributed to the half that drew it.
+            let tagged = sent >= SECONDS / 2;
+            let bytes = build_lacpdu(buffer, mac, &pdu, tagged.then_some(TRUNK_VLAN));
             if bytes > 0 {
                 // **The driver's cursor, not this loop's own count.** Keeping
                 // a separate slot index here is what wrote forty-five frames
@@ -13116,13 +13143,14 @@ fn run_lacp(
                 // head sat at 2 and the boot reported a switch that would not
                 // answer, when the device had never been shown a frame.
                 //
-                // **Plain first, then with the uplink context descriptor.**
-                // A head that stops dead is what the datasheet describes when
-                // a descriptor is refused -- *"the respective queue is
-                // stopped"* -- so whether it is the context descriptor that
-                // stops it, or an LACPDU refused however it is posted, is one
-                // boot's difference and this splits it.
-                let uplink = sent >= SECONDS / 2;
+                // **Plain, and the switch tag is not needed.** The split
+                // experiment answered it: 22 of 22 plain LACPDUs completed
+                // and were counted out of the MAC, while only 3 of 23 with a
+                // context descriptor did. The internal switch does not swallow
+                // slow protocols on transmit, so the uplink tag buys nothing
+                // and its second descriptor wedges the queue -- for a reason
+                // not chased, because the path that works needs neither.
+                let uplink = false;
                 if let Some(slot) = nic.post_frame(setup.packet_device, bytes as u16, uplink) {
                     nic.transmit_doorbell(target.queue, nic.transmit_tail());
                     for _ in 0..SPINS {
@@ -13175,18 +13203,20 @@ fn run_lacp(
         }
 
         if second == SECONDS / 2 - 1 || second == SECONDS - 1 {
+            let so_far = nic.port_counters(setup.port).since(&before);
             let (requested, active) = nic.transmit_queue_state(target.queue);
             println!(
                 "    nic lacp       after {sent} posted ({}): {completed} completed, queue REQ={} \
-                 STAT={}, head {}",
+                 STAT={}, head {}; the port has taken in {} multicast",
                 if second < SECONDS / 2 {
-                    "plain"
+                    "untagged"
                 } else {
-                    "plain then uplink-tagged"
+                    "untagged then VLAN-tagged"
                 },
                 u8::from(requested),
                 u8::from(active),
-                nic.transmit_head(target.queue)
+                nic.transmit_head(target.queue),
+                so_far.multicast
             );
         }
         machine.elapsed(1);
@@ -13203,14 +13233,10 @@ fn run_lacp(
 
     let delta = nic.port_counters(setup.port).since(&before);
     let out = nic.transmit_counters(setup.port).since(&sent_before);
+    let _ = overriding;
     println!(
-        "    nic lacp       {sent} LACPDU(s) posted{}, {completed} completed by the device, {} \
+        "    nic lacp       {sent} LACPDU(s) posted, {completed} completed by the device, {} \
          counted out of the MAC; {heard} heard back",
-        if overriding {
-            " with an uplink switch tag"
-        } else {
-            " with no switch tag, which the internal switch will swallow"
-        },
         out.packets()
     );
     // **The reading that splits the two worlds.** The transmit head advances as
@@ -13508,7 +13534,7 @@ fn bring_up_receive_queue(
     /// single ring cannot answer it. Eight is what fits: `QLEN` must be a
     /// whole multiple of 32 outside PXE mode, 32 sixteen-byte descriptors is
     /// 512 bytes, and eight such rings are one page.
-    const QUEUES: u32 = 8;
+    const QUEUES: u32 = 4;
     /// `QLEN`: a whole multiple of 32 once PXE mode is off.
     const DESCRIPTORS: u16 = 32;
     /// Bytes one ring occupies.
@@ -13516,12 +13542,19 @@ fn bring_up_receive_queue(
     /// Posted per queue: a multiple of eight, the tail's granularity outside
     /// PXE mode.
     const POSTED: u32 = 8;
-    /// *"It must be at least 1 KB bytes"*, and in 128-byte units. A kilobyte
-    /// each keeps sixty-four buffers inside one object.
-    const BUFFER_BYTES: u16 = 1024;
-    /// A standard frame with a tag and its CRC fits; jumbo frames are dropped.
-    /// `RXMAX` must not exceed five buffers, and 1536 is well inside that.
-    const MAX_FRAME: u16 = 1536;
+    /// *"It must be at least 1 KB bytes"*, and in 128-byte units. Two
+    /// kilobytes so that five of them span the jumbo frame this port is
+    /// configured for; four queues of eight then still fit one object.
+    const BUFFER_BYTES: u16 = 2048;
+    /// **The port's own maximum, not a standard frame.** `Get Link Status`
+    /// reports 9728 on this machine, and a receive queue with `RXMAX` at 1536
+    /// silently drops anything larger -- *"received packet larger than RXMAX
+    /// is dropped and counted by the GLV_REPC counter"*, a counter this
+    /// datasheet never defines a register for. Matching the port removes a
+    /// variable rather than fixes a known fault: the frames actually seen here
+    /// are 151 bytes. `RXMAX` must not exceed five buffers, which is why the
+    /// buffers grew with it.
+    const MAX_FRAME: u16 = 9728;
     const FRAME: u64 = bhaskix_mm::FRAME_SIZE;
     const _: () = assert!(
         QUEUES as u64 * RING_STRIDE <= 4096,
@@ -13725,15 +13758,26 @@ fn bring_up_receive_queue(
     // **What the VSI forwards.** Its own MAC filter takes only frames sent to
     // this port; what a switch sends unprompted is multicast and broadcast,
     // and the command the datasheet names for forwarding broadcast is this.
-    match nic.set_promiscuous(vsi, true, true, true, SPINS) {
-        Ok(()) => println!(
-            "    nic filter     VSI seid {vsi:#x} now forwards multicast, broadcast and **any \
-             VLAN** to its queues"
-        ),
-        Err(error) => println!(
-            "\x1b[93m    nic filter     Set VSI Promiscuous Modes: {error}; only frames to this \
-             port's own address can arrive\x1b[0m"
-        ),
+    // **One mode at a time**, so a mode this VSI may not have does not take
+    // the ones it may with it. Bundling all five was refused with `EINVAL` and
+    // cost the VSI the multicast promiscuity it had held for six boots.
+    for mode in [
+        i40e::PromiscuousMode::Unicast,
+        i40e::PromiscuousMode::Multicast,
+        i40e::PromiscuousMode::Broadcast,
+        i40e::PromiscuousMode::AnyVlan,
+        i40e::PromiscuousMode::DefaultVsi,
+    ] {
+        match nic.set_promiscuous(vsi, mode, true, SPINS) {
+            Ok(()) => println!(
+                "    nic filter     VSI {vsi:#x} promiscuous: {}",
+                mode.name()
+            ),
+            Err(error) => println!(
+                "\x1b[93m    nic filter     VSI {vsi:#x} refused {}: {error}\x1b[0m",
+                mode.name()
+            ),
+        }
     }
 
     // **RFC 0073 step 1: ask for the one address this wire actually carries.**
@@ -14092,10 +14136,14 @@ fn bring_up_receive_queue(
             if disabled { "clear" } else { "still set" }
         );
     }
-    if let Err(error) = nic.set_promiscuous(vsi, false, false, false, SPINS) {
-        println!(
-            "\x1b[93m    nic filter     could not restore the VSI's filtering: {error}\x1b[0m"
-        );
+    for mode in [
+        i40e::PromiscuousMode::Unicast,
+        i40e::PromiscuousMode::Multicast,
+        i40e::PromiscuousMode::Broadcast,
+        i40e::PromiscuousMode::AnyVlan,
+        i40e::PromiscuousMode::DefaultVsi,
+    ] {
+        let _ = nic.set_promiscuous(vsi, mode, false, SPINS);
     }
 }
 

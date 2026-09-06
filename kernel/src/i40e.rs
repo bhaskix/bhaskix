@@ -591,6 +591,59 @@ pub const TX_SWTCH_UPLINK: u64 = 0b01;
 /// it is neither an L2 tag nor IP, which Table 38-261 requires.
 pub const ETHERTYPE_SLOW_PROTOCOLS: u16 = 0x8809;
 
+/// One promiscuous mode a VSI can be put into -- Table 38-253's flags.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PromiscuousMode {
+    /// Every unicast address, not only this port's own.
+    Unicast,
+    /// Every multicast group.
+    Multicast,
+    /// Broadcast.
+    Broadcast,
+    /// *"Accept packets within the switch ID not matching any specific address
+    /// to this VSI."* Refused for a VSI wired straight to the port.
+    DefaultVsi,
+    /// Every VLAN, which a trunk needs -- without it the others are scoped to
+    /// one VLAN.
+    AnyVlan,
+}
+
+impl PromiscuousMode {
+    /// The flag bit, and the valid bit, for this mode.
+    const fn bit(self) -> u16 {
+        match self {
+            Self::Unicast => PROMISCUOUS_UNICAST,
+            Self::Multicast => PROMISCUOUS_MULTICAST,
+            Self::Broadcast => PROMISCUOUS_BROADCAST,
+            Self::DefaultVsi => PROMISCUOUS_DEFAULT_VSI,
+            Self::AnyVlan => PROMISCUOUS_VLAN,
+        }
+    }
+
+    /// What to call it in the boot report.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Unicast => "unicast",
+            Self::Multicast => "multicast",
+            Self::Broadcast => "broadcast",
+            Self::DefaultVsi => "default VSI",
+            Self::AnyVlan => "any VLAN",
+        }
+    }
+}
+
+/// Table 38-253, modes bit 0: promiscuous unicast.
+const PROMISCUOUS_UNICAST: u16 = 1 << 0;
+/// Table 38-253, modes bit 3: **Default VSI** -- *"accept packets within the
+/// switch ID not matching any specific address to this VSI"*.
+///
+/// **The bridge's answer to "where does an unmatched frame go".** Every other
+/// promiscuous flag widens what *this* VSI matches; this one claims the
+/// traffic that matches nothing, which is where a frame goes when the internal
+/// switch has no filter for it. Six mechanisms have been tried to get a frame
+/// into a queue on the SR550 and this is the one that was never set.
+const PROMISCUOUS_DEFAULT_VSI: u16 = 1 << 3;
 /// Table 38-253, modes bit 4: promiscuous VLAN.
 ///
 /// **The flag a trunk port needs.** Without it the unicast, multicast and
@@ -1895,9 +1948,16 @@ impl Device {
         }
     }
 
-    /// Sets a VSI's multicast, broadcast and VLAN promiscuity -- Table 38-253,
-    /// with every mode named in the valid mask each time, so that clearing is
-    /// the same command as setting and nothing is left half-changed.
+    /// Sets or clears **one** promiscuous mode on a VSI -- Table 38-253.
+    ///
+    /// **One at a time, because they are not all legal together.** Asking for
+    /// all five at once on the SR550 was refused with `EINVAL` and the refusal
+    /// took the whole command with it -- so a VSI that had multicast,
+    /// broadcast and VLAN promiscuity for six boots lost all three at once.
+    /// The datasheet says why: *"Default VSI should not be set if the VSI is
+    /// connected directly to the port (not via a VEB or a PV)"*, and this one
+    /// is. Each mode now stands or falls on its own, and the valid mask names
+    /// only the mode being changed.
     ///
     /// # Errors
     ///
@@ -1905,23 +1965,13 @@ impl Device {
     pub fn set_promiscuous(
         &mut self,
         seid: u16,
-        multicast: bool,
-        broadcast: bool,
-        vlan: bool,
+        mode: PromiscuousMode,
+        on: bool,
         spins: u32,
     ) -> Result<(), CommandError> {
         let mut request = Descriptor::direct(OPCODE_SET_VSI_PROMISCUOUS);
-        let mut modes = 0;
-        if multicast {
-            modes |= PROMISCUOUS_MULTICAST;
-        }
-        if broadcast {
-            modes |= PROMISCUOUS_BROADCAST;
-        }
-        if vlan {
-            modes |= PROMISCUOUS_VLAN;
-        }
-        let valid = PROMISCUOUS_MULTICAST | PROMISCUOUS_BROADCAST | PROMISCUOUS_VLAN;
+        let valid = mode.bit();
+        let modes = if on { valid } else { 0 };
         // Bytes 16-17 the modes, 18-19 the valid mask, 20-21 the SEID.
         request.words[4] = u32::from(modes) | (u32::from(valid) << 16);
         request.words[5] = u32::from(seid & 0x3ff);
