@@ -71,9 +71,26 @@ The `-ix` is the Unix lineage, the same suffix Minix and Linux carry.
 >
 > It took three boots to get there, and the reason is worth the sentence: the machine has **two**
 > serial ports and this kernel only ever probed one, so it spent two boots writing a report nobody
-> could carry. **What is still QEMU:** the IOMMU. Its bring-up is gated on finding a virtio block
-> device, which no real server has, so on that machine four units were found and none enabled — and
-> every containment claim that rests on RFC 0012 is a claim about an emulator until that is fixed.
+> could carry.
+>
+> ~~**What is still QEMU:** the IOMMU.~~ **Not since 2026-08-25.** That sentence said containment was
+> an emulator claim because the IOMMU bring-up was gated on a virtio block device no real server
+> has. [RFC 0049](docs/rfc/0049-every-unit-the-firmware-named.md) programs **all four units** on the
+> SR550, measured there, and on 2026-09-06 an Intel X722 on that machine was given its own page
+> table and domain. Containment is a claim about hardware now.
+>
+> **And as of 2026-09-06 it talks to a real network card**, which is further than "no NIC driver but
+> virtio" and much less than networking. Following
+> [RFC 0072](docs/rfc/0072-a-driver-for-the-nic-this-machine-has.md), on the SR550: the bus was
+> walked and the four X722s named (`8086:37d1` at `b1:00.0-3`), one was contained by the IOMMU, reset
+> through a register window the kernel mapped, given admin queues in memory the kernel allocated and
+> addressed in the device's own translation — and it **answered a command, reporting firmware
+> 3.10**. Every register offset came from Intel's public C620 datasheet, cited to its table; no
+> driver source was read, so the licence question
+> [RFC 0071](docs/rfc/0071-drivers-for-hardware-that-already-exists.md) raises never had to be
+> answered. **No packet has moved.** A receive queue needs the device's Host Memory Cache
+> programmed first, and that is not written.
+>
 > Nothing here should run anywhere that matters — see [SECURITY.md](SECURITY.md).
 >
 > **The design documents still have one author and no independent reviewers.** Phase 0's exit
