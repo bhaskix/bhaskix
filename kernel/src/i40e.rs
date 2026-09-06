@@ -129,6 +129,29 @@ const QENA_REQ: u32 = 1 << 0;
 /// guessed from a gap is a guess.
 const QENA_STAT: u32 = 1 << 2;
 
+/// The highest queue index `QRX_ENA` covers -- 38.39.2.18.13 gives `Q = 0..1535`.
+const MAX_RECEIVE_QUEUE: u64 = 1535;
+
+/// How much of BAR0 this module needs mapped.
+///
+/// **Coupled to the offsets above, and that coupling has bitten twice on the
+/// same machine.** First the window was one page and `PFGEN_CTRL` at `0x92400`
+/// faulted; the window went to a megabyte with a comment saying that covered
+/// every offset "with room". Then `QRX_ENA` at `0x120000` was added and the
+/// comment was not revisited, so the boot faulted at exactly that address.
+///
+/// A comment cannot enforce this and did not. The assertion below can: it fails
+/// the build if any register this module names falls outside the window, so the
+/// next offset added has to either fit or move this number.
+pub const REGISTER_WINDOW_BYTES: u64 = 0x20_0000;
+
+const _: () = assert!(
+    REGISTER_WINDOW_BYTES > QRX_ENA + 4 * MAX_RECEIVE_QUEUE,
+    "the mapped register window must reach past the highest register this module uses"
+);
+const _: () = assert!(REGISTER_WINDOW_BYTES > PFGEN_CTRL);
+const _: () = assert!(REGISTER_WINDOW_BYTES > PF_ARQT);
+
 /// One mapped X722 function, far enough along to be asked questions.
 pub struct Device {
     /// The register window, through the direct map.

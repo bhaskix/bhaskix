@@ -12651,7 +12651,7 @@ fn start_nic_domain(hhdm: u64) -> Result<(), &'static str> {
     // which disturbs a device this code has not reset yet. That is worth doing
     // when a second driver needs it; it is not worth doing to learn a number the
     // datasheet's own register map already bounds.
-    if let Some(mapped) = mmio::map(registers & !0xfff, 0x10_0000, hhdm) {
+    if let Some(mapped) = mmio::map(registers & !0xfff, i40e::REGISTER_WINDOW_BYTES, hhdm) {
         // SAFETY: `mmio::map` returned a device mapping of this function's
         // BAR0, it is never unmapped, and nothing else drives this device --
         // `bin/netd` drives virtio and `claimed` kept this one out of
