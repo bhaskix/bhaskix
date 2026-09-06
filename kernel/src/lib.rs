@@ -12606,7 +12606,7 @@ fn ask_nic(nic: &mut i40e::Device, transmit: u64, host: u64) -> NicFacts {
                     // The first VSI reported is the one a frame reaches; its
                     // SEID is what the filter command wants.
                     if vsi.is_none() {
-                        vsi = Some(element.seid);
+                        vsi = Some((element.seid, element.number));
                     }
                     match nic.vsi_queue_base(element.number) {
                         Some((base, true)) => println!(
@@ -12708,8 +12708,11 @@ fn ask_nic(nic: &mut i40e::Device, transmit: u64, host: u64) -> NicFacts {
 struct NicFacts {
     /// `Get Link Status` said the link is up.
     link_up: bool,
-    /// The SEID of the first VSI the switch reported, if any.
-    vsi: Option<u16>,
+    /// The first VSI the switch reported, as `(seid, number)`. The SEID is
+    /// what the admin commands take; the number is what `VSILAN_QBASE` and the
+    /// per-VSI statistics registers are indexed by. They are different values
+    /// and using one for the other is silent.
+    vsi: Option<(u16, u16)>,
     /// `PFLAN_QALLOC`'s first and last absolute queue, if valid.
     allocation: Option<(u16, u16)>,
 }
@@ -12831,13 +12834,32 @@ unsafe fn wait_for_first_frame(
     }
 }
 
+/// Which VSI and which queue a receive bring-up is for.
+///
+/// Grouped rather than passed one by one because two of the four are
+/// sixteen-bit VSI identifiers that are **not interchangeable**, and a struct
+/// makes a caller name which is which at the call site.
+struct QueueTarget {
+    /// The VSI's SEID -- what the admin commands take.
+    vsi: u16,
+    /// The VSI's number -- what `VSILAN_QBASE` and the per-VSI statistics
+    /// registers are indexed by. Not the SEID.
+    vsi_number: u16,
+    /// The absolute index of the queue taken.
+    queue: u32,
+    /// How many queues this PF owns, which sizes the private memory layout.
+    queues: u32,
+}
+
 /// One receive queue: private memory programmed, one context page backed, the
 /// context written, buffers posted, the queue enabled, and a bounded wait for
 /// a frame -- RFC 0072 step 4.
 ///
-/// `vsi` is the SEID of the VSI whose queues this PF's start with, `queue` the
-/// absolute index of the queue taken, and `queues` how many this PF owns,
-/// which is what the private memory layout is sized to.
+/// `vsi` is the SEID of the VSI whose queues this PF's start with and
+/// `vsi_number` is that VSI's number -- the admin commands take the first and
+/// the statistics registers are indexed by the second, and they are different
+/// values. `queue` is the absolute index of the queue taken, and `queues` how
+/// many this PF owns, which is what the private memory layout is sized to.
 ///
 /// **Armed within the boot.** Before the queue is enabled, descriptor zero is
 /// watched for a tenth of a second and must stay untouched; the frame line
@@ -12849,10 +12871,14 @@ fn bring_up_receive_queue(
     owner: domain::DomainId,
     device: (u8, u8, u8),
     hhdm: u64,
-    vsi: u16,
-    queue: u32,
-    queues: u32,
+    target: &QueueTarget,
 ) {
+    let &QueueTarget {
+        vsi,
+        vsi_number,
+        queue,
+        queues,
+    } = target;
     const SPINS: u32 = 2_000_000;
     /// `QLEN`: a whole multiple of 32 once PXE mode is off.
     const DESCRIPTORS: u16 = 32;
@@ -13022,6 +13048,26 @@ fn bring_up_receive_queue(
         }
     );
 
+    // **The baseline, taken before the queue is enabled.** The statistics
+    // registers are `RW1C` and nothing here clears them, so every reading is a
+    // running total since power-on which includes whatever firmware did with
+    // this port before this kernel started. Only the difference across the
+    // wait belongs to this experiment, and 38.30's own initialisation flow
+    // says so: a driver reads them at start-up because *"the values of these
+    // counters is the baseline for any statistics collected later"*.
+    let port = nic.port_number();
+    let port_before = nic.port_counters(port);
+    let vsi_before = nic.vsi_counters(vsi_number);
+    println!(
+        "    nic stats      port {port} baseline: {} packet(s) received since power-on \
+         ({} unicast, {} multicast, {} broadcast), {} discarded",
+        port_before.packets(),
+        port_before.unicast,
+        port_before.multicast,
+        port_before.broadcast,
+        port_before.discarded
+    );
+
     // **Enable** -- after the 50 ms 38.30.3.3.2 asks for since the last
     // disable, which the PF reset and the PXE-mode clear both were.
     let timed = pause_millis(50);
@@ -13123,6 +13169,55 @@ fn bring_up_receive_queue(
                 completion.cast_name()
             ),
         }
+
+        // **What the port saw, as against what this queue got.** This is the
+        // question three boots could not answer: a silent queue means nothing
+        // until the port says whether anything was there to receive.
+        let port_delta = nic.port_counters(port).since(&port_before);
+        let vsi_delta = nic.vsi_counters(vsi_number).since(&vsi_before);
+        println!(
+            "    nic stats      port {port} over the window: {} packet(s) ({} unicast, {} \
+             multicast, {} broadcast), {} octet(s), {} discarded",
+            port_delta.packets(),
+            port_delta.unicast,
+            port_delta.multicast,
+            port_delta.broadcast,
+            port_delta.octets,
+            port_delta.discarded
+        );
+        if port_delta.crc_errors > 0
+            || port_delta.length_errors > 0
+            || port_delta.undersize > 0
+            || port_delta.oversize > 0
+        {
+            println!(
+                "    nic stats      port {port} errors: {} CRC, {} length, {} undersize, {} \
+                 oversize",
+                port_delta.crc_errors,
+                port_delta.length_errors,
+                port_delta.undersize,
+                port_delta.oversize
+            );
+        }
+        // The VSI index is assumed to be the VSI number -- the datasheet
+        // assigns a statistics set when a VSI is added, and firmware added
+        // this one. Said plainly so it is never read as a measurement.
+        println!(
+            "    nic stats      VSI {vsi_number} over the window (index assumed to be the VSI \
+             number): {} packet(s), {} discarded",
+            vsi_delta.packets(),
+            vsi_delta.discarded
+        );
+        println!(
+            "    nic stats      \x1b[1m{}\x1b[0m",
+            if port_delta.saw_anything() {
+                "the port saw traffic and this queue got none -- steering or filtering, not a \
+                 quiet wire"
+            } else {
+                "the port saw nothing at all -- nothing was sent here, so the silence is the \
+                 wire and not the receive path"
+            }
+        );
     }
 
     // **What the device holds**, read out of its context cache: a head that
@@ -13412,15 +13507,20 @@ fn start_nic_domain(hhdm: u64) -> Result<(), &'static str> {
                             // frame needs a live link to arrive on, a VSI to
                             // be steered through, and a queue this PF owns.
                             match (facts.link_up, facts.vsi, facts.allocation) {
-                                (true, Some(vsi), Some((first, last))) => {
+                                (true, Some((vsi, vsi_number)), Some((first, last))) => {
                                     bring_up_receive_queue(
                                         &mut nic,
                                         owner,
                                         delegated,
                                         hhdm,
-                                        vsi,
-                                        u32::from(first),
-                                        u32::from(last).saturating_sub(u32::from(first)) + 1,
+                                        &QueueTarget {
+                                            vsi,
+                                            vsi_number,
+                                            queue: u32::from(first),
+                                            queues: u32::from(last)
+                                                .saturating_sub(u32::from(first))
+                                                + 1,
+                                        },
                                     );
                                 }
                                 (false, _, _) => println!(

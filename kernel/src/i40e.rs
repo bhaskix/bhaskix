@@ -268,6 +268,68 @@ const VSI_QTABLE_ENABLED: u32 = 1 << 11;
 /// The highest VSI index -- 38.39.2.18.18 gives `VSI = 0..383`.
 const MAX_VSI: u64 = 383;
 
+/// LAN Port Number -- 38.39.2.1.31, `PFGEN_PORTNUM` (`0x001C0480`, RO). Bits
+/// 1:0, *"indicates the LAN port connected to this function"*. The statistics
+/// registers below are indexed by it, and it is asked of the device rather
+/// than inferred from the PCI function, for the same reason `PF_FUNC_RID` is.
+const PFGEN_PORTNUM: u64 = 0x001C_0480;
+/// The highest port index the statistics registers cover -- `n = 0..3`.
+const MAX_PORT: u64 = 3;
+
+/// Port statistics -- 38.39.2.16, all `0x8*n` apart for `n = 0..3`, all
+/// **RW1C** rather than clear-on-read, so a reading is a running total since
+/// power-on and only a *difference* between two readings means anything.
+/// 38.30's initialisation flow says exactly that: a driver reads them at
+/// start-up because *"the values of these counters is the baseline for any
+/// statistics collected later"*.
+///
+/// The three packet counts are what answer whether this port receives at all.
+/// `GLPRT_GORCL` is *good octets received*, and the four error and discard
+/// counters below separate "nothing arrived" from "something arrived and was
+/// thrown away", which is the distinction a silent receive queue cannot make
+/// on its own.
+///
+/// **The `L`/`H` pairs are one 64-bit register.** The datasheet is explicit --
+/// *"the low and high registers are part of a 64-bit register and are read
+/// using 64-bit read accesses only"* -- which is why [`Device::read64`] exists
+/// and why these name only the low offset.
+const GLPRT_GORCL: u64 = 0x0030_0000;
+/// 38.39.2.16.5, `GLPRT_CRCERRS[n]` (`0x00300080 + 0x8*n`): CRC errors. 32-bit.
+const GLPRT_CRCERRS: u64 = 0x0030_0080;
+/// 38.39.2.16.6, `GLPRT_RLEC[n]` (`0x003000A0 + 0x8*n`): length errors. 32-bit.
+const GLPRT_RLEC: u64 = 0x0030_00A0;
+/// 38.39.2.16.8, `GLPRT_RUC[n]` (`0x00300100 + 0x8*n`): undersize. 32-bit.
+const GLPRT_RUC: u64 = 0x0030_0100;
+/// 38.39.2.16.9, `GLPRT_ROC[n]` (`0x00300120 + 0x8*n`): oversize. 32-bit.
+const GLPRT_ROC: u64 = 0x0030_0120;
+/// 38.39.2.16.31, `GLPRT_UPRCL[n]` (`0x003005A0 + 0x8*n`): unicast received.
+const GLPRT_UPRCL: u64 = 0x0030_05A0;
+/// 38.39.2.16.33, `GLPRT_MPRCL[n]` (`0x003005C0 + 0x8*n`): multicast received.
+const GLPRT_MPRCL: u64 = 0x0030_05C0;
+/// 38.39.2.16.35, `GLPRT_BPRCL[n]` (`0x003005E0 + 0x8*n`): broadcast received.
+const GLPRT_BPRCL: u64 = 0x0030_05E0;
+/// 38.39.2.16.37, `GLPRT_RDPC[n]` (`0x00300600 + 0x8*n`): *"receive discarded
+/// packets count"*. 32-bit. A port that receives and discards reads here.
+const GLPRT_RDPC: u64 = 0x0030_0600;
+
+/// Per-VSI statistics -- 38.39.2.16, `0x8*n` apart for `n = 0..383`.
+///
+/// **The index is not certainly the VSI number, and that is why these are
+/// reported with a caveat rather than as fact.** The range is 384, which is
+/// the number of VSIs, but 38.21.3.7.2 says the set to use *"is returned in
+/// the Add VSI response buffer in the Statistic Counters field"* -- and this
+/// driver did not add the VSI it is using, firmware did. So reading these at
+/// the VSI's own number is an assumption. It is made because the reading is
+/// free and informative if it holds, and the boot report says plainly that it
+/// is an assumption so that nobody later reads it as a measurement.
+const GLV_RDPC: u64 = 0x0031_0000;
+/// 38.39.2.16.103, `GLV_UPRCL[n]` (`0x0036C000 + 0x8*n`).
+const GLV_UPRCL: u64 = 0x0036_C000;
+/// 38.39.2.16.105, `GLV_MPRCL[n]` (`0x0036CC00 + 0x8*n`).
+const GLV_MPRCL: u64 = 0x0036_CC00;
+/// 38.39.2.16.107, `GLV_BPRCL[n]` (`0x0036D800 + 0x8*n`).
+const GLV_BPRCL: u64 = 0x0036_D800;
+
 /// Global Receive Queue Tail -- 38.39.2.18.14, `QRX_TAIL[Q]`
 /// (`0x00128000 + 0x4*Q`). `TAIL` bits 12:0: *"the first descriptor that
 /// software hands to hardware (it is the last valid descriptor plus one)"*.
@@ -392,6 +454,9 @@ const _: () = assert!(REGISTER_WINDOW_BYTES > PF_FUNC_RID);
 const _: () = assert!(REGISTER_WINDOW_BYTES > QRX_TAIL + 4 * MAX_RECEIVE_QUEUE);
 const _: () = assert!(REGISTER_WINDOW_BYTES > PFCM_LANCTXSTAT);
 const _: () = assert!(REGISTER_WINDOW_BYTES > PFHMC_SDDATAHIGH);
+const _: () = assert!(REGISTER_WINDOW_BYTES > GLV_BPRCL + 8 * MAX_VSI);
+const _: () = assert!(REGISTER_WINDOW_BYTES > GLPRT_RDPC + 8 * MAX_PORT);
+const _: () = assert!(REGISTER_WINDOW_BYTES > PFGEN_PORTNUM);
 
 /// One admin queue descriptor -- Table 38-339, as its eight little-endian
 /// 32-bit words.
@@ -1060,6 +1125,115 @@ pub unsafe fn frame_header(buffer_host: u64) -> FrameHeader {
     FrameHeader::parse(&bytes)
 }
 
+/// What a port's receive counters read at one instant.
+///
+/// Every field is a running total since power-on, not a rate and not a count
+/// for this boot: the registers are `RW1C` and nothing here clears them, so
+/// firmware's own use of the port before this kernel started is included. Two
+/// readings and [`PortCounters::since`] are what mean anything.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PortCounters {
+    /// `GLPRT_UPRCL/H`: unicast packets received.
+    pub unicast: u64,
+    /// `GLPRT_MPRCL/H`: multicast packets received.
+    pub multicast: u64,
+    /// `GLPRT_BPRCL/H`: broadcast packets received.
+    pub broadcast: u64,
+    /// `GLPRT_GORCL/H`: good octets received.
+    pub octets: u64,
+    /// `GLPRT_RDPC`: packets the port received and discarded.
+    pub discarded: u32,
+    /// `GLPRT_CRCERRS`: CRC errors.
+    pub crc_errors: u32,
+    /// `GLPRT_RLEC`: length errors.
+    pub length_errors: u32,
+    /// `GLPRT_RUC`: undersize packets.
+    pub undersize: u32,
+    /// `GLPRT_ROC`: oversize packets.
+    pub oversize: u32,
+}
+
+impl PortCounters {
+    /// What arrived between an earlier reading and this one.
+    ///
+    /// Saturating, so a counter that wrapped or a baseline taken after the
+    /// later reading yields zero rather than an enormous number. A wrap is not
+    /// a real risk over a minute on these widths; a mistake in the order of
+    /// two readings is, and this makes it read as "nothing" instead of as a
+    /// flood.
+    #[must_use]
+    pub const fn since(&self, baseline: &Self) -> Self {
+        Self {
+            unicast: self.unicast.saturating_sub(baseline.unicast),
+            multicast: self.multicast.saturating_sub(baseline.multicast),
+            broadcast: self.broadcast.saturating_sub(baseline.broadcast),
+            octets: self.octets.saturating_sub(baseline.octets),
+            discarded: self.discarded.saturating_sub(baseline.discarded),
+            crc_errors: self.crc_errors.saturating_sub(baseline.crc_errors),
+            length_errors: self.length_errors.saturating_sub(baseline.length_errors),
+            undersize: self.undersize.saturating_sub(baseline.undersize),
+            oversize: self.oversize.saturating_sub(baseline.oversize),
+        }
+    }
+
+    /// Packets the port took in, of any address kind.
+    #[must_use]
+    pub const fn packets(&self) -> u64 {
+        self.unicast + self.multicast + self.broadcast
+    }
+
+    /// Whether anything at all was seen -- a packet, a discard, or an error.
+    ///
+    /// The question a silent receive queue needs answered is not *"did a good
+    /// frame arrive"* but *"did this port see anything"*, so a discard and a
+    /// CRC error count as evidence of a live wire just as a packet does.
+    #[must_use]
+    pub const fn saw_anything(&self) -> bool {
+        self.packets() > 0
+            || self.discarded > 0
+            || self.crc_errors > 0
+            || self.length_errors > 0
+            || self.undersize > 0
+            || self.oversize > 0
+    }
+}
+
+/// What a VSI's receive counters read, at an index this driver assumes.
+///
+/// See [`GLV_RDPC`]: the statistics set is assigned when a VSI is added, and
+/// this driver did not add the VSI it uses. Read at the VSI's own number, and
+/// reported as an assumption.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct VsiCounters {
+    /// `GLV_UPRCL/H`: unicast packets received by the VSI.
+    pub unicast: u64,
+    /// `GLV_MPRCL/H`: multicast packets received by the VSI.
+    pub multicast: u64,
+    /// `GLV_BPRCL/H`: broadcast packets received by the VSI.
+    pub broadcast: u64,
+    /// `GLV_RDPC`: packets the VSI received and discarded.
+    pub discarded: u32,
+}
+
+impl VsiCounters {
+    /// What arrived between an earlier reading and this one, saturating.
+    #[must_use]
+    pub const fn since(&self, baseline: &Self) -> Self {
+        Self {
+            unicast: self.unicast.saturating_sub(baseline.unicast),
+            multicast: self.multicast.saturating_sub(baseline.multicast),
+            broadcast: self.broadcast.saturating_sub(baseline.broadcast),
+            discarded: self.discarded.saturating_sub(baseline.discarded),
+        }
+    }
+
+    /// Packets the VSI took in, of any address kind.
+    #[must_use]
+    pub const fn packets(&self) -> u64 {
+        self.unicast + self.multicast + self.broadcast
+    }
+}
+
 /// One mapped X722 function, far enough along to be asked questions.
 pub struct Device {
     /// The register window, through the direct map.
@@ -1101,6 +1275,19 @@ impl Device {
         // SAFETY: `new`'s invariant -- a device mapping of this function's BAR0
         // -- and every offset here is a documented register within it.
         unsafe { core::ptr::read_volatile((self.registers + offset) as *const u32) }
+    }
+
+    /// Reads one 64-bit register pair in a single access.
+    ///
+    /// **Required rather than preferred** for the statistics counters, whose
+    /// definitions say *"the low and high registers are part of a 64-bit
+    /// register and are read using 64-bit read accesses only"*. Two 32-bit
+    /// reads would also tear across a counter incrementing between them, which
+    /// is the ordinary reason such a pair exists.
+    fn read64(&self, offset: u64) -> u64 {
+        // SAFETY: as `read`; every offset used here is a documented 64-bit
+        // register pair, 8-byte aligned by its own `0x8*n` stride.
+        unsafe { core::ptr::read_volatile((self.registers + offset) as *const u64) }
     }
 
     /// Writes one register.
@@ -1420,6 +1607,48 @@ impl Device {
             core::hint::spin_loop();
         }
         None
+    }
+
+    /// Which LAN port this function is connected to -- `PFGEN_PORTNUM`, bits
+    /// 1:0. The statistics registers are indexed by it.
+    #[must_use]
+    pub fn port_number(&self) -> u32 {
+        self.read(PFGEN_PORTNUM) & 0b11
+    }
+
+    /// The port's receive counters, at this instant.
+    ///
+    /// Totals since power-on, not for this boot -- see [`PortCounters`]. Reads
+    /// nothing back that it writes, and clears nothing: these are `RW1C`, so a
+    /// reader leaves them exactly as found, and firmware's own accounting of
+    /// this port is undisturbed. That matters on a LOM the platform shares.
+    #[must_use]
+    pub fn port_counters(&self, port: u32) -> PortCounters {
+        let at = 8 * u64::from(port.min(MAX_PORT as u32));
+        PortCounters {
+            unicast: self.read64(GLPRT_UPRCL + at),
+            multicast: self.read64(GLPRT_MPRCL + at),
+            broadcast: self.read64(GLPRT_BPRCL + at),
+            octets: self.read64(GLPRT_GORCL + at),
+            discarded: self.read(GLPRT_RDPC + at),
+            crc_errors: self.read(GLPRT_CRCERRS + at),
+            length_errors: self.read(GLPRT_RLEC + at),
+            undersize: self.read(GLPRT_RUC + at),
+            oversize: self.read(GLPRT_ROC + at),
+        }
+    }
+
+    /// A VSI's receive counters, at an index this driver assumes is the VSI
+    /// number -- see [`VsiCounters`] and [`GLV_RDPC`].
+    #[must_use]
+    pub fn vsi_counters(&self, vsi: u16) -> VsiCounters {
+        let at = 8 * u64::from(u64::from(vsi).min(MAX_VSI) as u32);
+        VsiCounters {
+            unicast: self.read64(GLV_UPRCL + at),
+            multicast: self.read64(GLV_MPRCL + at),
+            broadcast: self.read64(GLV_BPRCL + at),
+            discarded: self.read(GLV_RDPC + at),
+        }
     }
 
     /// What a receive queue's enable handshake currently reads.
@@ -1794,5 +2023,68 @@ mod tests {
             FrameHeader::parse(&bytes).ethertype_name(),
             "an 802.3 length"
         );
+    }
+
+    /// The counters are running totals, so only a difference means anything.
+    #[test]
+    fn counter_deltas_are_differences_and_never_run_backwards() {
+        let baseline = PortCounters {
+            unicast: 900,
+            multicast: 40,
+            broadcast: 12,
+            octets: 100_000,
+            discarded: 3,
+            crc_errors: 1,
+            ..PortCounters::default()
+        };
+        let mut later = baseline;
+        later.multicast += 7;
+        later.broadcast += 2;
+        later.octets += 1_100;
+        later.discarded += 1;
+
+        let delta = later.since(&baseline);
+        assert_eq!(
+            delta.unicast, 0,
+            "a total that did not move is a delta of zero"
+        );
+        assert_eq!(delta.multicast, 7);
+        assert_eq!(delta.broadcast, 2);
+        assert_eq!(delta.octets, 1_100);
+        assert_eq!(delta.discarded, 1);
+        assert_eq!(delta.crc_errors, 0);
+        assert_eq!(delta.packets(), 9);
+        assert!(delta.saw_anything());
+
+        // Nothing moved at all: the port saw nothing, and that is the reading
+        // the receive investigation turns on.
+        let quiet = baseline.since(&baseline);
+        assert_eq!(quiet.packets(), 0);
+        assert!(
+            !quiet.saw_anything(),
+            "a wholly idle port must not look busy"
+        );
+
+        // A discard alone is still evidence of a live wire.
+        let mut discarded_only = baseline;
+        discarded_only.discarded += 5;
+        let delta = discarded_only.since(&baseline);
+        assert_eq!(delta.packets(), 0);
+        assert!(delta.saw_anything(), "a discard means something did arrive");
+
+        // Two readings in the wrong order read as nothing, not as a flood.
+        let backwards = baseline.since(&later);
+        assert_eq!(backwards.multicast, 0);
+        assert_eq!(backwards.octets, 0);
+        assert!(!backwards.saw_anything());
+
+        let vsi = VsiCounters {
+            unicast: 5,
+            multicast: 2,
+            broadcast: 1,
+            discarded: 0,
+        };
+        assert_eq!(vsi.packets(), 8);
+        assert_eq!(vsi.since(&vsi).packets(), 0);
     }
 }

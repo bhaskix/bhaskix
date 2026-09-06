@@ -675,7 +675,12 @@ asm_budget = 10
 # untouched" apart from "a frame landed at an index nobody was watching",
 # which is a distinction worth having inside the boot that fails rather than
 # in the boot after it.
-unsafe_budget = 2032
+#
+# 2033 on 2026-09-06: one line for `read64`. The statistics counters are
+# 64-bit register pairs whose definitions say they "are read using 64-bit read
+# accesses only", and two 32-bit reads would also tear across a counter that
+# increments between them -- which is the ordinary reason such a pair exists.
+unsafe_budget = 2033
 # Up thirty-one for RFC 0005 step 9's socket probe -- `ring3_socketeer`, which
 # is `ring3_lister` with a `sockaddr_in6` copied in beside its code instead of
 # two filenames. The same two blocks every hosted probe has: one
