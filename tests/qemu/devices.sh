@@ -182,6 +182,18 @@ qemu_device_list() {
                 # the SYN reaches `bin/tcpd` and is answered by it.
                 -netdev "user,id=net0,restrict=on,guestfwd=tcp:10.0.2.100:9-cmd:cat,hostfwd=tcp:127.0.0.1:${BHASKIX_INBOUND_PORT:-45557}-:7,hostfwd=tcp:127.0.0.1:${BHASKIX_CLOSED_PORT:-45558}-:1234"
                 -device "virtio-net-pci,netdev=net0$suffix"
+                # **A second NIC, so that "how many ports?" has an answer other
+                # than one.** RFC 0074: a bond is a thing this system can build
+                # only if it can see more than one port, and until this line a
+                # lane could not tell a four-port machine from a one-port one.
+                #
+                # It carries no forwards and is never driven. `bin/netd` drives
+                # the *first* virtio-net on the bus, which is `net0` above and
+                # stays so because this is added after it -- every gate that
+                # depends on those forwards is untouched, and the second port is
+                # there to be counted, bonded, and reported down.
+                -netdev "user,id=net1,restrict=on"
+                -device "virtio-net-pci,netdev=net1$suffix"
                 # Two xHCI controllers, and the pair is the point.
                 #
                 # RFC 0041 step 3 brings the **first** one up: the kernel gives

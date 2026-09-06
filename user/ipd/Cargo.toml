@@ -93,4 +93,7 @@ asm_budget = 4
 # page grew two fields -- the VLAN this interface carries and its MTU -- and
 # each is one more volatile read of a page mapped read-only, beside the three
 # already there. An address that lives on an interface has to be told which.
-unsafe_budget = 158
+#
+# 159 at step 6: one more, the port count. A bond is a thing this service can
+# only build if it is told how many ports were found.
+unsafe_budget = 159

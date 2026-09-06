@@ -14915,6 +14915,7 @@ pub fn start_net_domain(
             );
         }
     }
+    NET_PORTS.store(ports as u64, core::sync::atomic::Ordering::Release);
     let foreign = find_foreign_nic().is_some();
     println!(
         "    net interface  {ports} virtio port(s){} -- a bond may be built over {}",
@@ -16280,6 +16281,23 @@ const NET_ADDRESS: [u8; 4] = [10, 0, 2, 15];
 /// driver holding the device can read. Until then the page is zeroes with no
 /// marker, and `ipd` waits rather than believing them.
 fn publish_net_config(hhdm: u64, mac: u64) -> bool {
+    publish_net_config_with(
+        hhdm,
+        mac,
+        NET_PORTS.load(core::sync::atomic::Ordering::Acquire),
+    )
+}
+
+/// How many network ports this machine has, counted at bring-up.
+///
+/// A static because `publish_net_config` is called from where the MAC becomes
+/// known -- inside the driver hand-off -- and the count is learned earlier, in
+/// the walk that names them. One is the honest default: a machine whose ports
+/// were never counted has at least the one being driven.
+static NET_PORTS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
+
+/// As [`publish_net_config`], with the port count stated.
+fn publish_net_config_with(hhdm: u64, mac: u64, ports: u64) -> bool {
     use core::sync::atomic::Ordering;
 
     let raw = NET_CONFIG.load(Ordering::Acquire);
@@ -16304,6 +16322,7 @@ fn publish_net_config(hhdm: u64, mac: u64) -> bool {
         u64::from(address),
         u64::from(NET_VLAN),
         u64::from(NET_MTU),
+        ports.max(1),
     ];
     // SAFETY: a frame this object owns, through the direct map. The marker goes
     // last, so a reader that catches this half-written sees no marker rather
@@ -18118,11 +18137,17 @@ fn report_net_after_exchange(hhdm: u64) {
     //
     // The comment above this one said "twenty-five words, 200 bytes" while the
     // array read 26 and the slice read 208. Corrected while adding to it: a
-    // length written in three places is wrong in at least one of them.
-    let mut ipd = [0u64; 28];
+    // length written in three places is wrong in at least one of them -- and it
+    // happened again on 2026-09-06, when the array grew to 29 and the slice
+    // stayed at 224: the kernel panicked reading past the end and the boot
+    // stalled. The length is derived from the array now, so there is one place
+    // to be wrong instead of three.
+    let mut ipd = [0u64; 29];
     // SAFETY: a frame this object owns, through the direct map, read as the
-    // twenty-eight little-endian words the service wrote there.
-    let bytes = unsafe { core::slice::from_raw_parts((hhdm + pages[0]) as *const u8, 224) };
+    // little-endian words the service wrote there -- `ipd.len() * 8` bytes of
+    // a page, so the read cannot reach past the frame.
+    let bytes =
+        unsafe { core::slice::from_raw_parts((hhdm + pages[0]) as *const u8, ipd.len() * 8) };
     for (index, word) in ipd.iter_mut().enumerate() {
         let mut buffer = [0u8; 8];
         buffer.copy_from_slice(&bytes[index * 8..index * 8 + 8]);
@@ -18147,6 +18172,25 @@ fn report_net_after_exchange(hhdm: u64) {
     println!(
         "    ipd state      {:#x} (send/configured/tcp-rings)",
         ipd[7]
+    );
+    // **What the address is actually sitting on** -- RFC 0074 step 6. A bond
+    // reports its members; a port reports none, which is every machine with
+    // one NIC and was every machine until this line existed.
+    // **Both sides of the same fact**, so a disagreement localises itself: what
+    // the kernel published, and what the service built out of it.
+    println!(
+        "    ipd interface  {} port(s) published; the address is on {}",
+        NET_PORTS.load(core::sync::atomic::Ordering::Acquire),
+        if ipd[28] & 0xffff_ffff == 0 {
+            "a port directly"
+        } else {
+            "a bond"
+        }
+    );
+    println!(
+        "                   the service saw {} port(s) and built {} member(s)",
+        ipd[28] >> 32,
+        ipd[28] & 0xffff_ffff
     );
     // **What the socket service says it is holding** — RFC 0063.
     //

@@ -125,6 +125,18 @@ const MAX_FRAME: usize = 2048;
 /// The marker the kernel looks for before believing the report.
 const MARKER: u64 = 0x3154_5052_4450_4931;
 
+/// What the bound interface is made of, for the report: the number of members
+/// under it, or zero when the address sits straight on a port.
+///
+/// The gates read this to say whether the stack is running over a bond, which
+/// is the whole of RFC 0074 step 6's claim.
+static BOUND_SHAPE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// How many members the interface an address sits on has.
+fn shape_of(faces: &bhaskix_net::interface::Interfaces, on: bhaskix_net::interface::Index) -> u64 {
+    faces.get(on).map_or(0, |face| face.member_count() as u64)
+}
+
 /// The VLAN the bound interface carries, or `NO_VLAN`.
 ///
 /// A static because the receive path is two calls below where the interface
@@ -759,6 +771,8 @@ fn refresh() {
         UPPER_SLOTS.load(Relaxed),
         TCP_FORWARDED.load(Relaxed),
         TCP_RETURNED.load(Relaxed),
+        // Word 28, as the builder above: what the address is sitting on.
+        BOUND_SHAPE.load(Relaxed),
     ]);
 }
 
@@ -1787,13 +1801,14 @@ extern "C" fn ipd_main() -> ! {
         // so this waits for a marker rather than believing a page of zeroes.
         if can_send && me.0 == MacAddr::UNSPECIFIED {
             // SAFETY: the configuration page, mapped read-only by this program.
-            let (marker, mac, address, vlan, mtu) = unsafe {
+            let (marker, mac, address, vlan, mtu, ports) = unsafe {
                 (
                     core::ptr::read_volatile(CONFIG_AT as *const u64),
                     core::ptr::read_volatile((CONFIG_AT + 8) as *const u64),
                     core::ptr::read_volatile((CONFIG_AT + 16) as *const u64),
                     core::ptr::read_volatile((CONFIG_AT + 24) as *const u64),
                     core::ptr::read_volatile((CONFIG_AT + 32) as *const u64),
+                    core::ptr::read_volatile((CONFIG_AT + 40) as *const u64),
                 )
             };
             if marker == CONFIG_MARKER {
@@ -1808,16 +1823,50 @@ extern "C" fn ipd_main() -> ! {
                 // below are classified through it. That is what makes a tag a
                 // segmentation boundary rather than four bytes to step over.
                 let mtu = if mtu == 0 { 1500 } else { mtu as u16 };
-                if let Ok(port) = faces.add_physical(0, MacAddr(octets), mtu) {
-                    faces.set_link(port, true);
-                    let mut on = port;
+                // **The shape the machine actually has.** One port is a port;
+                // several are a bond over them, and the address goes on the
+                // bond. Only the first is driven -- `bin/netd` holds one
+                // device -- so the rest are members whose link is down, which
+                // is what a real bond looks like when a member's cable is out.
+                // The bond selects the live one and traffic goes through the
+                // model rather than around it.
+                if let Ok(first) = faces.add_physical(0, MacAddr(octets), mtu) {
+                    faces.set_link(first, true);
+                    let mut on = first;
+                    if ports > 1
+                        && let Ok(bond) =
+                            faces.add_bond(bhaskix_net::interface::BondMode::ActiveBackup)
+                    {
+                        let mut joined = faces.enslave(bond, first).is_ok();
+                        for port in 1..ports.min(u64::from(u8::MAX)) {
+                            // A member whose address this service does not
+                            // know: it is not driven, so nothing here can
+                            // read one, and it is down either way.
+                            if let Ok(other) = faces.add_physical(port as u16, MacAddr([0; 6]), mtu)
+                            {
+                                joined |= faces.enslave(bond, other).is_ok();
+                            }
+                        }
+                        if joined {
+                            on = bond;
+                        }
+                    }
                     if vlan != 0
-                        && let Ok(tagged) = faces.add_vlan(port, vlan as u16)
+                        && let Ok(tagged) = faces.add_vlan(on, vlan as u16)
                     {
                         on = tagged;
                     }
                     BOUND_VLAN.store(
                         faces.egress_tag(on).map_or(NO_VLAN, u32::from),
+                        core::sync::atomic::Ordering::Relaxed,
+                    );
+                    // High half: the ports the kernel said there were. Low
+                    // half: the members the interface actually ended up with.
+                    // Both, because "the address is on a port" has two causes
+                    // -- a count that never arrived, and a bond that would not
+                    // build -- and one number cannot tell them apart.
+                    BOUND_SHAPE.store(
+                        (ports << 32) | shape_of(&faces, on),
                         core::sync::atomic::Ordering::Relaxed,
                     );
                 }
@@ -2757,6 +2806,12 @@ fn report(
         // for the reason written at 23.
         TCP_FORWARDED.load(core::sync::atomic::Ordering::Relaxed),
         TCP_RETURNED.load(core::sync::atomic::Ordering::Relaxed),
+        // Word 28: how many members the interface this address sits on has --
+        // RFC 0074 step 6, and the only evidence that the stack is running
+        // over a bond rather than over a device. Zero means the address is on
+        // a port directly, which is every machine with one NIC. Appended, for
+        // the reason written at 23.
+        BOUND_SHAPE.load(core::sync::atomic::Ordering::Relaxed),
     ];
     V6_PREFIX.store(v6_prefix, core::sync::atomic::Ordering::Relaxed);
     V6_STATE.store(v6_state, core::sync::atomic::Ordering::Relaxed);
@@ -2782,7 +2837,7 @@ fn report(
 /// whatever the array says: the type is the documentation, and both builders --
 /// `report` and `refresh` -- are forced to agree with it by the compiler, which
 /// is the only reason the v6 words' silent overwrite could not happen twice.
-fn write_report(words: [u64; 28]) {
+fn write_report(words: [u64; 29]) {
     // SAFETY: the page this program mapped writable, which nothing else
     // reaches. The marker is written last, so a kernel reading a partial report
     // sees no marker rather than half the fields.
