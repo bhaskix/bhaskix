@@ -1102,10 +1102,17 @@ pub unsafe fn write_transmit_context(host: u64, context: &TransmitContext) {
     }
 }
 
-/// The bytes a frame this driver builds occupies, padded to Ethernet's own
-/// minimum before the CRC the device appends.
+/// The bytes an ARP frame this driver builds occupies, padded to Ethernet's
+/// own minimum before the CRC the device appends.
 pub const FRAME_BYTES: usize = 60;
 const _: () = assert!(FRAME_BYTES >= TRANSMIT_MINIMUM_BYTES);
+
+/// The transmit packet buffer this driver hands the device.
+///
+/// Large enough for the biggest frame it builds -- a tagged DHCP `DISCOVER` is
+/// a little over three hundred bytes -- and still one page.
+pub const PACKET_BYTES: usize = 1024;
+const _: () = assert!(PACKET_BYTES >= FRAME_BYTES);
 
 /// Posts receive descriptors, one per buffer, from descriptor zero -- Table
 /// 38-406: the packet buffer address, and a header address left zero because

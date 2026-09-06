@@ -12916,6 +12916,79 @@ fn build_arp_frame(out: &mut [u8], to: bhaskix_net::addr::MacAddr, from: [u8; 6]
     i40e::FRAME_BYTES
 }
 
+/// The VLAN this port's trunk carries a usable network on.
+///
+/// **Told to this project rather than discovered by it**, and that is the
+/// whole reason it is a constant here: five boots established that the segment
+/// delivers only control-plane multicast, and none of them could have found
+/// which VLAN carried anything else. A tagged DHCP exchange is the first
+/// traffic on this wire that is *for* this machine.
+const TRUNK_VLAN: u16 = 17;
+
+/// The 802.1Q header a trunk needs: fourteen bytes plus the four-byte tag.
+const TAGGED_HEADER: usize = bhaskix_net::eth::HEADER + 4;
+
+/// Builds a DHCP `DISCOVER` on [`TRUNK_VLAN`], returning the frame's length.
+///
+/// **The tag is written by hand and the rest is not.** `bhaskix_net` writes an
+/// untagged Ethernet header, and a trunk needs four bytes between the source
+/// address and the EtherType; everything inside -- the IPv4 header, the UDP
+/// datagram and its checksum, the DHCP message -- comes from the crate the
+/// network services already use, so the bytes on this wire are the bytes those
+/// services put on a virtual one.
+fn build_dhcp_discover(out: &mut [u8], from: [u8; 6], transaction: u32) -> usize {
+    use bhaskix_net::{
+        addr::{Ipv4Addr, MacAddr, Port},
+        dhcp, eth, ipv4, udp,
+    };
+    /// The fixed part, the cookie, one option and the end marker.
+    const MESSAGE: usize = dhcp::MINIMUM + 4;
+
+    let mine = MacAddr(from);
+    out.fill(0);
+    out[0..6].copy_from_slice(&MacAddr::BROADCAST.octets());
+    out[6..12].copy_from_slice(&mine.octets());
+    out[12..14].copy_from_slice(&eth::EtherType::VLAN.0.to_be_bytes());
+    // Priority zero, no drop-eligible bit, and the VLAN in the low twelve.
+    out[14..16].copy_from_slice(&(TRUNK_VLAN & 0x0fff).to_be_bytes());
+    out[16..18].copy_from_slice(&eth::EtherType::IPV4.0.to_be_bytes());
+
+    let mut message = [0u8; MESSAGE];
+    let Ok(length) = dhcp::write_discover(&mut message, mine, transaction) else {
+        return 0;
+    };
+    // A client with no address sends from 0.0.0.0 to the broadcast address,
+    // which is why the reply has to be broadcast too -- `write_discover` sets
+    // that flag for the same reason.
+    let Some(datagram) = out.get_mut(TAGGED_HEADER + ipv4::HEADER..) else {
+        return 0;
+    };
+    let Ok(udp_bytes) = udp::write(
+        datagram,
+        Port(68),
+        Port(67),
+        &message[..length],
+        Ipv4Addr(0),
+        Ipv4Addr::BROADCAST,
+    ) else {
+        return 0;
+    };
+    let Some(packet) = out.get_mut(TAGGED_HEADER..) else {
+        return 0;
+    };
+    let Ok(header) = ipv4::write_header(
+        packet,
+        Ipv4Addr(0),
+        Ipv4Addr::BROADCAST,
+        ipv4::Protocol::UDP,
+        udp_bytes,
+        0,
+    ) else {
+        return 0;
+    };
+    TAGGED_HEADER + header + udp_bytes
+}
+
 /// Everything the transmit half needs that the receive bring-up already holds.
 struct TransmitSetup {
     /// The page-descriptor page, as this kernel writes it: the transmit
@@ -13037,27 +13110,38 @@ fn send_frames(
         return false;
     }
 
-    // **Frame one: addressed to this port's own MAC.** If the internal switch
-    // loops it back it arrives in the receive queue with `LPBK` set, and that
-    // is a complete proof of both directions that needs nobody else.
-    // **Frame two: broadcast**, which leaves for the wire.
+    // **Three frames now, and the third is the one that matters.** An ARP to
+    // this port's own address, an ARP to broadcast, and a **DHCP DISCOVER
+    // tagged for VLAN 17** -- the first traffic this machine has put on the
+    // wire that something is expected to answer. The segment carries only
+    // control-plane multicast untagged; the VLAN is where a network lives.
     let baseline = nic.transmit_counters(setup.port);
+    let transaction = time::now() as u32 | 1;
     let mut sent = 0;
-    for (index, (name, destination)) in [
-        ("to its own address", bhaskix_net::addr::MacAddr(mac)),
-        ("to broadcast", bhaskix_net::addr::MacAddr::BROADCAST),
+    let mut discovered = false;
+    for (index, name) in [
+        "an ARP to its own address",
+        "an ARP to broadcast",
+        "a DHCP DISCOVER on VLAN 17",
     ]
     .into_iter()
     .enumerate()
     {
         // SAFETY: `packet_host` is the direct-map address of a page this
-        // kernel owns; the frame is far shorter than it.
+        // kernel owns; every frame here is far shorter than it.
         let buffer = unsafe {
-            core::slice::from_raw_parts_mut(setup.packet_host as *mut u8, i40e::FRAME_BYTES)
+            core::slice::from_raw_parts_mut(setup.packet_host as *mut u8, i40e::PACKET_BYTES)
         };
-        let bytes = build_arp_frame(buffer, destination, mac);
+        let bytes = match index {
+            0 => build_arp_frame(buffer, bhaskix_net::addr::MacAddr(mac), mac),
+            1 => build_arp_frame(buffer, bhaskix_net::addr::MacAddr::BROADCAST, mac),
+            _ => {
+                discovered = true;
+                build_dhcp_discover(buffer, mac, transaction)
+            }
+        };
         if bytes == 0 {
-            println!("\x1b[93m    nic tx frame   the frame would not build\x1b[0m");
+            println!("\x1b[93m    nic tx frame   {name} would not build\x1b[0m");
             continue;
         }
         let slot = index as u32;
@@ -13084,7 +13168,7 @@ fn send_frames(
             core::hint::spin_loop();
         }
         println!(
-            "    nic tx frame   {bytes} bytes {name}: {}, head {}",
+            "    nic tx frame   {bytes} bytes, {name}: {}, head {}",
             if done {
                 "\x1b[92mthe device reported the descriptor done\x1b[0m"
             } else {
@@ -13100,6 +13184,7 @@ fn send_frames(
     // **What the port says left, as against what this driver asked for.** The
     // descriptor completing says the device took the buffer; the counters say
     // the MAC put it on the wire, and they are different claims.
+    let _ = discovered;
     let delta = nic.transmit_counters(setup.port).since(&baseline);
     println!(
         "    nic tx stats   port {} sent {} packet(s) ({} unicast, {} multicast, {} broadcast), {} \
@@ -13556,13 +13641,77 @@ fn bring_up_receive_queue(
     let sent = send_frames(nic, &transmit, target, &memory);
 
     if sent {
-        // **Every ring, asked again.** A loopback of the self-addressed frame,
-        // or an answer to the broadcast, arrives in whichever queue the VSI
-        // steers it to.
+        // **A wait, not a glance.** A DHCP server has to see the DISCOVER,
+        // decide and answer, and a relay may be in the path; ten seconds is
+        // generous for that and cheap when nothing comes.
         // SAFETY: `rings` describes the posted rings.
-        let after = unsafe { report_rings(&rings, &buffers, "after transmitting") };
-        if after == 0 {
-            println!("    nic rx after   still nothing in any receive ring after transmitting");
+        match unsafe { wait_for_any_frame(&rings, 10_000) } {
+            Some((index, slot, completion, elapsed)) => {
+                let host = buffers.host_at(index, slot);
+                // SAFETY: the device marked this descriptor done.
+                let header = unsafe { i40e::frame_header(host) };
+                println!(
+                    "\x1b[92m    nic rx after   a frame arrived {} ms after transmitting, in absolute \
+                     queue {}: {} bytes, EtherType {:#06x} ({}), {} to {} from {}\x1b[0m",
+                    if elapsed == u64::MAX { 0 } else { elapsed },
+                    rings.queue(index),
+                    completion.length,
+                    header.ethertype,
+                    header.ethertype_name(),
+                    completion.cast_name(),
+                    MacAddress(header.destination),
+                    MacAddress(header.source)
+                );
+                if let Some(tag) = header.vlan {
+                    println!(
+                        "                   VLAN tag control {tag:#06x} -- VLAN {}",
+                        tag & 0x0fff
+                    );
+                }
+                // **If it is an offer, say what was offered.** A DHCP reply is
+                // the first thing on this wire that would have been sent
+                // *because this machine asked*, so it is worth naming the
+                // address rather than only counting the frame.
+                let payload = TAGGED_HEADER + bhaskix_net::ipv4::HEADER + bhaskix_net::udp::HEADER;
+                if header.ethertype == bhaskix_net::eth::EtherType::IPV4.0
+                    && (completion.length as usize) > payload
+                {
+                    let mut message = [0u8; 512];
+                    let take = ((completion.length as usize) - payload).min(message.len());
+                    for (offset, byte) in message.iter_mut().enumerate().take(take) {
+                        // SAFETY: inside the buffer the device filled.
+                        *byte = unsafe {
+                            core::ptr::read_volatile(
+                                (host + (payload + offset) as u64) as *const u8,
+                            )
+                        };
+                    }
+                    match bhaskix_net::dhcp::parse_offer(&message[..take]) {
+                        Ok(offer) => println!(
+                            "\x1b[92m    nic dhcp       an OFFER: {}.{}.{}.{} from the server, \
+                             transaction {:#x}\x1b[0m",
+                            offer.address.octets()[0],
+                            offer.address.octets()[1],
+                            offer.address.octets()[2],
+                            offer.address.octets()[3],
+                            offer.transaction
+                        ),
+                        Err(error) => println!(
+                            "    nic dhcp       the frame is IPv4 but not an offer this parser \
+                             takes: {error:?}"
+                        ),
+                    }
+                }
+                // SAFETY: as the header read above.
+                unsafe { dump_frame(host, completion.length as usize) };
+                // Whatever else landed.
+                // SAFETY: `rings` describes the posted rings.
+                unsafe { report_rings(&rings, &buffers, "after transmitting") };
+            }
+            None => println!(
+                "\x1b[91m    nic rx after   nothing in any receive ring in 10 s after \
+                 transmitting, the DHCP DISCOVER included\x1b[0m"
+            ),
         }
     }
 
