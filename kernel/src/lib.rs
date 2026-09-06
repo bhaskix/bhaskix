@@ -12727,6 +12727,25 @@ fn start_nic_domain(hhdm: u64) -> Result<(), &'static str> {
                                      queue is enabled and firmware did not complete it\x1b[0m"
                                 ),
                             }
+                            // **RFC 0072 step 4 begins by looking, for the
+                            // reason step 3 learned.** Firmware had left the
+                            // admin queues sized, and assuming a clean slate
+                            // would have enabled a ring at somebody else's
+                            // size. A receive queue this platform is already
+                            // using is worth knowing about before taking it --
+                            // and on a LOM that is not a remote possibility.
+                            let (requested, active) = nic.receive_queue_state(0);
+                            println!(
+                                "    nic rx queue   queue 0 reads QENA_REQ={} QENA_STAT={} -- {}",
+                                u8::from(requested),
+                                u8::from(active),
+                                match (requested, active) {
+                                    (false, false) => "off, and free to take",
+                                    (true, true) => "running; something else owns it",
+                                    (true, false) => "an enable is in flight",
+                                    (false, true) => "a disable is in flight",
+                                }
+                            );
                         }
                     }
                     None => println!(

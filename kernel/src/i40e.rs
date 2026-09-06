@@ -112,6 +112,23 @@ const FLAG_ERR: u16 = 1 << 2;
 /// them for its reply.
 const VERSION_MAJOR_AT: usize = 24;
 
+/// Global Receive Queue Enable -- 38.39.2.18.13, `QRX_ENA[Q]`
+/// (`0x00120000 + 0x4*Q`, Q = 0..1535).
+///
+/// Four states rather than two, per Table 38-418, and the datasheet is explicit
+/// about the handshake: *"If this bit is set, the software should poll the
+/// QENA_STAT flag before using the queue... Once software changes the state of
+/// the QENA_REQ flag it must poll the QENA_STAT before it is permitted to
+/// revert the state of the QENA_REQ once again."* So enabling a queue is a
+/// request and a wait, not a write.
+const QRX_ENA: u64 = 0x0012_0000;
+/// `QRX_ENA.QENA_REQ`, bit 0 -- what software asks for.
+const QENA_REQ: u32 = 1 << 0;
+/// `QRX_ENA.QENA_STAT`, bit 2 -- what the hardware reports. Read from the field
+/// list rather than inferred from the reserved range, because a bit position
+/// guessed from a gap is a guess.
+const QENA_STAT: u32 = 1 << 2;
+
 /// One mapped X722 function, far enough along to be asked questions.
 pub struct Device {
     /// The register window, through the direct map.
@@ -219,6 +236,23 @@ impl Device {
     #[must_use]
     pub fn admin_queue_lengths(&self) -> (u32, u32) {
         (self.read(PF_ATQLEN) & 0x3ff, self.read(PF_ARQLEN) & 0x3ff)
+    }
+
+    /// What a receive queue's enable handshake currently reads.
+    ///
+    /// Returns `(requested, active)` -- `QENA_REQ` and `QENA_STAT`. The four
+    /// combinations are Table 38-418's states: neither is a queue that is off,
+    /// both is one that is running, and the two mixed states are a request in
+    /// flight in one direction or the other.
+    ///
+    /// **Read before anything is written**, for the reason the admin queues
+    /// taught: firmware had left those sized, and assuming a clean slate would
+    /// have enabled a ring at somebody else's size. A queue this platform is
+    /// already using is worth knowing about before taking it.
+    #[must_use]
+    pub fn receive_queue_state(&self, queue: u32) -> (bool, bool) {
+        let value = self.read(QRX_ENA + 4 * u64::from(queue));
+        (value & QENA_REQ != 0, value & QENA_STAT != 0)
     }
 
     /// Posts `Get Version` and waits for firmware to answer it.
