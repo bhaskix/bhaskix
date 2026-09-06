@@ -330,6 +330,113 @@ const GLV_MPRCL: u64 = 0x0036_CC00;
 /// 38.39.2.16.107, `GLV_BPRCL[n]` (`0x0036D800 + 0x8*n`).
 const GLV_BPRCL: u64 = 0x0036_D800;
 
+/// Global Transmit Queue Head -- 38.39.2.18.8, `QTX_HEAD[Q]`
+/// (`0x000E4000 + 0x4*Q`). Cleared by software before a queue is enabled.
+const QTX_HEAD: u64 = 0x000E_4000;
+
+/// Global Transmit Pre Queue Disable -- 38.39.2.18.9, `GLLAN_TXPRE_QDIS[n]`
+/// (`0x000E6500 + 0x4*n`, n = 0..11).
+///
+/// `QINDX` is bits 10:0 and takes the **absolute** queue index; bit 31 is
+/// `CLEAR_QDIS`, *"setting this flag to 1b clears an internal QDIS flag of the
+/// transmit queue... This step should be made before the queue is enabled."*
+/// Each register covers 128 queues, so the register index is the queue divided
+/// by 128 -- a detail with no equivalent anywhere on the receive side.
+const GLLAN_TXPRE_QDIS: u64 = 0x000E_6500;
+/// `GLLAN_TXPRE_QDIS.CLEAR_QDIS`, bit 31.
+const TXPRE_CLEAR_QDIS: u32 = 1 << 31;
+/// `GLLAN_TXPRE_QDIS.SET_QDIS`, bit 30 -- the disable direction, *"mutually
+/// exclusive with the CLEAR_QDIS flag"*.
+const TXPRE_SET_QDIS: u32 = 1 << 30;
+/// How many queues one `GLLAN_TXPRE_QDIS` register covers.
+const QDIS_QUEUES_PER_REGISTER: u32 = 128;
+
+/// Global Transmit Queue Enable -- 38.39.2.18.10, `QTX_ENA[Q]`
+/// (`0x00100000 + 0x4*Q`). The same three-bit handshake as `QRX_ENA`:
+/// `QENA_REQ` bit 0, `FAST_QDIS` bit 1, `QENA_STAT` bit 2.
+const QTX_ENA: u64 = 0x0010_0000;
+
+/// Global Transmit Queue Control -- 38.39.2.18.11, `QTX_CTL[Q]`
+/// (`0x00104000 + 0x4*Q`).
+///
+/// `PFVF_Q` bits 1:0 -- `10b` is a PF queue -- `PF_INDX` bits 5:2, and
+/// `VFVM_INDX` bits 15:7 which *"should be set to zero"* for a PF's own queue.
+/// This is what tells the device which function owns the queue, and it has no
+/// counterpart on the receive side: a receive queue's owner is implied by the
+/// VSI that steers to it, a transmit queue's is stated here.
+const QTX_CTL: u64 = 0x0010_4000;
+/// `QTX_CTL.PFVF_Q` = `10b`: this queue belongs to a PF.
+const QTX_CTL_PF_QUEUE: u32 = 0b10;
+
+/// Global Transmit Queue Tail -- 38.39.2.18.12, `QTX_TAIL[Q]`
+/// (`0x00108000 + 0x4*Q`). The doorbell: the last valid descriptor plus one.
+const QTX_TAIL: u64 = 0x0010_8000;
+
+/// Station Address Low -- 38.39.2.5.6, `PRTPM_SAL[n]`
+/// (`0x001E4440 + 0x20*n`, n = 0..3, RO): *"the lower 32 bits of the 48-bit
+/// NVM pre-assigned Ethernet MAC address... defined in big endian (LS byte of
+/// SAL is first on the wire)"*.
+const PRTPM_SAL: u64 = 0x001E_4440;
+/// Station Address High -- 38.39.2.5.7, `PRTPM_SAH[n]`
+/// (`0x001E44C0 + 0x20*n`, n = 0..3, RO): the upper 16 bits, *"MS byte of
+/// PRTPM_SAH is last on the wire"*. Bit 31 is `AV`, which the datasheet says
+/// is set by firmware when the NVM supplies an address.
+const PRTPM_SAH: u64 = 0x001E_44C0;
+/// `PRTPM_SAH.AV`, bit 31 -- the address is valid.
+const SAH_ADDRESS_VALID: u32 = 1 << 31;
+
+/// Port transmit counters -- 38.39.2.16, the mirror of the receive set.
+const GLPRT_GOTCL: u64 = 0x0030_0680;
+/// 38.39.2.16.60, `GLPRT_UPTCL[n]`.
+const GLPRT_UPTCL: u64 = 0x0030_09C0;
+/// 38.39.2.16.62, `GLPRT_MPTCL[n]`.
+const GLPRT_MPTCL: u64 = 0x0030_09E0;
+/// 38.39.2.16.64, `GLPRT_BPTCL[n]`.
+const GLPRT_BPTCL: u64 = 0x0030_0A00;
+
+/// `Get VSI Parameters` -- Table 38-222, opcode `0x0212`: *"used to get the
+/// parameters of an existing VSI"*, which is exactly this driver's position --
+/// firmware created the VSI and this asks about it. Indirect, with a 128-byte
+/// buffer whose layout is the Add VSI response buffer's.
+const OPCODE_GET_VSI_PARAMETERS: u16 = 0x0212;
+/// The VSI parameter buffer's length -- Table 38-222's `Datalen` of `0x80`.
+pub const VSI_BUFFER_BYTES: u16 = 128;
+/// Where that buffer sits in the page holding the admin rings, after the
+/// switch buffer.
+pub const VSI_BUFFER_OFFSET: u64 = SWITCH_BUFFER_OFFSET + SWITCH_BUFFER_BYTES as u64;
+/// Where `QS_Handle 0` sits in the buffer -- Table 38-217: *"96-97 QS_Handle
+/// 0... Bits [9:0] of this handle are used by software to program the RDYList
+/// field in the transmit queues context"*.
+const QS_HANDLE_AT: usize = 96;
+const _: () = assert!(
+    VSI_BUFFER_OFFSET + VSI_BUFFER_BYTES as u64 <= 4096,
+    "the rings, the switch buffer and the VSI buffer must share one page"
+);
+
+/// One transmit data descriptor, in bytes -- Table 38-425 and 38.31.2.1.1.
+/// Qword 0 is the packet buffer address; qword 1 carries the type, the command
+/// and the length.
+pub const TRANSMIT_DESCRIPTOR_BYTES: u64 = 16;
+/// `DTYP`, qword 1 bits 3:0 -- *"0x0 stands for a transmit data descriptor"*.
+const TX_DTYP_MASK: u64 = 0xf;
+/// What `DTYP` reads once hardware has completed the descriptor:
+/// *"completion is reported by setting the DTYP field to 0xF"*, which is the
+/// path taken because `HEAD_WBEN` is cleared.
+const TX_DTYP_DONE: u64 = 0xf;
+/// `CMD.EOP`, CMD bit 0 at qword 1 bit 4 -- *"set in the last descriptor of a
+/// packet"*.
+const TX_CMD_EOP: u64 = 1 << 4;
+/// `CMD.RS`, CMD bit 1 at qword 1 bit 5 -- *"when set, hardware reports the DMA
+/// completion of the transmit descriptor and its data buffer"*. Without it
+/// nothing is written back and a sender cannot tell that anything happened.
+const TX_CMD_RS: u64 = 1 << 5;
+/// `Tx Buffer Size`, qword 1 bits 47:34, fourteen bits of byte count.
+const TX_BUFFER_SIZE_SHIFT: u32 = 34;
+/// The smallest packet the device will send -- 38.31.2: *"the total size of a
+/// single packet in host memory must be at least 17 bytes"*, and one outside
+/// the range is *"considered malicious. The respective queue is stopped"*.
+pub const TRANSMIT_MINIMUM_BYTES: usize = 17;
+
 /// Global Receive Queue Tail -- 38.39.2.18.14, `QRX_TAIL[Q]`
 /// (`0x00128000 + 0x4*Q`). `TAIL` bits 12:0: *"the first descriptor that
 /// software hands to hardware (it is the last valid descriptor plus one)"*.
@@ -457,6 +564,10 @@ const _: () = assert!(REGISTER_WINDOW_BYTES > PFHMC_SDDATAHIGH);
 const _: () = assert!(REGISTER_WINDOW_BYTES > GLV_BPRCL + 8 * MAX_VSI);
 const _: () = assert!(REGISTER_WINDOW_BYTES > GLPRT_RDPC + 8 * MAX_PORT);
 const _: () = assert!(REGISTER_WINDOW_BYTES > PFGEN_PORTNUM);
+const _: () = assert!(REGISTER_WINDOW_BYTES > QTX_TAIL + 4 * MAX_RECEIVE_QUEUE);
+const _: () = assert!(REGISTER_WINDOW_BYTES > GLPRT_BPTCL + 8 * MAX_PORT);
+const _: () = assert!(REGISTER_WINDOW_BYTES > PRTPM_SAH + 0x20 * MAX_PORT);
+const _: () = assert!(REGISTER_WINDOW_BYTES > GLLAN_TXPRE_QDIS + 4 * 11);
 
 /// One admin queue descriptor -- Table 38-339, as its eight little-endian
 /// 32-bit words.
@@ -969,6 +1080,24 @@ pub unsafe fn write_receive_context(host: u64, context: &ReceiveContext) {
     }
 }
 
+/// Writes a transmit context where the HMC will fetch it.
+///
+/// # Safety
+///
+/// `host` must be the direct-map address of the context's 128 bytes in a
+/// backing page, writable, and the device must not be fetching it yet.
+pub unsafe fn write_transmit_context(host: u64, context: &TransmitContext) {
+    for (index, word) in context.words().iter().enumerate() {
+        // SAFETY: per the caller; 128 bytes, written a word at a time.
+        unsafe { core::ptr::write_volatile((host + 4 * index as u64) as *mut u32, *word) };
+    }
+}
+
+/// The bytes a frame this driver builds occupies, padded to Ethernet's own
+/// minimum before the CRC the device appends.
+pub const FRAME_BYTES: usize = 60;
+const _: () = assert!(FRAME_BYTES >= TRANSMIT_MINIMUM_BYTES);
+
 /// Posts receive descriptors, one per buffer, from descriptor zero -- Table
 /// 38-406: the packet buffer address, and a header address left zero because
 /// the queue does no header split and bit 0 must stay clear for `DD`.
@@ -1228,6 +1357,153 @@ impl VsiCounters {
     }
 
     /// Packets the VSI took in, of any address kind.
+    #[must_use]
+    pub const fn packets(&self) -> u64 {
+        self.unicast + self.multicast + self.broadcast
+    }
+}
+
+/// The static half of a LAN transmit queue context -- Table 38-428, packed as
+/// the thirty-two little-endian dwords of the 128-byte object
+/// `GLHMC_LANTXOBJSZ` describes. Eight "lines" of 128 bits each.
+///
+/// **Only the fields the table marks `Static` are written, and everything else
+/// is left zero**, including the bits it calls `Internal`. `New_Context` is
+/// what makes that safe: the table's own note says it *"should be set to 1b by
+/// software at queue context programming"*, which is the device being told
+/// this is a fresh context rather than an edit of one it is already running.
+///
+/// **The datasheet's worked example contradicts itself here, and the reading
+/// taken is the field table's.** 38.31.3.4.3 prints Line 7 as `FFFFFFFF
+/// 480FFFFF 00000000 00000000` and then says `RDYList = 0x80 (128)`. Placed at
+/// the table's bits 84-93 those two cannot both be true: the hex puts zero
+/// there. Reading the line's internal bits as ones and `RDYList` as `0x80`
+/// reproduces `0x080FFFFF` for its third dword, which is the printed
+/// `0x480FFFFF` short of one bit -- so the legend is coherent and the hex is
+/// not quite. The field table wins, `RDYList` goes at bits 84-93, and the
+/// internal bits stay zero because the table's own `SW Init` column says
+/// `0x0`. Written down because a reader who checks the example will find the
+/// same contradiction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TransmitContext {
+    /// The descriptor ring's address as the device issues it. Table 38-428
+    /// says `BASE` is *"defined in 128-byte units"* -- in so many words, which
+    /// is the same unit the receive table only implied through its example.
+    pub ring: u64,
+    /// `QLEN`: descriptors in the ring, *"from 8 descriptors up to 8 KB-32"*,
+    /// a whole multiple of 8 below 32 and of 32 above it.
+    pub descriptors: u16,
+    /// `RDYList`: the transmit arbitration queue set. Firmware owns the
+    /// allocation -- *"allocation of queue sets to VSIs is managed by
+    /// firmware"* -- and hands the value out as a VSI's `QS_Handle`, which is
+    /// why this cannot be invented and [`Device::vsi_parameters`] exists.
+    pub ready_list: u16,
+}
+
+impl TransmitContext {
+    /// How many dwords the context occupies -- 128 bytes.
+    pub const WORDS: usize = 32;
+    /// Dwords per 128-bit line.
+    const LINE: usize = 4;
+
+    /// The 128 bytes as the HMC reads them.
+    #[must_use]
+    pub const fn words(&self) -> [u32; Self::WORDS] {
+        let mut words = [0u32; Self::WORDS];
+        // Line 0: New_Context at bit 30, BASE at bits 32-88.
+        words[0] = 1 << 30;
+        let base = self.ring / 128;
+        words[1] = base as u32;
+        words[2] = ((base >> 32) & 0x01ff_ffff) as u32;
+        // Line 1: HEAD_WBEN at bit 32 stays clear -- descriptor write-back,
+        // not head write-back, so a completed descriptor is what says so and
+        // no separate write-back address is needed. QLEN at bits 33-45.
+        words[Self::LINE + 1] = ((self.descriptors as u32) & 0x1fff) << 1;
+        // Line 7: RDYList at bits 84-93, which is the third dword of the line
+        // at its bits 20-29.
+        words[7 * Self::LINE + 2] = ((self.ready_list as u32) & 0x3ff) << 20;
+        words
+    }
+}
+
+/// A transmit data descriptor -- 38.31.2.1.1, as its two quad-words.
+///
+/// `EOP` and `RS` are always both set here because this driver sends one
+/// self-contained packet at a time and wants to be told it happened: without
+/// `RS` *"hardware reports"* nothing, and a sender that cannot see a
+/// completion is back to claiming rather than knowing.
+#[must_use]
+pub const fn transmit_descriptor(buffer: u64, bytes: u16) -> (u64, u64) {
+    let length = (bytes as u64) << TX_BUFFER_SIZE_SHIFT;
+    // DTYP is 0 for a data descriptor, so it is left out rather than written.
+    (buffer, TX_CMD_EOP | TX_CMD_RS | length)
+}
+
+/// Whether hardware has completed a transmit descriptor -- its `DTYP` field
+/// reading `0xF`.
+///
+/// # Safety
+///
+/// `ring_host` must be the direct-map address of the transmit ring, and
+/// `index` inside it.
+pub unsafe fn transmit_completed(ring_host: u64, index: u32) -> bool {
+    let at = ring_host + TRANSMIT_DESCRIPTOR_BYTES * u64::from(index) + 8;
+    // SAFETY: per the caller; the second quad-word, which hardware rewrites.
+    let qword = unsafe { core::ptr::read_volatile(at as *const u64) };
+    qword & TX_DTYP_MASK == TX_DTYP_DONE
+}
+
+/// Writes one transmit descriptor into a ring.
+///
+/// # Safety
+///
+/// As [`transmit_completed`], and the queue must not be running past `index`.
+pub unsafe fn post_transmit_descriptor(ring_host: u64, index: u32, buffer: u64, bytes: u16) {
+    let (low, high) = transmit_descriptor(buffer, bytes);
+    let at = ring_host + TRANSMIT_DESCRIPTOR_BYTES * u64::from(index);
+    // SAFETY: per the caller; two quad-words inside the ring.
+    unsafe {
+        core::ptr::write_volatile(at as *mut u64, low);
+        core::ptr::write_volatile((at + 8) as *mut u64, high);
+    }
+}
+
+/// What `Get VSI Parameters` reported about an existing VSI.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct VsiParameters {
+    /// The VSI number firmware assigned, from the descriptor's bytes 18-19.
+    pub number: u16,
+    /// `QS_Handle 0`, the queue set for traffic class 0. Its bits 9:0 are the
+    /// `RDYList` a transmit context needs.
+    pub queue_set: u16,
+}
+
+/// A port's transmit counters, the mirror of [`PortCounters`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TransmitCounters {
+    /// `GLPRT_UPTCL/H`: unicast packets transmitted.
+    pub unicast: u64,
+    /// `GLPRT_MPTCL/H`: multicast packets transmitted.
+    pub multicast: u64,
+    /// `GLPRT_BPTCL/H`: broadcast packets transmitted.
+    pub broadcast: u64,
+    /// `GLPRT_GOTCL/H`: good octets transmitted.
+    pub octets: u64,
+}
+
+impl TransmitCounters {
+    /// What left between an earlier reading and this one, saturating.
+    #[must_use]
+    pub const fn since(&self, baseline: &Self) -> Self {
+        Self {
+            unicast: self.unicast.saturating_sub(baseline.unicast),
+            multicast: self.multicast.saturating_sub(baseline.multicast),
+            broadcast: self.broadcast.saturating_sub(baseline.broadcast),
+            octets: self.octets.saturating_sub(baseline.octets),
+        }
+    }
+
+    /// Packets the port put on the wire, of any address kind.
     #[must_use]
     pub const fn packets(&self) -> u64 {
         self.unicast + self.multicast + self.broadcast
@@ -1649,6 +1925,172 @@ impl Device {
             broadcast: self.read64(GLV_BPRCL + at),
             discarded: self.read(GLV_RDPC + at),
         }
+    }
+
+    /// This port's own MAC address, from the NVM -- `PRTPM_SAL`/`PRTPM_SAH`.
+    ///
+    /// Returns `None` if `PRTPM_SAH.AV` is clear, which means the NVM did not
+    /// supply one and nothing here should invent it: a frame sent from an
+    /// address this port does not own is a frame a switch may drop, and worse,
+    /// one whose replies go elsewhere.
+    ///
+    /// The byte order is the datasheet's and not a convention: *"LS byte of
+    /// SAL is first on the wire"* and *"MS byte of PRTPM_SAH is last"*.
+    #[must_use]
+    pub fn mac_address(&self, port: u32) -> Option<[u8; 6]> {
+        let at = 0x20 * u64::from(port.min(MAX_PORT as u32));
+        let high = self.read(PRTPM_SAH + at);
+        if high & SAH_ADDRESS_VALID == 0 {
+            return None;
+        }
+        let low = self.read(PRTPM_SAL + at);
+        Some([
+            low as u8,
+            (low >> 8) as u8,
+            (low >> 16) as u8,
+            (low >> 24) as u8,
+            high as u8,
+            (high >> 8) as u8,
+        ])
+    }
+
+    /// The port's transmit counters, at this instant. Totals since power-on,
+    /// as [`PortCounters`].
+    #[must_use]
+    pub fn transmit_counters(&self, port: u32) -> TransmitCounters {
+        let at = 8 * u64::from(port.min(MAX_PORT as u32));
+        TransmitCounters {
+            unicast: self.read64(GLPRT_UPTCL + at),
+            multicast: self.read64(GLPRT_MPTCL + at),
+            broadcast: self.read64(GLPRT_BPTCL + at),
+            octets: self.read64(GLPRT_GOTCL + at),
+        }
+    }
+
+    /// Asks `Get VSI Parameters` about a VSI this function controls.
+    ///
+    /// `device` and `host` are the 128-byte buffer as the device issues it and
+    /// as this kernel reaches it. The buffer is zeroed first so a stale handle
+    /// cannot be read as this answer.
+    ///
+    /// # Safety
+    ///
+    /// `host` must be the direct-map address of the buffer the device reaches
+    /// at `device`, writable, at least [`VSI_BUFFER_BYTES`] long, and written
+    /// by nothing else while this runs.
+    ///
+    /// # Errors
+    ///
+    /// As [`Device::command`]. `ENOENT` means the SEID is not a VSI and
+    /// `EACCES` that it belongs to another PF.
+    pub unsafe fn vsi_parameters(
+        &mut self,
+        seid: u16,
+        device: u64,
+        host: u64,
+        spins: u32,
+    ) -> Result<VsiParameters, CommandError> {
+        // SAFETY: per the caller.
+        unsafe { core::ptr::write_bytes(host as *mut u8, 0, usize::from(VSI_BUFFER_BYTES)) };
+        let mut request =
+            Descriptor::with_buffer(OPCODE_GET_VSI_PARAMETERS, device, VSI_BUFFER_BYTES);
+        // The SEID goes in bytes 16-17, which `with_buffer` leaves clear.
+        request.words[4] = u32::from(seid);
+        let reply = self.command(request, spins)?;
+        // SAFETY: per the caller; firmware has completed the command, so its
+        // writes to the buffer are done.
+        let buffer =
+            unsafe { core::ptr::read_volatile(host as *const [u8; VSI_BUFFER_BYTES as usize]) };
+        Ok(VsiParameters {
+            // Bytes 18-19 of the descriptor: "returns the assigned VSI number".
+            number: reply.half(18),
+            queue_set: u16::from_le_bytes([buffer[QS_HANDLE_AT], buffer[QS_HANDLE_AT + 1]]),
+        })
+    }
+
+    /// Clears a transmit queue's internal disable flag -- 38.31.3.1.1's
+    /// *"software should clear the queue disable flag... before the queue is
+    /// enabled"*, through the one register whose index is the queue divided by
+    /// 128 rather than the queue itself.
+    ///
+    /// `queue` is the **absolute** index, which is what `QINDX` takes.
+    pub fn clear_transmit_queue_disable(&self, queue: u32) {
+        let register = GLLAN_TXPRE_QDIS + 4 * u64::from(queue / QDIS_QUEUES_PER_REGISTER);
+        self.write(register, (queue & 0x7ff) | TXPRE_CLEAR_QDIS);
+    }
+
+    /// Sets a transmit queue's internal disable flag, the other half of
+    /// [`Device::clear_transmit_queue_disable`] and the first step of the
+    /// disable flow.
+    pub fn set_transmit_queue_disable(&self, queue: u32) {
+        let register = GLLAN_TXPRE_QDIS + 4 * u64::from(queue / QDIS_QUEUES_PER_REGISTER);
+        self.write(register, (queue & 0x7ff) | TXPRE_SET_QDIS);
+    }
+
+    /// Says which function owns a transmit queue -- `QTX_CTL`, a statement a
+    /// receive queue never needs to make.
+    pub fn own_transmit_queue(&self, queue: u32, function: u32) {
+        self.write(
+            QTX_CTL + 4 * u64::from(queue),
+            QTX_CTL_PF_QUEUE | ((function & 0xf) << 2),
+        );
+    }
+
+    /// Enables a transmit queue -- 38.31.3.1.1: the head cleared, `QENA_REQ`
+    /// set, `QENA_STAT` polled, which follows *"not more than 10 µs"* later.
+    ///
+    /// The context, the ownership and the disable flag must already be done;
+    /// this is the last step and the one the device answers.
+    pub fn enable_transmit_queue(&self, queue: u32, spins: u32) -> bool {
+        let at = 4 * u64::from(queue);
+        self.write(QTX_HEAD + at, 0);
+        self.write(QTX_TAIL + at, 0);
+        let enable = self.read(QTX_ENA + at);
+        self.write(QTX_ENA + at, enable | QENA_REQ);
+        for _ in 0..spins {
+            if self.read(QTX_ENA + at) & QENA_STAT != 0 {
+                return true;
+            }
+            core::hint::spin_loop();
+        }
+        false
+    }
+
+    /// What a transmit queue's enable handshake currently reads, as
+    /// [`Device::receive_queue_state`] does for the other direction.
+    #[must_use]
+    pub fn transmit_queue_state(&self, queue: u32) -> (bool, bool) {
+        let value = self.read(QTX_ENA + 4 * u64::from(queue));
+        (value & QENA_REQ != 0, value & QENA_STAT != 0)
+    }
+
+    /// Rings the transmit doorbell -- `QTX_TAIL`, the last valid descriptor
+    /// plus one.
+    pub fn transmit_doorbell(&self, queue: u32, tail: u32) {
+        self.write(QTX_TAIL + 4 * u64::from(queue), tail & 0x1fff);
+    }
+
+    /// What the device says its transmit head is -- `QTX_HEAD`, which advances
+    /// as descriptors are consumed.
+    #[must_use]
+    pub fn transmit_head(&self, queue: u32) -> u32 {
+        self.read(QTX_HEAD + 4 * u64::from(queue)) & 0x1fff
+    }
+
+    /// Disables a transmit queue -- 38.31.3.1.2: the disable flag set first,
+    /// then `QENA_REQ` cleared, then `QENA_STAT` polled clear.
+    pub fn disable_transmit_queue(&self, queue: u32, spins: u32) -> bool {
+        self.set_transmit_queue_disable(queue);
+        let at = 4 * u64::from(queue);
+        let enable = self.read(QTX_ENA + at);
+        self.write(QTX_ENA + at, enable & !QENA_REQ);
+        for _ in 0..spins {
+            if self.read(QTX_ENA + at) & QENA_STAT == 0 {
+                return true;
+            }
+            core::hint::spin_loop();
+        }
+        false
     }
 
     /// What a receive queue's enable handshake currently reads.
@@ -2086,5 +2528,105 @@ mod tests {
         };
         assert_eq!(vsi.packets(), 8);
         assert_eq!(vsi.since(&vsi).packets(), 0);
+    }
+
+    /// Table 38-428's fields, against the legend of its own worked example.
+    ///
+    /// The example's Line 7 hex and its legend disagree -- see
+    /// [`TransmitContext`] -- so the test is written against the legend, which
+    /// is the half that is self-consistent, and against the field table's bit
+    /// positions.
+    #[test]
+    fn the_transmit_context_places_table_38_428s_fields() {
+        let context = TransmitContext {
+            ring: 0x001579A0 * 128,
+            descriptors: 512,
+            ready_list: 0x80,
+        };
+        let words = context.words();
+
+        // Line 0: New_Context at bit 30, BASE at 32-88 in 128-byte units.
+        assert_eq!(words[0], 1 << 30, "New_Context must be set at programming");
+        assert_eq!(words[1], 0x0015_79A0, "BASE low, in 128-byte units");
+        assert_eq!(words[2], 0, "this ring's BASE does not reach past 32 bits");
+
+        // Line 1: HEAD_WBEN clear at bit 32, QLEN at 33-45.
+        assert_eq!(words[4], 0, "THEAD_WB is hardware's");
+        assert_eq!(
+            words[5] & 1,
+            0,
+            "HEAD_WBEN clear means descriptor write-back"
+        );
+        assert_eq!((words[5] >> 1) & 0x1fff, 512, "QLEN");
+
+        // Line 7: RDYList at 84-93, the third dword's bits 20-29.
+        assert_eq!(
+            (words[30] >> 20) & 0x3ff,
+            0x80,
+            "RDYList from the QS handle"
+        );
+
+        // Everything the table calls Internal or Reserved stays zero, which is
+        // what New_Context makes safe.
+        for (index, word) in words.iter().enumerate() {
+            if ![0, 1, 2, 5, 30].contains(&index) {
+                assert_eq!(*word, 0, "dword {index} is not a field this driver sets");
+            }
+        }
+
+        // A ring above 4 GiB puts bits into the second dword rather than
+        // losing them, which is where this device's windows actually sit.
+        let high = TransmitContext {
+            ring: 0x1_0000_0000,
+            descriptors: 32,
+            ready_list: 0,
+        };
+        let words = high.words();
+        assert_eq!(words[1], 0x0200_0000, "0x1_0000_0000 / 128");
+        assert_eq!(words[2], 0);
+    }
+
+    /// 38.31.2.1.1's two quad-words.
+    #[test]
+    fn a_transmit_descriptor_carries_its_length_and_asks_for_a_completion() {
+        let (low, high) = transmit_descriptor(0x1_0000_4000, 60);
+        assert_eq!(low, 0x1_0000_4000, "qword 0 is the buffer address");
+        assert_eq!(high & TX_DTYP_MASK, 0, "DTYP 0x0 is a data descriptor");
+        assert_ne!(high & TX_CMD_EOP, 0, "EOP: this descriptor ends the packet");
+        assert_ne!(high & TX_CMD_RS, 0, "RS: report the completion");
+        assert_eq!(
+            (high >> TX_BUFFER_SIZE_SHIFT) & 0x3fff,
+            60,
+            "Tx Buffer Size"
+        );
+
+        // A completed descriptor is the same qword with DTYP reading 0xF.
+        let done = (high & !TX_DTYP_MASK) | TX_DTYP_DONE;
+        assert_eq!(done & TX_DTYP_MASK, TX_DTYP_DONE);
+        assert_ne!(
+            high & TX_DTYP_MASK,
+            TX_DTYP_DONE,
+            "an unsent one is not done"
+        );
+    }
+
+    /// The transmit counters are running totals, like the receive ones.
+    #[test]
+    fn transmit_counter_deltas_are_differences() {
+        let baseline = TransmitCounters {
+            unicast: 4,
+            multicast: 0,
+            broadcast: 7,
+            octets: 900,
+        };
+        let mut later = baseline;
+        later.broadcast += 1;
+        later.octets += 60;
+        let delta = later.since(&baseline);
+        assert_eq!(delta.packets(), 1, "one frame left");
+        assert_eq!(delta.broadcast, 1);
+        assert_eq!(delta.octets, 60);
+        assert_eq!(delta.unicast, 0);
+        assert_eq!(baseline.since(&later).packets(), 0, "never runs backwards");
     }
 }

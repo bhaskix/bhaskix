@@ -32,6 +32,11 @@ bhaskix-xhci = { path = "../third_party/xhci" }
 # of. The alternative was a literal 32 here and `MAX_PORTS` there, which is a
 # format defined twice and a drift waiting to happen.
 bhaskix-ahci = { path = "../ahci" }
+# RFC 0072 step 5. The kernel builds one ARP frame to make a transmit queue
+# prove itself, and builds it with the crate the network services already use
+# rather than with bytes laid out by hand here -- the same parsers, the same
+# fuzz targets, and one definition of what a frame looks like.
+bhaskix-net = { path = "../net" }
 # RFC 0021. The kernel does not need unpredictability itself yet -- randomising
 # the heap base is that RFC's open question 2 -- but it is the thing that boots,
 # so it is where "the instruction actually works on this machine" is checked.
@@ -680,7 +685,19 @@ asm_budget = 10
 # 64-bit register pairs whose definitions say they "are read using 64-bit read
 # accesses only", and two 32-bit reads would also tear across a counter that
 # increments between them -- which is the ordinary reason such a pair exists.
-unsafe_budget = 2033
+#
+# 2065 on 2026-09-06: thirty-two lines for RFC 0072 step 5's transmit half.
+# The 128-byte queue context written where the HMC fetches it, the descriptor
+# posted and its write-back polled, the VSI parameter buffer read back, the
+# frame bytes placed where the device will fetch them, and the receive ring
+# scanned once more for what comes back. Every one is a raw access to a page
+# this kernel created, zeroed and mapped for the device, and each block says
+# what it relies on.
+#
+# The frame itself is *not* laid out here: `bhaskix-net` builds it, so the
+# bytes on the wire come from the crate the network services already use and
+# its fuzz targets, not from a second definition in the kernel.
+unsafe_budget = 2065
 # Up thirty-one for RFC 0005 step 9's socket probe -- `ring3_socketeer`, which
 # is `ring3_lister` with a `sockaddr_in6` copied in beside its code instead of
 # two filenames. The same two blocks every hosted probe has: one

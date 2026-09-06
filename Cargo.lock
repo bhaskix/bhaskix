@@ -54,6 +54,7 @@ dependencies = [
  "bhaskix-elf",
  "bhaskix-fs",
  "bhaskix-mm",
+ "bhaskix-net",
  "bhaskix-personality",
  "bhaskix-rand",
  "bhaskix-service",

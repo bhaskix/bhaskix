@@ -12851,6 +12851,283 @@ struct QueueTarget {
     queues: u32,
 }
 
+/// Builds one ARP request frame into `out`, padded to a legal minimum.
+///
+/// Returns the bytes written. The payload is an **ARP probe** in RFC 5227's
+/// sense -- a sender address of `0.0.0.0` -- because this machine has no IP on
+/// this port and claiming one it was not given would be worse than asking with
+/// none. What the frame is *for* here is not address resolution but being a
+/// well-formed frame that leaves.
+///
+/// Padded to sixty bytes: 38.31.2 refuses anything under seventeen as
+/// *"malicious"* and stops the queue for it, and sixty is Ethernet's own
+/// minimum before the CRC the device appends.
+fn build_arp_frame(out: &mut [u8], to: bhaskix_net::addr::MacAddr, from: [u8; 6]) -> usize {
+    use bhaskix_net::{addr::Ipv4Addr, addr::MacAddr, arp, eth};
+    let mine = MacAddr(from);
+    out[..i40e::FRAME_BYTES].fill(0);
+    let header = eth::write_header(out, to, mine, eth::EtherType::ARP).unwrap_or(0);
+    let packet = arp::ArpPacket {
+        operation: arp::ArpOp::Request,
+        sender_hardware: mine,
+        sender_protocol: Ipv4Addr(0),
+        target_hardware: MacAddr([0; 6]),
+        target_protocol: Ipv4Addr(0),
+    };
+    let written = out
+        .get_mut(header..)
+        .and_then(|rest| packet.write(rest).ok())
+        .unwrap_or(0);
+    if header == 0 || written == 0 {
+        return 0;
+    }
+    i40e::FRAME_BYTES
+}
+
+/// Everything the transmit half needs that the receive bring-up already holds.
+struct TransmitSetup {
+    /// The page-descriptor page, as this kernel writes it: the transmit
+    /// context's backing page has to be named in the same page the receive
+    /// one was.
+    pd_page_host: u64,
+    /// The transmit context's backing page, device and host.
+    context_device: u64,
+    /// As above, through the direct map.
+    context_host: u64,
+    /// The transmit ring, device and host.
+    ring_device: u64,
+    /// As above, through the direct map.
+    ring_host: u64,
+    /// The packet buffer, device and host.
+    packet_device: u64,
+    /// As above, through the direct map.
+    packet_host: u64,
+    /// The admin ring page, so the VSI parameter buffer can be placed in it.
+    admin_device: u64,
+    /// As above, through the direct map.
+    admin_host: u64,
+    /// Which port, for the MAC address and the counters.
+    port: u32,
+}
+
+/// Sends two frames out of a transmit queue this kernel builds -- RFC 0072
+/// step 5, and the way step 4's gate is now expected to be met.
+///
+/// **Two frames, for two different reasons.** The first is addressed to this
+/// port's *own* MAC: if the internal switch loops it back, it lands in the
+/// receive queue with the descriptor's `LPBK` bit set, and that proves both
+/// directions **without anything outside this machine cooperating** -- which
+/// matters because four boots have shown that nothing on this segment is
+/// addressed to this machine. The second is a broadcast, which leaves for the
+/// wire and may draw an answer.
+///
+/// Returns whether a frame was reported sent.
+fn send_frames(
+    nic: &mut i40e::Device,
+    setup: &TransmitSetup,
+    target: &QueueTarget,
+    memory: &i40e::PrivateMemory,
+) -> bool {
+    const SPINS: u32 = 2_000_000;
+    /// `QLEN`'s floor: *"from 8 descriptors"*, and a whole multiple of 8
+    /// below 32.
+    const DESCRIPTORS: u16 = 8;
+
+    // **The queue set, which cannot be invented.** A transmit context carries
+    // an `RDYList` naming the arbitration queue set, firmware owns that
+    // allocation, and it hands the value out as a VSI's `QS_Handle`. This is
+    // the first command in this driver that exists because a *number* was
+    // needed rather than a fact for the report.
+    // SAFETY: `admin_host` is the direct-map address of the admin ring page,
+    // a page long and writable; the VSI buffer's offset keeps it inside that
+    // page after the rings and the switch buffer, which `i40e` asserts at
+    // compile time; nothing else writes it.
+    let parameters = match unsafe {
+        nic.vsi_parameters(
+            target.vsi,
+            setup.admin_device + i40e::VSI_BUFFER_OFFSET,
+            setup.admin_host + i40e::VSI_BUFFER_OFFSET,
+            SPINS,
+        )
+    } {
+        Ok(parameters) => {
+            println!(
+                "    nic vsi        seid {:#x} is VSI number {}, queue set handle {:#x} -- \
+                 RDYList {}",
+                target.vsi,
+                parameters.number,
+                parameters.queue_set,
+                parameters.queue_set & 0x3ff
+            );
+            if parameters.number != target.vsi_number {
+                println!(
+                    "\x1b[93m                   the switch reported VSI number {} and this \
+                     reports {} -- the statistics index above was read at the switch's\x1b[0m",
+                    target.vsi_number, parameters.number
+                );
+            }
+            parameters
+        }
+        Err(error) => {
+            println!(
+                "\x1b[93m    nic vsi        Get VSI Parameters: {error}; without a queue set \
+                 handle no transmit context can be written\x1b[0m"
+            );
+            return false;
+        }
+    };
+
+    let Some(mac) = nic.mac_address(setup.port) else {
+        println!(
+            "\x1b[93m    nic mac        PRTPM_SAH.AV is clear: this port has no NVM address, and \
+             a frame will not be sent from one this port does not own\x1b[0m"
+        );
+        return false;
+    };
+    println!(
+        "    nic mac        port {} station address {}",
+        setup.port,
+        MacAddress(mac)
+    );
+
+    // **The transmit context's own backing page.** Transmit objects sit at the
+    // bottom of this function's private memory -- `GLHMC_LANTXBASE` is zero by
+    // 38.26.3.1's rule that the first object's base always is -- so this is a
+    // different 4 KB page from the receive context's, named through the same
+    // page-descriptor page and inside the same segment.
+    let at = i40e::context_location(memory.tx_base, memory.tx_object_size, target.queue);
+    if at.segment != 0 {
+        println!(
+            "\x1b[93m    nic tx context transmit context {} is in segment {}, which this step \
+             does not back\x1b[0m",
+            target.queue, at.segment
+        );
+        return false;
+    }
+    // SAFETY: `pd_page_host` is the direct-map address of the page-descriptor
+    // page this kernel created, and `at.page` is below `PAGE_DESCRIPTORS`.
+    unsafe { i40e::write_page_descriptor(setup.pd_page_host, at.page, setup.context_device) };
+    let context = i40e::TransmitContext {
+        ring: setup.ring_device,
+        descriptors: DESCRIPTORS,
+        ready_list: parameters.queue_set & 0x3ff,
+    };
+    // SAFETY: `context_host` is the direct-map address of the zeroed backing
+    // page just named; the offset is inside it; the queue is not enabled, so
+    // the device is not fetching it.
+    unsafe { i40e::write_transmit_context(setup.context_host + u64::from(at.offset), &context) };
+    println!(
+        "    nic tx context queue {} context at private address {:#x} (page descriptor {}, offset \
+         {}), ring {:#x}, {DESCRIPTORS} descriptors",
+        target.queue, at.address, at.page, at.offset, setup.ring_device
+    );
+
+    // **Three steps a receive queue never needs**, in 38.31.3.1.1's order: the
+    // internal disable flag cleared, the owning function stated, and only then
+    // the enable.
+    nic.clear_transmit_queue_disable(target.queue);
+    nic.own_transmit_queue(target.queue, memory.function);
+    let enabled = nic.enable_transmit_queue(target.queue, SPINS);
+    let (requested, active) = nic.transmit_queue_state(target.queue);
+    println!(
+        "    nic tx queue   queue {} owned by PF {} and enabled: QENA_STAT {} (REQ={} STAT={})",
+        target.queue,
+        memory.function,
+        if enabled {
+            "set"
+        } else {
+            "\x1b[91mnever set\x1b[0m"
+        },
+        u8::from(requested),
+        u8::from(active)
+    );
+    if !enabled {
+        return false;
+    }
+
+    // **Frame one: addressed to this port's own MAC.** If the internal switch
+    // loops it back it arrives in the receive queue with `LPBK` set, and that
+    // is a complete proof of both directions that needs nobody else.
+    // **Frame two: broadcast**, which leaves for the wire.
+    let baseline = nic.transmit_counters(setup.port);
+    let mut sent = 0;
+    for (index, (name, destination)) in [
+        ("to its own address", bhaskix_net::addr::MacAddr(mac)),
+        ("to broadcast", bhaskix_net::addr::MacAddr::BROADCAST),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        // SAFETY: `packet_host` is the direct-map address of a page this
+        // kernel owns; the frame is far shorter than it.
+        let buffer = unsafe {
+            core::slice::from_raw_parts_mut(setup.packet_host as *mut u8, i40e::FRAME_BYTES)
+        };
+        let bytes = build_arp_frame(buffer, destination, mac);
+        if bytes == 0 {
+            println!("\x1b[93m    nic tx frame   the frame would not build\x1b[0m");
+            continue;
+        }
+        let slot = index as u32;
+        // SAFETY: `ring_host` is the direct-map address of the transmit ring,
+        // `slot` is inside its `DESCRIPTORS`, and the queue has not been told
+        // about this descriptor yet.
+        unsafe {
+            i40e::post_transmit_descriptor(
+                setup.ring_host,
+                slot,
+                setup.packet_device,
+                bytes as u16,
+            );
+        }
+        nic.transmit_doorbell(target.queue, slot + 1);
+
+        let mut done = false;
+        for _ in 0..SPINS {
+            // SAFETY: as the post above.
+            if unsafe { i40e::transmit_completed(setup.ring_host, slot) } {
+                done = true;
+                break;
+            }
+            core::hint::spin_loop();
+        }
+        println!(
+            "    nic tx frame   {bytes} bytes {name}: {}, head {}",
+            if done {
+                "\x1b[92mthe device reported the descriptor done\x1b[0m"
+            } else {
+                "\x1b[91mno completion -- the descriptor was never written back\x1b[0m"
+            },
+            nic.transmit_head(target.queue)
+        );
+        if done {
+            sent += 1;
+        }
+    }
+
+    // **What the port says left, as against what this driver asked for.** The
+    // descriptor completing says the device took the buffer; the counters say
+    // the MAC put it on the wire, and they are different claims.
+    let delta = nic.transmit_counters(setup.port).since(&baseline);
+    println!(
+        "    nic tx stats   port {} sent {} packet(s) ({} unicast, {} multicast, {} broadcast), {} \
+         octet(s)",
+        setup.port,
+        delta.packets(),
+        delta.unicast,
+        delta.multicast,
+        delta.broadcast,
+        delta.octets
+    );
+    if delta.packets() == 0 && sent > 0 {
+        println!(
+            "\x1b[93m                   descriptors completed but the port counted nothing out -- \
+             the device took the buffers and the MAC did not send them\x1b[0m"
+        );
+    }
+    sent > 0
+}
+
 /// One receive queue: private memory programmed, one context page backed, the
 /// context written, buffers posted, the queue enabled, and a bounded wait for
 /// a frame -- RFC 0072 step 4.
@@ -12872,6 +13149,7 @@ fn bring_up_receive_queue(
     device: (u8, u8, u8),
     hhdm: u64,
     target: &QueueTarget,
+    admin: (u64, u64),
 ) {
     let &QueueTarget {
         vsi,
@@ -12906,9 +13184,11 @@ fn bring_up_receive_queue(
         }
     }
 
+    let port = nic.port_number();
+
     // **Memory the device can reach**: a page of page descriptors, a backing
     // page for the receive contexts, a page for the ring; then the buffers.
-    let Some((control_device, control_host, _)) = nic_pages(owner, device, hhdm, 3) else {
+    let Some((control_device, control_host, _)) = nic_pages(owner, device, hhdm, 6) else {
         println!(
             "\x1b[93m    nic rx ring    no control pages the device can reach; no queue is taken\x1b[0m"
         );
@@ -12924,6 +13204,21 @@ fn bring_up_receive_queue(
     let (pd_page_device, pd_page_host) = (control_device, control_host[0]);
     let (backing_device, backing_host) = (control_device + FRAME, control_host[1]);
     let (ring_device, ring_host) = (control_device + 2 * FRAME, control_host[2]);
+    // Three more for the transmit half: its context's own backing page -- a
+    // different FPM page from the receive context's -- its ring, and one
+    // packet buffer.
+    let transmit = TransmitSetup {
+        pd_page_host,
+        context_device: control_device + 3 * FRAME,
+        context_host: control_host[3],
+        ring_device: control_device + 4 * FRAME,
+        ring_host: control_host[4],
+        packet_device: control_device + 5 * FRAME,
+        packet_host: control_host[5],
+        admin_device: admin.0,
+        admin_host: admin.1,
+        port,
+    };
 
     // **The layout, written and read back.** Transmit contexts first at base
     // zero, receive contexts after them; both sized to the PF's allocation
@@ -13055,7 +13350,6 @@ fn bring_up_receive_queue(
     // wait belongs to this experiment, and 38.30's own initialisation flow
     // says so: a driver reads them at start-up because *"the values of these
     // counters is the baseline for any statistics collected later"*.
-    let port = nic.port_number();
     let port_before = nic.port_counters(port);
     let vsi_before = nic.vsi_counters(vsi_number);
     println!(
@@ -13217,6 +13511,58 @@ fn bring_up_receive_queue(
                 "the port saw nothing at all -- nothing was sent here, so the silence is the \
                  wire and not the receive path"
             }
+        );
+    }
+
+    // **RFC 0072 step 5, here rather than in its own boot.** Four boots showed
+    // nothing on this segment is addressed to this machine, so the receive
+    // gate cannot be met by listening -- it has to be provoked. The receive
+    // queue is still enabled and its ring still posted, so a frame that comes
+    // back lands where the scan above already looked.
+    let sent = send_frames(nic, &transmit, target, &memory);
+
+    if sent {
+        // **The same ring, asked again.** A loopback of the self-addressed
+        // frame, or an answer to the broadcast, arrives here.
+        let mut after = 0;
+        let mut first_after = None;
+        for index in 0..BUFFERS as u32 {
+            // SAFETY: as the earlier scan; `index` is inside the posted ring.
+            if let Some(completion) = unsafe { i40e::completed_descriptor(ring_host, index) } {
+                after += 1;
+                if first_after.is_none() {
+                    first_after = Some((index, completion));
+                }
+            }
+        }
+        match first_after {
+            None => {
+                println!("    nic rx after   still nothing in the receive ring after transmitting")
+            }
+            Some((index, completion)) => {
+                // SAFETY: `buffers_host[index]` is the direct-map address of
+                // the buffer that descriptor named, and the device has marked
+                // the descriptor done.
+                let header = unsafe { i40e::frame_header(buffers_host[index as usize]) };
+                println!(
+                    "\x1b[92m    nic rx after   {after} descriptor(s) completed after transmitting; the \
+                     first at index {index}: {} bytes, EtherType {:#06x} ({}), {} to {} from {}\x1b[0m",
+                    completion.length,
+                    header.ethertype,
+                    header.ethertype_name(),
+                    completion.cast_name(),
+                    MacAddress(header.destination),
+                    MacAddress(header.source)
+                );
+            }
+        }
+    }
+
+    if nic.transmit_queue_state(target.queue).1 {
+        let stopped = nic.disable_transmit_queue(target.queue, SPINS);
+        println!(
+            "    nic tx queue   disabled again: QENA_STAT {}",
+            if stopped { "clear" } else { "still set" }
         );
     }
 
@@ -13521,6 +13867,7 @@ fn start_nic_domain(hhdm: u64) -> Result<(), &'static str> {
                                                 .saturating_sub(u32::from(first))
                                                 + 1,
                                         },
+                                        (transmit, host),
                                     );
                                 }
                                 (false, _, _) => println!(
