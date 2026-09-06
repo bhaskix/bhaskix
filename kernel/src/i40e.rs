@@ -105,6 +105,40 @@ const FLAG_DD: u16 = 1 << 0;
 /// `Flags.ERR`, byte 0 bit 2 -- *"Set by firmware to mark entry as an error
 /// indication."*
 const FLAG_ERR: u16 = 1 << 2;
+/// `Flags.LB`, byte 1 bit 1 -- *"indirect buffer is longer than
+/// AQ_LARGE_BUF"*, which 38.27 puts at 512 bytes.
+const FLAG_LB: u16 = 1 << 9;
+/// `Flags.BUF`, byte 1 bit 4 -- *"This command uses additional data."*
+const FLAG_BUF: u16 = 1 << 12;
+/// The buffer length above which `Flags.LB` must be set -- 38.27.
+pub const AQ_LARGE_BUF: u16 = 512;
+
+/// `Get Link Status` -- Table 38-63, opcode `0x0607`, a direct command whose
+/// answer is Table 38-65's fourteen bytes at descriptor bytes 18-31.
+const OPCODE_GET_LINK_STATUS: u16 = 0x0607;
+
+/// `Get Switch Configuration` -- Table 38-199, opcode `0x0200`: *"used to
+/// discover the switch configuration of the port. The software device driver
+/// must use this command as part of the initialization flow"*. Indirect: the
+/// answer is Table 38-201's buffer, a header and sixteen bytes per element.
+const OPCODE_GET_SWITCH_CONFIGURATION: u16 = 0x0200;
+
+/// Where the switch buffer sits in the page holding the admin rings.
+///
+/// The two rings take the first 2 KiB; this takes 512 bytes after them --
+/// exactly [`AQ_LARGE_BUF`], so `Flags.LB` is not needed, and the room is Table
+/// 38-202's header plus thirty-one elements, which a port with SR-IOV off does
+/// not approach.
+pub const SWITCH_BUFFER_OFFSET: u64 = 2 * RING_BYTES;
+/// The switch buffer's length -- see [`SWITCH_BUFFER_OFFSET`].
+pub const SWITCH_BUFFER_BYTES: u16 = AQ_LARGE_BUF;
+/// How many elements the switch buffer can hold after its header.
+pub const SWITCH_ELEMENTS_MAX: usize =
+    (SWITCH_BUFFER_BYTES as usize - SwitchElement::BYTES) / SwitchElement::BYTES;
+const _: () = assert!(
+    SWITCH_BUFFER_OFFSET + SWITCH_BUFFER_BYTES as u64 <= 4096,
+    "the rings and the switch buffer must share one page"
+);
 
 /// Where `Get Version`'s answer sits in the completed descriptor -- Table
 /// 38-353. Major at bytes 24-25 and minor at 26-27, which in a normal command
@@ -129,6 +163,111 @@ const QENA_REQ: u32 = 1 << 0;
 /// guessed from a gap is a guess.
 const QENA_STAT: u32 = 1 << 2;
 
+/// Function Requester ID -- 38.39.2.2.1, `PF_FUNC_RID` (`0x0009C000`, RO).
+///
+/// `FUNCTION_NUMBER` is bits 2:0, *"assigned to the function based on BIOS/OS
+/// enumeration"*. The HMC's per-function registers are indexed by it -- 38.26.3
+/// step 1: *"In the case of a PF, the HMC function number is equal to the PCI
+/// function number"* -- and it is asked of the device rather than taken from
+/// the PCI address, because the device is the one doing the indexing.
+const PF_FUNC_RID: u64 = 0x0009_C000;
+
+/// Private Memory Segment Table Partitioning -- 38.39.2.13.10,
+/// `GLHMC_SDPART[n]` (`0x000C0800 + 0x4*n`, n = 0..15).
+///
+/// `PMSDBASE` is bits 11:0 and `PMSDSIZE` bits 28:16: which segment descriptors
+/// this function owns. **Firmware's to set and this driver's to read.** The
+/// register heading says RO, its field table says RW, and the prose settles it:
+/// 38.26.2 says these registers *"are loaded from the NVM to match the default
+/// profile"*, and 38.26.1 that the controller *"manages the SD base and number
+/// registers internally based on the resource profile"*. A driver discovers its
+/// range and programs segment descriptors relative to it.
+const GLHMC_SDPART: u64 = 0x000C_0800;
+
+/// FPM LAN Tx Queue Base -- 38.39.2.13.68, `GLHMC_LANTXBASE[n]`
+/// (`0x000C6200 + 0x4*n`). `FPMLANTXBASE` is bits 23:0, in 512-byte units.
+///
+/// **Software-written, whatever the heading says.** The headings of the four
+/// LAN base and count registers read RO; their field tables read RW; and
+/// 38.26.3.1 is explicit -- *"Host software is responsible for setting up the
+/// GLHMC_{object}CNT and GLHMC_{object}BASE registers for LAN objects"*, and
+/// *"the FPM base of the first HMC object (GLHMC_LANTXBASE) for each PCI
+/// function is always zero"*. The first version of this file called the receive
+/// pair read-only and firmware-assigned, on the strength of the heading alone.
+/// The prose is what corrected it, before any boot had to.
+const GLHMC_LANTXBASE: u64 = 0x000C_6200;
+/// FPM LAN Tx Queue Object Count -- 38.39.2.13.69, `GLHMC_LANTXCNT[n]`
+/// (`0x000C6300 + 0x4*n`). `FPMLANTXCNT` is bits 10:0.
+const GLHMC_LANTXCNT: u64 = 0x000C_6300;
+/// FPM LAN Rx Queue Base -- 38.39.2.13.70, `GLHMC_LANRXBASE[n]`
+/// (`0x000C6400 + 0x4*n`). `FPMLANRXBASE` is bits 23:0, and *"the value in this
+/// register must be multiplied by 512 to get the actual address"* in the 8 GB
+/// private memory space. See [`GLHMC_LANTXBASE`] for who writes it.
+const GLHMC_LANRXBASE: u64 = 0x000C_6400;
+/// FPM LAN Rx Queue Object Count -- 38.39.2.13.71, `GLHMC_LANRXCNT[n]`
+/// (`0x000C6500 + 0x4*n`). `FPMLANRXCNT` is bits 10:0.
+const GLHMC_LANRXCNT: u64 = 0x000C_6500;
+/// Private Memory LAN Tx Object Size -- 38.39.2.13.12, `GLHMC_LANTXOBJSZ`
+/// (`0x000C2004`, RO). Bits 3:0, *"decoded such that the value =
+/// log2(ObjSize). 0x7 = 128 bytes."* Read rather than assumed, because a
+/// context's address in private memory is computed from it -- 38.26.4:
+/// `(GLHMC_{object}BASE*512) + (2^GLHMC_{object}OBJSZ * element_index)`.
+const GLHMC_LANTXOBJSZ: u64 = 0x000C_2004;
+/// Private Memory LAN Queue Maximum -- 38.39.2.13.13, `GLHMC_LANQMAX`
+/// (`0x000C2008`, RO). Bits 10:0, init `0x600` = 1536.
+const GLHMC_LANQMAX: u64 = 0x000C_2008;
+/// Private Memory LAN Rx Object Size -- 38.39.2.13.14, `GLHMC_LANRXOBJSZ`
+/// (`0x000C200C`, RO). Bits 3:0, `0x5` = 32 bytes.
+const GLHMC_LANRXOBJSZ: u64 = 0x000C_200C;
+
+/// Host Memory Cache Error Information -- 38.39.2.13.8, `PFHMC_ERRORINFO`
+/// (`0x000C0400`, RW). Bit 31 is `ERROR_DETECTED`, bits 11:8 the error type,
+/// bits 20:16 the object type and bits 4:0 the function. *"No subsequent errors
+/// are recorded until this field is written with a value of 0b."* Read after
+/// anything that touches private memory, because the HMC does not fault: it
+/// records here and carries on.
+const PFHMC_ERRORINFO: u64 = 0x000C_0400;
+/// Host Memory Cache Error Data -- 38.39.2.13.9, `PFHMC_ERRORDATA`
+/// (`0x000C0500`, RO): the queue, object index or SD/PD index an error names.
+const PFHMC_ERRORDATA: u64 = 0x000C_0500;
+
+/// PF Queue Allocation -- 38.39.2.18.16, `PFLAN_QALLOC` (`0x001C0400`, RO).
+///
+/// `FIRSTQ` bits 10:0, `LASTQ` bits 26:16, `VALID` bit 31: *"the first LAN
+/// queue pair allocated to this PF"* and the last, in the device's absolute
+/// numbering. 38.26.3 step 2 makes this the first thing a driver reads for its
+/// LAN objects, because *"HMC PM LAN objects are indexed with the absolute
+/// queue number"* -- so which queue this PF's queue 0 *is* comes from here,
+/// and a driver that assumes zero has assumed which function it is.
+const PFLAN_QALLOC: u64 = 0x001C_0400;
+/// `PFLAN_QALLOC.VALID`, bit 31.
+const QALLOC_VALID: u32 = 1 << 31;
+
+/// Global RLAN Control 0 -- 38.39.2.18.15, `GLLAN_RCTL_0` (`0x0012A500`, RW1C).
+///
+/// Bit 0 is `PXE_MODE`, init 1: *"When this flag is set, the device fetches and
+/// writes back a single descriptor at a time. During normal performance
+/// operation, (non-PXE mode) this flag must be cleared."* Cleared by the Clear
+/// PXE Mode admin command rather than by a write here -- 38.30.2.2.2 has
+/// firmware disable the PXE queues first, which a bare write would skip.
+const GLLAN_RCTL_0: u64 = 0x0012_A500;
+/// `GLLAN_RCTL_0.PXE_MODE`, bit 0.
+const PXE_MODE: u32 = 1 << 0;
+
+/// VSI Queue Control -- 38.39.2.18.18, `VSILAN_QBASE[VSI]`
+/// (`0x0020C800 + 0x4*VSI`, VSI = 0..383).
+///
+/// `VSIBASE` bits 10:0 is the VSI's first queue *"within the range of the PF
+/// queues"*; bit 11, `VSIQTABLE_ENA`, selects a scattered set through
+/// `VSILAN_QTABLE` instead. A received frame is steered to a VSI and the VSI to
+/// a queue through this register, so which queue a frame lands in is decided
+/// here and not by the queue -- which is why it is read before one is taken.
+const VSILAN_QBASE: u64 = 0x0020_C800;
+/// `VSILAN_QBASE.VSIQTABLE_ENA`, bit 11.
+const VSI_QTABLE_ENABLED: u32 = 1 << 11;
+/// The highest VSI index -- 38.39.2.18.18 gives `VSI = 0..383`.
+const MAX_VSI: u64 = 383;
+
 /// The highest queue index `QRX_ENA` covers -- 38.39.2.18.13 gives `Q = 0..1535`.
 const MAX_RECEIVE_QUEUE: u64 = 1535;
 
@@ -143,19 +282,377 @@ const MAX_RECEIVE_QUEUE: u64 = 1535;
 /// A comment cannot enforce this and did not. The assertion below can: it fails
 /// the build if any register this module names falls outside the window, so the
 /// next offset added has to either fit or move this number.
-pub const REGISTER_WINDOW_BYTES: u64 = 0x20_0000;
+///
+/// **Sized to the datasheet now, not to the offsets.** The rules above Table
+/// 38-599, *Structure of the PF Memory BAR*, say *"CSR space is located from
+/// the beginning of the BAR until address (4 MB-64 KB-1)"*, and that is what is
+/// mapped: every register this module could name is inside it, and what lies
+/// beyond -- protocol-engine doorbells, an exposed flash -- is nothing this
+/// driver should be able to reach by mistake. The assertions stay as the check
+/// that no offset has strayed out of the space the datasheet defines.
+pub const REGISTER_WINDOW_BYTES: u64 = 0x40_0000 - 0x1_0000;
 
 const _: () = assert!(
-    REGISTER_WINDOW_BYTES > QRX_ENA + 4 * MAX_RECEIVE_QUEUE,
+    REGISTER_WINDOW_BYTES > VSILAN_QBASE + 4 * MAX_VSI,
     "the mapped register window must reach past the highest register this module uses"
 );
+const _: () = assert!(REGISTER_WINDOW_BYTES > QRX_ENA + 4 * MAX_RECEIVE_QUEUE);
+const _: () = assert!(REGISTER_WINDOW_BYTES > PFLAN_QALLOC);
+const _: () = assert!(REGISTER_WINDOW_BYTES > GLLAN_RCTL_0);
 const _: () = assert!(REGISTER_WINDOW_BYTES > PFGEN_CTRL);
 const _: () = assert!(REGISTER_WINDOW_BYTES > PF_ARQT);
+const _: () = assert!(REGISTER_WINDOW_BYTES > GLHMC_LANRXCNT + 4 * 15);
+const _: () = assert!(REGISTER_WINDOW_BYTES > PFHMC_ERRORDATA);
+const _: () = assert!(REGISTER_WINDOW_BYTES > PF_FUNC_RID);
+
+/// One admin queue descriptor -- Table 38-339, as its eight little-endian
+/// 32-bit words.
+///
+/// Table 38-340 names the bytes: flags at 0-1, opcode 2-3, `Datalen` 4-5,
+/// return value 6-7, cookie 8-15, `Param0` 16-19, `Param1` 20-23, the data
+/// address high at 24-27 and low at 28-31. A direct command's answer comes back
+/// **in the same descriptor**, in whichever bytes its own table assigns, so
+/// this is both the request and the reply, and the byte accessors are how a
+/// reply is read.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Descriptor {
+    /// The eight words, in the order the ring holds them.
+    pub words: [u32; 8],
+}
+
+impl Descriptor {
+    /// A direct command: an opcode and nothing else. The cookie stays zero
+    /// because this driver waits for each command before posting the next, so
+    /// there is never a completion to tell apart.
+    #[must_use]
+    pub const fn direct(opcode: u16) -> Self {
+        let mut words = [0; 8];
+        words[0] = (opcode as u32) << 16;
+        Self { words }
+    }
+
+    /// A command with a buffer firmware fills: `Flags.BUF`, `Flags.LB` when
+    /// the buffer is longer than [`AQ_LARGE_BUF`], the length in `Datalen`,
+    /// and the buffer's address **as the device issues it** in bytes 24-31.
+    #[must_use]
+    pub const fn with_buffer(opcode: u16, address: u64, bytes: u16) -> Self {
+        let mut this = Self::direct(opcode);
+        let flags = if bytes > AQ_LARGE_BUF {
+            FLAG_BUF | FLAG_LB
+        } else {
+            FLAG_BUF
+        };
+        this.words[0] |= flags as u32;
+        this.words[1] = bytes as u32;
+        this.words[6] = (address >> 32) as u32;
+        this.words[7] = address as u32;
+        this
+    }
+
+    /// The flags, bytes 0-1.
+    #[must_use]
+    pub const fn flags(&self) -> u16 {
+        self.words[0] as u16
+    }
+
+    /// The return value, bytes 6-7 -- Table 38-350's code when `ERR` is set.
+    #[must_use]
+    pub const fn return_value(&self) -> u16 {
+        (self.words[1] >> 16) as u16
+    }
+
+    /// One byte, by Table 38-340's numbering; zero past the end.
+    #[must_use]
+    pub const fn byte(&self, index: usize) -> u8 {
+        if index >= DESCRIPTOR_BYTES as usize {
+            return 0;
+        }
+        (self.words[index / 4] >> (8 * (index % 4))) as u8
+    }
+
+    /// Two bytes, little-endian, by the same numbering.
+    #[must_use]
+    pub const fn half(&self, index: usize) -> u16 {
+        self.byte(index) as u16 | (self.byte(index + 1) as u16) << 8
+    }
+}
+
+/// Why a command got no usable answer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CommandError {
+    /// No ring is attached, so there is nowhere to post.
+    NoRing,
+    /// Firmware never set `DD` within the spins allowed.
+    NoAnswer,
+    /// Firmware completed it with `ERR` set; the payload is the return value,
+    /// Table 38-350's code -- `0xD` is `EEXIST`, which Clear PXE Mode answers
+    /// when the device was already out of PXE mode.
+    Refused(u16),
+}
+
+impl core::fmt::Display for CommandError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::NoRing => f.write_str("no admin ring is attached"),
+            Self::NoAnswer => f.write_str("firmware never marked it done"),
+            Self::Refused(code) => write!(f, "firmware refused it, return value {code:#x}"),
+        }
+    }
+}
+
+/// What `Get Link Status` answered -- Table 38-65, the fourteen bytes at
+/// descriptor bytes 18-31, kept raw with the readings the report needs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Link {
+    /// Byte 18: the operating PHY type, by Table 38-65's list.
+    pub phy_type: u8,
+    /// Byte 19: one bit set -- bit 2 for 1000 Mb/s, bit 3 for 10 Gb/s.
+    pub speed: u8,
+    /// Byte 20: bit 0 link up, bits 1-4 faults, bit 5 the port's own link, bit
+    /// 6 media available, bit 7 a receive signal detected.
+    pub status: u8,
+    /// Byte 21: bit 0 auto-negotiation completed, bit 1 the partner can.
+    pub negotiation: u8,
+    /// Bytes 24-25: *"maximum frame size set on this port"*.
+    pub max_frame: u16,
+}
+
+impl Link {
+    /// Table 38-65's reading of a completed descriptor.
+    #[must_use]
+    pub const fn from_descriptor(reply: &Descriptor) -> Self {
+        Self {
+            phy_type: reply.byte(18),
+            speed: reply.byte(19),
+            status: reply.byte(20),
+            negotiation: reply.byte(21),
+            max_frame: reply.half(24),
+        }
+    }
+
+    /// Bit 2.0: *"Returns 1b if link status = up"*.
+    #[must_use]
+    pub const fn up(&self) -> bool {
+        self.status & 1 != 0
+    }
+
+    /// Bit 2.1: the PHY reports a link fault.
+    #[must_use]
+    pub const fn faulted(&self) -> bool {
+        self.status & (1 << 1) != 0
+    }
+
+    /// Bit 2.6: media plugged in and usable.
+    #[must_use]
+    pub const fn media_available(&self) -> bool {
+        self.status & (1 << 6) != 0
+    }
+
+    /// Bit 2.7: the PHY or module sees a receive signal.
+    #[must_use]
+    pub const fn signal_detected(&self) -> bool {
+        self.status & (1 << 7) != 0
+    }
+
+    /// The speed as Table 38-65 names it.
+    #[must_use]
+    pub const fn speed_name(&self) -> &'static str {
+        match self.speed {
+            0 => "no speed",
+            0b100 => "1000 Mb/s",
+            0b1000 => "10 Gb/s",
+            _ => "a reserved speed code",
+        }
+    }
+
+    /// The PHY type as Table 38-65 names it.
+    #[must_use]
+    pub const fn phy_name(&self) -> &'static str {
+        match self.phy_type {
+            0x1 => "1000BASE-KX",
+            0x3 => "10GBASE-KR",
+            0x7 => "SFI",
+            0xb => "10GBASE-CR1",
+            0xc => "SFP+ active direct attach",
+            0xd => "QSFP+ active direct attach",
+            0x12 => "1000BASE-T",
+            0x13 => "10GBASE-T",
+            0x14 => "10GBASE-SR",
+            0x15 => "10GBASE-LR",
+            0x16 => "10GBASE-SFP+ Cu",
+            0x17 => "10GBASE-CR1 over QSFP+",
+            _ => "an unlisted PHY type",
+        }
+    }
+}
+
+/// One element of the switch as `Get Switch Configuration` reports it --
+/// Table 38-203, sixteen bytes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SwitchElement {
+    /// Byte 0: the element type -- Tables 38-191 and 38-192: 1 a physical
+    /// port's MAC, 2 a PF, 3 a VF, 4 the embedded processor, 19 a VSI.
+    pub kind: u8,
+    /// Bytes 2-3: this element's switch element id, which the admin commands
+    /// that act on a VSI take.
+    pub seid: u16,
+    /// Bytes 4-5: the element below it, *"towards the network"*.
+    pub uplink: u16,
+    /// Bytes 6-7: the element above it, *"towards the host"*.
+    pub downlink: u16,
+    /// Byte 11: 1 a regular data port, 2 the default port, 3 a cascaded port
+    /// virtualizer port.
+    pub connection: u8,
+    /// Bytes 14-15: the port number of a MAC, the function number of a PF or
+    /// VF, and **the VSI number of a VSI** -- which is what `VSILAN_QBASE` is
+    /// indexed by, and is not the SEID.
+    pub number: u16,
+}
+
+impl SwitchElement {
+    /// Table 38-201: sixteen bytes per element, after a sixteen-byte header.
+    pub const BYTES: usize = 16;
+
+    /// Table 38-203's reading of one element.
+    #[must_use]
+    pub const fn parse(bytes: &[u8; Self::BYTES]) -> Self {
+        Self {
+            kind: bytes[0],
+            seid: u16::from_le_bytes([bytes[2], bytes[3]]),
+            uplink: u16::from_le_bytes([bytes[4], bytes[5]]),
+            downlink: u16::from_le_bytes([bytes[6], bytes[7]]),
+            connection: bytes[11],
+            number: u16::from_le_bytes([bytes[14], bytes[15]]),
+        }
+    }
+
+    /// The element type by name.
+    #[must_use]
+    pub const fn kind_name(&self) -> &'static str {
+        match self.kind {
+            1 => "MAC",
+            2 => "PF",
+            3 => "VF",
+            4 => "EMP",
+            19 => "VSI",
+            _ => "other",
+        }
+    }
+}
+
+/// What the switch holds, as far as the buffer had room for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SwitchConfiguration {
+    /// The elements returned, in the order firmware listed them.
+    pub elements: [SwitchElement; SWITCH_ELEMENTS_MAX],
+    /// How many of `elements` are real -- Table 38-202's first field, clamped
+    /// to what the buffer can hold rather than trusted.
+    pub count: usize,
+    /// How many the switch has in all, which may exceed `count`.
+    pub total: u16,
+}
+
+impl SwitchConfiguration {
+    /// Table 38-201's reading of the response buffer.
+    #[must_use]
+    pub fn parse(buffer: &[u8; SWITCH_BUFFER_BYTES as usize]) -> Self {
+        let count =
+            usize::from(u16::from_le_bytes([buffer[0], buffer[1]])).min(SWITCH_ELEMENTS_MAX);
+        let total = u16::from_le_bytes([buffer[2], buffer[3]]);
+        let mut elements = [SwitchElement::default(); SWITCH_ELEMENTS_MAX];
+        for (index, element) in elements.iter_mut().enumerate().take(count) {
+            let at = SwitchElement::BYTES * (index + 1);
+            let mut bytes = [0; SwitchElement::BYTES];
+            bytes.copy_from_slice(&buffer[at..at + SwitchElement::BYTES]);
+            *element = SwitchElement::parse(&bytes);
+        }
+        Self {
+            elements,
+            count,
+            total,
+        }
+    }
+
+    /// The elements that are real.
+    #[must_use]
+    pub fn elements(&self) -> &[SwitchElement] {
+        &self.elements[..self.count]
+    }
+}
+
+/// What the private memory registers read for this function -- every input
+/// 38.26.3 needs before an FPM layout can be computed, and whatever the last
+/// owner left in the two pairs this driver will write.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PrivateMemory {
+    /// `PF_FUNC_RID.FUNCTION_NUMBER`: which of the sixteen PF spaces is this.
+    pub function: u32,
+    /// `GLHMC_SDPART.PMSDBASE`: the first segment descriptor this function owns.
+    pub sd_base: u32,
+    /// `GLHMC_SDPART.PMSDSIZE`: how many it owns, at 2 MB each.
+    pub sd_size: u32,
+    /// `GLHMC_LANTXBASE`, in 512-byte units.
+    pub tx_base: u32,
+    /// `GLHMC_LANTXCNT`.
+    pub tx_count: u32,
+    /// `GLHMC_LANRXBASE`, in 512-byte units.
+    pub rx_base: u32,
+    /// `GLHMC_LANRXCNT`.
+    pub rx_count: u32,
+    /// `GLHMC_LANTXOBJSZ`: log2 of a transmit context's bytes.
+    pub tx_object_size: u32,
+    /// `GLHMC_LANRXOBJSZ`: log2 of a receive context's bytes.
+    pub rx_object_size: u32,
+    /// `GLHMC_LANQMAX`: the most LAN queues the HMC supports.
+    pub queue_max: u32,
+}
+
+/// What `PFHMC_ERRORINFO` reports when its `ERROR_DETECTED` bit is set.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HmcError {
+    /// Bits 11:8, 38.39.2.13.8's list -- see [`HmcError::kind_name`].
+    pub kind: u8,
+    /// Bits 20:16 -- `0x10` a transmit context, `0x11` a receive context,
+    /// `0x19` a page descriptor.
+    pub object: u8,
+    /// Bits 4:0, the function the error belongs to.
+    pub function: u8,
+    /// `PFHMC_ERRORDATA`, the index the error names.
+    pub data: u32,
+}
+
+impl HmcError {
+    /// The error type by name, from 38.39.2.13.8.
+    #[must_use]
+    pub const fn kind_name(&self) -> &'static str {
+        match self.kind {
+            0 => "private memory function not valid",
+            3 => "invalid LAN queue index",
+            4 => "object index larger than its count register",
+            5 => "address beyond this function's segment descriptors",
+            6 => "segment descriptor invalid",
+            7 => "segment descriptor too small",
+            8 => "page descriptor invalid",
+            9 => "unsupported request on the object read",
+            10 => "LAN queue not valid",
+            11 => "invalid object type",
+            _ => "an unlisted error type",
+        }
+    }
+}
 
 /// One mapped X722 function, far enough along to be asked questions.
 pub struct Device {
     /// The register window, through the direct map.
     registers: u64,
+    /// The admin transmit ring as this kernel writes it -- its direct-map
+    /// address -- or zero until [`Device::enable_admin_queues`] attaches one.
+    ring: u64,
+    /// The next transmit descriptor to use, which is also what `PF_ATQT` is
+    /// written with after each post: a tail is the last valid descriptor plus
+    /// one, in 38.39.2.18.14's words for the receive tail and Table 38-341's
+    /// for this one.
+    next: u32,
 }
 
 impl Device {
@@ -173,7 +670,11 @@ impl Device {
     /// As above.
     #[must_use]
     pub const unsafe fn new(registers: u64) -> Self {
-        Self { registers }
+        Self {
+            registers,
+            ring: 0,
+            next: 0,
+        }
     }
 
     /// Reads one register, which the offsets in this file are all within.
@@ -207,7 +708,8 @@ impl Device {
         false
     }
 
-    /// Points the admin queues at rings the caller owns.
+    /// Points the admin queues at rings the caller owns, and remembers where
+    /// this kernel reaches the transmit ring.
     ///
     /// `transmit` and `receive` are the rings' addresses **as the device will
     /// issue them** -- which is not their physical address, because this device
@@ -215,12 +717,23 @@ impl Device {
     /// physical address here would name a page the device cannot reach, and the
     /// failure would be silence rather than a fault.
     ///
+    /// `host` is the transmit ring **as this kernel sees it** -- the direct-map
+    /// address of the same page the device reaches at `transmit`. Both are
+    /// needed and they are not the same number: the device is told where the
+    /// ring is in its own translation, and a descriptor has to be written where
+    /// the writer can reach it.
+    ///
     /// The enable bit goes last, in both rings, because the datasheet says the
     /// other fields must be initialized before it is set.
     ///
-    /// Both rings must stay mapped for the device's use while the queues are
-    /// enabled, which is the caller's obligation and not checkable here.
-    pub fn enable_admin_queues(&self, transmit: u64, receive: u64) {
+    /// # Safety
+    ///
+    /// `host` must be the transmit ring's direct-map address, mapped for
+    /// writing, at least [`RING_BYTES`] long, and nothing else may write it for
+    /// as long as this value lives; every command posted afterwards relies on
+    /// that. Both rings must stay mapped for the device's use while the queues
+    /// are enabled, which is the caller's obligation and not checkable here.
+    pub unsafe fn enable_admin_queues(&mut self, transmit: u64, receive: u64, host: u64) {
         // Heads and tails first, so an enabled ring does not start from
         // whatever a previous owner left. A PF reset clears the enable bits,
         // but this does not assume the reset happened.
@@ -236,6 +749,9 @@ impl Device {
 
         self.write(PF_ATQLEN, RING_DESCRIPTORS | QUEUE_ENABLE);
         self.write(PF_ARQLEN, RING_DESCRIPTORS | QUEUE_ENABLE);
+
+        self.ring = host;
+        self.next = 0;
     }
 
     /// Whether both admin queues read back as enabled.
@@ -243,13 +759,8 @@ impl Device {
     /// **Read back rather than assumed.** A write to a register the device is
     /// not answering returns nothing and looks exactly like success, which is
     /// the failure mode every driver in this tree has hit at least once.
-    ///
-    /// # Safety
-    ///
-    /// As [`Device::reset`].
     #[must_use]
     pub fn admin_queues_enabled(&self) -> bool {
-        // SAFETY: per the caller.
         let (transmit, receive) = (self.read(PF_ATQLEN), self.read(PF_ARQLEN));
         transmit & QUEUE_ENABLE != 0 && receive & QUEUE_ENABLE != 0
     }
@@ -259,6 +770,81 @@ impl Device {
     #[must_use]
     pub fn admin_queue_lengths(&self) -> (u32, u32) {
         (self.read(PF_ATQLEN) & 0x3ff, self.read(PF_ARQLEN) & 0x3ff)
+    }
+
+    /// What the private memory registers read for this function.
+    ///
+    /// **Discovered before anything is written.** The segment-descriptor range
+    /// and the object sizes are the device's to state; the LAN base and count
+    /// pairs are this driver's to write, and what they hold now is whatever
+    /// the last owner -- firmware's PXE driver, or nobody -- left in them,
+    /// which is worth one line of the report before it is overwritten. Asking
+    /// first is the same habit that found firmware holding the admin queues'
+    /// size.
+    #[must_use]
+    pub fn private_memory(&self) -> PrivateMemory {
+        let function = self.read(PF_FUNC_RID) & 0b111;
+        let at = 4 * u64::from(function);
+        let partition = self.read(GLHMC_SDPART + at);
+        PrivateMemory {
+            function,
+            sd_base: partition & 0xfff,
+            sd_size: (partition >> 16) & 0x1fff,
+            tx_base: self.read(GLHMC_LANTXBASE + at) & 0x00ff_ffff,
+            tx_count: self.read(GLHMC_LANTXCNT + at) & 0x7ff,
+            rx_base: self.read(GLHMC_LANRXBASE + at) & 0x00ff_ffff,
+            rx_count: self.read(GLHMC_LANRXCNT + at) & 0x7ff,
+            tx_object_size: self.read(GLHMC_LANTXOBJSZ) & 0xf,
+            rx_object_size: self.read(GLHMC_LANRXOBJSZ) & 0xf,
+            queue_max: self.read(GLHMC_LANQMAX) & 0x7ff,
+        }
+    }
+
+    /// Which LAN queues this PF owns, `(first, last)` in the device's absolute
+    /// numbering -- `PFLAN_QALLOC` -- or `None` if its `VALID` flag is clear,
+    /// which the datasheet says cannot be true of an active PF.
+    #[must_use]
+    pub fn queue_allocation(&self) -> Option<(u16, u16)> {
+        let value = self.read(PFLAN_QALLOC);
+        if value & QALLOC_VALID == 0 {
+            return None;
+        }
+        Some(((value & 0x7ff) as u16, ((value >> 16) & 0x7ff) as u16))
+    }
+
+    /// Whether the device is still in PXE mode -- `GLLAN_RCTL_0.PXE_MODE`,
+    /// which a core reset sets and only the Clear PXE Mode command clears.
+    #[must_use]
+    pub fn pxe_mode(&self) -> bool {
+        self.read(GLLAN_RCTL_0) & PXE_MODE != 0
+    }
+
+    /// Where a VSI's queues start within this PF's -- `VSILAN_QBASE[vsi]` as
+    /// `(base, scattered)` -- or `None` for a VSI index the register file does
+    /// not have.
+    #[must_use]
+    pub fn vsi_queue_base(&self, vsi: u16) -> Option<(u16, bool)> {
+        if u64::from(vsi) > MAX_VSI {
+            return None;
+        }
+        let value = self.read(VSILAN_QBASE + 4 * u64::from(vsi));
+        Some(((value & 0x7ff) as u16, value & VSI_QTABLE_ENABLED != 0))
+    }
+
+    /// What the HMC has recorded, if anything -- `PFHMC_ERRORINFO` with its
+    /// `ERROR_DETECTED` bit set, and the data register beside it.
+    #[must_use]
+    pub fn hmc_error(&self) -> Option<HmcError> {
+        let info = self.read(PFHMC_ERRORINFO);
+        if info & (1 << 31) == 0 {
+            return None;
+        }
+        Some(HmcError {
+            kind: ((info >> 8) & 0xf) as u8,
+            object: ((info >> 16) & 0x1f) as u8,
+            function: (info & 0x1f) as u8,
+            data: self.read(PFHMC_ERRORDATA),
+        })
     }
 
     /// What a receive queue's enable handshake currently reads.
@@ -278,58 +864,233 @@ impl Device {
         (value & QENA_REQ != 0, value & QENA_STAT != 0)
     }
 
-    /// Posts `Get Version` and waits for firmware to answer it.
+    /// Posts one command and waits for firmware to complete it.
     ///
-    /// `ring` is the transmit ring **as this kernel sees it** -- the direct-map
-    /// address of the same page the device reaches at its own address. Both are
-    /// needed and they are not the same number: the device was told where the
-    /// ring is in its own translation, and the descriptor has to be written
-    /// where the writer can reach it.
+    /// Written whole into the next free descriptor, the tail advanced, `DD`
+    /// polled -- Table 38-340: *"Set by firmware to mark entry done"* -- and
+    /// the completed descriptor handed back, because a direct command's answer
+    /// lives in it. `spins` bounds the wait.
     ///
-    /// Returns the firmware's major and minor version, or `None` if the
-    /// descriptor never came back done or came back flagged as an error.
+    /// The descriptor is written in full, flags included, so a stale `DD` from
+    /// whoever used this ring before cannot read as an answer that never came.
+    /// Firmware left these rings configured -- measured, not assumed -- so that
+    /// is not a hypothetical.
     ///
-    /// # Safety
+    /// # Errors
     ///
-    /// `ring` must be the transmit ring's direct-map address, mapped for
-    /// writing, at least [`RING_BYTES`] long, and the queues must be enabled.
-    pub unsafe fn get_version(&self, ring: u64, spins: u32) -> Option<(u16, u16)> {
-        // Descriptor zero, cleared first: firmware writes its answer over the
-        // command, and a stale `DD` from a previous owner would read as an
-        // answer that never came. Firmware left these rings configured, so this
-        // is not a hypothetical.
-        // SAFETY: per the caller -- a writable mapping of at least one
-        // descriptor, and nothing else is writing this ring.
-        unsafe {
-            core::ptr::write_bytes(ring as *mut u8, 0, DESCRIPTOR_BYTES as usize);
-            core::ptr::write_volatile((ring + 2) as *mut u16, OPCODE_GET_VERSION);
+    /// [`CommandError::NoRing`] before [`Device::enable_admin_queues`],
+    /// [`CommandError::NoAnswer`] if `DD` never appears, and
+    /// [`CommandError::Refused`] with firmware's return value if it appears
+    /// with `ERR` beside it.
+    pub fn command(&mut self, request: Descriptor, spins: u32) -> Result<Descriptor, CommandError> {
+        if self.ring == 0 {
+            return Err(CommandError::NoRing);
         }
-
+        let slot = self.ring + u64::from(self.next) * DESCRIPTOR_BYTES;
+        // SAFETY: `enable_admin_queues`' contract -- `ring` is the transmit
+        // ring's direct-map address, writable, `RING_BYTES` long and written by
+        // nothing else -- and `next` stays below `RING_DESCRIPTORS`, so every
+        // word lands inside it.
+        unsafe {
+            for (index, word) in request.words.iter().enumerate() {
+                core::ptr::write_volatile((slot + 4 * index as u64) as *mut u32, *word);
+            }
+        }
+        self.next = (self.next + 1) % RING_DESCRIPTORS;
         // The tail is what tells firmware a descriptor is there -- Table 38-341
-        // calls `ATQT` the pointer "software device driver updates". One
-        // descriptor posted, so the tail moves to one.
-        self.write(PF_ATQT, 1);
+        // calls `ATQT` the pointer "software device driver updates".
+        self.write(PF_ATQT, self.next);
 
         for _ in 0..spins {
-            // SAFETY: per the caller.
-            let flags = unsafe { core::ptr::read_volatile(ring as *const u16) };
-            if flags & FLAG_DD != 0 {
-                if flags & FLAG_ERR != 0 {
-                    return None;
+            // SAFETY: as above; the first word of the same slot.
+            let first = unsafe { core::ptr::read_volatile(slot as *const u32) };
+            if first & u32::from(FLAG_DD) != 0 {
+                let mut words = [0; 8];
+                for (index, word) in words.iter_mut().enumerate() {
+                    // SAFETY: as above; firmware has marked the descriptor done
+                    // and written its answer into it.
+                    *word = unsafe {
+                        core::ptr::read_volatile((slot + 4 * index as u64) as *const u32)
+                    };
                 }
-                // SAFETY: per the caller; the descriptor is complete.
-                let (major, minor) = unsafe {
-                    (
-                        core::ptr::read_volatile((ring + VERSION_MAJOR_AT as u64) as *const u16),
-                        core::ptr::read_volatile(
-                            (ring + VERSION_MAJOR_AT as u64 + 2) as *const u16,
-                        ),
-                    )
-                };
-                return Some((major, minor));
+                let reply = Descriptor { words };
+                if first & u32::from(FLAG_ERR) != 0 {
+                    return Err(CommandError::Refused(reply.return_value()));
+                }
+                return Ok(reply);
             }
             core::hint::spin_loop();
         }
-        None
+        Err(CommandError::NoAnswer)
+    }
+
+    /// Asks `Get Version` and reads what firmware answers.
+    ///
+    /// Table 38-353, and the datasheet is emphatic about its place: *"This must
+    /// be the first command that the software device driver issues before it
+    /// can use the queue for other purposes."* Its `Datalen` is 0 -- *"no
+    /// external response buffer"* -- so the answer comes back in the
+    /// descriptor: major at bytes 24-25 and minor at 26-27, which in a normal
+    /// command are the data address.
+    ///
+    /// # Errors
+    ///
+    /// As [`Device::command`].
+    pub fn get_version(&mut self, spins: u32) -> Result<(u16, u16), CommandError> {
+        let reply = self.command(Descriptor::direct(OPCODE_GET_VERSION), spins)?;
+        Ok((
+            reply.half(VERSION_MAJOR_AT),
+            reply.half(VERSION_MAJOR_AT + 2),
+        ))
+    }
+
+    /// Asks `Get Link Status` -- Table 38-63 -- without touching the event
+    /// enable, which is what bytes 16-17 at zero mean: *"NOP: LSE notification
+    /// value is not modified"*.
+    ///
+    /// # Errors
+    ///
+    /// As [`Device::command`].
+    pub fn link_status(&mut self, spins: u32) -> Result<Link, CommandError> {
+        let reply = self.command(Descriptor::direct(OPCODE_GET_LINK_STATUS), spins)?;
+        Ok(Link::from_descriptor(&reply))
+    }
+
+    /// Asks `Get Switch Configuration` into a buffer and reads it back.
+    ///
+    /// `device` is the buffer as the device issues it and `host` the same
+    /// [`SWITCH_BUFFER_BYTES`] as this kernel reaches them -- two addresses for
+    /// one buffer, as with the rings. The buffer is zeroed first so a stale
+    /// count cannot be read as this answer, and copied out whole once firmware
+    /// has marked the descriptor done.
+    ///
+    /// Only the first request is made: a switch with more elements than the
+    /// buffer holds reports its total, and the caller can say so rather than
+    /// page through what a first driver has no use for.
+    ///
+    /// # Safety
+    ///
+    /// `host` must be the direct-map address of the buffer the device reaches
+    /// at `device`, mapped for writing, at least [`SWITCH_BUFFER_BYTES`] long,
+    /// and written by nothing else while this runs.
+    ///
+    /// # Errors
+    ///
+    /// As [`Device::command`].
+    pub unsafe fn switch_configuration(
+        &mut self,
+        device: u64,
+        host: u64,
+        spins: u32,
+    ) -> Result<SwitchConfiguration, CommandError> {
+        // SAFETY: per the caller -- a writable mapping of `SWITCH_BUFFER_BYTES`
+        // at `host`, written by nothing else.
+        unsafe { core::ptr::write_bytes(host as *mut u8, 0, usize::from(SWITCH_BUFFER_BYTES)) };
+        self.command(
+            Descriptor::with_buffer(OPCODE_GET_SWITCH_CONFIGURATION, device, SWITCH_BUFFER_BYTES),
+            spins,
+        )?;
+        // SAFETY: per the caller; firmware has completed the command, so its
+        // writes to the buffer are done, and a volatile read is what keeps the
+        // compiler from serving an older view of memory a device wrote.
+        let buffer =
+            unsafe { core::ptr::read_volatile(host as *const [u8; SWITCH_BUFFER_BYTES as usize]) };
+        Ok(SwitchConfiguration::parse(&buffer))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Table 38-340's byte numbering, against the words the ring holds.
+    #[test]
+    fn descriptor_bytes_follow_table_38_340() {
+        let request = Descriptor::direct(0x0607);
+        assert_eq!(request.byte(2), 0x07);
+        assert_eq!(request.byte(3), 0x06);
+        assert_eq!(request.half(2), 0x0607);
+        assert_eq!(request.flags(), 0);
+        assert_eq!(request.byte(32), 0, "past the end reads as zero");
+
+        let indirect = Descriptor::with_buffer(0x0200, 0x0000_0001_0000_0800, 512);
+        assert_eq!(indirect.flags(), FLAG_BUF);
+        assert_eq!(indirect.half(4), 512, "Datalen at bytes 4-5");
+        assert_eq!(indirect.words[6], 0x1, "data address high at bytes 24-27");
+        assert_eq!(indirect.words[7], 0x800, "data address low at bytes 28-31");
+        let large = Descriptor::with_buffer(0x0200, 0, 513);
+        assert_eq!(
+            large.flags(),
+            FLAG_BUF | FLAG_LB,
+            "longer than AQ_LARGE_BUF sets LB"
+        );
+
+        let mut refused = Descriptor::direct(0x0110);
+        refused.words[0] |= u32::from(FLAG_DD | FLAG_ERR);
+        refused.words[1] |= 0xd << 16;
+        assert_eq!(refused.return_value(), 0xd, "return value at bytes 6-7");
+    }
+
+    /// Table 38-65's fields, at the descriptor bytes Table 38-64 gives them.
+    #[test]
+    fn link_status_reads_table_38_65() {
+        let mut words = [0u32; 8];
+        // Bytes 18 and 19: PHY type and speed, after the two command-flag bytes.
+        words[4] = (0x13 << 16) | (0b1000 << 24);
+        // Bytes 20 and 21: status and negotiation.
+        words[5] = 0b1110_0001 | (0b11 << 8);
+        // Bytes 24-25: the maximum frame size.
+        words[6] = 0x05ee;
+        let link = Link::from_descriptor(&Descriptor { words });
+        assert_eq!(link.phy_type, 0x13);
+        assert_eq!(link.phy_name(), "10GBASE-T");
+        assert_eq!(link.speed_name(), "10 Gb/s");
+        assert!(link.up());
+        assert!(link.media_available());
+        assert!(link.signal_detected());
+        assert!(!link.faulted());
+        assert_eq!(link.negotiation, 0b11);
+        assert_eq!(link.max_frame, 1518);
+
+        let down = Link::from_descriptor(&Descriptor::default());
+        assert!(!down.up());
+        assert_eq!(down.speed_name(), "no speed");
+    }
+
+    /// Tables 38-201 to 38-203: a header, then sixteen bytes per element.
+    #[test]
+    fn switch_configuration_parses_tables_38_201_to_203() {
+        let mut buffer = [0u8; SWITCH_BUFFER_BYTES as usize];
+        buffer[0] = 2;
+        buffer[2] = 3;
+        // A MAC: SEID 0x10, no uplink, downlink 0x20, the default port, port 0.
+        let mac = [1, 1, 0x10, 0, 0, 0, 0x20, 0, 0, 0, 0, 2, 0, 0, 0, 0];
+        buffer[16..32].copy_from_slice(&mac);
+        // A VSI: SEID 0x1ab, uplink 0x10, a regular data port, VSI number 0x17f.
+        let vsi = [
+            19, 1, 0xab, 0x01, 0x10, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0x7f, 0x01,
+        ];
+        buffer[32..48].copy_from_slice(&vsi);
+
+        let parsed = SwitchConfiguration::parse(&buffer);
+        assert_eq!(parsed.count, 2);
+        assert_eq!(parsed.total, 3);
+        let elements = parsed.elements();
+        assert_eq!(elements[0].kind_name(), "MAC");
+        assert_eq!(elements[0].seid, 0x10);
+        assert_eq!(elements[0].downlink, 0x20);
+        assert_eq!(elements[0].connection, 2);
+        assert_eq!(elements[1].kind_name(), "VSI");
+        assert_eq!(elements[1].seid, 0x1ab);
+        assert_eq!(elements[1].uplink, 0x10);
+        assert_eq!(elements[1].number, 0x17f);
+
+        // A count larger than the buffer holds is clamped, not trusted.
+        buffer[0] = 0xff;
+        buffer[1] = 0xff;
+        assert_eq!(
+            SwitchConfiguration::parse(&buffer).count,
+            SWITCH_ELEMENTS_MAX
+        );
     }
 }

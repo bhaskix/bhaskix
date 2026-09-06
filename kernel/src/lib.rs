@@ -12510,6 +12510,199 @@ fn admin_ring_address(device: (u8, u8, u8), hhdm: u64) -> Option<(u64, u64, u64)
     ))
 }
 
+/// Asks a contained, reset X722 with a working command channel what it is and
+/// what it holds -- RFC 0072 step 3's gate, and step 4's reading before
+/// writing.
+///
+/// **Nothing here changes the device.** Every line is a question, and the
+/// answers are what the receive queue's programming is computed from rather
+/// than assumed: whether the port has link at all, which VSI its frames land
+/// in and where that VSI's queues start, which absolute queue is this PF's
+/// first, whether the device is still in PXE mode, and what the private
+/// memory registers hold before this driver writes them.
+///
+/// `transmit` and `host` are the admin ring page as the device and this
+/// kernel reach it; the switch buffer lives in the same page after the rings.
+fn ask_nic(nic: &mut i40e::Device, transmit: u64, host: u64) {
+    const SPINS: u32 = 2_000_000;
+
+    match nic.get_version(SPINS) {
+        Ok((major, minor)) => {
+            println!("    nic firmware   the device answered: firmware {major}.{minor}");
+        }
+        Err(error) => {
+            println!("\x1b[93m    nic firmware   no answer to Get Version: {error}\x1b[0m");
+            return;
+        }
+    }
+
+    // **Link, which step 3's gate names beside the version and which was
+    // unread when step 3 was called complete.** A receive queue on a port with
+    // no link is a queue that will never fill, and the report should say which
+    // of those it is watching before it waits for a frame.
+    match nic.link_status(SPINS) {
+        Ok(link) => println!(
+            "    nic link       {} at {} over {}; media {}, signal {}{}; max frame {}",
+            if link.up() { "UP" } else { "down" },
+            link.speed_name(),
+            link.phy_name(),
+            if link.media_available() {
+                "available"
+            } else {
+                "absent"
+            },
+            if link.signal_detected() {
+                "detected"
+            } else {
+                "none"
+            },
+            if link.faulted() {
+                ", fault reported"
+            } else {
+                ""
+            },
+            link.max_frame,
+        ),
+        Err(error) => {
+            println!("\x1b[93m    nic link       no answer to Get Link Status: {error}\x1b[0m");
+        }
+    }
+
+    // **The switch, because a frame is steered to a VSI before any queue sees
+    // it.** The VSI's number indexes `VSILAN_QBASE`, which says where its
+    // queues start within this PF's; both are read here so that step 4 programs
+    // the queue a frame would actually reach rather than the one numbered zero.
+    let buffer_device = transmit + i40e::SWITCH_BUFFER_OFFSET;
+    let buffer_host = host + i40e::SWITCH_BUFFER_OFFSET;
+    // SAFETY: `host` is the direct-map address of the ring page, a page long
+    // and writable; the buffer's offset keeps it inside that page after both
+    // rings, which `i40e` asserts at compile time; nothing else writes it.
+    match unsafe { nic.switch_configuration(buffer_device, buffer_host, SPINS) } {
+        Ok(switch) => {
+            println!(
+                "    nic switch     {} element(s) reported of {} in the switch",
+                switch.count, switch.total
+            );
+            for element in switch.elements() {
+                println!(
+                    "                   {:<4} seid {:#06x}  uplink {:#06x}  downlink {:#06x}  \
+                     connection {}  number {}",
+                    element.kind_name(),
+                    element.seid,
+                    element.uplink,
+                    element.downlink,
+                    element.connection,
+                    element.number
+                );
+                if element.kind_name() == "VSI" {
+                    match nic.vsi_queue_base(element.number) {
+                        Some((base, true)) => println!(
+                            "                   VSI {} takes a scattered queue set through \
+                             VSILAN_QTABLE; base field {base}",
+                            element.number
+                        ),
+                        Some((base, false)) => println!(
+                            "                   VSI {} starts at PF queue {base}",
+                            element.number
+                        ),
+                        None => println!(
+                            "                   VSI {} is outside the register file's range",
+                            element.number
+                        ),
+                    }
+                }
+            }
+        }
+        Err(error) => println!(
+            "\x1b[93m    nic switch     no answer to Get Switch Configuration: {error}\x1b[0m"
+        ),
+    }
+
+    // **Which queue is this PF's first.** Absolute numbering is what the HMC
+    // and the queue registers use; the PF's own is an offset from here.
+    let first = match nic.queue_allocation() {
+        Some((first, last)) => {
+            println!(
+                "    nic queues     this PF owns absolute queues {first}..={last}, {} pair(s); \
+                 PXE mode {}",
+                u32::from(last).saturating_sub(u32::from(first)) + 1,
+                if nic.pxe_mode() { "still set" } else { "clear" }
+            );
+            first
+        }
+        None => {
+            println!(
+                "\x1b[93m    nic queues     PFLAN_QALLOC reads invalid: no queues are allocated \
+                 to this PF\x1b[0m"
+            );
+            0
+        }
+    };
+
+    // **What the private memory registers hold, before this driver writes the
+    // two pairs that are its to write.** The segment-descriptor range and the
+    // object sizes are the device's; the LAN base and count pairs are
+    // software's per 38.26.3.1, and what is in them now is whatever the last
+    // owner left.
+    let memory = nic.private_memory();
+    println!(
+        "    nic fpm        function {}: segment descriptors {}..+{} at 2 MB each; object sizes \
+         tx 2^{} rx 2^{} bytes; queue max {}",
+        memory.function,
+        memory.sd_base,
+        memory.sd_size,
+        memory.tx_object_size,
+        memory.rx_object_size,
+        memory.queue_max
+    );
+    println!(
+        "    nic fpm        LAN registers as left: tx base {} count {}, rx base {} count {} -- \
+         bases in 512-byte units, and this driver's to write",
+        memory.tx_base, memory.tx_count, memory.rx_base, memory.rx_count
+    );
+
+    // **The receive queue this PF would take, looked at before it is.** The
+    // first boot read absolute queue 0, which is this PF's first only if its
+    // allocation starts there; both are read when they differ.
+    report_receive_queue(nic, u32::from(first));
+    if first != 0 {
+        report_receive_queue(nic, 0);
+    }
+
+    match nic.hmc_error() {
+        None => println!("    nic hmc        no error recorded"),
+        Some(error) => println!(
+            "\x1b[93m    nic hmc        error recorded: {} (type {}, object {:#x}, function {}, \
+             data {:#x})\x1b[0m",
+            error.kind_name(),
+            error.kind,
+            error.object,
+            error.function,
+            error.data
+        ),
+    }
+}
+
+/// One receive queue's enable handshake, as the boot report states it.
+///
+/// Read before anything is written, for the reason the admin queues taught: a
+/// queue this platform is already using is worth knowing about before taking
+/// it, and on a LOM that is not a remote possibility.
+fn report_receive_queue(nic: &i40e::Device, queue: u32) {
+    let (requested, active) = nic.receive_queue_state(queue);
+    println!(
+        "    nic rx queue   absolute queue {queue} reads QENA_REQ={} QENA_STAT={} -- {}",
+        u8::from(requested),
+        u8::from(active),
+        match (requested, active) {
+            (false, false) => "off, and free to take",
+            (true, true) => "running; something else owns it",
+            (true, false) => "an enable is in flight",
+            (false, true) => "a disable is in flight",
+        }
+    );
+}
+
 /// The first X722 on the bus — RFC 0072 steps 2 and 3.
 ///
 /// **By exact identifier, and that was learned the hard way.** The first version
@@ -12640,23 +12833,24 @@ fn start_nic_domain(hhdm: u64) -> Result<(), &'static str> {
     // is not answering; that must be said rather than hang the boot. A million
     // spins is generous for a reset the datasheet describes as microseconds of
     // work, and cheap to be wrong about in the direction of waiting.
-    // **A megabyte, not a page.** The first version mapped `0x1000` and the
-    // SR550 answered with a page fault at `cr2 0xffff823ffd092400` -- which is
-    // this BAR plus `PFGEN_CTRL`'s `0x92400`, nearly six hundred kilobytes past
-    // the single page that was mapped. An i40e's register space is megabytes;
-    // the highest offset this module touches is that reset register, so a
-    // megabyte covers every one of them with room and is still a small mapping.
+    // **The window is the datasheet's CSR space, and `i40e` owns the number.**
+    // The first version mapped `0x1000` and the SR550 answered with a page
+    // fault at `cr2 0xffff823ffd092400` -- this BAR plus `PFGEN_CTRL`'s
+    // `0x92400`, nearly six hundred kilobytes past the single page mapped. The
+    // second mapped a megabyte with a comment claiming room it did not have,
+    // and faulted at `QRX_ENA`. The size now lives beside the offsets it must
+    // cover, is taken from the datasheet's own bound on the register space,
+    // and is checked by assertions that fail the build rather than the boot.
     //
-    // Sizing the BAR properly means writing all-ones and reading the mask back,
-    // which disturbs a device this code has not reset yet. That is worth doing
-    // when a second driver needs it; it is not worth doing to learn a number the
-    // datasheet's own register map already bounds.
+    // Sizing the BAR by writing all-ones and reading the mask back would tell
+    // the same number and disturb a device this code has not reset yet; it is
+    // worth doing when a second driver needs it.
     if let Some(mapped) = mmio::map(registers & !0xfff, i40e::REGISTER_WINDOW_BYTES, hhdm) {
         // SAFETY: `mmio::map` returned a device mapping of this function's
         // BAR0, it is never unmapped, and nothing else drives this device --
         // `bin/netd` drives virtio and `claimed` kept this one out of
         // pass-through precisely so that this kernel owns it.
-        let nic = unsafe { i40e::Device::new(mapped) };
+        let mut nic = unsafe { i40e::Device::new(mapped) };
         if nic.reset(1_000_000) {
             let (transmit, receive) = nic.admin_queue_lengths();
             // **Whether firmware still holds the queues, which the first boot
@@ -12697,7 +12891,12 @@ fn start_nic_domain(hhdm: u64) -> Result<(), &'static str> {
             if !held {
                 match admin_ring_address(delegated, hhdm) {
                     Some((transmit, receive, host)) => {
-                        nic.enable_admin_queues(transmit, receive);
+                        // SAFETY: `host` is the direct-map address of the page
+                        // `admin_ring_address` just created and mapped for this
+                        // device -- writable, a page long, so it holds both
+                        // rings and the switch buffer after them -- and nothing
+                        // else writes it.
+                        unsafe { nic.enable_admin_queues(transmit, receive, host) };
                         let taken = nic.admin_queues_enabled();
                         println!(
                             "    nic admin      rings at {transmit:#x} and {receive:#x}; {}",
@@ -12707,45 +12906,18 @@ fn start_nic_domain(hhdm: u64) -> Result<(), &'static str> {
                                 "the enable bits did not read back"
                             }
                         );
-                        // **The first thing this driver asks that the device has
-                        // to answer.** Everything before it was a write the
-                        // hardware could accept in silence; a version that comes
-                        // back is firmware executing a command from a ring this
-                        // kernel placed, which is the whole of step 3.
-                        //
+                        // **From here, every line is something the device has
+                        // to answer.** Everything before was a write the
+                        // hardware could accept in silence; a version that
+                        // comes back is firmware executing a command from a
+                        // ring this kernel placed, which is the whole of step
+                        // 3. The rest are step 4's questions, asked before
+                        // anything is written for the reason the admin queues
+                        // taught: firmware had left those sized, and a clean
+                        // slate assumed is a ring enabled at somebody else's
+                        // size.
                         if taken {
-                            // SAFETY: `host` is the direct-map address of the
-                            // ring just mapped and enabled -- writable, a page
-                            // long, and nothing else writes it.
-                            match unsafe { nic.get_version(host, 2_000_000) } {
-                                Some((major, minor)) => println!(
-                                    "    nic firmware   the device answered: firmware {major}.\
-                                     {minor}"
-                                ),
-                                None => println!(
-                                    "\x1b[93m    nic firmware   no answer to Get Version; the \
-                                     queue is enabled and firmware did not complete it\x1b[0m"
-                                ),
-                            }
-                            // **RFC 0072 step 4 begins by looking, for the
-                            // reason step 3 learned.** Firmware had left the
-                            // admin queues sized, and assuming a clean slate
-                            // would have enabled a ring at somebody else's
-                            // size. A receive queue this platform is already
-                            // using is worth knowing about before taking it --
-                            // and on a LOM that is not a remote possibility.
-                            let (requested, active) = nic.receive_queue_state(0);
-                            println!(
-                                "    nic rx queue   queue 0 reads QENA_REQ={} QENA_STAT={} -- {}",
-                                u8::from(requested),
-                                u8::from(active),
-                                match (requested, active) {
-                                    (false, false) => "off, and free to take",
-                                    (true, true) => "running; something else owns it",
-                                    (true, false) => "an enable is in flight",
-                                    (false, true) => "a disable is in flight",
-                                }
-                            );
+                            ask_nic(&mut nic, transmit, host);
                         }
                     }
                     None => println!(
