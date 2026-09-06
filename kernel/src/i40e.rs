@@ -2390,10 +2390,22 @@ impl Device {
         // SAFETY: as above.
         unsafe { post_transmit_descriptor(self.transmit_ring, data, buffer, bytes) };
         self.transmit_next += 1;
+        // **Wrap the cursor, because the tail is an index and not a count.**
+        // `QTX_TAIL` takes a descriptor index, so a ring of eight accepts 0 to
+        // 7; writing 8 after filling the last slot is out of range and the
+        // queue stops taking updates. That is exactly what happened on
+        // 2026-09-06: four LACPDUs left the wire and the fifth put the tail at
+        // eight, after which the head sat still at six and forty more frames
+        // went nowhere.
+        if self.transmit_next >= self.transmit_depth {
+            self.transmit_next = 0;
+        }
         Some(data)
     }
 
     /// The tail this driver's cursor now stands at, for the doorbell.
+    ///
+    /// Always a valid descriptor index -- see [`Device::post_frame`].
     #[must_use]
     pub const fn transmit_tail(&self) -> u32 {
         self.transmit_next
