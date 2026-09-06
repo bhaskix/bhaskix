@@ -60,6 +60,8 @@ pub mod icmp;
 pub mod icmpv6;
 pub mod ipv4;
 pub mod ipv6;
+/// LACP — 802.3ad link aggregation, so a switch will forward to a bonded port.
+pub mod lacp;
 pub mod neighbour;
 pub mod siphash;
 pub mod tcp;
