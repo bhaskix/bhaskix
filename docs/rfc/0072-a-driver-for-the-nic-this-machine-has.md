@@ -708,6 +708,70 @@ queue.
 
 ### Step 5 — one transmit queue
 
+#### A frame left, and the port's own MAC counted it out — 2026-09-06
+
+Built and run on the SR550, in the same boot as the receive attempt so that
+anything coming back would land in a ring that was still posted:
+
+    nic vsi        seid 0x18c is VSI number 12, queue set handle 0x0 -- RDYList 0
+                   the switch reported VSI number 19 and this reports 12 -- the statistics index above was read at the switch's
+    nic mac        port 0 station address 08:94:ef:7a:fc:8e
+    nic tx context queue 0 context at private address 0x0 (page descriptor 0, offset 0), ring 0x100005000, 8 descriptors
+    nic tx queue   queue 0 owned by PF 0 and enabled: QENA_STAT set (REQ=1 STAT=1)
+    nic tx frame   60 bytes to its own address: the device reported the descriptor done, head 0
+    nic tx frame   60 bytes to broadcast: the device reported the descriptor done, head 1
+    nic tx stats   port 0 sent 1 packet(s) (0 unicast, 0 multicast, 1 broadcast), 64 octet(s)
+    nic rx after   still nothing in the receive ring after transmitting
+
+**A frame this machine built left through the port's MAC.** One broadcast
+packet, 64 octets -- the sixty bytes written plus the four-byte CRC the device
+appends -- counted by `GLPRT_BPTCL`, which is the MAC's own accounting and not
+this driver's. Every layer under it is Bhaskix's: a queue set handle asked of
+firmware, a station address read from the NVM, a 128-byte transmit context
+written into a backing page named through a page descriptor in a segment this
+kernel programmed, the queue's internal disable flag cleared, its owning
+function stated in `QTX_CTL`, the enable handshake answered, a descriptor posted
+and a doorbell rung, and the completion written back into the ring.
+
+**The gate is not strictly met, and the reason is the wire rather than the
+driver.** It asks for a reply *"observed by the host rather than claimed by the
+guest"*. What exists is stronger than a guest's claim -- the MAC counted the
+frame out -- and weaker than the gate: nothing outside this machine confirmed
+receiving it, and nothing answered. Five boots have now shown this port has
+never taken in a single unicast or broadcast frame, so there may be no host on
+that segment to observe anything. **The mechanism is demonstrated; the
+external witness the gate wants is not available where this machine is
+plugged in.**
+
+**Three measured results worth more than the headline:**
+
+* **The self-addressed frame went nowhere.** A frame sent to this port's own MAC
+  completed its descriptor, was **not** counted out as unicast, and did **not**
+  come back into the receive ring. The internal switch neither transmitted it
+  nor looped it back, so the loopback route to proving both directions inside
+  one machine is closed. It was worth trying: it would have needed nobody else's
+  cooperation.
+* **The VSI number is not what the switch element said**, and this matters
+  backwards. `Get Switch Configuration` reports element-specific field 19;
+  `Get VSI Parameters` reports VSI number **12** for the same SEID. The per-VSI
+  statistics in the previous section were read at 19. **That reading is
+  therefore suspect**, and the "VSI got 0 packets" line beside it should not be
+  relied on -- which is exactly what its own "index assumed" label was for. The
+  port counters and the empty ring are unaffected, and they are what the
+  previous section's conclusion rests on.
+* **The queue set handle read `0x0`** and the queue enabled and transmitted
+  anyway. Either queue set zero really is this VSI's, or `RDYList` is not
+  consulted for a configuration this simple. Recorded as working-but-unexplained
+  rather than dressed up either way.
+
+**What this leaves.** Transmit works. Receive is built, running, and has never
+been handed a frame. The next thing that would settle it is a frame deliberately
+aimed at `08:94:ef:7a:fc:8e` from a machine on that segment -- which means
+finding out what that segment is, and is a question about cabling rather than
+about this driver.
+
+#### The original step, for the record
+
 The other half. A frame this machine builds leaves the wire.
 
 **Gate:** an ARP reply, or an ICMP echo reply, observed *by the host* rather than

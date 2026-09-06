@@ -958,9 +958,9 @@ the distinction is in the table rather than in somebody's head.
 
 Newest first. One entry per meaningful change of project state.
 
-### 2026-09-06 (a receive queue on real hardware, and where the frames actually go)
+### 2026-09-06 (a receive queue on real hardware, and a frame that left it)
 
-Four boots of the SR550, RFC 0072 step 4. **The step's gate is not met**: a frame did not arrive,
+Five boots of the SR550, RFC 0072 steps 4 and 5. **Step 4's gate is not met**: a frame did not arrive,
 and that is the sentence to keep. What did happen is everything up to it.
 
 The first boot asked and wrote nothing. It answered five things the code would otherwise have
@@ -1032,10 +1032,32 @@ an assumption); set the Default VSI flag; and then **step 5**, which this result
 finishing step 4 — an ARP out of this port draws a reply addressed to this port's own MAC, and a
 unicast frame aimed at us is the one thing this segment has never carried.
 
-Four boots have established, none of it testable in QEMU: the device resets, answers commands,
-reports link and switch, hands over its queue allocation, runs a queue context this kernel wrote
-through the host memory cache, prefetches from a ring this kernel posted, and counts what its port
-receives. One step is unproven — a frame crossing from the port into the queue.
+**A fifth boot built the transmit queue, and a frame left.** `port 0 sent 1 packet(s) (0 unicast, 0
+multicast, 1 broadcast), 64 octet(s)` — sixty bytes written plus the CRC the device appends, counted
+by the MAC's own `GLPRT_BPTCL` rather than claimed by this driver. Under it: a queue set handle
+asked of firmware, a station address from the NVM (`08:94:ef:7a:fc:8e`), a 128-byte transmit context
+in a backing page named through a page descriptor, the queue's disable flag cleared, its owner stated
+in `QTX_CTL`, the enable answered, a descriptor posted and its completion written back.
+
+**Step 5's gate is still not strictly met, and the reason is the wire.** It asks for a reply
+*observed by the host*; what exists is the MAC counting the frame out, which beats a guest's claim
+and falls short of an external witness. Five boots have shown this port has never taken in one
+unicast or broadcast frame, so there may be no host on that segment to observe anything.
+
+**And the transmit boot corrected the receive boot.** `Get VSI Parameters` reports VSI number **12**
+for SEID `0x18c`, where the switch element's field said 19 — so the per-VSI statistics read at 19
+were read at a suspect index, and that line should not be leaned on. Its own "index assumed" label
+is what makes this a correction rather than a discovery. The port counters and the empty ring are
+untouched, and they are what the conclusion rested on. A frame addressed to the port's own MAC also
+went nowhere: descriptor completed, not counted out, not looped back — so proving both directions
+inside one machine is not available either.
+
+Five boots have established, none of it testable in QEMU: the device resets, answers commands,
+reports link and switch, hands over its queue allocation, runs a receive context this kernel wrote
+through the host memory cache, prefetches from a ring this kernel posted, counts what its port
+receives, and **puts a frame this kernel built onto the wire**. One step is unproven — a frame
+crossing from the port into the queue — and the next thing that would settle it is a frame aimed
+deliberately at this port's address, which is a question about what that cable reaches.
 
 **The negative arm is inside every one of these boots**, which the testing plan asks for: with
 everything in place but the enable, descriptor zero was watched for 100 ms and stayed untouched. So
