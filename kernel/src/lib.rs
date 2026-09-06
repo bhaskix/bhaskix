@@ -13038,8 +13038,6 @@ fn run_lacp(
     /// Long enough for a partner honouring the short timeout to answer many
     /// times over, and short enough not to double the boot.
     const SECONDS: u32 = 45;
-    /// The transmit ring's depth, which the slot index wraps within.
-    const RING: u32 = 8;
 
     let Some(mac) = nic.mac_address(setup.port) else {
         return;
@@ -13093,6 +13091,13 @@ fn run_lacp(
     );
 
     let mut sent = 0u32;
+    // **Posted and completed are different numbers, and the previous boot
+    // could not tell them apart.** A descriptor the device never writes back
+    // is one it refused or never processed; a descriptor written back for a
+    // frame the port did not count out is one the MAC declined to send. Those
+    // want different fixes, and forty-five LACPDUs vanished without saying
+    // which had happened.
+    let mut completed = 0u32;
     let mut refused_before = machine.refused;
     let mut heard = 0u32;
     for second in 0..SECONDS {
@@ -13105,36 +13110,32 @@ fn run_lacp(
             };
             let bytes = build_lacpdu(buffer, mac, &pdu);
             if bytes > 0 {
-                // **A context descriptor before the data one.** It carries the
-                // switch control tag that says "uplink: transmit to the
-                // network bypassing hardware filters", and the context is lost
-                // after the packet it precedes, so each frame gets its own.
-                // Two descriptors per frame, so the pair index wraps at half
-                // the ring's depth.
-                let pair = (sent % (RING / 2)) * 2;
-                // SAFETY: `ring_host` is the transmit ring's direct-map
-                // address and both `pair` and `pair + 1` are inside its depth;
-                // the previous use of these slots completed before the tail
-                // was advanced past them.
-                unsafe {
-                    i40e::post_transmit_context(setup.ring_host, pair, i40e::TX_SWTCH_UPLINK);
-                    i40e::post_transmit_descriptor(
-                        setup.ring_host,
-                        pair + 1,
-                        setup.packet_device,
-                        bytes as u16,
-                    );
-                }
-                nic.transmit_doorbell(target.queue, pair + 2);
-                for _ in 0..SPINS {
-                    // SAFETY: as the post above; the data descriptor is the
-                    // one carrying `RS`, so it is the one written back.
-                    if unsafe { i40e::transmit_completed(setup.ring_host, pair + 1) } {
-                        break;
+                // **The driver's cursor, not this loop's own count.** Keeping
+                // a separate slot index here is what wrote forty-five frames
+                // behind the device's head and moved the tail backwards; the
+                // head sat at 2 and the boot reported a switch that would not
+                // answer, when the device had never been shown a frame.
+                //
+                // **Plain first, then with the uplink context descriptor.**
+                // A head that stops dead is what the datasheet describes when
+                // a descriptor is refused -- *"the respective queue is
+                // stopped"* -- so whether it is the context descriptor that
+                // stops it, or an LACPDU refused however it is posted, is one
+                // boot's difference and this splits it.
+                let uplink = sent >= SECONDS / 2;
+                if let Some(slot) = nic.post_frame(setup.packet_device, bytes as u16, uplink) {
+                    nic.transmit_doorbell(target.queue, nic.transmit_tail());
+                    for _ in 0..SPINS {
+                        // SAFETY: a ring is attached; the data descriptor
+                        // carries `RS`, so it is the one written back.
+                        if unsafe { nic.frame_completed(slot) } {
+                            completed += 1;
+                            break;
+                        }
+                        core::hint::spin_loop();
                     }
-                    core::hint::spin_loop();
+                    sent += 1;
                 }
-                sent += 1;
             }
         }
 
@@ -13173,8 +13174,22 @@ fn run_lacp(
             }
         }
 
+        if second == SECONDS / 2 - 1 || second == SECONDS - 1 {
+            let (requested, active) = nic.transmit_queue_state(target.queue);
+            println!(
+                "    nic lacp       after {sent} posted ({}): {completed} completed, queue REQ={} \
+                 STAT={}, head {}",
+                if second < SECONDS / 2 {
+                    "plain"
+                } else {
+                    "plain then uplink-tagged"
+                },
+                u8::from(requested),
+                u8::from(active),
+                nic.transmit_head(target.queue)
+            );
+        }
         machine.elapsed(1);
-        let _ = second;
         pause_millis(1_000);
     }
     if machine.refused > refused_before {
@@ -13189,13 +13204,31 @@ fn run_lacp(
     let delta = nic.port_counters(setup.port).since(&before);
     let out = nic.transmit_counters(setup.port).since(&sent_before);
     println!(
-        "    nic lacp       {sent} LACPDU(s) posted{}, {} counted out of the MAC; {heard} heard back",
+        "    nic lacp       {sent} LACPDU(s) posted{}, {completed} completed by the device, {} \
+         counted out of the MAC; {heard} heard back",
         if overriding {
             " with an uplink switch tag"
         } else {
             " with no switch tag, which the internal switch will swallow"
         },
         out.packets()
+    );
+    // **The reading that splits the two worlds.** The transmit head advances as
+    // the device consumes descriptors, so a head that moved with nothing
+    // counted out is a device that took the frames and a MAC that dropped
+    // them; a head that did not move is a device that never processed them.
+    println!(
+        "    nic lacp       transmit head {} after {sent} posted -- \x1b[1m{}\x1b[0m",
+        nic.transmit_head(target.queue),
+        match (completed, out.packets()) {
+            (0, _) =>
+                "the device completed none of them: it refused or never processed the \
+                       descriptors, and the MAC never saw a frame",
+            (_, 0) =>
+                "the device completed them and the port counted none out: the descriptors \
+                       were taken and the MAC declined to send",
+            _ => "frames were completed and counted out",
+        }
     );
     println!(
         "    nic lacp       the port received {} packet(s) in those {SECONDS} s ({} multicast), \
@@ -13343,6 +13376,13 @@ fn send_frames(
     if !enabled {
         return false;
     }
+    // **The ring the driver will post into, named once.** Both the frames
+    // below and the LACP exchange after them go through one cursor, which is
+    // the fix for a boot that wrote forty-five frames behind the device's head
+    // because two callers each kept their own slot count.
+    // SAFETY: `ring_host` is the direct-map address of the ring this queue's
+    // context points at, `DESCRIPTORS` deep, and written by nothing else.
+    unsafe { nic.attach_transmit_ring(setup.ring_host, DESCRIPTORS) };
 
     // **Three frames now, and the third is the one that matters.** An ARP to
     // this port's own address, an ARP to broadcast, and a **DHCP DISCOVER
@@ -13378,24 +13418,16 @@ fn send_frames(
             println!("\x1b[93m    nic tx frame   {name} would not build\x1b[0m");
             continue;
         }
-        let slot = index as u32;
-        // SAFETY: `ring_host` is the direct-map address of the transmit ring,
-        // `slot` is inside its `DESCRIPTORS`, and the queue has not been told
-        // about this descriptor yet.
-        unsafe {
-            i40e::post_transmit_descriptor(
-                setup.ring_host,
-                slot,
-                setup.packet_device,
-                bytes as u16,
-            );
-        }
-        nic.transmit_doorbell(target.queue, slot + 1);
+        let Some(slot) = nic.post_frame(setup.packet_device, bytes as u16, false) else {
+            println!("\x1b[93m    nic tx frame   no transmit ring is attached\x1b[0m");
+            continue;
+        };
+        nic.transmit_doorbell(target.queue, nic.transmit_tail());
 
         let mut done = false;
         for _ in 0..SPINS {
-            // SAFETY: as the post above.
-            if unsafe { i40e::transmit_completed(setup.ring_host, slot) } {
+            // SAFETY: a ring is attached.
+            if unsafe { nic.frame_completed(slot) } {
                 done = true;
                 break;
             }

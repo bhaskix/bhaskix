@@ -733,7 +733,13 @@ asm_budget = 10
 # read-modify-write, so nothing firmware chose is replaced by a guess -- and a
 # transmit context descriptor carrying the uplink switch tag is posted ahead of
 # each data descriptor.
-unsafe_budget = 2127
+#
+# 2124 on 2026-09-06: three lines *back*. The transmit ring's cursor moved into
+# the driver, so the two callers that each did their own slot arithmetic now
+# call one method -- which is both less `unsafe` and the fix for a real defect:
+# a loop that restarted at slot zero while the device's head stood at two wrote
+# forty-five frames behind the head and moved the tail backwards.
+unsafe_budget = 2116
 # Up thirty-one for RFC 0005 step 9's socket probe -- `ring3_socketeer`, which
 # is `ring3_lister` with a `sockaddr_in6` copied in beside its code instead of
 # two filenames. The same two blocks every hosted probe has: one

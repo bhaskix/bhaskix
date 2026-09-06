@@ -1647,6 +1647,20 @@ pub struct Device {
     /// The admin transmit ring as this kernel writes it -- its direct-map
     /// address -- or zero until [`Device::enable_admin_queues`] attaches one.
     ring: u64,
+    /// The LAN transmit ring as this kernel writes it, or zero until
+    /// [`Device::attach_transmit_ring`] names one.
+    transmit_ring: u64,
+    /// How many descriptors that ring holds.
+    transmit_depth: u32,
+    /// The next free descriptor in it.
+    ///
+    /// **One cursor, owned here, because two callers doing this arithmetic
+    /// separately got it wrong.** A loop that restarted at slot zero while the
+    /// device's head stood at two wrote forty-five frames behind the head and
+    /// moved the tail *backwards*; the device fetched none of them and the
+    /// boot reported a switch that would not answer. The device never saw a
+    /// frame to answer.
+    transmit_next: u32,
     /// The next transmit descriptor to use, which is also what `PF_ATQT` is
     /// written with after each post: a tail is the last valid descriptor plus
     /// one, in 38.39.2.18.14's words for the receive tail and Table 38-341's
@@ -1671,6 +1685,9 @@ impl Device {
     pub const unsafe fn new(registers: u64) -> Self {
         Self {
             registers,
+            transmit_ring: 0,
+            transmit_depth: 0,
+            transmit_next: 0,
             ring: 0,
             next: 0,
         }
@@ -2320,6 +2337,77 @@ impl Device {
             core::hint::spin_loop();
         }
         false
+    }
+
+    /// Names the LAN transmit ring this driver will post frames into.
+    ///
+    /// # Safety
+    ///
+    /// `host` must be the direct-map address of the ring the queue's context
+    /// points at, writable, `descriptors` deep, and written by nothing else.
+    pub unsafe fn attach_transmit_ring(&mut self, host: u64, descriptors: u16) {
+        self.transmit_ring = host;
+        self.transmit_depth = u32::from(descriptors);
+        self.transmit_next = 0;
+    }
+
+    /// Posts one frame on the transmit queue and rings its doorbell.
+    ///
+    /// `uplink` precedes the data descriptor with a context descriptor
+    /// carrying [`TX_SWTCH_UPLINK`], which a control frame needs to bypass the
+    /// internal switch's filters.
+    ///
+    /// Returns the descriptor index to poll for completion, or `None` if no
+    /// ring is attached or the frame needs more slots than the ring has.
+    ///
+    /// **The cursor is this driver's**, and advancing it here rather than in
+    /// each caller is the whole point: the tail must only ever move forward,
+    /// and a caller that recomputes a slot from its own counter does not know
+    /// where the previous caller left it.
+    pub fn post_frame(&mut self, buffer: u64, bytes: u16, uplink: bool) -> Option<u32> {
+        if self.transmit_ring == 0 {
+            return None;
+        }
+        let needed = if uplink { 2 } else { 1 };
+        if self.transmit_depth < needed {
+            return None;
+        }
+        // Wrap before writing rather than across the pair, so a frame's
+        // descriptors are always contiguous and the tail is always the slot
+        // after the last one written.
+        if self.transmit_next + needed > self.transmit_depth {
+            self.transmit_next = 0;
+        }
+        if uplink {
+            // SAFETY: `attach_transmit_ring`'s contract, and the slot is
+            // inside the ring's depth by the wrap above.
+            unsafe {
+                post_transmit_context(self.transmit_ring, self.transmit_next, TX_SWTCH_UPLINK);
+            }
+            self.transmit_next += 1;
+        }
+        let data = self.transmit_next;
+        // SAFETY: as above.
+        unsafe { post_transmit_descriptor(self.transmit_ring, data, buffer, bytes) };
+        self.transmit_next += 1;
+        Some(data)
+    }
+
+    /// The tail this driver's cursor now stands at, for the doorbell.
+    #[must_use]
+    pub const fn transmit_tail(&self) -> u32 {
+        self.transmit_next
+    }
+
+    /// Whether the frame posted at `index` has been written back.
+    ///
+    /// # Safety
+    ///
+    /// A ring must be attached.
+    #[must_use]
+    pub unsafe fn frame_completed(&self, index: u32) -> bool {
+        // SAFETY: per the caller and `attach_transmit_ring`'s contract.
+        unsafe { transmit_completed(self.transmit_ring, index) }
     }
 
     /// What a transmit queue's enable handshake currently reads, as
