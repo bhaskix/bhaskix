@@ -502,6 +502,15 @@ const OPCODE_SET_VSI_PROMISCUOUS: u16 = 0x0254;
 const PROMISCUOUS_MULTICAST: u16 = 1 << 1;
 /// Table 38-253, modes bit 2: promiscuous broadcast.
 const PROMISCUOUS_BROADCAST: u16 = 1 << 2;
+/// Table 38-253, modes bit 4: promiscuous VLAN.
+///
+/// **The flag a trunk port needs.** Without it the unicast, multicast and
+/// broadcast flags apply per-VLAN, so on a port carrying 802.1Q-tagged traffic
+/// a VSI can be counted as receiving frames and still hand none to a queue.
+/// The datasheet's note is the tell: *"if VSI is in promiscuous VLAN mode, the
+/// VLAN ID should not be used"*, meaning that otherwise a VLAN ID is what the
+/// other flags are scoped by.
+const PROMISCUOUS_VLAN: u16 = 1 << 4;
 
 /// Bytes one segment descriptor covers -- 38.26.1: *"each SD represents 2 MB
 /// of HMC PM address space"*.
@@ -1748,9 +1757,9 @@ impl Device {
         }
     }
 
-    /// Sets a VSI's multicast and broadcast promiscuity -- Table 38-253, with
-    /// both modes named in the valid mask every time, so that clearing is the
-    /// same command as setting and nothing is left half-changed.
+    /// Sets a VSI's multicast, broadcast and VLAN promiscuity -- Table 38-253,
+    /// with every mode named in the valid mask each time, so that clearing is
+    /// the same command as setting and nothing is left half-changed.
     ///
     /// # Errors
     ///
@@ -1760,6 +1769,7 @@ impl Device {
         seid: u16,
         multicast: bool,
         broadcast: bool,
+        vlan: bool,
         spins: u32,
     ) -> Result<(), CommandError> {
         let mut request = Descriptor::direct(OPCODE_SET_VSI_PROMISCUOUS);
@@ -1770,7 +1780,10 @@ impl Device {
         if broadcast {
             modes |= PROMISCUOUS_BROADCAST;
         }
-        let valid = PROMISCUOUS_MULTICAST | PROMISCUOUS_BROADCAST;
+        if vlan {
+            modes |= PROMISCUOUS_VLAN;
+        }
+        let valid = PROMISCUOUS_MULTICAST | PROMISCUOUS_BROADCAST | PROMISCUOUS_VLAN;
         // Bytes 16-17 the modes, 18-19 the valid mask, 20-21 the SEID.
         request.words[4] = u32::from(modes) | (u32::from(valid) << 16);
         request.words[5] = u32::from(seid & 0x3ff);

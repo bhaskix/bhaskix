@@ -12863,46 +12863,6 @@ fn pause_millis(millis: u64) -> bool {
     }
 }
 
-/// Polls the first receive descriptor for a completion, for up to `millis`.
-///
-/// Returns the completion and how long it took, in milliseconds on the
-/// calibrated clock -- or `u64::MAX` for an untimed wait.
-///
-/// # Safety
-///
-/// `ring_host` must be the direct-map address of a posted receive ring.
-unsafe fn wait_for_first_frame(
-    ring_host: u64,
-    millis: u64,
-) -> Option<(i40e::ReceiveCompletion, u64)> {
-    let start = time::now_nanos();
-    let mut spins: u64 = 0;
-    loop {
-        // SAFETY: per the caller; descriptor zero of the ring.
-        if let Some(completion) = unsafe { i40e::completed_descriptor(ring_host, 0) } {
-            let elapsed = match (start, time::now_nanos()) {
-                (Some(start), Some(now)) => now.saturating_sub(start) / 1_000_000,
-                _ => u64::MAX,
-            };
-            return Some((completion, elapsed));
-        }
-        match (start, time::now_nanos()) {
-            (Some(start), Some(now)) => {
-                if now.saturating_sub(start) >= millis * 1_000_000 {
-                    return None;
-                }
-            }
-            _ => {
-                spins += 1;
-                if spins >= millis.saturating_mul(200_000) {
-                    return None;
-                }
-            }
-        }
-        core::hint::spin_loop();
-    }
-}
-
 /// Which VSI and which queue a receive bring-up is for.
 ///
 /// Grouped rather than passed one by one because two of the four are
@@ -13191,15 +13151,34 @@ fn bring_up_receive_queue(
     } = target;
 
     const SPINS: u32 = 2_000_000;
+    /// **Eight queues, not one.** The VSI takes frames in and hands none to
+    /// queue zero, so the question is which of its queues they go to -- and a
+    /// single ring cannot answer it. Eight is what fits: `QLEN` must be a
+    /// whole multiple of 32 outside PXE mode, 32 sixteen-byte descriptors is
+    /// 512 bytes, and eight such rings are one page.
+    const QUEUES: u32 = 8;
     /// `QLEN`: a whole multiple of 32 once PXE mode is off.
     const DESCRIPTORS: u16 = 32;
-    /// Posted: a multiple of eight, which is the tail's granularity outside
-    /// PXE mode, and one page each so a buffer is a frame.
-    const BUFFERS: usize = 16;
-    const BUFFER_BYTES: u16 = 4096;
+    /// Bytes one ring occupies.
+    const RING_STRIDE: u64 = DESCRIPTORS as u64 * i40e::RECEIVE_DESCRIPTOR_BYTES;
+    /// Posted per queue: a multiple of eight, the tail's granularity outside
+    /// PXE mode.
+    const POSTED: u32 = 8;
+    /// *"It must be at least 1 KB bytes"*, and in 128-byte units. A kilobyte
+    /// each keeps sixty-four buffers inside one object.
+    const BUFFER_BYTES: u16 = 1024;
     /// A standard frame with a tag and its CRC fits; jumbo frames are dropped.
+    /// `RXMAX` must not exceed five buffers, and 1536 is well inside that.
     const MAX_FRAME: u16 = 1536;
     const FRAME: u64 = bhaskix_mm::FRAME_SIZE;
+    const _: () = assert!(
+        QUEUES as u64 * RING_STRIDE <= 4096,
+        "the rings must share one page"
+    );
+    const _: () = assert!(
+        MAX_FRAME as u32 <= 5 * BUFFER_BYTES as u32,
+        "RXMAX spans five buffers"
+    );
 
     // **Out of PXE mode first** -- 38.30.2.1's *"operating system driver only
     // step"*, and the queue-length rule depends on it.
@@ -13227,7 +13206,9 @@ fn bring_up_receive_queue(
         );
         return;
     };
-    let Some((buffers_device, buffers_host, _)) = nic_pages(owner, device, hhdm, BUFFERS as u64)
+    let buffer_pages = (u64::from(QUEUES) * u64::from(POSTED) * u64::from(BUFFER_BYTES))
+        .div_ceil(bhaskix_mm::FRAME_SIZE);
+    let Some((buffers_device, buffers_host, _)) = nic_pages(owner, device, hhdm, buffer_pages)
     else {
         println!(
             "\x1b[93m    nic rx ring    no buffer pages the device can reach; no queue is taken\x1b[0m"
@@ -13323,37 +13304,77 @@ fn bring_up_receive_queue(
         return;
     }
 
-    // **The context and the ring.** The context goes where the HMC will fetch
-    // it; the descriptors name one buffer each, and only `BUFFERS` of the
-    // ring's `DESCRIPTORS` are handed over.
-    let context = i40e::ReceiveContext {
-        ring: ring_device,
-        descriptors: DESCRIPTORS,
-        buffer_bytes: BUFFER_BYTES,
-        max_frame: MAX_FRAME,
+    // **A context and a ring for each of the eight queues.** Every context
+    // lands in the one backing page already named -- they are 32 bytes apart
+    // and the first is at the page's start -- and every ring in the one rings
+    // page, so eight queues cost no more mapped memory than one did.
+    let rings = ReceiveRings {
+        device: ring_device,
+        host: ring_host,
+        stride: RING_STRIDE,
+        queues: QUEUES,
+        first: queue,
+        posted: POSTED,
     };
-    // SAFETY: `backing_host` is the direct-map address of the zeroed backing
-    // page just named; the offset is inside it; the device has not fetched
-    // from it because the queue is not enabled.
-    unsafe { i40e::write_receive_context(backing_host + u64::from(at.offset), &context) };
-    let mut buffers = [0u64; BUFFERS];
-    for (index, buffer) in buffers.iter_mut().enumerate() {
-        *buffer = buffers_device + index as u64 * FRAME;
+    let buffers = ReceiveBuffers {
+        device: buffers_device,
+        hosts: buffers_host,
+        bytes: u64::from(BUFFER_BYTES),
+        per_queue: POSTED,
+    };
+    let mut contexts = 0;
+    for index in 0..QUEUES {
+        let absolute = rings.queue(index);
+        let where_at = i40e::context_location(memory.rx_base, memory.rx_object_size, absolute);
+        if where_at.segment != at.segment || where_at.page != at.page {
+            println!(
+                "\x1b[93m    nic rx ring    queue {absolute}'s context is in segment {} page {}, \
+                 outside the one page this step backs; {index} queue(s) set up\x1b[0m",
+                where_at.segment, where_at.page
+            );
+            break;
+        }
+        let context = i40e::ReceiveContext {
+            ring: rings.device_ring(index),
+            descriptors: DESCRIPTORS,
+            buffer_bytes: BUFFER_BYTES,
+            max_frame: MAX_FRAME,
+        };
+        // SAFETY: `backing_host` is the direct-map address of the zeroed
+        // backing page just named; the offset is inside it; the device has not
+        // fetched from it because the queue is not enabled.
+        unsafe {
+            i40e::write_receive_context(backing_host + u64::from(where_at.offset), &context);
+        }
+        let mut posted = [0u64; POSTED as usize];
+        for (slot, buffer) in posted.iter_mut().enumerate() {
+            *buffer = buffers.device_at(index, slot as u32);
+        }
+        // SAFETY: `host_ring` is inside the zeroed rings page and has room for
+        // `DESCRIPTORS`; the queue is not enabled.
+        unsafe { i40e::post_receive_descriptors(rings.host_ring(index), &posted) };
+        contexts += 1;
     }
-    // SAFETY: `ring_host` is the direct-map address of a zeroed page, so the
-    // ring has room for `DESCRIPTORS`; the queue is not enabled.
-    unsafe { i40e::post_receive_descriptors(ring_host, &buffers) };
     println!(
-        "    nic rx ring    {DESCRIPTORS} descriptors at {ring_device:#x}, {BUFFERS} posted with \
-         {BUFFER_BYTES}-byte buffers from {buffers_device:#x}; frames up to {MAX_FRAME} bytes"
+        "    nic rx ring    {contexts} queue(s) from absolute {queue}: {DESCRIPTORS} descriptors \
+         each at {ring_device:#x} +{RING_STRIDE}, {POSTED} posted with {BUFFER_BYTES}-byte buffers \
+         from {buffers_device:#x}; frames up to {MAX_FRAME} bytes"
     );
+    let rings = ReceiveRings {
+        queues: contexts,
+        ..rings
+    };
+    if contexts == 0 {
+        return;
+    }
 
     // **What the VSI forwards.** Its own MAC filter takes only frames sent to
     // this port; what a switch sends unprompted is multicast and broadcast,
     // and the command the datasheet names for forwarding broadcast is this.
-    match nic.set_promiscuous(vsi, true, true, SPINS) {
+    match nic.set_promiscuous(vsi, true, true, true, SPINS) {
         Ok(()) => println!(
-            "    nic filter     VSI seid {vsi:#x} now forwards multicast and broadcast to its queues"
+            "    nic filter     VSI seid {vsi:#x} now forwards multicast, broadcast and **any \
+             VLAN** to its queues"
         ),
         Err(error) => println!(
             "\x1b[93m    nic filter     Set VSI Promiscuous Modes: {error}; only frames to this \
@@ -13363,10 +13384,10 @@ fn bring_up_receive_queue(
 
     // **Armed before enabled.** With everything in place but the enable, the
     // first descriptor must stay untouched.
-    // SAFETY: `ring_host` is the posted ring's direct-map address.
-    let early = unsafe { wait_for_first_frame(ring_host, 100) };
+    // SAFETY: `rings` describes the posted rings.
+    let early = unsafe { wait_for_any_frame(&rings, 100) };
     println!(
-        "    nic rx armed   with the queue still disabled, {}",
+        "    nic rx armed   with every queue still disabled, {}",
         match early {
             Some(_) =>
                 "\x1b[91ma descriptor completed anyway -- which nothing should have done\x1b[0m",
@@ -13396,19 +13417,25 @@ fn bring_up_receive_queue(
     // **Enable** -- after the 50 ms 38.30.3.3.2 asks for since the last
     // disable, which the PF reset and the PXE-mode clear both were.
     let timed = pause_millis(50);
-    let enabled = nic.enable_receive_queue(queue, BUFFERS as u32, SPINS);
-    let (requested, active) = nic.receive_queue_state(queue);
-    println!(
-        "    nic rx queue   absolute queue {queue} enable requested{}; QENA_STAT {} (REQ={} STAT={})",
-        if timed { "" } else { " after an untimed pause" },
-        if enabled {
-            "set"
+    let mut enabled = 0;
+    let mut refused = 0;
+    for index in 0..rings.queues {
+        if nic.enable_receive_queue(rings.queue(index), POSTED, SPINS) {
+            enabled += 1;
         } else {
-            "\x1b[91mnever set\x1b[0m"
-        },
-        u8::from(requested),
-        u8::from(active)
+            refused += 1;
+        }
+    }
+    println!(
+        "    nic rx queue   absolute queues {}..={} enabled{}: {enabled} answered QENA_STAT",
+        rings.queue(0),
+        rings.queue(rings.queues - 1),
+        if timed { "" } else { " after an untimed pause" }
     );
+    if refused > 0 {
+        println!("\x1b[91m                   {refused} queue(s) never set QENA_STAT\x1b[0m");
+    }
+    let enabled = enabled > 0;
 
     // **The gate: a frame from the switch arrives, and the report prints its
     // length and EtherType.**
@@ -13422,17 +13449,17 @@ fn bring_up_receive_queue(
     // and any ordinary ARP. If nothing lands in a minute on a live 1 Gb/s
     // port, "the wire was quiet" stops being the comfortable explanation.
     if enabled {
-        // SAFETY: as above.
-        match unsafe { wait_for_first_frame(ring_host, 60_000) } {
-            Some((completion, elapsed)) => {
-                // SAFETY: `buffers_host[0]` is the direct-map address of the
-                // buffer descriptor zero named, a page long, and the device
-                // has marked the descriptor done.
-                let header = unsafe { i40e::frame_header(buffers_host[0]) };
+        // SAFETY: `rings` describes the posted, now-enabled rings.
+        match unsafe { wait_for_any_frame(&rings, 60_000) } {
+            Some((index, slot, completion, elapsed)) => {
+                // SAFETY: the device marked this descriptor done.
+                let header = unsafe { i40e::frame_header(buffers.host_at(index, slot)) };
                 println!(
-                    "\x1b[92m    nic rx frame   a frame arrived after {} ms: {} bytes, EtherType {:#06x} \
-                     ({}){}, {} to {} from {}, packet type {}{}{}\x1b[0m",
+                    "\x1b[92m    nic rx frame   a frame arrived after {} ms in absolute queue {}, \
+                     descriptor {slot}: {} bytes, EtherType {:#06x} ({}){}, {} to {} from {}, packet \
+                     type {}{}{}\x1b[0m",
                     if elapsed == u64::MAX { 0 } else { elapsed },
+                    rings.queue(index),
                     completion.length,
                     header.ethertype,
                     header.ethertype_name(),
@@ -13456,50 +13483,29 @@ fn bring_up_receive_queue(
                     },
                 );
                 if let Some(tag) = header.vlan {
-                    println!("                   VLAN tag control {tag:#06x}");
+                    println!(
+                        "                   VLAN tag control {tag:#06x} -- VLAN {}",
+                        tag & 0x0fff
+                    );
                 }
                 // SAFETY: as the header read above.
-                unsafe { dump_frame(buffers_host[0], completion.length as usize) };
+                unsafe { dump_frame(buffers.host_at(index, slot), completion.length as usize) };
             }
             None => println!(
-                "\x1b[91m    nic rx frame   FAILED: no frame in 60 s with the queue enabled and \
-                 the link up\x1b[0m"
+                "\x1b[91m    nic rx frame   FAILED: no frame in 60 s in any of the {} queues, with \
+                 the link up\x1b[0m",
+                rings.queues
             ),
         }
 
-        // **Every posted descriptor, not just the first.** The wait watches
-        // descriptor zero because that is where a queue starting at head zero
-        // puts its first frame. If the device disagreed about where to start,
-        // that wait would report nothing while the ring held something, and
-        // the two are worth telling apart in the same boot rather than in the
-        // next one. Free to ask, and it says nothing when there is nothing.
-        let mut completed = 0;
-        let mut first_at = None;
-        for index in 0..BUFFERS as u32 {
-            // SAFETY: as above; `index` is inside the posted ring.
-            if let Some(completion) = unsafe { i40e::completed_descriptor(ring_host, index) } {
-                completed += 1;
-                if first_at.is_none() {
-                    first_at = Some((index, completion));
-                }
-            }
-        }
-        match first_at {
-            None => println!(
-                "    nic rx ring    none of the {BUFFERS} posted descriptors completed, so the \
-                 ring is untouched rather than filled elsewhere"
-            ),
-            Some((index, completion)) => println!(
-                "    nic rx ring    {completed} of {BUFFERS} descriptor(s) completed, the first at \
-                 index {index}: {} bytes, {}",
-                completion.length,
-                completion.cast_name()
-            ),
-        }
+        // **Every queue, so the answer names one.** This is what more than one
+        // ring was for: if a hash spreads frames across the VSI's queues, the
+        // one that fills says which.
+        // SAFETY: as above.
+        let total = unsafe { report_rings(&rings, &buffers, "while enabled") };
+        let _ = total;
 
-        // **What the port saw, as against what this queue got.** This is the
-        // question three boots could not answer: a silent queue means nothing
-        // until the port says whether anything was there to receive.
+        // **What the port saw, as against what these queues got.**
         let port_delta = nic.port_counters(port).since(&port_before);
         let vsi_delta = nic.vsi_counters(vsi_number).since(&vsi_before);
         println!(
@@ -13526,23 +13532,18 @@ fn bring_up_receive_queue(
                 port_delta.oversize
             );
         }
-        // The VSI index is assumed to be the VSI number -- the datasheet
-        // assigns a statistics set when a VSI is added, and firmware added
-        // this one. Said plainly so it is never read as a measurement.
         println!(
-            "    nic stats      VSI {vsi_number} over the window (index assumed to be the VSI \
-             number): {} packet(s), {} discarded",
+            "    nic stats      VSI {vsi_number} over the window: {} packet(s), {} discarded",
             vsi_delta.packets(),
             vsi_delta.discarded
         );
         println!(
             "    nic stats      \x1b[1m{}\x1b[0m",
-            if port_delta.saw_anything() {
-                "the port saw traffic and this queue got none -- steering or filtering, not a \
-                 quiet wire"
-            } else {
-                "the port saw nothing at all -- nothing was sent here, so the silence is the \
-                 wire and not the receive path"
+            match (port_delta.saw_anything(), total > 0) {
+                (_, true) => "frames reached a queue -- the receive path carries traffic",
+                (true, false) =>
+                    "the port saw traffic and no queue got any -- still steering or filtering",
+                (false, false) => "the port saw nothing at all, so the silence is the wire",
             }
         );
     }
@@ -13555,43 +13556,13 @@ fn bring_up_receive_queue(
     let sent = send_frames(nic, &transmit, target, &memory);
 
     if sent {
-        // **The same ring, asked again.** A loopback of the self-addressed
-        // frame, or an answer to the broadcast, arrives here.
-        let mut after = 0;
-        let mut first_after = None;
-        for index in 0..BUFFERS as u32 {
-            // SAFETY: as the earlier scan; `index` is inside the posted ring.
-            if let Some(completion) = unsafe { i40e::completed_descriptor(ring_host, index) } {
-                after += 1;
-                if first_after.is_none() {
-                    first_after = Some((index, completion));
-                }
-            }
-        }
-        match first_after {
-            None => {
-                println!("    nic rx after   still nothing in the receive ring after transmitting")
-            }
-            Some((index, completion)) => {
-                // SAFETY: `buffers_host[index]` is the direct-map address of
-                // the buffer that descriptor named, and the device has marked
-                // the descriptor done.
-                let header = unsafe { i40e::frame_header(buffers_host[index as usize]) };
-                println!(
-                    "\x1b[92m    nic rx after   {after} descriptor(s) completed after transmitting; the \
-                     first at index {index}: {} bytes, EtherType {:#06x} ({}), {} to {} from {}\x1b[0m",
-                    completion.length,
-                    header.ethertype,
-                    header.ethertype_name(),
-                    completion.cast_name(),
-                    MacAddress(header.destination),
-                    MacAddress(header.source)
-                );
-                // SAFETY: as the header read above.
-                unsafe {
-                    dump_frame(buffers_host[index as usize], completion.length as usize);
-                }
-            }
+        // **Every ring, asked again.** A loopback of the self-addressed frame,
+        // or an answer to the broadcast, arrives in whichever queue the VSI
+        // steers it to.
+        // SAFETY: `rings` describes the posted rings.
+        let after = unsafe { report_rings(&rings, &buffers, "after transmitting") };
+        if after == 0 {
+            println!("    nic rx after   still nothing in any receive ring after transmitting");
         }
     }
 
@@ -13651,7 +13622,7 @@ fn bring_up_receive_queue(
             if disabled { "clear" } else { "still set" }
         );
     }
-    if let Err(error) = nic.set_promiscuous(vsi, false, false, SPINS) {
+    if let Err(error) = nic.set_promiscuous(vsi, false, false, false, SPINS) {
         println!(
             "\x1b[93m    nic filter     could not restore the VSI's filtering: {error}\x1b[0m"
         );
@@ -13689,6 +13660,190 @@ unsafe fn dump_frame(buffer_host: u64, bytes: usize) {
         }
         println!();
     }
+}
+
+/// Several receive rings, laid out one after another in a single page.
+///
+/// **Eight of them fit exactly.** `QLEN` must be a whole multiple of 32 once
+/// PXE mode is cleared, and 32 sixteen-byte descriptors is 512 bytes, so eight
+/// rings are one 4 KiB page and eight contexts are one backing page. The
+/// geometry is not a coincidence to be relied on, which is why the assertions
+/// below fail the build rather than the boot if it stops holding.
+#[derive(Clone, Copy)]
+struct ReceiveRings {
+    /// The rings page as the device issues it.
+    device: u64,
+    /// The same page through the direct map.
+    host: u64,
+    /// Bytes between one ring and the next.
+    stride: u64,
+    /// How many queues are set up, starting at [`ReceiveRings::first`].
+    queues: u32,
+    /// The absolute index of the first queue.
+    first: u32,
+    /// Descriptors handed to hardware in each ring.
+    posted: u32,
+}
+
+impl ReceiveRings {
+    /// Where the device fetches queue `index`'s descriptors.
+    const fn device_ring(&self, index: u32) -> u64 {
+        self.device + self.stride * index as u64
+    }
+
+    /// Where this kernel writes and reads them.
+    const fn host_ring(&self, index: u32) -> u64 {
+        self.host + self.stride * index as u64
+    }
+
+    /// The absolute queue number of the `index`th ring.
+    const fn queue(&self, index: u32) -> u32 {
+        self.first + index
+    }
+}
+
+/// The receive buffers, one contiguous run shared by every queue.
+#[derive(Clone, Copy)]
+struct ReceiveBuffers {
+    /// The run as the device issues it.
+    device: u64,
+    /// The pages behind it, through the direct map -- the frames need not be
+    /// physically contiguous even though the device sees them as one range.
+    hosts: [u64; shared::MAX_FRAMES],
+    /// Bytes per buffer.
+    bytes: u64,
+    /// Buffers given to each queue.
+    per_queue: u32,
+}
+
+impl ReceiveBuffers {
+    /// The offset of one queue's `slot`th buffer within the run.
+    const fn offset(&self, index: u32, slot: u32) -> u64 {
+        (index * self.per_queue + slot) as u64 * self.bytes
+    }
+
+    /// Where the device writes into it.
+    const fn device_at(&self, index: u32, slot: u32) -> u64 {
+        self.device + self.offset(index, slot)
+    }
+
+    /// Where this kernel reads it, which needs the page it fell in.
+    fn host_at(&self, index: u32, slot: u32) -> u64 {
+        let at = self.offset(index, slot);
+        let page = (at / bhaskix_mm::FRAME_SIZE) as usize;
+        self.hosts[page.min(shared::MAX_FRAMES - 1)] + at % bhaskix_mm::FRAME_SIZE
+    }
+}
+
+/// The first completed descriptor across every queue, if any.
+///
+/// **Every queue, not just the one a driver expects to fill.** That is the
+/// whole point of setting up more than one: the VSI takes frames in and this
+/// says which of its queues they land in, which no amount of watching a single
+/// ring could answer.
+///
+/// # Safety
+///
+/// `rings` must describe posted rings, and `buffers` their buffers.
+unsafe fn first_completion(rings: &ReceiveRings) -> Option<(u32, u32, i40e::ReceiveCompletion)> {
+    for index in 0..rings.queues {
+        let host = rings.host_ring(index);
+        for slot in 0..rings.posted {
+            // SAFETY: per the caller; `slot` is inside a posted ring.
+            if let Some(completion) = unsafe { i40e::completed_descriptor(host, slot) } {
+                return Some((index, slot, completion));
+            }
+        }
+    }
+    None
+}
+
+/// Waits for any queue to be handed a frame, for up to `millis`.
+///
+/// Returns which ring, which descriptor, what it says and how long it took --
+/// or `None`, with `u64::MAX` standing for an untimed wait as elsewhere.
+///
+/// # Safety
+///
+/// As [`first_completion`].
+unsafe fn wait_for_any_frame(
+    rings: &ReceiveRings,
+    millis: u64,
+) -> Option<(u32, u32, i40e::ReceiveCompletion, u64)> {
+    let start = time::now_nanos();
+    let mut spins: u64 = 0;
+    loop {
+        // SAFETY: per the caller.
+        if let Some((index, slot, completion)) = unsafe { first_completion(rings) } {
+            let elapsed = match (start, time::now_nanos()) {
+                (Some(start), Some(now)) => now.saturating_sub(start) / 1_000_000,
+                _ => u64::MAX,
+            };
+            return Some((index, slot, completion, elapsed));
+        }
+        match (start, time::now_nanos()) {
+            (Some(start), Some(now)) => {
+                if now.saturating_sub(start) >= millis * 1_000_000 {
+                    return None;
+                }
+            }
+            _ => {
+                spins += 1;
+                if spins >= millis.saturating_mul(200_000) {
+                    return None;
+                }
+            }
+        }
+        core::hint::spin_loop();
+    }
+}
+
+/// Reports what every ring holds, and returns how many descriptors completed.
+///
+/// # Safety
+///
+/// As [`first_completion`].
+unsafe fn report_rings(rings: &ReceiveRings, buffers: &ReceiveBuffers, when: &str) -> u32 {
+    let mut total = 0;
+    for index in 0..rings.queues {
+        let host = rings.host_ring(index);
+        let mut filled = 0;
+        let mut first = None;
+        for slot in 0..rings.posted {
+            // SAFETY: per the caller.
+            if let Some(completion) = unsafe { i40e::completed_descriptor(host, slot) } {
+                filled += 1;
+                if first.is_none() {
+                    first = Some((slot, completion));
+                }
+            }
+        }
+        total += filled;
+        if let Some((slot, completion)) = first {
+            // SAFETY: per the caller; the device marked this descriptor done.
+            let header = unsafe { i40e::frame_header(buffers.host_at(index, slot)) };
+            println!(
+                "\x1b[92m    nic rx queue   absolute queue {} took {filled} frame(s) {when}; the first \
+                 at descriptor {slot}: {} bytes, EtherType {:#06x} ({}), {} to {} from {}\x1b[0m",
+                rings.queue(index),
+                completion.length,
+                header.ethertype,
+                header.ethertype_name(),
+                completion.cast_name(),
+                MacAddress(header.destination),
+                MacAddress(header.source)
+            );
+            // SAFETY: as the header read above.
+            unsafe { dump_frame(buffers.host_at(index, slot), completion.length as usize) };
+        }
+    }
+    if total == 0 {
+        println!(
+            "    nic rx queues  none of the {} queues took a frame {when}",
+            rings.queues
+        );
+    }
+    total
 }
 
 /// Six bytes, colon-separated, for the boot report.

@@ -703,7 +703,13 @@ asm_budget = 10
 # bytes name the switch -- LLDP carries the neighbour's system name and port as
 # TLVs. Printing the bytes and decoding them off the log beats writing an LLDP
 # parser into the kernel to learn one fact about one cable.
-unsafe_budget = 2072
+#
+# 2074 on 2026-09-06: net two lines for eight receive queues instead of one.
+# The per-queue context writes and descriptor posts replace their single-queue
+# forms, and the scan that answers "which queue filled" costs a little more
+# than the one that only ever watched one ring. The single-ring waiter it
+# supersedes is gone.
+unsafe_budget = 2074
 # Up thirty-one for RFC 0005 step 9's socket probe -- `ring3_socketeer`, which
 # is `ring3_lister` with a `sockaddr_in6` copied in beside its code instead of
 # two filenames. The same two blocks every hosted probe has: one
