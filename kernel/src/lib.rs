@@ -439,6 +439,20 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
         }
         // `tearprobe=<runs>` — tries to reproduce the console tear on demand
         // rather than waiting for it at one boot in twenty-five.
+        // `bhaskix.lacp=<ms>` — RFC 0074 step 5. Both spellings, for the
+        // reason the comment above `busybox=1` gives: this file has two
+        // conventions and a flag that is accepted and does nothing is the
+        // failure it keeps recording.
+        if let Some(value) = word
+            .strip_prefix("bhaskix.lacp=")
+            .or_else(|| word.strip_prefix("lacp="))
+            && let Ok(ms) = value.parse::<u64>()
+        {
+            // Bounded below the harness's own deadline: a window past it turns
+            // a slow bond into a hung machine, and a hung machine reports
+            // nothing at all rather than reporting that it did not aggregate.
+            LACP_PATIENCE_MS.store(ms.min(120_000), core::sync::atomic::Ordering::Relaxed);
+        }
         if let Some(value) = word.strip_prefix("tearprobe=")
             && let Ok(runs) = value.parse::<u64>()
         {
@@ -3935,6 +3949,23 @@ static TEAR_NOISE_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::Atomic
 /// million laps is therefore evidence *about the model*, not only about the
 /// bug — and either answer is worth the afternoon.
 static RING_SOAK_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(2000);
+
+/// How long the boot report will wait for a bond to form, in milliseconds.
+///
+/// **Zero on every ordinary boot, and that is the point.** A bond forms in its
+/// own time -- two machines have to boot, learn their addresses, and exchange
+/// LACPDUs -- and the report is one snapshot. Reading it at a fixed instant
+/// asks whether the bond had formed *by then*, which on a pair of machines
+/// started seconds apart is a coin toss: RFC 0074 step 5's first attempt saw
+/// the same input print `speaking, and nothing has answered` once and nothing
+/// at all on the next run. A gate that does that is not a gate.
+///
+/// So the wait is a decision the image is given rather than one the kernel
+/// makes: `bhaskix.lacp=<ms>` on the command line, set by the two-guest
+/// harness and by nothing else. Every other lane has no partner and would
+/// spend the whole window learning that, which is why the default is not to
+/// wait at all.
+static LACP_PATIENCE_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// Extra runnable threads spawned alongside the ring — `ringload=<n>`.
 ///
@@ -18129,6 +18160,29 @@ fn report_net_after_exchange(hhdm: u64) {
     if count == 0 {
         return;
     }
+    // **Wait for the bond, if this image was told to.** RFC 0074 step 5.
+    //
+    // `LACP_PATIENCE_MS` is zero unless the two-guest harness set it, so every
+    // other lane reads the page exactly as it did before. Where it is set, this
+    // turns "had the bond formed at the instant the report was read?" into "did
+    // it form within the window?", which is a question with the same answer
+    // twice.
+    //
+    // Polled in 50 ms steps through `wait_millis` rather than `wait_until`,
+    // because the service that has to make progress here is another domain:
+    // spinning holds this CPU and answers slower for doing it. The loop leaves
+    // the moment the state says collecting, distributing and synchronised —
+    // the three bits `bin/ipd` publishes in the low byte of word 29 — so a
+    // bond that forms in half a second costs half a second. It sits below the
+    // page's slice rather than here, so that it reads through the same window
+    // the report does.
+    //
+    // The word `bin/ipd` publishes its LACP state in, and the three flags that
+    // mean the link is carrying traffic. Named once because the wait below and
+    // the print below that test the same bits, and two spellings of one rule is
+    // how they stop agreeing.
+    const LACP_WORD: usize = 29;
+    const AGGREGATED: u64 = 0x38;
     // Twenty-eight words, 224 bytes. Twenty-one until RFC 0063 appended what
     // the service holds and how often each slot has been reused at 23 and 24 --
     // appended, because the two words this instrument first used were the
@@ -18148,6 +18202,26 @@ fn report_net_after_exchange(hhdm: u64) {
     // a page, so the read cannot reach past the frame.
     let bytes =
         unsafe { core::slice::from_raw_parts((hhdm + pages[0]) as *const u8, ipd.len() * 8) };
+    // **The wait happens here, through the slice above and not a second window
+    // on the same page.** A window of its own would be another `unsafe` saying
+    // exactly what this one says, and the rule it would have to restate -- that
+    // the read stays inside a frame this object owns -- is the one worth having
+    // in a single place.
+    //
+    // `bin/ipd` writes this page while it is read, which is true of every word
+    // below as well: the report is a service's own account of itself, taken
+    // without stopping it.
+    let patience = LACP_PATIENCE_MS.load(Ordering::Relaxed);
+    if patience > 0 {
+        for _ in 0..(patience / 50) {
+            let mut word = [0u8; 8];
+            word.copy_from_slice(&bytes[LACP_WORD * 8..LACP_WORD * 8 + 8]);
+            if u64::from_le_bytes(word) & AGGREGATED == AGGREGATED {
+                break;
+            }
+            wait_millis(50);
+        }
+    }
     for (index, word) in ipd.iter_mut().enumerate() {
         let mut buffer = [0u8; 8];
         buffer.copy_from_slice(&bytes[index * 8..index * 8 + 8]);
@@ -18196,12 +18270,12 @@ fn report_net_after_exchange(hhdm: u64) {
     // station's own state flags; bit 48 says a partner has been heard from at
     // all, which is the difference between "nobody answered" and "we have not
     // spoken".
-    if ipd[29] != 0 {
-        let flags = ipd[29] & 0xff;
-        let heard = ipd[29] >> 32 & (1 << 16) != 0;
+    if ipd[LACP_WORD] != 0 {
+        let flags = ipd[LACP_WORD] & 0xff;
+        let heard = ipd[LACP_WORD] >> 32 & (1 << 16) != 0;
         println!(
             "    ipd lacp       state {flags:#04x} -- {}",
-            if flags & 0x38 == 0x38 {
+            if flags & AGGREGATED == AGGREGATED {
                 "\x1b[92maggregated: synchronised, collecting and distributing\x1b[0m"
             } else if heard {
                 "a partner is heard but the link is not yet aggregated"
@@ -18212,7 +18286,7 @@ fn report_net_after_exchange(hhdm: u64) {
         if heard {
             println!(
                 "                   the partner's key is {}",
-                ipd[29] >> 32 & 0xffff
+                ipd[LACP_WORD] >> 32 & 0xffff
             );
         }
     }

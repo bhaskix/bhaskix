@@ -202,7 +202,7 @@ OVMF_VARS    := $(firstword $(wildcard $(OVMF_DIR)OVMF_VARS$(OVMF_SUFFIX).fd))
 
 .PHONY: FORCE all kernel iso demo run run-uefi progress test test-host test-boot test-boot-uefi test-boot-uefi-qemu64 test-boot-iommu test-keyboard \
         test-boot-iommu-off test-boot-qemu64 test-boot-native test-boot-native-full \
-        test-placements mkfs test-shell test-faults test-usb-keyboard fmt clippy gates hooks clean distclean help
+        test-placements mkfs test-shell test-faults test-usb-keyboard test-lacp fmt clippy gates hooks clean distclean help
 
 all: iso
 
@@ -631,7 +631,7 @@ run-uefi: $(ISO)
 test: fmt clippy test-host gates test-boot test-boot-uefi test-boot-iommu test-boot-iommu-off \
       test-boot-qemu64 test-boot-uefi-qemu64 test-boot-native test-boot-native-full \
       test-placements test-shell \
-      test-keyboard test-usb-keyboard test-busybox test-faults
+      test-keyboard test-usb-keyboard test-busybox test-lacp test-faults
 	@echo
 	@echo "  all checks passed"
 
@@ -695,6 +695,18 @@ test-keyboard: $(ISO)
 # answer. This one boots with `busybox=sh`, and puts the image back afterwards.
 test-busybox: $(ISO)
 	tests/qemu/busybox-test.sh
+
+# Two guests on one wire -- RFC 0074 step 5, and the only lane that boots a
+# pair.
+#
+# LACP cannot be tested against QEMU's user-mode network at all: its gateway
+# answers ARP, ICMP and DHCP and knows nothing about 802.3ad, and a protocol
+# whose whole content is what a *partner* says needs one. So this lane joins
+# two Bhaskix guests with a socket netdev and asks each what its machine
+# believes. Like `test-busybox` it builds the image it needs -- one told to wait
+# for the bond rather than glance at it -- and puts the default back afterwards.
+test-lacp: $(ISO)
+	tests/qemu/lacp-test.sh
 
 test-boot: $(ISO)
 	tests/qemu/boot-test.sh bios

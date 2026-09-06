@@ -1868,6 +1868,20 @@ extern "C" fn ipd_main() -> ! {
     let mut asked = false;
     let mut pinged = false;
     let mut quiet = 0u32;
+    // **Empty passes since the demonstration began, which nothing resets.**
+    //
+    // `quiet` is a *consecutive* run and a frame clears it, which is right for
+    // "the wire has gone quiet, and the work is done". It is exactly wrong as a
+    // backstop: on a segment carrying anybody else's traffic the run never gets
+    // long, so a demonstration that will never finish never ends either.
+    //
+    // Measured, 2026-09-06, on two guests joined by one wire: neither reached
+    // `serve` in sixty seconds. Each had made thirteen million empty passes
+    // with a longest run of two hundred thousand -- a hundredth of the
+    // backstop -- because each kept clearing the other's counter with ARP and
+    // DHCP nobody was going to answer. A quiet link is a test network. This is
+    // the number that does not assume one.
+    let mut spent = 0u32;
     let mut run = 0u64;
     let mut sockets = [Socket {
         port: 0,
@@ -2299,6 +2313,7 @@ extern "C" fn ipd_main() -> ! {
             // have**, and that is the honest reason this exits rather than
             // idles.
             quiet = quiet.saturating_add(1);
+            spent = spent.saturating_add(1);
             // Not before the work is done. Twenty thousand idle passes elapse
             // in a fraction of a second, and the kernel cannot publish this
             // program's configuration until the driver has read the device's
@@ -2306,8 +2321,12 @@ extern "C" fn ipd_main() -> ! {
             // anything to be idle about.
             //
             // The second bound is the backstop for a machine where the
-            // configuration never comes at all, which is every boot without a
-            // DMA window: there is nothing to wait for and no reason to spin.
+            // demonstration cannot finish -- no DMA window, so no configuration
+            // and nothing to wait for, or a link with nothing on it that
+            // answers. It counts *total* empty passes rather than a run of
+            // them, because a run is cleared by any frame at all and the frames
+            // that clear it need have nothing to do with this program. See
+            // `spent`.
             let done = asked && pinged;
             // **Not while a burst phase is unfinished.** This left for `serve`
             // with the last phase at 245 replies of 256: the ring went quiet
@@ -2321,7 +2340,7 @@ extern "C" fn ipd_main() -> ! {
             // every machine with no network, which is every BIOS boot.
             if can_send && pongs >= 1 && phase < 4 {
                 // Still measuring. Fall through to another pass.
-            } else if (done && quiet > 20_000) || quiet > 2_000_000 {
+            } else if (done && quiet > 20_000) || spent > 2_000_000 {
                 // **Serve rather than stop.** Through step 4 this program
                 // exited here, because it had nothing to wait on and a poll
                 // loop that never ends is a processor nobody else can have.

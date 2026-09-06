@@ -26,7 +26,7 @@
 
 # Builds the device list.
 #
-#   $1  profile — `full`, `usb`, `disks`, or `one-disk`
+#   $1  profile — `full`, `usb`, `disks`, `one-disk`, or `paired`
 #   $2  translated — `yes` if the devices must go through an IOMMU (optional,
 #       defaults to `no`; only `full` has ever needed it)
 #
@@ -274,6 +274,53 @@ qemu_device_list() {
                 # has to tell them apart.
                 -drive "file=$sata_disk,format=raw,if=none,id=sata0"
                 -device ide-hd,drive=sata0,bus=ide.0
+            )
+            ;;
+        paired)
+            # **Two guests on one wire** -- RFC 0074 step 5, and the only
+            # profile whose machine is half of a pair.
+            #
+            # Every other networked profile uses QEMU's `user` netdev, whose
+            # gateway answers ARP, ICMP and DHCP and knows nothing about
+            # 802.3ad. LACP has no meaning against it: the protocol needs a
+            # *partner* running the same state machine, and there is no way to
+            # ask slirp to be one. `socket` is QEMU's only netdev that carries
+            # raw frames between two guests, so this profile is what makes a
+            # second Bhaskix the partner.
+            #
+            # **The role is the caller's and the shape is this file's**, the
+            # same division `BHASKIX_INBOUND_PORT` already uses above: a
+            # harness says *listen* or *connect* and which port, and the netdev
+            # it gets is described here where it can be compared with the
+            # others.
+            #
+            # `listen` must be started first -- `connect` fails outright if
+            # nothing is listening, while a listener waits -- and that ordering
+            # is the pair's whole synchronisation.
+            #
+            # One disk, because this machine is about the wire: the initrd is
+            # what `bin/netd` and `bin/ipd` are loaded from, and a second disk
+            # would be a writable image two machines booting at once would
+            # both take a lock on.
+            # **And the two halves must not be the same machine.** QEMU gives
+            # every guest the same default address, and LACP's system id *is*
+            # that address -- so a pair left on the default aggregates with a
+            # partner indistinguishable from itself, which proves the arithmetic
+            # and nothing about two systems. Distinct addresses here make the
+            # partner a partner. They are in the locally-administered range and
+            # differ in the last byte, so the boot reports name which guest is
+            # which.
+            local pair_port="${BHASKIX_PAIR_PORT:-45559}"
+            local pair_end="connect=127.0.0.1:$pair_port"
+            local pair_mac="52:54:00:0a:cb:02"
+            if [[ "${BHASKIX_PAIR_ROLE:-listen}" == "listen" ]]; then
+                pair_end="listen=127.0.0.1:$pair_port"
+                pair_mac="52:54:00:0a:cb:01"
+            fi
+            VIRTIO_ARGS=(
+                -device "virtio-blk-pci,drive=disk0$suffix"
+                -netdev "socket,id=net0,$pair_end"
+                -device "virtio-net-pci,netdev=net0,mac=$pair_mac$suffix"
             )
             ;;
         usb)

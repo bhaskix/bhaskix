@@ -166,44 +166,64 @@ address on the VLAN, and the existing network gates running over it.
 > **Gate:** the UDP, TCP, IPv6 and DHCP gates pass with the stack sitting on a
 > VLAN over a bond rather than on a device.
 
-## Step 5, attempted 2026-09-06 — the mechanism is built and the gate is NOT met
+## Step 5, met 2026-09-06 — two guests, one wire, and a bond that formed
 
-`bin/ipd` speaks LACP over the virtio path now: it starts a machine once it
-knows its own address, opens with a bounded burst of LACPDUs, answers every one
-that arrives, and publishes what the machine believes. All of it passes fmt,
-clippy, the host tests and every boot lane.
+**The gate is met.** `tests/qemu/lacp-test.sh` boots two Bhaskix guests joined
+by a socket netdev — QEMU's only netdev that carries raw frames between guests —
+and both report the same thing:
 
-**What is not proven is that two guests aggregate**, and the reason is the
-observation point rather than the protocol.
+    ipd lacp       state 0x3f -- aggregated: synchronised, collecting and distributing
 
-* **The boot report is a snapshot, and it races.** The kernel reads `bin/ipd`'s
-  report page during bring-up; the LACP machine lives in `serve`, which the
-  service enters *after* the demonstration. Whether a state established in
-  `serve` appears in the report is therefore a race, and it was seen to fall
-  both ways across runs — one guest printed `state 0x07 -- speaking, and
-  nothing has answered`, and later runs printed nothing at all. **A gate that
-  reports differently on identical input is not a gate.**
-* **A harness must go through `tests/qemu/devices.sh`.** The two-guest script
-  written for this built its own QEMU command line and the invariant checker
-  refused it, correctly. It was removed rather than left in the tree.
+Both sides, because a bond is symmetric: a run where one end says it is
+aggregated and the other says nothing answered has found a bug, not half a
+pass. The two guests are given **different addresses** in `devices.sh`, and that
+is not tidiness — LACP's system id *is* the address, and QEMU gives every guest
+the same default, so a pair left on it aggregates with a partner
+indistinguishable from itself and proves the arithmetic rather than two systems.
 
-**What the attempt did establish**, and both are worth keeping:
+**Watched red.** With `LACP_OPENINGS` set to zero, so neither guest opens the
+conversation, both sides print `state 0x07 -- speaking, and nothing has
+answered` and the harness fails on each. The assertion distinguishes the two
+states rather than matching anything that mentions LACP.
 
-* **A real defect in `bin/ipd`, unrelated to LACP.** Its configuration was read
-  *only* during the demonstration phase. On a link with no gateway that phase
-  ends before `bin/netd` has read the device's address, so the service held an
-  unspecified address for the life of the boot and could send nothing at all.
-  It is read from the serve loop and once more before entering it now.
-* **The IOMMU is not optional for any networked lane.** Four two-guest runs
-  read as "LACP failed" when the guests simply had no DMA window, so no address
-  was ever published. The `net config` line is what said so.
+### The first attempt failed, and its two reasons were not the protocol
 
-**What would meet the gate**, in the order worth trying: give the report a
-later reader, or a second one, so a state reached in `serve` is observable at
-all; then build the two-guest harness through `devices.sh` as the rule
-requires. The protocol underneath is host-tested against the standard's layout
-and its convergence rules, and none of that is in question here — what is
-missing is a way to watch two machines do it.
+Recorded here because they were both real, and one of them was a defect in this
+system that had nothing to do with aggregation.
+
+**`bin/ipd` never reached its serve loop on a wire with anybody else on it.**
+The demonstration phase ends when the ring has been quiet for a long run of
+passes — and a *run* is cleared by any frame at all, including frames this
+program has no interest in. Two guests kept clearing each other's counter with
+ARP and DHCP nobody was going to answer, so neither left the demonstration in
+sixty seconds: thirteen million empty passes each, with a longest run of two
+hundred thousand, a hundredth of the backstop. **A quiet link is a test
+network.** The backstop counts total empty passes now, which is the number that
+does not assume one, and the twenty-thousand run still ends a demonstration that
+actually finished. This would have bitten on any real network, and it was found
+by putting a second machine on the wire.
+
+**The report is a snapshot, and a bond does not form at an instant.** Two
+machines have to boot, learn their addresses and exchange LACPDUs; read at a
+fixed point the answer is a coin toss, and it was — the same input printed
+`speaking, and nothing has answered` once and nothing at all on the next run.
+`bhaskix.lacp=<ms>` tells the boot report to *wait* for the bond, which turns
+"had it formed by then?" into "did it form within the window?", a question with
+the same answer twice. It is set by this one harness and by nothing else,
+because every other lane has no partner and would spend the window finding that
+out.
+
+The removed harness's third reason stands as well: a QEMU harness must not build
+its own device list, and the first one did. This one asks `devices.sh` for a
+`paired` profile and tells it a role.
+
+### What this does not prove
+
+That the SR550's switch will aggregate with this. The partner here is another
+copy of the same implementation, so a rule both sides read the same wrong way
+would still converge. [RFC 0073](0073-speaking-lacp-so-the-switch-will-listen.md)
+records what that machine has done so far, and it is not a dependency of this
+row.
 
 ## Alternatives considered
 
