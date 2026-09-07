@@ -1586,6 +1586,24 @@ impl ReceiveCompletion {
     }
 }
 
+/// Writes one receive descriptor at `index`, giving the device a buffer again.
+///
+/// **A ring that is never refilled receives exactly as many frames as it was
+/// posted and then stops**, because the head reaches the tail and the device
+/// has nowhere to put the next one. [`post_receive_descriptors`] fills a ring
+/// from descriptor zero, which is what bring-up wants; this is what a driver
+/// wants afterwards, when the frames it has taken are the ones to hand back.
+///
+/// Table 38-406's read format: the packet buffer address, and a header address
+/// left zero because the queue does no header split and bit 0 must stay clear
+/// for `DD`. Writing the whole descriptor is what clears the write-back
+/// hardware left there, so a stale `DD` cannot read as a new frame.
+pub fn post_receive_descriptor(ring: &mut impl Dma, index: u32, buffer: u64) {
+    let at = RECEIVE_DESCRIPTOR_BYTES as usize * index as usize;
+    put_dma64(ring, at, buffer);
+    put_dma64(ring, at + 8, 0);
+}
+
 /// Reads a receive descriptor's write-back, if hardware has completed it.
 ///
 /// `ring` as [`post_receive_descriptors`], and `index` inside it.
@@ -3735,6 +3753,26 @@ mod tests {
             QINT_NEXTQ_NONE
         );
         assert_eq!(device.registers.at(PFINT_LNKLST0) & QINT_NEXTQ_NONE, 7);
+    }
+
+    /// **A refilled descriptor is a whole descriptor**, write-back included:
+    /// hardware left `DD` and a length there, and a driver that wrote only the
+    /// buffer address would read the old completion as a new frame.
+    #[test]
+    fn refilling_a_descriptor_clears_what_hardware_left_in_it() {
+        let mut ring = FakeDma::new();
+        // A completed descriptor, as hardware writes one back.
+        ring.write(RECEIVE_DESCRIPTOR_BYTES as usize * 3, &[0xff; 16]);
+        assert!(completed_descriptor(&ring, 3).is_some(), "it reads as done");
+
+        post_receive_descriptor(&mut ring, 3, 0x1_0000_7000);
+        assert!(
+            completed_descriptor(&ring, 3).is_none(),
+            "and after refilling it is a descriptor the device has not touched"
+        );
+        let mut bytes = [0u8; 8];
+        ring.read(RECEIVE_DESCRIPTOR_BYTES as usize * 3, &mut bytes);
+        assert_eq!(u64::from_le_bytes(bytes), 0x1_0000_7000, "with its buffer");
     }
 
     /// **The bug that lost forty-five frames.** `QTX_TAIL` takes a descriptor

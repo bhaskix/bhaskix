@@ -961,6 +961,47 @@ the distinction is in the table rather than in somebody's head.
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-09-07 (DHCP, all four messages, and a switch port that answers none of them)
+
+`net/src/dhcp.rs` had `DISCOVER` and `OFFER` and said in its own header that `REQUEST`, `ACK` and a
+lease were *"a protocol this system has no use for until something depends on keeping an address"*.
+The X722 receiving is that something, so the other half is written: `write_request`, `parse_ack`, a
+`Lease` carrying the subnet, gateway and duration, and `parse_reply` under both parsers. Five host
+tests, three watched red.
+
+**The distinction the second half draws is not ceremony: an offer is not an address.** A server may
+offer to several clients at once and commits to none until it acknowledges a request, so a machine
+that used the offered address would be using one the server is free to give away.
+
+The kernel runs the whole exchange on the X722 — both halves, and the `DISCOVER` goes out **twice**,
+tagged for VLAN 17 and untagged, because which one the port wants is not knowable from here.
+
+**Nothing answered either.** Read off the SR550:
+
+    nic dhcp       no OFFER in 6 s to either DISCOVER, tagged for VLAN 17 or untagged;
+                   2 frame(s) arrived meanwhile and none was one
+
+**And the port's own numbers say why that is not a driver defect.** Over a sixty-second window it
+counted **2 packets, both multicast, zero broadcast** — and the only frames it has ever carried are
+the switch's own LLDP from `08:bd:43:76:47:e3`, announcing port `xg12`. A VLAN with a DHCP server on
+it carries ARP; a port that sees no broadcast at all in a minute is a port with nothing else on its
+segment, or one whose VLAN is not being trunked here.
+
+So the question moves to the switch: whether VLAN 17 is trunked to `xg12`, and whether that VLAN has a
+DHCP server or relay. The client is built and its transmit is proven — the frames leave and the port
+counts them out — and it will bind the moment something answers.
+
+**Two defects were found and fixed on the way**, both real and neither about DHCP:
+
+* **A receive ring that is never refilled takes as many frames as it was posted and then stops.** The
+  minute-long receive window filled all eight descriptors, so the head reached the tail and the reply
+  to the first `DISCOVER` had nowhere to land. `i40e::post_receive_descriptor` refills one descriptor
+  and the exchange refills from wherever the device's head stands.
+* **A single-threaded `python3 -m http.server` blocks every later request when one client stalls.**
+  An hour was spent on a BMC reporting `HTTP 500` on a mount that was fine; the BMC was fine too. It
+  cost a full XClarity controller reset to rule out, which is written down here so the next person
+  checks their own end first. The image is served threaded now.
+
 ### 2026-09-07 (**the X722 receives**, and the frames were never missing)
 
 RFC 0072 step 4's gate, open since 2026-09-05 and the reason every network claim in this project has

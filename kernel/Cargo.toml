@@ -744,6 +744,16 @@ asm_budget = 10
 # call one method -- which is both less `unsafe` and the fix for a real defect:
 # a loop that restarted at slot zero while the device's head stood at two wrote
 # forty-five frames behind the head and moved the tail backwards.
+# 2112: the ring named again to refill it, because a queue that is never
+# refilled receives as many frames as it was posted and then stops -- which is
+# what made the first DHCP exchange report no answer.
+#
+# 2111 for the DHCP exchange: four regions named where they are used -- the
+# transmit ring and the packet buffer it posts from, and each receive buffer as
+# a frame is examined. All four are `DeviceMemory::new` and its bound, and the
+# alternative was carrying regions down through three functions that have no
+# other use for them.
+#
 # 2107: naming the first receive buffer, so a delivered frame's bytes can be
 # read beside the descriptor that should have described it.
 #
@@ -781,7 +791,7 @@ asm_budget = 10
 # device and a different domain id. A helper serving both would have needed a
 # parameter for every difference between them, which is a worse way of saying
 # they are not the same job.
-unsafe_budget = 2107
+unsafe_budget = 2112
 # Up thirty-one for RFC 0005 step 9's socket probe -- `ring3_socketeer`, which
 # is `ring3_lister` with a `sockaddr_in6` copied in beside its code instead of
 # two filenames. The same two blocks every hosted probe has: one

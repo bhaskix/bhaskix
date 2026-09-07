@@ -13124,6 +13124,23 @@ const TAGGED_HEADER: usize = bhaskix_net::eth::HEADER + 4;
 /// network services already use, so the bytes on this wire are the bytes those
 /// services put on a virtual one.
 fn build_dhcp_discover(out: &mut [u8], from: [u8; 6], transaction: u32) -> usize {
+    build_dhcp_discover_on(out, from, transaction, Some(TRUNK_VLAN))
+}
+
+/// The same, on a VLAN or on none.
+///
+/// **Both are tried, because which one this port wants is not known.** The
+/// machine was described as trunked for VLAN 17 and the port carries the
+/// switch's LLDP *untagged* and no broadcast at all -- so a tagged DISCOVER
+/// may be dropped by a switch that is not trunking 17 here, and an untagged one
+/// may be dropped by a trunk with no native VLAN. Sending both costs two frames
+/// and settles it.
+fn build_dhcp_discover_on(
+    out: &mut [u8],
+    from: [u8; 6],
+    transaction: u32,
+    vlan: Option<u16>,
+) -> usize {
     use bhaskix_net::{
         addr::{Ipv4Addr, MacAddr, Port},
         dhcp, eth, ipv4, udp,
@@ -13135,10 +13152,16 @@ fn build_dhcp_discover(out: &mut [u8], from: [u8; 6], transaction: u32) -> usize
     out.fill(0);
     out[0..6].copy_from_slice(&MacAddr::BROADCAST.octets());
     out[6..12].copy_from_slice(&mine.octets());
-    out[12..14].copy_from_slice(&eth::EtherType::VLAN.0.to_be_bytes());
-    // Priority zero, no drop-eligible bit, and the VLAN in the low twelve.
-    out[14..16].copy_from_slice(&(TRUNK_VLAN & 0x0fff).to_be_bytes());
-    out[16..18].copy_from_slice(&eth::EtherType::IPV4.0.to_be_bytes());
+    let header = if let Some(id) = vlan {
+        out[12..14].copy_from_slice(&eth::EtherType::VLAN.0.to_be_bytes());
+        // Priority zero, no drop-eligible bit, and the VLAN in the low twelve.
+        out[14..16].copy_from_slice(&(id & 0x0fff).to_be_bytes());
+        out[16..18].copy_from_slice(&eth::EtherType::IPV4.0.to_be_bytes());
+        TAGGED_HEADER
+    } else {
+        out[12..14].copy_from_slice(&eth::EtherType::IPV4.0.to_be_bytes());
+        eth::HEADER
+    };
 
     let mut message = [0u8; MESSAGE];
     let Ok(length) = dhcp::write_discover(&mut message, mine, transaction) else {
@@ -13147,6 +13170,67 @@ fn build_dhcp_discover(out: &mut [u8], from: [u8; 6], transaction: u32) -> usize
     // A client with no address sends from 0.0.0.0 to the broadcast address,
     // which is why the reply has to be broadcast too -- `write_discover` sets
     // that flag for the same reason.
+    let Some(datagram) = out.get_mut(header + ipv4::HEADER..) else {
+        return 0;
+    };
+    let Ok(udp_bytes) = udp::write(
+        datagram,
+        Port(68),
+        Port(67),
+        &message[..length],
+        Ipv4Addr(0),
+        Ipv4Addr::BROADCAST,
+    ) else {
+        return 0;
+    };
+    let Some(packet) = out.get_mut(header..) else {
+        return 0;
+    };
+    let Ok(ip_bytes) = ipv4::write_header(
+        packet,
+        Ipv4Addr(0),
+        Ipv4Addr::BROADCAST,
+        ipv4::Protocol::UDP,
+        udp_bytes,
+        0,
+    ) else {
+        return 0;
+    };
+    header + ip_bytes + udp_bytes
+}
+
+/// Builds a DHCP `REQUEST` frame on VLAN 17, returning its length.
+///
+/// **The same envelope the `DISCOVER` went out in**, and for the same reasons:
+/// broadcast, from `0.0.0.0`, tagged for the trunk's VLAN. A client that has
+/// only been *offered* an address still does not hold it, so it cannot yet be
+/// the source of anything or be answered by unicast.
+fn build_dhcp_request(
+    out: &mut [u8],
+    from: [u8; 6],
+    transaction: u32,
+    offered: bhaskix_net::addr::Ipv4Addr,
+    server: bhaskix_net::addr::Ipv4Addr,
+) -> usize {
+    use bhaskix_net::{
+        addr::{Ipv4Addr, MacAddr, Port},
+        dhcp, eth, ipv4, udp,
+    };
+    /// The fixed part, the cookie, three options and the end marker.
+    const MESSAGE: usize = dhcp::MINIMUM + 16;
+
+    let mine = MacAddr(from);
+    out.fill(0);
+    out[0..6].copy_from_slice(&MacAddr::BROADCAST.octets());
+    out[6..12].copy_from_slice(&mine.octets());
+    out[12..14].copy_from_slice(&eth::EtherType::VLAN.0.to_be_bytes());
+    out[14..16].copy_from_slice(&(TRUNK_VLAN & 0x0fff).to_be_bytes());
+    out[16..18].copy_from_slice(&eth::EtherType::IPV4.0.to_be_bytes());
+
+    let mut message = [0u8; MESSAGE];
+    let Ok(length) = dhcp::write_request(&mut message, mine, transaction, offered, server) else {
+        return 0;
+    };
     let Some(datagram) = out.get_mut(TAGGED_HEADER + ipv4::HEADER..) else {
         return 0;
     };
@@ -13713,6 +13797,341 @@ fn send_frames(
     sent > 0
 }
 
+/// Runs a DHCP exchange on the X722 and returns the lease, if a server gives
+/// one.
+///
+/// **`DISCOVER`, `OFFER`, `REQUEST`, `ACK` — all four, because an offer is not
+/// an address.** A server may offer to several clients at once and commits to
+/// none of them until it acknowledges a request; a machine that used the
+/// offered address would be using one the server is free to hand elsewhere.
+///
+/// Tagged for VLAN 17, which is what this port is trunked for. A reply may come
+/// back tagged or not — a server on the native VLAN answers untagged — so both
+/// are accepted, and [`dhcp_payload`] says which arrived.
+///
+/// This is the *kernel* asking, once, to answer RFC 0072's question of whether
+/// the port carries a conversation. The address a program uses comes from
+/// `bin/ipd`, which holds a socket; nothing here keeps the lease or renews it.
+fn dhcp_exchange(
+    nic: &mut i40e::Device<MappedRegisters>,
+    setup: &TransmitSetup,
+    target: &QueueTarget,
+    rings: &ReceiveRings,
+    buffers: &ReceiveBuffers,
+    mac: [u8; 6],
+) -> Option<bhaskix_net::dhcp::Lease> {
+    use bhaskix_net::dhcp;
+
+    const SPINS: u32 = 2_000_000;
+    /// How long to wait for each half. A server answers in milliseconds; this
+    /// is generous because the alternative to waiting is reporting a silence
+    /// that was never given a chance.
+    const PATIENCE_MS: u64 = 6_000;
+
+    // SAFETY: the transmit ring `send_frames` attached and the packet buffer
+    // beside it -- pages this kernel owns, and the device has finished with
+    // both, since every frame sent above was waited for.
+    let mut transmit_ring =
+        unsafe { DeviceMemory::new(setup.ring_host, i40e::TRANSMIT_RING_BYTES as usize) };
+    // SAFETY: as above -- the packet buffer is a page this kernel owns, and the
+    // device has finished with it because every frame sent was waited for.
+    let mut packet = unsafe { DeviceMemory::new(setup.packet_host, i40e::PACKET_BYTES) };
+
+    // The transaction, from this port's own address: two machines asking at
+    // once cannot collide, and a reply meant for somebody else is refused.
+    let transaction = u32::from_be_bytes([mac[2], mac[3], mac[4], mac[5]]);
+
+    // **Give every queue its buffers back before asking anything.**
+    //
+    // The receive window above ran for a minute and the frames it took are
+    // still sitting in their descriptors, so the head has walked up to the tail
+    // and the device has nowhere to put the next frame. A DISCOVER sent into
+    // that gets no answer for a reason that has nothing to do with the server:
+    // the reply arrives and is dropped. Measured on the first boot of this
+    // exchange, which reported no OFFER while the port was carrying LLDP.
+    //
+    // Refilled from where the device stands rather than from descriptor zero,
+    // because the head is where it will look next.
+    let mut refilled_from = [0u32; MAX_RECEIVE_QUEUES];
+    for index in 0..rings.queues.min(MAX_RECEIVE_QUEUES as u32) {
+        let queue = rings.queue(index);
+        let Some((context, _)) = nic.cached_receive_context(queue, SPINS) else {
+            continue;
+        };
+        let head = (context[0] & 0x1fff) % rings.descriptors;
+        refilled_from[index as usize] = head;
+        // SAFETY: a ring this kernel posted, `ring_bytes` long.
+        let mut ring = unsafe { DeviceMemory::new(rings.host_ring(index), rings.ring_bytes()) };
+        for slot in 0..rings.posted {
+            let at = (head + slot) % rings.descriptors;
+            i40e::post_receive_descriptor(&mut ring, at, buffers.device_at(index, slot));
+        }
+        // The tail is the descriptor after the last one handed over, and it is
+        // an index: see `Device::post_frame` for what writing a count here
+        // costs.
+        nic.arm_receive_queue(queue, (head + rings.posted) % rings.descriptors);
+    }
+
+    // Descriptors already looked at, so a frame is examined once. Four queues
+    // of eight is thirty-two, which is why one word is enough.
+    let mut seen = 0u64;
+    let mut lldp_shown = false;
+    let mut message = [0u8; 512];
+
+    // **Both ways, because which one this port wants is not known.** The
+    // machine was described as trunked for VLAN 17; the port carries the
+    // switch's LLDP untagged and no broadcast at all, which is what an access
+    // port looks like from here. A tagged DISCOVER dies on a switch that is not
+    // trunking 17 to this port, and an untagged one dies on a trunk with no
+    // native VLAN -- so both go out, and the answer says which the port is.
+    let mut asked = 0;
+    for vlan in [Some(TRUNK_VLAN), None] {
+        let bytes = build_dhcp_discover_on(&mut message, mac, transaction, vlan);
+        if post_and_wait(
+            nic,
+            &mut transmit_ring,
+            &mut packet,
+            setup,
+            target,
+            &message[..bytes],
+            SPINS,
+        ) {
+            asked += 1;
+        } else {
+            println!(
+                "\x1b[93m    nic dhcp       the {} DISCOVER would not go out\x1b[0m",
+                if vlan.is_some() { "tagged" } else { "untagged" }
+            );
+        }
+    }
+    if asked == 0 {
+        return None;
+    }
+
+    let Some(offer) = wait_for_dhcp(
+        (rings, buffers, &refilled_from),
+        (&mut lldp_shown, &mut seen),
+        PATIENCE_MS,
+        transaction,
+        dhcp::OFFER,
+    ) else {
+        println!(
+            "\x1b[93m    nic dhcp       no OFFER in {} s to either DISCOVER, tagged for VLAN {} \
+             or untagged; {} frame(s) arrived meanwhile and none was one\x1b[0m",
+            PATIENCE_MS / 1000,
+            TRUNK_VLAN & 0x0fff,
+            seen.count_ones()
+        );
+        return None;
+    };
+    println!(
+        "    nic dhcp       an OFFER of {} from {}, transaction {:#x}",
+        Dotted(offer.address),
+        Dotted(offer.server),
+        offer.transaction
+    );
+
+    // **The request, which is what turns an offer into an address.** It names
+    // the address and the server, so every other server that offered withdraws
+    // its own.
+    let bytes = build_dhcp_request(&mut message, mac, transaction, offer.address, offer.server);
+    if !post_and_wait(
+        nic,
+        &mut transmit_ring,
+        &mut packet,
+        setup,
+        target,
+        &message[..bytes],
+        SPINS,
+    ) {
+        println!("\x1b[93m    nic dhcp       the REQUEST would not go out\x1b[0m");
+        return None;
+    }
+
+    let lease = wait_for_dhcp(
+        (rings, buffers, &refilled_from),
+        (&mut lldp_shown, &mut seen),
+        PATIENCE_MS,
+        transaction,
+        dhcp::ACK,
+    );
+    if lease.is_none() {
+        println!(
+            "\x1b[93m    nic dhcp       no ACK in {} s after the REQUEST; the address was \
+             offered and never committed\x1b[0m",
+            PATIENCE_MS / 1000
+        );
+    }
+    lease
+}
+
+/// Puts one frame in the packet buffer, posts it and waits for its completion.
+fn post_and_wait(
+    nic: &mut i40e::Device<MappedRegisters>,
+    ring: &mut DeviceMemory,
+    packet: &mut DeviceMemory,
+    setup: &TransmitSetup,
+    target: &QueueTarget,
+    frame: &[u8],
+    spins: u32,
+) -> bool {
+    if frame.is_empty() {
+        return false;
+    }
+    i40e::Dma::write(packet, 0, frame);
+    let Some(slot) = nic.post_frame(ring, setup.packet_device, frame.len() as u16, false) else {
+        return false;
+    };
+    nic.transmit_doorbell(target.queue, nic.transmit_tail());
+    for _ in 0..spins {
+        if nic.frame_completed(ring, slot) {
+            return true;
+        }
+        core::hint::spin_loop();
+    }
+    false
+}
+
+/// Finds the DHCP message inside a received frame, tagged or not.
+///
+/// Returns the payload and whether it arrived on a VLAN. **Both are accepted
+/// deliberately**: the request goes out tagged for VLAN 17, and a server on the
+/// native VLAN answers untagged -- so refusing one of the two would refuse the
+/// answer on about half the ways this port could be configured.
+fn dhcp_payload(frame: &[u8]) -> Option<(&[u8], bool)> {
+    use bhaskix_net::{eth, ipv4, udp};
+    /// The port a client is answered on.
+    const CLIENT: u16 = 68;
+
+    let (parsed, tagged) = match eth::EthFrame::parse_on(frame, Some(NET_VLAN)) {
+        Ok(parsed) => (parsed, true),
+        Err(_) => (eth::EthFrame::parse(frame).ok()?, false),
+    };
+    if parsed.ethertype != eth::EtherType::IPV4 {
+        return None;
+    }
+    let (header, rest) = ipv4::Ipv4Header::parse(parsed.payload).ok()?;
+    let datagram = udp::UdpDatagram::parse(rest, header.source, header.destination).ok()?;
+    (datagram.destination.0 == CLIENT).then_some((datagram.payload, tagged))
+}
+
+/// Waits for a DHCP reply of type `want` that answers `transaction`.
+///
+/// `seen` is a bitmap of descriptors already examined, so a frame is looked at
+/// once and two calls in one exchange do not re-read the first call's frames.
+/// The ring is not re-posted: eight descriptors a queue is enough for an
+/// exchange of four messages on a port carrying an LLDP frame every thirty
+/// seconds, and a re-post while the device is running is a race this does not
+/// need to take.
+fn wait_for_dhcp(
+    where_: (&ReceiveRings, &ReceiveBuffers, &[u32; MAX_RECEIVE_QUEUES]),
+    progress: (&mut bool, &mut u64),
+    millis: u64,
+    transaction: u32,
+    want: u8,
+) -> Option<bhaskix_net::dhcp::Lease> {
+    // Grouped rather than listed, because eight parameters is past the point
+    // where a caller can get their order right by reading the call.
+    let (rings, buffers, refilled_from) = where_;
+    let (lldp_shown, seen) = progress;
+    let start = time::now_nanos();
+    let mut spins = 0u64;
+    let mut frame = [0u8; 2048];
+    loop {
+        for index in 0..rings.queues.min(MAX_RECEIVE_QUEUES as u32) {
+            for slot in 0..rings.descriptors {
+                let bit = 1u64 << ((index * rings.descriptors + slot) % 64);
+                if *seen & bit != 0 {
+                    continue;
+                }
+                // SAFETY: a ring this kernel posted, `ring_bytes` long.
+                let ring = unsafe { DeviceMemory::new(rings.host_ring(index), rings.ring_bytes()) };
+                let Some(completion) = i40e::completed_descriptor(&ring, slot) else {
+                    continue;
+                };
+                *seen |= bit;
+                let length = (completion.length as usize).min(frame.len());
+                // **The buffer this descriptor was given**, which after a
+                // refill is not the one whose number matches the descriptor:
+                // the ring was filled from wherever the device's head stood, so
+                // descriptor `head + n` holds buffer `n`.
+                let head = refilled_from[index as usize];
+                let buffer = (slot + rings.descriptors - head) % rings.descriptors;
+                if buffer >= rings.posted {
+                    continue;
+                }
+                // SAFETY: the buffer the device filled and has finished with.
+                let held = unsafe { DeviceMemory::new(buffers.host_at(index, buffer), length) };
+                i40e::Dma::read(&held, 0, &mut frame[..length]);
+                // **What the switch says about itself, printed once.** LLDP
+                // is the only thing this port carries, and a switch announces
+                // its port and often the VLAN that port is on. Reading it is
+                // cheaper than guessing at a configuration, which is what the
+                // last three boots have been doing.
+                if length > 14 && frame[12] == 0x88 && frame[13] == 0xcc && !*lldp_shown {
+                    *lldp_shown = true;
+                    for line in 0..(length.min(96) / 16) {
+                        println!(
+                            "    nic lldp       +{:3}: {}",
+                            line * 16,
+                            HexBytes(&frame[line * 16..line * 16 + 16])
+                        );
+                    }
+                }
+                let Some((payload, tagged)) = dhcp_payload(&frame[..length]) else {
+                    continue;
+                };
+                match bhaskix_net::dhcp::parse_reply(payload, want) {
+                    Ok(lease) if lease.transaction == transaction => {
+                        if !tagged {
+                            println!(
+                                "    nic dhcp       the reply came back untagged, so the server \
+                                 is on this port's native VLAN"
+                            );
+                        }
+                        return Some(lease);
+                    }
+                    Ok(lease) => println!(
+                        "    nic dhcp       a reply for transaction {:#x}, not ours ({transaction:#x})",
+                        lease.transaction
+                    ),
+                    Err(_) => {}
+                }
+            }
+        }
+        match (start, time::now_nanos()) {
+            (Some(start), Some(now)) => {
+                if now.saturating_sub(start) >= millis * 1_000_000 {
+                    return None;
+                }
+            }
+            _ => {
+                spins += 1;
+                if spins >= millis.saturating_mul(200_000) {
+                    return None;
+                }
+            }
+        }
+        core::hint::spin_loop();
+    }
+}
+
+/// How many receive queues this kernel's own driver ever takes.
+///
+/// Four, and named so the arrays that track them cannot disagree with the loops
+/// that fill them.
+const MAX_RECEIVE_QUEUES: usize = 4;
+
+/// An IPv4 address, printed the way people write one.
+struct Dotted(bhaskix_net::addr::Ipv4Addr);
+
+impl core::fmt::Display for Dotted {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let octets = self.0.octets();
+        write!(f, "{}.{}.{}.{}", octets[0], octets[1], octets[2], octets[3])
+    }
+}
+
 /// One receive queue: private memory programmed, one context page backed, the
 /// context written, buffers posted, the queue enabled, and a bounded wait for
 /// a frame -- RFC 0072 step 4.
@@ -13922,6 +14341,7 @@ fn bring_up_receive_queue(
         queues: QUEUES,
         first: queue,
         posted: POSTED,
+        descriptors: u32::from(DESCRIPTORS),
     };
     let buffers = ReceiveBuffers {
         device: buffers_device,
@@ -14393,6 +14813,26 @@ fn bring_up_receive_queue(
     // back lands where the scan above already looked.
     let sent = send_frames(nic, &transmit, target, &memory);
 
+    // **The whole exchange, now that the port receives.** Until 2026-09-07 a
+    // DISCOVER went out and nothing could come back, so there was nothing to
+    // answer it with; the reply is now delivered and this asks the rest of the
+    // question -- an OFFER, a REQUEST naming it, and the ACK that commits.
+    if sent
+        && let Some(mac) = nic.mac_address(transmit.port)
+        && let Some(lease) = dhcp_exchange(nic, &transmit, target, &rings, &buffers, mac)
+    {
+        println!(
+            "\x1b[92m    nic dhcp       BOUND: {} from {}, mask {}, gateway {}, lease {} s -- \
+             this machine has an address on VLAN {}\x1b[0m",
+            Dotted(lease.address),
+            Dotted(lease.server),
+            Dotted(lease.subnet),
+            Dotted(lease.router),
+            lease.seconds,
+            TRUNK_VLAN & 0x0fff
+        );
+    }
+
     if sent {
         // **A wait, not a glance.** A DHCP server has to see the DISCOVER,
         // decide and answer, and a relay may be in the path; ten seconds is
@@ -14600,6 +15040,13 @@ struct ReceiveRings {
     first: u32,
     /// Descriptors handed to hardware in each ring.
     posted: u32,
+    /// Descriptors the ring holds, which is what an index wraps at.
+    ///
+    /// **Not the same as `posted`, and the difference matters once the ring is
+    /// refilled**: the queue is thirty-two descriptors long and eight of them
+    /// are handed over at a time, so the head walks up to thirty-two and a
+    /// refill starts wherever it stands.
+    descriptors: u32,
 }
 
 impl ReceiveRings {
