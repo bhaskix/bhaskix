@@ -32,6 +32,11 @@ bhaskix-xhci = { path = "../third_party/xhci" }
 # of. The alternative was a literal 32 here and `MAX_PORTS` there, which is a
 # format defined twice and a drift waiting to happen.
 bhaskix-ahci = { path = "../ahci" }
+# RFC 0075: the X722, which used to be `kernel/src/i40e.rs`. It is here rather
+# than gone because the kernel still drives the device at this step -- what
+# moved is the code, and with it the half of the driver that touches a register,
+# which now has tests. The dependency goes when `bin/netd` takes the device.
+bhaskix-i40e = { path = "../i40e" }
 # RFC 0072 step 5. The kernel builds one ARP frame to make a transmit queue
 # prove itself, and builds it with the crate the network services already use
 # rather than with bytes laid out by hand here -- the same parsers, the same
@@ -739,6 +744,16 @@ asm_budget = 10
 # call one method -- which is both less `unsafe` and the fix for a real defect:
 # a loop that restarted at slot zero while the device's head stood at two wrote
 # forty-five frames behind the head and moved the tail backwards.
+# **2098 at RFC 0075, and it went DOWN by 39 while a driver kept working.**
+# `kernel/src/i40e.rs` left for a crate that forbids `unsafe` entirely: the
+# volatile register accesses became a trait its holder implements -- three
+# lines here, in `MappedRegisters` -- and every ring and command buffer became
+# a region reached through a second trait -- `Dma` -- so the descriptor writes
+# that were raw pointer arithmetic are bounds-checked arithmetic somewhere the
+# kernel cannot reach, and the six volatile accesses left here are the whole of
+# what a driver's memory costs. What is left is
+# the plumbing, and it goes when `bin/netd` takes the device.
+#
 # 2137 at RFC 0074 step 4: delegating a second NIC. Fourteen of the twenty-one
 # are `delegate_second_port` -- enabling memory space, enabling bus mastering,
 # and claiming a vector, each of which the *first* port already pays for and
@@ -747,7 +762,7 @@ asm_budget = 10
 # device and a different domain id. A helper serving both would have needed a
 # parameter for every difference between them, which is a worse way of saying
 # they are not the same job.
-unsafe_budget = 2137
+unsafe_budget = 2098
 # Up thirty-one for RFC 0005 step 9's socket probe -- `ring3_socketeer`, which
 # is `ring3_lister` with a `sockaddr_in6` copied in beside its code instead of
 # two filenames. The same two blocks every hosted probe has: one

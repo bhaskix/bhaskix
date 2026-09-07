@@ -1,9 +1,25 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Bringing up an Intel X722, far enough to ask it what it is.
+#![no_std]
+#![forbid(unsafe_code)]
+//! An Intel X722, as arithmetic over a trait.
 //!
-//! RFC 0072 step 3. This resets the function and gives it an admin queue,
-//! which is the handshake every later question goes through: an i40e-class
-//! device answers nothing until its admin queue exists.
+//! RFC 0072 wrote this driver; **RFC 0075 moved it out of the kernel**, and the
+//! move is what this crate's shape is about. It was `kernel/src/i40e.rs`, three
+//! thousand lines of device driver inside the nucleus, and the only half of it
+//! anything could test was the byte encoders -- twelve tests over the
+//! descriptors and contexts, and not one over a register, which is where every
+//! bug this driver has actually had was found.
+//!
+//! So there is no address in this crate. Registers go through [`Registers`],
+//! rings and command buffers arrive as slices, and the one unsafe operation a
+//! NIC driver genuinely needs -- a volatile access to a mapping somebody else
+//! made -- belongs to whoever implements the trait. `forbid(unsafe_code)` above
+//! is what makes that a rule rather than an intention, and it is the same shape
+//! `ahci/src/lib.rs` has for the same reason.
+//!
+//! What the driver *does* is unchanged: it resets the function and gives it an
+//! admin queue, which is the handshake every later question goes through, since
+//! an i40e-class device answers nothing until its admin queue exists.
 //!
 //! # Where these numbers come from
 //!
@@ -417,6 +433,21 @@ const _: () = assert!(
 /// Qword 0 is the packet buffer address; qword 1 carries the type, the command
 /// and the length.
 pub const TRANSMIT_DESCRIPTOR_BYTES: u64 = 16;
+
+/// How many descriptors the transmit ring this driver builds holds.
+///
+/// `QLEN`'s floor is *"from 8 descriptors"* and this is that floor: the driver
+/// sends one self-contained frame at a time and waits for it, so a longer ring
+/// is a wrap-around nothing tests.
+pub const TRANSMIT_DESCRIPTORS: u16 = 8;
+
+/// And how many bytes that ring occupies.
+///
+/// **One number rather than two.** The depth and the size were computed in
+/// different places, which is the shape of the bug that wrote a tail of eight
+/// into an eight-descriptor ring; a caller that sizes its memory from here and
+/// its depth from here cannot make the two disagree.
+pub const TRANSMIT_RING_BYTES: u64 = TRANSMIT_DESCRIPTOR_BYTES * TRANSMIT_DESCRIPTORS as u64;
 /// `DTYP`, qword 1 bits 3:0 -- *"0x0 stands for a transmit data descriptor"*.
 const TX_DTYP_MASK: u64 = 0xf;
 /// What `DTYP` reads once hardware has completed the descriptor:
@@ -803,6 +834,15 @@ pub enum CommandError {
     /// Table 38-350's code -- `0xD` is `EEXIST`, which Clear PXE Mode answers
     /// when the device was already out of PXE mode.
     Refused(u16),
+    /// The buffer handed in is too small for what firmware will write into it.
+    ///
+    /// **A refusal rather than a truncation**, and the distinction is the whole
+    /// reason this variant exists: reading a short buffer would report fields
+    /// firmware never wrote, which is a wrong answer where this is a missing
+    /// one. It cannot happen on a caller that sizes its buffer from the
+    /// constants here, which is why it is a bug report and not a condition to
+    /// handle.
+    ShortBuffer,
 }
 
 impl core::fmt::Display for CommandError {
@@ -811,6 +851,7 @@ impl core::fmt::Display for CommandError {
             Self::NoRing => f.write_str("no admin ring is attached"),
             Self::NoAnswer => f.write_str("firmware never marked it done"),
             Self::Refused(code) => write!(f, "firmware refused it, return value {code:#x}"),
+            Self::ShortBuffer => f.write_str("the command buffer is too small for the answer"),
         }
     }
 }
@@ -1183,6 +1224,131 @@ impl ReceiveContext {
     }
 }
 
+/// The 4 KiB pages of BAR0 this driver can reach, as offsets from its base.
+///
+/// **The whole BAR cannot be delegated and should not be.** Its CSR space is
+/// just under four megabytes -- a thousand pages -- against a capability space
+/// of a hundred and twenty-eight slots, and a driver that could reach all of it
+/// would hold the protocol-engine doorbells and an exposed flash it has no
+/// business touching. These are the pages that contain a register this file
+/// names, each one covering its indexed range to the maximum index the
+/// datasheet allows, so a queue number this driver accepts can never land
+/// outside the mapping.
+///
+/// Whoever delegates the device maps exactly these; a register outside them
+/// faults instead of being reachable, which is strictly less authority than the
+/// kernel had when it drove this itself. `page_is_mapped` and the test beside it
+/// are what keep this list and the constants above from drifting apart.
+pub const REGISTER_PAGES: [u64; 34] = [
+    0x08_0000, 0x09_2000, 0x09_c000, 0x0c_0000, 0x0c_2000, 0x0c_6000, 0x0e_4000, 0x0e_5000,
+    0x0e_6000, 0x10_0000, 0x10_1000, 0x10_2000, 0x10_4000, 0x10_5000, 0x10_6000, 0x10_8000,
+    0x10_9000, 0x10_a000, 0x10_c000, 0x12_0000, 0x12_1000, 0x12_2000, 0x12_8000, 0x12_9000,
+    0x12_a000, 0x1c_0000, 0x1e_4000, 0x20_c000, 0x20_d000, 0x30_0000, 0x31_0000, 0x36_c000,
+    0x36_d000, 0x36_e000,
+];
+
+/// How many bytes a transmit queue context occupies -- Table 38-428's 128.
+///
+/// Named because a caller has to hand this function a slice of exactly that
+/// much, and a length written at the call site is a length that can be wrong
+/// there without anything noticing.
+pub const TRANSMIT_CONTEXT_BYTES: usize = 128;
+
+/// And a receive context's -- Table 38-419's 32.
+pub const RECEIVE_CONTEXT_BYTES: usize = 32;
+
+/// How large a page of registers is, which is the mapping granule as well.
+pub const REGISTER_PAGE_BYTES: u64 = 4096;
+
+/// Whether `offset` falls inside a page [`REGISTER_PAGES`] names.
+#[must_use]
+pub const fn page_is_mapped(offset: u64) -> bool {
+    let page = offset & !(REGISTER_PAGE_BYTES - 1);
+    let mut index = 0;
+    while index < REGISTER_PAGES.len() {
+        if REGISTER_PAGES[index] == page {
+            return true;
+        }
+        index += 1;
+    }
+    false
+}
+
+/// A device's registers, without an address.
+///
+/// **This is what keeps the crate `forbid(unsafe_code)` honestly** rather than
+/// by moving the driver somewhere the rule does not apply. A volatile access to
+/// a mapping somebody else made is the one unsafe operation a NIC driver
+/// genuinely needs, and it belongs to whoever owns that mapping; every offset
+/// in this file is a documented register reached through here.
+///
+/// The same trait `ahci/src/lib.rs` defines for the same reason, with one
+/// addition: [`Registers::read64`], because the statistics counters say *"the
+/// low and high registers are part of a 64-bit register and are read using
+/// 64-bit read accesses only"* and two 32-bit reads would also tear across a
+/// counter incrementing between them.
+pub trait Registers {
+    /// Reads the 32-bit register at `offset`.
+    fn read(&self, offset: u64) -> u32;
+    /// Writes the 32-bit register at `offset`.
+    fn write(&mut self, offset: u64, value: u32);
+    /// Reads the 64-bit register pair at `offset` in one access.
+    fn read64(&self, offset: u64) -> u64;
+}
+
+/// Memory a device also writes, without an address.
+///
+/// **The second thing this crate must not hold, and the reason is a boot that
+/// went wrong.** Rings and command buffers were `&mut [u8]` at first, which
+/// reads as the obvious translation of a raw pointer. It is not: a `&mut`
+/// promises the compiler that *nothing else* writes those bytes, and a device
+/// writing them is exactly something else. `Get Switch Configuration` zeroed
+/// its buffer, ran the command, and read the buffer back — and on the SR550 it
+/// read back the zeroes, because forwarding them is a legal thing to do to
+/// memory nobody else may touch. The switch reported nought elements of nought
+/// and the receive queue was never taken.
+///
+/// So DMA memory goes through a trait, like [`Registers`] and for the same
+/// reason: the access belongs to whoever owns the mapping, who can make it
+/// volatile. This crate does the arithmetic and holds no address at all.
+pub trait Dma {
+    /// Copies `into.len()` bytes from `at` into `into`.
+    ///
+    /// Bytes past the end of the region read as zero, which is what an
+    /// unwritten descriptor looks like and the answer a caller can act on.
+    fn read(&self, at: usize, into: &mut [u8]);
+
+    /// Copies `from` to `at`, ignoring anything past the end of the region.
+    fn write(&mut self, at: usize, from: &[u8]);
+
+    /// Zeroes `bytes` bytes at `at`.
+    fn zero(&mut self, at: usize, bytes: usize);
+}
+
+/// Reads a little-endian `u32` out of DMA memory.
+fn dma32(from: &impl Dma, at: usize) -> u32 {
+    let mut bytes = [0u8; 4];
+    from.read(at, &mut bytes);
+    u32::from_le_bytes(bytes)
+}
+
+/// Reads a little-endian `u64` out of DMA memory.
+fn dma64(from: &impl Dma, at: usize) -> u64 {
+    let mut bytes = [0u8; 8];
+    from.read(at, &mut bytes);
+    u64::from_le_bytes(bytes)
+}
+
+/// Writes a little-endian `u32` into DMA memory.
+fn put_dma32(into: &mut impl Dma, at: usize, value: u32) {
+    into.write(at, &value.to_le_bytes());
+}
+
+/// Writes a little-endian `u64` into DMA memory.
+fn put_dma64(into: &mut impl Dma, at: usize, value: u64) {
+    into.write(at, &value.to_le_bytes());
+}
+
 /// A page descriptor -- Table 38-330: bits 63:12 the backing page's address
 /// as the device issues it, bit 0 valid.
 #[must_use]
@@ -1203,44 +1369,30 @@ pub const fn segment_descriptor(pd_page: u64, backing_pages: u32) -> (u32, u32) 
 
 /// Writes one page descriptor into a page descriptor page.
 ///
-/// # Safety
-///
-/// `page_host` must be the direct-map address of a page descriptor page,
-/// writable and not yet named to the device, and `index` below
-/// [`PAGE_DESCRIPTORS`].
-pub unsafe fn write_page_descriptor(page_host: u64, index: u32, backing: u64) {
-    // SAFETY: per the caller; eight bytes at an index inside the page.
-    unsafe {
-        core::ptr::write_volatile(
-            (page_host + 8 * index as u64) as *mut u64,
-            page_descriptor(backing),
-        );
-    }
+/// `page` is that page, `index` below [`PAGE_DESCRIPTORS`], and the device must
+/// not be fetching it yet -- which the caller arranges by writing every
+/// descriptor before naming the page to the device.
+pub fn write_page_descriptor(page: &mut impl Dma, index: u32, backing: u64) {
+    put_dma64(page, 8 * index as usize, page_descriptor(backing));
 }
 
 /// Writes a receive context where the HMC will fetch it.
 ///
-/// # Safety
-///
-/// `host` must be the direct-map address of the context's 32 bytes in a
-/// backing page, writable, and the device must not be fetching it yet.
-pub unsafe fn write_receive_context(host: u64, context: &ReceiveContext) {
+/// `at` is the context's 32 bytes inside a backing page, and the device must
+/// not be fetching it yet.
+pub fn write_receive_context(at: &mut impl Dma, offset: usize, context: &ReceiveContext) {
     for (index, word) in context.words().iter().enumerate() {
-        // SAFETY: per the caller; 32 bytes, written a word at a time.
-        unsafe { core::ptr::write_volatile((host + 4 * index as u64) as *mut u32, *word) };
+        put_dma32(at, offset + 4 * index, *word);
     }
 }
 
 /// Writes a transmit context where the HMC will fetch it.
 ///
-/// # Safety
-///
-/// `host` must be the direct-map address of the context's 128 bytes in a
-/// backing page, writable, and the device must not be fetching it yet.
-pub unsafe fn write_transmit_context(host: u64, context: &TransmitContext) {
+/// `at` is the context's 128 bytes inside a backing page, and the device must
+/// not be fetching it yet.
+pub fn write_transmit_context(at: &mut impl Dma, offset: usize, context: &TransmitContext) {
     for (index, word) in context.words().iter().enumerate() {
-        // SAFETY: per the caller; 128 bytes, written a word at a time.
-        unsafe { core::ptr::write_volatile((host + 4 * index as u64) as *mut u32, *word) };
+        put_dma32(at, offset + 4 * index, *word);
     }
 }
 
@@ -1260,18 +1412,13 @@ const _: () = assert!(PACKET_BYTES >= FRAME_BYTES);
 /// 38-406: the packet buffer address, and a header address left zero because
 /// the queue does no header split and bit 0 must stay clear for `DD`.
 ///
-/// # Safety
-///
-/// `ring_host` must be the direct-map address of a ring with at least
-/// `buffers.len()` descriptors, writable, and the queue must not be enabled.
-pub unsafe fn post_receive_descriptors(ring_host: u64, buffers: &[u64]) {
+/// `ring` must hold at least `buffers.len()` descriptors, and the queue must
+/// not be enabled while this runs.
+pub fn post_receive_descriptors(ring: &mut impl Dma, buffers: &[u64]) {
     for (index, buffer) in buffers.iter().enumerate() {
-        let at = ring_host + RECEIVE_DESCRIPTOR_BYTES * index as u64;
-        // SAFETY: per the caller; two quad-words inside the ring.
-        unsafe {
-            core::ptr::write_volatile(at as *mut u64, *buffer);
-            core::ptr::write_volatile((at + 8) as *mut u64, 0);
-        }
+        let at = RECEIVE_DESCRIPTOR_BYTES as usize * index;
+        put_dma64(ring, at, *buffer);
+        put_dma64(ring, at + 8, 0);
     }
 }
 
@@ -1329,13 +1476,12 @@ impl ReceiveCompletion {
 
 /// Reads a receive descriptor's write-back, if hardware has completed it.
 ///
-/// # Safety
-///
-/// `ring_host` as [`post_receive_descriptors`], and `index` inside the ring.
-pub unsafe fn completed_descriptor(ring_host: u64, index: u32) -> Option<ReceiveCompletion> {
-    let at = ring_host + RECEIVE_DESCRIPTOR_BYTES * index as u64 + 8;
-    // SAFETY: per the caller; the second quad-word, which hardware writes.
-    let qword = unsafe { core::ptr::read_volatile(at as *const u64) };
+/// `ring` as [`post_receive_descriptors`], and `index` inside it.
+#[must_use]
+pub fn completed_descriptor(ring: &impl Dma, index: u32) -> Option<ReceiveCompletion> {
+    let at = RECEIVE_DESCRIPTOR_BYTES as usize * index as usize + 8;
+    // The second quad-word, which hardware writes back.
+    let qword = dma64(ring, at);
     if qword & RX_DD == 0 {
         return None;
     }
@@ -1402,13 +1548,14 @@ impl FrameHeader {
 
 /// Copies a frame's first eighteen bytes out of a buffer hardware filled.
 ///
-/// # Safety
-///
-/// `buffer_host` must be the direct-map address of a buffer at least
-/// [`FrameHeader::BYTES`] long that hardware has finished writing.
-pub unsafe fn frame_header(buffer_host: u64) -> FrameHeader {
-    // SAFETY: per the caller.
-    let bytes = unsafe { core::ptr::read_volatile(buffer_host as *const [u8; FrameHeader::BYTES]) };
+/// `buffer` must be at least [`FrameHeader::BYTES`] long and hardware must have
+/// finished writing it. A shorter one reads as zeroes, which parses as a frame
+/// with no ethertype -- the same answer a caller would get from an empty
+/// buffer, and the one it can act on.
+#[must_use]
+pub fn frame_header(buffer: &impl Dma, at: usize) -> FrameHeader {
+    let mut bytes = [0u8; FrameHeader::BYTES];
+    buffer.read(at, &mut bytes);
     FrameHeader::parse(&bytes)
 }
 
@@ -1609,46 +1756,33 @@ pub const fn transmit_context_descriptor(switch_tag: u64) -> (u64, u64) {
 
 /// Writes a transmit context descriptor into a ring.
 ///
-/// # Safety
-///
 /// As [`post_transmit_descriptor`].
-pub unsafe fn post_transmit_context(ring_host: u64, index: u32, switch_tag: u64) {
+pub fn post_transmit_context(ring: &mut impl Dma, index: u32, switch_tag: u64) {
     let (low, high) = transmit_context_descriptor(switch_tag);
-    let at = ring_host + TRANSMIT_DESCRIPTOR_BYTES * u64::from(index);
-    // SAFETY: per the caller; two quad-words inside the ring.
-    unsafe {
-        core::ptr::write_volatile(at as *mut u64, low);
-        core::ptr::write_volatile((at + 8) as *mut u64, high);
-    }
+    let at = TRANSMIT_DESCRIPTOR_BYTES as usize * index as usize;
+    put_dma64(ring, at, low);
+    put_dma64(ring, at + 8, high);
 }
 
 /// Whether hardware has completed a transmit descriptor -- its `DTYP` field
 /// reading `0xF`.
 ///
-/// # Safety
-///
-/// `ring_host` must be the direct-map address of the transmit ring, and
-/// `index` inside it.
-pub unsafe fn transmit_completed(ring_host: u64, index: u32) -> bool {
-    let at = ring_host + TRANSMIT_DESCRIPTOR_BYTES * u64::from(index) + 8;
-    // SAFETY: per the caller; the second quad-word, which hardware rewrites.
-    let qword = unsafe { core::ptr::read_volatile(at as *const u64) };
-    qword & TX_DTYP_MASK == TX_DTYP_DONE
+/// `ring` is the transmit ring and `index` inside it.
+#[must_use]
+pub fn transmit_completed(ring: &impl Dma, index: u32) -> bool {
+    let at = TRANSMIT_DESCRIPTOR_BYTES as usize * index as usize + 8;
+    // The second quad-word, which hardware rewrites.
+    dma64(ring, at) & TX_DTYP_MASK == TX_DTYP_DONE
 }
 
 /// Writes one transmit descriptor into a ring.
 ///
-/// # Safety
-///
 /// As [`transmit_completed`], and the queue must not be running past `index`.
-pub unsafe fn post_transmit_descriptor(ring_host: u64, index: u32, buffer: u64, bytes: u16) {
+pub fn post_transmit_descriptor(ring: &mut impl Dma, index: u32, buffer: u64, bytes: u16) {
     let (low, high) = transmit_descriptor(buffer, bytes);
-    let at = ring_host + TRANSMIT_DESCRIPTOR_BYTES * u64::from(index);
-    // SAFETY: per the caller; two quad-words inside the ring.
-    unsafe {
-        core::ptr::write_volatile(at as *mut u64, low);
-        core::ptr::write_volatile((at + 8) as *mut u64, high);
-    }
+    let at = TRANSMIT_DESCRIPTOR_BYTES as usize * index as usize;
+    put_dma64(ring, at, low);
+    put_dma64(ring, at + 8, high);
 }
 
 /// What `Get VSI Parameters` reported about an existing VSI.
@@ -1694,15 +1828,13 @@ impl TransmitCounters {
 }
 
 /// One mapped X722 function, far enough along to be asked questions.
-pub struct Device {
-    /// The register window, through the direct map.
-    registers: u64,
-    /// The admin transmit ring as this kernel writes it -- its direct-map
-    /// address -- or zero until [`Device::enable_admin_queues`] attaches one.
-    ring: u64,
-    /// The LAN transmit ring as this kernel writes it, or zero until
-    /// [`Device::attach_transmit_ring`] names one.
-    transmit_ring: u64,
+pub struct Device<R: Registers> {
+    /// The registers, reached through the trait rather than an address.
+    registers: R,
+    /// Whether [`Device::enable_admin_queues`] has run, so a command posted
+    /// before it is refused rather than written into a ring the device is not
+    /// reading.
+    ring_enabled: bool,
     /// How many descriptors that ring holds.
     transmit_depth: u32,
     /// The next free descriptor in it.
@@ -1721,7 +1853,7 @@ pub struct Device {
     next: u32,
 }
 
-impl Device {
+impl<R: Registers> Device<R> {
     /// Takes a mapped register window.
     ///
     /// **The whole unsafety of this driver is here**, deliberately. `registers`
@@ -1735,22 +1867,19 @@ impl Device {
     ///
     /// As above.
     #[must_use]
-    pub const unsafe fn new(registers: u64) -> Self {
+    pub const fn new(registers: R) -> Self {
         Self {
             registers,
-            transmit_ring: 0,
+            ring_enabled: false,
             transmit_depth: 0,
             transmit_next: 0,
-            ring: 0,
             next: 0,
         }
     }
 
     /// Reads one register, which the offsets in this file are all within.
     fn read(&self, offset: u64) -> u32 {
-        // SAFETY: `new`'s invariant -- a device mapping of this function's BAR0
-        // -- and every offset here is a documented register within it.
-        unsafe { core::ptr::read_volatile((self.registers + offset) as *const u32) }
+        self.registers.read(offset)
     }
 
     /// Reads one 64-bit register pair in a single access.
@@ -1761,15 +1890,12 @@ impl Device {
     /// reads would also tear across a counter incrementing between them, which
     /// is the ordinary reason such a pair exists.
     fn read64(&self, offset: u64) -> u64 {
-        // SAFETY: as `read`; every offset used here is a documented 64-bit
-        // register pair, 8-byte aligned by its own `0x8*n` stride.
-        unsafe { core::ptr::read_volatile((self.registers + offset) as *const u64) }
+        self.registers.read64(offset)
     }
 
     /// Writes one register.
-    fn write(&self, offset: u64, value: u32) {
-        // SAFETY: as `read`.
-        unsafe { core::ptr::write_volatile((self.registers + offset) as *mut u32, value) };
+    fn write(&mut self, offset: u64, value: u32) {
+        self.registers.write(offset, value);
     }
 
     /// Asks for a PF reset and says whether the device finished one.
@@ -1779,7 +1905,7 @@ impl Device {
     /// that never clears the bit is a device that is not there or not
     /// answering, and this must say so rather than hang a boot.
     ///
-    pub fn reset(&self, spins: u32) -> bool {
+    pub fn reset(&mut self, spins: u32) -> bool {
         self.write(PFGEN_CTRL, PFSWR);
         for _ in 0..spins {
             if self.read(PFGEN_CTRL) & PFSWR == 0 {
@@ -1808,14 +1934,18 @@ impl Device {
     /// The enable bit goes last, in both rings, because the datasheet says the
     /// other fields must be initialized before it is set.
     ///
-    /// # Safety
+    /// `transmit` and `receive` are the two rings as the **device** reaches
+    /// them. They must stay mapped for its use while the queues are enabled,
+    /// which is the caller's obligation and not checkable here; the transmit
+    /// ring as *this driver* writes it is handed to each [`Device::command`],
+    /// which bounds-checks every descriptor it posts.
     ///
-    /// `host` must be the transmit ring's direct-map address, mapped for
-    /// writing, at least [`RING_BYTES`] long, and nothing else may write it for
-    /// as long as this value lives; every command posted afterwards relies on
-    /// that. Both rings must stay mapped for the device's use while the queues
-    /// are enabled, which is the caller's obligation and not checkable here.
-    pub unsafe fn enable_admin_queues(&mut self, transmit: u64, receive: u64, host: u64) {
+    /// **The rings are passed to each call rather than held**, and the reason
+    /// is testability rather than taste: a driver holding `&mut [u8]` cannot be
+    /// handed a ring a test also wants to write, so firmware's side of a
+    /// command round-trip could not be modelled at all. Nine methods take one
+    /// argument more; every one of them became testable.
+    pub fn enable_admin_queues(&mut self, transmit: u64, receive: u64) {
         // Heads and tails first, so an enabled ring does not start from
         // whatever a previous owner left. A PF reset clears the enable bits,
         // but this does not assume the reset happened.
@@ -1832,7 +1962,7 @@ impl Device {
         self.write(PF_ATQLEN, RING_DESCRIPTORS | QUEUE_ENABLE);
         self.write(PF_ARQLEN, RING_DESCRIPTORS | QUEUE_ENABLE);
 
-        self.ring = host;
+        self.ring_enabled = true;
         self.next = 0;
     }
 
@@ -1940,8 +2070,12 @@ impl Device {
     /// # Errors
     ///
     /// As [`Device::command`], except that `EEXIST` is an answer.
-    pub fn clear_pxe_mode(&mut self, spins: u32) -> Result<bool, CommandError> {
-        match self.command(Descriptor::direct(OPCODE_CLEAR_PXE_MODE), spins) {
+    pub fn clear_pxe_mode(
+        &mut self,
+        ring: &mut impl Dma,
+        spins: u32,
+    ) -> Result<bool, CommandError> {
+        match self.command(ring, Descriptor::direct(OPCODE_CLEAR_PXE_MODE), spins) {
             Ok(_) => Ok(true),
             Err(CommandError::Refused(RETURN_EEXIST)) => Ok(false),
             Err(error) => Err(error),
@@ -1964,6 +2098,7 @@ impl Device {
     /// As [`Device::command`].
     pub fn set_promiscuous(
         &mut self,
+        ring: &mut impl Dma,
         seid: u16,
         mode: PromiscuousMode,
         on: bool,
@@ -1975,7 +2110,7 @@ impl Device {
         // Bytes 16-17 the modes, 18-19 the valid mask, 20-21 the SEID.
         request.words[4] = u32::from(modes) | (u32::from(valid) << 16);
         request.words[5] = u32::from(seid & 0x3ff);
-        self.command(request, spins).map(|_| ())
+        self.command(ring, request, spins).map(|_| ())
     }
 
     /// Programs where the LAN objects live in this function's private memory
@@ -1983,7 +2118,7 @@ impl Device {
     /// after them at the next 512-byte boundary; both counted to `queues`,
     /// which is the PF's whole allocation because the objects are indexed by
     /// absolute queue number -- and reads the four registers back.
-    pub fn program_lan_private_memory(&self, queues: u32) -> PrivateMemory {
+    pub fn program_lan_private_memory(&mut self, queues: u32) -> PrivateMemory {
         let function = self.read(PF_FUNC_RID) & 0b111;
         let at = 4 * u64::from(function);
         let tx_size = self.read(GLHMC_LANTXOBJSZ) & 0xf;
@@ -2006,7 +2141,7 @@ impl Device {
     /// hold against [`segment_descriptor`]: a write past this function's range
     /// *"is dropped"*, and dropped silently.
     pub fn write_segment_descriptor(
-        &self,
+        &mut self,
         index: u32,
         pd_page: u64,
         backing_pages: u32,
@@ -2028,7 +2163,7 @@ impl Device {
     ///
     /// `tail` is the first descriptor software has not handed over -- the
     /// count posted -- and a multiple of eight outside PXE mode.
-    pub fn enable_receive_queue(&self, queue: u32, tail: u32, spins: u32) -> bool {
+    pub fn enable_receive_queue(&mut self, queue: u32, tail: u32, spins: u32) -> bool {
         let at = 4 * u64::from(queue);
         self.write(QRX_TAIL + at, 0);
         self.write(QRX_TAIL + at, tail & 0x1fff);
@@ -2046,7 +2181,7 @@ impl Device {
     /// Disables a receive queue -- 38.30.3.3.3: `QENA_REQ` cleared, then
     /// `QENA_STAT` polled clear, after which *"software can release all memory
     /// structures of the queue"*.
-    pub fn disable_receive_queue(&self, queue: u32, spins: u32) -> bool {
+    pub fn disable_receive_queue(&mut self, queue: u32, spins: u32) -> bool {
         let at = 4 * u64::from(queue);
         let enable = self.read(QRX_ENA + at);
         self.write(QRX_ENA + at, enable & !QENA_REQ);
@@ -2069,7 +2204,7 @@ impl Device {
     /// wrote into private memory: a `HEAD` that moved is a device that fetched
     /// descriptors from the ring the context names.
     #[must_use]
-    pub fn cached_receive_context(&self, queue: u32, spins: u32) -> Option<([u32; 4], bool)> {
+    pub fn cached_receive_context(&mut self, queue: u32, spins: u32) -> Option<([u32; 4], bool)> {
         // Sub-line 0, queue type 00 (receive), op code 00 (read).
         self.write(PFCM_LANCTXCTL, queue & 0xfff);
         for _ in 0..spins {
@@ -2177,19 +2312,20 @@ impl Device {
     ///
     /// # Safety
     ///
-    /// `host` must be the direct-map address of the buffer the device reaches
-    /// at `device`, writable, at least [`MAC_VLAN_ENTRY_BYTES`] long, and
-    /// written by nothing else while this runs.
+    /// `buffer` is what the device reaches at `device`, at least
+    /// [`MAC_VLAN_ENTRY_BYTES`] long and written by nothing else while this
+    /// runs.
     ///
     /// # Errors
     ///
     /// As [`Device::command`]. `ENOSPC` means the filter table is full.
-    pub unsafe fn add_mac_filter(
+    pub fn add_mac_filter(
         &mut self,
+        ring: &mut impl Dma,
         seid: u16,
         address: [u8; 6],
         device: u64,
-        host: u64,
+        buffer: &mut impl Dma,
         spins: u32,
     ) -> Result<(), CommandError> {
         let mut entry = [0u8; MAC_VLAN_ENTRY_BYTES as usize];
@@ -2199,18 +2335,12 @@ impl Device {
         // `ToQueue`, which is not set -- the VSI's own steering decides.
         let flags = MAC_VLAN_PERFECT_MATCH | MAC_VLAN_IGNORE_VLAN;
         entry[8..10].copy_from_slice(&flags.to_le_bytes());
-        // SAFETY: per the caller -- a writable mapping of at least
-        // `MAC_VLAN_ENTRY_BYTES`, written by nothing else.
-        unsafe {
-            for (offset, byte) in entry.iter().enumerate() {
-                core::ptr::write_volatile((host + offset as u64) as *mut u8, *byte);
-            }
-        }
+        buffer.write(0, &entry);
         let mut request =
             Descriptor::with_buffer(OPCODE_ADD_MAC_VLAN, device, MAC_VLAN_ENTRY_BYTES);
         // Bytes 16-17 the count, 18-19 the SEID with its valid bit.
         request.words[4] = 1 | (u32::from(seid & 0x3ff) | 0x8000) << 16;
-        self.command(request, spins).map(|_| ())
+        self.command(ring, request, spins).map(|_| ())
     }
 
     /// Asks firmware to stop its LLDP agent, releasing the port's control VSI.
@@ -2223,11 +2353,16 @@ impl Device {
     ///
     /// As [`Device::command`]. A firmware with no agent running may answer
     /// `EEXIST` or `ENOENT`, and either is an answer rather than a failure.
-    pub fn stop_lldp_agent(&mut self, shutdown: bool, spins: u32) -> Result<(), CommandError> {
+    pub fn stop_lldp_agent(
+        &mut self,
+        ring: &mut impl Dma,
+        shutdown: bool,
+        spins: u32,
+    ) -> Result<(), CommandError> {
         let mut request = Descriptor::direct(OPCODE_STOP_LLDP_AGENT);
         // Byte 16 is the command; the rest of the descriptor is reserved.
         request.words[4] = u32::from(if shutdown { LLDP_SHUTDOWN } else { 0 });
-        self.command(request, spins).map(|_| ())
+        self.command(ring, request, spins).map(|_| ())
     }
 
     /// Lets a VSI fix a transmit packet's destination itself -- the *Allow
@@ -2240,35 +2375,33 @@ impl Device {
     /// a switching section from zeroes would replace its switch id and its
     /// loopback setting with guesses.
     ///
-    /// # Safety
-    ///
     /// As [`Device::vsi_parameters`].
     ///
     /// # Errors
     ///
     /// As [`Device::command`].
-    pub unsafe fn allow_destination_override(
+    pub fn allow_destination_override(
         &mut self,
+        ring: &mut impl Dma,
         seid: u16,
         device: u64,
-        host: u64,
+        buffer: &mut impl Dma,
         spins: u32,
     ) -> Result<(), CommandError> {
-        // SAFETY: per the caller.
-        unsafe { self.vsi_parameters(seid, device, host, spins) }?;
-        // SAFETY: per the caller -- the buffer firmware just filled, which is
-        // at least `VSI_BUFFER_BYTES` and written by nothing else.
-        unsafe {
-            let sections = core::ptr::read_volatile(host as *const u16);
-            core::ptr::write_volatile(host as *mut u16, sections | VSI_SECTION_SWITCHING);
-            let at = host + VSI_SWITCHING_FLAGS_AT as u64;
-            let flags = core::ptr::read_volatile(at as *const u8);
-            core::ptr::write_volatile(at as *mut u8, flags | VSI_ALLOW_DESTINATION_OVERRIDE);
-        }
+        self.vsi_parameters(ring, seid, device, buffer, spins)?;
+        // The buffer firmware just filled, read back with one bit changed.
+        let mut sections = [0u8; 2];
+        buffer.read(0, &mut sections);
+        let sections = u16::from_le_bytes(sections) | VSI_SECTION_SWITCHING;
+        buffer.write(0, &sections.to_le_bytes());
+        let mut flags = [0u8; 1];
+        buffer.read(VSI_SWITCHING_FLAGS_AT, &mut flags);
+        flags[0] |= VSI_ALLOW_DESTINATION_OVERRIDE;
+        buffer.write(VSI_SWITCHING_FLAGS_AT, &flags);
         let mut request = Descriptor::with_buffer(OPCODE_UPDATE_VSI, device, VSI_BUFFER_BYTES);
         // Bytes 16-17 are the SEID.
         request.words[4] = u32::from(seid);
-        self.command(request, spins).map(|_| ())
+        self.command(ring, request, spins).map(|_| ())
     }
 
     /// Routes a control protocol to a VSI by EtherType -- `Add Control Packet
@@ -2287,6 +2420,7 @@ impl Device {
     /// agent holding one is exactly the case worth telling apart.
     pub fn add_control_packet_filter(
         &mut self,
+        ring: &mut impl Dma,
         seid: u16,
         ethertype: u16,
         spins: u32,
@@ -2297,7 +2431,7 @@ impl Device {
         // meaningful with `ToQueue`, which is not set.
         request.words[5] = u32::from(ethertype) << 16;
         request.words[6] = u32::from(CONTROL_FILTER_IGNORE_MAC) | (u32::from(seid & 0x3ff) << 16);
-        self.command(request, spins).map(|_| ())
+        self.command(ring, request, spins).map(|_| ())
     }
 
     /// Asks `Get VSI Parameters` about a VSI this function controls.
@@ -2308,36 +2442,36 @@ impl Device {
     ///
     /// # Safety
     ///
-    /// `host` must be the direct-map address of the buffer the device reaches
-    /// at `device`, writable, at least [`VSI_BUFFER_BYTES`] long, and written
-    /// by nothing else while this runs.
+    /// `buffer` is what the device reaches at `device`, at least
+    /// [`VSI_BUFFER_BYTES`] long and written by nothing else while this runs.
     ///
     /// # Errors
     ///
     /// As [`Device::command`]. `ENOENT` means the SEID is not a VSI and
-    /// `EACCES` that it belongs to another PF.
-    pub unsafe fn vsi_parameters(
+    /// `EACCES` that it belongs to another PF. [`CommandError::ShortBuffer`] if
+    /// `buffer` is too small to hold what firmware will write -- refused rather
+    /// than truncated, because a short read here would report a queue set that
+    /// firmware never named.
+    pub fn vsi_parameters(
         &mut self,
+        ring: &mut impl Dma,
         seid: u16,
         device: u64,
-        host: u64,
+        buffer: &mut impl Dma,
         spins: u32,
     ) -> Result<VsiParameters, CommandError> {
-        // SAFETY: per the caller.
-        unsafe { core::ptr::write_bytes(host as *mut u8, 0, usize::from(VSI_BUFFER_BYTES)) };
+        buffer.zero(0, VSI_BUFFER_BYTES as usize);
         let mut request =
             Descriptor::with_buffer(OPCODE_GET_VSI_PARAMETERS, device, VSI_BUFFER_BYTES);
         // The SEID goes in bytes 16-17, which `with_buffer` leaves clear.
         request.words[4] = u32::from(seid);
-        let reply = self.command(request, spins)?;
-        // SAFETY: per the caller; firmware has completed the command, so its
-        // writes to the buffer are done.
-        let buffer =
-            unsafe { core::ptr::read_volatile(host as *const [u8; VSI_BUFFER_BYTES as usize]) };
+        let reply = self.command(ring, request, spins)?;
+        let mut handle = [0u8; 2];
+        buffer.read(QS_HANDLE_AT, &mut handle);
         Ok(VsiParameters {
             // Bytes 18-19 of the descriptor: "returns the assigned VSI number".
             number: reply.half(18),
-            queue_set: u16::from_le_bytes([buffer[QS_HANDLE_AT], buffer[QS_HANDLE_AT + 1]]),
+            queue_set: u16::from_le_bytes(handle),
         })
     }
 
@@ -2347,7 +2481,7 @@ impl Device {
     /// 128 rather than the queue itself.
     ///
     /// `queue` is the **absolute** index, which is what `QINDX` takes.
-    pub fn clear_transmit_queue_disable(&self, queue: u32) {
+    pub fn clear_transmit_queue_disable(&mut self, queue: u32) {
         let register = GLLAN_TXPRE_QDIS + 4 * u64::from(queue / QDIS_QUEUES_PER_REGISTER);
         self.write(register, (queue & 0x7ff) | TXPRE_CLEAR_QDIS);
     }
@@ -2355,14 +2489,14 @@ impl Device {
     /// Sets a transmit queue's internal disable flag, the other half of
     /// [`Device::clear_transmit_queue_disable`] and the first step of the
     /// disable flow.
-    pub fn set_transmit_queue_disable(&self, queue: u32) {
+    pub fn set_transmit_queue_disable(&mut self, queue: u32) {
         let register = GLLAN_TXPRE_QDIS + 4 * u64::from(queue / QDIS_QUEUES_PER_REGISTER);
         self.write(register, (queue & 0x7ff) | TXPRE_SET_QDIS);
     }
 
     /// Says which function owns a transmit queue -- `QTX_CTL`, a statement a
     /// receive queue never needs to make.
-    pub fn own_transmit_queue(&self, queue: u32, function: u32) {
+    pub fn own_transmit_queue(&mut self, queue: u32, function: u32) {
         self.write(
             QTX_CTL + 4 * u64::from(queue),
             QTX_CTL_PF_QUEUE | ((function & 0xf) << 2),
@@ -2374,7 +2508,7 @@ impl Device {
     ///
     /// The context, the ownership and the disable flag must already be done;
     /// this is the last step and the one the device answers.
-    pub fn enable_transmit_queue(&self, queue: u32, spins: u32) -> bool {
+    pub fn enable_transmit_queue(&mut self, queue: u32, spins: u32) -> bool {
         let at = 4 * u64::from(queue);
         self.write(QTX_HEAD + at, 0);
         self.write(QTX_TAIL + at, 0);
@@ -2395,8 +2529,7 @@ impl Device {
     ///
     /// `host` must be the direct-map address of the ring the queue's context
     /// points at, writable, `descriptors` deep, and written by nothing else.
-    pub unsafe fn attach_transmit_ring(&mut self, host: u64, descriptors: u16) {
-        self.transmit_ring = host;
+    pub fn attach_transmit_ring(&mut self, descriptors: u16) {
         self.transmit_depth = u32::from(descriptors);
         self.transmit_next = 0;
     }
@@ -2414,10 +2547,13 @@ impl Device {
     /// each caller is the whole point: the tail must only ever move forward,
     /// and a caller that recomputes a slot from its own counter does not know
     /// where the previous caller left it.
-    pub fn post_frame(&mut self, buffer: u64, bytes: u16, uplink: bool) -> Option<u32> {
-        if self.transmit_ring == 0 {
-            return None;
-        }
+    pub fn post_frame(
+        &mut self,
+        ring: &mut impl Dma,
+        buffer: u64,
+        bytes: u16,
+        uplink: bool,
+    ) -> Option<u32> {
         let needed = if uplink { 2 } else { 1 };
         if self.transmit_depth < needed {
             return None;
@@ -2428,18 +2564,13 @@ impl Device {
         if self.transmit_next + needed > self.transmit_depth {
             self.transmit_next = 0;
         }
+        let slot = self.transmit_next;
+        let data = if uplink { slot + 1 } else { slot };
         if uplink {
-            // SAFETY: `attach_transmit_ring`'s contract, and the slot is
-            // inside the ring's depth by the wrap above.
-            unsafe {
-                post_transmit_context(self.transmit_ring, self.transmit_next, TX_SWTCH_UPLINK);
-            }
-            self.transmit_next += 1;
+            post_transmit_context(ring, slot, TX_SWTCH_UPLINK);
         }
-        let data = self.transmit_next;
-        // SAFETY: as above.
-        unsafe { post_transmit_descriptor(self.transmit_ring, data, buffer, bytes) };
-        self.transmit_next += 1;
+        post_transmit_descriptor(ring, data, buffer, bytes);
+        self.transmit_next = data + 1;
         // **Wrap the cursor, because the tail is an index and not a count.**
         // `QTX_TAIL` takes a descriptor index, so a ring of eight accepts 0 to
         // 7; writing 8 after filling the last slot is out of range and the
@@ -2463,13 +2594,9 @@ impl Device {
 
     /// Whether the frame posted at `index` has been written back.
     ///
-    /// # Safety
-    ///
-    /// A ring must be attached.
     #[must_use]
-    pub unsafe fn frame_completed(&self, index: u32) -> bool {
-        // SAFETY: per the caller and `attach_transmit_ring`'s contract.
-        unsafe { transmit_completed(self.transmit_ring, index) }
+    pub fn frame_completed(&self, ring: &impl Dma, index: u32) -> bool {
+        transmit_completed(ring, index)
     }
 
     /// What a transmit queue's enable handshake currently reads, as
@@ -2482,7 +2609,7 @@ impl Device {
 
     /// Rings the transmit doorbell -- `QTX_TAIL`, the last valid descriptor
     /// plus one.
-    pub fn transmit_doorbell(&self, queue: u32, tail: u32) {
+    pub fn transmit_doorbell(&mut self, queue: u32, tail: u32) {
         self.write(QTX_TAIL + 4 * u64::from(queue), tail & 0x1fff);
     }
 
@@ -2495,7 +2622,7 @@ impl Device {
 
     /// Disables a transmit queue -- 38.31.3.1.2: the disable flag set first,
     /// then `QENA_REQ` cleared, then `QENA_STAT` polled clear.
-    pub fn disable_transmit_queue(&self, queue: u32, spins: u32) -> bool {
+    pub fn disable_transmit_queue(&mut self, queue: u32, spins: u32) -> bool {
         self.set_transmit_queue_disable(queue);
         let at = 4 * u64::from(queue);
         let enable = self.read(QTX_ENA + at);
@@ -2544,36 +2671,69 @@ impl Device {
     /// [`CommandError::NoAnswer`] if `DD` never appears, and
     /// [`CommandError::Refused`] with firmware's return value if it appears
     /// with `ERR` beside it.
-    pub fn command(&mut self, request: Descriptor, spins: u32) -> Result<Descriptor, CommandError> {
-        if self.ring == 0 {
+    pub fn command(
+        &mut self,
+        ring: &mut impl Dma,
+        request: Descriptor,
+        spins: u32,
+    ) -> Result<Descriptor, CommandError> {
+        let slot = self.post(ring, request)?;
+        self.collect(ring, slot, spins)
+    }
+
+    /// Writes a command into the ring and tells firmware it is there.
+    ///
+    /// Returns the byte offset of the descriptor, which [`Device::collect`]
+    /// polls. **Split from `command` so that firmware's half of the round trip
+    /// can be written by something other than firmware**: with the two joined
+    /// there was no instant at which anything but a real device could answer,
+    /// so the command path had no test at all. A test posts, fills the slot the
+    /// way firmware would, and collects.
+    ///
+    /// # Errors
+    ///
+    /// [`CommandError::NoRing`] before [`Device::enable_admin_queues`].
+    pub fn post(
+        &mut self,
+        ring: &mut impl Dma,
+        request: Descriptor,
+    ) -> Result<usize, CommandError> {
+        if !self.ring_enabled {
             return Err(CommandError::NoRing);
         }
-        let slot = self.ring + u64::from(self.next) * DESCRIPTOR_BYTES;
-        // SAFETY: `enable_admin_queues`' contract -- `ring` is the transmit
-        // ring's direct-map address, writable, `RING_BYTES` long and written by
-        // nothing else -- and `next` stays below `RING_DESCRIPTORS`, so every
-        // word lands inside it.
-        unsafe {
-            for (index, word) in request.words.iter().enumerate() {
-                core::ptr::write_volatile((slot + 4 * index as u64) as *mut u32, *word);
-            }
+        let slot = self.next as usize * DESCRIPTOR_BYTES as usize;
+        for (index, word) in request.words.iter().enumerate() {
+            put_dma32(ring, slot + 4 * index, *word);
         }
         self.next = (self.next + 1) % RING_DESCRIPTORS;
         // The tail is what tells firmware a descriptor is there -- Table 38-341
         // calls `ATQT` the pointer "software device driver updates".
         self.write(PF_ATQT, self.next);
+        Ok(slot)
+    }
 
+    /// Waits for firmware to mark the descriptor at `slot` done, and reads it.
+    ///
+    /// # Errors
+    ///
+    /// [`CommandError::NoAnswer`] if `DD` never appears, and
+    /// [`CommandError::Refused`] with firmware's return value if it appears
+    /// with `ERR` beside it.
+    pub fn collect(
+        &self,
+        ring: &impl Dma,
+        slot: usize,
+        spins: u32,
+    ) -> Result<Descriptor, CommandError> {
         for _ in 0..spins {
-            // SAFETY: as above; the first word of the same slot.
-            let first = unsafe { core::ptr::read_volatile(slot as *const u32) };
+            // The first word of the same slot, which firmware marks done.
+            let first = dma32(ring, slot);
             if first & u32::from(FLAG_DD) != 0 {
                 let mut words = [0; 8];
                 for (index, word) in words.iter_mut().enumerate() {
-                    // SAFETY: as above; firmware has marked the descriptor done
-                    // and written its answer into it.
-                    *word = unsafe {
-                        core::ptr::read_volatile((slot + 4 * index as u64) as *const u32)
-                    };
+                    // Firmware has marked the descriptor done and written its
+                    // answer into it.
+                    *word = dma32(ring, slot + 4 * index);
                 }
                 let reply = Descriptor { words };
                 if first & u32::from(FLAG_ERR) != 0 {
@@ -2598,8 +2758,12 @@ impl Device {
     /// # Errors
     ///
     /// As [`Device::command`].
-    pub fn get_version(&mut self, spins: u32) -> Result<(u16, u16), CommandError> {
-        let reply = self.command(Descriptor::direct(OPCODE_GET_VERSION), spins)?;
+    pub fn get_version(
+        &mut self,
+        ring: &mut impl Dma,
+        spins: u32,
+    ) -> Result<(u16, u16), CommandError> {
+        let reply = self.command(ring, Descriptor::direct(OPCODE_GET_VERSION), spins)?;
         Ok((
             reply.half(VERSION_MAJOR_AT),
             reply.half(VERSION_MAJOR_AT + 2),
@@ -2613,57 +2777,597 @@ impl Device {
     /// # Errors
     ///
     /// As [`Device::command`].
-    pub fn link_status(&mut self, spins: u32) -> Result<Link, CommandError> {
-        let reply = self.command(Descriptor::direct(OPCODE_GET_LINK_STATUS), spins)?;
+    pub fn link_status(&mut self, ring: &mut impl Dma, spins: u32) -> Result<Link, CommandError> {
+        let reply = self.command(ring, Descriptor::direct(OPCODE_GET_LINK_STATUS), spins)?;
         Ok(Link::from_descriptor(&reply))
     }
 
     /// Asks `Get Switch Configuration` into a buffer and reads it back.
     ///
-    /// `device` is the buffer as the device issues it and `host` the same
-    /// [`SWITCH_BUFFER_BYTES`] as this kernel reaches them -- two addresses for
-    /// one buffer, as with the rings. The buffer is zeroed first so a stale
-    /// count cannot be read as this answer, and copied out whole once firmware
-    /// has marked the descriptor done.
+    /// `device` is the buffer as the device issues it and `buffer` the same
+    /// [`SWITCH_BUFFER_BYTES`] as this driver reaches them -- an address and a
+    /// slice for one buffer, as with the rings. It is zeroed first so a stale
+    /// count cannot be read as this answer, and parsed once firmware has marked
+    /// the descriptor done.
     ///
     /// Only the first request is made: a switch with more elements than the
     /// buffer holds reports its total, and the caller can say so rather than
     /// page through what a first driver has no use for.
     ///
-    /// # Safety
+    /// # Errors
     ///
-    /// `host` must be the direct-map address of the buffer the device reaches
-    /// at `device`, mapped for writing, at least [`SWITCH_BUFFER_BYTES`] long,
-    /// and written by nothing else while this runs.
+    /// As [`Device::command`], and [`CommandError::ShortBuffer`] if `buffer` is
+    /// smaller than [`SWITCH_BUFFER_BYTES`].
     ///
     /// # Errors
     ///
     /// As [`Device::command`].
-    pub unsafe fn switch_configuration(
+    pub fn switch_configuration(
         &mut self,
+        ring: &mut impl Dma,
         device: u64,
-        host: u64,
+        buffer: &mut impl Dma,
         spins: u32,
     ) -> Result<SwitchConfiguration, CommandError> {
-        // SAFETY: per the caller -- a writable mapping of `SWITCH_BUFFER_BYTES`
-        // at `host`, written by nothing else.
-        unsafe { core::ptr::write_bytes(host as *mut u8, 0, usize::from(SWITCH_BUFFER_BYTES)) };
+        buffer.zero(0, SWITCH_BUFFER_BYTES as usize);
         self.command(
+            ring,
             Descriptor::with_buffer(OPCODE_GET_SWITCH_CONFIGURATION, device, SWITCH_BUFFER_BYTES),
             spins,
         )?;
-        // SAFETY: per the caller; firmware has completed the command, so its
-        // writes to the buffer are done, and a volatile read is what keeps the
-        // compiler from serving an older view of memory a device wrote.
-        let buffer =
-            unsafe { core::ptr::read_volatile(host as *const [u8; SWITCH_BUFFER_BYTES as usize]) };
-        Ok(SwitchConfiguration::parse(&buffer))
+        // Firmware has completed the command, so its writes to the buffer are
+        // done -- and this read goes through `Dma`, which is what makes it a
+        // read of what the device wrote rather than of what this function
+        // zeroed. See the trait: that distinction cost a boot.
+        let mut bytes = [0u8; SWITCH_BUFFER_BYTES as usize];
+        buffer.read(0, &mut bytes);
+        Ok(SwitchConfiguration::parse(&bytes))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every register this file names, at index zero and at the highest index
+    /// the datasheet allows, must be inside a page [`REGISTER_PAGES`] asks for.
+    ///
+    /// **This is the check that keeps a delegation honest.** The kernel maps
+    /// exactly those pages; a constant added here whose page is not among them
+    /// would read as zero on hardware and be diagnosed as a device that will
+    /// not answer, which is the worst kind of wrong -- so it fails here
+    /// instead, on a host, in a second.
+    #[test]
+    fn every_register_this_driver_names_is_in_a_page_it_asks_for() {
+        // (offset, highest index, stride) -- an unindexed register is (r, 0, 0).
+        let registers: [(u64, u64, u64); 39] = [
+            (PFGEN_CTRL, 0, 0),
+            (PF_ATQBAL, 0, 0),
+            (PF_ATQT, 0, 0),
+            (PF_ARQT, 0, 0),
+            (PF_FUNC_RID, 0, 0),
+            (GLHMC_SDPART, 0, 0),
+            (PFHMC_SDCMD, 0, 0),
+            (PFHMC_SDDATALOW, 0, 0),
+            (PFHMC_SDDATAHIGH, 0, 0),
+            (PFHMC_ERRORINFO, 0, 0),
+            (PFHMC_ERRORDATA, 0, 0),
+            (GLHMC_LANTXOBJSZ, 0, 0),
+            (GLHMC_LANRXOBJSZ, 0, 0),
+            (GLHMC_LANQMAX, 15, 4),
+            (GLHMC_LANTXBASE, 7, 4),
+            (GLHMC_LANTXCNT, 7, 4),
+            (GLHMC_LANRXBASE, 7, 4),
+            (GLHMC_LANRXCNT, 7, 4),
+            (PFLAN_QALLOC, 0, 0),
+            (PFGEN_PORTNUM, 0, 0),
+            (GLLAN_RCTL_0, 0, 0),
+            (VSILAN_QBASE, MAX_VSI, 4),
+            (QRX_ENA, MAX_RECEIVE_QUEUE, 4),
+            (QRX_TAIL, MAX_RECEIVE_QUEUE, 4),
+            (QTX_ENA, MAX_RECEIVE_QUEUE, 4),
+            (QTX_TAIL, MAX_RECEIVE_QUEUE, 4),
+            (QTX_HEAD, MAX_RECEIVE_QUEUE, 4),
+            (QTX_CTL, MAX_RECEIVE_QUEUE, 4),
+            (GLLAN_TXPRE_QDIS, 11, 4),
+            (PFCM_LANCTXDATA, 3, 4),
+            (PFCM_LANCTXCTL, 0, 0),
+            (PFCM_LANCTXSTAT, 0, 0),
+            (PRTPM_SAL, MAX_PORT, 32),
+            (PRTPM_SAH, MAX_PORT, 32),
+            (GLPRT_GORCL, MAX_PORT, 8),
+            (GLPRT_UPRCL, MAX_PORT, 8),
+            (GLPRT_BPTCL, MAX_PORT, 8),
+            (GLV_RDPC, MAX_VSI, 8),
+            (GLV_BPRCL, MAX_VSI, 8),
+        ];
+        for (offset, highest, stride) in registers {
+            for index in [0, highest] {
+                let at = offset + stride * index;
+                assert!(
+                    page_is_mapped(at),
+                    "{at:#x} (index {index} of {offset:#x}) is outside REGISTER_PAGES"
+                );
+                // And the whole 64-bit pair, for the counters that are read as
+                // one: a page boundary between the halves would tear.
+                assert!(page_is_mapped(at + 4), "{at:#x} straddles a page");
+            }
+        }
+    }
+
+    /// And the list asks for nothing it does not need: every page in it holds a
+    /// register the table above names.
+    ///
+    /// The other direction of the same rule. Without it the list could grow to
+    /// the whole BAR and still pass the test above, which would defeat the
+    /// point of naming pages at all.
+    #[test]
+    fn the_pages_asked_for_are_the_pages_used() {
+        for page in REGISTER_PAGES {
+            assert!(
+                page_is_mapped(page),
+                "{page:#x} is in the list and not found by the lookup"
+            );
+        }
+        assert!(
+            !page_is_mapped(0x3f_f000),
+            "the flash beyond the CSR space is not asked for"
+        );
+        assert!(!page_is_mapped(0), "nor page zero, which names no register");
+    }
+
+    /// Memory with a device on the other side of it.
+    ///
+    /// **The fake that a `&mut [u8]` could not be.** Its whole point is the
+    /// `answer`: bytes the device writes *after* the driver has zeroed the
+    /// buffer and posted the command, which is the sequence every indirect
+    /// admin command performs. Modelling it is what a plain slice made
+    /// impossible, and reading the zeroes back instead of the answer is what
+    /// went wrong on the SR550 -- see [`Dma`].
+    struct FakeDma {
+        bytes: core::cell::RefCell<[u8; Self::BYTES]>,
+        answer: core::cell::RefCell<Option<(usize, usize, [u8; 64])>>,
+    }
+
+    impl FakeDma {
+        const BYTES: usize = 1024;
+
+        fn new() -> Self {
+            Self {
+                bytes: core::cell::RefCell::new([0; Self::BYTES]),
+                answer: core::cell::RefCell::new(None),
+            }
+        }
+
+        /// Arranges for the device to have written `payload` at `at` by the
+        /// time anything looks.
+        fn answers(self, at: usize, payload: &[u8]) -> Self {
+            let mut bytes = [0u8; 64];
+            bytes[..payload.len()].copy_from_slice(payload);
+            *self.answer.borrow_mut() = Some((at, payload.len(), bytes));
+            self
+        }
+
+        /// What is in it now, for a test that wants to see what was written.
+        fn at(&self, at: usize) -> u8 {
+            self.bytes.borrow()[at]
+        }
+    }
+
+    impl Dma for FakeDma {
+        fn read(&self, at: usize, into: &mut [u8]) {
+            // The device's write lands before the first look at it, which is
+            // exactly when a real one's would become visible.
+            if let Some((where_, length, payload)) = self.answer.borrow_mut().take() {
+                self.bytes.borrow_mut()[where_..where_ + length]
+                    .copy_from_slice(&payload[..length]);
+            }
+            let bytes = self.bytes.borrow();
+            for (index, slot) in into.iter_mut().enumerate() {
+                *slot = bytes.get(at + index).copied().unwrap_or(0);
+            }
+        }
+
+        fn write(&mut self, at: usize, from: &[u8]) {
+            let mut bytes = self.bytes.borrow_mut();
+            for (index, byte) in from.iter().enumerate() {
+                if let Some(slot) = bytes.get_mut(at + index) {
+                    *slot = *byte;
+                }
+            }
+        }
+
+        fn zero(&mut self, at: usize, count: usize) {
+            let mut bytes = self.bytes.borrow_mut();
+            for index in at..at + count {
+                if let Some(slot) = bytes.get_mut(index) {
+                    *slot = 0;
+                }
+            }
+        }
+    }
+
+    /// A register file with no machine behind it.
+    ///
+    /// **This is what the move was for.** Every test above this one reads bytes
+    /// out of an array; not one of them could reach a register, and the
+    /// register half is where every bug this driver has actually had was
+    /// found -- a tail written as a count, a ring the device never fetched, a
+    /// command bundling five flags firmware would only take one at a time. They
+    /// were each found by booting a particular server. They are testable here.
+    ///
+    /// Sparse and linear, because a test touches a handful of offsets and a
+    /// dense array of the X722's four megabytes would be a million entries to
+    /// make a point about eight.
+    struct Fake {
+        slots: core::cell::RefCell<[(u64, u32); Self::SLOTS]>,
+        used: core::cell::Cell<usize>,
+        /// Every write in order, which is how the ordering rules the datasheet
+        /// states -- "software should initialize all other fields" before the
+        /// enable bit -- become assertions rather than comments.
+        log: core::cell::RefCell<[(u64, u32); Self::SLOTS]>,
+        written: core::cell::Cell<usize>,
+        /// One register hardware clears by itself, after this many reads: the
+        /// reset's `PFSWR` and a queue's `QENA_STAT` both behave this way.
+        clears: core::cell::Cell<(u64, u32, u32)>,
+        /// And one it sets by itself, which is how firmware marks a descriptor
+        /// done.
+        sets: core::cell::Cell<(u64, u32, u32)>,
+    }
+
+    impl Fake {
+        const SLOTS: usize = 96;
+
+        fn new() -> Self {
+            Self {
+                slots: core::cell::RefCell::new([(u64::MAX, 0); Self::SLOTS]),
+                used: core::cell::Cell::new(0),
+                log: core::cell::RefCell::new([(u64::MAX, 0); Self::SLOTS]),
+                written: core::cell::Cell::new(0),
+                clears: core::cell::Cell::new((u64::MAX, 0, 0)),
+                sets: core::cell::Cell::new((u64::MAX, 0, 0)),
+            }
+        }
+
+        /// Makes hardware clear `mask` at `offset` after `reads` reads.
+        fn clears(self, offset: u64, mask: u32, reads: u32) -> Self {
+            self.clears.set((offset, mask, reads));
+            self
+        }
+
+        /// Makes hardware set `mask` at `offset` after `reads` reads.
+        fn sets(self, offset: u64, mask: u32, reads: u32) -> Self {
+            self.sets.set((offset, mask, reads));
+            self
+        }
+
+        /// The value at `offset`, or zero.
+        fn at(&self, offset: u64) -> u32 {
+            let slots = self.slots.borrow();
+            slots
+                .iter()
+                .take(self.used.get())
+                .find(|(where_, _)| *where_ == offset)
+                .map_or(0, |(_, value)| *value)
+        }
+
+        fn put(&self, offset: u64, value: u32) {
+            let mut slots = self.slots.borrow_mut();
+            for slot in slots.iter_mut().take(self.used.get()) {
+                if slot.0 == offset {
+                    slot.1 = value;
+                    return;
+                }
+            }
+            let used = self.used.get();
+            assert!(used < Self::SLOTS, "the fake ran out of registers");
+            slots[used] = (offset, value);
+            self.used.set(used + 1);
+        }
+
+        /// The offsets written, in the order they were written.
+        fn order(&self) -> [u64; Self::SLOTS] {
+            let log = self.log.borrow();
+            let mut order = [u64::MAX; Self::SLOTS];
+            for (index, entry) in log.iter().take(self.written.get()).enumerate() {
+                order[index] = entry.0;
+            }
+            order
+        }
+
+        /// Where `offset` first appears in the write order, for the ordering
+        /// rules that say one register must be written after another.
+        fn written_at(&self, offset: u64) -> usize {
+            self.order()
+                .iter()
+                .position(|where_| *where_ == offset)
+                .unwrap_or_else(|| panic!("{offset:#x} was never written"))
+        }
+    }
+
+    impl Registers for Fake {
+        fn read(&self, offset: u64) -> u32 {
+            let (where_, mask, left) = self.clears.get();
+            if where_ == offset {
+                if left == 0 {
+                    self.put(offset, self.at(offset) & !mask);
+                } else {
+                    self.clears.set((where_, mask, left - 1));
+                }
+            }
+            let (where_, mask, left) = self.sets.get();
+            if where_ == offset {
+                if left == 0 {
+                    self.put(offset, self.at(offset) | mask);
+                } else {
+                    self.sets.set((where_, mask, left - 1));
+                }
+            }
+            self.at(offset)
+        }
+
+        fn write(&mut self, offset: u64, value: u32) {
+            let written = self.written.get();
+            if written < Self::SLOTS {
+                self.log.borrow_mut()[written] = (offset, value);
+                self.written.set(written + 1);
+            }
+            self.put(offset, value);
+        }
+
+        fn read64(&self, offset: u64) -> u64 {
+            u64::from(self.at(offset)) | u64::from(self.at(offset + 4)) << 32
+        }
+    }
+
+    /// 38.39.2.1.20: software sets `PFSWR` and **hardware clears it** when the
+    /// reset is done, which is the only completion test there is.
+    #[test]
+    fn a_reset_waits_for_hardware_to_clear_the_bit_it_set() {
+        let mut device = Device::new(Fake::new().clears(PFGEN_CTRL, PFSWR, 3));
+        assert!(device.reset(16), "the bit cleared on the fourth read");
+
+        // And a device that never clears it is a device that is not answering,
+        // which must be said rather than waited on for ever.
+        let mut dead = Device::new(Fake::new());
+        assert!(!dead.reset(16), "nothing cleared the bit, so nothing reset");
+    }
+
+    /// 38.39.2.15.9 is explicit about the order: *"When setting the enable bit,
+    /// software should initialize all other fields."* So both base addresses
+    /// go down before the length that carries `ATQENABLE`.
+    #[test]
+    fn the_admin_queues_take_their_lengths_last() {
+        let mut device = Device::new(Fake::new());
+        device.enable_admin_queues(0x1_0000_0000, 0x1_0000_1000);
+
+        let registers = &device.registers;
+        assert_eq!(registers.at(PF_ATQBAL), 0, "the low half of the base");
+        assert_eq!(registers.at(PF_ATQBAH), 1, "and the high half");
+        assert_eq!(registers.at(PF_ARQBAL), 0x1000);
+        assert_eq!(
+            registers.at(PF_ATQLEN),
+            RING_DESCRIPTORS | QUEUE_ENABLE,
+            "the length carries the enable bit"
+        );
+        assert!(
+            registers.written_at(PF_ATQBAH) < registers.written_at(PF_ATQLEN),
+            "the base must be complete before the queue is enabled"
+        );
+        assert!(
+            registers.written_at(PF_ATQH) < registers.written_at(PF_ATQBAL),
+            "the head is zeroed before a base is named, so an enabled ring does \
+             not start from whatever the last owner left"
+        );
+    }
+
+    /// A command is written into the ring, the tail is advanced to say so, and
+    /// firmware's answer comes back out of the same descriptor.
+    #[test]
+    fn a_command_is_posted_and_its_answer_read_back() {
+        let mut ring = FakeDma::new();
+        let mut device = Device::new(Fake::new());
+        device.enable_admin_queues(0x1_0000_0000, 0x1_0000_1000);
+
+        let slot = device
+            .post(&mut ring, Descriptor::direct(OPCODE_GET_VERSION))
+            .expect("the ring is enabled");
+        assert_eq!(
+            device.registers.at(PF_ATQT),
+            1,
+            "the tail says one descriptor is there"
+        );
+        assert_eq!(
+            dma32(&ring, slot) >> 16,
+            u32::from(OPCODE_GET_VERSION),
+            "the opcode went into the ring at bytes 2-3"
+        );
+
+        // **Firmware's half of the round trip**, which is exactly what could
+        // not be written while one call posted and polled: `DD` in the flags at
+        // bytes **0-1** -- the opcode is what lives at 2-3 -- and the major
+        // version at 24-25 with the minor at 26-27.
+        ring.write(slot, &u32::from(FLAG_DD).to_le_bytes());
+        ring.write(slot + 24, &(3u32 | 10 << 16).to_le_bytes());
+
+        let reply = device.collect(&ring, slot, 4).expect("firmware answered");
+        assert_eq!(
+            (
+                reply.half(VERSION_MAJOR_AT),
+                reply.half(VERSION_MAJOR_AT + 2)
+            ),
+            (3, 10),
+            "major and minor, from bytes 24-27"
+        );
+    }
+
+    /// A refusal carries firmware's own return value, which is the difference
+    /// between "it said no" and "it never answered".
+    #[test]
+    fn a_refusal_carries_the_return_value_and_silence_is_a_different_error() {
+        let mut ring = FakeDma::new();
+        let mut device = Device::new(Fake::new());
+        device.enable_admin_queues(0, 0);
+        let slot = device
+            .post(&mut ring, Descriptor::direct(OPCODE_GET_VERSION))
+            .expect("the ring is enabled");
+
+        // Flags are bytes 0-1 and the return value bytes 6-7, so word 0's low
+        // half carries the flags and word 1's high half the return value.
+        ring.write(slot, &u32::from(FLAG_DD | FLAG_ERR).to_le_bytes());
+        ring.write(slot + 4, &(0xdu32 << 16).to_le_bytes());
+        assert_eq!(
+            device.collect(&ring, slot, 4),
+            Err(CommandError::Refused(0xd)),
+            "EEXIST, and the code is what tells a caller which"
+        );
+
+        // A descriptor firmware never marked is silence, not a refusal, and the
+        // difference is the whole reason both errors exist.
+        let quiet = FakeDma::new();
+        assert_eq!(
+            device.collect(&quiet, 0, 4),
+            Err(CommandError::NoAnswer),
+            "a ring firmware never touched is silence, not a refusal"
+        );
+    }
+
+    /// Before `enable_admin_queues` there is nowhere to post, and saying so is
+    /// not the same as saying firmware refused.
+    #[test]
+    fn a_command_with_no_ring_is_refused_before_anything_is_written() {
+        let mut ring = FakeDma::new();
+        let mut device: Device<Fake> = Device::new(Fake::new());
+        assert_eq!(device.get_version(&mut ring, 4), Err(CommandError::NoRing));
+        assert_eq!(device.registers.written.get(), 0, "and no register moved");
+        assert_eq!(
+            ring.at(0),
+            0,
+            "and no descriptor was written into a ring the device is not reading"
+        );
+    }
+
+    /// **The regression that a slice could not have caught, and the shape of
+    /// the boot that caught it.** `Get Switch Configuration` zeroes its buffer,
+    /// posts the command, and reads the buffer back; on the SR550 it read the
+    /// zeroes and reported nought elements of nought, because a `&mut [u8]`
+    /// tells the compiler nothing else writes those bytes and forwarding the
+    /// zeroes across an opaque call is then a legal thing to do.
+    ///
+    /// This is the same sequence against a fake whose device writes *after* the
+    /// zeroing. It fails if the answer is ever read from anywhere but the
+    /// memory the device wrote.
+    #[test]
+    fn a_buffer_the_device_filled_is_read_and_not_the_zeroes_that_preceded_it() {
+        let ring = FakeDma::new();
+        let mut device = Device::new(Fake::new());
+        device.enable_admin_queues(0, 0);
+
+        // Firmware's answer to Get Switch Configuration: one element reported
+        // of one, then the element itself -- Table 38-201's count at bytes 0-1
+        // and total at 2-3, the first element at `SWITCH_ELEMENT_AT`.
+        let mut answer = [0u8; 64];
+        answer[0..2].copy_from_slice(&1u16.to_le_bytes());
+        answer[2..4].copy_from_slice(&1u16.to_le_bytes());
+        let mut buffer = FakeDma::new().answers(0, &answer);
+
+        // And firmware marks the descriptor done *after* the request is
+        // posted into it, which is the same "written while nobody was looking"
+        // the buffer relies on. Written before the post it would simply be
+        // overwritten, which is what a first version of this test discovered.
+        let mut ring = ring.answers(0, &u32::from(FLAG_DD).to_le_bytes());
+
+        let switch = device
+            .switch_configuration(&mut ring, 0x1_0000_0000, &mut buffer, 4)
+            .expect("firmware answered");
+        assert_eq!(
+            (switch.count, switch.total),
+            (1, 1),
+            "the count came from the buffer the device wrote, not from the \
+             zeroes this command put there first"
+        );
+    }
+
+    /// **The bug that lost forty-five frames.** `QTX_TAIL` takes a descriptor
+    /// *index*, so a ring of eight accepts 0 to 7; writing 8 after filling the
+    /// last slot stops the queue. On 2026-09-06 four LACPDUs left the wire and
+    /// the fifth put the tail at eight, after which the head sat at six and
+    /// forty more frames went nowhere.
+    #[test]
+    fn the_transmit_cursor_wraps_instead_of_running_past_the_ring() {
+        const DEPTH: u16 = 8;
+        let mut ring = FakeDma::new();
+        let mut device = Device::new(Fake::new());
+        device.attach_transmit_ring(DEPTH);
+
+        for expected in 0..u32::from(DEPTH) {
+            let at = device.post_frame(&mut ring, 0x1_0000_0000, 60, false);
+            assert_eq!(at, Some(expected), "one descriptor per frame, in order");
+            assert!(
+                device.transmit_tail() < u32::from(DEPTH),
+                "a tail of {} is not a valid index into {DEPTH} descriptors",
+                device.transmit_tail()
+            );
+        }
+        assert_eq!(
+            device.transmit_tail(),
+            0,
+            "the ninth frame starts the ring again"
+        );
+    }
+
+    /// An uplink frame needs a context descriptor in front of its data
+    /// descriptor, and the pair must be contiguous -- so a frame that would
+    /// straddle the end of the ring starts again rather than wrapping between
+    /// its own two halves.
+    #[test]
+    fn an_uplink_frame_takes_two_contiguous_descriptors() {
+        const DEPTH: u16 = 4;
+        let mut ring = FakeDma::new();
+        let mut device = Device::new(Fake::new());
+        device.attach_transmit_ring(DEPTH);
+
+        assert_eq!(
+            device.post_frame(&mut ring, 0x2000, 60, true),
+            Some(1),
+            "context, data"
+        );
+        assert_eq!(device.transmit_tail(), 2);
+        assert_eq!(device.post_frame(&mut ring, 0x2000, 60, true), Some(3));
+        assert_eq!(device.transmit_tail(), 0, "and the ring is full");
+        assert_eq!(
+            device.post_frame(&mut ring, 0x2000, 60, true),
+            Some(1),
+            "the next pair starts at zero, not straddling the end"
+        );
+
+        // A ring too short for the pair takes neither half.
+        let mut narrow = FakeDma::new();
+        let mut small = Device::new(Fake::new());
+        small.attach_transmit_ring(1);
+        assert_eq!(small.post_frame(&mut narrow, 0x2000, 60, true), None);
+    }
+
+    /// A receive queue is enabled by asking and then waiting for hardware to
+    /// agree -- `QENA_REQ` set, `QENA_STAT` polled -- and the tail is written
+    /// before either, because a queue enabled with a stale tail fetches
+    /// descriptors nobody posted.
+    #[test]
+    fn a_receive_queue_is_enabled_by_asking_and_waiting_for_hardware_to_agree() {
+        let queue = 3;
+        let mut device = Device::new(Fake::new().sets(QRX_ENA + 4 * queue, QENA_STAT, 2));
+        assert!(device.enable_receive_queue(queue as u32, 8, 16));
+        assert_eq!(device.registers.at(QRX_TAIL + 4 * queue), 8);
+        assert!(
+            device.registers.written_at(QRX_TAIL + 4 * queue)
+                < device.registers.written_at(QRX_ENA + 4 * queue),
+            "the tail is posted before the queue is enabled"
+        );
+
+        // Hardware that never agrees is a queue that is not enabled.
+        let mut deaf = Device::new(Fake::new());
+        assert!(!deaf.enable_receive_queue(queue as u32, 8, 16));
+    }
 
     /// Table 38-340's byte numbering, against the words the ring holds.
     #[test]

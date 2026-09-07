@@ -36,6 +36,12 @@ members = [
     "usb",
     "ahci",
 
+    # RFC 0075 -- the X722's registers and rings, moved out of the kernel so
+    # that the half of a NIC driver that touches a register can be tested at
+    # all. It was in `kernel/src/i40e.rs`, where only its byte encoders had
+    # tests and nothing that read a register did.
+    "i40e",
+
     # M6
     "fs",
     # "drivers",

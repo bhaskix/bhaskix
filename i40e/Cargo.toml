@@ -1,0 +1,27 @@
+[package]
+name = "bhaskix-i40e"
+version = "0.0.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "An Intel X722's registers, descriptors and queue contexts, as arithmetic over a trait. No machine required."
+authors = ["Tarun Kumar Kushwaha"]
+publish = false
+
+[lib]
+name = "bhaskix_i40e"
+path = "src/lib.rs"
+
+# Nothing, for the reason `ahci/Cargo.toml` gives: a queue context is bits at
+# offsets and a completion is bytes a device wrote. Neither needs a NIC to be
+# tested and neither should be able to reach one from here.
+[dependencies]
+
+[package.metadata.bhaskix]
+# **Zero, and this crate is where a driver's `unsafe` used to be.** Every
+# register access goes through [`Registers`] and every ring through a slice, so
+# the one unsafe operation a NIC driver genuinely needs -- a volatile access to
+# a mapping somebody else made -- belongs to whoever implements the trait. RFC
+# 0075 moved it there on purpose: `forbid(unsafe_code)` in the source says so
+# where a reader will see it, and it is what makes the register half of this
+# driver testable without a machine.
+unsafe_budget = 0

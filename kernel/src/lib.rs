@@ -39,7 +39,113 @@ pub mod font;
 pub mod framebuffer;
 pub mod frames;
 pub mod heap;
-pub mod i40e;
+/// The X722's registers and rings, which used to be a module here.
+///
+/// **RFC 0075.** It moved to `i40e/` -- a crate that forbids `unsafe` and
+/// reaches registers through a trait -- because three thousand lines of device
+/// driver in the nucleus is the opposite of what this project does with every
+/// other driver, and because only its byte encoders had tests. The register
+/// half has them now. What is still here is the *plumbing*: the mapping, the
+/// memory, and the report, which move to `bin/netd` at the next step.
+use bhaskix_i40e as i40e;
+
+/// The X722's registers, as the kernel reaches them: the direct map.
+///
+/// **The one `unsafe` a driver genuinely needs**, and RFC 0075 is about where
+/// it belongs. `i40e/` forbids `unsafe` entirely and asks its holder for reads
+/// and writes; this is that holder while the kernel still drives the device.
+/// When `bin/netd` takes it over, the same three lines appear there over pages
+/// it was granted, and this goes.
+struct MappedRegisters {
+    /// A mapping of the device's BAR0, valid for as long as this value lives.
+    base: u64,
+}
+
+impl i40e::Registers for MappedRegisters {
+    fn read(&self, offset: u64) -> u32 {
+        // SAFETY: `base` is a device mapping of this function's BAR0 and every
+        // offset the crate uses is a documented register inside it -- which
+        // `i40e::page_is_mapped` and its test are what make true rather than
+        // hoped.
+        unsafe { core::ptr::read_volatile((self.base + offset) as *const u32) }
+    }
+
+    fn write(&mut self, offset: u64, value: u32) {
+        // SAFETY: as `read`.
+        unsafe { core::ptr::write_volatile((self.base + offset) as *mut u32, value) };
+    }
+
+    fn read64(&self, offset: u64) -> u64 {
+        // SAFETY: as `read`; every offset read this way is a documented 64-bit
+        // register pair, 8-byte aligned by its own stride.
+        unsafe { core::ptr::read_volatile((self.base + offset) as *const u64) }
+    }
+}
+
+/// A region of memory this kernel shares with a device.
+///
+/// **Not a slice, and a hardware boot is why.** The rings and command buffers
+/// were `&mut [u8]` for one afternoon, which reads as the obvious translation
+/// of a raw pointer and is not one: `&mut` promises the compiler that nothing
+/// else writes those bytes, and a device writing them is precisely something
+/// else. `Get Switch Configuration` zeroed its buffer, ran the command and read
+/// the buffer back, and on the SR550 it read back the zeroes -- the switch
+/// reported nought elements of nought and the receive queue was never taken.
+/// Every access here is volatile, which is what makes a read a read of what the
+/// device wrote.
+struct DeviceMemory {
+    /// The direct-map address of the region.
+    at: u64,
+    /// How long it is, so an access past the end is refused rather than made.
+    bytes: usize,
+}
+
+impl DeviceMemory {
+    /// Names a region of the direct map.
+    ///
+    /// # Safety
+    ///
+    /// `at` must be the direct-map address of `bytes` writable bytes this
+    /// object owns and has named to the device.
+    const unsafe fn new(at: u64, bytes: usize) -> Self {
+        Self { at, bytes }
+    }
+}
+
+impl i40e::Dma for DeviceMemory {
+    fn read(&self, at: usize, into: &mut [u8]) {
+        for (index, slot) in into.iter_mut().enumerate() {
+            *slot = if at + index < self.bytes {
+                // SAFETY: `new`'s invariant, and the bound above keeps the
+                // access inside the region. Volatile because the device writes
+                // this memory and the compiler is not told so by the type.
+                unsafe { core::ptr::read_volatile((self.at + (at + index) as u64) as *const u8) }
+            } else {
+                0
+            };
+        }
+    }
+
+    fn write(&mut self, at: usize, from: &[u8]) {
+        for (index, byte) in from.iter().enumerate() {
+            if at + index < self.bytes {
+                // SAFETY: as `read`.
+                unsafe {
+                    core::ptr::write_volatile((self.at + (at + index) as u64) as *mut u8, *byte);
+                }
+            }
+        }
+    }
+
+    fn zero(&mut self, at: usize, bytes: usize) {
+        for index in at..at + bytes {
+            if index < self.bytes {
+                // SAFETY: as `read`.
+                unsafe { core::ptr::write_volatile((self.at + index as u64) as *mut u8, 0) };
+            }
+        }
+    }
+}
 pub mod input;
 pub mod iommu;
 pub mod ipc;
@@ -12578,10 +12684,32 @@ fn admin_ring_address(
 ///
 /// `transmit` and `host` are the admin ring page as the device and this
 /// kernel reach it; the switch buffer lives in the same page after the rings.
-fn ask_nic(nic: &mut i40e::Device, transmit: u64, host: u64) -> NicFacts {
+fn ask_nic(nic: &mut i40e::Device<MappedRegisters>, transmit: u64, host: u64) -> NicFacts {
     const SPINS: u32 = 2_000_000;
 
-    match nic.get_version(SPINS) {
+    // The admin ring and the two command buffers behind it, as slices. One
+    // place turns the direct-map address into bytes; every call below is
+    // bounds-checked from here on, which is what the crate's move bought.
+    //
+    // SAFETY: `host` is the direct-map address of the ring page -- a page,
+    // writable, named to the device and written by nothing else -- and both
+    // buffer offsets are inside it after the rings, which `i40e` asserts at
+    // compile time.
+    let (mut ring, mut switch_buffer, mut vsi_buffer) = unsafe {
+        (
+            DeviceMemory::new(host, i40e::RING_BYTES as usize),
+            DeviceMemory::new(
+                host + i40e::SWITCH_BUFFER_OFFSET,
+                i40e::SWITCH_BUFFER_BYTES as usize,
+            ),
+            DeviceMemory::new(
+                host + i40e::VSI_BUFFER_OFFSET,
+                i40e::VSI_BUFFER_BYTES as usize,
+            ),
+        )
+    };
+
+    match nic.get_version(&mut ring, SPINS) {
         Ok((major, minor)) => {
             println!("    nic firmware   the device answered: firmware {major}.{minor}");
         }
@@ -12595,7 +12723,7 @@ fn ask_nic(nic: &mut i40e::Device, transmit: u64, host: u64) -> NicFacts {
     // unread when step 3 was called complete.** A receive queue on a port with
     // no link is a queue that will never fill, and the report should say which
     // of those it is watching before it waits for a frame.
-    let link_up = match nic.link_status(SPINS) {
+    let link_up = match nic.link_status(&mut ring, SPINS) {
         Ok(link) => {
             println!(
                 "    nic link       {} at {} over {}; media {}, signal {}{}; max frame {}",
@@ -12632,12 +12760,8 @@ fn ask_nic(nic: &mut i40e::Device, transmit: u64, host: u64) -> NicFacts {
     // queues start within this PF's; both are read here so that step 4 programs
     // the queue a frame would actually reach rather than the one numbered zero.
     let buffer_device = transmit + i40e::SWITCH_BUFFER_OFFSET;
-    let buffer_host = host + i40e::SWITCH_BUFFER_OFFSET;
     let mut vsi = None;
-    // SAFETY: `host` is the direct-map address of the ring page, a page long
-    // and writable; the buffer's offset keeps it inside that page after both
-    // rings, which `i40e` asserts at compile time; nothing else writes it.
-    match unsafe { nic.switch_configuration(buffer_device, buffer_host, SPINS) } {
+    match nic.switch_configuration(&mut ring, buffer_device, &mut switch_buffer, SPINS) {
         Ok(switch) => {
             println!(
                 "    nic switch     {} element(s) reported of {} in the switch",
@@ -12663,18 +12787,13 @@ fn ask_nic(nic: &mut i40e::Device, transmit: u64, host: u64) -> NicFacts {
                     // the driver then waits on a queue nothing steers to.
                     // That is not a hypothetical: it is what the first four
                     // boots did.
-                    // SAFETY: `host` is the direct-map address of the admin
-                    // ring page, a page long and writable; the VSI buffer's
-                    // offset keeps it inside that page after the rings and the
-                    // switch buffer, which `i40e` asserts at compile time.
-                    let asked = unsafe {
-                        nic.vsi_parameters(
-                            element.seid,
-                            transmit + i40e::VSI_BUFFER_OFFSET,
-                            host + i40e::VSI_BUFFER_OFFSET,
-                            SPINS,
-                        )
-                    };
+                    let asked = nic.vsi_parameters(
+                        &mut ring,
+                        element.seid,
+                        transmit + i40e::VSI_BUFFER_OFFSET,
+                        &mut vsi_buffer,
+                        SPINS,
+                    );
                     let (number, queue_set) = match asked {
                         Ok(parameters) => {
                             println!(
@@ -12843,7 +12962,7 @@ struct NicFacts {
 /// Read before anything is written, for the reason the admin queues taught: a
 /// queue this platform is already using is worth knowing about before taking
 /// it, and on a LOM that is not a remote possibility.
-fn report_receive_queue(nic: &i40e::Device, queue: u32) {
+fn report_receive_queue(nic: &mut i40e::Device<MappedRegisters>, queue: u32) {
     let (requested, active) = nic.receive_queue_state(queue);
     println!(
         "    nic rx queue   absolute queue {queue} reads QENA_REQ={} QENA_STAT={} -- {}",
@@ -13102,7 +13221,7 @@ fn build_lacpdu(
 /// The receive rings are polled anyway, because the day the control filter
 /// starts working this is what turns it into a formed aggregate.
 fn run_lacp(
-    nic: &mut i40e::Device,
+    nic: &mut i40e::Device<MappedRegisters>,
     setup: &TransmitSetup,
     target: &QueueTarget,
     rings: &ReceiveRings,
@@ -13133,15 +13252,25 @@ fn run_lacp(
     // SAFETY: `admin_host` is the direct-map address of the admin ring page, a
     // page long and writable; the VSI buffer's offset keeps it inside that
     // page after the rings and the switch buffer, which `i40e` asserts at
-    // compile time; nothing else writes it.
-    let overriding = match unsafe {
-        nic.allow_destination_override(
-            target.vsi,
-            setup.admin_device + i40e::VSI_BUFFER_OFFSET,
-            setup.admin_host + i40e::VSI_BUFFER_OFFSET,
-            SPINS,
+    // compile time; nothing else writes it. The transmit ring is the one
+    // `bring_up_receive_queue` named, `TRANSMIT_RING_BYTES` long.
+    let (mut ring, mut vsi_buffer, mut transmit_ring) = unsafe {
+        (
+            DeviceMemory::new(setup.admin_host, i40e::RING_BYTES as usize),
+            DeviceMemory::new(
+                setup.admin_host + i40e::VSI_BUFFER_OFFSET,
+                i40e::VSI_BUFFER_BYTES as usize,
+            ),
+            DeviceMemory::new(setup.ring_host, i40e::TRANSMIT_RING_BYTES as usize),
         )
-    } {
+    };
+    let overriding = match nic.allow_destination_override(
+        &mut ring,
+        target.vsi,
+        setup.admin_device + i40e::VSI_BUFFER_OFFSET,
+        &mut vsi_buffer,
+        SPINS,
+    ) {
         Ok(()) => {
             println!(
                 "    nic lacp       VSI seid {:#x} may now fix a packet's destination itself",
@@ -13203,12 +13332,17 @@ fn run_lacp(
                 // and its second descriptor wedges the queue -- for a reason
                 // not chased, because the path that works needs neither.
                 let uplink = false;
-                if let Some(slot) = nic.post_frame(setup.packet_device, bytes as u16, uplink) {
+                if let Some(slot) = nic.post_frame(
+                    &mut transmit_ring,
+                    setup.packet_device,
+                    bytes as u16,
+                    uplink,
+                ) {
                     nic.transmit_doorbell(target.queue, nic.transmit_tail());
                     for _ in 0..SPINS {
-                        // SAFETY: a ring is attached; the data descriptor
-                        // carries `RS`, so it is the one written back.
-                        if unsafe { nic.frame_completed(slot) } {
+                        // The data descriptor carries `RS`, so it is the one
+                        // written back.
+                        if nic.frame_completed(&transmit_ring, slot) {
                             completed += 1;
                             break;
                         }
@@ -13224,8 +13358,12 @@ fn run_lacp(
         // SAFETY: `rings` describes the posted rings.
         if let Some((index, slot, completion)) = unsafe { first_completion(rings) } {
             let host = buffers.host_at(index, slot);
-            // SAFETY: the device marked this descriptor done.
-            let header = unsafe { i40e::frame_header(host) };
+            // SAFETY: the device marked this descriptor done, and the buffer
+            // is `RECEIVE_BUFFER_BYTES` of the region this kernel posted.
+            let header = i40e::frame_header(
+                &unsafe { DeviceMemory::new(host, i40e::FrameHeader::BYTES) },
+                0,
+            );
             if header.ethertype == lacp::ETHERTYPE {
                 let mut body = [0u8; lacp::PDU];
                 let take = (completion.length as usize)
@@ -13369,15 +13507,15 @@ struct TransmitSetup {
 ///
 /// Returns whether a frame was reported sent.
 fn send_frames(
-    nic: &mut i40e::Device,
+    nic: &mut i40e::Device<MappedRegisters>,
     setup: &TransmitSetup,
     target: &QueueTarget,
     memory: &i40e::PrivateMemory,
 ) -> bool {
     const SPINS: u32 = 2_000_000;
-    /// `QLEN`'s floor: *"from 8 descriptors"*, and a whole multiple of 8
-    /// below 32.
-    const DESCRIPTORS: u16 = 8;
+    /// `QLEN`'s floor, from the crate that also sizes the ring, so the depth
+    /// and the bytes cannot disagree -- see `i40e::TRANSMIT_RING_BYTES`.
+    const DESCRIPTORS: u16 = i40e::TRANSMIT_DESCRIPTORS;
 
     // The queue set handle was asked of firmware when the switch was walked;
     // a transmit context's `RDYList` is that handle's low ten bits.
@@ -13415,8 +13553,10 @@ fn send_frames(
         return false;
     }
     // SAFETY: `pd_page_host` is the direct-map address of the page-descriptor
-    // page this kernel created, and `at.page` is below `PAGE_DESCRIPTORS`.
-    unsafe { i40e::write_page_descriptor(setup.pd_page_host, at.page, setup.context_device) };
+    // page this kernel created, a page long and written by nothing else.
+    let mut pd_page =
+        unsafe { DeviceMemory::new(setup.pd_page_host, i40e::HMC_PAGE_BYTES as usize) };
+    i40e::write_page_descriptor(&mut pd_page, at.page, setup.context_device);
     let context = i40e::TransmitContext {
         ring: setup.ring_device,
         descriptors: DESCRIPTORS,
@@ -13425,7 +13565,11 @@ fn send_frames(
     // SAFETY: `context_host` is the direct-map address of the zeroed backing
     // page just named; the offset is inside it; the queue is not enabled, so
     // the device is not fetching it.
-    unsafe { i40e::write_transmit_context(setup.context_host + u64::from(at.offset), &context) };
+    // SAFETY: the backing page just named, a page long, written by nothing
+    // else while the queue is disabled.
+    let mut backing =
+        unsafe { DeviceMemory::new(setup.context_host, i40e::HMC_PAGE_BYTES as usize) };
+    i40e::write_transmit_context(&mut backing, at.offset as usize, &context);
     println!(
         "    nic tx context queue {} context at private address {:#x} (page descriptor {}, offset \
          {}), ring {:#x}, {DESCRIPTORS} descriptors",
@@ -13458,9 +13602,12 @@ fn send_frames(
     // below and the LACP exchange after them go through one cursor, which is
     // the fix for a boot that wrote forty-five frames behind the device's head
     // because two callers each kept their own slot count.
+    nic.attach_transmit_ring(DESCRIPTORS);
     // SAFETY: `ring_host` is the direct-map address of the ring this queue's
-    // context points at, `DESCRIPTORS` deep, and written by nothing else.
-    unsafe { nic.attach_transmit_ring(setup.ring_host, DESCRIPTORS) };
+    // context points at, `TRANSMIT_RING_BYTES` long, and written by nothing
+    // else.
+    let mut transmit_ring =
+        unsafe { DeviceMemory::new(setup.ring_host, i40e::TRANSMIT_RING_BYTES as usize) };
 
     // **Three frames now, and the third is the one that matters.** An ARP to
     // this port's own address, an ARP to broadcast, and a **DHCP DISCOVER
@@ -13496,7 +13643,9 @@ fn send_frames(
             println!("\x1b[93m    nic tx frame   {name} would not build\x1b[0m");
             continue;
         }
-        let Some(slot) = nic.post_frame(setup.packet_device, bytes as u16, false) else {
+        let Some(slot) =
+            nic.post_frame(&mut transmit_ring, setup.packet_device, bytes as u16, false)
+        else {
             println!("\x1b[93m    nic tx frame   no transmit ring is attached\x1b[0m");
             continue;
         };
@@ -13504,8 +13653,7 @@ fn send_frames(
 
         let mut done = false;
         for _ in 0..SPINS {
-            // SAFETY: a ring is attached.
-            if unsafe { nic.frame_completed(slot) } {
+            if nic.frame_completed(&transmit_ring, slot) {
                 done = true;
                 break;
             }
@@ -13565,7 +13713,7 @@ fn send_frames(
 /// A separate boot with the enable left out is the fuller arming, and the RFC
 /// records whether it was taken.
 fn bring_up_receive_queue(
-    nic: &mut i40e::Device,
+    nic: &mut i40e::Device<MappedRegisters>,
     owner: domain::DomainId,
     device: (u8, u8, u8),
     hhdm: u64,
@@ -13581,6 +13729,10 @@ fn bring_up_receive_queue(
     } = target;
 
     const SPINS: u32 = 2_000_000;
+    // The admin ring, once, for every command this function issues.
+    // SAFETY: `admin.1` is the direct-map address of the ring page -- a page,
+    // writable, named to the device and written by nothing else.
+    let mut ring = unsafe { DeviceMemory::new(admin.1, i40e::RING_BYTES as usize) };
     /// **Eight queues, not one.** The VSI takes frames in and hands none to
     /// queue zero, so the question is which of its queues they go to -- and a
     /// single ring cannot answer it. Eight is what fits: `QLEN` must be a
@@ -13619,7 +13771,7 @@ fn bring_up_receive_queue(
 
     // **Out of PXE mode first** -- 38.30.2.1's *"operating system driver only
     // step"*, and the queue-length rule depends on it.
-    match nic.clear_pxe_mode(SPINS) {
+    match nic.clear_pxe_mode(&mut ring, SPINS) {
         Ok(true) => println!(
             "    nic pxe        cleared: the device left PXE mode; GLLAN_RCTL_0.PXE_MODE reads {}",
             u8::from(nic.pxe_mode())
@@ -13718,9 +13870,9 @@ fn bring_up_receive_queue(
     // context lives in. Both addresses are the device's: the HMC fetches
     // through them.
     // SAFETY: `pd_page_host` is the direct-map address of a page this kernel
-    // just created and zeroed, not yet named to the device, and `at.page` is
-    // below `PAGE_DESCRIPTORS`.
-    unsafe { i40e::write_page_descriptor(pd_page_host, at.page, backing_device) };
+    // just created and zeroed, not yet named to the device.
+    let mut pd_page = unsafe { DeviceMemory::new(pd_page_host, i40e::HMC_PAGE_BYTES as usize) };
+    i40e::write_page_descriptor(&mut pd_page, at.page, backing_device);
     let read_back = nic.write_segment_descriptor(at.segment, pd_page_device, backing_pages);
     let asked = i40e::segment_descriptor(pd_page_device, backing_pages);
     println!(
@@ -13782,16 +13934,22 @@ fn bring_up_receive_queue(
         // SAFETY: `backing_host` is the direct-map address of the zeroed
         // backing page just named; the offset is inside it; the device has not
         // fetched from it because the queue is not enabled.
-        unsafe {
-            i40e::write_receive_context(backing_host + u64::from(where_at.offset), &context);
-        }
+        // SAFETY: as above -- the backing page just named and zeroed.
+        let mut backing = unsafe { DeviceMemory::new(backing_host, i40e::HMC_PAGE_BYTES as usize) };
+        i40e::write_receive_context(&mut backing, where_at.offset as usize, &context);
         let mut posted = [0u64; POSTED as usize];
         for (slot, buffer) in posted.iter_mut().enumerate() {
             *buffer = buffers.device_at(index, slot as u32);
         }
         // SAFETY: `host_ring` is inside the zeroed rings page and has room for
         // `DESCRIPTORS`; the queue is not enabled.
-        unsafe { i40e::post_receive_descriptors(rings.host_ring(index), &posted) };
+        let mut ring = unsafe {
+            DeviceMemory::new(
+                rings.host_ring(index),
+                DESCRIPTORS as usize * i40e::RECEIVE_DESCRIPTOR_BYTES as usize,
+            )
+        };
+        i40e::post_receive_descriptors(&mut ring, &posted);
         contexts += 1;
     }
     println!(
@@ -13820,7 +13978,7 @@ fn bring_up_receive_queue(
         i40e::PromiscuousMode::AnyVlan,
         i40e::PromiscuousMode::DefaultVsi,
     ] {
-        match nic.set_promiscuous(vsi, mode, true, SPINS) {
+        match nic.set_promiscuous(&mut ring, vsi, mode, true, SPINS) {
             Ok(()) => println!(
                 "    nic filter     VSI {vsi:#x} promiscuous: {}",
                 mode.name()
@@ -13849,7 +14007,7 @@ fn bring_up_receive_queue(
     // `Stop LLDP Agent`. Without this the control filter below is installed
     // against a control port this driver does not hold, which is the shape of
     // the previous boot: the command was accepted and no frame arrived.
-    match nic.stop_lldp_agent(false, SPINS) {
+    match nic.stop_lldp_agent(&mut ring, false, SPINS) {
         Ok(()) => println!(
             "    nic lldp       firmware's LLDP agent stopped; its control port is released"
         ),
@@ -13866,7 +14024,7 @@ fn bring_up_receive_queue(
     // Filter` is what the control-VSI section and the `Stop LLDP Agent`
     // section both point at, and it matches on EtherType with the address
     // ignored.
-    match nic.add_control_packet_filter(vsi, i40e::ETHERTYPE_SLOW_PROTOCOLS, SPINS) {
+    match nic.add_control_packet_filter(&mut ring, vsi, i40e::ETHERTYPE_SLOW_PROTOCOLS, SPINS) {
         Ok(()) => println!(
             "    nic filter     slow protocols ({:#06x}) routed to VSI seid {vsi:#x} -- LACP rides \
              on it",
@@ -13947,8 +14105,16 @@ fn bring_up_receive_queue(
         // SAFETY: `rings` describes the posted, now-enabled rings.
         match unsafe { wait_for_any_frame(&rings, 60_000) } {
             Some((index, slot, completion, elapsed)) => {
-                // SAFETY: the device marked this descriptor done.
-                let header = unsafe { i40e::frame_header(buffers.host_at(index, slot)) };
+                // SAFETY: the device marked this descriptor done, and the
+                // buffer holds at least a frame header.
+                let header = i40e::frame_header(
+                    // SAFETY: a receive buffer the device filled and has
+                    // finished with.
+                    &unsafe {
+                        DeviceMemory::new(buffers.host_at(index, slot), i40e::FrameHeader::BYTES)
+                    },
+                    0,
+                );
                 println!(
                     "\x1b[92m    nic rx frame   a frame arrived after {} ms in absolute queue {}, \
                      descriptor {slot}: {} bytes, EtherType {:#06x} ({}){}, {} to {} from {}, packet \
@@ -14058,8 +14224,12 @@ fn bring_up_receive_queue(
         match unsafe { wait_for_any_frame(&rings, 10_000) } {
             Some((index, slot, completion, elapsed)) => {
                 let host = buffers.host_at(index, slot);
-                // SAFETY: the device marked this descriptor done.
-                let header = unsafe { i40e::frame_header(host) };
+                // SAFETY: as above.
+                // SAFETY: as above.
+                let header = i40e::frame_header(
+                    &unsafe { DeviceMemory::new(host, i40e::FrameHeader::BYTES) },
+                    0,
+                );
                 println!(
                     "\x1b[92m    nic rx after   a frame arrived {} ms after transmitting, in absolute \
                      queue {}: {} bytes, EtherType {:#06x} ({}), {} to {} from {}\x1b[0m",
@@ -14195,7 +14365,7 @@ fn bring_up_receive_queue(
         i40e::PromiscuousMode::AnyVlan,
         i40e::PromiscuousMode::DefaultVsi,
     ] {
-        let _ = nic.set_promiscuous(vsi, mode, false, SPINS);
+        let _ = nic.set_promiscuous(&mut ring, vsi, mode, false, SPINS);
     }
 }
 
@@ -14256,6 +14426,14 @@ struct ReceiveRings {
 }
 
 impl ReceiveRings {
+    /// How many bytes one ring occupies, which is what a slice over it needs.
+    ///
+    /// The stride, because that is what the rings were laid out with: a ring is
+    /// its descriptors and the gap to the next one is nothing else's.
+    const fn ring_bytes(&self) -> usize {
+        self.stride as usize
+    }
+
     /// Where the device fetches queue `index`'s descriptors.
     const fn device_ring(&self, index: u32) -> u64 {
         self.device + self.stride * index as u64
@@ -14319,8 +14497,10 @@ unsafe fn first_completion(rings: &ReceiveRings) -> Option<(u32, u32, i40e::Rece
     for index in 0..rings.queues {
         let host = rings.host_ring(index);
         for slot in 0..rings.posted {
-            // SAFETY: per the caller; `slot` is inside a posted ring.
-            if let Some(completion) = unsafe { i40e::completed_descriptor(host, slot) } {
+            // SAFETY: per the caller; the ring is `descriptors` deep and this
+            // kernel posted it.
+            let ring = unsafe { DeviceMemory::new(host, rings.ring_bytes()) };
+            if let Some(completion) = i40e::completed_descriptor(&ring, slot) {
                 return Some((index, slot, completion));
             }
         }
@@ -14381,7 +14561,8 @@ unsafe fn report_rings(rings: &ReceiveRings, buffers: &ReceiveBuffers, when: &st
         let mut first = None;
         for slot in 0..rings.posted {
             // SAFETY: per the caller.
-            if let Some(completion) = unsafe { i40e::completed_descriptor(host, slot) } {
+            let ring = unsafe { DeviceMemory::new(host, rings.ring_bytes()) };
+            if let Some(completion) = i40e::completed_descriptor(&ring, slot) {
                 filled += 1;
                 if first.is_none() {
                     first = Some((slot, completion));
@@ -14391,7 +14572,13 @@ unsafe fn report_rings(rings: &ReceiveRings, buffers: &ReceiveBuffers, when: &st
         total += filled;
         if let Some((slot, completion)) = first {
             // SAFETY: per the caller; the device marked this descriptor done.
-            let header = unsafe { i40e::frame_header(buffers.host_at(index, slot)) };
+            // SAFETY: per the caller; the device marked this descriptor done.
+            let header = i40e::frame_header(
+                &unsafe {
+                    DeviceMemory::new(buffers.host_at(index, slot), i40e::FrameHeader::BYTES)
+                },
+                0,
+            );
             println!(
                 "\x1b[92m    nic rx queue   absolute queue {} took {filled} frame(s) {when}; the first \
                  at descriptor {slot}: {} bytes, EtherType {:#06x} ({}), {} to {} from {}\x1b[0m",
@@ -14592,7 +14779,7 @@ fn start_nic_domain(hhdm: u64) -> Result<(), &'static str> {
         // BAR0, it is never unmapped, and nothing else drives this device --
         // `bin/netd` drives virtio and `claimed` kept this one out of
         // pass-through precisely so that this kernel owns it.
-        let mut nic = unsafe { i40e::Device::new(mapped) };
+        let mut nic = i40e::Device::new(MappedRegisters { base: mapped });
         if nic.reset(1_000_000) {
             let (transmit, receive) = nic.admin_queue_lengths();
             // **Whether firmware still holds the queues, which the first boot
@@ -14636,12 +14823,14 @@ fn start_nic_domain(hhdm: u64) -> Result<(), &'static str> {
                     admin_ring_address(owner, delegated, hhdm).map(|rings| (owner, rings))
                 }) {
                     Some((owner, (transmit, receive, host))) => {
-                        // SAFETY: `host` is the direct-map address of the page
+                        // `host` is the direct-map address of the page
                         // `admin_ring_address` just created and mapped for this
                         // device -- writable, a page long, so it holds both
                         // rings and the switch buffer after them -- and nothing
-                        // else writes it.
-                        unsafe { nic.enable_admin_queues(transmit, receive, host) };
+                        // else writes it. It is turned into bytes where it is
+                        // used, by `device_bytes`, which is the one place that
+                        // obligation is stated now.
+                        nic.enable_admin_queues(transmit, receive);
                         let taken = nic.admin_queues_enabled();
                         println!(
                             "    nic admin      rings at {transmit:#x} and {receive:#x}; {}",

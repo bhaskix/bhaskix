@@ -103,6 +103,12 @@ LAYERS = {
     # device. Neither needs a controller to be tested, and a crate that cannot
     # reach one cannot be the thing that lets a disk reach memory.
     "bhaskix-ahci": -3,
+    # The X722's registers and rings, RFC 0075. A leaf for the same two
+    # reasons as `bhaskix-ahci` and one more of its own: it reaches registers
+    # only through a trait its holder implements, so it holds no address at
+    # all and `forbid(unsafe_code)` is true of the whole crate. A driver that
+    # cannot name a page cannot be the thing that points a bus master at one.
+    "bhaskix-i40e": -3,
     # The Linux personality's arithmetic, RFC 0005: the kernel builds a real
     # initial stack with it and a host test checks the bytes, so it depends
     # on nothing -- the leaf-layer argument a seventh time.

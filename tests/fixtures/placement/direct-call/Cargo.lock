@@ -34,6 +34,10 @@ name = "bhaskix-fs"
 version = "0.0.0"
 
 [[package]]
+name = "bhaskix-i40e"
+version = "0.0.0"
+
+[[package]]
 name = "bhaskix-kernel"
 version = "0.0.0"
 dependencies = [
@@ -44,6 +48,7 @@ dependencies = [
  "bhaskix-device",
  "bhaskix-elf",
  "bhaskix-fs",
+ "bhaskix-i40e",
  "bhaskix-mm",
  "bhaskix-net",
  "bhaskix-personality",
