@@ -1107,12 +1107,35 @@ struct Port {
 /// The entry point.
 #[unsafe(no_mangle)]
 extern "C" fn netd_main() -> ! {
-    if !attach(COMMON, COMMON_AT, 1)
-        || !attach(NOTIFY, NOTIFY_AT, 1)
-        || !attach(DEVICE, DEVICE_AT, 0)
-        || !attach(RINGS, RINGS_AT, 1)
-    {
+    // **The rings first, and alone, because they are where this program says
+    // anything at all.** The report lives in their last page: a service that
+    // could not attach them has no way to be heard, and one that exits before
+    // attaching them is a service the kernel reports as having left no report.
+    //
+    // That is exactly what the SR550 showed on 2026-09-07 -- `bin/netd` started
+    // and vanished, because the three attaches above these were the *virtio*
+    // device's and that machine has no virtio device at all. A NIC is not
+    // required to run; being able to report is.
+    if !attach(RINGS, RINGS_AT, 1) {
         exit()
+    }
+
+    // **A virtio device, if there is one.** RFC 0075 step 3: this program is a
+    // driver with ports rather than a driver with a device, and on a machine
+    // whose only NIC is an X722 there is nothing here to attach.
+    let has_virtio = attach(COMMON, COMMON_AT, 1)
+        && attach(NOTIFY, NOTIFY_AT, 1)
+        && attach(DEVICE, DEVICE_AT, 0);
+    if !has_virtio {
+        // Nothing of the virtio path can run. Say so through the report and
+        // then take whatever else was delegated -- which is the whole reason
+        // this program is started on a machine with no virtio device.
+        let x722 = take_x722();
+        let (state, firmware) = x722.words();
+        no_virtio_report(state, firmware);
+        loop {
+            call(syscall::YIELD, 0, 0, [0; 4]);
+        }
     }
 
     // Where the device will look for the rings. Not a physical address: this
@@ -1640,6 +1663,37 @@ extern "C" fn netd_main() -> ! {
 /// own counts are in [`bond_report`].
 fn receive_seen(ports: &[Option<Port>; 2]) -> u16 {
     ports[0].as_ref().map_or(0, |port| port.receive.seen())
+}
+
+/// Words in the report this program writes.
+///
+/// Seventeen are the driver's own, five the bond's and two the X722's, and the
+/// kernel reads exactly this many. Named because three places write it and a
+/// length spelled three times is wrong in at least one of them -- which this
+/// file has recorded happening twice.
+const REPORT_WORDS: usize = 24;
+
+/// Publishes what this program found on a machine with no virtio device.
+///
+/// The report `report` writes describes a virtio driver's rings and counters,
+/// none of which exist here. This writes the marker, the X722's two words, and
+/// zeroes for the rest -- so the kernel reads a report rather than concluding
+/// the service left none, and the X722 line is what says what was found.
+fn no_virtio_report(state: u64, firmware: u64) {
+    let mut words = [0u64; REPORT_WORDS];
+    words[0] = MARKER;
+    words[22] = state;
+    words[23] = firmware;
+    let at = RINGS_AT + ring::REPORT;
+    // SAFETY: the last page of the rings this program mapped writable, which no
+    // ring and no buffer reaches. The marker is written last, so a kernel that
+    // reads a partial report sees no marker rather than half the fields.
+    unsafe {
+        for (index, word) in words.iter().enumerate().skip(1) {
+            core::ptr::write_volatile((at + index as u64 * 8) as *mut u64, *word);
+        }
+        core::ptr::write_volatile(at as *mut u64, words[0]);
+    }
 }
 
 /// What the X722 answered, or that there is none to ask.

@@ -90,6 +90,12 @@ asm_budget = 3
 # five report words the bond publishes. Nineteen lines for a member, and the
 # alternative was a second driver domain that would have needed its own ring to
 # `bin/ipd` and its own copy of everything above.
+# 333 at RFC 0075 step 3: the report a machine with no virtio device writes.
+# Six volatile stores, the same six `report` makes -- and they cannot be shared
+# with it, because `report` describes rings and counters that do not exist on a
+# machine whose only NIC is an X722. Writing that report from a virtio driver's
+# fields would mean inventing values for every one of them.
+#
 # **327 at RFC 0075 step 2, and the budget did not move: the headroom did.**
 # The count was 320 with seven spare; the X722's two trait implementations --
 # three register accessors and three memory ones, plus the 64-bit read its
@@ -99,4 +105,4 @@ asm_budget = 3
 #
 # Every line of it is a volatile access to a mapping this program was granted,
 # which is the operation `bhaskix-i40e` forbids itself so that it lands here.
-unsafe_budget = 327
+unsafe_budget = 333

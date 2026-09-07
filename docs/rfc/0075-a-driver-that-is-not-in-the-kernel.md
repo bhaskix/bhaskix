@@ -181,6 +181,41 @@ virtio or X722; the `nic` domain and `start_nic_domain` go.
 
 > **Gate:** an SR550 boot shows the same `nic ...` lines, produced from ring 3.
 
+**Half done 2026-09-07.** The delegation works and `bin/netd` drives the device
+from ring 3:
+
+    net domain     no virtio device; bin/netd drives what else is delegated
+    net domain     b1:00.0 8086:37d1 delegated to bin/netd: 34 register page(s) of
+                   0x23ffd000000, its own dma window, and a page for its rings
+    net x722       bin/netd holds it: firmware 3.10, link UP, 1 switch element(s);
+                   reset done, admin queues enabled
+
+Three things had to change for that line to exist at all.
+
+**`start_net_domain` returned early on a machine with no virtio device**, which
+is exactly the SR550 — so the only machine in the project with real hardware was
+the one where no network service ever started. What decides whether there is
+anything to start is *any* port now, of either kind, and the rings and the report
+page are created before any device rather than half way down the virtio path.
+
+**`bin/netd` required a virtio device to run.** Its first four attaches were the
+virtio windows and the rings together, so on that machine it exited before
+writing anything and the kernel reported a driver that *"left no report"*. The
+rings come first and alone now: a NIC is not required to run, being able to
+report is.
+
+**And the kernel still drives this card.** Its queue, HMC, receive and DHCP work
+is the nineteen hundred lines step 4 removes, and two owners of one device is
+not a state to boot a machine in — so the handover is behind
+`bhaskix.netd-x722=1`, off by default. On this machine the default is a NIC that
+receives frames and runs a DHCP exchange, and that is not worth trading for a
+delegation with nothing yet behind it.
+
+**What is left of this step** is therefore the gate's own words: the same `nic`
+lines from ring 3. `bin/netd` brings the device up as far as RFC 0072 step 3 did
+— reset, admin queues, version, link, switch — and the queues, the HMC, the
+receive path and the exchange move with step 4.
+
 **Step 4 — the plumbing goes.** The nineteen hundred lines in
 `kernel/src/lib.rs` are deleted with the measurements they made moved into
 report words.

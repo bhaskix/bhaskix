@@ -961,6 +961,32 @@ the distinction is in the table rather than in somebody's head.
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-09-07 (bin/netd drives an X722, from ring 3)
+
+RFC 0075 step 3, half met. The SR550's NIC is driven by a **service** for the first time:
+
+    net domain     b1:00.0 8086:37d1 delegated to bin/netd: 34 register page(s) of
+                   0x23ffd000000, its own dma window, and a page for its rings
+    net x722       bin/netd holds it: firmware 3.10, link UP, 1 switch element(s);
+                   reset done, admin queues enabled
+
+Thirty-four register pages of a four-megabyte BAR, named by the crate and granted by the kernel, so a
+register in a page nobody granted faults instead of being reachable — strictly less authority than the
+kernel took when it drove this itself.
+
+**Two structural faults had to go first, and both had hidden the same thing.** `start_net_domain`
+returned early on a machine with no virtio device, so the only machine in the project with real
+hardware was the one where no network service ever started; and `bin/netd` required a virtio device to
+run at all, exiting before it could write a report — which the kernel dutifully reported as a driver
+that *"left no report"*. The rings and the report page now exist before any device, and a NIC is not
+required to run: being able to report is.
+
+**The kernel still drives this card by default**, and deliberately. Its queue, HMC, receive and DHCP
+work is the nineteen hundred lines step 4 removes, and two owners of one device is not a state to boot
+a machine in — so the handover is behind `bhaskix.netd-x722=1`. The default boot is still a NIC that
+receives frames and runs a DHCP exchange, which is not worth trading for a delegation with nothing yet
+behind it.
+
 ### 2026-09-07 (DHCP, all four messages, and a switch port that answers none of them)
 
 `net/src/dhcp.rs` had `DISCOVER` and `OFFER` and said in its own header that `REQUEST`, `ACK` and a

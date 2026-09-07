@@ -549,6 +549,10 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
         // reason the comment above `busybox=1` gives: this file has two
         // conventions and a flag that is accepted and does nothing is the
         // failure it keeps recording.
+        // `bhaskix.netd-x722=1` — RFC 0075 step 3. See `NETD_TAKES_X722`.
+        if word == "bhaskix.netd-x722=1" || word == "netd-x722=1" {
+            NETD_TAKES_X722.store(true, core::sync::atomic::Ordering::Relaxed);
+        }
         // `bhaskix.bond=<ms>` — RFC 0074 step 4, and the same bargain as the
         // line below it.
         if let Some(value) = word
@@ -4093,6 +4097,16 @@ static LACP_PATIENCE_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::Ato
 /// `bhaskix.bond=<ms>` sets it, and one harness does. Every other lane has
 /// nobody to pull its cable and would spend the window finding that out.
 static BOND_PATIENCE_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Whether `bin/netd` is given the X722 rather than the kernel driving it.
+///
+/// **RFC 0075 step 3, and off by default until step 4 moves the driving.** One
+/// device has one owner: the kernel's queue, HMC, receive and DHCP work still
+/// lives in `start_nic_domain`, and handing the card away while that runs would
+/// leave two drivers writing one register file. `bhaskix.netd-x722=1` performs
+/// the handover for a boot that proves the delegation before anything depends
+/// on it.
+static NETD_TAKES_X722: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 /// Extra runnable threads spawned alongside the ring — `ringload=<n>`.
 ///
@@ -15302,6 +15316,11 @@ fn find_foreign_nic_nth(
 ///
 /// Inert where there is no such device, which is every lane in QEMU.
 fn start_nic_domain(hhdm: u64) -> Result<(), &'static str> {
+    // **Not while `bin/netd` holds it.** One device has one owner, and with the
+    // handover asked for, this one is the service's. See `NETD_TAKES_X722`.
+    if NETD_TAKES_X722.load(core::sync::atomic::Ordering::Relaxed) {
+        return Ok(());
+    }
     let Some((address, identity)) = find_foreign_nic() else {
         return Ok(());
     };
@@ -15759,79 +15778,155 @@ pub fn start_ahci_domain(cpu: u32, hhdm_base: u64) -> Result<(), &'static str> {
     Ok(())
 }
 
-/// Hands a virtio network device to a domain in ring 3.
+/// Where a foreign NIC's registers are, from its BAR0.
 ///
-/// RFC 0018 step 2. The same delegation `start_block_domain` performs, for a
-/// device that differs in one way that matters: **a disk answers, a network
-/// device initiates.** Everything below is the block path's shape; the receive
-/// direction is what is new, and it is the driver's problem rather than this
-/// function's.
+/// **A memory BAR marks its width in bits 2:1, and `10` means the address
+/// continues into BAR1.** Read through the safe ECAM reader rather than
+/// assumed, because a 64-bit BAR read as 32 names the wrong page and the
+/// mistake is silent.
+fn foreign_registers(address: bhaskix_arch::pci::Address) -> Option<u64> {
+    let bar0 = bhaskix_arch::pci::read32_ecam(address, 0x10)?;
+    let high = if (bar0 >> 1) & 0b11 == 0b10 {
+        bhaskix_arch::pci::read32_ecam(address, 0x14).unwrap_or(0)
+    } else {
+        0
+    };
+    let at = (u64::from(high) << 32) | u64::from(bar0 & !0xf);
+    (at != 0).then_some(at)
+}
+
+/// Hands the X722 to the net domain -- RFC 0075 step 3.
 ///
-/// Not a boot dependency. A machine with no network device boots, says so, and
-/// carries on, exactly as it does with one disk.
+/// **The register pages, and only those.** Its CSR space is just under four
+/// megabytes and a `Frame` capability is one page, so the whole BAR cannot be a
+/// capability and should not be: beyond the CSR space are protocol-engine
+/// doorbells and an exposed flash. `bhaskix_i40e::REGISTER_PAGES` names the
+/// pages that hold a register the driver uses, and exactly those are granted --
+/// strictly less authority than the kernel took for itself when it drove this.
+///
+/// Each is installed at `X722_PAGES + n` and `bin/netd` maps it at its own
+/// offset, so every register offset in the crate works unchanged and a register
+/// in a page nobody granted faults instead of being reachable.
+///
+/// Returns whether the device was delegated with everything a driver needs. A
+/// device with registers and no DMA window is **not**: without one it cannot be
+/// aimed at memory, and a service that held it would report a NIC it cannot
+/// drive.
 ///
 /// # Errors
 ///
-/// Every failure here leaves the machine bootable and is reported as a string,
-/// because a network device is a convenience and a kernel that refuses to boot
-/// without one is worse than a kernel with no network.
-pub fn start_net_domain(
-    cpu: u32,
-    hhdm_base: u64,
+/// A capability that would not be created or installed.
+fn delegate_x722(
+    realm: domain::DomainId,
+    keeper: domain::DomainId,
+    hhdm: u64,
+) -> Result<bool, &'static str> {
+    /// Slot: the DMA window. `bin/netd`'s `X722_WINDOW`.
+    const X722_WINDOW: usize = 16;
+    /// Slot: the page holding its admin rings and the buffers behind them.
+    const X722_MEMORY: usize = 17;
+    /// Slot: the first of its register pages.
+    const X722_PAGES: usize = 20;
+
+    let Some((address, identity)) = find_foreign_nic() else {
+        return Ok(false);
+    };
+    let Some(bar) = foreign_registers(address) else {
+        println!("    net domain     the X722's BAR0 would not read; nothing delegated");
+        return Ok(false);
+    };
+
+    // SAFETY: this device belongs to nobody once `start_nic_domain` is gone --
+    // the kernel has no network driver of its own, which is RFC 0075's point.
+    unsafe { bhaskix_arch::pci::enable_memory(address) };
+
+    for (index, page) in bhaskix_i40e::REGISTER_PAGES.iter().enumerate() {
+        let window = cap::with_arena(|arena| {
+            arena
+                .insert_root(
+                    cap::ObjectRef::new(cap::ObjectKind::Frame, bar + page),
+                    cap::Rights::READ
+                        .union(cap::Rights::WRITE)
+                        .union(cap::Rights::DERIVE),
+                    0,
+                )
+                .ok()
+        })
+        .ok_or("an X722 register page capability would not be created")?;
+        if domain::with(realm, |owner| {
+            owner.cspace.install_at(X722_PAGES + index, window).is_ok()
+        }) != Some(true)
+        {
+            return Err("an X722 register page would not install");
+        }
+    }
+
+    // One page for the admin rings and the two command buffers behind them,
+    // which is the layout `bhaskix_i40e` asserts at compile time.
+    let memory = shared::create(keeper, bhaskix_mm::FRAME_SIZE)
+        .map_err(|_| "the X722's admin page would not be created")?;
+    let named = shared::name(memory).map_err(|_| "the X722's admin page would not be named")?;
+    if domain::with(realm, |owner| {
+        owner.cspace.install_at(X722_MEMORY, named).is_ok()
+    }) != Some(true)
+    {
+        return Err("the X722's admin page would not install");
+    }
+
+    let delegated = (address.bus, address.device, address.function);
+    if !iommu::present_for(delegated) {
+        println!(
+            "\x1b[93m    net domain     the X722 has registers and no DMA window; not \
+             delegated, because a device that cannot be aimed cannot be driven\x1b[0m"
+        );
+        return Ok(false);
+    }
+    let window = iommu::name(delegated).map_err(|_| "the X722's dma window would not be named")?;
+    if domain::with(realm, |owner| {
+        owner.cspace.install_at(X722_WINDOW, window).is_ok()
+    }) != Some(true)
+    {
+        return Err("the X722's dma window would not install");
+    }
+
+    // Bus mastering last, and safe only because the device translates -- the
+    // same argument every other delegation here makes.
+    // SAFETY: this device is the net domain's; nothing else drives it.
+    unsafe { bhaskix_arch::pci::enable(address) };
+    let _ = hhdm;
+    println!(
+        "    net domain     {:02x}:{:02x}.{} {:04x}:{:04x} delegated to bin/netd: {} register \
+         page(s) of {:#x}, its own dma window, and a page for its rings",
+        address.bus,
+        address.device,
+        address.function,
+        identity.vendor,
+        identity.device,
+        bhaskix_i40e::REGISTER_PAGES.len(),
+        bar
+    );
+    Ok(true)
+}
+
+/// Hands one virtio network device to the net domain.
+///
+/// **Split out at RFC 0075 step 3**, when `bin/netd` had to be able to start on
+/// a machine with no virtio device at all -- the SR550, which has four X722
+/// ports and nothing this function would recognise. What it does is unchanged;
+/// what changed is that the caller decides whether to call it.
+///
+/// Returns the notification its vector raises, so a second port can share it.
+///
+/// # Errors
+///
+/// A capability that would not be created or installed.
+fn delegate_virtio_nic(
+    realm: domain::DomainId,
+    address: bhaskix_arch::pci::Address,
     apic_id: u32,
     rsdp: Option<bhaskix_boot::PhysAddr>,
-) -> Result<(), &'static str> {
-    // **Every NIC on the bus, not only the one that gets driven.** RFC 0074
-    // step 1: an interface is something this system can name, and it cannot
-    // name what it never counted. Until now the walk stopped at the first
-    // match, so a machine with four ports and a machine with one looked
-    // identical from here -- which is how eight boots went by before the
-    // SR550's cabling could be described at all.
-    let mut ports = 0;
-    while virtio::find_nth_of(virtio::Class::NET, ports).is_some() {
-        ports += 1;
-    }
-    for port in 0..ports {
-        if let Some((at, identity)) = virtio::find_nth_of(virtio::Class::NET, port) {
-            println!(
-                "    net interface  port {port}: {:02x}:{:02x}.{} {:04x}:{:04x}, virtio-net",
-                at.bus, at.device, at.function, identity.vendor, identity.device
-            );
-        }
-    }
-    NET_PORTS.store(ports as u64, core::sync::atomic::Ordering::Release);
-    // **And every foreign port, which on the one machine that has any is four.**
-    // Named rather than driven: `start_nic_domain` takes the first, and the
-    // other three are on the bus and counted so that the report describes the
-    // machine rather than the driver.
-    let mut foreign_ports = 0;
-    while let Some((at, identity)) = find_foreign_nic_nth(foreign_ports) {
-        println!(
-            "    net interface  x722 port {foreign_ports}: {:02x}:{:02x}.{} {:04x}:{:04x}, \
-             driven by the kernel itself",
-            at.bus, at.device, at.function, identity.vendor, identity.device
-        );
-        foreign_ports += 1;
-    }
-    let foreign = foreign_ports > 0;
-    println!(
-        "    net interface  {ports} virtio port(s){} -- a bond may be built over {}",
-        if foreign {
-            ", and an X722 this kernel drives itself"
-        } else {
-            ""
-        },
-        if ports + foreign_ports > 1 {
-            "them"
-        } else {
-            "nothing yet: one port is not a bond"
-        }
-    );
-
-    let Some((address, _)) = virtio::find_nth_of(virtio::Class::NET, 0) else {
-        println!("    net domain     no device on the bus; nothing delegated");
-        return Ok(());
-    };
+    hhdm_base: u64,
+) -> Result<Option<crate::notify::NotificationId>, &'static str> {
     let layout = virtio::layout(address).ok_or("the network device is not a modern virtio")?;
 
     // Memory space only. Bus mastering stays off until the driver has reset the
@@ -15841,9 +15936,6 @@ pub fn start_net_domain(
     // SAFETY: this device belongs to nobody -- the kernel has no network driver
     // of its own, which is the whole point of RFC 0018.
     unsafe { bhaskix_arch::pci::enable_memory(address) };
-
-    let realm = domain::create("net", domain::ResourceEnvelope::new())
-        .map_err(|_| "the net domain would not be created")?;
 
     let windows = [layout.common, layout.notify, layout.device];
     for (slot, (base, length)) in windows.iter().enumerate() {
@@ -15869,37 +15961,6 @@ pub fn start_net_domain(
         {
             return Err("a device window capability would not install");
         }
-    }
-
-    // Rings: eight pages, and the arithmetic rather than a feel for it.
-    //
-    // Two queues, not the block driver's one, and each needs a descriptor
-    // table, an available ring and a used ring. Then the buffers: a receive
-    // queue must have somewhere to put a frame *before* the device has one to
-    // deliver, so every receive descriptor owns a buffer big enough for a full
-    // Ethernet frame plus the virtio header in front of it.
-    //
-    //   2 queues x (descriptors + available + used)        ~2 pages
-    //   4 receive buffers x 2 KiB                            2 pages
-    //   1 transmit buffer                                   <1 page
-    //   slack, so the layout can move without re-sizing      3 pages
-    //
-    // Owned by a keeper domain rather than by the driver, for the reason
-    // `blk-keeper` exists: a domain ends when its last thread exits and takes
-    // the memory it owns with it, so rings owned by the driver would be freed
-    // the moment it stopped and anything reading them afterwards would be
-    // reading returned frames.
-    let keeper = domain::create("net-keeper", domain::ResourceEnvelope::new())
-        .map_err(|_| "the net rings' owner would not be created")?;
-    NET_KEEPER.store(
-        keeper.as_u32().saturating_add(1),
-        core::sync::atomic::Ordering::Release,
-    );
-    let rings = shared::create(keeper, 8 * bhaskix_mm::FRAME_SIZE)
-        .map_err(|_| "the net domain's rings would not be created")?;
-    let named = shared::name(rings).map_err(|_| "the rings would not be named")?;
-    if domain::with(realm, |owner| owner.cspace.install_at(3, named).is_ok()) != Some(true) {
-        return Err("the rings capability would not install");
     }
 
     let delegated = (address.bus, address.device, address.function);
@@ -16025,6 +16086,134 @@ pub fn start_net_domain(
     } else {
         println!("    net domain     no interrupt delegated; the driver polls its used rings");
     }
+    Ok(shared_signal)
+}
+
+/// Hands a virtio network device to a domain in ring 3.
+///
+/// RFC 0018 step 2. The same delegation `start_block_domain` performs, for a
+/// device that differs in one way that matters: **a disk answers, a network
+/// device initiates.** Everything below is the block path's shape; the receive
+/// direction is what is new, and it is the driver's problem rather than this
+/// function's.
+///
+/// Not a boot dependency. A machine with no network device boots, says so, and
+/// carries on, exactly as it does with one disk.
+///
+/// # Errors
+///
+/// Every failure here leaves the machine bootable and is reported as a string,
+/// because a network device is a convenience and a kernel that refuses to boot
+/// without one is worse than a kernel with no network.
+pub fn start_net_domain(
+    cpu: u32,
+    hhdm_base: u64,
+    apic_id: u32,
+    rsdp: Option<bhaskix_boot::PhysAddr>,
+) -> Result<(), &'static str> {
+    // **Every NIC on the bus, not only the one that gets driven.** RFC 0074
+    // step 1: an interface is something this system can name, and it cannot
+    // name what it never counted. Until now the walk stopped at the first
+    // match, so a machine with four ports and a machine with one looked
+    // identical from here -- which is how eight boots went by before the
+    // SR550's cabling could be described at all.
+    let mut ports = 0;
+    while virtio::find_nth_of(virtio::Class::NET, ports).is_some() {
+        ports += 1;
+    }
+    for port in 0..ports {
+        if let Some((at, identity)) = virtio::find_nth_of(virtio::Class::NET, port) {
+            println!(
+                "    net interface  port {port}: {:02x}:{:02x}.{} {:04x}:{:04x}, virtio-net",
+                at.bus, at.device, at.function, identity.vendor, identity.device
+            );
+        }
+    }
+    NET_PORTS.store(ports as u64, core::sync::atomic::Ordering::Release);
+    // **And every foreign port, which on the one machine that has any is four.**
+    // Named rather than driven: `start_nic_domain` takes the first, and the
+    // other three are on the bus and counted so that the report describes the
+    // machine rather than the driver.
+    let mut foreign_ports = 0;
+    while let Some((at, identity)) = find_foreign_nic_nth(foreign_ports) {
+        println!(
+            "    net interface  x722 port {foreign_ports}: {:02x}:{:02x}.{} {:04x}:{:04x}, \
+             driven by the kernel itself",
+            at.bus, at.device, at.function, identity.vendor, identity.device
+        );
+        foreign_ports += 1;
+    }
+    let foreign = foreign_ports > 0;
+    println!(
+        "    net interface  {ports} virtio port(s){} -- a bond may be built over {}",
+        if foreign {
+            ", and an X722 this kernel drives itself"
+        } else {
+            ""
+        },
+        if ports + foreign_ports > 1 {
+            "them"
+        } else {
+            "nothing yet: one port is not a bond"
+        }
+    );
+
+    // **A machine with no virtio device may still have a NIC** -- RFC 0075
+    // step 3. The SR550 has four X722 ports and nothing this recognises, and
+    // until now the walk stopped here and returned -- so the only machine in
+    // the project with real hardware was the one with no network service at
+    // all. What decides whether there is anything to start is *any* port.
+    let virtio_device = virtio::find_nth_of(virtio::Class::NET, 0);
+    if virtio_device.is_none() && !foreign {
+        println!("    net domain     no device on the bus; nothing delegated");
+        return Ok(());
+    }
+
+    let realm = domain::create("net", domain::ResourceEnvelope::new())
+        .map_err(|_| "the net domain would not be created")?;
+
+    // Rings: eight pages, and the arithmetic rather than a feel for it.
+    //
+    // Two queues, not the block driver's one, and each needs a descriptor
+    // table, an available ring and a used ring. Then the buffers: a receive
+    // queue must have somewhere to put a frame *before* the device has one to
+    // deliver, so every receive descriptor owns a buffer big enough for a full
+    // Ethernet frame plus the virtio header in front of it.
+    //
+    //   2 queues x (descriptors + available + used)        ~2 pages
+    //   4 receive buffers x 2 KiB                            2 pages
+    //   1 transmit buffer                                   <1 page
+    //   slack, so the layout can move without re-sizing      3 pages
+    //
+    // Owned by a keeper domain rather than by the driver, for the reason
+    // `blk-keeper` exists: a domain ends when its last thread exits and takes
+    // the memory it owns with it, so rings owned by the driver would be freed
+    // the moment it stopped and anything reading them afterwards would be
+    // reading returned frames.
+    let keeper = domain::create("net-keeper", domain::ResourceEnvelope::new())
+        .map_err(|_| "the net rings' owner would not be created")?;
+    NET_KEEPER.store(
+        keeper.as_u32().saturating_add(1),
+        core::sync::atomic::Ordering::Release,
+    );
+    let rings = shared::create(keeper, 8 * bhaskix_mm::FRAME_SIZE)
+        .map_err(|_| "the net domain's rings would not be created")?;
+    let named = shared::name(rings).map_err(|_| "the rings would not be named")?;
+    if domain::with(realm, |owner| owner.cspace.install_at(3, named).is_ok()) != Some(true) {
+        return Err("the rings capability would not install");
+    }
+
+    // **The rings and the report exist before any device**, and that is the
+    // other half of the same change: `bin/netd` writes its report into the last
+    // page of that object and the kernel reads it there, so a machine with no
+    // virtio device used to have no page to report through either.
+    let shared_signal = match virtio_device {
+        Some((address, _)) => delegate_virtio_nic(realm, address, apic_id, rsdp, hhdm_base)?,
+        None => {
+            println!("    net domain     no virtio device; bin/netd drives what else is delegated");
+            None
+        }
+    };
 
     // **The second member of a bond** -- RFC 0074 step 4.
     //
@@ -16036,6 +16225,26 @@ pub fn start_net_domain(
     // "which slot is this?" has an answer that does not depend on how many
     // ports were found. Slots 7, 8 and 9 are the rings to `bin/ipd` and its
     // doorbell, which belong to the driver and not to either port.
+    // **And the X722 -- but only when asked, and the reason is one device with
+    // one owner.**
+    //
+    // RFC 0075 step 3 hands this card to `bin/netd`. The kernel still drives it
+    // (`start_nic_domain`, and the queue, HMC, receive and DHCP work behind
+    // it), and two owners of one device is not a state to boot a machine in --
+    // so the handover waits for the driving to move with it, which is step 4.
+    //
+    // `bhaskix.netd-x722=1` performs it now, for the boot that proves the
+    // delegation itself works before anything depends on it. Off by default,
+    // because on this machine the default is a NIC that receives frames and
+    // runs a DHCP exchange, and that is not worth trading for a delegation with
+    // nothing yet behind it.
+    if NETD_TAKES_X722.load(core::sync::atomic::Ordering::Relaxed) {
+        match delegate_x722(realm, keeper, hhdm_base) {
+            Ok(true) | Ok(false) => {}
+            Err(why) => println!("\x1b[91m    net domain     the X722 FAILED: {why}\x1b[0m"),
+        }
+    }
+
     if ports > 1 {
         match delegate_second_port(realm, keeper, shared_signal, apic_id, rsdp, hhdm_base) {
             Ok(true) => println!(
