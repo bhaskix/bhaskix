@@ -698,6 +698,75 @@ change to this RFC's order and it is made on evidence: the receive path is built
 and the device is running it, and the only thing missing is a frame that was
 meant for this machine.
 
+## Step 4, met 2026-09-07 — and the frame was never missing
+
+**A frame arrives.** Read off the SR550:
+
+    nic rx frame   a frame arrived after 8115 ms in absolute queue 0, descriptor 0: 171 bytes,
+                   EtherType 0x88cc (LLDP), multicast to 01:80:c2:00:00:0e from 08:bd:43:76:47:e3
+    nic stats      frames reached a queue -- the receive path carries traffic
+
+**The reasoning above was wrong in an instructive way.** It concluded the
+segment carried nothing addressed to this machine and that step 5 — sending, to
+draw a reply — was the way to close step 4. Neither was true. The frames had
+been arriving the whole time, and no amount of sending would have revealed it,
+because what was broken was not delivery.
+
+### What was actually wrong, and how each layer proved itself innocent
+
+Every boot said *the port saw traffic and no queue got any*, so the search ran
+for six mechanisms of steering and filtering. All six were the wrong half of the
+chain. Each of these was measured, not argued:
+
+* **The tail** was read back after the queues were enabled: all four held the 8
+  they were given. Descriptors were always available.
+* **The IOMMU** recorded no fault while the receive queues ran — a window that
+  had never been sampled, because faults were only ever reported *before* the
+  drivers start and at the end of bring-up.
+* **The VSI's queue mapping** was genuinely wrong: traffic class 0 had **one**
+  queue while the driver enabled four. Fixed with `Update VSI`, and it was not
+  the cause.
+* **The buffer** held the frame. Dumping it is what ended the search:
+  `01 80 c2 00 00 0e … 88 cc` — an LLDP frame from the switch, DMA'd into memory
+  this kernel allocated, with the switch's port ID `xg12` in its payload. The
+  device had received it, written it, and advanced the queue's head.
+
+So the receive path worked. What did not was **the report**: the completed
+descriptor was never posted back, and the driver watched the descriptor.
+
+### The rule, and the bit
+
+38.22.5, *Write Back on Interrupts*: *"Following packet reception, the status of
+completed descriptors are posted (write back) to host memory **once every
+several packets or at ITR expiration**."* Four packets a minute reaches neither
+trigger, and the same section says a queue in no interrupt linked list is
+reported at neither.
+
+The arrangement it names for a driver that wants the reporting and not the
+interrupt is a vector with `WB_ON_ITR` set and `INTENA` clear, with the queues
+chained onto it. Three registers, all previously unwritten by this driver:
+
+* `QINT_RQCTL[Q]` (38.39.2.9.27) — each queue on ITR0, chained, ending with the
+  datasheet's `0x7FF` NULL rather than the reset value's zero, which points back
+  at receive queue 0.
+* `PFINT_LNKLST0` (38.39.2.9.22) — interrupt zero's list starts at the first
+  queue, of type receive.
+* `PFINT_DYN_CTL0` (38.39.2.9.21) — `WB_ON_ITR` set, `INTENA` clear.
+
+**And `CAUSE_ENA`, which is the bit the datasheet's own wording argues against.**
+38.39.2.9.27 says of it: *"When this bit is cleared, interrupts are not generated
+by the queue. The queue remains in the interrupt linked list and is processed at
+ITR expiration."* Read plainly, a driver that wants no interrupts should leave it
+clear — and with it clear, through two boots with everything else in place, not
+one descriptor was posted back. Setting it, with `INTENA` clear at the vector so
+nothing is delivered, is what made the frames appear. **The cause is what puts a
+completion into the path the ITR then processes; the vector is where the
+interrupt is refused.**
+
+That is a case where the datasheet's sentence and the device's behaviour differ,
+and it is recorded here rather than smoothed over, because the next person to
+read that sentence will reach the same wrong conclusion.
+
 **What four boots have established, and none of it was testable in QEMU:** the
 device resets, answers commands, reports its link and its switch, hands over its
 queue allocation, runs a queue context this kernel wrote through the host memory

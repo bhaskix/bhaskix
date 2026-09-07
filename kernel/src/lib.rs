@@ -759,9 +759,9 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
     //
     // Reading clears them, so the two reports are disjoint by construction:
     // anything printed at the end of the boot happened *after* this line.
-    if let Some((found, _)) = iommu_state.as_ref() {
+    if iommu_state.is_some() {
         // SAFETY: the unit `iommu_bringup` mapped and programmed.
-        unsafe { iommu::report_faults_since(found, handoff.hhdm_base.as_u64(), "before drivers") };
+        unsafe { iommu::report_faults_since("before drivers") };
     }
 
     // RFC 0046 step 2: SATA AHCI controllers, on exactly the same terms and in
@@ -1012,7 +1012,7 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
             }
         }
     }
-    if let Some((found, _)) = iommu_state.as_ref() {
+    if iommu_state.is_some() {
         // A fault here means a device reached for something nobody granted it,
         // during its own bring-up. RFC 0012 calls that the feature.
         //
@@ -1035,7 +1035,7 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
             );
         }
         // SAFETY: the unit `iommu_bringup` mapped and programmed.
-        unsafe { iommu::report_faults_since(found, handoff.hhdm_base.as_u64(), "during bring-up") };
+        unsafe { iommu::report_faults_since("during bring-up") };
     }
     mount_root(handoff);
     if !vfs_self_test(handoff) {
@@ -12796,6 +12796,22 @@ fn ask_nic(nic: &mut i40e::Device<MappedRegisters>, transmit: u64, host: u64) ->
                     );
                     let (number, queue_set) = match asked {
                         Ok(parameters) => {
+                            // **The VSI's whole context, printed once.**
+                            // Port counters count frames, the VSI counter
+                            // counts frames, and no receive queue has ever
+                            // taken one -- so what steers a frame from a VSI to
+                            // a queue is the one thing never looked at, and it
+                            // is in these 128 bytes. Table 38-217 names the
+                            // fields; this prints them so the next change can
+                            // be to the right register rather than to another
+                            // filter.
+                            for line in 0..8 {
+                                let at = line * 16;
+                                println!(
+                                    "    nic vsi ctx    {at:3}: {}",
+                                    HexBytes(&parameters.context[at..at + 16])
+                                );
+                            }
                             println!(
                                 "                   seid {:#x} is VSI number {} (the element \
                                  field says {}), queue set handle {:#x}",
@@ -14069,6 +14085,66 @@ fn bring_up_receive_queue(
 
     // **Enable** -- after the 50 ms 38.30.3.3.2 asks for since the last
     // disable, which the PF reset and the PXE-mode clear both were.
+    // **Tell the VSI which queues are its own** -- the one link in the receive
+    // chain never written. The SR550's VSI context says traffic class 0 has a
+    // single queue while this driver enables four, and a frame steered to a
+    // queue the VSI does not own is a frame with nowhere to go. Read, modified
+    // and written back, so nothing firmware chose is replaced by a guess.
+    // SAFETY: the VSI buffer inside the admin ring page, after both rings and
+    // the switch buffer, which `i40e` asserts at compile time.
+    let mut vsi_buffer = unsafe {
+        DeviceMemory::new(
+            admin.1 + i40e::VSI_BUFFER_OFFSET,
+            i40e::VSI_BUFFER_BYTES as usize,
+        )
+    };
+    match nic.map_receive_queues(
+        &mut ring,
+        vsi,
+        admin.0 + i40e::VSI_BUFFER_OFFSET,
+        &mut vsi_buffer,
+        0,
+        rings.queues as u16,
+    ) {
+        Ok((was, now)) => println!(
+            "    nic vsi queues traffic class 0 mapped: was {} queue(s) at offset {}, now {} at \
+             {} -- {} queue(s) enabled below",
+            1 << (was >> 9 & 0x7),
+            was & 0x1ff,
+            1 << (now >> 9 & 0x7),
+            now & 0x1ff,
+            rings.queues
+        ),
+        Err(error) => println!(
+            "\x1b[93m    nic vsi queues firmware would not take the queue mapping: {error}\x1b[0m"
+        ),
+    }
+
+    // **Tell the device to report a completed descriptor at all** -- 38.22.5.
+    //
+    // *"Following packet reception, the status of completed descriptors are
+    // posted (write back) to host memory once every several packets or at ITR
+    // expiration"*, and a queue in no interrupt linked list reaches neither. So
+    // for twenty boots the frames arrived, the device filled the buffers and
+    // advanced the head, and nothing was ever posted back to say so -- which
+    // read from here as a receive path that did not work.
+    //
+    // The queues are chained onto interrupt zero with *No ITR* and `WB_ON_ITR`,
+    // which the datasheet names as the arrangement for queues that report and
+    // do not interrupt. Before the queues are enabled, so nothing is running
+    // while its reporting is being reconfigured.
+    let control = nic.report_completions(rings.queue(0), rings.queues);
+    println!(
+        "    nic rx report  {} queue(s) chained onto interrupt 0 on ITR0, cause enabled, \
+         interrupt disabled; PFINT_DYN_CTL0 reads {control:#010x} -- write-back on ITR {}",
+        rings.queues,
+        if control & (1 << 30) != 0 {
+            "set"
+        } else {
+            "\x1b[91mNOT SET\x1b[0m"
+        }
+    );
+
     let timed = pause_millis(50);
     let mut enabled = 0;
     let mut refused = 0;
@@ -14087,6 +14163,38 @@ fn bring_up_receive_queue(
     );
     if refused > 0 {
         println!("\x1b[91m                   {refused} queue(s) never set QENA_STAT\x1b[0m");
+    }
+
+    // **The tail, read back.** 38.30.3.3.2 lists the tail before the enable and
+    // this driver has followed that order for twenty boots without once looking
+    // at the register afterwards. A tail of zero is a queue with no descriptors
+    // available, which on the wire is indistinguishable from a queue nothing is
+    // steered to -- and that is the symptom this machine has shown throughout.
+    // It is one register read to tell those two apart.
+    let mut armed = 0;
+    for index in 0..rings.queues {
+        if nic.receive_tail(rings.queue(index)) == POSTED {
+            armed += 1;
+        }
+    }
+    println!(
+        "    nic rx tail    {armed} of {} queue(s) hold the tail they were given ({POSTED}); \
+         queue {} reads {}",
+        rings.queues,
+        rings.queue(0),
+        nic.receive_tail(rings.queue(0))
+    );
+    if armed < rings.queues {
+        // Written again now the queues report themselves enabled. Harmless
+        // where the first write stuck; the whole of the fix where it did not.
+        for index in 0..rings.queues {
+            nic.arm_receive_queue(rings.queue(index), POSTED);
+        }
+        println!(
+            "\x1b[93m                   armed again after the enable: queue {} now reads {}\x1b[0m",
+            rings.queue(0),
+            nic.receive_tail(rings.queue(0))
+        );
     }
     let enabled = enabled > 0;
 
@@ -14198,6 +14306,75 @@ fn bring_up_receive_queue(
             vsi_delta.packets(),
             vsi_delta.discarded
         );
+
+        // **What the device says it did with the ring, and what is in the ring
+        // -- read at the same moment.**
+        //
+        // The boot before this one reported `head 7` from the context cache,
+        // seven descriptors consumed, while every descriptor read as untouched.
+        // Those cannot both be true of the same bytes. One of them is being
+        // read in the wrong place, and reading one at the start and the other
+        // at the end is what made that possible to miss for twenty boots.
+        for index in 0..rings.queues {
+            let queue = rings.queue(index);
+            if let Some((context, resident)) = nic.cached_receive_context(queue, SPINS) {
+                println!(
+                    "    nic rx head    queue {queue}: head {}, tail {}, base {:#x}{}",
+                    context[0] & 0x1fff,
+                    nic.receive_tail(queue),
+                    (u64::from(context[1]) | (u64::from(context[2] & 0x1ff_ffff) << 32)) * 128,
+                    if resident { "" } else { ", NOT resident" }
+                );
+            }
+        }
+        // **And whether the unit refused a write.**
+        //
+        // Faults have only ever been reported *before* the drivers run and at
+        // the end of bring-up, and this device receives in between -- so a DMA
+        // write the unit blocked has never had anywhere to be printed. Every
+        // observation here fits one: descriptors the device can read, a head
+        // that advances once per packet the VSI counted, no write-back, and no
+        // error from the device itself, which would not see a fault the fabric
+        // raised on its behalf.
+        // SAFETY: the units this kernel programmed; reading a fault record
+        // clears it, so this window is disjoint from the two around it.
+        unsafe { iommu::report_faults_since("while the receive queues ran") };
+
+        // **And the buffer, which is what tells the last two stories apart.**
+        //
+        // A head that advanced four times while four packets reached the VSI
+        // is either four write-backs this driver is reading in the wrong place,
+        // or four descriptors the device merely *prefetched* while delivering
+        // nothing. Those need different fixes and look identical from the
+        // descriptor alone. They do not look identical here: a delivered frame
+        // put its bytes in this buffer, and an Ethernet header is unmistakable.
+        // SAFETY: the first receive buffer, which this kernel posted.
+        let buffer = unsafe { DeviceMemory::new(buffers.host_at(0, 0), 32) };
+        for line in 0..2usize {
+            let mut bytes = [0u8; 16];
+            i40e::Dma::read(&buffer, line * 16, &mut bytes);
+            println!(
+                "    nic rx buffer  queue {} buffer 0 +{}: {}",
+                rings.queue(0),
+                line * 16,
+                HexBytes(&bytes)
+            );
+        }
+
+        // And the ring itself, as bytes. A write-back the driver cannot see is
+        // a write-back at an offset it does not read, and sixteen bytes at a
+        // time is what tells one from the other.
+        // SAFETY: the first ring, which this kernel posted and mapped.
+        let first = unsafe { DeviceMemory::new(rings.host_ring(0), 64) };
+        for line in 0..4usize {
+            let mut bytes = [0u8; 16];
+            i40e::Dma::read(&first, line * 16, &mut bytes);
+            println!(
+                "    nic rx desc    queue {} descriptor {line}: {}",
+                rings.queue(0),
+                HexBytes(&bytes)
+            );
+        }
         println!(
             "    nic stats      \x1b[1m{}\x1b[0m",
             match (port_delta.saw_anything(), total > 0) {
@@ -18534,6 +18711,25 @@ fn time_the_burst(hhdm: u64) {
 ///
 /// This prints what the driver saw by the end, which is the only version of
 /// those numbers that can say whether the offer was ever delivered.
+/// Sixteen bytes as hex, for a line of a structure dump.
+///
+/// A `Display` rather than a loop of `print!`, because the console takes a whole
+/// line at a time and a run of small writes is what the tear this kernel
+/// records was made of.
+struct HexBytes<'a>(&'a [u8]);
+
+impl core::fmt::Display for HexBytes<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        for (index, byte) in self.0.iter().enumerate() {
+            if index > 0 && index % 4 == 0 {
+                f.write_str(" ")?;
+            }
+            write!(f, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
 /// Prints what `bin/netd` found when it went looking for an X722.
 ///
 /// RFC 0075 step 2. **Silent on a machine that has none**, which is every lane

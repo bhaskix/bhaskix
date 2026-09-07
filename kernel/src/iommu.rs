@@ -2036,7 +2036,7 @@ unsafe fn program_unit(
 /// # Safety
 ///
 /// As [`enable`], and the unit must already have been mapped by it.
-pub unsafe fn report_faults_since(_report: &Report, _hhdm: u64, when: &str) {
+pub unsafe fn report_faults_since(when: &str) {
     let mut records = [vtd::FaultRecord {
         source: 0,
         address: 0,

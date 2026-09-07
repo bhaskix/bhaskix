@@ -744,6 +744,25 @@ asm_budget = 10
 # call one method -- which is both less `unsafe` and the fix for a real defect:
 # a loop that restarted at slot zero while the device's head stood at two wrote
 # forty-five frames behind the head and moved the tail backwards.
+# 2107: naming the first receive buffer, so a delivered frame's bytes can be
+# read beside the descriptor that should have described it.
+#
+# 2106: reading the IOMMU's fault records while the receive queues run. Faults
+# had only ever been reported before the drivers start and at the end of
+# bring-up, and this device receives in between -- so a DMA write the unit
+# refused had nowhere to be printed, for twenty boots.
+#
+# 2105 while chasing the receive path: one more, naming the first receive ring
+# so the descriptors can be dumped beside the head the device reports. The two
+# had only ever been read at different moments, which is how a device that had
+# consumed seven descriptors and a ring that read as untouched could both be
+# true for twenty boots without anyone noticing they disagreed.
+#
+# 2104 while chasing the receive path: the VSI's parameter buffer, named where
+# the queue mapping is written rather than carried down from `ask_nic`. Six
+# lines, all of them `DeviceMemory::new` and its bound, and the alternative was
+# threading a region through four functions that have no other use for it.
+#
 # **2098 at RFC 0075, and it went DOWN by 39 while a driver kept working.**
 # `kernel/src/i40e.rs` left for a crate that forbids `unsafe` entirely: the
 # volatile register accesses became a trait its holder implements -- three
@@ -762,7 +781,7 @@ asm_budget = 10
 # device and a different domain id. A helper serving both would have needed a
 # parameter for every difference between them, which is a worse way of saying
 # they are not the same job.
-unsafe_budget = 2098
+unsafe_budget = 2107
 # Up thirty-one for RFC 0005 step 9's socket probe -- `ring3_socketeer`, which
 # is `ring3_lister` with a `sockaddr_in6` copied in beside its code instead of
 # two filenames. The same two blocks every hosted probe has: one
