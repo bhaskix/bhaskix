@@ -271,20 +271,31 @@ ring 3**, and the service above was told the port's own station address to build
 them with — the first time anything above `bin/netd` has had an interface on
 this machine.
 
-**Receive is written and has not carried a frame.** The loop walks the
-descriptors in order, hands a completed one to `bin/ipd`, gives the buffer back
-and advances the tail; the boot reported none taken. The port carries an LLDP
-frame about every thirty seconds and the report is read early, so "nothing
-arrived in the window" is the ordinary explanation — and it is not the same as
-proven. Written down as unproven rather than assumed.
+**Receive carries too, proven the same day.** The report was glancing during
+bring-up at a port that carries a frame about every thirty seconds, which
+reports the silence rather than the receive path — so `bhaskix.x722=<ms>` makes
+it wait, the way `bhaskix.lacp=` and `bhaskix.bond=` already do for the same
+reason. With ninety seconds:
+
+    net after      1 completions seen, 1 handed across, 25 sent back
+    ipd after      1 frames taken, 0 refused, 1 datagrams delivered to a socket;
+                   last refusal reason 2, on a frame of 171 bytes with ethertype
+                   0x88cc; woken by a frame 2 times
+
+**The whole path runs in ring 3**: the wire, the X722, `bin/netd` driving it,
+the ring between them, and `bin/ipd` taking the frame and being woken by the
+doorbell to do it. The frame is the switch's LLDP — 171 bytes, EtherType
+`0x88cc` — which `bin/ipd` refuses as a protocol it does not carry, and refusing
+it correctly is the stack working rather than a fault.
+
 
 ### What is left
 
-The deletion. `start_nic_domain` and its nineteen hundred lines still hold the
-kernel's own copy of this driver, and `bhaskix.netd-x722=1` is still a flag
-rather than what the machine does. **Neither should change until a frame has
-been received in ring 3**, because the kernel's copy is the only thing on this
-machine that has ever received one.
+The deletion, and nothing now blocks it. `start_nic_domain` and its nineteen
+hundred lines still hold the kernel's own copy of this driver, and
+`bhaskix.netd-x722=1` is still a flag rather than what the machine does. The
+reason for waiting was that the kernel's copy was the only thing on this machine
+that had ever received a frame. It is not any more.
 
 
 ## Alternatives considered

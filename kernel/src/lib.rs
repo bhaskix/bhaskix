@@ -549,6 +549,14 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
         // reason the comment above `busybox=1` gives: this file has two
         // conventions and a flag that is accepted and does nothing is the
         // failure it keeps recording.
+        // `bhaskix.x722=<ms>` — RFC 0075 step 4. See `X722_PATIENCE_MS`.
+        if let Some(value) = word
+            .strip_prefix("bhaskix.x722=")
+            .or_else(|| word.strip_prefix("x722="))
+            && let Ok(ms) = value.parse::<u64>()
+        {
+            X722_PATIENCE_MS.store(ms.min(120_000), core::sync::atomic::Ordering::Relaxed);
+        }
         // `bhaskix.netd-x722=1` — RFC 0075 step 3. See `NETD_TAKES_X722`.
         if word == "bhaskix.netd-x722=1" || word == "netd-x722=1" {
             NETD_TAKES_X722.store(true, core::sync::atomic::Ordering::Relaxed);
@@ -4107,6 +4115,18 @@ static BOND_PATIENCE_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::Ato
 /// the handover for a boot that proves the delegation before anything depends
 /// on it.
 static NETD_TAKES_X722: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// How long the boot report will wait for `bin/netd` to hand a frame across.
+///
+/// Zero on every ordinary boot, for the reason [`LACP_PATIENCE_MS`] and
+/// [`BOND_PATIENCE_MS`] give and one of its own: the port this matters on
+/// carries a frame about every thirty seconds, and the report is read during
+/// bring-up. Glancing asks *"had a frame arrived by then?"*, which on a wire
+/// that quiet is a coin toss; waiting asks *"did one arrive within the
+/// window?"*, which has the same answer twice.
+///
+/// `bhaskix.x722=<ms>` sets it, and one boot does.
+static X722_PATIENCE_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// Extra runnable threads spawned alongside the ring — `ringload=<n>`.
 ///
@@ -19596,6 +19616,20 @@ fn report_net_after_exchange(hhdm: u64) {
     take(&mut words);
     if words[0] != NETD_MARKER {
         return;
+    }
+    // **Wait for a frame, where this image was told to.** RFC 0075 step 4: word
+    // 9 is what `bin/netd` has handed across, and on the one machine that has
+    // an X722 the wire carries a frame about every thirty seconds. A glance
+    // during bring-up reports the silence rather than the receive path.
+    let patience = X722_PATIENCE_MS.load(Ordering::Relaxed);
+    if patience > 0 && words[9] == 0 {
+        for _ in 0..(patience / 50) {
+            take(&mut words);
+            if words[9] > 0 {
+                break;
+            }
+            wait_millis(50);
+        }
     }
     println!(
         "    net after      {} completions seen, {} handed across, {} sent back; widest frame \

@@ -961,6 +961,29 @@ the distinction is in the table rather than in somebody's head.
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-09-07 (a frame from the wire reaches bin/ipd, and nothing in the path is the kernel)
+
+RFC 0075 step 4's receive, proven. The report had been glancing during bring-up at a port that carries
+a frame about every thirty seconds, which reports the silence rather than the receive path — so
+`bhaskix.x722=<ms>` makes it wait, as `bhaskix.lacp=` and `bhaskix.bond=` already do for the same
+reason. With ninety seconds:
+
+    net after      1 completions seen, 1 handed across, 25 sent back
+    ipd after      1 frames taken, 0 refused, 1 datagrams delivered to a socket;
+                   last refusal reason 2, on a frame of 171 bytes with ethertype
+                   0x88cc; woken by a frame 2 times
+
+**Every step of that is in ring 3**: the X722, `bin/netd` driving it, the ring between them, and
+`bin/ipd` taking the frame — woken by the doorbell rather than polling for it. The frame is the
+switch's own LLDP, which `bin/ipd` refuses as a protocol it does not carry; refusing it correctly is
+the stack working, not a fault.
+
+**This machine now has a network stack.** Twenty-five frames out, one in, an interface with the port's
+own address, and not one line of the path inside the nucleus.
+
+**And the deletion is unblocked.** `start_nic_domain` and its nineteen hundred lines were kept because
+the kernel's copy was the only thing here that had ever received a frame. It is not any more.
+
 ### 2026-09-07 (frames on a real wire, from ring 3)
 
 RFC 0075 step 4's other half. `bin/netd` carries frames between the X722 and `bin/ipd`, and the
