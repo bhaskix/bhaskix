@@ -103,6 +103,18 @@ const X722_WINDOW: u64 = 16;
 const X722_MEMORY: u64 = 17;
 /// Slot: the first of its register pages.
 const X722_PAGES: u64 = 20;
+/// Slot: the private-memory pages the HMC fetches queue contexts from.
+///
+/// **After the register pages, and computed rather than written down.** They
+/// were 54, 55 and 56 -- inside the range the pages occupy once the interrupt
+/// registers joined the list, so the kernel's install refused and the service
+/// got a device it could not give memory to. A number chosen by hand beside a
+/// range that grows is a number that will one day be inside it.
+const X722_HMC: u64 = X722_PAGES + bhaskix_i40e::REGISTER_PAGES.len() as u64;
+/// Slot: the receive rings and the buffers behind them.
+const X722_RINGS: u64 = X722_HMC + 1;
+/// Slot: the transmit ring and the one packet buffer it posts from.
+const X722_TX: u64 = X722_HMC + 2;
 
 /// Where the X722's registers are mapped: page `P` of its BAR at `X722_AT + P`.
 ///
@@ -113,6 +125,27 @@ const X722_PAGES: u64 = 20;
 const X722_AT: u64 = 0x3000_0000;
 /// And where its admin page goes, clear of the register window's four megabytes.
 const X722_MEMORY_AT: u64 = 0x3400_0000;
+/// The private memory the HMC reads: a page-descriptor page and the pages it
+/// names.
+const X722_HMC_AT: u64 = 0x3410_0000;
+/// The receive rings, and the packet buffers behind them.
+const X722_RINGS_AT: u64 = 0x3420_0000;
+/// The transmit ring and its packet buffer.
+const X722_TX_AT: u64 = 0x3430_0000;
+
+/// How many receive queues this driver takes on the X722.
+///
+/// **One, where the kernel took four.** Four answered a question the kernel was
+/// asking -- *which* queue a frame is steered to -- and that question has an
+/// answer now. One queue carries traffic; a bond over the card's four ports is
+/// RFC 0074's work and needs four *ports*, not four queues on one.
+const X722_QUEUES: u32 = 1;
+/// Descriptors in each receive ring: a whole multiple of 32 outside PXE mode.
+const X722_DESCRIPTORS: u16 = 32;
+/// Descriptors handed to the device at a time, a multiple of eight.
+const X722_POSTED: u32 = 8;
+/// Bytes in each receive packet buffer, in 128-byte units and at least 1 KB.
+const X722_BUFFER: u16 = 2048;
 
 /// Where this program maps what it holds.
 const COMMON_AT: u64 = 0x2000_0000;
@@ -1130,7 +1163,7 @@ extern "C" fn netd_main() -> ! {
         // Nothing of the virtio path can run. Say so through the report and
         // then take whatever else was delegated -- which is the whole reason
         // this program is started on a machine with no virtio device.
-        let x722 = take_x722();
+        let (x722, _) = take_x722();
         let (state, firmware) = x722.words();
         no_virtio_report(state, firmware);
         loop {
@@ -1357,7 +1390,10 @@ extern "C" fn netd_main() -> ! {
     // **The X722, if the kernel delegated one** -- RFC 0075 step 2. Taken once,
     // here, because a device is brought up once and because the answer on every
     // machine that has none is the same answer every time: there is none.
-    let x722 = take_x722();
+    let (x722, x722_queues) = take_x722();
+    // Wired into the loop at the next step; held now so the bring-up above is
+    // not doing work nothing keeps.
+    let _ = &x722_queues;
 
     let mut active = 0usize;
     let mut failovers = 0u64;
@@ -1673,6 +1709,222 @@ fn receive_seen(ports: &[Option<Port>; 2]) -> u16 {
 /// file has recorded happening twice.
 const REPORT_WORDS: usize = 24;
 
+/// Everything the X722 needs to carry a frame, once it is up.
+///
+/// **RFC 0075 step 4**: the queue programming the kernel used to do, in the
+/// service that holds the device. What each call means is in `bhaskix-i40e`,
+/// beside the datasheet section it came from; what is here is the memory and
+/// the order.
+#[allow(
+    dead_code,
+    reason = "held by the bring-up and read when the port joins the loop, which               is the next half of RFC 0075 step 4: frames to and from bin/ipd"
+)]
+struct X722Queues {
+    /// The receive ring, as this program writes it and as the device reads it.
+    ring: X722Memory,
+    /// Where the device fetches it.
+    ring_device: u64,
+    /// The packet buffers, as this program reads them.
+    buffers: X722Memory,
+    /// Where the device writes them.
+    buffers_device: u64,
+    /// The transmit ring and its packet buffer.
+    transmit: X722Memory,
+    /// Where the device reads them.
+    transmit_device: u64,
+    /// The absolute index of the receive queue taken.
+    queue: u32,
+    /// The transmit queue, which is the same index in the other direction.
+    transmit_queue: u32,
+    /// Descriptors handed over, which is also the tail.
+    posted: u32,
+}
+
+/// Brings the X722's queues up: private memory, contexts, buffers, filters and
+/// the write-back path.
+///
+/// The order is the kernel's, which is the datasheet's: out of PXE mode, the
+/// LAN private memory programmed, a segment descriptor written and read back, a
+/// page descriptor for the page each context falls in, the contexts themselves,
+/// the buffers posted, the VSI told which queues are its own, the completions
+/// routed to an interrupt that reports and does not raise, and only then the
+/// queues enabled.
+///
+/// Returns `None` at the first step that will not complete, because every step
+/// after it would be programming a device that is not going to answer.
+fn bring_up_x722(
+    device: &mut bhaskix_i40e::Device<X722Registers>,
+    admin: &mut X722Memory,
+    admin_device: u64,
+    vsi: u16,
+    vsi_number: u16,
+    stage: &mut u8,
+) -> Option<X722Queues> {
+    use bhaskix_i40e as i40e;
+    const SPINS: u32 = 2_000_000;
+
+    // The queues this PF owns, and where the VSI's start.
+    let (first, queues) = device.queue_allocation()?;
+    *stage = 5;
+    let (base, _scattered) = device.vsi_queue_base(vsi_number)?;
+    let queue = u32::from(first) + u32::from(base);
+    *stage = 6;
+
+    // **Out of PXE mode first** -- 38.30.2.1's "operating system driver only
+    // step", and the queue-length rule depends on it.
+    let _ = device.clear_pxe_mode(admin, SPINS);
+
+    // The private memory the HMC fetches contexts from, sized to the queues
+    // this function owns rather than to the one it takes.
+    let memory = device.program_lan_private_memory(u32::from(queues));
+    let receive_base = i40e::receive_base_after(0, u32::from(queues), memory.tx_object_size);
+    let at = i40e::context_location(receive_base, memory.rx_object_size, queue);
+    let end = i40e::object_area_end(receive_base, u32::from(queues), memory.rx_object_size);
+    let backing = i40e::backing_pages_to(end);
+
+    // The HMC object: a page-descriptor page, then the pages it names.
+    let hmc_device = map_window(X722_WINDOW, X722_HMC)?;
+    *stage = 7;
+    let mut hmc = X722Memory {
+        at: X722_HMC_AT,
+        bytes: (1 + backing as usize) * 4096,
+    };
+    let pd_page_device = hmc_device;
+    let backing_device = hmc_device + 4096;
+
+    let read_back = device.write_segment_descriptor(at.segment, pd_page_device, backing);
+    if read_back != i40e::segment_descriptor(pd_page_device, backing) {
+        return None;
+    }
+    *stage = 8;
+    // The page the context falls in, named to the device.
+    i40e::write_page_descriptor(
+        &mut hmc,
+        at.page,
+        backing_device + u64::from(at.page) * 4096,
+    );
+
+    // The rings and the buffers behind them.
+    let rings_device = map_window(X722_WINDOW, X722_RINGS)?;
+    *stage = 9;
+    let ring_bytes = X722_DESCRIPTORS as usize * i40e::RECEIVE_DESCRIPTOR_BYTES as usize;
+    let buffers_at = 4096;
+    let mut ring = X722Memory {
+        at: X722_RINGS_AT,
+        bytes: ring_bytes,
+    };
+    let buffers = X722Memory {
+        at: X722_RINGS_AT + buffers_at,
+        bytes: X722_POSTED as usize * X722_BUFFER as usize,
+    };
+    let buffers_device = rings_device + buffers_at;
+
+    // The context, into the backing page at the offset the layout gives.
+    let context = i40e::ReceiveContext {
+        ring: rings_device,
+        descriptors: X722_DESCRIPTORS,
+        buffer_bytes: X722_BUFFER,
+        max_frame: X722_BUFFER,
+    };
+    let mut backing_page = X722Memory {
+        at: X722_HMC_AT + 4096 + u64::from(at.page) * 4096,
+        bytes: 4096,
+    };
+    i40e::write_receive_context(&mut backing_page, at.offset as usize, &context);
+
+    let mut posted = [0u64; X722_POSTED as usize];
+    for (slot, buffer) in posted.iter_mut().enumerate() {
+        *buffer = buffers_device + (slot as u64) * u64::from(X722_BUFFER);
+    }
+    i40e::post_receive_descriptors(&mut ring, &posted);
+
+    // **What the VSI forwards.** Its own MAC filter takes only frames sent to
+    // this port; what a switch sends unprompted is multicast and broadcast.
+    // One mode per command: bundling them was refused, and the refusal cost
+    // the modes that had worked.
+    for mode in [
+        i40e::PromiscuousMode::Unicast,
+        i40e::PromiscuousMode::Multicast,
+        i40e::PromiscuousMode::Broadcast,
+        i40e::PromiscuousMode::AnyVlan,
+    ] {
+        let _ = device.set_promiscuous(admin, vsi, mode, true, SPINS);
+    }
+    let _ = device.stop_lldp_agent(admin, false, SPINS);
+
+    // The VSI is told which queues are its own, and the completions are routed
+    // to an interrupt that reports and never raises -- without which the frames
+    // arrive and nothing is ever posted back to say so.
+    let mut vsi_buffer = X722Memory {
+        at: X722_MEMORY_AT + i40e::VSI_BUFFER_OFFSET,
+        bytes: i40e::VSI_BUFFER_BYTES as usize,
+    };
+    let _ = device.map_receive_queues(
+        admin,
+        vsi,
+        admin_device + i40e::VSI_BUFFER_OFFSET,
+        &mut vsi_buffer,
+        0,
+        X722_QUEUES as u16,
+    );
+    device.report_completions(queue, X722_QUEUES);
+
+    *stage = 10;
+    if !device.enable_receive_queue(queue, X722_POSTED, SPINS) {
+        return None;
+    }
+    *stage = 11;
+    device.arm_receive_queue(queue, X722_POSTED);
+
+    // And the transmit side: its context in the same page, then the queue.
+    let transmit_device = map_window(X722_WINDOW, X722_TX)?;
+    *stage = 12;
+    let transmit_at = i40e::context_location(0, memory.tx_object_size, queue);
+    i40e::write_page_descriptor(
+        &mut hmc,
+        transmit_at.page,
+        backing_device + u64::from(transmit_at.page) * 4096,
+    );
+    let mut transmit_backing = X722Memory {
+        at: X722_HMC_AT + 4096 + u64::from(transmit_at.page) * 4096,
+        bytes: 4096,
+    };
+    i40e::write_transmit_context(
+        &mut transmit_backing,
+        transmit_at.offset as usize,
+        &i40e::TransmitContext {
+            ring: transmit_device,
+            descriptors: i40e::TRANSMIT_DESCRIPTORS,
+            ready_list: 0,
+        },
+    );
+    device.clear_transmit_queue_disable(queue);
+    device.own_transmit_queue(queue, memory.function);
+    let _ = device.enable_transmit_queue(queue, SPINS);
+    device.attach_transmit_ring(i40e::TRANSMIT_DESCRIPTORS);
+
+    Some(X722Queues {
+        ring,
+        ring_device: rings_device,
+        buffers,
+        buffers_device,
+        transmit: X722Memory {
+            at: X722_TX_AT,
+            bytes: 4096,
+        },
+        transmit_device,
+        queue,
+        transmit_queue: queue,
+        posted: X722_POSTED,
+    })
+}
+
+/// Asks the DMA window where the device reaches the object in `slot`.
+fn map_window(window: u64, slot: u64) -> Option<u64> {
+    let (status_out, at) = call(syscall::INVOKE, window, method::MAP, [slot, 0, 0, 0]);
+    (status_out == status::OK).then_some(at)
+}
+
 /// Publishes what this program found on a machine with no virtio device.
 ///
 /// The report `report` writes describes a virtio driver's rings and counters,
@@ -1719,6 +1971,20 @@ struct X722 {
     /// How many switch elements it reported, which is what says a VSI exists
     /// for frames to be steered to.
     switch_elements: u16,
+    /// The VSI number firmware assigned, which is what indexes its registers.
+    vsi: u16,
+    /// Whether its **LAN** queues came up -- the ones that carry frames, as
+    /// against the admin queues that carry commands.
+    carrying: bool,
+    /// Its station address, once there is a queue to use it with.
+    mac: [u8; 6],
+    /// **How far the bring-up got.**
+    ///
+    /// A driver that stops has stopped *somewhere*, and on a machine that takes
+    /// seven minutes to boot the difference between "it did not come up" and
+    /// "it stopped at the segment descriptor" is a day. `bin/ahcid` keeps the
+    /// same kind of number for the same reason.
+    stage: u8,
 }
 
 impl X722 {
@@ -1727,7 +1993,9 @@ impl X722 {
         let flags = u64::from(self.delegated)
             | u64::from(self.reset) << 1
             | u64::from(self.queues) << 2
-            | u64::from(self.link_up) << 3;
+            | u64::from(self.link_up) << 3
+            | u64::from(self.carrying) << 4
+            | u64::from(self.stage) << 40;
         (
             flags | u64::from(self.link_speed) << 8 | u64::from(self.switch_elements) << 16,
             u64::from(self.firmware.0) | u64::from(self.firmware.1) << 16,
@@ -1741,8 +2009,9 @@ impl X722 {
 /// step: a machine with no such NIC leaves the slots empty, the first attach
 /// fails, and this answers `delegated: false` without touching a register. Every
 /// QEMU lane checks that, because none of them has an X722 and none ever will.
-fn take_x722() -> X722 {
+fn take_x722() -> (X722, Option<X722Queues>) {
     let mut found = X722::default();
+    let mut carrying = None;
 
     // The register pages first, because they are what makes the rest reachable
     // and because their absence is the cheapest thing to discover. Each is
@@ -1750,11 +2019,11 @@ fn take_x722() -> X722 {
     // crate works against that base unchanged.
     for (index, page) in bhaskix_i40e::REGISTER_PAGES.iter().enumerate() {
         if !attach(X722_PAGES + index as u64, X722_AT + page, 1) {
-            return found;
+            return (found, None);
         }
     }
     if !attach(X722_MEMORY, X722_MEMORY_AT, 1) {
-        return found;
+        return (found, None);
     }
     // Where the device will look for its rings. Without a window there is no
     // such number, and a device that cannot be aimed cannot be driven -- the
@@ -1766,7 +2035,7 @@ fn take_x722() -> X722 {
         [X722_MEMORY, 0, 0, 0],
     );
     if mapped != status::OK {
-        return found;
+        return (found, None);
     }
     found.delegated = true;
 
@@ -1798,6 +2067,8 @@ fn take_x722() -> X722 {
         at: X722_MEMORY_AT + bhaskix_i40e::SWITCH_BUFFER_OFFSET,
         bytes: bhaskix_i40e::SWITCH_BUFFER_BYTES as usize,
     };
+    found.stage = 1;
+    let mut seid = 0;
     if let Ok(switch) = device.switch_configuration(
         &mut admin,
         admin_device + bhaskix_i40e::SWITCH_BUFFER_OFFSET,
@@ -1805,8 +2076,59 @@ fn take_x722() -> X722 {
         SPINS,
     ) {
         found.switch_elements = switch.count as u16;
+        // The first VSI in the switch is the one this port's frames land in.
+        for element in switch.elements() {
+            if element.kind_name() == "VSI" {
+                seid = element.seid;
+                break;
+            }
+        }
     }
-    found
+    if seid == 0 {
+        return (found, None);
+    }
+    found.stage = 2;
+
+    // **The number to index registers by is asked of firmware**, not taken from
+    // the switch element: the two disagreed on the SR550, 19 against 12, and
+    // `VSILAN_QBASE` is indexed by the number.
+    let mut vsi_buffer = X722Memory {
+        at: X722_MEMORY_AT + bhaskix_i40e::VSI_BUFFER_OFFSET,
+        bytes: bhaskix_i40e::VSI_BUFFER_BYTES as usize,
+    };
+    let Ok(parameters) = device.vsi_parameters(
+        &mut admin,
+        seid,
+        admin_device + bhaskix_i40e::VSI_BUFFER_OFFSET,
+        &mut vsi_buffer,
+        SPINS,
+    ) else {
+        return (found, None);
+    };
+    found.vsi = parameters.number;
+    found.stage = 3;
+
+    // The memory the queues need, and then the queues.
+    if !attach(X722_HMC, X722_HMC_AT, 1)
+        || !attach(X722_RINGS, X722_RINGS_AT, 1)
+        || !attach(X722_TX, X722_TX_AT, 1)
+    {
+        return (found, None);
+    }
+    found.stage = 4;
+    if let Some(queues) = bring_up_x722(
+        &mut device,
+        &mut admin,
+        admin_device,
+        seid,
+        parameters.number,
+        &mut found.stage,
+    ) {
+        found.carrying = true;
+        found.mac = device.mac_address(device.port_number()).unwrap_or([0; 6]);
+        carrying = Some(queues);
+    }
+    (found, carrying)
 }
 
 /// Leaves the bond's own state where the kernel reads the rest of the report.

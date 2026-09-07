@@ -961,6 +961,39 @@ the distinction is in the table rather than in somebody's head.
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-09-07 (the X722's queues come up in ring 3)
+
+RFC 0075 step 4's driving, moved. `bin/netd` brings the card's LAN queues up with no help from the
+kernel:
+
+    net x722       its LAN queues came up -- private memory, contexts, buffers and
+                   the write-back path, all from ring 3
+
+The reset, the admin queues, the switch walk, the VSI parameters, the LAN private memory, a segment
+descriptor written and read back, page descriptors, a receive queue context, the buffers, the
+promiscuous modes, LLDP stopped, the VSI's queue mapping, the completion write-back path and both
+queues enabled — every one a call into `bhaskix-i40e` from a service holding thirty-seven register
+pages and three memory objects.
+
+**Three faults on the way, each a rule worth keeping.**
+
+`REGISTER_PAGES` did not include the four interrupt registers the write-back path needs, so
+`bin/netd` faulted on the first and died before reporting — which the kernel dutifully called a driver
+that *"left no report"*. **The test that exists to catch exactly this passed**, because its own table
+of registers had not been extended either. A list checked only against the registers somebody
+remembered to list is not checked at all. Both extended, and watched red.
+
+The memory slots were written by hand as 54, 55 and 56, and the register pages start at 20 and grew to
+thirty-seven — so they collided and the install refused. Computed from the page count now.
+
+And the DMA window's `MAP` is the *service's* call: the kernel mapped the memory first, leaving
+nothing for it to do, and the bring-up stopped at the step that asks.
+
+**What is left is the frames.** The queues run and nothing yet moves what arrives into the ring
+`bin/ipd` reads, so the machine has a driver in ring 3 and no stack above it. That, then
+`start_nic_domain` and its plumbing go, and `bhaskix.netd-x722=1` stops being a flag and starts being
+what the machine does.
+
 ### 2026-09-07 (bin/netd drives an X722, from ring 3)
 
 RFC 0075 step 3, half met. The SR550's NIC is driven by a **service** for the first time:

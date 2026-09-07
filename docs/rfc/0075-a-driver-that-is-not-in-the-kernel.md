@@ -222,6 +222,50 @@ report words.
 
 > **Gate:** the kernel's unsafe budget, stated in the manifest, and a green suite.
 
+**The driving is moved, 2026-09-07; the deletion is not.** `bin/netd` brings the
+X722's LAN queues up entirely from ring 3:
+
+    net domain     b1:00.0 8086:37d1 delegated to bin/netd: 37 register page(s) of
+                   0x23ffd000000, its own dma window, and a page for its rings
+    net x722       bin/netd holds it: firmware 3.10, link UP, 1 switch element(s);
+                   reset done, admin queues enabled
+    net x722       its LAN queues came up -- private memory, contexts, buffers and
+                   the write-back path, all from ring 3
+
+That is the reset, the admin queues, the switch walk, the VSI's parameters, the
+LAN private memory, a segment descriptor written and read back, the page
+descriptors, a receive queue context, the buffers, the promiscuous modes, the
+LLDP agent stopped, the VSI's queue mapping, the completion write-back path, and
+both queues enabled — every one of them a call into `bhaskix-i40e` from a
+service holding thirty-seven register pages and three memory objects.
+
+### Three faults on the way, and each is a rule worth keeping
+
+**The register pages are a list, and a list is only as good as what checks it.**
+`report_completions` writes four registers between `0x38000` and `0x3b000`, all
+of them below the lowest page the list held — so `bin/netd` faulted on the first
+and died before it could report anything, which the kernel reported as a driver
+that *"left no report"*. The test that exists to catch exactly this passed,
+because its table of registers had not been extended either. Both are extended
+now, and the test was watched red by removing the pages again.
+
+**A slot number chosen by hand beside a range that grows will one day be inside
+it.** The memory slots were 54, 55 and 56; the pages start at 20 and there are
+thirty-seven of them. They are computed from the page count now.
+
+**And the window's `MAP` is the service's call to make.** The kernel mapped the
+memory through the IOMMU before granting it, which left nothing for `bin/netd`'s
+own `MAP` to do — the bring-up stopped at the step that asks. The virtio rings
+had always been mapped by the service; this now is too.
+
+### What is left
+
+The frames. `bin/netd` drives the queues and does not yet move what arrives into
+the ring `bin/ipd` reads — so the machine has a driver in ring 3 and still no
+stack above it. That, and then `start_nic_domain` and its plumbing go, and the
+handover stops being `bhaskix.netd-x722=1` and starts being what the machine
+does.
+
 ## Alternatives considered
 
 **A service of its own, `bin/i40ed`.** The obvious mirror of `bin/ahcid`, and

@@ -1351,7 +1351,13 @@ impl ReceiveContext {
 /// faults instead of being reachable, which is strictly less authority than the
 /// kernel had when it drove this itself. `page_is_mapped` and the test beside it
 /// are what keep this list and the constants above from drifting apart.
-pub const REGISTER_PAGES: [u64; 34] = [
+pub const REGISTER_PAGES: [u64; 37] = [
+    // The interrupt registers, added when the write-back path was found -- and
+    // added to the test below in the same change, which is the only reason
+    // they are not still missing: `bin/netd` faulted on the first of them and
+    // died before it could report, and a list that is checked only against the
+    // registers somebody remembered to list is not checked at all.
+    0x03_8000, 0x03_a000, 0x03_b000, //
     0x08_0000, 0x09_2000, 0x09_c000, 0x0c_0000, 0x0c_2000, 0x0c_6000, 0x0e_4000, 0x0e_5000,
     0x0e_6000, 0x10_0000, 0x10_1000, 0x10_2000, 0x10_4000, 0x10_5000, 0x10_6000, 0x10_8000,
     0x10_9000, 0x10_a000, 0x10_c000, 0x12_0000, 0x12_1000, 0x12_2000, 0x12_8000, 0x12_9000,
@@ -3135,7 +3141,7 @@ mod tests {
     #[test]
     fn every_register_this_driver_names_is_in_a_page_it_asks_for() {
         // (offset, highest index, stride) -- an unindexed register is (r, 0, 0).
-        let registers: [(u64, u64, u64); 39] = [
+        let registers: [(u64, u64, u64); 43] = [
             (PFGEN_CTRL, 0, 0),
             (PF_ATQBAL, 0, 0),
             (PF_ATQT, 0, 0),
@@ -3167,6 +3173,10 @@ mod tests {
             (GLLAN_TXPRE_QDIS, 11, 4),
             (PFCM_LANCTXDATA, 3, 4),
             (PFCM_LANCTXCTL, 0, 0),
+            (PFINT_ITR0, 2, 0x80),
+            (PFINT_DYN_CTL0, 0, 0),
+            (PFINT_LNKLST0, 0, 0),
+            (QINT_RQCTL, MAX_RECEIVE_QUEUE, 4),
             (PFCM_LANCTXSTAT, 0, 0),
             (PRTPM_SAL, MAX_PORT, 32),
             (PRTPM_SAH, MAX_PORT, 32),

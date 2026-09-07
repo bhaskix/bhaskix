@@ -15816,17 +15816,24 @@ fn foreign_registers(address: bhaskix_arch::pci::Address) -> Option<u64> {
 /// # Errors
 ///
 /// A capability that would not be created or installed.
-fn delegate_x722(
-    realm: domain::DomainId,
-    keeper: domain::DomainId,
-    hhdm: u64,
-) -> Result<bool, &'static str> {
+fn delegate_x722(realm: domain::DomainId, keeper: domain::DomainId) -> Result<bool, &'static str> {
     /// Slot: the DMA window. `bin/netd`'s `X722_WINDOW`.
     const X722_WINDOW: usize = 16;
     /// Slot: the page holding its admin rings and the buffers behind them.
     const X722_MEMORY: usize = 17;
     /// Slot: the first of its register pages.
     const X722_PAGES: usize = 20;
+    /// Slot: the private memory the HMC fetches queue contexts from.
+    ///
+    /// **After the register pages, and computed rather than written down**, for
+    /// the reason `bin/netd`'s matching constant gives: these were 54, 55 and
+    /// 56, which the pages grew to cover the moment the interrupt registers
+    /// joined the list, and the install refused.
+    const X722_HMC: usize = X722_PAGES + bhaskix_i40e::REGISTER_PAGES.len();
+    /// Slot: the receive rings and the buffers behind them.
+    const X722_RINGS: usize = X722_HMC + 1;
+    /// Slot: the transmit ring and the packet buffer it posts from.
+    const X722_TX: usize = X722_HMC + 2;
 
     let Some((address, identity)) = find_foreign_nic() else {
         return Ok(false);
@@ -15889,11 +15896,38 @@ fn delegate_x722(
         return Err("the X722's dma window would not install");
     }
 
+    // **The memory its queues need**, each named to the device through the
+    // window above so `bin/netd` can ask where the device reaches it.
+    //
+    // Three objects rather than one because `shared::MAX_FRAMES` is sixteen and
+    // the private memory alone is that: a page-descriptor page and the fifteen
+    // pages it names, which is what a layout of 384 queue contexts spans.
+    for (slot, pages) in [
+        (X722_HMC, 16u64),
+        // One receive ring and the eight two-kilobyte buffers behind it.
+        (X722_RINGS, 5),
+        // The transmit ring and its packet buffer, which fit one page.
+        (X722_TX, 1),
+    ] {
+        let object = shared::create(keeper, pages * bhaskix_mm::FRAME_SIZE)
+            .map_err(|_| "the X722's queue memory would not be created")?;
+        // **Named to the device by `bin/netd`, not here.** The window's `MAP`
+        // is what turns an object into an address the device can issue, and it
+        // is the service's call to make -- as it already does for the virtio
+        // rings. Mapping it here first left nothing for that call to do, and
+        // the service stopped at the step that asks: measured on the SR550,
+        // where the bring-up reached step 6 and went no further.
+        let named =
+            shared::name(object).map_err(|_| "the X722's queue memory would not be named")?;
+        if domain::with(realm, |owner| owner.cspace.install_at(slot, named).is_ok()) != Some(true) {
+            return Err("the X722's queue memory would not install");
+        }
+    }
+
     // Bus mastering last, and safe only because the device translates -- the
     // same argument every other delegation here makes.
     // SAFETY: this device is the net domain's; nothing else drives it.
     unsafe { bhaskix_arch::pci::enable(address) };
-    let _ = hhdm;
     println!(
         "    net domain     {:02x}:{:02x}.{} {:04x}:{:04x} delegated to bin/netd: {} register \
          page(s) of {:#x}, its own dma window, and a page for its rings",
@@ -16239,7 +16273,7 @@ pub fn start_net_domain(
     // runs a DHCP exchange, and that is not worth trading for a delegation with
     // nothing yet behind it.
     if NETD_TAKES_X722.load(core::sync::atomic::Ordering::Relaxed) {
-        match delegate_x722(realm, keeper, hhdm_base) {
+        match delegate_x722(realm, keeper) {
             Ok(true) | Ok(false) => {}
             Err(why) => println!("\x1b[91m    net domain     the X722 FAILED: {why}\x1b[0m"),
         }
@@ -19402,6 +19436,9 @@ fn report_x722(words: &[u64; 24]) {
     const RESET: u64 = 1 << 1;
     const QUEUES: u64 = 1 << 2;
     const LINK_UP: u64 = 1 << 3;
+    /// Bit 4: its LAN queues came up -- the ones that carry frames, as against
+    /// the admin queues that carry commands.
+    const CARRYING: u64 = 1 << 4;
 
     let state = words[22];
     if state & DELEGATED == 0 {
@@ -19430,6 +19467,16 @@ fn report_x722(words: &[u64; 24]) {
         } else {
             "REFUSED"
         }
+    );
+    println!(
+        "    net x722       its LAN queues {} -- private memory, contexts, buffers and the \
+         write-back path, all from ring 3; it reached step {}",
+        if state & CARRYING != 0 {
+            "\x1b[92mcame up\x1b[0m"
+        } else {
+            "\x1b[93mdid not come up\x1b[0m"
+        },
+        state >> 40 & 0xff
     );
 }
 
