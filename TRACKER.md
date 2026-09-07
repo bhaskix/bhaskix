@@ -961,6 +961,29 @@ the distinction is in the table rather than in somebody's head.
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-09-07 (frames on a real wire, from ring 3)
+
+RFC 0075 step 4's other half. `bin/netd` carries frames between the X722 and `bin/ipd`, and the
+transmit direction is proven end to end:
+
+    net config     interface told to ipd: mac 0x0894ef7afc8e, address 10.0.2.15
+    net after      0 completions seen, 0 handed across, 14 sent back
+
+**Fourteen frames `bin/ipd` built went onto a real wire through a driver in ring 3**, and the service
+above was told the port's own station address to build them with — the first time anything above
+`bin/netd` has had an interface on this machine.
+
+**Receive is written and has not carried a frame**, and that is recorded as unproven rather than
+assumed. The loop walks the descriptors in order, hands a completed one across, gives the buffer back
+and advances the tail; the boot reported none taken. The port carries an LLDP frame about every thirty
+seconds and the report is read early, so "nothing arrived in the window" is the ordinary explanation —
+and it is not the same as proven.
+
+**Nothing is deleted yet, deliberately.** `start_nic_domain` and its nineteen hundred lines still hold
+the kernel's own copy, and `bhaskix.netd-x722=1` is still a flag. Neither should change until a frame
+has been received in ring 3, because the kernel's copy is the only thing on this machine that ever
+has.
+
 ### 2026-09-07 (the X722's queues come up in ring 3)
 
 RFC 0075 step 4's driving, moved. `bin/netd` brings the card's LAN queues up with no help from the

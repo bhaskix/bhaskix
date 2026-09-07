@@ -90,6 +90,12 @@ asm_budget = 3
 # five report words the bond publishes. Nineteen lines for a member, and the
 # alternative was a second driver domain that would have needed its own ring to
 # `bin/ipd` and its own copy of everything above.
+# 339 at RFC 0075 step 4: the frames. Six lines -- the report this loop
+# publishes as the counts move, and the two ring calls that carry a frame each
+# way. Both of those are the *virtio* loop's own unsafe operations, reached
+# through the same helpers, which is why the number moves by six and not by the
+# size of a second driver.
+#
 # 333 at RFC 0075 step 3: the report a machine with no virtio device writes.
 # Six volatile stores, the same six `report` makes -- and they cannot be shared
 # with it, because `report` describes rings and counters that do not exist on a
@@ -105,4 +111,4 @@ asm_budget = 3
 #
 # Every line of it is a volatile access to a mapping this program was granted,
 # which is the operation `bhaskix-i40e` forbids itself so that it lands here.
-unsafe_budget = 333
+unsafe_budget = 339

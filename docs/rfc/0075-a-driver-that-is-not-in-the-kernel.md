@@ -258,13 +258,34 @@ memory through the IOMMU before granting it, which left nothing for `bin/netd`'s
 own `MAP` to do — the bring-up stopped at the step that asks. The virtio rings
 had always been mapped by the service; this now is too.
 
+### The frames, later the same day: out, yes; in, wired and unproven
+
+`bin/netd` carries frames between the X722 and `bin/ipd` now, and the transmit
+direction is proven end to end from ring 3:
+
+    net config     interface told to ipd: mac 0x0894ef7afc8e, address 10.0.2.15
+    net after      0 completions seen, 0 handed across, 14 sent back
+
+**Fourteen frames that `bin/ipd` built went onto a real wire through a driver in
+ring 3**, and the service above was told the port's own station address to build
+them with — the first time anything above `bin/netd` has had an interface on
+this machine.
+
+**Receive is written and has not carried a frame.** The loop walks the
+descriptors in order, hands a completed one to `bin/ipd`, gives the buffer back
+and advances the tail; the boot reported none taken. The port carries an LLDP
+frame about every thirty seconds and the report is read early, so "nothing
+arrived in the window" is the ordinary explanation — and it is not the same as
+proven. Written down as unproven rather than assumed.
+
 ### What is left
 
-The frames. `bin/netd` drives the queues and does not yet move what arrives into
-the ring `bin/ipd` reads — so the machine has a driver in ring 3 and still no
-stack above it. That, and then `start_nic_domain` and its plumbing go, and the
-handover stops being `bhaskix.netd-x722=1` and starts being what the machine
-does.
+The deletion. `start_nic_domain` and its nineteen hundred lines still hold the
+kernel's own copy of this driver, and `bhaskix.netd-x722=1` is still a flag
+rather than what the machine does. **Neither should change until a frame has
+been received in ring 3**, because the kernel's copy is the only thing on this
+machine that has ever received one.
+
 
 ## Alternatives considered
 

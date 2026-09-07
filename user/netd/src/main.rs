@@ -1050,7 +1050,7 @@ unsafe fn read_runs_into(into: *mut u8, runs: (chan::Run, chan::Run)) {
 /// # Safety
 ///
 /// The return ring must be mapped at [`BACK_AT`] and the rings at [`RINGS_AT`].
-unsafe fn take_from_ipd(w: Windows) -> Option<usize> {
+unsafe fn take_from_ipd_into(buffer: u64, header: u64) -> Option<usize> {
     let layout = chan::Layout::for_region(RING_BYTES)?;
     // SAFETY: the ring's header, in the region this program mapped. Volatile
     // because the producer is another domain and takes no lock.
@@ -1073,7 +1073,7 @@ unsafe fn take_from_ipd(w: Windows) -> Option<usize> {
     // A length the *other side* wrote. Bounded before it is used, and refused
     // rather than clamped: a frame that does not fit a buffer is not a shorter
     // frame, it is a producer this program has stopped believing.
-    if length == 0 || length > (ring::RX_BUFFER as usize - VIRTIO_NET_HEADER as usize) {
+    if length == 0 || length > (ring::RX_BUFFER as usize - header as usize) {
         return None;
     }
     // **Where the frame is, from `abi::ring`.** The refusal below used to be
@@ -1083,15 +1083,17 @@ unsafe fn take_from_ipd(w: Windows) -> Option<usize> {
     // it is tested.
     let framed = chan::frame_to_read(layout, cursor, length)?;
 
-    let into = w.rings + ring::TX_BUFFER + VIRTIO_NET_HEADER;
     // SAFETY: the ring is mapped, and the destination is inside a transmit
     // buffer this program mapped writable, bounded by the check above.
     unsafe {
-        // The virtio header this device expects in front of every frame.
-        for offset in 0..VIRTIO_NET_HEADER {
-            core::ptr::write_volatile((w.rings + ring::TX_BUFFER + offset) as *mut u8, 0);
+        // The virtio header this device expects in front of every frame. The
+        // X722 wants none, which is why `header` is a parameter rather than a
+        // constant: the two devices differ in exactly this and in nothing else
+        // about taking a frame from `bin/ipd`.
+        for offset in 0..header {
+            core::ptr::write_volatile((buffer + offset) as *mut u8, 0);
         }
-        read_runs_into(into as *mut u8, framed.payload);
+        read_runs_into((buffer + header) as *mut u8, framed.payload);
         // Outbound, copy two of two: the ring into the transmit buffer.
         copied();
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
@@ -1101,6 +1103,17 @@ unsafe fn take_from_ipd(w: Windows) -> Option<usize> {
         );
     }
     Some(length)
+}
+
+/// Takes a frame `bin/ipd` built into a virtio port's transmit buffer.
+///
+/// # Safety
+///
+/// As [`take_from_ipd_into`], for the buffer inside `w`'s rings.
+unsafe fn take_from_ipd(w: Windows) -> Option<usize> {
+    // SAFETY: the caller's, and the buffer is inside the rings object this
+    // program mapped writable.
+    unsafe { take_from_ipd_into(w.rings + ring::TX_BUFFER, VIRTIO_NET_HEADER) }
 }
 
 /// Looks once, without spinning and without blocking.
@@ -1160,14 +1173,17 @@ extern "C" fn netd_main() -> ! {
         && attach(NOTIFY, NOTIFY_AT, 1)
         && attach(DEVICE, DEVICE_AT, 0);
     if !has_virtio {
-        // Nothing of the virtio path can run. Say so through the report and
-        // then take whatever else was delegated -- which is the whole reason
-        // this program is started on a machine with no virtio device.
-        let (x722, _) = take_x722();
+        // Nothing of the virtio path can run. Take whatever else was delegated
+        // -- which is the whole reason this program is started on a machine
+        // with no virtio device -- and then carry its frames.
+        let (x722, queues) = take_x722();
         let (state, firmware) = x722.words();
-        no_virtio_report(state, firmware);
-        loop {
-            call(syscall::YIELD, 0, 0, [0; 4]);
+        no_virtio_report(state, firmware, x722.address());
+        match queues {
+            Some(queues) => carry_x722(queues, x722),
+            None => loop {
+                call(syscall::YIELD, 0, 0, [0; 4]);
+            },
         }
     }
 
@@ -1925,15 +1941,138 @@ fn map_window(window: u64, slot: u64) -> Option<u64> {
     (status_out == status::OK).then_some(at)
 }
 
+/// Carries frames between the X722 and `bin/ipd`, for ever.
+///
+/// **RFC 0075 step 4's other half.** The queues are up; this is what makes them
+/// a network: what the device writes goes into the ring `bin/ipd` reads, and
+/// what `bin/ipd` builds goes onto the wire.
+///
+/// The shape is the virtio loop's, with the two differences the devices have.
+/// A received frame is found by walking the descriptors for a write-back rather
+/// than by a used ring, and it carries no header in front of it -- so the frame
+/// starts at the buffer rather than twelve bytes into it. A transmitted frame
+/// is posted with the driver's own cursor, which is the one that must not be
+/// recomputed by a caller.
+fn carry_x722(mut queues: X722Queues, found: X722) -> ! {
+    use bhaskix_i40e as i40e;
+    const SPINS: u32 = 2_000_000;
+
+    let mut device = i40e::Device::new(X722Registers);
+    device.attach_transmit_ring(i40e::TRANSMIT_DESCRIPTORS);
+
+    let back_mapped = attach(BACK, BACK_AT, 1);
+    if !attach(RING, RING_AT, 1) {
+        loop {
+            call(syscall::YIELD, 0, 0, [0; 4]);
+        }
+    }
+
+    let (state, firmware) = found.words();
+    let mut handed = 0u64;
+    let mut sent = 0u64;
+    let mut seen = 0u64;
+    // Which descriptor the device will fill next, as this program follows it.
+    let mut next = 0u32;
+    let mut idle = 0u32;
+
+    loop {
+        // **What arrived.** The descriptors are walked in order rather than
+        // scanned, because the device fills them in order and a scan would take
+        // a later frame before an earlier one -- which is a reordering, not a
+        // shortcut.
+        if let Some(completion) = i40e::completed_descriptor(&queues.ring, next) {
+            idle = 0;
+            seen += 1;
+            let length = completion.length as usize;
+            let buffer = queues.buffers.at + u64::from(next) * u64::from(X722_BUFFER);
+            // SAFETY: a buffer this program mapped and the device has finished
+            // with -- the descriptor's write-back is what says so -- and the
+            // ring to `bin/ipd`, mapped writable above.
+            if length > 0 && unsafe { hand_to_ipd(buffer, length) } {
+                handed += 1;
+            }
+            // Back to the device, and the tail after it: a descriptor taken and
+            // not given back is a ring that works once, which this file has
+            // recorded discovering twice.
+            i40e::post_receive_descriptor(
+                &mut queues.ring,
+                next,
+                queues.buffers_device + u64::from(next) * u64::from(X722_BUFFER),
+            );
+            next = (next + 1) % queues.posted;
+            device.arm_receive_queue(queues.queue, next);
+            no_virtio_report_with(state, firmware, found.address(), handed, sent, seen);
+        }
+
+        // **What `bin/ipd` built.** One per pass, and its completion waited for
+        // -- this program is pinned and the transmit ring is eight deep, so a
+        // frame posted and forgotten is a descriptor nobody reclaims.
+        if back_mapped {
+            // SAFETY: the return ring is mapped, and the packet buffer is the
+            // page this program mapped for the transmit ring's use. No header:
+            // an X722 takes the frame as it stands.
+            if let Some(length) = unsafe { take_from_ipd_into(queues.transmit.at + 2048, 0) } {
+                idle = 0;
+                if let Some(slot) = device.post_frame(
+                    &mut queues.transmit,
+                    queues.transmit_device + 2048,
+                    length as u16,
+                    false,
+                ) {
+                    device.transmit_doorbell(queues.transmit_queue, device.transmit_tail());
+                    for _ in 0..SPINS {
+                        if device.frame_completed(&queues.transmit, slot) {
+                            break;
+                        }
+                        core::hint::spin_loop();
+                    }
+                    sent += 1;
+                    no_virtio_report_with(state, firmware, found.address(), handed, sent, seen);
+                }
+            }
+        }
+
+        // **Yield rather than spin.** This program is pinned, and there is no
+        // interrupt delegated for this device -- the completions are reported
+        // through the write-back path and not through a vector -- so there is
+        // nothing to park on and the processor has to be handed back by hand.
+        idle = idle.saturating_add(1);
+        if idle > 64 {
+            idle = 0;
+        }
+        call(syscall::YIELD, 0, 0, [0; 4]);
+    }
+}
+
 /// Publishes what this program found on a machine with no virtio device.
 ///
 /// The report `report` writes describes a virtio driver's rings and counters,
 /// none of which exist here. This writes the marker, the X722's two words, and
 /// zeroes for the rest -- so the kernel reads a report rather than concluding
 /// the service left none, and the X722 line is what says what was found.
-fn no_virtio_report(state: u64, firmware: u64) {
+fn no_virtio_report(state: u64, firmware: u64, address: u64) {
+    no_virtio_report_with(state, firmware, address, 0, 0, 0)
+}
+
+/// The same, with what the frames have done so far.
+fn no_virtio_report_with(
+    state: u64,
+    firmware: u64,
+    address: u64,
+    handed: u64,
+    sent: u64,
+    seen: u64,
+) {
     let mut words = [0u64; REPORT_WORDS];
     words[0] = MARKER;
+    // **Word 1 is the station address**, which is where the kernel reads it to
+    // tell `bin/ipd` what interface it is on. On a machine with a virtio device
+    // that is the virtio port's; here it is the X722's, and without it the
+    // service above holds an unspecified address for the life of the boot.
+    words[1] = address;
+    words[8] = seen;
+    words[9] = handed;
+    words[10] = sent;
     words[22] = state;
     words[23] = firmware;
     let at = RINGS_AT + ring::REPORT;
@@ -1988,6 +2127,15 @@ struct X722 {
 }
 
 impl X722 {
+    /// Its station address as one word, the way the report carries a MAC.
+    fn address(self) -> u64 {
+        let mut value = 0u64;
+        for octet in self.mac {
+            value = (value << 8) | u64::from(octet);
+        }
+        value
+    }
+
     /// Packs what the kernel prints into two words of the report.
     fn words(self) -> (u64, u64) {
         let flags = u64::from(self.delegated)
