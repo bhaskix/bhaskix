@@ -14442,13 +14442,32 @@ impl core::fmt::Display for MacAddress {
 /// agree**: containing one device and driving another is a defect that would
 /// present as hardware misbehaving.
 fn find_foreign_nic() -> Option<(bhaskix_arch::pci::Address, bhaskix_arch::pci::Identity)> {
+    find_foreign_nic_nth(0)
+}
+
+/// The `index`th foreign NIC on the bus, so a machine with four ports can name
+/// four.
+///
+/// **The SR550 has four X722 functions on one card** -- `b1:00.0` through `.3`,
+/// surveyed 2026-08-24 -- and every walk in this file stopped at the first. RFC
+/// 0074 step 1's gate is that the report *lists each NIC as an interface*, and
+/// on the only machine in this project that has more than one it listed one of
+/// four. Naming them is not driving them: [`start_nic_domain`] still takes the
+/// first, because one driver drives one port.
+fn find_foreign_nic_nth(
+    index: usize,
+) -> Option<(bhaskix_arch::pci::Address, bhaskix_arch::pci::Identity)> {
     const INTEL: u16 = 0x8086;
     const X722: u16 = 0x37d1;
+    let mut seen = 0;
     let mut found = None;
     let mut each = |address: bhaskix_arch::pci::Address, identity: bhaskix_arch::pci::Identity| {
         if identity.vendor == INTEL && identity.device == X722 {
-            found = Some((address, identity));
-            return false;
+            if seen == index {
+                found = Some((address, identity));
+                return false;
+            }
+            seen += 1;
         }
         true
     };
@@ -14968,7 +14987,20 @@ pub fn start_net_domain(
         }
     }
     NET_PORTS.store(ports as u64, core::sync::atomic::Ordering::Release);
-    let foreign = find_foreign_nic().is_some();
+    // **And every foreign port, which on the one machine that has any is four.**
+    // Named rather than driven: `start_nic_domain` takes the first, and the
+    // other three are on the bus and counted so that the report describes the
+    // machine rather than the driver.
+    let mut foreign_ports = 0;
+    while let Some((at, identity)) = find_foreign_nic_nth(foreign_ports) {
+        println!(
+            "    net interface  x722 port {foreign_ports}: {:02x}:{:02x}.{} {:04x}:{:04x}, \
+             driven by the kernel itself",
+            at.bus, at.device, at.function, identity.vendor, identity.device
+        );
+        foreign_ports += 1;
+    }
+    let foreign = foreign_ports > 0;
     println!(
         "    net interface  {ports} virtio port(s){} -- a bond may be built over {}",
         if foreign {
@@ -14976,7 +15008,7 @@ pub fn start_net_domain(
         } else {
             ""
         },
-        if ports + usize::from(foreign) > 1 {
+        if ports + foreign_ports > 1 {
             "them"
         } else {
             "nothing yet: one port is not a bond"

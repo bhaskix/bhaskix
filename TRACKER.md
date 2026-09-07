@@ -960,6 +960,38 @@ the distinction is in the table rather than in somebody's head.
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-09-07 (four ports named on the machine that has four)
+
+The SR550, booted with RFC 0074's work on it. **What it settled is step 1's other half.** That step's
+gate says the report lists each NIC as an interface; the QEMU half passed months ago, and the half
+that matters — the machine whose X722 presents four functions on one card — listed *one*, because
+every walk in the kernel stopped at the first match. It lists all four now, read off the machine over
+serial:
+
+    net interface  x722 port 0: b1:00.0 8086:37d1, driven by the kernel itself
+    net interface  x722 port 1: b1:00.1 8086:37d1, driven by the kernel itself
+    net interface  x722 port 2: b1:00.2 8086:37d1, driven by the kernel itself
+    net interface  x722 port 3: b1:00.3 8086:37d1, driven by the kernel itself
+    net interface  0 virtio port(s), and an X722 this kernel drives itself -- a bond may be built over them
+    net domain     no device on the bus; nothing delegated
+
+**Named is not driven, and the last line is the honest half.** `start_nic_domain` still takes the
+first function; naming a port costs a walk of the bus, driving one costs a domain, a window, rings and
+a vector.
+
+**Steps 4 and 5 cannot run on this machine at all**, and the reason is structural rather than a
+shortfall: both need `bin/netd`, which drives *virtio* devices, and this machine has none. The only
+multi-port machine in the project and the only driver that can bond are on opposite sides of a device
+class. Closing that means teaching `bin/netd` the X722, or moving `kernel/src/i40e.rs` out of the
+kernel into a domain that could be a member — the second agrees with RFC 0018 and with every other
+driver here, and it is an RFC nobody has written.
+
+The rest of the boot was clean and is worth stating because it is a regression check: four VT-d units
+programmed, 16 CPUs of 16, the shell reached, and **one** `FAILED` in the whole report — RFC 0072's
+`nic rx frame`, which is the receive path this machine has never completed and which nothing in this
+change touches. The machine was found powered off and was returned powered off, image unmounted, the
+one-time boot override self-cleared.
+
 ### 2026-09-07 (a bond with the cable pulled out of it)
 
 RFC 0074 step 4, **met**, and with it every step of that RFC. `make test-bond` boots the two-port

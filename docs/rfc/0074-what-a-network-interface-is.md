@@ -166,6 +166,42 @@ address on the VLAN, and the existing network gates running over it.
 > **Gate:** the UDP, TCP, IPv6 and DHCP gates pass with the stack sitting on a
 > VLAN over a bond rather than on a device.
 
+## Step 1, on the machine that actually has four ports (2026-09-07)
+
+Step 1's gate has two halves, and only one of them had ever run. The QEMU half —
+a lane given two NICs lists two — passed. The other half is the SR550, whose
+X722 presents **four functions on one card**, and there the report listed one of
+them, because every walk in the kernel stopped at the first match.
+
+It lists all four now, read off the machine over serial:
+
+    net interface  x722 port 0: b1:00.0 8086:37d1, driven by the kernel itself
+    net interface  x722 port 1: b1:00.1 8086:37d1, driven by the kernel itself
+    net interface  x722 port 2: b1:00.2 8086:37d1, driven by the kernel itself
+    net interface  x722 port 3: b1:00.3 8086:37d1, driven by the kernel itself
+    net interface  0 virtio port(s), and an X722 this kernel drives itself -- a bond may be built over them
+    net domain     no device on the bus; nothing delegated
+
+**Named is not driven**, and the last line is the honest half of it. Naming a
+port costs a walk of the bus; driving one costs a domain, a window, rings and a
+vector, and `start_nic_domain` still takes the first function only. The four
+ports are on the bus, counted, and reported so that the machine is described
+rather than the driver.
+
+### What the SR550 cannot test, and why that is structural
+
+**Steps 4 and 5 do not run there at all.** Both need `bin/netd`, which drives
+*virtio* devices; this machine has none, so the line above reads `no device on
+the bus` and the bond has nothing to be built from. That is not a gap in the
+bond — it is that the only multi-port machine in this project and the only
+driver that can bond are on different sides of a device class.
+
+Closing it means one of two things, neither of them this RFC's: teaching
+`bin/netd` the X722 (a second driver in a service written for virtio), or moving
+`kernel/src/i40e.rs` out of the kernel into a domain that could be a member. The
+second is the one that agrees with [RFC 0018](0018-networking.md) and with every
+other driver in this tree, and it is the RFC that has not been written.
+
 ## Step 4, met 2026-09-07 — a member taken away underneath a bond
 
 **The gate is met.** `make test-bond` boots the two-port machine, reaches in
