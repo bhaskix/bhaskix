@@ -92,46 +92,69 @@ const HANDLER_1: u64 = 15;
 /// the capability space rather than told in a word somewhere, the same way the
 /// second virtio port is found.
 ///
-/// Its register pages start at [`X722_PAGES`] and run for one slot per entry in
-/// `i40e::REGISTER_PAGES`. **Thirty-four of them, not one**, because a virtio
+/// Its register pages start at this port's `grant::PAGES` and run for one slot
+/// per entry in `i40e::REGISTER_PAGES`. **Thirty-seven of them, not one**,
+/// because a virtio
 /// device's registers are a page and this device's are four megabytes: the
 /// whole BAR cannot be a capability and should not be, so the crate names the
 /// pages that hold a register it uses and the kernel grants exactly those. See
 /// `i40e::REGISTER_PAGES`.
-const X722_WINDOW: u64 = 16;
-/// Slot: the page holding its admin rings and the buffers behind them.
-const X722_MEMORY: u64 = 17;
-/// Slot: the first of its register pages.
-const X722_PAGES: u64 = 20;
-/// Slot: the private-memory pages the HMC fetches queue contexts from.
-///
-/// **After the register pages, and computed rather than written down.** They
-/// were 54, 55 and 56 -- inside the range the pages occupy once the interrupt
-/// registers joined the list, so the kernel's install refused and the service
-/// got a device it could not give memory to. A number chosen by hand beside a
-/// range that grows is a number that will one day be inside it.
-const X722_HMC: u64 = X722_PAGES + bhaskix_i40e::REGISTER_PAGES.len() as u64;
-/// Slot: the receive rings and the buffers behind them.
-const X722_RINGS: u64 = X722_HMC + 1;
-/// Slot: the transmit ring and the one packet buffer it posts from.
-const X722_TX: u64 = X722_HMC + 2;
+const X722_FIRST_SLOT: u64 = 16;
 
-/// Where the X722's registers are mapped: page `P` of its BAR at `X722_AT + P`.
+/// How many X722 ports this program will drive.
+///
+/// **Two, and the capability space is what decides it** -- RFC 0076. A port
+/// costs `grant::SPAN` slots, which is 42, against 128 with the first sixteen
+/// spoken for: two fit, three do not, and a bond needs exactly two. The kernel
+/// holds the matching constant and `bhaskix_i40e::grant`'s own test is what
+/// says the number is right.
+const X722_MEMBERS: usize = 2;
+
+/// Slot `offset` of port `nth`'s grant.
+///
+/// **The layout is `bhaskix_i40e::grant`'s**, not this file's and not the
+/// kernel's. Both used to spell it out, which is two copies of one arithmetic
+/// that had to agree with no way to check that they did -- and slots 54, 55 and
+/// 56 sitting inside a register range that had grown past them is what that
+/// cost. RFC 0076 moved it into the crate both sides already link.
+const fn x722_slot(nth: u64, offset: u64) -> u64 {
+    bhaskix_i40e::grant::base(X722_FIRST_SLOT, nth) + offset
+}
+
+/// How far apart two ports' mappings are laid out.
+///
+/// A quarter of a gigabyte, against a register window of under four megabytes
+/// and four memory objects behind it. Generous on purpose: these are addresses
+/// in this program's own space, they cost nothing unmapped, and a stride that
+/// is obviously clear of the thing it separates cannot be quietly outgrown.
+const X722_STRIDE: u64 = 0x1000_0000;
+
+/// Where port `nth`'s registers are mapped: page `P` of its BAR at `+ P`.
 ///
 /// Sparse — only the pages granted are mapped — and at their own offsets, so
 /// every register offset in `bhaskix-i40e` works against this base unchanged.
 /// A register in a page nobody granted faults instead of being reachable, which
 /// is the whole point of naming pages.
-const X722_AT: u64 = 0x3000_0000;
+const fn x722_at(nth: u64) -> u64 {
+    0x3000_0000 + nth * X722_STRIDE
+}
 /// And where its admin page goes, clear of the register window's four megabytes.
-const X722_MEMORY_AT: u64 = 0x3400_0000;
+const fn x722_memory_at(nth: u64) -> u64 {
+    x722_at(nth) + 0x0400_0000
+}
 /// The private memory the HMC reads: a page-descriptor page and the pages it
 /// names.
-const X722_HMC_AT: u64 = 0x3410_0000;
+const fn x722_hmc_at(nth: u64) -> u64 {
+    x722_at(nth) + 0x0410_0000
+}
 /// The receive rings, and the packet buffers behind them.
-const X722_RINGS_AT: u64 = 0x3420_0000;
+const fn x722_rings_at(nth: u64) -> u64 {
+    x722_at(nth) + 0x0420_0000
+}
 /// The transmit ring and its packet buffer.
-const X722_TX_AT: u64 = 0x3430_0000;
+const fn x722_tx_at(nth: u64) -> u64 {
+    x722_at(nth) + 0x0430_0000
+}
 
 /// How many receive queues this driver takes on the X722.
 ///
@@ -172,25 +195,34 @@ const BACK_AT: u64 = 0x2030_0000;
 /// belongs: `bhaskix-i40e` forbids `unsafe` entirely and asks its holder for
 /// reads and writes, and this is that holder. The kernel had the identical
 /// three functions while it drove the device itself.
-struct X722Registers;
+struct X722Registers {
+    /// Where this port's register pages were mapped.
+    ///
+    /// **This was a unit struct with the address welded into all three
+    /// methods**, which is what a program driving one device writes. RFC 0076
+    /// needs two, and this field is the whole of what stood in the way:
+    /// `X722Memory` already carried its own address, and `bring_up_x722`
+    /// already took the device and its memory as parameters.
+    at: u64,
+}
 
 impl bhaskix_i40e::Registers for X722Registers {
     fn read(&self, offset: u64) -> u32 {
         // SAFETY: the register pages this program attached at their own offsets
-        // from `X722_AT`. An offset in a page nobody granted is not mapped and
+        // from `self.at`. An offset in a page nobody granted is not mapped and
         // faults, which is the containment working rather than a hazard.
-        unsafe { read32(X722_AT + offset) }
+        unsafe { read32(self.at + offset) }
     }
 
     fn write(&mut self, offset: u64, value: u32) {
         // SAFETY: as `read`.
-        unsafe { write32(X722_AT + offset, value) };
+        unsafe { write32(self.at + offset, value) };
     }
 
     fn read64(&self, offset: u64) -> u64 {
         // SAFETY: as `read`; every offset read this way is a documented 64-bit
         // register pair, 8-byte aligned by its own stride.
-        unsafe { read64(X722_AT + offset) }
+        unsafe { read64(self.at + offset) }
     }
 }
 
@@ -327,6 +359,17 @@ mod ring {
     // already enforces and which the specification requires anyway.
     /// Where this program leaves its findings for the kernel.
     pub const REPORT: u64 = 0x7000;
+
+    /// Word in the report page the **kernel writes and this program reads**.
+    ///
+    /// **The one place the page runs the other way**, and it is worth naming
+    /// rather than hiding: everything else here is `bin/netd` describing itself
+    /// to the kernel. RFC 0076 step 3 needs the opposite -- a boot has to be
+    /// able to ask for a failover, and on real hardware there is no hypervisor
+    /// monitor to ask through. It is one word, well clear of the report's
+    /// twenty-six, and non-zero means *take the active member's link down once
+    /// traffic has proven it works*.
+    pub const FAILOVER_REQUEST: u64 = REPORT + 40 * 8;
 }
 
 /// Offsets into the common configuration structure, from the specification.
@@ -824,16 +867,36 @@ fn post_receive_buffers(receive: &mut Virtqueue<Volatile>, w: Windows) {
 ///
 /// The port's rings must be mapped writable at `w.rings`.
 unsafe fn fill_transmit(w: Windows, mac: [u8; 6]) -> u64 {
-    const FRAME: u64 = 42;
-    let at = w.rings + ring::TX_BUFFER;
+    // SAFETY: the caller's obligation, unchanged.
+    unsafe { fill_announcement(w.rings + ring::TX_BUFFER, VIRTIO_NET_HEADER, mac) }
+}
 
-    // SAFETY: the caller guarantees the mapping; `VIRTIO_NET_HEADER + FRAME` is
-    // far inside one page.
+/// The same frame, at a raw address and with `header` bytes in front of it.
+///
+/// **Both bonds announce with this** -- RFC 0076 step 3. The X722 bond had no
+/// frame of its own and forwarded only what `bin/ipd` built, so when it failed
+/// over there was nothing to send and the report could say only that nothing
+/// had crossed. That is not evidence about the switch; it is evidence that
+/// nothing was tried, and RFC 0074's own note said what was needed: *"a switch
+/// learns which port an address is on from the frames it sees, and after a
+/// failover everything it learned is wrong"*.
+///
+/// `header` is the virtio header a virtio device expects in front of the frame,
+/// and zero for an X722, which takes the frame as it stands.
+///
+/// # Safety
+///
+/// `at` must be a writable mapping of at least `header + 42` bytes.
+unsafe fn fill_announcement(at: u64, header: u64, mac: [u8; 6]) -> u64 {
+    const FRAME: u64 = 42;
+
+    // SAFETY: the caller guarantees the mapping; `header + FRAME` is far inside
+    // one page.
     unsafe {
-        for offset in 0..VIRTIO_NET_HEADER + FRAME {
+        for offset in 0..header + FRAME {
             core::ptr::write_volatile((at + offset) as *mut u8, 0);
         }
-        let frame = at + VIRTIO_NET_HEADER;
+        let frame = at + header;
         let put = |offset: u64, byte: u8| {
             core::ptr::write_volatile((frame + offset) as *mut u8, byte);
         };
@@ -862,7 +925,7 @@ unsafe fn fill_transmit(w: Windows, mac: [u8; 6]) -> u64 {
             put(12 + index as u64, *byte);
         }
     }
-    VIRTIO_NET_HEADER + FRAME
+    header + FRAME
 }
 
 /// Whether the device says its link is up.
@@ -1176,14 +1239,51 @@ extern "C" fn netd_main() -> ! {
         // Nothing of the virtio path can run. Take whatever else was delegated
         // -- which is the whole reason this program is started on a machine
         // with no virtio device -- and then carry its frames.
-        let (x722, queues) = take_x722();
-        let (state, firmware) = x722.words();
-        no_virtio_report(state, firmware, x722.address());
-        match queues {
-            Some(queues) => carry_x722(queues, x722),
-            None => loop {
-                call(syscall::YIELD, 0, 0, [0; 4]);
-            },
+        //
+        // **Both ports, RFC 0076 step 1.** A bond needs two members and this
+        // program was given one, so on the only machine in the project with
+        // real ports the bond RFC 0074 built had nothing to select between.
+        // The second is taken exactly as the first is -- by asking the
+        // capability space whether it is there -- so a machine with one port
+        // gets `delegated: false` for the second and says so.
+        let mut found = [X722::default(); X722_MEMBERS];
+        let mut members: [Option<X722Member>; X722_MEMBERS] = [None, None];
+        for nth in 0..X722_MEMBERS {
+            let (taken, member) = take_x722(nth as u64);
+            found[nth] = taken;
+            // **Both members are kept now** -- RFC 0076 step 2. Step 1 drove
+            // the first and measured the second; a bond has to be able to
+            // choose, so each one's device, rings and admin queue survive the
+            // bring-up that produced them.
+            members[nth] = member;
+            // **Publish after every port, not after all of them.** Bringing up
+            // a second device is a second chance to die, and this program's
+            // report is the only thing that says what happened -- so a port
+            // that faults must not take the previous port's findings with it.
+            //
+            // It did. The second boot of RFC 0076 step 1 published nothing at
+            // all and the machine reported *"the driver left no report"*, which
+            // named neither the port that had come up perfectly nor the one
+            // that had not. RFC 0075 step 3 learned the same lesson one level
+            // out -- a NIC is not required to run, being able to report is --
+            // and this is that rule applied between two ports rather than
+            // between a device and none.
+            let (state, firmware) = found[0].words();
+            no_virtio_report_with(
+                state,
+                firmware,
+                found[0].address(),
+                0,
+                0,
+                0,
+                found[X722_MEMBERS - 1].pair(),
+            );
+        }
+        if members.iter().any(Option::is_some) {
+            carry_x722(members, found);
+        }
+        loop {
+            call(syscall::YIELD, 0, 0, [0; 4]);
         }
     }
 
@@ -1406,7 +1506,7 @@ extern "C" fn netd_main() -> ! {
     // **The X722, if the kernel delegated one** -- RFC 0075 step 2. Taken once,
     // here, because a device is brought up once and because the answer on every
     // machine that has none is the same answer every time: there is none.
-    let (x722, x722_queues) = take_x722();
+    let (x722, x722_queues) = take_x722(0);
     // Wired into the loop at the next step; held now so the bring-up above is
     // not doing work nothing keeps.
     let _ = &x722_queues;
@@ -1501,33 +1601,30 @@ extern "C" fn netd_main() -> ! {
             port.up = link_up(port.at, port.reports_link);
         }
         // The member carrying traffic has stopped being able to: select
-        // another, if there is one that can. If there is not, the bond keeps
-        // the member it has -- a down member and a bond with no members are the
-        // same amount of traffic, and staying put means the link coming back
-        // needs no second decision.
-        if !ports[active].as_ref().is_some_and(|port| port.up) {
-            for (index, port) in ports.iter().enumerate() {
-                if index != active && port.as_ref().is_some_and(|port| port.up) {
-                    active = index;
-                    failovers += 1;
-                    // **Announce on the member that has taken over.** A switch
-                    // learns which port an address is on from the frames it
-                    // sees, and after a failover everything it learned is
-                    // wrong: it goes on sending this station's traffic to a
-                    // port that has gone away, until something arrives from the
-                    // new one. Linux's bonding sends gratuitous ARP here for
-                    // this reason; this driver has one frame it knows how to
-                    // send, so it sends that.
-                    //
-                    // It is also what makes "traffic continues" measurable
-                    // rather than hoped for: the answer comes back on the new
-                    // member and crosses to `bin/ipd`, so the report can say a
-                    // frame arrived *after* the failover rather than that
-                    // nothing has gone wrong yet.
-                    probes = 0;
-                    break;
-                }
-            }
+        // another, if there is one that can. **The rule lives in [`select`]**
+        // -- RFC 0076 step 2 -- because the X722 bond makes the same decision
+        // and two copies of it would drift.
+        let up = [
+            ports[0].as_ref().is_some_and(|port| port.up),
+            ports[1].as_ref().is_some_and(|port| port.up),
+        ];
+        let chosen = select(active, &up);
+        if chosen != active {
+            active = chosen;
+            failovers += 1;
+            // **Announce on the member that has taken over.** A switch learns
+            // which port an address is on from the frames it sees, and after a
+            // failover everything it learned is wrong: it goes on sending this
+            // station's traffic to a port that has gone away, until something
+            // arrives from the new one. Linux's bonding sends gratuitous ARP
+            // here for this reason; this driver has one frame it knows how to
+            // send, so it sends that.
+            //
+            // It is also what makes "traffic continues" measurable rather than
+            // hoped for: the answer comes back on the new member and crosses to
+            // `bin/ipd`, so the report can say a frame arrived *after* the
+            // failover rather than that nothing has gone wrong yet.
+            probes = 0;
         }
 
         // **One transmit outstanding at a time.** A descriptor handed to the
@@ -1723,7 +1820,7 @@ fn receive_seen(ports: &[Option<Port>; 2]) -> u16 {
 /// kernel reads exactly this many. Named because three places write it and a
 /// length spelled three times is wrong in at least one of them -- which this
 /// file has recorded happening twice.
-const REPORT_WORDS: usize = 24;
+const REPORT_WORDS: usize = 28;
 
 /// Everything the X722 needs to carry a frame, once it is up.
 ///
@@ -1756,6 +1853,56 @@ struct X722Queues {
     posted: u32,
 }
 
+/// Which member of a bond should carry, given which one does now.
+///
+/// **The rule, and there is only one of it.** RFC 0076 step 2: the virtio bond
+/// and the X722 bond make the same three decisions, and two loops with the same
+/// logic written twice would drift. This is that logic, called by both.
+///
+/// * The member carrying traffic keeps it while its link is up.
+/// * When it is not, the first other member that is up takes over.
+/// * A member whose link comes back does **not** take it back. That is churn
+///   and reordering for no gain -- RFC 0074's rule, unchanged.
+/// * With nothing up, the bond stays where it is: a down member and no member
+///   carry the same amount of traffic, and staying put means the link returning
+///   needs no second decision.
+///
+/// **This has no host test and cannot have one**: `bin/netd` is its own
+/// workspace, outside `cargo test --workspace`, which is what
+/// `tools/check-deps.py` says about anything written here. What it has instead
+/// is `make test-bond`, which boots two guests, drops the active member's link
+/// and watches traffic move -- watched red when it was written. Sharing one
+/// implementation is what makes that lane cover the X722 path too.
+fn select(active: usize, up: &[bool]) -> usize {
+    if up.get(active).copied().unwrap_or(false) {
+        return active;
+    }
+    for (index, live) in up.iter().enumerate() {
+        if index != active && *live {
+            return index;
+        }
+    }
+    active
+}
+
+/// How far a bring-up got, and the two numbers behind a refusal.
+///
+/// **One argument rather than two**, because `bring_up_x722` had eight and the
+/// limit is seven -- and because these belong together anyway: they are the
+/// whole of what a bring-up reports about itself when it does not finish.
+struct Progress {
+    /// **How far the bring-up got.**
+    ///
+    /// A driver that stops has stopped *somewhere*, and on a machine that takes
+    /// seven minutes to boot the difference between "it did not come up" and
+    /// "it stopped at the segment descriptor" is a day. `bin/ahcid` keeps the
+    /// same kind of number for the same reason.
+    stage: u8,
+    /// The backing pages the layout wanted and the page its context fell in --
+    /// the two `grant::HMC_PAGES` is checked against.
+    layout: (u8, u8),
+}
+
 /// Brings the X722's queues up: private memory, contexts, buffers, filters and
 /// the write-back path.
 ///
@@ -1774,17 +1921,37 @@ fn bring_up_x722(
     admin_device: u64,
     vsi: u16,
     vsi_number: u16,
-    stage: &mut u8,
+    progress: &mut Progress,
+    nth: u64,
 ) -> Option<X722Queues> {
     use bhaskix_i40e as i40e;
+    use bhaskix_i40e::grant;
     const SPINS: u32 = 2_000_000;
 
     // The queues this PF owns, and where the VSI's start.
-    let (first, queues) = device.queue_allocation()?;
-    *stage = 5;
+    //
+    // **The index is the queue's number in the PF's own space, not the
+    // device's**, and that distinction is invisible on the first function of a
+    // card because its `FIRSTQ` is zero. RFC 0076 step 1's second boot is where
+    // it stopped being invisible: `bin/netd` took a page fault at
+    // `0x4411c000` bringing up `b1:00.1`, which is page 28 of a sixteen-page
+    // object, because the context was located by an index that had `FIRSTQ`
+    // added to it.
+    //
+    // C620 §38.30.3.4.2 says it three times for the three places it matters --
+    // *"'n' is the queue index within the PF space"* for `QRX_TAIL[n]` and for
+    // `QRX_ENA[n]`, and *"prepare the queue context in the FPM in the PF memory
+    // space"*. Each function has a BAR of its own (`0x23ffd000000` and
+    // `0x23ffc000000` on this machine), so a queue register named `Q=0...1535`
+    // globally is still reached PF-relative through that window.
+    //
+    // `FIRSTQ` itself is not needed once the index is PF-relative -- it is the
+    // thing that must *not* be added -- so it is read and discarded.
+    let (_first, queue_count) = device.queue_allocation()?;
+    progress.stage = 5;
     let (base, _scattered) = device.vsi_queue_base(vsi_number)?;
-    let queue = u32::from(first) + u32::from(base);
-    *stage = 6;
+    let queue = u32::from(base);
+    progress.stage = 6;
 
     // **Out of PXE mode first** -- 38.30.2.1's "operating system driver only
     // step", and the queue-length rule depends on it.
@@ -1792,17 +1959,45 @@ fn bring_up_x722(
 
     // The private memory the HMC fetches contexts from, sized to the queues
     // this function owns rather than to the one it takes.
-    let memory = device.program_lan_private_memory(u32::from(queues));
-    let receive_base = i40e::receive_base_after(0, u32::from(queues), memory.tx_object_size);
+    let memory = device.program_lan_private_memory(u32::from(queue_count));
+    let receive_base = i40e::receive_base_after(0, u32::from(queue_count), memory.tx_object_size);
     let at = i40e::context_location(receive_base, memory.rx_object_size, queue);
-    let end = i40e::object_area_end(receive_base, u32::from(queues), memory.rx_object_size);
+    let end = i40e::object_area_end(receive_base, u32::from(queue_count), memory.rx_object_size);
     let backing = i40e::backing_pages_to(end);
 
+    // **The layout has to fit the memory that was granted, and if it does not
+    // this refuses rather than writing past it.**
+    //
+    // The boot that made this necessary wrote to page 28 of a sixteen-page
+    // object and took a page fault, which killed `bin/netd` before it could
+    // report anything at all -- so the machine said "the driver left no report"
+    // and named neither the port that worked nor the one that did not. The
+    // index that produced 28 is fixed above; this is what makes the *class* of
+    // that bug a refusal with a step number instead of a dead service.
+    //
+    // `X722Memory` bounds every access, but it cannot help here: the context
+    // window's *base* is `at.page` pages in, so a page past the grant is
+    // outside the mapping before the first offset is checked.
+    //
+    // **The two numbers are reported, not just the refusal.** A boot that says
+    // "step 6" says a layout did not fit and nothing about why -- and the
+    // difference between "this PF wants more backing pages than any PF gets"
+    // and "this PF's context sits further into its private memory than the
+    // grant reaches" is the difference between raising `HMC_PAGES` and finding
+    // out why one function's queue base is not the other's.
+    progress.layout = (backing.min(255) as u8, at.page.min(255) as u8);
+    // The page-descriptor page, then the pages it names -- and the context has
+    // to land inside them.
+    let pages = u64::from(backing) + 1;
+    if pages > grant::HMC_PAGES || u64::from(at.page) + 1 > grant::HMC_PAGES {
+        return None;
+    }
+
     // The HMC object: a page-descriptor page, then the pages it names.
-    let hmc_device = map_window(X722_WINDOW, X722_HMC)?;
-    *stage = 7;
+    let hmc_device = map_window(x722_slot(nth, grant::WINDOW), x722_slot(nth, grant::HMC))?;
+    progress.stage = 7;
     let mut hmc = X722Memory {
-        at: X722_HMC_AT,
+        at: x722_hmc_at(nth),
         bytes: (1 + backing as usize) * 4096,
     };
     let pd_page_device = hmc_device;
@@ -1812,7 +2007,7 @@ fn bring_up_x722(
     if read_back != i40e::segment_descriptor(pd_page_device, backing) {
         return None;
     }
-    *stage = 8;
+    progress.stage = 8;
     // The page the context falls in, named to the device.
     i40e::write_page_descriptor(
         &mut hmc,
@@ -1821,16 +2016,16 @@ fn bring_up_x722(
     );
 
     // The rings and the buffers behind them.
-    let rings_device = map_window(X722_WINDOW, X722_RINGS)?;
-    *stage = 9;
+    let rings_device = map_window(x722_slot(nth, grant::WINDOW), x722_slot(nth, grant::RINGS))?;
+    progress.stage = 9;
     let ring_bytes = X722_DESCRIPTORS as usize * i40e::RECEIVE_DESCRIPTOR_BYTES as usize;
     let buffers_at = 4096;
     let mut ring = X722Memory {
-        at: X722_RINGS_AT,
+        at: x722_rings_at(nth),
         bytes: ring_bytes,
     };
     let buffers = X722Memory {
-        at: X722_RINGS_AT + buffers_at,
+        at: x722_rings_at(nth) + buffers_at,
         bytes: X722_POSTED as usize * X722_BUFFER as usize,
     };
     let buffers_device = rings_device + buffers_at;
@@ -1843,7 +2038,7 @@ fn bring_up_x722(
         max_frame: X722_BUFFER,
     };
     let mut backing_page = X722Memory {
-        at: X722_HMC_AT + 4096 + u64::from(at.page) * 4096,
+        at: x722_hmc_at(nth) + 4096 + u64::from(at.page) * 4096,
         bytes: 4096,
     };
     i40e::write_receive_context(&mut backing_page, at.offset as usize, &context);
@@ -1872,7 +2067,7 @@ fn bring_up_x722(
     // to an interrupt that reports and never raises -- without which the frames
     // arrive and nothing is ever posted back to say so.
     let mut vsi_buffer = X722Memory {
-        at: X722_MEMORY_AT + i40e::VSI_BUFFER_OFFSET,
+        at: x722_memory_at(nth) + i40e::VSI_BUFFER_OFFSET,
         bytes: i40e::VSI_BUFFER_BYTES as usize,
     };
     let _ = device.map_receive_queues(
@@ -1885,16 +2080,16 @@ fn bring_up_x722(
     );
     device.report_completions(queue, X722_QUEUES);
 
-    *stage = 10;
+    progress.stage = 10;
     if !device.enable_receive_queue(queue, X722_POSTED, SPINS) {
         return None;
     }
-    *stage = 11;
+    progress.stage = 11;
     device.arm_receive_queue(queue, X722_POSTED);
 
     // And the transmit side: its context in the same page, then the queue.
-    let transmit_device = map_window(X722_WINDOW, X722_TX)?;
-    *stage = 12;
+    let transmit_device = map_window(x722_slot(nth, grant::WINDOW), x722_slot(nth, grant::TX))?;
+    progress.stage = 12;
     let transmit_at = i40e::context_location(0, memory.tx_object_size, queue);
     i40e::write_page_descriptor(
         &mut hmc,
@@ -1902,7 +2097,7 @@ fn bring_up_x722(
         backing_device + u64::from(transmit_at.page) * 4096,
     );
     let mut transmit_backing = X722Memory {
-        at: X722_HMC_AT + 4096 + u64::from(transmit_at.page) * 4096,
+        at: x722_hmc_at(nth) + 4096 + u64::from(transmit_at.page) * 4096,
         bytes: 4096,
     };
     i40e::write_transmit_context(
@@ -1925,7 +2120,7 @@ fn bring_up_x722(
         buffers,
         buffers_device,
         transmit: X722Memory {
-            at: X722_TX_AT,
+            at: x722_tx_at(nth),
             bytes: 4096,
         },
         transmit_device,
@@ -1941,6 +2136,30 @@ fn map_window(window: u64, slot: u64) -> Option<u64> {
     (status_out == status::OK).then_some(at)
 }
 
+/// One X722 port the bond can select, and everything needed to drive it.
+///
+/// **`take_x722` built these one at a time and threw all but the queues
+/// away** -- which was right while one port carried frames. RFC 0076 step 2
+/// needs both, so each member keeps what its own bring-up produced: the
+/// registers it is reached through, the admin ring a link poll goes down, and
+/// where its receive walk had got to.
+struct X722Member {
+    device: bhaskix_i40e::Device<X722Registers>,
+    queues: X722Queues,
+    /// Its admin ring, for asking firmware about its link.
+    ///
+    /// **A member keeps its own.** `Get Link Status` is a command, not a
+    /// register read, so a bond that polls two links needs two rings to poll
+    /// down -- and they must be the rings each port's admin queues were
+    /// enabled with, not a shared one.
+    admin: X722Memory,
+    /// Which receive descriptor this program will look at next. **Per member**,
+    /// because two rings do not advance together.
+    next: u32,
+    /// What its link was, last time it was asked.
+    up: bool,
+}
+
 /// Carries frames between the X722 and `bin/ipd`, for ever.
 ///
 /// **RFC 0075 step 4's other half.** The queues are up; this is what makes them
@@ -1953,12 +2172,31 @@ fn map_window(window: u64, slot: u64) -> Option<u64> {
 /// starts at the buffer rather than twelve bytes into it. A transmitted frame
 /// is posted with the driver's own cursor, which is the one that must not be
 /// recomputed by a caller.
-fn carry_x722(mut queues: X722Queues, found: X722) -> ! {
+fn carry_x722(mut members: [Option<X722Member>; X722_MEMBERS], facts: [X722; X722_MEMBERS]) -> ! {
     use bhaskix_i40e as i40e;
     const SPINS: u32 = 2_000_000;
+    /// Announcements sent in one burst, on start and after each failover.
+    const PROBES: u32 = 8;
+    /// Passes to wait before putting a downed link back up.
+    ///
+    /// Long enough that the report's patience window sees the bond on the
+    /// backup and traffic crossing there; short enough that the port is up
+    /// again well before the boot ends.
+    const RESTORE_AFTER: u32 = 20_000;
+    /// Passes between link polls.
+    ///
+    /// **A link poll is an admin-queue round trip**, not a register read as it
+    /// is for virtio -- `Get Link Status` posts a descriptor and waits for
+    /// firmware. Doing that every pass would spend the loop on it, so it is
+    /// counted out. Small enough that a failover is noticed in well under a
+    /// second at this loop's rate, large enough that the cost disappears.
+    const LINK_EVERY: u32 = 512;
 
-    let mut device = i40e::Device::new(X722Registers);
-    device.attach_transmit_ring(i40e::TRANSMIT_DESCRIPTORS);
+    for member in members.iter_mut().flatten() {
+        member
+            .device
+            .attach_transmit_ring(i40e::TRANSMIT_DESCRIPTORS);
+    }
 
     let back_mapped = attach(BACK, BACK_AT, 1);
     if !attach(RING, RING_AT, 1) {
@@ -1967,70 +2205,231 @@ fn carry_x722(mut queues: X722Queues, found: X722) -> ! {
         }
     }
 
-    let (state, firmware) = found.words();
+    // **The bond's address is its first member's**, RFC 0074's rule, and the
+    // kernel has already told `bin/ipd` that same address. So everything this
+    // sends carries port 0's address whichever port carries it -- which is
+    // exactly the case a real switch may refuse, and the reason step 3 exists.
+    let (state, firmware) = facts[0].words();
+    let bond_address = facts[0].address();
+    let address = facts[0].mac;
+    let second = facts[X722_MEMBERS - 1].pair();
+
+    let mut active = members.iter().position(Option::is_some).unwrap_or(0);
     let mut handed = 0u64;
     let mut sent = 0u64;
     let mut seen = 0u64;
-    // Which descriptor the device will fill next, as this program follows it.
-    let mut next = 0u32;
+    let mut failovers = 0u64;
+    // **Frames handed across since the failover, counted by the side that knows
+    // when it happened.**
+    //
+    // The kernel takes its baseline when *its* window opens, and the failover
+    // can happen well before that -- during the wait for a first frame -- so
+    // anything the new member carried in between landed in the baseline and was
+    // invisible. A boot could then say "nothing has crossed since" about a
+    // member that had been carrying for a minute. This is the same quantity,
+    // measured from the instant that actually matters.
+    let mut carried_since = 0u64;
+    // Frames that arrived on a member that is not carrying traffic.
+    let mut off_member = 0u64;
     let mut idle = 0u32;
+    let mut since_link = 0u32;
+    // **Announcements this bond sends of its own** -- RFC 0076 step 3.
+    //
+    // Bounded, because a driver that filled a segment with its own broadcasts
+    // would be a worse citizen than one that says little; reset on a failover,
+    // because that is exactly when the switch's idea of where this address
+    // lives has become wrong.
+    let mut probes = 0u32;
+    // **The failover test, once, and only when asked.** Nothing here takes a
+    // link down unless the boot asked for it, because this is somebody's
+    // cluster node and a port that goes dark for no reason is a fault report.
+    let mut downed: Option<usize> = None;
+    let mut since_down = 0u32;
+
+    let publish = |handed: u64, sent: u64, seen: u64| {
+        no_virtio_report_with(state, firmware, bond_address, handed, sent, seen, second);
+    };
 
     loop {
-        // **What arrived.** The descriptors are walked in order rather than
-        // scanned, because the device fills them in order and a scan would take
-        // a later frame before an earlier one -- which is a reordering, not a
-        // shortcut.
-        if let Some(completion) = i40e::completed_descriptor(&queues.ring, next) {
+        // **What each member's link is doing.** Counted out rather than asked
+        // every pass, for the reason `LINK_EVERY` gives.
+        since_link = since_link.saturating_add(1);
+        if since_link >= LINK_EVERY {
+            since_link = 0;
+            for member in members.iter_mut().flatten() {
+                if let Ok(link) = member.device.link_status(&mut member.admin, SPINS) {
+                    member.up = link.up();
+                }
+            }
+        }
+
+        // Selection, by the same rule the virtio bond uses.
+        let up = [
+            members[0].as_ref().is_some_and(|member| member.up),
+            members[1].as_ref().is_some_and(|member| member.up),
+        ];
+        let chosen = select(active, &up);
+        if chosen != active {
+            active = chosen;
+            failovers += 1;
+            // **Announce on the member that has taken over.** Until this
+            // existed the X722 bond failed over into silence and the report
+            // could say only that nothing had crossed -- which reads like a
+            // switch refusing a moved address and was in fact a driver that
+            // sent nothing. RFC 0074 named the need; this is it, on the side
+            // that had been forwarding `bin/ipd`'s frames and nothing else.
+            probes = 0;
+        }
+
+        // **Every member's ring is walked, and only the active one's frames
+        // cross.** A member that is not carrying traffic still receives -- the
+        // wire does not know which one this program has selected -- and
+        // delivering those would duplicate what the active member already
+        // handed across. They are dropped and counted, which is how the report
+        // can say a backup was live without claiming its frames arrived twice.
+        for (index, member) in members.iter_mut().enumerate() {
+            let Some(member) = member else {
+                continue;
+            };
+            let Some(completion) = i40e::completed_descriptor(&member.queues.ring, member.next)
+            else {
+                continue;
+            };
             idle = 0;
-            seen += 1;
             let length = completion.length as usize;
-            let buffer = queues.buffers.at + u64::from(next) * u64::from(X722_BUFFER);
-            // SAFETY: a buffer this program mapped and the device has finished
-            // with -- the descriptor's write-back is what says so -- and the
-            // ring to `bin/ipd`, mapped writable above.
-            if length > 0 && unsafe { hand_to_ipd(buffer, length) } {
-                handed += 1;
+            let buffer = member.queues.buffers.at + u64::from(member.next) * u64::from(X722_BUFFER);
+            if index == active {
+                seen += 1;
+                if downed.is_some() {
+                    carried_since += 1;
+                }
+                // SAFETY: a buffer this program mapped and the device has
+                // finished with -- the descriptor's write-back is what says so
+                // -- and the ring to `bin/ipd`, mapped writable above.
+                if length > 0 && unsafe { hand_to_ipd(buffer, length) } {
+                    handed += 1;
+                }
+            } else {
+                off_member += 1;
             }
             // Back to the device, and the tail after it: a descriptor taken and
             // not given back is a ring that works once, which this file has
-            // recorded discovering twice.
+            // recorded discovering twice. **Both members are refilled**, the
+            // backup included -- a ring left empty is a member that cannot take
+            // over.
             i40e::post_receive_descriptor(
-                &mut queues.ring,
-                next,
-                queues.buffers_device + u64::from(next) * u64::from(X722_BUFFER),
+                &mut member.queues.ring,
+                member.next,
+                member.queues.buffers_device + u64::from(member.next) * u64::from(X722_BUFFER),
             );
-            next = (next + 1) % queues.posted;
-            device.arm_receive_queue(queues.queue, next);
-            no_virtio_report_with(state, firmware, found.address(), handed, sent, seen);
+            member.next = (member.next + 1) % member.queues.posted;
+            let (queue, next) = (member.queues.queue, member.next);
+            member.device.arm_receive_queue(queue, next);
+            publish(handed, sent, seen);
         }
 
-        // **What `bin/ipd` built.** One per pass, and its completion waited for
-        // -- this program is pinned and the transmit ring is eight deep, so a
-        // frame posted and forgotten is a descriptor nobody reclaims.
-        if back_mapped {
+        // **This bond's own frame, out of the member that carries.** One per
+        // pass and only while the burst is unfinished, so that a wire nobody
+        // else speaks on still shows whether this port can transmit -- and so
+        // that a failover has something to be measured by.
+        if probes < PROBES
+            && let Some(member) = members[active].as_mut()
+        {
+            // SAFETY: the transmit buffer inside this member's rings object,
+            // which this program mapped writable. No virtio header: an X722
+            // takes the frame as it stands.
+            let length = unsafe { fill_announcement(member.queues.transmit.at + 2048, 0, address) };
+            let at = member.queues.transmit_device + 2048;
+            if let Some(slot) =
+                member
+                    .device
+                    .post_frame(&mut member.queues.transmit, at, length as u16, false)
+            {
+                let queue = member.queues.transmit_queue;
+                let tail = member.device.transmit_tail();
+                member.device.transmit_doorbell(queue, tail);
+                for _ in 0..SPINS {
+                    if member.device.frame_completed(&member.queues.transmit, slot) {
+                        break;
+                    }
+                    core::hint::spin_loop();
+                }
+                probes += 1;
+                sent += 1;
+                publish(handed, sent, seen);
+            }
+        }
+
+        // **What `bin/ipd` built, out of the member that carries.**
+        if back_mapped && let Some(member) = members[active].as_mut() {
             // SAFETY: the return ring is mapped, and the packet buffer is the
-            // page this program mapped for the transmit ring's use. No header:
-            // an X722 takes the frame as it stands.
-            if let Some(length) = unsafe { take_from_ipd_into(queues.transmit.at + 2048, 0) } {
+            // page this program mapped for this member's transmit ring. No
+            // header: an X722 takes the frame as it stands.
+            if let Some(length) = unsafe { take_from_ipd_into(member.queues.transmit.at + 2048, 0) }
+            {
                 idle = 0;
-                if let Some(slot) = device.post_frame(
-                    &mut queues.transmit,
-                    queues.transmit_device + 2048,
-                    length as u16,
-                    false,
-                ) {
-                    device.transmit_doorbell(queues.transmit_queue, device.transmit_tail());
+                let at = member.queues.transmit_device + 2048;
+                if let Some(slot) =
+                    member
+                        .device
+                        .post_frame(&mut member.queues.transmit, at, length as u16, false)
+                {
+                    let queue = member.queues.transmit_queue;
+                    let tail = member.device.transmit_tail();
+                    member.device.transmit_doorbell(queue, tail);
                     for _ in 0..SPINS {
-                        if device.frame_completed(&queues.transmit, slot) {
+                        if member.device.frame_completed(&member.queues.transmit, slot) {
                             break;
                         }
                         core::hint::spin_loop();
                     }
                     sent += 1;
-                    no_virtio_report_with(state, firmware, found.address(), handed, sent, seen);
+                    publish(handed, sent, seen);
                 }
             }
         }
+
+        // **Take the active member's link down, if the boot asked and the bond
+        // has shown it works.** `handed > 0` is the condition that matters: a
+        // failover from a member that was never carrying anything proves
+        // nothing, and the report could not tell the difference afterwards.
+        if downed.is_none()
+            && handed > 0
+            && failover_requested()
+            && let Some(member) = members[active].as_mut()
+            && member
+                .device
+                .set_link(&mut member.admin, false, SPINS)
+                .is_ok()
+        {
+            // Believed at once rather than waited for. The next link poll would
+            // find it anyway; this makes the failover happen in the pass that
+            // caused it, so a boot report that has to catch both halves has a
+            // chance of catching them.
+            member.up = false;
+            downed = Some(active);
+            since_down = 0;
+        }
+
+        // **And put it back.** RFC 0076's testing plan promises the machine is
+        // returned as found, and a port left dark is the one way this change
+        // could fail that promise. `Restart AN` touches no NVM, so a boot that
+        // died between the two would still leave the port up at the next power
+        // cycle -- but not leaving it to that is the point.
+        if let Some(index) = downed {
+            since_down = since_down.saturating_add(1);
+            if since_down == RESTORE_AFTER
+                && let Some(member) = members[index].as_mut()
+            {
+                let _ = member.device.set_link(&mut member.admin, true, SPINS);
+            }
+        }
+
+        // What the bond is, for the kernel to print.
+        let links = u64::from(up[0]) | u64::from(up[1]) << 1;
+        let count = members.iter().flatten().count() as u64;
+        x722_bond_report(count, active as u64, links, failovers, off_member);
+        carried_since_report(carried_since);
 
         // **Yield rather than spin.** This program is pinned, and there is no
         // interrupt delegated for this device -- the completions are reported
@@ -2050,11 +2449,12 @@ fn carry_x722(mut queues: X722Queues, found: X722) -> ! {
 /// none of which exist here. This writes the marker, the X722's two words, and
 /// zeroes for the rest -- so the kernel reads a report rather than concluding
 /// the service left none, and the X722 line is what says what was found.
-fn no_virtio_report(state: u64, firmware: u64, address: u64) {
-    no_virtio_report_with(state, firmware, address, 0, 0, 0)
-}
-
-/// The same, with what the frames have done so far.
+/// The same, with what the frames have done so far and what the second port is.
+///
+/// **`second` is that port's state word and its station address**, RFC 0076
+/// step 1 -- a pair rather than two more arguments, because this function
+/// already takes six positional numbers and a caller passing eight is a caller
+/// that will pass two of them in the wrong order.
 fn no_virtio_report_with(
     state: u64,
     firmware: u64,
@@ -2062,6 +2462,7 @@ fn no_virtio_report_with(
     handed: u64,
     sent: u64,
     seen: u64,
+    second: (u64, u64),
 ) {
     let mut words = [0u64; REPORT_WORDS];
     words[0] = MARKER;
@@ -2075,6 +2476,12 @@ fn no_virtio_report_with(
     words[10] = sent;
     words[22] = state;
     words[23] = firmware;
+    // **The second port, words 24 and 25.** Its own state word and its own
+    // station address -- and the address is the half that matters, because two
+    // ports reporting the same one would be one device counted twice, which is
+    // exactly what step 1's gate exists to rule out.
+    words[24] = second.0;
+    words[25] = second.1;
     let at = RINGS_AT + ring::REPORT;
     // SAFETY: the last page of the rings this program mapped writable, which no
     // ring and no buffer reaches. The marker is written last, so a kernel that
@@ -2124,6 +2531,10 @@ struct X722 {
     /// "it stopped at the segment descriptor" is a day. `bin/ahcid` keeps the
     /// same kind of number for the same reason.
     stage: u8,
+    /// How many backing pages this port's HMC layout wants, and which page its
+    /// receive context falls in -- the two numbers `grant::HMC_PAGES` is
+    /// checked against, reported so a refusal says which one it was.
+    layout: (u8, u8),
 }
 
 impl X722 {
@@ -2143,11 +2554,24 @@ impl X722 {
             | u64::from(self.queues) << 2
             | u64::from(self.link_up) << 3
             | u64::from(self.carrying) << 4
-            | u64::from(self.stage) << 40;
+            | u64::from(self.stage) << 40
+            | u64::from(self.layout.0) << 48
+            | u64::from(self.layout.1) << 56;
         (
             flags | u64::from(self.link_speed) << 8 | u64::from(self.switch_elements) << 16,
             u64::from(self.firmware.0) | u64::from(self.firmware.1) << 16,
         )
+    }
+
+    /// What a *second* port contributes to the report: its state and its
+    /// address.
+    ///
+    /// **Not its firmware**, which is the card's rather than the port's -- all
+    /// four functions of an X722 are one device and answer the same version.
+    /// The address is what differs, and what says two ports were driven rather
+    /// than one driven twice.
+    fn pair(self) -> (u64, u64) {
+        (self.words().0, self.address())
     }
 }
 
@@ -2157,20 +2581,25 @@ impl X722 {
 /// step: a machine with no such NIC leaves the slots empty, the first attach
 /// fails, and this answers `delegated: false` without touching a register. Every
 /// QEMU lane checks that, because none of them has an X722 and none ever will.
-fn take_x722() -> (X722, Option<X722Queues>) {
+fn take_x722(nth: u64) -> (X722, Option<X722Member>) {
+    use bhaskix_i40e::grant;
     let mut found = X722::default();
     let mut carrying = None;
 
     // The register pages first, because they are what makes the rest reachable
     // and because their absence is the cheapest thing to discover. Each is
-    // mapped at its own offset from `X722_AT`, so every register offset in the
+    // mapped at its own offset from `x722_at(nth)`, so every register offset in the
     // crate works against that base unchanged.
     for (index, page) in bhaskix_i40e::REGISTER_PAGES.iter().enumerate() {
-        if !attach(X722_PAGES + index as u64, X722_AT + page, 1) {
+        if !attach(
+            x722_slot(nth, grant::PAGES) + index as u64,
+            x722_at(nth) + page,
+            1,
+        ) {
             return (found, None);
         }
     }
-    if !attach(X722_MEMORY, X722_MEMORY_AT, 1) {
+    if !attach(x722_slot(nth, grant::MEMORY), x722_memory_at(nth), 1) {
         return (found, None);
     }
     // Where the device will look for its rings. Without a window there is no
@@ -2178,9 +2607,9 @@ fn take_x722() -> (X722, Option<X722Queues>) {
     // refusal working, exactly as it does for the virtio ports above.
     let (mapped, admin_device) = call(
         syscall::INVOKE,
-        X722_WINDOW,
+        x722_slot(nth, grant::WINDOW),
         method::MAP,
-        [X722_MEMORY, 0, 0, 0],
+        [x722_slot(nth, grant::MEMORY), 0, 0, 0],
     );
     if mapped != status::OK {
         return (found, None);
@@ -2191,9 +2620,9 @@ fn take_x722() -> (X722, Option<X722Queues>) {
     /// cannot hang a boot. The kernel used the same number for the same reason.
     const SPINS: u32 = 2_000_000;
 
-    let mut device = bhaskix_i40e::Device::new(X722Registers);
+    let mut device = bhaskix_i40e::Device::new(X722Registers { at: x722_at(nth) });
     let mut admin = X722Memory {
-        at: X722_MEMORY_AT,
+        at: x722_memory_at(nth),
         bytes: 4096,
     };
     found.reset = device.reset(SPINS);
@@ -2212,7 +2641,7 @@ fn take_x722() -> (X722, Option<X722Queues>) {
     }
     // The switch, into the buffer that follows both rings in the same page.
     let mut buffer = X722Memory {
-        at: X722_MEMORY_AT + bhaskix_i40e::SWITCH_BUFFER_OFFSET,
+        at: x722_memory_at(nth) + bhaskix_i40e::SWITCH_BUFFER_OFFSET,
         bytes: bhaskix_i40e::SWITCH_BUFFER_BYTES as usize,
     };
     found.stage = 1;
@@ -2241,7 +2670,7 @@ fn take_x722() -> (X722, Option<X722Queues>) {
     // the switch element: the two disagreed on the SR550, 19 against 12, and
     // `VSILAN_QBASE` is indexed by the number.
     let mut vsi_buffer = X722Memory {
-        at: X722_MEMORY_AT + bhaskix_i40e::VSI_BUFFER_OFFSET,
+        at: x722_memory_at(nth) + bhaskix_i40e::VSI_BUFFER_OFFSET,
         bytes: bhaskix_i40e::VSI_BUFFER_BYTES as usize,
     };
     let Ok(parameters) = device.vsi_parameters(
@@ -2257,26 +2686,108 @@ fn take_x722() -> (X722, Option<X722Queues>) {
     found.stage = 3;
 
     // The memory the queues need, and then the queues.
-    if !attach(X722_HMC, X722_HMC_AT, 1)
-        || !attach(X722_RINGS, X722_RINGS_AT, 1)
-        || !attach(X722_TX, X722_TX_AT, 1)
+    if !attach(x722_slot(nth, grant::HMC), x722_hmc_at(nth), 1)
+        || !attach(x722_slot(nth, grant::RINGS), x722_rings_at(nth), 1)
+        || !attach(x722_slot(nth, grant::TX), x722_tx_at(nth), 1)
     {
         return (found, None);
     }
     found.stage = 4;
-    if let Some(queues) = bring_up_x722(
+    let mut progress = Progress {
+        stage: found.stage,
+        layout: (0, 0),
+    };
+    let brought_up = bring_up_x722(
         &mut device,
         &mut admin,
         admin_device,
         seid,
         parameters.number,
-        &mut found.stage,
-    ) {
+        &mut progress,
+        nth,
+    );
+    // **Whether it came up or not**, because the numbers a refusal leaves
+    // behind are the whole reason they are collected.
+    found.stage = progress.stage;
+    found.layout = progress.layout;
+    if let Some(queues) = brought_up {
         found.carrying = true;
-        found.mac = device.mac_address(device.port_number()).unwrap_or([0; 6]);
-        carrying = Some(queues);
+        // **Asked of firmware, not read out of `PRTPM_SAL`.** RFC 0076 step 1:
+        // that register pair holds the *WoL* address, which equals the LAN one
+        // on this card's first port and is marked invalid on its second -- so
+        // the boot that finally brought port 1's queues up still reported
+        // `000000000000` for it. 38.17.3's table names `Manage MAC Address
+        // Read` as where a LAN address comes from.
+        //
+        // The port's own address is the fallback, because several functions of
+        // one port share it and a shared address is better than none; the
+        // register is the last resort, and no address at all is reported as
+        // zeros rather than invented.
+        let mut mac_buffer = X722Memory {
+            at: x722_memory_at(nth) + bhaskix_i40e::MAC_BUFFER_OFFSET,
+            bytes: bhaskix_i40e::MAC_BUFFER_BYTES as usize,
+        };
+        found.mac = device
+            .mac_addresses(
+                &mut admin,
+                admin_device + bhaskix_i40e::MAC_BUFFER_OFFSET,
+                &mut mac_buffer,
+                SPINS,
+            )
+            .ok()
+            .and_then(|found| found.lan.or(found.port))
+            .or_else(|| device.mac_address(device.port_number()))
+            .unwrap_or([0; 6]);
+        // **The whole member, not just its queues.** RFC 0076 step 2: a bond
+        // selects between two of these every pass, so what the bring-up
+        // produced has to survive it -- the device it was reached through and
+        // the admin ring a link poll goes down, as much as the queues.
+        found.link_up = device
+            .link_status(&mut admin, SPINS)
+            .map_or(found.link_up, |link| link.up());
+        carrying = Some(X722Member {
+            device,
+            queues,
+            admin,
+            next: 0,
+            up: found.link_up,
+        });
     }
     (found, carrying)
+}
+
+/// Publishes how much the bond has carried since it failed over -- word 26.
+fn carried_since_report(frames: u64) {
+    let at = RINGS_AT + ring::REPORT + 26 * 8;
+    // SAFETY: the report page this program mapped writable, one word past the
+    // bond's five and far short of the failover request.
+    unsafe { core::ptr::write_volatile(at as *mut u64, frames) };
+}
+
+/// Whether the boot asked for a failover -- [`ring::FAILOVER_REQUEST`].
+fn failover_requested() -> bool {
+    // SAFETY: the report page this program mapped writable, at a word outside
+    // the report itself. The kernel writes it; this reads it.
+    unsafe { core::ptr::read_volatile((RINGS_AT + ring::FAILOVER_REQUEST) as *const u64) != 0 }
+}
+
+/// The bond's words, for a bond whose members are X722 ports.
+///
+/// **The same five slots [`bond_report`] writes**, so `report_bond` in the
+/// kernel prints either bond without knowing which driver produced it. What
+/// differs is only where the numbers come from: that one reads them off virtio
+/// `Port`s, and this is handed them.
+fn x722_bond_report(members: u64, active: u64, links: u64, failovers: u64, off_member: u64) {
+    let at = RINGS_AT + ring::REPORT;
+    let words = [members, active, links, failovers, off_member];
+    // SAFETY: the report page this program mapped writable, at the five words
+    // that follow the seventeen `report` writes -- the same ones `bond_report`
+    // writes, and not the marker.
+    unsafe {
+        for (index, word) in words.iter().enumerate() {
+            core::ptr::write_volatile((at + (17 + index as u64) * 8) as *mut u64, *word);
+        }
+    }
 }
 
 /// Leaves the bond's own state where the kernel reads the rest of the report.

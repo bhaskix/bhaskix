@@ -152,7 +152,7 @@ const MARKER: u64 = 0x3154_5052_4450_4931;
 /// because both are derived from this page and neither has another source.
 fn read_interface() -> Option<(MacAddr, Ipv4Addr)> {
     // SAFETY: the configuration page, mapped read-only by this program.
-    let (marker, mac, address, vlan, mtu, ports) = unsafe {
+    let (marker, mac, address, vlan, mtu, ports, bond_lacp) = unsafe {
         (
             core::ptr::read_volatile(CONFIG_AT as *const u64),
             core::ptr::read_volatile((CONFIG_AT + 8) as *const u64),
@@ -160,8 +160,10 @@ fn read_interface() -> Option<(MacAddr, Ipv4Addr)> {
             core::ptr::read_volatile((CONFIG_AT + 24) as *const u64),
             core::ptr::read_volatile((CONFIG_AT + 32) as *const u64),
             core::ptr::read_volatile((CONFIG_AT + 40) as *const u64),
+            core::ptr::read_volatile((CONFIG_AT + 48) as *const u64),
         )
     };
+    let lacp_wanted = bond_lacp != 0;
     if marker != CONFIG_MARKER {
         return None;
     }
@@ -179,8 +181,18 @@ fn read_interface() -> Option<(MacAddr, Ipv4Addr)> {
     if let Ok(first) = faces.add_physical(0, MacAddr(octets), mtu) {
         faces.set_link(first, true);
         let mut on = first;
+        // **The mode the boot asked for.** Active-backup needs nothing from the
+        // switch and is the right default; a switch-side port-channel needs
+        // 802.3ad, and on such a wire active-backup is not merely worse but
+        // wrong -- the switch will not forward data to a member it has not
+        // bundled. The SR550's four ports are one such channel.
+        let mode = if lacp_wanted {
+            bhaskix_net::interface::BondMode::Lacp
+        } else {
+            bhaskix_net::interface::BondMode::ActiveBackup
+        };
         if ports > 1
-            && let Ok(bond) = faces.add_bond(bhaskix_net::interface::BondMode::ActiveBackup)
+            && let Ok(bond) = faces.add_bond(mode)
         {
             let mut joined = faces.enslave(bond, first).is_ok();
             for port in 1..ports.min(u64::from(u8::MAX)) {
@@ -192,6 +204,10 @@ fn read_interface() -> Option<(MacAddr, Ipv4Addr)> {
             }
             if joined {
                 on = bond;
+                BOND_MODE_LACP.store(
+                    matches!(mode, bhaskix_net::interface::BondMode::Lacp),
+                    core::sync::atomic::Ordering::Relaxed,
+                );
             }
         }
         if vlan != 0
@@ -232,6 +248,33 @@ fn lacp_publish(machine: &bhaskix_net::lacp::Machine) {
         core::sync::atomic::Ordering::Relaxed,
     );
 }
+
+/// LACPDUs this service has put on the wire, and slow-protocol frames that have
+/// come back.
+///
+/// **So that "the switch did not answer" is a measurement.** Without these, a
+/// boot that sends nothing and a boot whose partner is silent produce the same
+/// report -- and this session has already twice mistaken the first for the
+/// second. Sent in the high half, received in the low.
+static LACP_TRAFFIC: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Counts one LACPDU sent.
+fn lacp_sent() {
+    LACP_TRAFFIC.fetch_add(1 << 32, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Counts one slow-protocol frame received.
+fn lacp_heard() {
+    LACP_TRAFFIC.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Which bond the interface was actually built as, for the report.
+///
+/// **Not what was asked for -- what exists.** The boot report said
+/// "active-backup" as a hardcoded word, so it would have printed that for an
+/// 802.3ad bond too, and no reader could have told. A report that states
+/// something it never read is worse than one that says nothing.
+static BOND_MODE_LACP: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 /// What the bound interface is made of, for the report: the number of members
 /// under it, or zero when the address sits straight on a port.
@@ -470,12 +513,84 @@ fn exit() -> ! {
     loop {}
 }
 
-/// Hands one frame to `bin/netd` to put on the wire.
+/// Whether this EtherType is a frame the *wire* carries rather than a VLAN.
+///
+/// **On a trunk port these go untagged, both ways.** LACP is how a switch
+/// decides whether a link is in its aggregate at all, and LLDP is how it says
+/// what it is; both are scoped to the physical link and neither belongs to any
+/// VLAN on it. Tagging them would hide them from the switch, and refusing the
+/// untagged ones on receive would make this service deaf to exactly the
+/// traffic that brings a bundle up.
+fn is_link_control(ethertype: EtherType) -> bool {
+    /// 802.1AB LLDP.
+    const LLDP: u16 = 0x88cc;
+    ethertype.0 == bhaskix_net::lacp::ETHERTYPE || ethertype.0 == LLDP
+}
+
+/// Hands one frame to `bin/netd` to put on the wire, **tagged if this
+/// interface is**.
+///
+/// **The tag goes on here and nowhere else.** An interface's VLAN is a property
+/// of leaving it -- `Interface::egress_tag` says exactly that -- so every frame
+/// this program builds is built untagged and tagged once, at the door. The
+/// alternative was to teach twenty-one call sites that a header is sometimes
+/// eighteen bytes instead of fourteen, which is twenty-one chances to get an
+/// offset wrong for one behaviour.
+///
+/// **This is why nothing on the SR550 ever answered.** Its four ports are a
+/// switch-side trunk carrying tagged VLANs; every frame this project put on
+/// that wire was untagged, and an untagged frame on a trunk port reaches none
+/// of them. `bin/ipd` has parsed *for* its bound VLAN since RFC 0074 and has
+/// never sent one.
 ///
 /// # Safety
 ///
 /// The return ring must be mapped writable at [`BACK_AT`].
 unsafe fn send(frame: &[u8]) -> bool {
+    if let Some(id) = bound_vlan()
+        && frame.len() >= eth::HEADER
+        && !is_link_control(EtherType(u16::from_be_bytes([frame[12], frame[13]])))
+    {
+        let vlan = eth::Vlan::id(id);
+        // Addresses, then the tag, then the EtherType the payload really is and
+        // everything after it. `write_tagged_header` lays the first eighteen
+        // bytes out; the rest is the frame from its EtherType on.
+        let mut tagged = [0u8; MAX_FRAME + eth::Vlan::BYTES];
+        let (Ok(destination), Ok(source)) = (
+            <[u8; 6]>::try_from(&frame[0..6]),
+            <[u8; 6]>::try_from(&frame[6..12]),
+        ) else {
+            return false;
+        };
+        let ethertype = EtherType(u16::from_be_bytes([frame[12], frame[13]]));
+        let body = &frame[eth::HEADER..];
+        let total = eth::HEADER + eth::Vlan::BYTES + body.len();
+        if total <= tagged.len()
+            && eth::write_tagged_header(
+                &mut tagged,
+                MacAddr(destination),
+                MacAddr(source),
+                vlan,
+                ethertype,
+            )
+            .is_ok()
+        {
+            tagged[eth::HEADER + eth::Vlan::BYTES..total].copy_from_slice(body);
+            // SAFETY: the caller's obligation, unchanged.
+            return unsafe { send_untagged(&tagged[..total]) };
+        }
+        return false;
+    }
+    // SAFETY: the caller's obligation.
+    unsafe { send_untagged(frame) }
+}
+
+/// Puts `frame` on the ring exactly as given.
+///
+/// # Safety
+///
+/// As [`send`].
+unsafe fn send_untagged(frame: &[u8]) -> bool {
     let Some(layout) = ring::Layout::for_region(RING_BYTES) else {
         return false;
     };
@@ -878,6 +993,11 @@ fn refresh() {
         BOUND_SHAPE.load(Relaxed),
         // Word 29, as the builder above.
         LACP_STATE.load(Relaxed),
+        // Words 30 and 31, as the builder above: LACP traffic both ways, and
+        // whether the bond is 802.3ad. `refresh` keeps reporting them after
+        // serving starts, which is when the switch has had time to answer.
+        LACP_TRAFFIC.load(Relaxed),
+        u64::from(BOND_MODE_LACP.load(Relaxed)),
     ]);
 }
 
@@ -1264,7 +1384,18 @@ fn drain_ring(
         // arrived. On an untagged interface that is exactly what `parse` did
         // before; on a VLAN one it accepts that VLAN's tag and refuses every
         // other, which is the boundary RFC 0074 exists to draw.
-        let Ok(parsed) = EthFrame::parse_on(&frame[..length], bound_vlan()) else {
+        // **A trunk carries two kinds of frame and this takes both.** Data
+        // belongs to a VLAN and must carry its tag; LACP and LLDP belong to the
+        // wire and arrive untagged. Binding a VLAN and refusing everything
+        // untagged would make this service deaf to exactly the frames that
+        // bring a bundle up -- so an untagged frame is taken when, and only
+        // when, it is one of those.
+        let untagged = EthFrame::parse_on(&frame[..length], None)
+            .ok()
+            .filter(|frame| is_link_control(frame.ethertype));
+        let Some(parsed) =
+            untagged.or_else(|| EthFrame::parse_on(&frame[..length], bound_vlan()).ok())
+        else {
             refuse(why::NOT_A_FRAME, length, seen);
             continue;
         };
@@ -1274,6 +1405,7 @@ fn drain_ring(
         // decides what to believe, and a reply goes back on the same wake,
         // which is how two peers converge without either holding a clock.
         if parsed.ethertype.0 == bhaskix_net::lacp::ETHERTYPE {
+            lacp_heard();
             if let Some(machine) = lacp.as_mut()
                 && machine.received(parsed.payload)
             {
@@ -1296,6 +1428,7 @@ fn drain_ring(
                         // SAFETY: the return ring is mapped writable.
                         && unsafe { send(&out[..length]) }
                 {
+                    lacp_sent();
                     *openings = openings.saturating_sub(1);
                 }
             }
@@ -1462,6 +1595,7 @@ fn serve(
                     // SAFETY: the return ring is mapped writable.
                     && unsafe { send(&out[..length]) }
                 {
+                    lacp_sent();
                     openings -= 1;
                 }
             }
@@ -2965,6 +3099,16 @@ fn report(
         BOUND_SHAPE.load(core::sync::atomic::Ordering::Relaxed),
         // Word 29: what the LACP machine believes -- RFC 0074 step 5.
         LACP_STATE.load(core::sync::atomic::Ordering::Relaxed),
+        // Word 30: LACPDUs sent in the high half, slow-protocol frames heard in
+        // the low. **So a silent partner and a silent us are different
+        // numbers** -- word 29 is zero for both, because it is only ever
+        // written when a PDU arrives, and a boot report that cannot tell those
+        // apart is one that invites the wrong conclusion. RFC 0076.
+        LACP_TRAFFIC.load(core::sync::atomic::Ordering::Relaxed),
+        // Word 31: whether the bond under this address is 802.3ad. The kernel
+        // printed the word "active-backup" as a literal, so it said that of an
+        // LACP bond too. What is reported now is what was built.
+        u64::from(BOND_MODE_LACP.load(core::sync::atomic::Ordering::Relaxed)),
     ];
     V6_PREFIX.store(v6_prefix, core::sync::atomic::Ordering::Relaxed);
     V6_STATE.store(v6_state, core::sync::atomic::Ordering::Relaxed);
@@ -2990,7 +3134,7 @@ fn report(
 /// whatever the array says: the type is the documentation, and both builders --
 /// `report` and `refresh` -- are forced to agree with it by the compiler, which
 /// is the only reason the v6 words' silent overwrite could not happen twice.
-fn write_report(words: [u64; 30]) {
+fn write_report(words: [u64; 32]) {
     // SAFETY: the page this program mapped writable, which nothing else
     // reaches. The marker is written last, so a kernel reading a partial report
     // sees no marker rather than half the fields.

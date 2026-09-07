@@ -101,4 +101,22 @@ asm_budget = 4
 # reply to a partner. Each is the return ring's existing `send`, which is the
 # one unsafe line a frame leaving this service has always cost; the LACPDU
 # inside them is built by `bhaskix-net` and costs none.
-unsafe_budget = 161
+#
+# 163 at RFC 0076: `send` puts the 802.1Q tag on and hands the tagged copy to
+# `send_untagged`, so the one call became two -- one on each arm. **The tagging
+# itself costs nothing**: it is `bhaskix-net`'s `write_tagged_header` and a
+# copy, in a crate that forbids `unsafe` entirely.
+#
+# The tag goes on at the door rather than at twenty-one call sites, which is
+# also why this is two lines and not a rewrite: an interface's VLAN is a
+# property of *leaving* it, and every frame is built untagged and tagged once.
+# 164 at RFC 0076's report work: `write_report` grew two words and the loop
+# that stores them is one line longer. The words themselves -- LACPDUs sent and
+# heard, and whether the bond is 802.3ad -- are plain atomics and cost nothing.
+#
+# **They exist because the report asserted a mode it never read.** It printed
+# the word "active-backup" as a literal, so it printed that of an LACP bond too;
+# and word 29 is written only when a PDU *arrives*, so a boot that never spoke
+# and a boot whose partner is mute were the same report. Both were caught by the
+# project lead rather than by a test.
+unsafe_budget = 164

@@ -451,6 +451,29 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
         {
             X722_PATIENCE_MS.store(ms.min(120_000), core::sync::atomic::Ordering::Relaxed);
         }
+        // `bhaskix.x722fail` — RFC 0076 step 3. Asks `bin/netd` to take its
+        // active member's link down once the bond has carried something, and to
+        // put it back after. **Off unless a boot says so**: this machine is a
+        // live cluster node, and a port that goes dark for no reason is a fault
+        // report somebody has to chase.
+        if word == "bhaskix.x722fail" || word == "x722fail" {
+            X722_FAILOVER.store(true, core::sync::atomic::Ordering::Relaxed);
+        }
+        // `bhaskix.bondlacp` -- bond the ports with 802.3ad instead of
+        // active-backup, for a switch that has them in a port-channel.
+        if word == "bhaskix.bondlacp" || word == "bondlacp" {
+            NET_BOND_LACP.store(true, core::sync::atomic::Ordering::Relaxed);
+        }
+        // `bhaskix.vlan=<id>` -- the tag this interface's frames carry. Zero,
+        // and untagged, unless a boot says otherwise; a trunk port needs one.
+        if let Some(value) = word
+            .strip_prefix("bhaskix.vlan=")
+            .or_else(|| word.strip_prefix("vlan="))
+            && let Ok(id) = value.parse::<u16>()
+            && id < 4096
+        {
+            NET_VLAN.store(id, core::sync::atomic::Ordering::Relaxed);
+        }
         // `bhaskix.bond=<ms>` — RFC 0074 step 4, and the same bargain as the
         // line below it.
         if let Some(value) = word
@@ -4007,6 +4030,13 @@ static BOND_PATIENCE_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::Ato
 ///
 /// `bhaskix.x722=<ms>` sets it, and one boot does.
 static X722_PATIENCE_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Whether this boot asked for the X722 bond to prove a failover.
+///
+/// RFC 0076 step 3. On a machine with a hypervisor the harness drops a link
+/// from outside; on this one there is nobody outside, so the driver has to do
+/// it to itself -- and it must be asked, because the machine is somebody's.
+static X722_FAILOVER: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 /// Extra runnable threads spawned alongside the ring — `ringload=<n>`.
 ///
@@ -12818,6 +12848,24 @@ fn foreign_registers(address: bhaskix_arch::pci::Address) -> Option<u64> {
     (at != 0).then_some(at)
 }
 
+/// The first capability slot an X722 port's grant may use.
+///
+/// Below it are the net domain's own: its endpoint, its inbox, the virtio
+/// windows and the ring to `bin/ipd`. Port `n`'s slots start at
+/// `grant::base(X722_FIRST_SLOT, n)` and there is room for **two**, which is
+/// why RFC 0076 bonds two -- `bhaskix_i40e::grant`'s own test is what says a
+/// third would not fit in `cap::CSPACE_SLOTS`.
+const X722_FIRST_SLOT: u64 = 16;
+
+/// How many X722 ports are delegated, at most.
+///
+/// **Two, and two is not a preference.** RFC 0076: a port costs 42 capability
+/// slots -- one DMA window, four memory objects and thirty-seven register pages
+/// -- against `cap::CSPACE_SLOTS` of 128 with the first sixteen spoken for. Two
+/// fit and three do not, and a bond needs exactly two. The machine this is for
+/// has four cabled ports; the other two are named as interfaces and not driven.
+const X722_MEMBERS: u64 = 2;
+
 /// Hands the X722 to the net domain -- RFC 0075 steps 3 and 4.
 ///
 /// **This is all that is left of a NIC in the kernel.** `kernel/src/i40e.rs`
@@ -12838,8 +12886,9 @@ fn foreign_registers(address: bhaskix_arch::pci::Address) -> Option<u64> {
 /// pages that hold a register the driver uses, and exactly those are granted --
 /// strictly less authority than the kernel took for itself when it drove this.
 ///
-/// Each is installed at `X722_PAGES + n` and `bin/netd` maps it at its own
-/// offset, so every register offset in the crate works unchanged and a register
+/// Each is installed at this port's `grant::PAGES + n` and `bin/netd` maps it at
+/// its own offset, so every register offset in the crate works unchanged and a
+/// register
 /// in a page nobody granted faults instead of being reachable.
 ///
 /// Returns whether the device was delegated with everything a driver needs. A
@@ -12850,26 +12899,27 @@ fn foreign_registers(address: bhaskix_arch::pci::Address) -> Option<u64> {
 /// # Errors
 ///
 /// A capability that would not be created or installed.
-fn delegate_x722(realm: domain::DomainId, keeper: domain::DomainId) -> Result<bool, &'static str> {
-    /// Slot: the DMA window. `bin/netd`'s `X722_WINDOW`.
-    const X722_WINDOW: usize = 16;
-    /// Slot: the page holding its admin rings and the buffers behind them.
-    const X722_MEMORY: usize = 17;
-    /// Slot: the first of its register pages.
-    const X722_PAGES: usize = 20;
-    /// Slot: the private memory the HMC fetches queue contexts from.
-    ///
-    /// **After the register pages, and computed rather than written down**, for
-    /// the reason `bin/netd`'s matching constant gives: these were 54, 55 and
-    /// 56, which the pages grew to cover the moment the interrupt registers
-    /// joined the list, and the install refused.
-    const X722_HMC: usize = X722_PAGES + bhaskix_i40e::REGISTER_PAGES.len();
-    /// Slot: the receive rings and the buffers behind them.
-    const X722_RINGS: usize = X722_HMC + 1;
-    /// Slot: the transmit ring and the packet buffer it posts from.
-    const X722_TX: usize = X722_HMC + 2;
+fn delegate_x722(
+    realm: domain::DomainId,
+    keeper: domain::DomainId,
+    nth: u64,
+) -> Result<bool, &'static str> {
+    use bhaskix_i40e::grant;
 
-    let Some((address, identity)) = find_foreign_nic() else {
+    // **The layout is the driver crate's, not this file's.** RFC 0076: it was
+    // spelled out here and again in `bin/netd`, two copies of one arithmetic
+    // that had to agree and could not check that they did -- which is how slots
+    // 54, 55 and 56 ended up inside a register range that had grown past them.
+    // With a second port the expression gains a multiply, so there is one of it.
+    let base = grant::base(X722_FIRST_SLOT, nth);
+    let window = (base + grant::WINDOW) as usize;
+    let memory_slot = (base + grant::MEMORY) as usize;
+    let pages_slot = (base + grant::PAGES) as usize;
+    let hmc_slot = (base + grant::HMC) as usize;
+    let rings_slot = (base + grant::RINGS) as usize;
+    let tx_slot = (base + grant::TX) as usize;
+
+    let Some((address, identity)) = find_foreign_nic_nth(nth as usize) else {
         return Ok(false);
     };
     let Some(bar) = foreign_registers(address) else {
@@ -12882,7 +12932,7 @@ fn delegate_x722(realm: domain::DomainId, keeper: domain::DomainId) -> Result<bo
     unsafe { bhaskix_arch::pci::enable_memory(address) };
 
     for (index, page) in bhaskix_i40e::REGISTER_PAGES.iter().enumerate() {
-        let window = cap::with_arena(|arena| {
+        let page_cap = cap::with_arena(|arena| {
             arena
                 .insert_root(
                     cap::ObjectRef::new(cap::ObjectKind::Frame, bar + page),
@@ -12895,7 +12945,10 @@ fn delegate_x722(realm: domain::DomainId, keeper: domain::DomainId) -> Result<bo
         })
         .ok_or("an X722 register page capability would not be created")?;
         if domain::with(realm, |owner| {
-            owner.cspace.install_at(X722_PAGES + index, window).is_ok()
+            owner
+                .cspace
+                .install_at(pages_slot + index, page_cap)
+                .is_ok()
         }) != Some(true)
         {
             return Err("an X722 register page would not install");
@@ -12908,7 +12961,7 @@ fn delegate_x722(realm: domain::DomainId, keeper: domain::DomainId) -> Result<bo
         .map_err(|_| "the X722's admin page would not be created")?;
     let named = shared::name(memory).map_err(|_| "the X722's admin page would not be named")?;
     if domain::with(realm, |owner| {
-        owner.cspace.install_at(X722_MEMORY, named).is_ok()
+        owner.cspace.install_at(memory_slot, named).is_ok()
     }) != Some(true)
     {
         return Err("the X722's admin page would not install");
@@ -12922,9 +12975,10 @@ fn delegate_x722(realm: domain::DomainId, keeper: domain::DomainId) -> Result<bo
         );
         return Ok(false);
     }
-    let window = iommu::name(delegated).map_err(|_| "the X722's dma window would not be named")?;
+    let named_window =
+        iommu::name(delegated).map_err(|_| "the X722's dma window would not be named")?;
     if domain::with(realm, |owner| {
-        owner.cspace.install_at(X722_WINDOW, window).is_ok()
+        owner.cspace.install_at(window, named_window).is_ok()
     }) != Some(true)
     {
         return Err("the X722's dma window would not install");
@@ -12937,11 +12991,11 @@ fn delegate_x722(realm: domain::DomainId, keeper: domain::DomainId) -> Result<bo
     // the private memory alone is that: a page-descriptor page and the fifteen
     // pages it names, which is what a layout of 384 queue contexts spans.
     for (slot, pages) in [
-        (X722_HMC, 16u64),
+        (hmc_slot, grant::HMC_PAGES),
         // One receive ring and the eight two-kilobyte buffers behind it.
-        (X722_RINGS, 5),
+        (rings_slot, 5),
         // The transmit ring and its packet buffer, which fit one page.
-        (X722_TX, 1),
+        (tx_slot, 1),
     ] {
         let object = shared::create(keeper, pages * bhaskix_mm::FRAME_SIZE)
             .map_err(|_| "the X722's queue memory would not be created")?;
@@ -12963,8 +13017,9 @@ fn delegate_x722(realm: domain::DomainId, keeper: domain::DomainId) -> Result<bo
     // SAFETY: this device is the net domain's; nothing else drives it.
     unsafe { bhaskix_arch::pci::enable(address) };
     println!(
-        "    net domain     {:02x}:{:02x}.{} {:04x}:{:04x} delegated to bin/netd: {} register \
-         page(s) of {:#x}, its own dma window, and a page for its rings",
+        "    net domain     x722 port {} = {:02x}:{:02x}.{} {:04x}:{:04x} delegated to bin/netd: \
+         {} register page(s) of {:#x}, its own dma window, and a page for its rings",
+        nth,
         address.bus,
         address.device,
         address.function,
@@ -13199,15 +13254,28 @@ pub fn start_net_domain(
     }
     NET_PORTS.store(ports as u64, core::sync::atomic::Ordering::Release);
     // **And every foreign port, which on the one machine that has any is four.**
-    // Named rather than driven: `start_nic_domain` takes the first, and the
-    // other three are on the bus and counted so that the report describes the
-    // machine rather than the driver.
+    //
+    // **This said "driven by the kernel itself" and that stopped being true on
+    // 2026-09-07**, when RFC 0075 step 4 deleted the kernel's driver -- the
+    // line outlived the thing it described by a day, and the comment above it
+    // still named `start_nic_domain`, which no longer exists. What is true is
+    // that the first `X722_MEMBERS` of them are handed to `bin/netd` and the
+    // rest are named so the report describes the machine rather than the
+    // driver.
     let mut foreign_ports = 0;
     while let Some((at, identity)) = find_foreign_nic_nth(foreign_ports) {
         println!(
-            "    net interface  x722 port {foreign_ports}: {:02x}:{:02x}.{} {:04x}:{:04x}, \
-             driven by the kernel itself",
-            at.bus, at.device, at.function, identity.vendor, identity.device
+            "    net interface  x722 port {foreign_ports}: {:02x}:{:02x}.{} {:04x}:{:04x}, {}",
+            at.bus,
+            at.device,
+            at.function,
+            identity.vendor,
+            identity.device,
+            if (foreign_ports as u64) < X722_MEMBERS {
+                "for bin/netd"
+            } else {
+                "named, not driven -- the capability space affords two"
+            }
         );
         foreign_ports += 1;
     }
@@ -13215,7 +13283,7 @@ pub fn start_net_domain(
     println!(
         "    net interface  {ports} virtio port(s){} -- a bond may be built over {}",
         if foreign {
-            ", and an X722 this kernel drives itself"
+            ", and an X722 no kernel driver touches"
         } else {
             ""
         },
@@ -13299,9 +13367,56 @@ pub fn start_net_domain(
     // any more: the service resets it, programs its private memory and its
     // queues, and carries frames to and from `bin/ipd` -- every step of which
     // was watched happen on the SR550 before the kernel's own copy was deleted.
-    match delegate_x722(realm, keeper) {
-        Ok(true) | Ok(false) => {}
-        Err(why) => println!("\x1b[91m    net domain     the X722 FAILED: {why}\x1b[0m"),
+    //
+    // **Two of them, RFC 0076 step 1.** The bond RFC 0074 built has only ever
+    // had virtio members in QEMU, and the sentence that RFC left standing --
+    // that hardware which filters and a switch that will not accept an address
+    // moving are both unproven -- can only be answered by two real ports.
+    let mut x722_ports = 0;
+    for nth in 0..X722_MEMBERS {
+        match delegate_x722(realm, keeper, nth) {
+            Ok(true) => x722_ports += 1,
+            // No further port on the bus, or one that cannot be aimed. Either
+            // way the next index will say the same thing.
+            Ok(false) => break,
+            Err(why) => {
+                println!("\x1b[91m    net domain     the X722 FAILED: {why}\x1b[0m");
+                break;
+            }
+        }
+    }
+    match x722_ports {
+        0 => {}
+        1 => println!(
+            "\x1b[93m    net domain     one x722 port delegated; a bond needs two and cannot \
+             fail over with one\x1b[0m"
+        ),
+        n => println!(
+            "    net domain     {n} x722 port(s) delegated, each with its own dma window: a bond \
+             has two members to select from"
+        ),
+    }
+    // **A contained X722 is a contained network** -- RFC 0076.
+    //
+    // `NET_CONTAINED` was set only by the virtio delegation, so on the one
+    // machine whose only NIC is an X722 it stayed false and every client above
+    // the driver refused to start: `dhcp client no unit contains the device, so
+    // there is no network to ask`, on a boot where the device had its own page
+    // table and was carrying frames. The flag means *this machine's network is
+    // contained*, and two ports with their own domains are exactly that.
+    if x722_ports > 0 {
+        NET_CONTAINED.store(true, core::sync::atomic::Ordering::Release);
+    }
+
+    // **The delegated X722 ports count as ports** -- RFC 0076 step 2.
+    //
+    // `NET_PORTS` was the *virtio* count, which is zero on the only machine
+    // that has X722s: `bin/ipd` was told one port, so it built no members and
+    // put the address on a port directly. A bond it does not know about is a
+    // bond it cannot publish an interface over, and the report said so every
+    // boot -- *"0 port(s) published; the service saw 1 port(s)"*.
+    if x722_ports > 0 {
+        NET_PORTS.fetch_add(x722_ports, core::sync::atomic::Ordering::AcqRel);
     }
 
     if ports > 1 {
@@ -14595,13 +14710,30 @@ const NET_DOORBELL_BADGE: u64 = 1 << 3;
 /// The marker `bin/ipd` waits for before believing its configuration.
 const NET_CONFIG_MARKER: u64 = 0x3146_4e43_5049_5f4e;
 
+/// Byte offset in `bin/netd`'s report page of the failover request.
+///
+/// **The one word this kernel writes into that page**, and the driver's
+/// `ring::FAILOVER_REQUEST` is the same number from the other side. Forty words
+/// in, well clear of the twenty-six the report itself uses.
+const NETD_FAILOVER_REQUEST: u64 = 40 * 8;
+
 /// The VLAN this interface's frames carry, or zero for untagged.
 ///
 /// Zero on every lane, because QEMU's built-in network is untagged. It is a
 /// field rather than an assumption so that a tagged interface is a
 /// configuration change rather than a code change -- which is the point of
 /// RFC 0074's model.
-const NET_VLAN: u16 = 0;
+///
+/// **`bhaskix.vlan=<id>` sets it, and the SR550 needs it.** That machine's four
+/// ports are a switch-side LACP trunk carrying tagged VLANs 17, 5, 20, 10, 2,
+/// 3 and 50 -- told to this project on 2026-09-07. An untagged frame on a trunk
+/// port does not reach any of them, which is why no DHCP server has ever
+/// answered this machine and why every attempt to get one read as a quiet wire.
+static NET_VLAN: core::sync::atomic::AtomicU16 = core::sync::atomic::AtomicU16::new(0);
+
+/// Whether the bond over this machine's ports should be 802.3ad rather than
+/// active-backup. `bhaskix.bondlacp` sets it.
+static NET_BOND_LACP: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 /// The largest frame this interface carries.
 const NET_MTU: u16 = 1500;
@@ -14659,9 +14791,14 @@ fn publish_net_config_with(hhdm: u64, mac: u64, ports: u64) -> bool {
         NET_CONFIG_MARKER,
         mac,
         u64::from(address),
-        u64::from(NET_VLAN),
+        u64::from(NET_VLAN.load(core::sync::atomic::Ordering::Relaxed)),
         u64::from(NET_MTU),
         ports.max(1),
+        // **Which bond the interface should be.** Active-backup asks nothing of
+        // the switch and is the default; a switch-side port-channel needs
+        // 802.3ad, and on that wire active-backup is not merely worse -- the
+        // switch will not forward data to a member it has not bundled.
+        u64::from(NET_BOND_LACP.load(core::sync::atomic::Ordering::Relaxed)),
     ];
     // SAFETY: a frame this object owns, through the direct map. The marker goes
     // last, so a reader that catches this half-written sees no marker rather
@@ -16426,7 +16563,7 @@ fn time_the_burst(hhdm: u64) {
 /// such a NIC on its bus where the service was not given it. That is a fact
 /// about this kernel rather than about the machine, and leaving it unsaid is
 /// how a delegation that quietly stopped working would go unnoticed.
-fn report_x722(words: &[u64; 24]) {
+fn report_x722(words: &[u64; 28]) {
     /// Word 22's low four bits: delegated, reset, queues enabled, link up.
     const DELEGATED: u64 = 1;
     const RESET: u64 = 1 << 1;
@@ -16490,9 +16627,9 @@ fn report_x722(words: &[u64; 24]) {
 /// the bond still carries. So this waits for both, and says which one it got —
 /// a failover with no traffic after it is a bond that failed over into silence,
 /// and it must not print as a pass.
-fn report_bond(words: &mut [u64; 24], take: impl Fn(&mut [u64; 24])) {
+fn report_bond(words: &mut [u64; 28], take: impl Fn(&mut [u64; 28])) {
     /// Which member the bond is on, and what each member's link says.
-    fn members(words: &[u64; 24]) -> (u64, u64, u64) {
+    fn members(words: &[u64; 28]) -> (u64, u64, u64) {
         (words[17], words[18], words[19])
     }
 
@@ -16501,8 +16638,16 @@ fn report_bond(words: &mut [u64; 24], take: impl Fn(&mut [u64; 24])) {
         return;
     }
     println!(
-        "    net bond       {count} member(s), active-backup; traffic on port {active}, \
-         link up on {}",
+        "    net bond       {count} member(s), {}; traffic on port {active}, link up on {}",
+        // **The mode, not a word that was always printed.** This said
+        // "active-backup" as a literal, so it said it of an 802.3ad bond too
+        // and no reader could tell -- caught by the project lead on
+        // 2026-09-08, on a boot that had asked for LACP.
+        if NET_BOND_LACP.load(core::sync::atomic::Ordering::Relaxed) {
+            "802.3ad"
+        } else {
+            "active-backup"
+        },
         if links == 0 {
             "no member at all"
         } else if links == 0b11 {
@@ -16524,6 +16669,12 @@ fn report_bond(words: &mut [u64; 24], take: impl Fn(&mut [u64; 24])) {
     for _ in 0..(patience / 50) {
         take(words);
         failed_over = words[20] != 0;
+        // **Word 26 is the driver's own count from the instant it failed
+        // over**, and it is the one that answers the question. This compared
+        // against a baseline taken when *this* window opened, which is later --
+        // sometimes a minute later, because the wait for a first frame runs
+        // first -- so a member that had been carrying since the change looked
+        // like one that had carried nothing.
         carried = words[9] > handed;
         if failed_over && carried {
             break;
@@ -16539,9 +16690,19 @@ fn report_bond(words: &mut [u64; 24], take: impl Fn(&mut [u64; 24])) {
             words[9] - handed
         );
     } else if failed_over {
+        // **What "nothing crossed" could mean, said rather than left to be
+        // guessed.** The first boot to print this line was read as a switch
+        // refusing a moved address, and it was a driver that sent nothing:
+        // the X722 bond forwarded `bin/ipd`'s frames and had no announcement of
+        // its own, so a failover had nothing to be measured by. These are the
+        // numbers that tell those two apart -- frames sent out of the new
+        // member, and frames the backup had been receiving all along while it
+        // was the backup.
         println!(
             "\x1b[91m    net bond       failed over to port {active} and nothing has crossed \
-             since: the bond selected a member that carries nothing\x1b[0m"
+             since: {} sent from it, {} frame(s) had reached the backup before the \
+             change\x1b[0m",
+            words[10], words[21]
         );
     } else {
         println!(
@@ -16565,33 +16726,56 @@ fn report_net_after_exchange(hhdm: u64) {
         return;
     }
     // **Twenty-four words**, seventeen of which are the driver's original
-    // report, five the bond's and two the X722's -- members, which one carries
+    // report, five the bond's and four the X722's -- members, which one carries
     // traffic, each member's link, how many times it has failed over, and
     // frames dropped from a member that is not carrying traffic. The length is
     // derived from the array, for the reason the `bin/ipd` report below gives
     // at length: a length written twice is wrong in one of the two places.
-    let mut words = [0u64; 24];
-    // SAFETY: a frame this object owns, through the direct map, read as the
-    // little-endian words the driver wrote there -- `words.len() * 8` bytes of
-    // a page, so the read cannot reach past the frame.
-    let raw = unsafe {
-        core::slice::from_raw_parts(
-            (hhdm + frames[NETD_REPORT_PAGE]) as *const u8,
-            words.len() * 8,
-        )
-    };
-    // Read again rather than once: the driver writes this page while it is
-    // read, and a bond that fails over does so *after* the first look.
-    let take = |words: &mut [u64; 24]| {
+    let mut words = [0u64; 28];
+    let at = hhdm + frames[NETD_REPORT_PAGE];
+    // **Read again rather than once, and read it *volatile*.**
+    //
+    // The driver writes this page while it is read -- it is another domain on
+    // another CPU -- and a bond that fails over does so *after* the first look.
+    // This used a plain slice, which tells the compiler nothing of the sort:
+    // no writer is visible to it, so the loads were hoistable straight out of
+    // the polling loop below, and the loop then examined one snapshot twelve
+    // hundred times.
+    //
+    // **It had been that way since the loop was written and passed by luck of
+    // codegen.** Widening the array from 24 words to 28 changed the optimiser's
+    // mind, `make test-bond` began failing every run, and six hypotheses died
+    // before the numbers said it: the words read `2 0 3 0 0` -- the state
+    // *before* the link went down -- while `bin/netd` had long since failed
+    // over. The intent was in the comment; the guarantee was not in the code.
+    let take = |words: &mut [u64; 28]| {
         for (index, word) in words.iter_mut().enumerate() {
-            let mut buffer = [0u8; 8];
-            buffer.copy_from_slice(&raw[index * 8..index * 8 + 8]);
-            *word = u64::from_le_bytes(buffer);
+            // SAFETY: a frame this object owns, through the direct map, at a
+            // word inside it -- `words.len() * 8` is far short of a page.
+            // Volatile because the writer is a domain this kernel cannot see
+            // from here, which is the whole point.
+            *word = unsafe { core::ptr::read_volatile((at + index as u64 * 8) as *const u64) };
         }
     };
     take(&mut words);
     if words[0] != NETD_MARKER {
         return;
+    }
+    // **Ask for the failover, where this boot said to** -- RFC 0076 step 3.
+    //
+    // The word goes in before the patience windows below, so that `bin/netd`
+    // finds it while they are waiting. It is the one thing written *into* this
+    // page rather than read out of it, and it is a request rather than a
+    // command: the driver takes a link down only once its bond has carried
+    // something, because a failover from a member that never carried anything
+    // proves nothing and would read the same in the report.
+    if X722_FAILOVER.load(Ordering::Relaxed) {
+        let at = (hhdm + frames[NETD_REPORT_PAGE] + NETD_FAILOVER_REQUEST) as *mut u64;
+        // SAFETY: a frame this object owns, through the direct map, at a word
+        // past the report `netd` writes -- the offset `ring::FAILOVER_REQUEST`
+        // names on the other side. The address is computed outside the block so
+        // that one line is unsafe rather than six.
+        unsafe { core::ptr::write_volatile(at, 1) };
     }
     // **Wait for a frame, where this image was told to.** RFC 0075 step 4: word
     // 9 is what `bin/netd` has handed across, and on the one machine that has
@@ -16661,7 +16845,7 @@ fn report_net_after_exchange(hhdm: u64) {
     // stayed at 224: the kernel panicked reading past the end and the boot
     // stalled. The length is derived from the array now, so there is one place
     // to be wrong instead of three.
-    let mut ipd = [0u64; 30];
+    let mut ipd = [0u64; 32];
     // SAFETY: a frame this object owns, through the direct map, read as the
     // little-endian words the service wrote there -- `ipd.len() * 8` bytes of
     // a page, so the read cannot reach past the frame.
@@ -16679,9 +16863,21 @@ fn report_net_after_exchange(hhdm: u64) {
     let patience = LACP_PATIENCE_MS.load(Ordering::Relaxed);
     if patience > 0 {
         for _ in 0..(patience / 50) {
-            let mut word = [0u8; 8];
-            word.copy_from_slice(&bytes[LACP_WORD * 8..LACP_WORD * 8 + 8]);
-            if u64::from_le_bytes(word) & AGGREGATED == AGGREGATED {
+            // **Volatile, for the reason the net report's loop now carries.**
+            // Waiting on another domain through a plain slice lets the compiler
+            // hoist the load clean out of the loop -- nothing tells it the page
+            // has another writer -- and the wait then examines one snapshot
+            // until it gives up. That is what broke `make test-bond`, and this
+            // loop is the same shape waiting on the same kind of page: it
+            // waits for LACP to aggregate, so a hoisted load here would report
+            // a switch that never answered no matter what the switch did.
+            //
+            // SAFETY: a word inside a frame this object owns, through the
+            // direct map -- the same read the slice above describes.
+            let word = unsafe {
+                core::ptr::read_volatile((hhdm + pages[0] + LACP_WORD as u64 * 8) as *const u64)
+            };
+            if word & AGGREGATED == AGGREGATED {
                 break;
             }
             wait_millis(50);
@@ -16722,8 +16918,10 @@ fn report_net_after_exchange(hhdm: u64) {
         NET_PORTS.load(core::sync::atomic::Ordering::Acquire),
         if ipd[28] & 0xffff_ffff == 0 {
             "a port directly"
+        } else if ipd[31] != 0 {
+            "an 802.3ad bond"
         } else {
-            "a bond"
+            "an active-backup bond"
         }
     );
     println!(
@@ -16735,6 +16933,18 @@ fn report_net_after_exchange(hhdm: u64) {
     // station's own state flags; bit 48 says a partner has been heard from at
     // all, which is the difference between "nobody answered" and "we have not
     // spoken".
+    // **What was said and what came back**, so silence has an author. Word 29
+    // is written only when a PDU *arrives*, so a boot that never spoke and a
+    // boot whose partner is mute both leave it zero -- and this line is what
+    // tells them apart.
+    let lacp_sent = ipd[30] >> 32;
+    let lacp_heard = ipd[30] & 0xffff_ffff;
+    if lacp_sent > 0 || lacp_heard > 0 {
+        println!(
+            "    ipd lacp       {lacp_sent} LACPDU(s) sent, {lacp_heard} slow-protocol frame(s) \
+             heard back"
+        );
+    }
     if ipd[LACP_WORD] != 0 {
         let flags = ipd[LACP_WORD] & 0xff;
         let heard = ipd[LACP_WORD] >> 32 & (1 << 16) != 0;
@@ -23519,9 +23729,30 @@ fn iommu_bringup(handoff: &Handoff) -> Option<(iommu::Report, iommu::Window)> {
     // unsolicited frame arrives at a moment nobody chose.
     //
     // Silent where there is no such device, which is every lane in QEMU.
-    if let Some((nic, _)) = find_foreign_nic() {
+    //
+    // **Every port that will be delegated, not just the first** -- RFC 0076
+    // step 1. This said `find_foreign_nic()`, which is the first of four, and
+    // the boot of 2026-09-07 is what that cost: `bin/netd` was given port 0 and
+    // refused port 1, because `present_for` answered no for a device that had
+    // registers and no page table. A bond needs two members and the delegation
+    // could only ever have produced one.
+    //
+    // **A domain id each, and they must differ.** The hardware is entitled to
+    // share IOTLB entries between devices in one domain, and two ports of a
+    // bond are on one network -- so a shared translation would let a frame
+    // arriving on the backup land in the active member's buffers. That is the
+    // same argument RFC 0074 made for the second virtio NIC, and it is stronger
+    // here because these two ports are meant to carry the same address.
+    for nth in 0..X722_MEMBERS {
+        let Some((nic, _)) = find_foreign_nic_nth(nth as usize) else {
+            break;
+        };
         let delegated = (nic.bus, nic.device, nic.function);
-        match iommu::attach_device(&window, delegated, 5, hhdm) {
+        // 5 is the id this device has had since RFC 0072; 7 is the first free
+        // one after the six above. Written out rather than computed, so that a
+        // collision is visible here rather than arithmetic somewhere else.
+        let domain = [5u16, 7][nth as usize];
+        match iommu::attach_device(&window, delegated, domain, hhdm) {
             Some(nic_window) => {
                 if iommu::verify_window(&nic_window, iommu::windows_on(delegated.0) + 1, hhdm)
                     && iommu::install(delegated, found, nic_window)
@@ -23537,11 +23768,13 @@ fn iommu_bringup(handoff: &Handoff) -> Option<(iommu::Report, iommu::Window)> {
                         );
                     }
                     println!(
-                        "    iommu window   {:02x}:{:02x}.{} translating too, a foreign NIC's own \
-                         page table and domain, {} in use",
+                        "    iommu window   {:02x}:{:02x}.{} translating too, x722 port {}'s own \
+                         page table and domain {}, {} in use",
                         delegated.0,
                         delegated.1,
                         delegated.2,
+                        nth,
+                        domain,
                         iommu::windows()
                     );
                 } else {

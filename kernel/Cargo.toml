@@ -755,7 +755,16 @@ asm_budget = 10
 # What is left of a NIC in here is the delegation: the register pages named,
 # the memory created, and the report read back. Two `unsafe` lines name the
 # device to the PCI configuration space, and the rest is capabilities.
-unsafe_budget = 2018
+#
+# 2019 at RFC 0076 step 3: **one** volatile write, asking `bin/netd` to prove a
+# failover. It is the only word this kernel writes into that report page, which
+# otherwise runs the other way -- and on a machine with a hypervisor the harness
+# would drop the link from outside instead, which is why this exists only for
+# the one machine that has nobody outside.
+#
+# One line and not six: the address is computed before the block, so what is
+# unsafe is the store and nothing else.
+unsafe_budget = 2019
 # Up thirty-one for RFC 0005 step 9's socket probe -- `ring3_socketeer`, which
 # is `ring3_lister` with a `sockaddr_in6` copied in beside its code instead of
 # two filenames. The same two blocks every hosted probe has: one

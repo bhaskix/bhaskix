@@ -109,6 +109,44 @@ asm_budget = 3
 # next one raises the number rather than finding it already spent, which is
 # what this note is for.
 #
+# 344 at RFC 0076 step 2: the bond's own five words. `x722_bond_report` writes
+# members, active member, link bitmap, failovers and frames dropped from the
+# backup into the same five slots `bond_report` uses -- one volatile store per
+# word, in a loop the counter reads as five lines.
+#
+# **They are not shared with `bond_report` and the reason is the same one the
+# report above gives**: that function derives its numbers from an array of
+# virtio `Port`s, and a machine whose only NIC is an X722 has none. The words
+# are identical; where they come from is not. What *is* shared is the rule that
+# produces the active member -- `select`, called by both loops -- which is the
+# part that would actually be wrong if it drifted.
+#
+# 345 at RFC 0076 step 3: one volatile *read*, and it is the only one in this
+# file that runs the other way. `failover_requested` reads a word the kernel
+# writes into the report page, because a boot has to be able to ask for a
+# failover and on real hardware there is no hypervisor monitor to ask through.
+# One word, well clear of the report's twenty-six, and it is a request rather
+# than a command -- the driver acts on it only once its bond has carried
+# something.
+#
+# 347 at RFC 0076 step 3's second try: the X722 bond's own announcement. Two
+# lines -- the call that fills a frame and the `unsafe fn` boundary it crosses
+# -- and the frame itself is *shared* with the virtio bond rather than written
+# twice, which is why this is two and not thirty.
+#
+# **It exists because its absence read as a hardware verdict.** The first boot
+# to fail over printed "nothing has crossed since", which looks like a switch
+# refusing an address that moved. It was a driver with nothing to send: this
+# bond forwarded `bin/ipd`'s frames and had no frame of its own, so the failover
+# had nothing to be measured by.
+#
+# 348 at RFC 0076 step 3's third try: one more store, and it exists because a
+# measurement was taken from the wrong instant. The kernel's report compares
+# frames handed against a baseline captured when *its* window opens; the
+# failover happens earlier, during the wait for a first frame, so a member that
+# had been carrying since the change read as one that had carried nothing. This
+# word is the same quantity counted by the side that knows when the change was.
+#
 # Every line of it is a volatile access to a mapping this program was granted,
 # which is the operation `bhaskix-i40e` forbids itself so that it lands here.
-unsafe_budget = 339
+unsafe_budget = 348

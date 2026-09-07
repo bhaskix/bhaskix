@@ -429,6 +429,52 @@ const _: () = assert!(
     "the rings, the switch buffer and the VSI buffer must share one page"
 );
 
+/// How long the `Manage MAC Address Read` return buffer is -- Table's own
+/// layout runs to offset 23, and firmware writes a whole 24 bytes.
+pub const MAC_BUFFER_BYTES: u16 = 32;
+
+/// Where it sits in the admin page, after the VSI buffer.
+pub const MAC_BUFFER_OFFSET: u64 = VSI_BUFFER_OFFSET + VSI_BUFFER_BYTES as u64;
+
+const _: () = assert!(
+    MAC_BUFFER_OFFSET + MAC_BUFFER_BYTES as u64 <= 4096,
+    "the MAC buffer must fit the admin page with the rings and the others"
+);
+
+/// `Setup Link and Restart Auto-Negotiation` -- §38.11.3.1.3, opcode 0x0605.
+///
+/// **A direct command**: Table 38-58's `Datalen` is *"must be 0x0, value is
+/// ignored"*, and everything it says is in one byte of the descriptor.
+const OPCODE_SET_LINK_RESTART_AN: u16 = 0x0605;
+/// Byte 16.1: *"set to 1b to restart the link"*.
+const PHY_RESTART_LINK: u8 = 1 << 1;
+/// Byte 16.2: *"set to 1b to enable link. Set to 0b to disable link"*.
+const PHY_ENABLE_LINK: u8 = 1 << 2;
+
+/// `Manage MAC Address Read` -- 38.27.x, opcode 0x0107.
+const OPCODE_MAC_ADDRESS_READ: u16 = 0x0107;
+/// Response byte 16.4: the PF LAN address in the buffer is valid.
+const MAC_LAN_VALID: u8 = 1 << 4;
+/// Byte 16.6: the port address is.
+const MAC_PORT_VALID: u8 = 1 << 6;
+
+/// The addresses firmware holds for this function, from `Manage MAC Address
+/// Read`.
+///
+/// **This is where a station address comes from**, and `PRTPM_SAL`/`PRTPM_SAH`
+/// is not: 38.17.3's own table lists the LAN MAC address as coming from
+/// *"Manage MAC address read"* and lists `PRTPM_SAL/H` under **WoL MAC
+/// Address**. Reading the WoL registers worked on the SR550's first port
+/// because the two happen to be equal there, and gave zeros on the second
+/// because its `AV` bit is clear -- measured 2026-09-07.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct MacAddresses {
+    /// The PF's own LAN address, or `None` where firmware says it is not valid.
+    pub lan: Option<[u8; 6]>,
+    /// The port's, which several functions of one port share.
+    pub port: Option<[u8; 6]>,
+}
+
 /// One transmit data descriptor, in bytes -- Table 38-425 and 38.31.2.1.1.
 /// Qword 0 is the packet buffer address; qword 1 carries the type, the command
 /// and the length.
@@ -1392,6 +1438,54 @@ pub const fn page_is_mapped(offset: u64) -> bool {
     false
 }
 
+/// What one port's grant looks like, as offsets from its base slot.
+///
+/// **The kernel and the driver each used to spell this out**, and the
+/// arithmetic was duplicated across two files with no way to check that they
+/// agreed. RFC 0075 step 4 records what that cost: the slot numbers 54, 55 and
+/// 56, chosen by hand beside a page range that grew past them, and an install
+/// that refused. They were computed after that -- and computed *twice*. With a
+/// second port the expression gains a multiply, so it lives here once, in the
+/// crate that owns [`REGISTER_PAGES`] and is already linked by both sides.
+///
+/// **The pages go last because they are the part that grows.** A variable-length
+/// run followed by fixed slots is a range that grows into its neighbours; one
+/// followed by nothing is not. That is the same bug as the paragraph above,
+/// prevented by layout rather than by remembering.
+pub mod grant {
+    /// Slot: the port's own DMA window.
+    pub const WINDOW: u64 = 0;
+    /// Slot: the page holding its admin rings and the buffers behind them.
+    pub const MEMORY: u64 = 1;
+    /// Slot: the private memory the HMC fetches queue contexts from.
+    pub const HMC: u64 = 2;
+    /// Slot: the receive ring and the buffers behind it.
+    pub const RINGS: u64 = 3;
+    /// Slot: the transmit ring and the packet buffer it posts from.
+    pub const TX: u64 = 4;
+    /// Slot: the first of the port's register pages, and the last fixed offset.
+    pub const PAGES: u64 = 5;
+
+    /// How many slots one port costs, all told.
+    pub const SPAN: u64 = PAGES + super::REGISTER_PAGES.len() as u64;
+
+    /// How many 4 KiB pages the [`HMC`] object holds: a page-descriptor page
+    /// and the fifteen it names.
+    ///
+    /// **Sixteen because `shared::MAX_FRAMES` is sixteen**, which is the reason
+    /// the private memory is its own object rather than part of a larger one.
+    /// It lives here for the same reason the slot offsets do: the kernel grants
+    /// this many and the driver must refuse a layout that needs more, and those
+    /// two numbers being written in two files is how they drift.
+    pub const HMC_PAGES: u64 = 16;
+
+    /// The base slot of port `nth`, counting from `first`.
+    #[must_use]
+    pub const fn base(first: u64, nth: u64) -> u64 {
+        first + nth * SPAN
+    }
+}
+
 /// A device's registers, without an address.
 ///
 /// **This is what keeps the crate `forbid(unsafe_code)` honestly** rather than
@@ -2169,16 +2263,37 @@ impl<R: Registers> Device<R> {
         }
     }
 
-    /// Which LAN queues this PF owns, `(first, last)` in the device's absolute
-    /// numbering -- `PFLAN_QALLOC` -- or `None` if its `VALID` flag is clear,
-    /// which the datasheet says cannot be true of an active PF.
+    /// Which LAN queues this PF owns: `(first, count)` -- `PFLAN_QALLOC`'s
+    /// `FIRSTQ` in the device's absolute numbering, and **how many** there are
+    /// -- or `None` if its `VALID` flag is clear, which the datasheet says
+    /// cannot be true of an active PF.
+    ///
+    /// **The second value used to be `LASTQ`** and a caller multiplied by it as
+    /// though it were a count. See the body for what that cost and why the
+    /// count is returned instead of the raw field.
     #[must_use]
     pub fn queue_allocation(&self) -> Option<(u16, u16)> {
         let value = self.read(PFLAN_QALLOC);
         if value & QALLOC_VALID == 0 {
             return None;
         }
-        Some(((value & 0x7ff) as u16, ((value >> 16) & 0x7ff) as u16))
+        let first = (value & 0x7ff) as u16;
+        let last = ((value >> 16) & 0x7ff) as u16;
+        // **A count, not `LASTQ`.** This returned the register's two raw fields
+        // and the caller named the second one `queues` and multiplied by it --
+        // which is the *last index*, not how many there are.
+        //
+        // On the first function of a card that is nearly harmless, because
+        // `FIRSTQ` is zero there and `LASTQ` is one less than the count. On the
+        // second it is not: the SR550's `b1:00.1` owns queues 384..=767, so a
+        // layout sized by 767 instead of 384 wanted **30 backing pages and put
+        // its context on page 24**, against sixteen granted -- both numbers
+        // measured on the boot of 2026-09-07 that refused to bring it up, and
+        // both reproduced exactly by this arithmetic.
+        //
+        // Returning the count is the fix rather than fixing the caller: two
+        // raw fields with no units are what invited the mistake.
+        Some((first, last.saturating_sub(first).saturating_add(1)))
     }
 
     /// Whether the device is still in PXE mode -- `GLLAN_RCTL_0.PXE_MODE`,
@@ -3124,6 +3239,96 @@ impl<R: Registers> Device<R> {
         buffer.read(0, &mut bytes);
         Ok(SwitchConfiguration::parse(&bytes))
     }
+
+    /// Enables or disables this port's link -- `Restart AN`, opcode 0x0605.
+    ///
+    /// **This is the only instrument for the job, and the datasheet says so**:
+    /// Table 38-58's note reads *"used by the device driver to enable/disable
+    /// the link without modifying the other link settings"*. Byte 16 bit 1
+    /// restarts the link and bit 2 carries the state, so down is `0b010` and up
+    /// is `0b110` — the restart bit is set either way, which is what the table
+    /// itself describes firmware doing when it issues this after a `Set PHY
+    /// Config`.
+    ///
+    /// **It touches no NVM.** `Set PHY Config` can be made persistent and this
+    /// cannot, so a port cannot be left dark across a power cycle by a boot
+    /// that dies between the down and the up. That property is the reason to
+    /// prefer this command, and it is worth stating because the alternative is
+    /// a way to leave a port off on somebody else's machine.
+    ///
+    /// **It is a real link down**: the PHY stops, so the switch's own port goes
+    /// down with it and its MAC table ages out — which is the half of a failure
+    /// that a hypervisor's `set_link` on a socket netdev cannot reproduce, and
+    /// the half RFC 0074 named as unproven.
+    ///
+    /// # Errors
+    ///
+    /// As [`Device::command`].
+    pub fn set_link(
+        &mut self,
+        ring: &mut impl Dma,
+        up: bool,
+        spins: u32,
+    ) -> Result<(), CommandError> {
+        let mut request = Descriptor::direct(OPCODE_SET_LINK_RESTART_AN);
+        // Byte 16 is word 4's low byte, by Table 38-340's numbering.
+        request.words[4] = u32::from(PHY_RESTART_LINK | if up { PHY_ENABLE_LINK } else { 0 });
+        self.command(ring, request, spins)?;
+        Ok(())
+    }
+
+    /// Asks firmware for this function's station addresses -- `Manage MAC
+    /// Address Read`, opcode 0x0107.
+    ///
+    /// `device` is the buffer as the device issues it, `buffer` the same
+    /// [`MAC_BUFFER_BYTES`] as this driver reaches them.
+    ///
+    /// **The response's own validity bits decide**, not this code: byte 16.4
+    /// says the PF LAN address is real and 16.6 the port's, and an address
+    /// firmware has not vouched for is `None` rather than zeros. A frame sent
+    /// from an address this port does not own is one a switch may drop, and
+    /// worse, one whose replies go elsewhere.
+    ///
+    /// # Errors
+    ///
+    /// As [`Device::command`], and [`CommandError::ShortBuffer`] if `buffer` is
+    /// smaller than [`MAC_BUFFER_BYTES`].
+    pub fn mac_addresses(
+        &mut self,
+        ring: &mut impl Dma,
+        device: u64,
+        buffer: &mut impl Dma,
+        spins: u32,
+    ) -> Result<MacAddresses, CommandError> {
+        buffer.zero(0, MAC_BUFFER_BYTES as usize);
+        let reply = self.command(
+            ring,
+            Descriptor::with_buffer(OPCODE_MAC_ADDRESS_READ, device, MAC_BUFFER_BYTES),
+            spins,
+        )?;
+        // Firmware has completed the command, so the buffer is its writes and
+        // not the zeroes above -- read back through `Dma`, which is the whole
+        // reason that trait exists.
+        let mut bytes = [0u8; MAC_BUFFER_BYTES as usize];
+        buffer.read(0, &mut bytes);
+
+        // *"All MAC addresses are in big endian order"* -- the note under the
+        // response's buffer layout. So the six bytes are already wire order and
+        // are taken as they lie, unlike `PRTPM_SAL`'s little-endian halves.
+        let take = |at: usize| {
+            let mut address = [0u8; 6];
+            address.copy_from_slice(&bytes[at..at + 6]);
+            address
+        };
+        let flags = reply.byte(16);
+        Ok(MacAddresses {
+            // Buffer offset 0-5: "Current device value of the PF LAN MAC
+            // address. Validated by LAN Address Valid flag."
+            lan: (flags & MAC_LAN_VALID != 0).then(|| take(0)),
+            // Offset 12-17: the port's.
+            port: (flags & MAC_PORT_VALID != 0).then(|| take(12)),
+        })
+    }
 }
 
 #[cfg(test)]
@@ -3367,6 +3572,12 @@ mod tests {
         /// Makes hardware set `mask` at `offset` after `reads` reads.
         fn sets(self, offset: u64, mask: u32, reads: u32) -> Self {
             self.sets.set((offset, mask, reads));
+            self
+        }
+
+        /// Seeds a read-only register with the value hardware would hold.
+        fn with(self, offset: u64, value: u32) -> Self {
+            self.put(offset, value);
             self
         }
 
@@ -4245,5 +4456,264 @@ mod tests {
         assert_eq!(delta.octets, 60);
         assert_eq!(delta.unicast, 0);
         assert_eq!(baseline.since(&later).packets(), 0, "never runs backwards");
+    }
+    /// **Two ports fit a capability space and three do not**, which is the
+    /// whole of why RFC 0076 bonds two.
+    ///
+    /// The number is `cap::CSPACE_SLOTS`, which this crate cannot name -- it
+    /// sits below the kernel and must stay there. So it is written down with
+    /// the name it has on the other side, and this test is what says the two
+    /// have not drifted.
+    #[test]
+    fn two_ports_fit_a_capability_space_and_three_do_not() {
+        /// `cap::CSPACE_SLOTS`.
+        const SLOTS: u64 = 128;
+        /// The first slot a port may use; below it are the domain's own.
+        const FIRST: u64 = 16;
+
+        assert_eq!(grant::SPAN, 42, "five fixed slots and thirty-seven pages");
+        assert!(
+            grant::base(FIRST, 2) <= SLOTS,
+            "two ports must fit: {} slots used of {SLOTS}",
+            grant::base(FIRST, 2)
+        );
+        assert!(
+            grant::base(FIRST, 3) > SLOTS,
+            "three must not, and the RFC says two because of this"
+        );
+    }
+
+    /// Every fixed offset is distinct, and every one of them is below the
+    /// pages.
+    ///
+    /// **The second half is the one that matters.** The pages are the only
+    /// variable-length run in the grant, and the boot RFC 0075 step 4 records
+    /// was a fixed slot sitting where that run grew to. A fixed offset that
+    /// ever exceeds `PAGES` is that bug returning, so it is asserted rather
+    /// than left to the layout looking obviously right.
+    #[test]
+    fn the_pages_are_last_so_nothing_can_grow_into_a_fixed_slot() {
+        let fixed = [
+            grant::WINDOW,
+            grant::MEMORY,
+            grant::HMC,
+            grant::RINGS,
+            grant::TX,
+        ];
+        for (index, one) in fixed.iter().enumerate() {
+            assert!(*one < grant::PAGES, "offset {one} is not below the pages");
+            for other in &fixed[index + 1..] {
+                assert_ne!(one, other, "two grant slots share an offset");
+            }
+        }
+        assert_eq!(
+            grant::PAGES as usize + REGISTER_PAGES.len(),
+            grant::SPAN as usize,
+            "the span ends where the pages do, so nothing follows them"
+        );
+    }
+
+    /// Port `n`'s slots and port `n + 1`'s do not overlap.
+    #[test]
+    fn one_ports_slots_end_before_the_nexts_begin() {
+        const FIRST: u64 = 16;
+        for nth in 0..3 {
+            let base = grant::base(FIRST, nth);
+            let next = grant::base(FIRST, nth + 1);
+            assert_eq!(
+                base + grant::SPAN,
+                next,
+                "port {nth} runs into port {}",
+                nth + 1
+            );
+            assert!(
+                base + grant::PAGES + REGISTER_PAGES.len() as u64 <= next,
+                "port {nth}'s last register page lands in port {}'s window",
+                nth + 1
+            );
+        }
+    }
+    /// **`PFLAN_QALLOC` gives a first and a last; a layout needs a count.**
+    ///
+    /// The numbers are the SR550's own, read off `b1:00.0` and `b1:00.1` on
+    /// 2026-09-07. The first function owns queues 0..=383 and the second owns
+    /// 384..=767 -- the same 384 queues each, which is exactly what makes the
+    /// mistake invisible on the first one: there `LASTQ` is 383, one off a
+    /// count of 384, and every layout still fits. On the second, `LASTQ` is 767
+    /// and a layout sized by it wants **thirty backing pages with its context
+    /// on page 24**, against the sixteen a port is granted. Both of those
+    /// numbers came off a boot, and both are reproduced here in arithmetic.
+    #[test]
+    fn a_queue_allocation_is_a_count_not_a_last_index() {
+        /// `PFLAN_QALLOC` as the two functions read it.
+        fn allocation(first: u32, last: u32) -> u32 {
+            QALLOC_VALID | (last << 16) | first
+        }
+
+        let port0 = Device::new(Fake::new().with(PFLAN_QALLOC, allocation(0, 383)));
+        let port1 = Device::new(Fake::new().with(PFLAN_QALLOC, allocation(384, 767)));
+
+        assert_eq!(port0.queue_allocation(), Some((0, 384)));
+        assert_eq!(
+            port1.queue_allocation(),
+            Some((384, 384)),
+            "the second function owns as many queues as the first, not twice as many"
+        );
+
+        // And the layout that count produces has to fit what a port is granted.
+        for (name, device) in [("port 0", &port0), ("port 1", &port1)] {
+            let (_first, count) = device.queue_allocation().expect("valid");
+            // 128 bytes a transmit context, 32 a receive one -- Tables 38-428
+            // and 38-419, the sizes `program_lan_private_memory` reads back.
+            let receive_base = receive_base_after(0, u32::from(count), 7);
+            let end = object_area_end(receive_base, u32::from(count), 5);
+            // The page-descriptor page, then the pages it names.
+            let pages = u64::from(backing_pages_to(end)) + 1;
+            assert!(
+                pages <= grant::HMC_PAGES,
+                "{name}'s layout wants {pages} page(s), more than a port is granted"
+            );
+        }
+
+        // The bug, stated as arithmetic: `LASTQ` used as a count is what put
+        // the second port's context on page 24 and asked for 30 pages.
+        //
+        // `receive_base_after` answers in **FPM base units of 512 bytes**, not
+        // in bytes -- which is why the page is that value scaled, and worth
+        // stating because getting it wrong once here produced a test that
+        // failed against numbers the hardware had already confirmed.
+        let wrong = receive_base_after(0, 767, 7);
+        assert_eq!(
+            u64::from(wrong) * FPM_BASE_UNITS / HMC_PAGE_BYTES,
+            24,
+            "the context page the SR550 reported"
+        );
+        assert_eq!(
+            backing_pages_to(object_area_end(wrong, 767, 5)),
+            30,
+            "the backing pages the SR550 reported"
+        );
+    }
+    /// **A station address comes from firmware, not from `PRTPM_SAL`.**
+    ///
+    /// 38.17.3's table lists the LAN MAC address as coming from *"Manage MAC
+    /// address read"* and lists `PRTPM_SAL/H` under *WoL MAC Address* -- two
+    /// different addresses that happen to be equal on the SR550's first port
+    /// and are not on its second, where the WoL register's `AV` bit is clear
+    /// and the driver reported `000000000000` for a port whose queues had come
+    /// up. Measured 2026-09-07.
+    ///
+    /// The buffer offsets are the response's own: PF LAN SA at 0, Port SA at
+    /// 12, and *"all MAC addresses are in big endian order"* -- so the six
+    /// bytes are wire order and are not reversed.
+    #[test]
+    fn a_station_address_is_asked_of_firmware_and_its_valid_bits_believed() {
+        /// A reply descriptor: done, with `flags` in byte 16.
+        fn reply(flags: u8) -> [u8; 17] {
+            let mut bytes = [0u8; 17];
+            bytes[..4].copy_from_slice(&u32::from(FLAG_DD).to_le_bytes());
+            bytes[16] = flags;
+            bytes
+        }
+
+        let lan = [0x08, 0x94, 0xef, 0x7a, 0xfc, 0x8f];
+        let port = [0x08, 0x94, 0xef, 0x7a, 0xfc, 0x8e];
+
+        let mut ring = FakeDma::new().answers(0, &reply(MAC_LAN_VALID | MAC_PORT_VALID));
+        let mut device = Device::new(Fake::new());
+        device.enable_admin_queues(0, 0);
+
+        // **Through `answers`, not `write`.** The command zeroes the buffer
+        // before posting -- so a stale count cannot be read as this answer --
+        // and a fake that wrote once would be wiped by it. `answers` re-applies
+        // on every read, which is what firmware filling a buffer looks like
+        // from here. PF LAN SA at 0, Port SA at 12.
+        let mut payload = [0u8; 18];
+        payload[..6].copy_from_slice(&lan);
+        payload[12..].copy_from_slice(&port);
+        let mut buffer = FakeDma::new().answers(0, &payload);
+
+        let found = device
+            .mac_addresses(&mut ring, 0x1_0000_0000, &mut buffer, 16)
+            .expect("firmware answered");
+        assert_eq!(found.lan, Some(lan), "big endian, taken as it lies");
+        assert_eq!(found.port, Some(port));
+
+        // **And a flag firmware did not set means no address, not zeros.** This
+        // is the half that matters: an address nobody vouched for, sent from,
+        // is a frame a switch may drop and whose replies go elsewhere.
+        let mut quiet = FakeDma::new().answers(0, &reply(0));
+        let mut device = Device::new(Fake::new());
+        device.enable_admin_queues(0, 0);
+        let mut buffer = FakeDma::new().answers(0, &lan);
+        let found = device
+            .mac_addresses(&mut quiet, 0x1_0000_0000, &mut buffer, 16)
+            .expect("firmware answered");
+        assert_eq!(found.lan, None, "no valid bit, no address");
+        assert_eq!(found.port, None);
+    }
+    /// **Down clears the enable bit and up sets it; the restart bit is set
+    /// either way.** Table 38-58: byte 16.1 *"set to 1b to restart the link"*,
+    /// byte 16.2 *"set to 1b to enable link. Set to 0b to disable link"*.
+    ///
+    /// `Datalen` stays zero because this is a direct command -- *"must be 0x0,
+    /// value is ignored"* -- and a length written into a command that has no
+    /// buffer is a descriptor firmware may read an address out of.
+    ///
+    /// **Posted into a ring nobody answers**, on purpose. A fake that completes
+    /// every command marks each slot done by writing word 0, which is where the
+    /// opcode lives -- so the thing under test would be overwritten by the
+    /// thing simulating firmware. The command times out; the descriptor it
+    /// wrote is still there, and the descriptor is the point.
+    #[test]
+    fn a_link_is_downed_by_the_command_that_says_it_does_not_modify_anything_else() {
+        fn posted(up: bool) -> Descriptor {
+            let mut ring = FakeDma::new();
+            let mut device = Device::new(Fake::new());
+            device.enable_admin_queues(0, 0);
+            assert_eq!(
+                device.set_link(&mut ring, up, 4),
+                Err(CommandError::NoAnswer),
+                "nothing answered, which is what leaves the descriptor to read"
+            );
+            let mut bytes = [0u8; DESCRIPTOR_BYTES as usize];
+            ring.read(0, &mut bytes);
+            Descriptor {
+                words: core::array::from_fn(|index| {
+                    u32::from_le_bytes([
+                        bytes[index * 4],
+                        bytes[index * 4 + 1],
+                        bytes[index * 4 + 2],
+                        bytes[index * 4 + 3],
+                    ])
+                }),
+            }
+        }
+
+        let down = posted(false);
+        assert_eq!(down.half(2), OPCODE_SET_LINK_RESTART_AN, "opcode 0x0605");
+        assert_eq!(down.half(4), 0, "Datalen must be zero: this is direct");
+        assert_eq!(
+            down.byte(16) & PHY_ENABLE_LINK,
+            0,
+            "bit 16.2 clear is what disables the link"
+        );
+        assert_ne!(
+            down.byte(16) & PHY_RESTART_LINK,
+            0,
+            "bit 16.1 is what makes the change take effect"
+        );
+
+        let up = posted(true);
+        assert_eq!(
+            up.byte(16),
+            PHY_RESTART_LINK | PHY_ENABLE_LINK,
+            "restart and enable together is how the port comes back"
+        );
+        assert_ne!(
+            up.byte(16),
+            down.byte(16),
+            "up and down cannot be the same descriptor"
+        );
     }
 }
