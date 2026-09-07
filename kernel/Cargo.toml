@@ -744,59 +744,18 @@ asm_budget = 10
 # call one method -- which is both less `unsafe` and the fix for a real defect:
 # a loop that restarted at slot zero while the device's head stood at two wrote
 # forty-five frames behind the head and moved the tail backwards.
-# 2114 at RFC 0075 step 3: enabling memory space and bus mastering on the X722
-# as it is delegated to `bin/netd`. Two lines, both of which name a device, and
-# both of which `start_nic_domain` was paying for until it goes at step 4 --
-# when this number falls a long way.
+# **2018 at RFC 0075 step 4, and it fell by ninety-six because a driver left.**
 #
-# 2112: the ring named again to refill it, because a queue that is never
-# refilled receives as many frames as it was posted and then stops -- which is
-# what made the first DHCP exchange report no answer.
+# `start_nic_domain` and the plumbing behind it -- the private memory, the
+# queue contexts, the rings and buffers, the frames out and the frames in, the
+# LACP exchange and the DHCP one -- are gone: `bin/netd` does all of it, and
+# every step of that was watched happen on the SR550 before this was deleted.
+# Three thousand lines of driver and its plumbing left the nucleus in one day.
 #
-# 2111 for the DHCP exchange: four regions named where they are used -- the
-# transmit ring and the packet buffer it posts from, and each receive buffer as
-# a frame is examined. All four are `DeviceMemory::new` and its bound, and the
-# alternative was carrying regions down through three functions that have no
-# other use for them.
-#
-# 2107: naming the first receive buffer, so a delivered frame's bytes can be
-# read beside the descriptor that should have described it.
-#
-# 2106: reading the IOMMU's fault records while the receive queues run. Faults
-# had only ever been reported before the drivers start and at the end of
-# bring-up, and this device receives in between -- so a DMA write the unit
-# refused had nowhere to be printed, for twenty boots.
-#
-# 2105 while chasing the receive path: one more, naming the first receive ring
-# so the descriptors can be dumped beside the head the device reports. The two
-# had only ever been read at different moments, which is how a device that had
-# consumed seven descriptors and a ring that read as untouched could both be
-# true for twenty boots without anyone noticing they disagreed.
-#
-# 2104 while chasing the receive path: the VSI's parameter buffer, named where
-# the queue mapping is written rather than carried down from `ask_nic`. Six
-# lines, all of them `DeviceMemory::new` and its bound, and the alternative was
-# threading a region through four functions that have no other use for it.
-#
-# **2098 at RFC 0075, and it went DOWN by 39 while a driver kept working.**
-# `kernel/src/i40e.rs` left for a crate that forbids `unsafe` entirely: the
-# volatile register accesses became a trait its holder implements -- three
-# lines here, in `MappedRegisters` -- and every ring and command buffer became
-# a region reached through a second trait -- `Dma` -- so the descriptor writes
-# that were raw pointer arithmetic are bounds-checked arithmetic somewhere the
-# kernel cannot reach, and the six volatile accesses left here are the whole of
-# what a driver's memory costs. What is left is
-# the plumbing, and it goes when `bin/netd` takes the device.
-#
-# 2137 at RFC 0074 step 4: delegating a second NIC. Fourteen of the twenty-one
-# are `delegate_second_port` -- enabling memory space, enabling bus mastering,
-# and claiming a vector, each of which the *first* port already pays for and
-# neither of which can be shared: they name a device. The rest is the second
-# port's IOMMU attachment, which is the first port's block with a different
-# device and a different domain id. A helper serving both would have needed a
-# parameter for every difference between them, which is a worse way of saying
-# they are not the same job.
-unsafe_budget = 2114
+# What is left of a NIC in here is the delegation: the register pages named,
+# the memory created, and the report read back. Two `unsafe` lines name the
+# device to the PCI configuration space, and the rest is capabilities.
+unsafe_budget = 2018
 # Up thirty-one for RFC 0005 step 9's socket probe -- `ring3_socketeer`, which
 # is `ring3_lister` with a `sockaddr_in6` copied in beside its code instead of
 # two filenames. The same two blocks every hosted probe has: one

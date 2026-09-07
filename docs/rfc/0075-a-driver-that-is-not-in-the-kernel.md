@@ -289,13 +289,35 @@ doorbell to do it. The frame is the switch's LLDP — 171 bytes, EtherType
 it correctly is the stack working rather than a fault.
 
 
-### What is left
+### The deletion, the same day: 2,960 lines out of the nucleus
 
-The deletion, and nothing now blocks it. `start_nic_domain` and its nineteen
-hundred lines still hold the kernel's own copy of this driver, and
-`bhaskix.netd-x722=1` is still a flag rather than what the machine does. The
-reason for waiting was that the kernel's copy was the only thing on this machine
-that had ever received a frame. It is not any more.
+`start_nic_domain` is gone, and with it every function that existed to drive a
+NIC from ring 0 — the private memory and the queue contexts, the rings and the
+buffers, the frames out and the frames in, the LACP exchange and the DHCP one,
+the register mapping and the two `Dma`/`Registers` implementations over it.
+Thirty-six items, **2,960 lines**, and the handover is no longer a flag.
+
+The kernel's `unsafe` count fell **2,114 to 2,018** — ninety-six lines, and the
+first time in this project's history that a subsystem left the nucleus and took
+its unsafe with it rather than adding more.
+
+What remains of a NIC in the kernel is `delegate_x722`: pages named, memory
+created, a report read back. Two `unsafe` lines name the device to the PCI
+configuration space and the rest is capabilities. `bhaskix-i40e` is still a
+kernel dependency for `REGISTER_PAGES` alone — the list of pages to grant, which
+is the driver's to know and the kernel's to honour.
+
+**Proven by boot, twice.** With no driver in the kernel at all the SR550 reports
+the same numbers it did with one — 25 frames out, 1 in, the queues up, an
+interface holding the port's own address — and **no `nic` lines**, because there
+is nothing left in the kernel to print them.
+
+One caution recorded rather than smoothed over: the first of those two boots
+also failed `ring 3`'s revocation self-test, which had not failed in the twelve
+hardware boots before it. The second boot passed it, and passed `tcp client`
+which the two before had failed. One sighting in thirteen is an intermittent
+rather than a regression, and it is written into `TRACKER.md` §3 as a sighting
+with its date, not waved away.
 
 
 ## Alternatives considered

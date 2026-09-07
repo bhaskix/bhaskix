@@ -961,6 +961,31 @@ the distinction is in the table rather than in somebody's head.
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-09-07 (the NIC driver leaves the nucleus: 2,960 lines out)
+
+RFC 0075 step 4, done. `start_nic_domain` is gone, and with it every function that existed to drive a
+NIC from ring 0 — the private memory and the queue contexts, the rings and the buffers, the frames out
+and the frames in, the LACP exchange and the DHCP one, the register mapping and the two trait
+implementations over it. **Thirty-six items, 2,960 lines**, and the handover is no longer a flag.
+
+**The kernel's `unsafe` count fell 2,114 to 2,018.** Ninety-six lines, and the first time in this
+project's history that a subsystem left the nucleus and took its unsafe with it rather than adding
+more. Counting the crate's own move earlier the same day, `kernel/src/lib.rs` and `kernel/src/i40e.rs`
+are about six thousand lines lighter than they were this morning.
+
+What remains of a NIC in the kernel is `delegate_x722`: pages named, memory created, a report read
+back. Two `unsafe` lines name the device to the PCI configuration space; the rest is capabilities.
+
+**Proven by boot, twice.** With no driver in the kernel at all the SR550 reports what it did with one
+— 25 frames out, 1 in, the queues up, an interface holding the port's own address — and **no `nic`
+lines**, because nothing is left in the kernel to print them.
+
+**One caution, recorded rather than smoothed over.** The first of those two boots also failed `ring
+3`'s revocation self-test, which had not failed in the twelve hardware boots before it. The second
+boot passed it — and passed `tcp client`, which the two boots before had failed. One sighting in
+thirteen is an intermittent rather than a regression from this change, and it is filed as a sighting
+with its date rather than waved away.
+
 ### 2026-09-07 (a frame from the wire reaches bin/ipd, and nothing in the path is the kernel)
 
 RFC 0075 step 4's receive, proven. The report had been glancing during bring-up at a port that carries
