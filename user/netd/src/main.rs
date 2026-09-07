@@ -85,6 +85,35 @@ const RINGS_1: u64 = 13;
 const WINDOW_1: u64 = 14;
 const HANDLER_1: u64 = 15;
 
+/// Slots the **X722** arrives in, when the machine has one.
+///
+/// RFC 0075 step 2. A machine with no such NIC leaves them empty and the attach
+/// below fails, which is how this program discovers there is none -- asked of
+/// the capability space rather than told in a word somewhere, the same way the
+/// second virtio port is found.
+///
+/// Its register pages start at [`X722_PAGES`] and run for one slot per entry in
+/// `i40e::REGISTER_PAGES`. **Thirty-four of them, not one**, because a virtio
+/// device's registers are a page and this device's are four megabytes: the
+/// whole BAR cannot be a capability and should not be, so the crate names the
+/// pages that hold a register it uses and the kernel grants exactly those. See
+/// `i40e::REGISTER_PAGES`.
+const X722_WINDOW: u64 = 16;
+/// Slot: the page holding its admin rings and the buffers behind them.
+const X722_MEMORY: u64 = 17;
+/// Slot: the first of its register pages.
+const X722_PAGES: u64 = 20;
+
+/// Where the X722's registers are mapped: page `P` of its BAR at `X722_AT + P`.
+///
+/// Sparse — only the pages granted are mapped — and at their own offsets, so
+/// every register offset in `bhaskix-i40e` works against this base unchanged.
+/// A register in a page nobody granted faults instead of being reachable, which
+/// is the whole point of naming pages.
+const X722_AT: u64 = 0x3000_0000;
+/// And where its admin page goes, clear of the register window's four megabytes.
+const X722_MEMORY_AT: u64 = 0x3400_0000;
+
 /// Where this program maps what it holds.
 const COMMON_AT: u64 = 0x2000_0000;
 const NOTIFY_AT: u64 = 0x2001_0000;
@@ -103,6 +132,77 @@ const RINGS_1_AT: u64 = 0x2110_0000;
 const RING_AT: u64 = 0x2020_0000;
 /// Where the return ring from `bin/ipd` is mapped.
 const BACK_AT: u64 = 0x2030_0000;
+
+/// The X722's registers, as this program reaches them.
+///
+/// **The one `unsafe` a driver genuinely needs**, in the place RFC 0075 says it
+/// belongs: `bhaskix-i40e` forbids `unsafe` entirely and asks its holder for
+/// reads and writes, and this is that holder. The kernel had the identical
+/// three functions while it drove the device itself.
+struct X722Registers;
+
+impl bhaskix_i40e::Registers for X722Registers {
+    fn read(&self, offset: u64) -> u32 {
+        // SAFETY: the register pages this program attached at their own offsets
+        // from `X722_AT`. An offset in a page nobody granted is not mapped and
+        // faults, which is the containment working rather than a hazard.
+        unsafe { read32(X722_AT + offset) }
+    }
+
+    fn write(&mut self, offset: u64, value: u32) {
+        // SAFETY: as `read`.
+        unsafe { write32(X722_AT + offset, value) };
+    }
+
+    fn read64(&self, offset: u64) -> u64 {
+        // SAFETY: as `read`; every offset read this way is a documented 64-bit
+        // register pair, 8-byte aligned by its own stride.
+        unsafe { read64(X722_AT + offset) }
+    }
+}
+
+/// Memory this program shares with the X722.
+///
+/// **Not a slice, and RFC 0075 records the boot that settled it**: a `&mut [u8]`
+/// promises the compiler nothing else writes those bytes, and a device writing
+/// them is precisely something else. Every access here is volatile.
+struct X722Memory {
+    /// Where this program mapped it.
+    at: u64,
+    /// How long it is, so an access past the end is refused rather than made.
+    bytes: usize,
+}
+
+impl bhaskix_i40e::Dma for X722Memory {
+    fn read(&self, at: usize, into: &mut [u8]) {
+        for (index, slot) in into.iter_mut().enumerate() {
+            *slot = if at + index < self.bytes {
+                // SAFETY: a region this program mapped writable, bounded above.
+                unsafe { read8(self.at + (at + index) as u64) }
+            } else {
+                0
+            };
+        }
+    }
+
+    fn write(&mut self, at: usize, from: &[u8]) {
+        for (index, byte) in from.iter().enumerate() {
+            if at + index < self.bytes {
+                // SAFETY: as `read`.
+                unsafe { write8(self.at + (at + index) as u64, *byte) };
+            }
+        }
+    }
+
+    fn zero(&mut self, at: usize, bytes: usize) {
+        for index in at..at + bytes {
+            if index < self.bytes {
+                // SAFETY: as `read`.
+                unsafe { write8(self.at + index as u64, 0) };
+            }
+        }
+    }
+}
 
 /// Bytes in the ring to `bin/ipd`, matching what the kernel granted.
 const RING_BYTES: usize = 16 * 4096;
@@ -415,6 +515,25 @@ unsafe fn write64(at: u64, value: u64) {
         core::ptr::write_volatile(at as *mut u32, value as u32);
         core::ptr::write_volatile((at + 4) as *mut u32, (value >> 32) as u32);
     }
+}
+
+/// Reads eight bytes as one access.
+///
+/// **The counterpart of [`write64`] and the opposite decision**, for a
+/// different device and a documented reason: the X722's statistics say *"the
+/// low and high registers are part of a 64-bit register and are read using
+/// 64-bit read accesses only"*, and two 32-bit reads would also tear across a
+/// counter incrementing between them. `write64` splits its store because
+/// virtio's specification defines those registers as two halves; this joins its
+/// load because this one's specification says the opposite. Neither is a
+/// preference.
+///
+/// # Safety
+///
+/// As [`read8`], and `at` must be eight-byte aligned.
+unsafe fn read64(at: u64) -> u64 {
+    // SAFETY: delegated to the caller.
+    unsafe { core::ptr::read_volatile(at as *const u64) }
 }
 
 /// Rings this driver's doorbell for `index`.
@@ -1212,6 +1331,11 @@ extern "C" fn netd_main() -> ! {
     // Sticky: a member that comes back does *not* take the link back, because
     // that is churn and reordering bought for nothing. The selection changes
     // only when the member carrying traffic stops being able to.
+    // **The X722, if the kernel delegated one** -- RFC 0075 step 2. Taken once,
+    // here, because a device is brought up once and because the answer on every
+    // machine that has none is the same answer every time: there is none.
+    let x722 = take_x722();
+
     let mut active = 0usize;
     let mut failovers = 0u64;
     // **The bond's address, which is the first member's**, and everything the
@@ -1291,7 +1415,7 @@ extern "C" fn netd_main() -> ! {
         took,
         took_length,
     );
-    bond_report(&ports, active, failovers, off_member);
+    bond_report(&ports, active, failovers, off_member, x722);
     let mut probes = 0u32;
     let mut idle = 0u32;
     loop {
@@ -1472,7 +1596,7 @@ extern "C" fn netd_main() -> ! {
                 took_length,
             );
         }
-        bond_report(&ports, active, failovers, off_member);
+        bond_report(&ports, active, failovers, off_member, x722);
         // **Quiesce rather than spin.** This loop polled for ever, and a pinned
         // program that never stops polling is a processor the rest of the
         // machine cannot have -- which showed up as the shell test timing out
@@ -1518,13 +1642,132 @@ fn receive_seen(ports: &[Option<Port>; 2]) -> u16 {
     ports[0].as_ref().map_or(0, |port| port.receive.seen())
 }
 
+/// What the X722 answered, or that there is none to ask.
+///
+/// RFC 0075 step 2. This is deliberately the same first three questions RFC
+/// 0072 step 3 asked when the kernel drove the device -- can it be reset, will
+/// it take an admin queue, and what does it say it is -- because the whole
+/// claim of the move is that the answers do not change when the asker does.
+#[derive(Clone, Copy, Default)]
+struct X722 {
+    /// Whether the register pages and the memory were there to be taken.
+    delegated: bool,
+    /// Whether the device completed a PF reset.
+    reset: bool,
+    /// Whether both admin queues read back as enabled.
+    queues: bool,
+    /// The firmware version it reported, major and minor.
+    firmware: (u16, u16),
+    /// Its link, as `Get Link Status` answered.
+    link_up: bool,
+    /// And the speed byte behind that, kept raw for the report.
+    link_speed: u8,
+    /// How many switch elements it reported, which is what says a VSI exists
+    /// for frames to be steered to.
+    switch_elements: u16,
+}
+
+impl X722 {
+    /// Packs what the kernel prints into two words of the report.
+    fn words(self) -> (u64, u64) {
+        let flags = u64::from(self.delegated)
+            | u64::from(self.reset) << 1
+            | u64::from(self.queues) << 2
+            | u64::from(self.link_up) << 3;
+        (
+            flags | u64::from(self.link_speed) << 8 | u64::from(self.switch_elements) << 16,
+            u64::from(self.firmware.0) | u64::from(self.firmware.1) << 16,
+        )
+    }
+}
+
+/// Takes the X722 the kernel delegated, if it delegated one.
+///
+/// **The absence path is the one every lane runs**, and it is the gate for this
+/// step: a machine with no such NIC leaves the slots empty, the first attach
+/// fails, and this answers `delegated: false` without touching a register. Every
+/// QEMU lane checks that, because none of them has an X722 and none ever will.
+fn take_x722() -> X722 {
+    let mut found = X722::default();
+
+    // The register pages first, because they are what makes the rest reachable
+    // and because their absence is the cheapest thing to discover. Each is
+    // mapped at its own offset from `X722_AT`, so every register offset in the
+    // crate works against that base unchanged.
+    for (index, page) in bhaskix_i40e::REGISTER_PAGES.iter().enumerate() {
+        if !attach(X722_PAGES + index as u64, X722_AT + page, 1) {
+            return found;
+        }
+    }
+    if !attach(X722_MEMORY, X722_MEMORY_AT, 1) {
+        return found;
+    }
+    // Where the device will look for its rings. Without a window there is no
+    // such number, and a device that cannot be aimed cannot be driven -- the
+    // refusal working, exactly as it does for the virtio ports above.
+    let (mapped, admin_device) = call(
+        syscall::INVOKE,
+        X722_WINDOW,
+        method::MAP,
+        [X722_MEMORY, 0, 0, 0],
+    );
+    if mapped != status::OK {
+        return found;
+    }
+    found.delegated = true;
+
+    /// Long enough for firmware to answer, bounded so a device that never does
+    /// cannot hang a boot. The kernel used the same number for the same reason.
+    const SPINS: u32 = 2_000_000;
+
+    let mut device = bhaskix_i40e::Device::new(X722Registers);
+    let mut admin = X722Memory {
+        at: X722_MEMORY_AT,
+        bytes: 4096,
+    };
+    found.reset = device.reset(SPINS);
+
+    // The two rings, at the offsets the crate lays out, as the *device* reaches
+    // them -- and the buffers behind them in the same page.
+    device.enable_admin_queues(admin_device, admin_device + bhaskix_i40e::RING_BYTES);
+    found.queues = device.admin_queues_enabled();
+
+    if let Ok(version) = device.get_version(&mut admin, SPINS) {
+        found.firmware = version;
+    }
+    if let Ok(link) = device.link_status(&mut admin, SPINS) {
+        found.link_up = link.up();
+        found.link_speed = link.speed;
+    }
+    // The switch, into the buffer that follows both rings in the same page.
+    let mut buffer = X722Memory {
+        at: X722_MEMORY_AT + bhaskix_i40e::SWITCH_BUFFER_OFFSET,
+        bytes: bhaskix_i40e::SWITCH_BUFFER_BYTES as usize,
+    };
+    if let Ok(switch) = device.switch_configuration(
+        &mut admin,
+        admin_device + bhaskix_i40e::SWITCH_BUFFER_OFFSET,
+        &mut buffer,
+        SPINS,
+    ) {
+        found.switch_elements = switch.count as u16;
+    }
+    found
+}
+
 /// Leaves the bond's own state where the kernel reads the rest of the report.
 ///
-/// Words 17 to 20, appended rather than folded into [`report`]'s arguments:
+/// Words 17 to 22, appended rather than folded into [`report`]'s arguments:
 /// that function already takes ten and clippy's limit is not the only reason to
 /// stop -- a caller passing four more positional numbers is a caller that will
 /// pass them in the wrong order.
-fn bond_report(ports: &[Option<Port>; 2], active: usize, failovers: u64, off_member: u64) {
+fn bond_report(
+    ports: &[Option<Port>; 2],
+    active: usize,
+    failovers: u64,
+    off_member: u64,
+    x722: X722,
+) {
     let at = RINGS_AT + ring::REPORT;
     let members = ports.iter().flatten().count() as u64;
     // One bit per member, so "the bond is up on one leg" and "both are up" are
@@ -1535,7 +1778,16 @@ fn bond_report(ports: &[Option<Port>; 2], active: usize, failovers: u64, off_mem
             links |= 1 << index;
         }
     }
-    let words = [members, active as u64, links, failovers, off_member];
+    let (x722, firmware) = x722.words();
+    let words = [
+        members,
+        active as u64,
+        links,
+        failovers,
+        off_member,
+        x722,
+        firmware,
+    ];
     // SAFETY: the report page this program mapped writable, at the five words
     // that follow the seventeen `report` writes. The marker is not touched:
     // this is an addition to a report that is already published, and a reader

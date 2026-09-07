@@ -268,6 +268,11 @@ PLACEMENTS: dict[str, set[str]] = {
     # does reach, and the driver is the two volatile accesses that crate is
     # `forbid(unsafe_code)` precisely so it cannot perform.
     "bhaskix-user-ahcid": {"bhaskix-abi", "bhaskix-ahci"},
+    # RFC 0075 step 2: the network driver shares `bhaskix-i40e` with the kernel
+    # for exactly the reason above -- the register arithmetic belongs where
+    # `cargo test --workspace` can reach it, and `bin/netd` is not a workspace
+    # member. `bhaskix-device` is the virtqueue it already had.
+    "bhaskix-user-netd": {"bhaskix-abi", "bhaskix-device", "bhaskix-i40e"},
     # The filesystem, unlike the driver, **is** the kernel's own code: it
     # depends on `bhaskix-fs`, the same crate the kernel links. That is the
     # point of it -- one parser, two places -- and it is why this entry names

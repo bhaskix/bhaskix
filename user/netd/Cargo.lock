@@ -11,9 +11,14 @@ name = "bhaskix-device"
 version = "0.0.0"
 
 [[package]]
+name = "bhaskix-i40e"
+version = "0.0.0"
+
+[[package]]
 name = "bhaskix-user-netd"
 version = "0.0.0"
 dependencies = [
  "bhaskix-abi",
  "bhaskix-device",
+ "bhaskix-i40e",
 ]

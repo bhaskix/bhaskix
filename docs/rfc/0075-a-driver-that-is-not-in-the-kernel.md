@@ -163,6 +163,18 @@ the report words.
 > **Gate:** on a lane with no X722 it does nothing and says so — which every
 > QEMU lane can check.
 
+**Done 2026-09-07.** `bin/netd` implements both traits over pages and memory it
+was granted, and `take_x722` asks the capability space whether there is a device
+rather than being told: it attaches the register pages, and their absence is the
+answer on every machine that has none. It brings the device up as far as RFC
+0072 step 3 did — reset, admin queues, `Get Version`, `Get Link Status`, `Get
+Switch Configuration` — and publishes what it found in report words 22 and 23.
+
+The kernel prints that line only where there is something to say, and prints a
+**warning where the bus has an X722 that `bin/netd` was not given**, which is the
+state between this step and the next. All twenty-two lanes pass with the absence
+path taken on every one of them.
+
 **Step 3 — the delegation.** `start_net_domain` delegates the register pages,
 the DMA window and the memory; it starts `bin/netd` when there is **any** port,
 virtio or X722; the `nic` domain and `start_nic_domain` go.

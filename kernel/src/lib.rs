@@ -18534,6 +18534,53 @@ fn time_the_burst(hhdm: u64) {
 ///
 /// This prints what the driver saw by the end, which is the only version of
 /// those numbers that can say whether the offer was ever delivered.
+/// Prints what `bin/netd` found when it went looking for an X722.
+///
+/// RFC 0075 step 2. **Silent on a machine that has none**, which is every lane
+/// in QEMU and is why this is not a line in the ordinary report: an absence the
+/// `net interface` count already describes does not need saying twice.
+///
+/// What it does say is the state between step 2 and step 3 — a machine with
+/// such a NIC on its bus where the service was not given it. That is a fact
+/// about this kernel rather than about the machine, and leaving it unsaid is
+/// how a delegation that quietly stopped working would go unnoticed.
+fn report_x722(words: &[u64; 24]) {
+    /// Word 22's low four bits: delegated, reset, queues enabled, link up.
+    const DELEGATED: u64 = 1;
+    const RESET: u64 = 1 << 1;
+    const QUEUES: u64 = 1 << 2;
+    const LINK_UP: u64 = 1 << 3;
+
+    let state = words[22];
+    if state & DELEGATED == 0 {
+        if find_foreign_nic().is_some() {
+            println!(
+                "\x1b[93m    net x722       an X722 is on the bus and bin/netd was not given it; \
+                 the kernel is still driving it\x1b[0m"
+            );
+        }
+        return;
+    }
+    println!(
+        "    net x722       bin/netd holds it: firmware {}.{}, link {}, {} switch element(s); \
+         reset {}, admin queues {}",
+        words[23] & 0xffff,
+        words[23] >> 16 & 0xffff,
+        if state & LINK_UP != 0 { "UP" } else { "down" },
+        state >> 16 & 0xffff,
+        if state & RESET != 0 {
+            "done"
+        } else {
+            "REFUSED"
+        },
+        if state & QUEUES != 0 {
+            "enabled"
+        } else {
+            "REFUSED"
+        }
+    );
+}
+
 /// Prints what the bond is made of, and — where a lane asked for it — what it
 /// became.
 ///
@@ -18548,9 +18595,9 @@ fn time_the_burst(hhdm: u64) {
 /// the bond still carries. So this waits for both, and says which one it got —
 /// a failover with no traffic after it is a bond that failed over into silence,
 /// and it must not print as a pass.
-fn report_bond(words: &mut [u64; 22], take: impl Fn(&mut [u64; 22])) {
+fn report_bond(words: &mut [u64; 24], take: impl Fn(&mut [u64; 24])) {
     /// Which member the bond is on, and what each member's link says.
-    fn members(words: &[u64; 22]) -> (u64, u64, u64) {
+    fn members(words: &[u64; 24]) -> (u64, u64, u64) {
         (words[17], words[18], words[19])
     }
 
@@ -18622,13 +18669,13 @@ fn report_net_after_exchange(hhdm: u64) {
     if count <= NETD_REPORT_PAGE {
         return;
     }
-    // **Twenty-two words**, seventeen of which are the driver's original
-    // report and five of which are the bond's -- members, which one carries
+    // **Twenty-four words**, seventeen of which are the driver's original
+    // report, five the bond's and two the X722's -- members, which one carries
     // traffic, each member's link, how many times it has failed over, and
     // frames dropped from a member that is not carrying traffic. The length is
     // derived from the array, for the reason the `bin/ipd` report below gives
     // at length: a length written twice is wrong in one of the two places.
-    let mut words = [0u64; 22];
+    let mut words = [0u64; 24];
     // SAFETY: a frame this object owns, through the direct map, read as the
     // little-endian words the driver wrote there -- `words.len() * 8` bytes of
     // a page, so the read cannot reach past the frame.
@@ -18640,7 +18687,7 @@ fn report_net_after_exchange(hhdm: u64) {
     };
     // Read again rather than once: the driver writes this page while it is
     // read, and a bond that fails over does so *after* the first look.
-    let take = |words: &mut [u64; 22]| {
+    let take = |words: &mut [u64; 24]| {
         for (index, word) in words.iter_mut().enumerate() {
             let mut buffer = [0u8; 8];
             buffer.copy_from_slice(&raw[index * 8..index * 8 + 8]);
@@ -18657,6 +18704,7 @@ fn report_net_after_exchange(hhdm: u64) {
         words[8], words[9], words[10], words[13], words[14]
     );
     report_bond(&mut words, take);
+    report_x722(&words);
 
     let raw = NET_RING_REPORT.load(Ordering::Acquire);
     if raw == u64::MAX {
