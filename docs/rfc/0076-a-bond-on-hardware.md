@@ -655,14 +655,54 @@ this RFC reached hardware first.
 
 **Two findings this boot opened.**
 
-**Ports 2 and 3 report link down to the driver and LinkUp to the BMC.** The bond
-line says `link up on ports 0, 1 only`, while Redfish reports all four NICs
-`LinkStatus: LinkUp, SpeedMbps: 1000` with addresses `…8E`, `…8F`, `…90`, `…91`.
-Either `Get Link Status` is being read wrongly for functions 2 and 3, or those
-ports are up electrically and not carrying. **The generalised link naming is the
-only reason this is visible**: the old two-member code was a chain of `if`s
-whose last arm was an `else`, so it would have printed "both" for this bitmap
-and said nothing was wrong.
+~~**Ports 2 and 3 report link down to the driver and LinkUp to the BMC.**~~
+**Wrong, and the defect was mine.** The bond line said `link up on ports 0, 1
+only` while Redfish reported all four NICs `LinkStatus: LinkUp, SpeedMbps:
+1000`, and that was read here as a question about `Get Link Status` on
+functions 2 and 3. It was not. `carry_x722` polls every member's link -- that
+loop is `members.iter_mut().flatten()` and always was -- but the array handed to
+`select`, and used to build the report's link bitmap, was written out by index:
+
+```rust
+let up = [members[0]…is_some_and(|m| m.up), members[1]…is_some_and(|m| m.up)];
+let links = u64::from(up[0]) | u64::from(up[1]) << 1;
+```
+
+Two entries, correct while a bond was two ports, left behind when
+`X722_MEMBERS` became four. Members 2 and 3 were polled and then **never
+consulted**: `select` could not choose them and their bits were structurally
+zero. The ports were not reporting down; nothing was asking.
+
+Both are built from `X722_MEMBERS` now, and the bitmap folds over the same
+array `select` reads so the report cannot disagree with the choice.
+
+**This is the second time in one change that a written-out pair outlived the
+count beside it** -- the first panicked the kernel on `[5u16, 7][nth]`. The
+lesson the kernel one already carried is the lesson here: an array whose length
+must equal a constant should be built from that constant, and a sweep for the
+pattern is worth more than a fix for the instance.
+
+**What the generalised link naming did earn**: the old two-member code was a
+chain of `if`s whose last arm was an `else`, so it would have printed "both"
+for this bitmap and shown nothing amiss at all. The wrong answer was visible
+only because the naming had been fixed first.
+
+**Confirmed on the machine, same day**, with both arrays built from
+`X722_MEMBERS`:
+
+```
+net bond       4 member(s), 802.3ad; traffic on port 0, link up on every one of them
+ipd lacp       47 LACPDU(s) sent, 15 slow-protocol frame(s) heard back
+ipd lacp       state 0x05 -- a partner is heard but the link is not yet aggregated
+               per link: link 0 0x05, link 1 0x05, link 2 0x05, link 3 0x05
+```
+
+All four links up, which is what the BMC had been saying all along, and frames
+handed across went 1 to 7. **The aggregation question is unchanged**: four live
+members, all four speaking, all four answered, none selected. That was true
+with two members and is true with four, so the number of members was never the
+variable — which is worth knowing, because it was the last thing this side
+could vary.
 
 **Aggregation did not form on any of the four links.** All four sit at `0x05`
 with partner key 20. Offering the switch every member of its channel-group did

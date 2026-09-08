@@ -2311,10 +2311,19 @@ fn carry_x722(mut members: [Option<X722Member>; X722_MEMBERS], facts: [X722; X72
         }
 
         // Selection, by the same rule the virtio bond uses.
-        let up = [
-            members[0].as_ref().is_some_and(|member| member.up),
-            members[1].as_ref().is_some_and(|member| member.up),
-        ];
+        //
+        // **Every member, not the first two.** This was a two-element array
+        // written out by index while a bond was two ports, and raising
+        // `X722_MEMBERS` to four left it behind: members 2 and 3 were polled
+        // above and then never consulted, so `select` could not choose them
+        // and the report's link bitmap read zero for both. The first four-port
+        // boot printed `link up on ports 0, 1 only` and it was read as a
+        // finding about the hardware -- the BMC said all four were LinkUp at
+        // 1 Gb/s at the same moment. The wrong number was this array's length.
+        let mut up = [false; X722_MEMBERS];
+        for (slot, member) in up.iter_mut().zip(members.iter()) {
+            *slot = member.as_ref().is_some_and(|member| member.up);
+        }
         let chosen = select(active, &up);
         if chosen != active {
             active = chosen;
@@ -2519,7 +2528,12 @@ fn carry_x722(mut members: [Option<X722Member>; X722_MEMBERS], facts: [X722; X72
         }
 
         // What the bond is, for the kernel to print.
-        let links = u64::from(up[0]) | u64::from(up[1]) << 1;
+        // One bit per member, from the same array `select` reads -- so the
+        // report cannot disagree with the choice.
+        let links = up
+            .iter()
+            .enumerate()
+            .fold(0u64, |bits, (index, live)| bits | u64::from(*live) << index);
         let count = members.iter().flatten().count() as u64;
         x722_bond_report(count, active as u64, links, failovers, off_member);
         carried_since_report(carried_since);
