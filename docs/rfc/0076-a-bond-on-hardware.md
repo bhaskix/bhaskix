@@ -559,3 +559,37 @@ Lenovo's own `RemoteMap` action — after fetching the image successfully, and a
 BMC restart does not clear it. What works is the XCC's own CLI:
 `rdmount -map -t http -ro -l <url>` then `rdmount -mount`, with `rdmount -umount`
 to release it.
+
+### The per-link report answered it, and corrected the boot before
+
+Booted again the same day with the per-link reporting in place:
+
+```
+ipd lacp       23 LACPDU(s) sent, 7 slow-protocol frame(s) heard back
+ipd lacp       state 0x05 -- a partner is heard but the link is not yet aggregated
+               per link: link 0 0x05, link 1 0x05
+               the partner's key is 20
+```
+
+**Both links, not one.** The AND was hiding nothing: the switch synchronises
+neither member. That closes the question the previous boot could not answer and
+rules out the reading where one link had come up and the report could not say
+so. What remains is a switch that hears both links, answers both, gives its key
+as 20, and selects neither -- which is what a channel-group configured for four
+members looks like to a host offering two.
+
+**And a correction to the section above, which claimed too much.** It read
+"a gate turned green: frames now cross", from a boot whose `net ring` line said
+`4 crossed`. This boot's said `0 frames crossed` and `FAILED`, with
+`net after 1 completions seen, 2 handed across` in the same report -- so frames
+*did* cross and `bin/ipd`'s report page was simply read before it had taken
+them. The line is a sample, not a verdict, and the switch's unsolicited LLDP
+arrives about every thirty seconds, so whether the sample catches one is timing.
+
+The defensible claim is narrower and still worth having: **frames cross from
+`bin/netd` to `bin/ipd` on this machine** -- `handed across` is non-zero on both
+boots, and the first frame's source on the boot that caught one was
+`08:bd:43:76:47:e3`, the switch itself. The `net ring` *gate* is timing-sensitive
+and has been red and green on consecutive boots of the same image; treating one
+green sample as a gate that turned is exactly the error this document keeps
+having to correct.
