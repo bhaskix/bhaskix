@@ -342,6 +342,19 @@ pub struct Machine {
     pub actor: Actor,
     /// What the partner last said about itself, if it has ever spoken.
     pub partner: Option<Actor>,
+    /// **What the partner last said about *us*.**
+    ///
+    /// Every LACPDU carries two records: the sender's own, which is
+    /// [`Machine::partner`], and the sender's record of whoever it believes is
+    /// at the other end. The second is what [`Machine::received`] compares
+    /// against this port to decide SYNCHRONIZATION -- and it was compared and
+    /// then dropped, so a port that never synchronised could not say whether
+    /// the partner had named the wrong port or had named nothing at all.
+    ///
+    /// Those are different faults with different fixes, and on the SR550 the
+    /// difference is the whole question: four links sit at `0x05` against a
+    /// switch that answers every PDU, and the reason is in this field.
+    pub recorded: Option<Actor>,
     /// Seconds since the partner was last heard from.
     pub silent_for: u32,
     /// Seconds since this port last sent an LACPDU.
@@ -370,6 +383,7 @@ impl Machine {
                 state: State(State::ACTIVITY | State::AGGREGATION),
             },
             partner: None,
+            recorded: None,
             silent_for: 0,
             since_sent: u32::MAX,
             refused: 0,
@@ -386,6 +400,7 @@ impl Machine {
             return false;
         };
         self.partner = Some(pdu.actor);
+        self.recorded = Some(pdu.partner);
         self.silent_for = 0;
         self.actor.state = self.actor.state.without(State::EXPIRED | State::DEFAULTED);
 
@@ -654,6 +669,46 @@ mod tests {
         assert!(machine.actor.state.has(State::EXPIRED));
         assert!(machine.partner.is_none());
         assert!(!machine.actor.state.has(State::DISTRIBUTING));
+    }
+
+    /// **A PDU says two things and this keeps both**: what the partner is, and
+    /// what the partner believes *we* are.
+    ///
+    /// Watched red by dropping `self.recorded = Some(pdu.partner)`, which is
+    /// the whole of the change this guards. Without it a port that will not
+    /// synchronise cannot say whether the partner named the wrong port or
+    /// named nothing -- and on a real switch those are different faults.
+    #[test]
+    fn a_pdu_records_what_the_partner_thinks_this_port_is() {
+        let mut machine = Machine::new(MacAddr([2, 0, 0, 0, 0, 1]), 1, 1);
+        assert_eq!(machine.recorded, None, "nothing heard, nothing recorded");
+
+        // A partner that has us wrong: it names port 9 of another system.
+        let mut theirs = Machine::new(MacAddr([2, 0, 0, 0, 0, 2]), 20, 5);
+        theirs.partner = Some(Actor {
+            system: MacAddr([9, 9, 9, 9, 9, 9]),
+            key: 7,
+            port: 9,
+            ..theirs.actor
+        });
+        let mut bytes = [0u8; PDU];
+        theirs.sending().write(&mut bytes).expect("a pdu fits");
+        assert!(machine.received(&bytes), "a well-formed pdu is taken");
+
+        let recorded = machine
+            .recorded
+            .expect("the partner's record of us is kept");
+        assert_eq!(recorded.port, 9, "it named port 9, not ours");
+        assert_eq!(recorded.key, 7, "and key 7, not ours");
+        assert!(
+            !machine.actor.state.has(State::SYNCHRONIZATION),
+            "a partner naming another port does not synchronise this one"
+        );
+        assert_eq!(
+            machine.partner.expect("the partner itself is kept too").key,
+            20,
+            "the two records are distinct and neither overwrites the other"
+        );
     }
 
     /// The partner's timeout preference sets the sending interval.

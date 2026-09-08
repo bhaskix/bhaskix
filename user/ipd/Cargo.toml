@@ -130,4 +130,17 @@ asm_budget = 4
 # entirely; the mark is an index in the length prefix, which `bhaskix-abi` tests
 # on the host; and the only thing this file does with either is put bytes on a
 # ring it already had a call for.
-unsafe_budget = 165
+# 172 at RFC 0076's switch-side diagnostics: the report page grew two words and
+# a tail sentinel, and the sentinel is what the extra lines buy. `write_report`
+# took a `[u64; 32]` while the kernel had grown to read 34, so two words it
+# printed from were never written -- and unwritten page memory is zero, which
+# is a legitimate value for both. The boot report then stated in a full
+# sentence that the switch recorded no partner, a conclusion drawn from memory
+# nobody had assigned, and it took two hardware boots to notice.
+#
+# The length is one named constant now, so the array and the signature cannot
+# drift without the compiler saying so, and the sentinel one word past the
+# report lets the kernel prove the page was written to its full length instead
+# of assuming it. A marker at word 0 says *a* report is here; the tail says
+# *all* of it is. That is the seven lines.
+unsafe_budget = 172

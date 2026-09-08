@@ -16805,13 +16805,23 @@ impl core::fmt::Display for LinksUp {
 struct LinkStates {
     links: [u64; 4],
     aggregated: u64,
+    /// Which links to print, one bit each.
+    ///
+    /// **Explicit, because "the byte is non-zero" is not the same question.**
+    /// For this station's own flags the two coincide: a running machine always
+    /// has ACTIVITY set, so a zero byte is no machine. For a *partner's* flags
+    /// they do not: `0x00` is a legitimate advertisement -- passive,
+    /// individual, unsynchronised -- and reading it as absence turned the one
+    /// measurement that could answer "is the switch active" into no
+    /// measurement at all.
+    present: u64,
 }
 
 impl core::fmt::Display for LinkStates {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         let mut first = true;
         for (index, state) in self.links.iter().enumerate() {
-            if *state == 0 {
+            if self.present >> index & 1 == 0 {
                 continue;
             }
             if !first {
@@ -16948,6 +16958,8 @@ fn report_net_after_exchange(hhdm: u64) {
     // the print below that test the same bits, and two spellings of one rule is
     // how they stop agreeing.
     const LACP_WORD: usize = 29;
+    /// `bin/ipd`'s `REPORT_TAIL`, written one word past its report.
+    const IPD_REPORT_TAIL: u64 = 0x4c49_4154_4450_4931;
     const AGGREGATED: u64 = 0x38;
     // Twenty-eight words, 224 bytes. Twenty-one until RFC 0063 appended what
     // the service holds and how often each slot has been reused at 23 and 24 --
@@ -16962,7 +16974,7 @@ fn report_net_after_exchange(hhdm: u64) {
     // stayed at 224: the kernel panicked reading past the end and the boot
     // stalled. The length is derived from the array now, so there is one place
     // to be wrong instead of three.
-    let mut ipd = [0u64; 32];
+    let mut ipd = [0u64; 35];
     // SAFETY: a frame this object owns, through the direct map, read as the
     // little-endian words the service wrote there -- `ipd.len() * 8` bytes of
     // a page, so the read cannot reach past the frame.
@@ -17062,6 +17074,22 @@ fn report_net_after_exchange(hhdm: u64) {
              heard back"
         );
     }
+    // **Did `bin/ipd` write as far as this kernel reads?** Word 34 is a
+    // sentinel it puts one past its report. Without it, every word beyond what
+    // the service actually wrote is page memory, and zero is a legitimate value
+    // for most of them -- so a report can state a finding drawn from nothing.
+    // That happened: `write_report` took a `[u64; 32]` while this read 34, and
+    // the boot report said in a sentence that the switch recorded no partner.
+    // Checked on every boot, not only where the words are used, because the
+    // cheapest place to catch it is before anybody believes a number.
+    let complete = ipd[34] == IPD_REPORT_TAIL;
+    if !complete {
+        println!(
+            "\x1b[93m    ipd report     INCOMPLETE: this kernel reads {} words and bin/ipd \
+             wrote fewer; anything past its report is page memory\x1b[0m",
+            ipd.len()
+        );
+    }
     if ipd[LACP_WORD] != 0 {
         // **One byte per link.** `bin/ipd` runs a state machine per bond member
         // -- 802.3ad runs one per link -- and publishes each machine's flags in
@@ -17102,7 +17130,13 @@ fn report_net_after_exchange(hhdm: u64) {
                 "                   per link: {}",
                 LinkStates {
                     links,
-                    aggregated: AGGREGATED
+                    aggregated: AGGREGATED,
+                    // A running machine always has ACTIVITY set, so a zero byte
+                    // here is no machine.
+                    present: links
+                        .iter()
+                        .enumerate()
+                        .fold(0, |bits, (n, state)| bits | u64::from(*state != 0) << n),
                 }
             );
         }
@@ -17111,6 +17145,71 @@ fn report_net_after_exchange(hhdm: u64) {
                 "                   the partner's key is {}",
                 ipd[LACP_WORD] >> 32 & 0xffff
             );
+            // **What the switch is, read off its own PDUs.** A host with no
+            // login on the switch can still read its LACP configuration from
+            // the wire: bit 0 of a partner's state is ACTIVITY, and a switch
+            // configured *passive* advertises it clear. That distinction is
+            // the difference between "it will never speak first" and "it
+            // speaks and refuses us".
+            // **Only if `bin/ipd` actually wrote this far.** Word 34 is a
+            // sentinel it writes past the report; without it these words are
+            // whatever the page held, and zero is a legitimate value for both
+            // of them. That is not hypothetical: `write_report` took a
+            // `[u64; 32]` while this read 34, so the two words below went
+            // unwritten and the report stated -- in a sentence -- that the
+            // switch recorded no partner. It was reading memory nobody had
+            // assigned. A marker at word 0 says *a* report is here; this says
+            // *all* of it is.
+            let theirs: [u64; 4] = core::array::from_fn(|n| ipd[32] >> (8 * n) & 0xff);
+            // **Which links heard a partner**, published beside the flags
+            // because a partner's byte may legitimately be `0x00`.
+            let answered = if complete { ipd[32] >> 32 & 0xf } else { 0 };
+            if !complete {
+                println!(
+                    "                   \x1b[93mthe partner's own flags were not reported; this \
+                     kernel reads further than bin/ipd wrote\x1b[0m"
+                );
+            } else if answered != 0 {
+                println!(
+                    "                   the partner says: {}",
+                    LinkStates {
+                        links: theirs,
+                        aggregated: AGGREGATED,
+                        present: answered,
+                    }
+                );
+                // Bit 0 of a partner's state is ACTIVITY. A switch configured
+                // passive advertises it clear and will never open a
+                // conversation; one that answers with every flag clear is also
+                // saying the port is *individual* rather than aggregatable.
+                let active = (0..4)
+                    .filter(|n| answered >> n & 1 != 0)
+                    .all(|n| theirs[n] & 1 != 0);
+                println!(
+                    "                   so the switch is LACP {}",
+                    if active {
+                        "\x1b[92mactive\x1b[0m"
+                    } else {
+                        "\x1b[93mpassive -- it will not open a conversation\x1b[0m"
+                    }
+                );
+            }
+            // **And what it thinks we are**, which is the whole of why a link
+            // does or does not synchronise: `received` sets SYNC only when the
+            // partner's record names this system, key and port.
+            if !complete {
+                // Say nothing about a word that was never written.
+            } else if ipd[33] >> 32 & 1 != 0 {
+                println!(
+                    "                   and records its partner as key {}, port {} -- ours are key 1, port 1",
+                    ipd[33] & 0xffff,
+                    ipd[33] >> 16 & 0xffff
+                );
+            } else {
+                println!(
+                    "                   \x1b[93mand records no partner at all, so it has not selected this link\x1b[0m"
+                );
+            }
         }
     }
     // **What the socket service says it is holding** — RFC 0063.

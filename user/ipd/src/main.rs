@@ -125,6 +125,25 @@ const MAX_FRAME: usize = 2048;
 /// The marker the kernel looks for before believing the report.
 const MARKER: u64 = 0x3154_5052_4450_4931;
 
+/// How many words the report page carries.
+///
+/// **Named once, because the two sides drifted silently.** `write_report` took
+/// a `[u64; 32]` while the kernel had grown to read 34, so two words it printed
+/// from were never written -- and unwritten page memory is zero, which is a
+/// legitimate value for both of them. The boot report then stated, in a full
+/// sentence, that the switch recorded no partner: a conclusion drawn entirely
+/// from memory nobody had assigned. The array literal that feeds this function
+/// must have exactly this many entries, and the compiler now says so.
+const REPORT_WORDS: usize = 34;
+
+/// The last word, written with a sentinel so a reader can prove the page was
+/// written to its full length rather than trusting that it was.
+///
+/// The marker at word 0 says *a* report is here; this says *this* report is,
+/// all of it. Without the pair, a kernel that reads further than the service
+/// writes cannot tell a zero it was given from a zero it invented.
+const REPORT_TAIL: u64 = 0x4c49_4154_4450_4931;
+
 /// This port's LACP machine, and what it has learned.
 ///
 /// **Responsive rather than periodic, and that is a deliberate limit.** The
@@ -321,6 +340,30 @@ impl Bundle {
 /// high half and our own state flags in the low, or zero before one is running.
 static LACP_STATE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
+/// **The partner's own flags**, one byte per link, as `LACP_STATE`'s low half
+/// holds ours.
+///
+/// This is how a host with no access to the switch reads the switch's LACP
+/// configuration: bit 0 of a partner's state is ACTIVITY, and a switch
+/// configured *passive* advertises it clear. Every LACPDU carries it, and this
+/// service was parsing it and throwing it away.
+///
+/// **Bits 32..35 say which links have heard a partner at all**, because a
+/// partner's flags may legitimately be `0x00` and a zero byte would otherwise
+/// be indistinguishable from silence.
+static LACP_PARTNER_STATE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// **What the partner records as its own partner** -- what the switch believes
+/// is at our end of link 0.
+///
+/// Its key in bits 0..15, its port in bits 16..31, and bit 32 set once any
+/// record has been heard. `lacp::Machine::received` synchronises only when this
+/// names *this* port -- same system, same key, same port -- so a link stuck
+/// unsynchronised is explained by this word and by nothing else in the report:
+/// a switch that names another port and a switch that names nothing look
+/// identical from our own flags.
+static LACP_RECORDED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 /// Publishes what the bundle believes, so the boot report can say it.
 ///
 /// **One byte per link, not one number for the bundle.** The first version of
@@ -356,6 +399,34 @@ fn lacp_publish(bundle: &Bundle) {
         (partner << 32) | links,
         core::sync::atomic::Ordering::Relaxed,
     );
+
+    // **The other side of the same PDU.** Their flags per link, and their
+    // record of us on link 0 -- the two things that say whether the switch is
+    // active and whether it has us right.
+    //
+    // **A heard bit per link, separate from the flags.** Our own byte can use
+    // zero to mean "no machine", because a running machine always has ACTIVITY
+    // set. A *partner's* byte cannot: `0x00` is a legitimate advertisement --
+    // passive, individual, unsynchronised -- and the first version of this word
+    // treated it as absence, so the one boot that measured it could not say
+    // whether the switch had answered with all flags clear or had not answered
+    // at all. Those are opposite conclusions.
+    let mut theirs = 0u64;
+    for (index, machine) in bundle.each.iter().enumerate() {
+        if let Some(partner) = machine.as_ref().and_then(|m| m.partner) {
+            theirs |= u64::from(partner.state.0) << (8 * index);
+            theirs |= 1 << (32 + index);
+        }
+    }
+    LACP_PARTNER_STATE.store(theirs, core::sync::atomic::Ordering::Relaxed);
+
+    let recorded = bundle.each[0]
+        .as_ref()
+        .and_then(|machine| machine.recorded)
+        .map_or(0, |them| {
+            u64::from(them.key) | u64::from(them.port) << 16 | 1 << 32
+        });
+    LACP_RECORDED.store(recorded, core::sync::atomic::Ordering::Relaxed);
 }
 
 /// LACPDUs this service has put on the wire, and slow-protocol frames that have
@@ -1123,6 +1194,11 @@ fn refresh() {
         // serving starts, which is when the switch has had time to answer.
         LACP_TRAFFIC.load(Relaxed),
         u64::from(BOND_MODE_LACP.load(Relaxed)),
+        // Words 32 and 33: **what the partner is, and what it thinks we are.**
+        // The switch's own flags answer "is it LACP active"; its record of us
+        // answers why SYNC never sets. See `lacp_publish`.
+        LACP_PARTNER_STATE.load(Relaxed),
+        LACP_RECORDED.load(Relaxed),
     ]);
 }
 
@@ -3259,6 +3335,12 @@ fn report(
         // printed the word "active-backup" as a literal, so it said that of an
         // LACP bond too. What is reported now is what was built.
         u64::from(BOND_MODE_LACP.load(core::sync::atomic::Ordering::Relaxed)),
+        // Words 32 and 33: the partner's own flags per link, and its record of
+        // us. Zero here until a PDU has arrived, which `refresh` then keeps
+        // current -- and the tail sentinel below is what lets a reader tell
+        // that zero from a word nobody wrote.
+        LACP_PARTNER_STATE.load(core::sync::atomic::Ordering::Relaxed),
+        LACP_RECORDED.load(core::sync::atomic::Ordering::Relaxed),
     ];
     V6_PREFIX.store(v6_prefix, core::sync::atomic::Ordering::Relaxed);
     V6_STATE.store(v6_state, core::sync::atomic::Ordering::Relaxed);
@@ -3284,7 +3366,7 @@ fn report(
 /// whatever the array says: the type is the documentation, and both builders --
 /// `report` and `refresh` -- are forced to agree with it by the compiler, which
 /// is the only reason the v6 words' silent overwrite could not happen twice.
-fn write_report(words: [u64; 32]) {
+fn write_report(words: [u64; REPORT_WORDS]) {
     // SAFETY: the page this program mapped writable, which nothing else
     // reaches. The marker is written last, so a kernel reading a partial report
     // sees no marker rather than half the fields.
@@ -3292,6 +3374,13 @@ fn write_report(words: [u64; 32]) {
         for (index, word) in words.iter().enumerate().skip(1) {
             core::ptr::write_volatile((REPORT_AT + index as u64 * 8) as *mut u64, *word);
         }
+        // **The tail, one word past the report**, so a reader can prove the
+        // page was written to its full length instead of assuming it. Written
+        // before the marker, for the marker's own reason.
+        core::ptr::write_volatile(
+            (REPORT_AT + REPORT_WORDS as u64 * 8) as *mut u64,
+            REPORT_TAIL,
+        );
         core::ptr::write_volatile(REPORT_AT as *mut u64, words[0]);
     }
 }

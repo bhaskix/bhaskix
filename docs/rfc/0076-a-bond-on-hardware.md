@@ -710,3 +710,61 @@ not change its answer, which exhausts what this side can vary: the remaining
 question is the switch's own configuration — whether that group is LACP
 *active*, and what it expects of a peer. RFC 0073's premise, that speaking the
 protocol correctly is sufficient, is not confirmed by this machine.
+
+### Reading the switch off its own PDUs, 2026-09-08
+
+The host has no login on the switch. It does not need one: **every LACPDU the
+switch sends carries its own state flags and its record of whoever it believes
+is at the far end**, and this service was parsing both and discarding them.
+`Machine` keeps the second now (`recorded`, host-tested and watched red), and
+`bin/ipd` publishes the partner's flags per link beside its own.
+
+```
+ipd lacp   44 LACPDU(s) sent, 12 slow-protocol frame(s) heard back
+ipd lacp   state 0x05 -- a partner is heard but the link is not yet aggregated
+           the partner says: link 0 0x45, link 1 0x45, link 2 0x45, link 3 0x45
+           so the switch is LACP active
+           and records its partner as key 0, port 0 -- ours are key 1, port 1
+```
+
+`0x45` is **ACTIVITY | AGGREGATION | DEFAULTED**, identically on all four links.
+
+* **ACTIVITY** — the switch is configured *active*, not passive. It speaks
+  first, so the reading this RFC has carried since `Machine::new` ("one of the
+  two readings of why the SR550's wire looks silent") is settled: not that one.
+* **AGGREGATION** — it treats each port as aggregatable, not individual.
+* **DEFAULTED** — *the partner's information is made up rather than received.*
+
+**That third flag moves the fault.** The switch is not misconfigured and is not
+refusing this host: it has never received a usable LACPDU from us, so it runs on
+administrative defaults for its partner — which is exactly the partner record it
+advertises, key 0 and port 0. Forty-four PDUs leave this side by our own count
+and the switch's own flags say none arrived.
+
+So the open question is no longer the switch's configuration. It is **what
+happens to an LACPDU between `bin/ipd` building it and the wire**: whether the
+X722 transmits those frames at all, and whether what arrives is well formed.
+That is answerable from this side, which the previous question was not.
+
+**Two defects of mine on the way to this, both about zero.**
+
+The first measurement was not a measurement. `write_report` took a `[u64; 32]`
+while the kernel had grown to read 34, so the two words carrying this finding
+were **never written**, and unwritten page memory is zero -- a legitimate value
+for both. The report then stated, in a sentence, that the switch recorded no
+partner. It was reading memory nobody had assigned, and it took two hardware
+boots to notice because the conclusion was plausible.
+
+The second was the same error one level down: the partner's flag byte was
+published without a *heard* bit, so `0x00` -- passive, individual,
+unsynchronised, a perfectly legitimate advertisement -- was indistinguishable
+from silence.
+
+Both are structural now rather than remembered. The report length is one named
+constant, so the array and the signature cannot drift without the compiler
+saying so; `bin/ipd` writes a sentinel one word past its report, and the kernel
+refuses to interpret anything past what that sentinel proves was written,
+saying `ipd report INCOMPLETE` instead. **Watched both ways on real boots**:
+red with the tail write removed, green with it restored -- after two earlier
+checks that proved nothing, because a lane prints only its verdict on success
+and the logs I grepped never contained the report at all.
