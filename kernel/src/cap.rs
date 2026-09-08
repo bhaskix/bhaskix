@@ -63,7 +63,19 @@ use crate::sync::{Rank, SpinLock};
 pub const MAX_CAPABILITIES: usize = 4096;
 
 /// Capability slots one domain can hold.
-pub const CSPACE_SLOTS: usize = 128;
+///
+/// Raised from 128 on 2026-09-08, and the reason is one domain: `bin/netd`
+/// holding every port of the SR550's X722. A port costs 42 slots -- one DMA
+/// window, four memory objects and thirty-seven register pages, which is
+/// `bhaskix_i40e::grant::SPAN` -- so four ports need 184 with the first sixteen
+/// spoken for, and 128 afforded two. The switch bundles all four ports in one
+/// channel-group, so a host offering two was offering the wrong thing.
+///
+/// **It is priced.** A slot is a 12-byte `Option<SlotRef>` and every domain has
+/// a full set, so this costs 96 KiB of static kernel memory across
+/// `MAX_OWNERS`. The boot report's `fixed tables` line is where that shows up,
+/// and it is meant to be read rather than assumed.
+pub const CSPACE_SLOTS: usize = 256;
 
 /// Distinct owners the arena can attribute capabilities to.
 ///

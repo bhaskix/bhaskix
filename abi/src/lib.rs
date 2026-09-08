@@ -104,7 +104,7 @@ pub mod limits {
     /// Declared here as well as in the kernel because [`crate::adapter`] lays
     /// out a CSpace and must know where it ends; the kernel asserts the two
     /// agree, as it does for every other number both sides name.
-    pub const CSPACE_SLOTS: usize = 128;
+    pub const CSPACE_SLOTS: usize = 256;
 }
 
 /// **The Linux adapter's capability space, in one place** —

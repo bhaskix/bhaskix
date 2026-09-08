@@ -61,22 +61,47 @@ assumption about ordering.
 
 ## Design
 
-### Two ports, and two is not a preference
+### How many ports, and it is the table that decides
 
 Each X722 port costs one DMA window, four memory objects and **37 register
-pages** — 42 capability slots. `cap::CSPACE_SLOTS` is 128 and the net domain's
-first sixteen are spoken for, so:
+pages** — 42 capability slots, which is `bhaskix_i40e::grant::SPAN`. The net
+domain's first sixteen slots are spoken for, so with `cap::CSPACE_SLOTS` at 256:
 
-| ports | slots | fits |
+| ports | slots | fits 256 |
 |---|---|---|
-| 1 | 42 | yes |
-| 2 | 84 | yes |
-| 3 | 126 | no — nothing left for the rings, the report or `bin/ipd`'s ring |
+| 2 | 100 | yes |
+| 4 | 184 | yes |
+| 6 | 268 | no |
 
-**Two is what the capability space affords**, and a bond needs exactly two.
-Three ports would need a larger cspace or a register window granted as something
-other than one frame per page, and neither is worth doing for a member that adds
-nothing to the gate.
+**This section said "two, and two is not a preference" until 2026-09-08**, and
+against a 128-slot table that was arithmetic rather than opinion: two fit and
+three did not. What it got wrong was treating a table size as a property of the
+hardware. The SR550's switch bundles all four ports in one channel-group, and
+two boots with two members reported `per link: link 0 0x05, link 1 0x05` — both
+links heard, neither selected, which is what a four-port channel-group looks
+like to a host offering two. The table is 256 now, all four ports are
+delegated, and `bhaskix_i40e::grant`'s own test moved with it: it asserts four
+fit and **six** do not.
+
+Six, not five — five ports take 226 slots and would fit. The card has four
+functions so five is unreachable, but a test asserting a false edge would be
+asserting arithmetic nobody had done.
+
+**The other table was already full.** The boot before this change reported
+`memory objects 48 of 48 live at once` with two ports delegated: exactly at
+`shared::MAX_OBJECTS`, so the next object anything asked for would have been
+refused. That was a live fault independent of port count. It is 64 now, and
+four ports use 56 of it.
+
+**What was not done, and why.** The 37 register pages dominate the 42, and
+`ObjectKind::Memory` already names a set of frames, so collapsing them into
+three objects per port is the obvious saving. `REGISTER_PAGES` is **sparse**
+across the BAR, and `bin/netd` maps page *P* at `x722_at(n) + P` so every
+register offset in `bhaskix-i40e` works unchanged; grouping them would put a
+lookup on every register access to save memory the machine has. It would also
+blur what RFC 0075 chose deliberately — each granted page named individually,
+so anything outside the set faults rather than being reachable, with an exposed
+flash and protocol-engine doorbells elsewhere in that BAR.
 
 ### The slot layout moves into `bhaskix-i40e`
 
@@ -593,3 +618,55 @@ boots, and the first frame's source on the boot that caught one was
 and has been red and green on consecutive boots of the same image; treating one
 green sample as a gate that turned is exactly the error this document keeps
 having to correct.
+
+### Four ports on the machine, 2026-09-08
+
+```
+iommu window   b1:00.0 … x722 port 0's own page table and domain 8,  2 in use
+iommu window   b1:00.1 … x722 port 1's own page table and domain 9,  3 in use
+iommu window   b1:00.2 … x722 port 2's own page table and domain 10, 4 in use
+iommu window   b1:00.3 … x722 port 3's own page table and domain 11, 5 in use
+net domain     4 x722 port(s) delegated, each with its own dma window
+net bond       4 member(s), 802.3ad; traffic on port 0, link up on ports 0, 1 only
+ipd interface  4 port(s) published; the address is on an 802.3ad bond
+ipd lacp       44 LACPDU(s) sent, 12 slow-protocol frame(s) heard back
+ipd lacp       state 0x05 -- a partner is heard but the link is not yet aggregated
+               per link: link 0 0x05, link 1 0x05, link 2 0x05, link 3 0x05
+               the partner's key is 20
+memory objects 56 of 64 live at once
+fixed tables   … cspace 256 slots … 365 KiB of static kernel memory
+```
+
+Both raised tables land where the arithmetic said: 56 of 64 objects, and fixed
+tables at 365 KiB against 269 before. LACPDUs went 23 to 44 and slow-protocol
+frames heard 7 to 12, so all four machines speak and all four are answered.
+
+**The first attempt panicked the kernel**, and it is worth writing down because
+the shape of the mistake is familiar. `KERNEL PANIC: index out of bounds: the
+len is 2 but the index is 2` — `X722_MEMBERS` went to four and the IOMMU loop
+still read `let domain = [5u16, 7][nth as usize]`, a written-out pair whose own
+comment said the ids were spelled out "so that a collision is visible here
+rather than arithmetic somewhere else". Writing a number out does not make it
+agree with a count. It is a run now, `X722_FIRST_DOMAIN + nth`, with a
+`const _: () = assert!(…)` against `iommu::PASS_THROUGH_DOMAIN`, so the next
+raise fails at build time instead of on a server. **No QEMU lane has an X722**,
+so no lane could have caught it — the same reason the four PF0 driver defects in
+this RFC reached hardware first.
+
+**Two findings this boot opened.**
+
+**Ports 2 and 3 report link down to the driver and LinkUp to the BMC.** The bond
+line says `link up on ports 0, 1 only`, while Redfish reports all four NICs
+`LinkStatus: LinkUp, SpeedMbps: 1000` with addresses `…8E`, `…8F`, `…90`, `…91`.
+Either `Get Link Status` is being read wrongly for functions 2 and 3, or those
+ports are up electrically and not carrying. **The generalised link naming is the
+only reason this is visible**: the old two-member code was a chain of `if`s
+whose last arm was an `else`, so it would have printed "both" for this bitmap
+and said nothing was wrong.
+
+**Aggregation did not form on any of the four links.** All four sit at `0x05`
+with partner key 20. Offering the switch every member of its channel-group did
+not change its answer, which exhausts what this side can vary: the remaining
+question is the switch's own configuration — whether that group is LACP
+*active*, and what it expects of a peer. RFC 0073's premise, that speaking the
+protocol correctly is sufficient, is not confirmed by this machine.

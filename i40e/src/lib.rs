@@ -4457,29 +4457,43 @@ mod tests {
         assert_eq!(delta.unicast, 0);
         assert_eq!(baseline.since(&later).packets(), 0, "never runs backwards");
     }
-    /// **Two ports fit a capability space and three do not**, which is the
-    /// whole of why RFC 0076 bonds two.
+    /// **Four ports fit a capability space and six do not**, which is what
+    /// lets RFC 0076 bond all four of the SR550's.
     ///
     /// The number is `cap::CSPACE_SLOTS`, which this crate cannot name -- it
     /// sits below the kernel and must stay there. So it is written down with
     /// the name it has on the other side, and this test is what says the two
     /// have not drifted.
+    ///
+    /// **It said two and three until 2026-09-08**, against a capability space
+    /// of 128. That was never a fact about the X722; it was a fact about the
+    /// table, and the SR550's switch bundles four ports in one channel-group,
+    /// so a host offering two was offering the wrong thing. The table is 256
+    /// now and this test moved with it -- which is the point of writing the
+    /// kernel's number down here rather than inferring it.
+    ///
+    /// **The bound is six, not five, and saying five would have been a guess.**
+    /// Four ports take 184 slots and five take 226, both inside 256; six take
+    /// 268 and do not. The device has four functions, so five is unreachable
+    /// on this hardware -- but a test that asserted a false edge would be
+    /// asserting arithmetic nobody had done.
     #[test]
-    fn two_ports_fit_a_capability_space_and_three_do_not() {
+    fn four_ports_fit_a_capability_space_and_six_do_not() {
         /// `cap::CSPACE_SLOTS`.
-        const SLOTS: u64 = 128;
+        const SLOTS: u64 = 256;
         /// The first slot a port may use; below it are the domain's own.
         const FIRST: u64 = 16;
 
         assert_eq!(grant::SPAN, 42, "five fixed slots and thirty-seven pages");
         assert!(
-            grant::base(FIRST, 2) <= SLOTS,
-            "two ports must fit: {} slots used of {SLOTS}",
-            grant::base(FIRST, 2)
+            grant::base(FIRST, 4) <= SLOTS,
+            "four ports must fit: {} slots used of {SLOTS}",
+            grant::base(FIRST, 4)
         );
         assert!(
-            grant::base(FIRST, 3) > SLOTS,
-            "three must not, and the RFC says two because of this"
+            grant::base(FIRST, 6) > SLOTS,
+            "six must not: {} slots of {SLOTS}",
+            grant::base(FIRST, 6)
         );
     }
 

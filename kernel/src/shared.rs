@@ -36,13 +36,16 @@ use crate::sync::{Rank, SpinLock};
 use bhaskix_mm::{FRAME_SIZE, Zone};
 
 /// Memory objects that can exist at once.
-pub const MAX_OBJECTS: usize = 48;
-// Raised from 16 on 2026-08-12, from 24 on 2026-08-15, and from 32 on
-// 2026-08-18, each **measured full before being raised**: 16 of 16 on the
-// boot that refused the DHCP client's memory, 24 of 24 on the boot that
-// refused the TCP client's listener rings (RFC 0020 step 5 gives it four),
-// and 32 of 32 on the shell-test's iommu machine when RFC 0029 step 4's
-// udp6 client asked for its two pages.
+pub const MAX_OBJECTS: usize = 64;
+// Raised from 16 on 2026-08-12, from 24 on 2026-08-15, from 32 on
+// 2026-08-18, and from 48 on 2026-09-08, each **measured full before being
+// raised**: 16 of 16 on the boot that refused the DHCP client's memory, 24 of
+// 24 on the boot that refused the TCP client's listener rings (RFC 0020 step 5
+// gives it four), 32 of 32 on the shell-test's iommu machine when RFC 0029
+// step 4's udp6 client asked for its two pages, and **48 of 48 on the SR550
+// with only two X722 ports delegated** -- exactly full, so the next object
+// anything asked for would have been refused. RFC 0076 delegates four ports
+// and a port costs four objects, which is 56.
 //
 // **Raised from 40 on 2026-08-30, and this one was measured by a failure
 // rather than by a full table.** RFC 0059 gave the Linux adapter a staging

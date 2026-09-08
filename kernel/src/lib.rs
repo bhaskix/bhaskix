@@ -12852,19 +12852,41 @@ fn foreign_registers(address: bhaskix_arch::pci::Address) -> Option<u64> {
 ///
 /// Below it are the net domain's own: its endpoint, its inbox, the virtio
 /// windows and the ring to `bin/ipd`. Port `n`'s slots start at
-/// `grant::base(X722_FIRST_SLOT, n)` and there is room for **two**, which is
-/// why RFC 0076 bonds two -- `bhaskix_i40e::grant`'s own test is what says a
-/// third would not fit in `cap::CSPACE_SLOTS`.
+/// `grant::base(X722_FIRST_SLOT, n)` and there is room for **four** --
+/// `bhaskix_i40e::grant`'s own test is what says four fit in
+/// `cap::CSPACE_SLOTS` and six do not.
 const X722_FIRST_SLOT: u64 = 16;
+
+/// The first IOMMU domain id an X722 port is given; port `n` gets `+ n`.
+///
+/// **A domain id each, and they must differ.** The hardware may share IOTLB
+/// entries between devices in one domain, and the members of a bond are on one
+/// network carrying one address -- so a shared translation would let a frame
+/// arriving on one member land in another's buffers.
+///
+/// Eight, because 1, 2, 3, 4 and 6 are written out at the `attach_device` calls
+/// for the other devices this kernel drives, and 15 is
+/// `iommu::PASS_THROUGH_DOMAIN`. The run sits between them.
+const X722_FIRST_DOMAIN: u16 = 8;
+
+const _: () = assert!(
+    X722_FIRST_DOMAIN as u64 + X722_MEMBERS <= iommu::PASS_THROUGH_DOMAIN as u64,
+    "the x722 ports' domain ids must stay clear of the pass-through domain"
+);
 
 /// How many X722 ports are delegated, at most.
 ///
-/// **Two, and two is not a preference.** RFC 0076: a port costs 42 capability
-/// slots -- one DMA window, four memory objects and thirty-seven register pages
-/// -- against `cap::CSPACE_SLOTS` of 128 with the first sixteen spoken for. Two
-/// fit and three do not, and a bond needs exactly two. The machine this is for
-/// has four cabled ports; the other two are named as interfaces and not driven.
-const X722_MEMBERS: u64 = 2;
+/// **Four, which is every port the card has.** A port costs 42 capability slots
+/// -- one DMA window, four memory objects and thirty-seven register pages --
+/// so four take 184 of `cap::CSPACE_SLOTS` with the first sixteen spoken for.
+///
+/// **This was two until 2026-09-08, and two was never a fact about the card.**
+/// It was a fact about a 128-slot table, and the SR550's switch bundles all
+/// four ports in one channel-group: two boots with two members reported
+/// `per link: link 0 0x05, link 1 0x05` -- both heard, neither selected, which
+/// is what a four-port channel-group looks like to a host offering two. RFC
+/// 0076 raised the table rather than keep bonding the wrong number.
+const X722_MEMBERS: u64 = 4;
 
 /// Hands the X722 to the net domain -- RFC 0075 steps 3 and 4.
 ///
@@ -13274,7 +13296,10 @@ pub fn start_net_domain(
             if (foreign_ports as u64) < X722_MEMBERS {
                 "for bin/netd"
             } else {
-                "named, not driven -- the capability space affords two"
+                // Reachable again the day a card has more functions than
+                // `X722_MEMBERS`; the SR550's has exactly four and all four
+                // are driven, so this arm says nothing on that machine.
+                "named, not driven -- past what the capability space affords"
             }
         );
         foreign_ports += 1;
@@ -13410,7 +13435,7 @@ pub fn start_net_domain(
         ),
         n => println!(
             "    net domain     {n} x722 port(s) delegated, each with its own dma window: a bond \
-             has two members to select from"
+             has {n} members to select from"
         ),
     }
     // **A contained X722 is a contained network** -- RFC 0076.
@@ -16673,15 +16698,7 @@ fn report_bond(words: &mut [u64; 28], take: impl Fn(&mut [u64; 28])) {
         } else {
             "active-backup"
         },
-        if links == 0 {
-            "no member at all"
-        } else if links == 0b11 {
-            "both"
-        } else if links & 1 != 0 {
-            "port 0 only"
-        } else {
-            "port 1 only"
-        }
+        LinksUp { links, count }
     );
 
     let patience = BOND_PATIENCE_MS.load(core::sync::atomic::Ordering::Relaxed);
@@ -16734,6 +16751,46 @@ fn report_bond(words: &mut [u64; 28], take: impl Fn(&mut [u64; 28])) {
             "    net bond       no member went down inside the window; traffic is still on \
              port {active}, link up on {links:#b}"
         );
+    }
+}
+
+/// Which of a bond's members have their link up, for one line of the report.
+///
+/// **This was a chain of `if`s written for exactly two members** -- "both",
+/// "port 0 only", "port 1 only" -- which was true while a bond was two ports
+/// and silently wrong the moment RFC 0076 delegated four: a four-member bond
+/// with ports 0 and 2 up would have read "port 1 only", because the last arm
+/// was an `else` rather than a test.
+///
+/// A `Display` rather than a built string for the reason `LinkStates` gives:
+/// this kernel has no allocator where the report is printed.
+struct LinksUp {
+    links: u64,
+    count: u64,
+}
+
+impl core::fmt::Display for LinksUp {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let up = (0..self.count).filter(|n| self.links >> n & 1 != 0).count() as u64;
+        if up == 0 {
+            return write!(f, "no member at all");
+        }
+        if up == self.count {
+            return write!(f, "every one of them");
+        }
+        write!(f, "port")?;
+        if up > 1 {
+            write!(f, "s")?;
+        }
+        let mut first = true;
+        for n in 0..self.count {
+            if self.links >> n & 1 == 0 {
+                continue;
+            }
+            write!(f, "{} {n}", if first { "" } else { "," })?;
+            first = false;
+        }
+        write!(f, " only")
     }
 }
 
@@ -23839,10 +23896,14 @@ fn iommu_bringup(handoff: &Handoff) -> Option<(iommu::Report, iommu::Window)> {
             break;
         };
         let delegated = (nic.bus, nic.device, nic.function);
-        // 5 is the id this device has had since RFC 0072; 7 is the first free
-        // one after the six above. Written out rather than computed, so that a
-        // collision is visible here rather than arithmetic somewhere else.
-        let domain = [5u16, 7][nth as usize];
+        // **A run, not a written-out pair.** This was `[5u16, 7][nth]`, two
+        // ids written out "so that a collision is visible here rather than
+        // arithmetic somewhere else" -- and the moment `X722_MEMBERS` went from
+        // two to four it panicked the kernel on the SR550, `index out of
+        // bounds: the len is 2 but the index is 2`, before it reached a single
+        // line of the network report. Writing a number out does not make it
+        // agree with a count; the const assertion below is what does.
+        let domain = X722_FIRST_DOMAIN + nth as u16;
         match iommu::attach_device(&window, delegated, domain, hhdm) {
             Some(nic_window) => {
                 if iommu::verify_window(&nic_window, iommu::windows_on(delegated.0) + 1, hhdm)

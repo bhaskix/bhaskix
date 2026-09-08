@@ -103,12 +103,16 @@ const X722_FIRST_SLOT: u64 = 16;
 
 /// How many X722 ports this program will drive.
 ///
-/// **Two, and the capability space is what decides it** -- RFC 0076. A port
-/// costs `grant::SPAN` slots, which is 42, against 128 with the first sixteen
-/// spoken for: two fit, three do not, and a bond needs exactly two. The kernel
+/// **Four, which is every port the card has** -- RFC 0076. A port costs
+/// `grant::SPAN` slots, which is 42, against `CSPACE_SLOTS` of 256 with the
+/// first sixteen spoken for: four take 184 and six would not fit. The kernel
 /// holds the matching constant and `bhaskix_i40e::grant`'s own test is what
 /// says the number is right.
-const X722_MEMBERS: usize = 2;
+///
+/// **It was two while that table was 128**, which was a fact about the table
+/// and not about the card -- and the SR550's switch bundles all four ports in
+/// one channel-group, so a bond of two was the wrong shape for that wire.
+const X722_MEMBERS: usize = 4;
 
 /// Slot `offset` of port `nth`'s grant.
 ///
@@ -1272,7 +1276,10 @@ extern "C" fn netd_main() -> ! {
         // capability space whether it is there -- so a machine with one port
         // gets `delegated: false` for the second and says so.
         let mut found = [X722::default(); X722_MEMBERS];
-        let mut members: [Option<X722Member>; X722_MEMBERS] = [None, None];
+        // Sized from the constant rather than written out, so the array and
+        // the count cannot disagree -- which they would have the moment
+        // `X722_MEMBERS` moved off two.
+        let mut members: [Option<X722Member>; X722_MEMBERS] = [const { None }; X722_MEMBERS];
         for nth in 0..X722_MEMBERS {
             let (taken, member) = take_x722(nth as u64);
             found[nth] = taken;
