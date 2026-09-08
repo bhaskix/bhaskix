@@ -222,8 +222,17 @@ fn read_interface() -> Option<(MacAddr, Ipv4Addr)> {
         // High half: the ports the kernel said there were. Low half: the
         // members the interface ended up with. Both, because "the address is
         // on a port" has two causes and one number cannot tell them apart.
+        // **Count the members of what actually has members.** A VLAN sits
+        // *over* an interface and has a parent, not members, so reading the
+        // count off `on` reports zero the moment a tag is configured -- and the
+        // boot then says "the address is on a port directly" about a bond that
+        // was built correctly underneath. Measured on the SR550, 2026-09-08.
+        let beneath = match faces.get(on).map(|face| face.kind) {
+            Some(bhaskix_net::interface::Kind::Vlan { parent, .. }) => parent,
+            _ => on,
+        };
         BOUND_SHAPE.store(
-            (ports << 32) | faces.get(on).map_or(0, |f| f.member_count() as u64),
+            (ports << 32) | faces.get(beneath).map_or(0, |f| f.member_count() as u64),
             core::sync::atomic::Ordering::Relaxed,
         );
     }
@@ -236,15 +245,115 @@ fn read_interface() -> Option<(MacAddr, Ipv4Addr)> {
 /// there is no second chance -- so there are a few first chances instead.
 const LACP_OPENINGS: u32 = 8;
 
-/// What the machine has reached, for the report: the partner's key in the high
-/// half and our own state flags in the low, or zero before one is running.
+/// How many members this service will run a machine for.
+///
+/// Four, because `bin/netd`'s member array is four and the length prefix
+/// carries the index in four bits. A bond with more members than this would
+/// run machines for the first four and leave the rest unaggregated, which is
+/// wrong rather than merely limited -- so the count is asserted against
+/// `bin/netd`'s below.
+const LACP_MACHINES: usize = 4;
+
+const _: () = assert!(LACP_MACHINES as u32 <= ring::MEMBER_MASK >> ring::MEMBER_SHIFT);
+
+/// **One 802.3ad state machine per link, which is what the standard says.**
+///
+/// This service ran a single machine until 2026-09-08, and duplicated its PDU
+/// onto both members of the bond. A switch that sees two links claim one
+/// `Actor_Port` has no aggregation it can form: the two frames describe one
+/// port that cannot be in two places, so it answers each and synchronises
+/// neither. The SR550 said exactly that -- state `0x05`, ACTIVITY and
+/// AGGREGATION with no SYNC, on both links, for the whole boot.
+///
+/// So each member gets its own machine, with `Actor_Port = index + 1`, its own
+/// partner, and its own PDU marked for the member it speaks for. The key is
+/// shared, because the key is what says these links may aggregate together.
+struct Bundle {
+    each: [Option<bhaskix_net::lacp::Machine>; LACP_MACHINES],
+}
+
+impl Bundle {
+    const fn new() -> Self {
+        Self {
+            each: [const { None }; LACP_MACHINES],
+        }
+    }
+
+    /// Starts a machine per member, once this service knows its own address.
+    ///
+    /// `members` is what the bond is made of; zero means the address sits
+    /// straight on a port, which is one link and so one machine.
+    fn arm(&mut self, me: MacAddr, members: usize) {
+        for index in 0..members.clamp(1, LACP_MACHINES) {
+            self.each[index].get_or_insert_with(|| {
+                // The port id is what distinguishes the links. Numbered from
+                // one because 802.3ad reserves zero for "no port".
+                let mut fresh = bhaskix_net::lacp::Machine::new(me, 1, (index + 1) as u16);
+                // Ask for the short timeout: a peer that honours it answers
+                // promptly, which is what a boot-length gate needs.
+                fresh.actor.state = fresh.actor.state.with(bhaskix_net::lacp::State::TIMEOUT);
+                fresh
+            });
+        }
+    }
+
+    /// The machine speaking for `member`, if one is running.
+    fn member(&mut self, member: usize) -> Option<(u8, &mut bhaskix_net::lacp::Machine)> {
+        let index = if member < LACP_MACHINES { member } else { 0 };
+        self.each[index]
+            .as_mut()
+            .map(|machine| (index as u8, machine))
+    }
+
+    /// Whether every running machine has aggregated.
+    fn aggregated(&self) -> bool {
+        self.each
+            .iter()
+            .flatten()
+            .fold(None, |all: Option<bool>, m| {
+                Some(all.unwrap_or(true) && m.aggregated())
+            })
+            .unwrap_or(false)
+    }
+}
+
+/// What the machines have reached, for the report: the partner's key in the
+/// high half and our own state flags in the low, or zero before one is running.
 static LACP_STATE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
-/// Publishes what the machine believes, so the boot report can say it.
-fn lacp_publish(machine: &bhaskix_net::lacp::Machine) {
-    let partner = machine.partner.map_or(0, |p| u64::from(p.key) | 1 << 16);
+/// Publishes what the bundle believes, so the boot report can say it.
+///
+/// **One byte per link, not one number for the bundle.** The first version of
+/// this function published the bitwise AND of every machine's flags, on the
+/// reasoning that a bundle is up only when each link is synchronised -- which
+/// is true, and which made the report unable to say anything else. `0x05` then
+/// meant *either* "neither link synchronised" *or* "one did and one did not",
+/// and on the SR550, where the switch bundles four ports and this kernel drives
+/// two, those are completely different findings. A boot cannot be re-read; a
+/// number that cannot distinguish them throws the distinction away.
+///
+/// So each machine's flags go in their own byte, machine `n` at bit `8 * n`,
+/// and the kernel derives the verdict from all of them. A byte of zero is *no
+/// machine*: a running one always has ACTIVITY set, so zero is unambiguous.
+/// Machine 0 keeps the low byte, which is where the single-machine version put
+/// it, so a reader of the old shape still reads a true thing.
+///
+/// The partner key is the first one learned; the links are meant to report the
+/// same key, and a switch that gave two would not aggregate them anyway.
+fn lacp_publish(bundle: &Bundle) {
+    let mut links = 0u64;
+    let mut partner = 0;
+    for (index, machine) in bundle.each.iter().enumerate() {
+        let Some(machine) = machine else {
+            continue;
+        };
+        links |= u64::from(machine.actor.state.0) << (8 * index);
+        if partner == 0 {
+            partner = machine.partner.map_or(0, |p| u64::from(p.key) | 1 << 16);
+        }
+    }
     LACP_STATE.store(
-        (partner << 32) | u64::from(machine.actor.state.0),
+        (partner << 32) | links,
         core::sync::atomic::Ordering::Relaxed,
     );
 }
@@ -591,6 +700,20 @@ unsafe fn send(frame: &[u8]) -> bool {
 ///
 /// As [`send`].
 unsafe fn send_untagged(frame: &[u8]) -> bool {
+    // SAFETY: the caller's obligation.
+    unsafe { send_from(frame, None) }
+}
+
+/// The same, naming the **member** the frame must leave by.
+///
+/// `None` means whichever member carries traffic, which is every frame but an
+/// LACPDU. An LACPDU speaks for one link and carries that link's port id, so it
+/// names the member its machine belongs to.
+///
+/// # Safety
+///
+/// As [`send`].
+unsafe fn send_from(frame: &[u8], member: Option<u8>) -> bool {
     let Some(layout) = ring::Layout::for_region(RING_BYTES) else {
         return false;
     };
@@ -610,7 +733,9 @@ unsafe fn send_untagged(frame: &[u8]) -> bool {
     let Some(framed) = ring::frame_to_write(layout, cursor, frame.len()) else {
         return false;
     };
-    let prefix = (frame.len() as u32).to_le_bytes();
+    // The length, and the mark that says where it goes. `bin/netd` reads an
+    // index and never the frame -- see `ring::mark`.
+    let prefix = ring::mark(frame.len() as u32, member).to_le_bytes();
     // SAFETY: every offset is `abi::ring`'s, inside the region this program
     // mapped writable, and `frame` is a slice it owns.
     unsafe {
@@ -1326,7 +1451,7 @@ fn drain_ring(
     me: (MacAddr, Ipv4Addr),
     tail: &mut u64,
     can_tcp: bool,
-    lacp: &mut Option<bhaskix_net::lacp::Machine>,
+    lacp: &mut Bundle,
     openings: &mut u32,
 ) {
     let Some(layout) = ring::Layout::for_region(RING_BYTES) else {
@@ -1350,7 +1475,10 @@ fn drain_ring(
         };
         // SAFETY: the ring is mapped and `prefix` is `PREFIX` writable bytes.
         unsafe { read_runs(RING_AT, prefix.as_mut_ptr(), runs) };
-        let length = u32::from_le_bytes(prefix) as usize;
+        // The length, and the member the frame arrived on. `bin/netd` stamps
+        // the index; an LACPDU is answered by the machine that speaks for that
+        // link and by no other. See `ring::marked`.
+        let (length, from_member) = ring::marked(u32::from_le_bytes(prefix));
         if length == 0 || length > MAX_FRAME {
             // A length this program has stopped believing. Skip the prefix and
             // carry on rather than wedging on it for ever.
@@ -1406,10 +1534,14 @@ fn drain_ring(
         // which is how two peers converge without either holding a clock.
         if parsed.ethertype.0 == bhaskix_net::lacp::ETHERTYPE {
             lacp_heard();
-            if let Some(machine) = lacp.as_mut()
+            // **To the machine for the link it came in on.** A partner is a
+            // property of a link, not of the bond: routing every PDU to one
+            // machine would let the second link's partner overwrite the
+            // first's, and the report would show a bundle neither link had.
+            let member = from_member.map_or(0, usize::from);
+            if let Some((index, machine)) = lacp.member(member)
                 && machine.received(parsed.payload)
             {
-                lacp_publish(machine);
                 // Answer while awake. A partner that has just told us
                 // something is a partner that will want our view of it.
                 let pdu = machine.sending();
@@ -1426,11 +1558,12 @@ fn drain_ring(
                             &body,
                         )
                         // SAFETY: the return ring is mapped writable.
-                        && unsafe { send(&out[..length]) }
+                        && unsafe { send_from(&out[..length], Some(index)) }
                 {
                     lacp_sent();
                     *openings = openings.saturating_sub(1);
                 }
+                lacp_publish(lacp);
             }
             continue;
         }
@@ -1552,10 +1685,11 @@ fn serve(
     mut tail: u64,
     mut tcp_tail: u64,
 ) -> ! {
-    // **RFC 0074 step 5's machine, and it lives here.** One port is driven, so
-    // one machine; it starts as soon as this service knows its own address,
-    // because the system id an LACPDU carries is that address.
-    let mut lacp: Option<bhaskix_net::lacp::Machine> = None;
+    // **RFC 0074 step 5's machines, and they live here.** One per bond member,
+    // because 802.3ad runs a machine per link -- see `Bundle`. They start as
+    // soon as this service knows its own address, because the system id an
+    // LACPDU carries is that address.
+    let mut lacp = Bundle::new();
     let mut openings = LACP_OPENINGS;
     loop {
         // The configuration may arrive after serving begins -- see
@@ -1573,33 +1707,41 @@ fn serve(
         // yet drops what it is sent, and with no clock there is no retry --
         // so there are a few opening frames rather than one.
         if can_send && me.0 != MacAddr::UNSPECIFIED {
-            let machine = lacp.get_or_insert_with(|| {
-                let mut fresh = bhaskix_net::lacp::Machine::new(me.0, 1, 1);
-                // Ask for the short timeout: a peer that honours it answers
-                // promptly, which is what a boot-length gate needs.
-                fresh.actor.state = fresh.actor.state.with(bhaskix_net::lacp::State::TIMEOUT);
-                fresh
-            });
-            if openings > 0 && !machine.aggregated() {
-                let pdu = machine.sending();
-                let mut body = [0u8; bhaskix_net::lacp::PDU];
-                let mut out = [0u8; eth::HEADER + bhaskix_net::lacp::PDU];
-                if pdu.write(&mut body).is_ok()
-                    && let Some(length) = frame(
-                        &mut out,
-                        bhaskix_net::lacp::GROUP_ADDRESS,
-                        me.0,
-                        EtherType(bhaskix_net::lacp::ETHERTYPE),
-                        &body,
-                    )
-                    // SAFETY: the return ring is mapped writable.
-                    && unsafe { send(&out[..length]) }
-                {
-                    lacp_sent();
-                    openings -= 1;
+            // What the bond is made of, from the shape `read_interface`
+            // published. Zero members is an address straight on a port, which
+            // is one link.
+            let members =
+                (BOUND_SHAPE.load(core::sync::atomic::Ordering::Relaxed) & 0xffff_ffff) as usize;
+            lacp.arm(me.0, members);
+            if openings > 0 && !lacp.aggregated() {
+                // One opening frame per link, each carrying its own port id.
+                for index in 0..LACP_MACHINES {
+                    let Some((member, machine)) = lacp.member(index) else {
+                        continue;
+                    };
+                    if machine.aggregated() {
+                        continue;
+                    }
+                    let pdu = machine.sending();
+                    let mut body = [0u8; bhaskix_net::lacp::PDU];
+                    let mut out = [0u8; eth::HEADER + bhaskix_net::lacp::PDU];
+                    if pdu.write(&mut body).is_ok()
+                        && let Some(length) = frame(
+                            &mut out,
+                            bhaskix_net::lacp::GROUP_ADDRESS,
+                            me.0,
+                            EtherType(bhaskix_net::lacp::ETHERTYPE),
+                            &body,
+                        )
+                        // SAFETY: the return ring is mapped writable.
+                        && unsafe { send_from(&out[..length], Some(member)) }
+                    {
+                        lacp_sent();
+                    }
                 }
+                openings -= 1;
             }
-            lacp_publish(machine);
+            lacp_publish(&lacp);
         }
         // The rings may land after serving has begun — a boot whose
         // demonstration ends early reaches here first — and a serve loop
@@ -2592,7 +2734,15 @@ extern "C" fn ipd_main() -> ! {
         };
         // SAFETY: the ring is mapped and `prefix` is `PREFIX` writable bytes.
         unsafe { read_runs(RING_AT, prefix.as_mut_ptr(), runs) };
-        let length = u32::from_le_bytes(prefix) as usize;
+        // **The length is the low twenty-four bits, not the whole word.** The
+        // top bits name the bond member the frame arrived on -- see
+        // `ring::marked`. This read the word raw until 2026-09-08, when the
+        // member index was added and this demonstration, which shares the ring
+        // with `drain_ring`, began seeing every frame as sixteen million bytes:
+        // 189 refusals, the tail walked forward four bytes at a time, and
+        // nothing ever parsed. The frame's own bytes are the same either way;
+        // what broke was the arithmetic in front of them.
+        let (length, _) = ring::marked(u32::from_le_bytes(prefix));
         // A number the other side chose. Bounded before it is used, and a
         // refusal rather than a clamp: a frame that does not fit is not a
         // shorter frame, it is a producer this program has stopped believing.

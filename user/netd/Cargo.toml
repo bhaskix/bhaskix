@@ -149,4 +149,34 @@ asm_budget = 3
 #
 # Every line of it is a volatile access to a mapping this program was granted,
 # which is the operation `bhaskix-i40e` forbids itself so that it lands here.
-unsafe_budget = 348
+# 357 at RFC 0076's every-member work, and nine lines is the whole of it: a
+# volatile byte copy from the member that took the frame into each other
+# member's own transmit buffer.
+#
+# **It cannot be avoided by pointing two descriptors at one buffer.** A member
+# owns its rings, and a descriptor may only name memory its own device reaches
+# through its own IOMMU window -- the two ports have separate domains precisely
+# so that neither can reach the other's. Copying is what the isolation costs,
+# and it is forty-two bytes for an LACPDU.
+#
+# **It exists because a bundle forms only if every member speaks.** LACPDUs left
+# the active member alone, and the SR550's switch -- four ports in one
+# channel-group -- heard from one link and synchronised none: LACP state `0x05`,
+# partner heard, never aggregated, 2026-09-08.
+#
+# 361 at RFC 0076's per-member machines, and the four lines are what replaced
+# the duplication above. `bin/ipd` now runs one 802.3ad machine per link and
+# names the member each LACPDU must leave by, so this program copies a frame to
+# **one** other member rather than to all of them, and it stamps the member a
+# received frame arrived on so the answer can go back down the same link.
+#
+# The four: one volatile read of the bond's mode -- the second word the kernel
+# writes into this page, and the reason a backup member's frames go up in an
+# aggregation and are dropped in active-backup -- and three from the receive
+# paths handing a frame across where they used to drop it.
+#
+# **The copy did not get cheaper, it got rarer.** Duplicating one PDU onto every
+# member told the switch that two links shared one `Actor_Port`, which is a
+# contradiction under 802.3ad and is why the state stuck at `0x05`. This program
+# reads an index and still never a frame.
+unsafe_budget = 361

@@ -119,4 +119,15 @@ asm_budget = 4
 # and word 29 is written only when a PDU *arrives*, so a boot that never spoke
 # and a boot whose partner is mute were the same report. Both were caught by the
 # project lead rather than by a test.
-unsafe_budget = 164
+# 165 at RFC 0076's every-member work: `send` splits into a marked and an
+# unmarked arm, so the call that puts a frame on the ring is written once more.
+# The mark itself is a bit in the length prefix and costs no unsafe at all.
+#
+# **165 still at RFC 0076's per-member machines, and that is the point.** One
+# 802.3ad state machine per link, each with its own `Actor_Port`, its own
+# partner and its own PDU marked for the member it speaks for -- and not one
+# line of it is unsafe. The machines are `bhaskix-net`'s, which forbids unsafe
+# entirely; the mark is an index in the length prefix, which `bhaskix-abi` tests
+# on the host; and the only thing this file does with either is put bytes on a
+# ring it already had a call for.
+unsafe_budget = 165

@@ -224,6 +224,54 @@ pub fn write_runs(layout: Layout, cursor: Cursor, count: usize) -> (Run, Run) {
 /// [`frame_to_write`].
 pub const PREFIX: usize = 4;
 
+/// Where the member index sits in that prefix, and how wide it is.
+///
+/// **A frame on a bond belongs to a member, in both directions.** Going out, an
+/// LACPDU must leave the member whose port it names -- 802.3ad runs a state
+/// machine per link, each with its own `Actor_Port`, and a switch shown two
+/// links claiming one port identity has no aggregation it can form. Coming in,
+/// a PDU has to reach the machine for the link it arrived on, or the machines
+/// learn each other's partners.
+///
+/// **The driver reads an index and never the frame.** RFC 0018's rule is that a
+/// frame's bytes are opaque to the domain holding DMA, so `bin/netd` cannot
+/// decide what a frame is; the sender says which member it is for, and the
+/// receiver says which member it came from.
+///
+/// Stored as the index **plus one**, so that zero keeps its old meaning:
+/// *whichever member carries traffic*, which is every frame that is not a
+/// per-link protocol. A frame is at most an MTU, so these bits are free.
+pub const MEMBER_SHIFT: u32 = 24;
+
+/// The member field, once shifted -- four bits, which is more members than a
+/// capability space affords.
+pub const MEMBER_MASK: u32 = 0xf << MEMBER_SHIFT;
+
+/// The length itself, once the member is taken off.
+pub const LENGTH_MASK: u32 = (1 << MEMBER_SHIFT) - 1;
+
+/// Puts `member` -- an index, or `None` for the carrying member -- into a
+/// length prefix.
+#[must_use]
+pub const fn mark(length: u32, member: Option<u8>) -> u32 {
+    match member {
+        Some(index) => (length & LENGTH_MASK) | ((index as u32 + 1) << MEMBER_SHIFT),
+        None => length & LENGTH_MASK,
+    }
+}
+
+/// Reads back what [`mark`] wrote: the length, and the member if one was named.
+#[must_use]
+pub const fn marked(prefix: u32) -> (usize, Option<u8>) {
+    let member = (prefix & MEMBER_MASK) >> MEMBER_SHIFT;
+    let which = if member == 0 {
+        None
+    } else {
+        Some((member - 1) as u8)
+    };
+    ((prefix & LENGTH_MASK) as usize, which)
+}
+
 /// Where a frame of `length` bytes goes, and where the head lands after it.
 ///
 /// **RFC 0010 step 6, the framing half.** `bin/netd` and `bin/ipd` each wrote
@@ -571,5 +619,24 @@ mod tests {
         assert_eq!(frame_to_write(layout, cursor, 0), None);
         let full = Cursor::new(layout, 8, 0).expect("valid");
         assert_eq!(frame_to_read(layout, full, 0), None);
+    }
+    /// **A member survives the round trip, and a length is never corrupted by
+    /// one.** RFC 0076: the prefix carries both, and getting that wrong sends a
+    /// frame out of the wrong link or truncates it.
+    #[test]
+    fn a_length_prefix_carries_a_member_without_losing_the_length() {
+        for length in [1u32, 42, 60, 1500, 2048, LENGTH_MASK] {
+            assert_eq!(marked(mark(length, None)), (length as usize, None));
+            for member in 0..8u8 {
+                let (back, which) = marked(mark(length, Some(member)));
+                assert_eq!(back, length as usize, "length survived member {member}");
+                assert_eq!(which, Some(member));
+            }
+        }
+        // Zero is *the carrying member*, not member zero -- the distinction the
+        // plus-one encoding exists for.
+        assert_eq!(marked(mark(64, None)).1, None);
+        assert_eq!(marked(mark(64, Some(0))).1, Some(0));
+        assert_ne!(mark(64, None), mark(64, Some(0)));
     }
 }

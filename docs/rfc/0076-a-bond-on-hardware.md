@@ -459,3 +459,103 @@ leans on, so every "the switch never answered" result recorded above rests on a
 wait that may not have been able to observe an answer. The counters added
 alongside -- LACPDUs sent and slow-protocol frames heard -- are what will settle
 that, and they did not exist when those boots were taken.
+
+## One state machine per link, which is what 802.3ad says
+
+The switch config arrived from the project lead partway through this work:
+*"sr550 have 4 nic on switch 4 port LACP with TRUNK and vlan tagged
+17,5,20,10,2,3,50."* That answered unresolved question 1 before the gate could:
+the ports are a channel-group, so active-backup is the wrong model for this wire
+and the address never had a chance to move. It also explained every quiet boot
+in this document — a trunk drops untagged data, and every frame this stack had
+ever built was untagged.
+
+So the stack became a bond on 802.3ad, a VLAN 17 interface over it, and DHCP on
+that, in that order. LACP then worked in both directions and the report could
+say so: **11 sent, 3 heard**, with the machine's own state at `0x05` — ACTIVITY
+and AGGREGATION, and no SYNC. A partner heard from, and no bundle.
+
+**`0x05` was this service's own fault, not the switch's.** `bin/ipd` ran *one*
+`lacp::Machine` with `Actor_Port = 1` and duplicated its PDU onto every member
+of the bond. A switch shown two links that both claim port 1 of one system has
+no aggregation it can form: the frames describe a single port that cannot be on
+two cables, so it answers each and synchronises neither. The duplication was
+added one step earlier for a reason that was half right — a bundle forms only if
+every link speaks — and got the other half exactly backwards.
+
+The shape now:
+
+* **`bin/ipd` runs one machine per member**, each with `Actor_Port = index + 1`
+  and a partner of its own, sharing one key because the key is what says these
+  links may aggregate together. A PDU arriving on a link is answered by that
+  link's machine; routing them all to one machine would let the second link's
+  partner overwrite the first's, and the report would show a bundle neither had.
+* **The length prefix carries the member**, four bits at bit 24, stored as
+  index + 1 so that zero keeps its meaning of *whichever member carries
+  traffic*. `bin/netd` reads an index and never the frame, which is RFC 0018's
+  rule for the domain holding DMA. It replaced a broadcast bit, and the encoding
+  is tested on the host in `bhaskix-abi`.
+* **`bin/netd` stamps the member a frame arrived on**, so an answer goes back
+  down the link the question came in on.
+* **In an aggregation every member's frames go up.** Active-backup drops the
+  backup's as duplicates; a bundle has no duplicate to drop, and a bond that
+  dropped them would never hear the second link's partner at all. The mode
+  reaches the driver as a word the kernel writes into the report page before the
+  driver starts — a configuration fact, not a fact about any frame.
+* **The report states what every machine agrees on**, not one machine's view: a
+  bundle is up when each link is synchronised, so SYNC shown because one of two
+  links had it would claim an aggregation that does not exist.
+
+**The honest limit, which the boot cannot hide.** This kernel delegates two of
+the four X722 ports, because a domain's capability space bounds how many it can
+hold. The switch's channel-group has four. Whether a switch will bundle two
+links of a four-port group depends on its configuration, and if it will not,
+per-member machines are still the right shape and still will not aggregate —
+the next step is then more ports, not a different state machine.
+
+### What the machine said, 2026-09-08
+
+Booted with `bhaskix.bondlacp bhaskix.vlan=17 bhaskix.lacp=90000 bhaskix.x722=120000`,
+both X722 ports delegated with their own IOMMU domain, LAN queues up from ring 3
+to step 12. Against the boot before it:
+
+| | one machine | per-member machines |
+|---|---|---|
+| `net ring` | **FAILED: 0 frames crossed** | **4 crossed, 590 bytes, 0 refused** |
+| LACPDUs | 11 sent, 3 heard | 21 sent, 5 heard |
+| LACP state | `0x05` | `0x05` |
+| `net domain` | FAILED: nothing was transmitted | FAILED: nothing was transmitted |
+| `dhcp client` | FAILED | FAILED |
+
+**A gate turned green: frames now cross from `bin/netd` to `bin/ipd` on this
+machine**, and the first one came from `08:bd:43:76:47:e3` — the switch. LACP
+traffic roughly doubled, which is two machines speaking where there was one.
+
+**The aggregation did not form, and this boot cannot say why.** That is a defect
+in the instrumentation and it was mine: `lacp_publish` published the bitwise AND
+of every machine's flags. The AND is the right rule for the verdict and the
+wrong thing to record — `0x05` means *either* "neither link synchronised" *or*
+"one did and one did not", and a boot cannot be re-read to find out which. On a
+wire where the switch bundles four ports and this kernel drives two, those are
+completely different findings.
+
+So each machine's flags now go in their own byte of the published word, machine
+`n` at bit `8n`, with zero meaning *no machine* — a running one always has
+ACTIVITY set. The kernel derives the verdict from every link and prints a
+`per link:` line naming each. Machine 0 keeps the low byte, so a reader of the
+old shape still reads a true thing. **The next boot will answer the question
+this one could not**, and until then the honest statement is that the bundle did
+not come up and the reason is unmeasured.
+
+Two red lines are older than this work and stay flagged rather than fixed:
+`net domain FAILED: nothing was transmitted`, which sits beside `41 sent back`
+in the same report and so is a measurement question before it is a device one;
+and DHCP, which cannot be answered while the bond is unbundled — a switch does
+not forward data to a member it has not selected.
+
+**One operational note, because it cost an hour.** Redfish virtual media on this
+BMC returns HTTP 500 on every slot — `EXT1`–`EXT4`, `Remote1`–`Remote4`, and
+Lenovo's own `RemoteMap` action — after fetching the image successfully, and a
+BMC restart does not clear it. What works is the XCC's own CLI:
+`rdmount -map -t http -ro -l <url>` then `rdmount -mount`, with `rdmount -umount`
+to release it.

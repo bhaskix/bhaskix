@@ -13339,6 +13339,23 @@ pub fn start_net_domain(
         return Err("the rings capability would not install");
     }
 
+    // **The bond's mode, written before the driver runs.** `bin/netd` needs it
+    // to know whose received frames to hand up -- every member's in an
+    // aggregation, the carrier's alone in active-backup -- and it needs it from
+    // the first frame, not from whenever the report is printed. So it goes in
+    // here rather than beside the failover request, which is asked for long
+    // after the driver has started. Written unconditionally, so that a driver
+    // reading zero knows the kernel meant active-backup.
+    if let Some((pages, count)) = shared::frames_of(rings)
+        && count > NETD_REPORT_PAGE
+    {
+        let at = (hhdm_base + pages[NETD_REPORT_PAGE] + NETD_BOND_IS_LACP) as *mut u64;
+        let lacp = u64::from(NET_BOND_LACP.load(core::sync::atomic::Ordering::Relaxed));
+        // SAFETY: a frame this object owns, through the direct map, at a word
+        // inside it and past the report `bin/netd` writes.
+        unsafe { core::ptr::write_volatile(at, lacp) };
+    }
+
     // **The rings and the report exist before any device**, and that is the
     // other half of the same change: `bin/netd` writes its report into the last
     // page of that object and the kernel reads it there, so a machine with no
@@ -14716,6 +14733,14 @@ const NET_CONFIG_MARKER: u64 = 0x3146_4e43_5049_5f4e;
 /// `ring::FAILOVER_REQUEST` is the same number from the other side. Forty words
 /// in, well clear of the twenty-six the report itself uses.
 const NETD_FAILOVER_REQUEST: u64 = 40 * 8;
+
+/// Byte offset in that page of the bond's mode: non-zero for 802.3ad.
+///
+/// The second word this kernel writes into it. `bin/netd` needs the mode to
+/// know whose received frames to hand up -- every member's in an aggregation,
+/// the carrier's alone in active-backup -- and the mode is a configuration
+/// fact, so the driver may hold it without reading a frame.
+const NETD_BOND_IS_LACP: u64 = 41 * 8;
 
 /// The VLAN this interface's frames carry, or zero for untagged.
 ///
@@ -16712,6 +16737,39 @@ fn report_bond(words: &mut [u64; 28], take: impl Fn(&mut [u64; 28])) {
     }
 }
 
+/// Each bond member's LACP flags, for one line of the boot report.
+///
+/// A `Display` rather than a built string because this kernel has no allocator
+/// at the point the report is printed, and `println!` takes formatting
+/// arguments -- the same reason every other composite line here is a type.
+///
+/// Prints only the links that have a machine: a byte of zero is no machine,
+/// since a running one always has ACTIVITY set.
+struct LinkStates {
+    links: [u64; 4],
+    aggregated: u64,
+}
+
+impl core::fmt::Display for LinkStates {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let mut first = true;
+        for (index, state) in self.links.iter().enumerate() {
+            if *state == 0 {
+                continue;
+            }
+            if !first {
+                write!(f, ", ")?;
+            }
+            first = false;
+            write!(f, "link {index} {state:#04x}")?;
+            if state & self.aggregated == self.aggregated {
+                write!(f, " \x1b[92msynchronised\x1b[0m")?;
+            }
+        }
+        Ok(())
+    }
+}
+
 fn report_net_after_exchange(hhdm: u64) {
     use core::sync::atomic::Ordering;
 
@@ -16728,7 +16786,7 @@ fn report_net_after_exchange(hhdm: u64) {
     // **Twenty-four words**, seventeen of which are the driver's original
     // report, five the bond's and four the X722's -- members, which one carries
     // traffic, each member's link, how many times it has failed over, and
-    // frames dropped from a member that is not carrying traffic. The length is
+    // frames that arrived on a member that is not carrying traffic. The length is
     // derived from the array, for the reason the `bin/ipd` report below gives
     // at length: a length written twice is wrong in one of the two places.
     let mut words = [0u64; 28];
@@ -16764,11 +16822,13 @@ fn report_net_after_exchange(hhdm: u64) {
     // **Ask for the failover, where this boot said to** -- RFC 0076 step 3.
     //
     // The word goes in before the patience windows below, so that `bin/netd`
-    // finds it while they are waiting. It is the one thing written *into* this
-    // page rather than read out of it, and it is a request rather than a
+    // finds it while they are waiting. It is a request rather than a
     // command: the driver takes a link down only once its bond has carried
     // something, because a failover from a member that never carried anything
     // proves nothing and would read the same in the report.
+    //
+    // It is one of two words written *into* this page; the other is the bond's
+    // mode, which `start_net_domain` writes before the driver runs.
     if X722_FAILOVER.load(Ordering::Relaxed) {
         let at = (hhdm + frames[NETD_REPORT_PAGE] + NETD_FAILOVER_REQUEST) as *mut u64;
         // SAFETY: a frame this object owns, through the direct map, at a word
@@ -16946,11 +17006,31 @@ fn report_net_after_exchange(hhdm: u64) {
         );
     }
     if ipd[LACP_WORD] != 0 {
-        let flags = ipd[LACP_WORD] & 0xff;
+        // **One byte per link.** `bin/ipd` runs a state machine per bond member
+        // -- 802.3ad runs one per link -- and publishes each machine's flags in
+        // its own byte. A byte of zero is no machine at all: a running one
+        // always has ACTIVITY set.
+        //
+        // This used to read the low byte alone, when there was one machine, and
+        // then briefly read the *bitwise AND* of them all. The AND is the right
+        // rule for the verdict and the wrong thing to print: `0x05` meant
+        // either "no link synchronised" or "one of two did", and a boot cannot
+        // be re-read to find out which. So the verdict is derived here from
+        // every link, and the links are named beside it.
+        let links: [u64; 4] = core::array::from_fn(|n| ipd[LACP_WORD] >> (8 * n) & 0xff);
+        let running = links.iter().filter(|state| **state != 0).count();
         let heard = ipd[LACP_WORD] >> 32 & (1 << 16) != 0;
+        // A bundle is up when **every** link is synchronised, collecting and
+        // distributing. One link out of two is not half a bundle.
+        let aggregated = running > 0
+            && links
+                .iter()
+                .filter(|state| **state != 0)
+                .all(|state| state & AGGREGATED == AGGREGATED);
+        let flags = links[0];
         println!(
             "    ipd lacp       state {flags:#04x} -- {}",
-            if flags & AGGREGATED == AGGREGATED {
+            if aggregated {
                 "\x1b[92maggregated: synchronised, collecting and distributing\x1b[0m"
             } else if heard {
                 "a partner is heard but the link is not yet aggregated"
@@ -16958,6 +17038,17 @@ fn report_net_after_exchange(hhdm: u64) {
                 "speaking, and nothing has answered"
             }
         );
+        // Only where there is more than one, because a single link's state is
+        // the line above and repeating it says nothing.
+        if running > 1 {
+            println!(
+                "                   per link: {}",
+                LinkStates {
+                    links,
+                    aggregated: AGGREGATED
+                }
+            );
+        }
         if heard {
             println!(
                 "                   the partner's key is {}",

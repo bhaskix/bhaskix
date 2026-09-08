@@ -370,6 +370,15 @@ mod ring {
     /// twenty-six, and non-zero means *take the active member's link down once
     /// traffic has proven it works*.
     pub const FAILOVER_REQUEST: u64 = REPORT + 40 * 8;
+
+    /// The second such word: non-zero when the bond is **802.3ad**.
+    ///
+    /// A configuration fact, not a fact about any frame -- which is why this
+    /// program may hold it. It decides whose received frames go up: in an
+    /// aggregation every member carries, so every member's frames are handed
+    /// across; in active-backup only the one carrying does, and a backup's
+    /// frames would arrive twice.
+    pub const BOND_IS_LACP: u64 = REPORT + 41 * 8;
 }
 
 /// Offsets into the common configuration structure, from the specification.
@@ -1008,7 +1017,12 @@ unsafe fn write_runs_from(source: *const u8, runs: (chan::Run, chan::Run)) {
     }
 }
 
-/// Hands one frame to `bin/ipd`: a four-byte length, then the bytes.
+/// Hands one frame to `bin/ipd`: a four-byte length and member, then the bytes.
+///
+/// `member` is the bond member the frame arrived on, or `None` where there is
+/// no bond. `bin/ipd` runs one LACP machine per link and answers a partner on
+/// the link it spoke from, so the index has to survive the crossing -- and an
+/// index is all this program hands over, never a reading of the frame.
 ///
 /// Returns whether it fitted. A frame that does not fit is **dropped and
 /// counted**, which is what a datagram path is permitted to do — blocking the
@@ -1019,7 +1033,7 @@ unsafe fn write_runs_from(source: *const u8, runs: (chan::Run, chan::Run)) {
 ///
 /// The ring must be mapped writable at [`RING_AT`] and the frame readable at
 /// `frame_at` for `length` bytes.
-unsafe fn hand_to_ipd(frame_at: u64, length: usize) -> bool {
+unsafe fn hand_to_ipd(frame_at: u64, length: usize, member: Option<u8>) -> bool {
     let Some(layout) = chan::Layout::for_region(RING_BYTES) else {
         return false;
     };
@@ -1044,7 +1058,7 @@ unsafe fn hand_to_ipd(frame_at: u64, length: usize) -> bool {
     let Some(framed) = chan::frame_to_write(layout, cursor, length) else {
         return false;
     };
-    let prefix = (length as u32).to_le_bytes();
+    let prefix = chan::mark(length as u32, member).to_le_bytes();
     // SAFETY: every offset is one `abi::ring` computed inside the region this
     // program mapped writable, `frame_at` is a receive buffer readable for
     // `length`, and the runs of a transfer do not overlap -- they are the two
@@ -1113,7 +1127,7 @@ unsafe fn read_runs_into(into: *mut u8, runs: (chan::Run, chan::Run)) {
 /// # Safety
 ///
 /// The return ring must be mapped at [`BACK_AT`] and the rings at [`RINGS_AT`].
-unsafe fn take_from_ipd_into(buffer: u64, header: u64) -> Option<usize> {
+unsafe fn take_from_ipd_into(buffer: u64, header: u64) -> Option<(usize, Option<u8>)> {
     let layout = chan::Layout::for_region(RING_BYTES)?;
     // SAFETY: the ring's header, in the region this program mapped. Volatile
     // because the producer is another domain and takes no lock.
@@ -1132,7 +1146,13 @@ unsafe fn take_from_ipd_into(buffer: u64, header: u64) -> Option<usize> {
     let runs = chan::length_to_read(layout, cursor)?;
     // SAFETY: the ring is mapped and `prefix` is `PREFIX` writable bytes.
     unsafe { read_runs_into(prefix.as_mut_ptr(), runs) };
-    let length = u32::from_le_bytes(prefix) as usize;
+    // **The member, then the length.** `bin/ipd` names the member a frame must
+    // leave by -- an LACPDU carries the port id of the link it goes out of, so
+    // it can go out of that link and no other. Everything else names none and
+    // leaves by whichever member carries traffic. This program reads an index
+    // and never the frame, which is the rule RFC 0018 set for the domain that
+    // holds DMA.
+    let (length, for_member) = chan::marked(u32::from_le_bytes(prefix));
     // A length the *other side* wrote. Bounded before it is used, and refused
     // rather than clamped: a frame that does not fit a buffer is not a shorter
     // frame, it is a producer this program has stopped believing.
@@ -1165,7 +1185,7 @@ unsafe fn take_from_ipd_into(buffer: u64, header: u64) -> Option<usize> {
             framed.next,
         );
     }
-    Some(length)
+    Some((length, for_member))
 }
 
 /// Takes a frame `bin/ipd` built into a virtio port's transmit buffer.
@@ -1174,9 +1194,14 @@ unsafe fn take_from_ipd_into(buffer: u64, header: u64) -> Option<usize> {
 ///
 /// As [`take_from_ipd_into`], for the buffer inside `w`'s rings.
 unsafe fn take_from_ipd(w: Windows) -> Option<usize> {
-    // SAFETY: the caller's, and the buffer is inside the rings object this
-    // program mapped writable.
-    unsafe { take_from_ipd_into(w.rings + ring::TX_BUFFER, VIRTIO_NET_HEADER) }
+    // The member `bin/ipd` named is dropped here, deliberately: the virtio bond
+    // sends out its active member only. It is a lane's bond with no switch to
+    // aggregate it, so naming a link has nothing to act on -- the X722 bond is
+    // where the mark is honoured.
+    //
+    // SAFETY: the caller's obligation, and the buffer is inside the rings
+    // object this program mapped writable.
+    unsafe { take_from_ipd_into(w.rings + ring::TX_BUFFER, VIRTIO_NET_HEADER) }.map(|(len, _)| len)
 }
 
 /// Looks once, without spinning and without blocking.
@@ -1524,11 +1549,16 @@ extern "C" fn netd_main() -> ! {
     // send from an address that is not its own; this sends from the bond's, and
     // whether the answer comes back is what the failover gate measures.
     let bond_mac = mac;
-    // Frames a member that is not carrying traffic delivered, and which were
-    // therefore dropped. Counted rather than ignored: on a bond both members
-    // are on the wire and both receive, and a frame taken from the backup would
-    // be a duplicate of one the active member already handed across.
+    // Frames a member that is not carrying traffic delivered. Counted rather
+    // than ignored: in active-backup both members are on the wire and both
+    // receive, and a frame taken from the backup would be a duplicate of one
+    // the active member already handed across -- so those are dropped. In an
+    // 802.3ad bond every member carries and they go up, still counted here.
     let mut off_member = 0u64;
+
+    // Which of those two this is. Read once: the kernel writes the word before
+    // this program starts, and it does not change while it runs.
+    let lacp_bond = bond_is_lacp();
 
     // Everything after this is step 3: frames go to `bin/ipd` rather than into
     // a report. Without a ring there is nowhere to put them, and this program
@@ -1552,7 +1582,7 @@ extern "C" fn netd_main() -> ! {
         let buffer = RINGS_AT + ring_buffer_of(first_index) + header;
         // SAFETY: a receive buffer this program mapped and the device has
         // finished with, and the ring it just mapped writable.
-        if unsafe { hand_to_ipd(buffer, received as usize) } {
+        if unsafe { hand_to_ipd(buffer, received as usize, None) } {
             handed += 1;
         }
         // Back to the device. **A receive queue that is drained and not
@@ -1716,10 +1746,12 @@ extern "C" fn netd_main() -> ! {
 
         idle = idle.saturating_add(1);
         // Every member's receive queue, because both are on the wire whether
-        // or not either is carrying traffic. A frame from a member that is not
-        // the active one is given back to the device and *not* handed across:
-        // it is a duplicate of one the active member has already delivered, and
-        // a bond that delivered both would be a bond that reordered.
+        // or not either is carrying traffic. What happens to a frame from a
+        // member that is not the active one depends on the bond: in
+        // active-backup it is given back to the device and not handed across,
+        // because it duplicates one the active member already delivered and a
+        // bond that delivered both would be a bond that reordered. In an
+        // aggregation every member carries and there is no duplicate to drop.
         for index in 0..ports.len() {
             let Some(port) = ports[index].as_mut() else {
                 continue;
@@ -1737,12 +1769,18 @@ extern "C" fn netd_main() -> ! {
             );
             let buffer = port.at.rings + ring_buffer_of(slot) + port.header;
             let length = u64::from(written).saturating_sub(port.header) as usize;
-            if index == active {
+            // **Whose frames go up.** In an 802.3ad bond every member carries,
+            // so every member's frames are handed across; in active-backup only
+            // the one carrying does, and a backup's would arrive twice. The
+            // mode is `ring::BOND_IS_LACP`, a configuration fact the kernel
+            // wrote -- this program still never reads a frame.
+            if length > 0 && (index == active || lacp_bond) {
                 // SAFETY: as above.
-                if length > 0 && unsafe { hand_to_ipd(buffer, length) } {
+                if unsafe { hand_to_ipd(buffer, length, Some(index as u8)) } {
                     handed += 1;
                 }
-            } else if length > 0 {
+            }
+            if index != active && length > 0 {
                 off_member += 1;
             }
             port.receive.describe(
@@ -2231,6 +2269,8 @@ fn carry_x722(mut members: [Option<X722Member>; X722_MEMBERS], facts: [X722; X72
     let mut carried_since = 0u64;
     // Frames that arrived on a member that is not carrying traffic.
     let mut off_member = 0u64;
+    // Whether they are handed up as well as counted -- see the virtio bond.
+    let lacp_bond = bond_is_lacp();
     let mut idle = 0u32;
     let mut since_link = 0u32;
     // **Announcements this bond sends of its own** -- RFC 0076 step 3.
@@ -2303,14 +2343,20 @@ fn carry_x722(mut members: [Option<X722Member>; X722_MEMBERS], facts: [X722; X72
                 if downed.is_some() {
                     carried_since += 1;
                 }
+            } else {
+                off_member += 1;
+            }
+            // **Whose frames go up** -- as the virtio bond above, and for the
+            // same reason. An aggregation that dropped its backup's frames
+            // would never hear that link's partner, and the machine speaking
+            // for it could not aggregate.
+            if length > 0 && (index == active || lacp_bond) {
                 // SAFETY: a buffer this program mapped and the device has
                 // finished with -- the descriptor's write-back is what says so
                 // -- and the ring to `bin/ipd`, mapped writable above.
-                if length > 0 && unsafe { hand_to_ipd(buffer, length) } {
+                if unsafe { hand_to_ipd(buffer, length, Some(index as u8)) } {
                     handed += 1;
                 }
-            } else {
-                off_member += 1;
             }
             // Back to the device, and the tail after it: a descriptor taken and
             // not given back is a ring that works once, which this file has
@@ -2360,32 +2406,72 @@ fn carry_x722(mut members: [Option<X722Member>; X722_MEMBERS], facts: [X722; X72
             }
         }
 
-        // **What `bin/ipd` built, out of the member that carries.**
-        if back_mapped && let Some(member) = members[active].as_mut() {
+        // **What `bin/ipd` built** -- out of the member it named, or out of the
+        // member that carries where it named none.
+        //
+        // 802.3ad runs a state machine per link, and each machine's PDU carries
+        // the port id of the link it speaks for. So an LACPDU leaves by the
+        // member whose machine built it and no other, and everything else
+        // leaves by the one carrying traffic. Which member is `bin/ipd`'s mark,
+        // not this program's reading of the frame -- see `chan::marked`.
+        if back_mapped && let Some(carrier) = members[active].as_mut() {
             // SAFETY: the return ring is mapped, and the packet buffer is the
             // page this program mapped for this member's transmit ring. No
             // header: an X722 takes the frame as it stands.
-            if let Some(length) = unsafe { take_from_ipd_into(member.queues.transmit.at + 2048, 0) }
-            {
+            let taken = unsafe { take_from_ipd_into(carrier.queues.transmit.at + 2048, 0) };
+            if let Some((length, for_member)) = taken {
                 idle = 0;
-                let at = member.queues.transmit_device + 2048;
-                if let Some(slot) =
-                    member
-                        .device
-                        .post_frame(&mut member.queues.transmit, at, length as u16, false)
-                {
-                    let queue = member.queues.transmit_queue;
-                    let tail = member.device.transmit_tail();
-                    member.device.transmit_doorbell(queue, tail);
-                    for _ in 0..SPINS {
-                        if member.device.frame_completed(&member.queues.transmit, slot) {
-                            break;
-                        }
-                        core::hint::spin_loop();
+                // The frame landed in the active member's buffer, because that
+                // is the buffer `bin/ipd`'s ring writes into. A frame marked
+                // for a different member is copied into that member's own --
+                // a member owns its rings, and a descriptor may only name
+                // memory its own device reaches through its own window.
+                let source = carrier.queues.transmit.at + 2048;
+                let leaves_by = match for_member {
+                    Some(index) if members.get(index as usize).is_some_and(Option::is_some) => {
+                        index as usize
                     }
-                    sent += 1;
-                    publish(handed, sent, seen);
+                    // Named a member this program does not hold, or named none.
+                    _ => active,
+                };
+                if leaves_by != active {
+                    // SAFETY: two transmit buffers this program mapped, each a
+                    // page it holds, and `length` is bounded by
+                    // `take_from_ipd_into`.
+                    unsafe {
+                        let into = members[leaves_by]
+                            .as_ref()
+                            .expect("held")
+                            .queues
+                            .transmit
+                            .at;
+                        for offset in 0..length as u64 {
+                            let byte = core::ptr::read_volatile((source + offset) as *const u8);
+                            core::ptr::write_volatile((into + 2048 + offset) as *mut u8, byte);
+                        }
+                    }
                 }
+                if let Some(member) = members[leaves_by].as_mut() {
+                    let at = member.queues.transmit_device + 2048;
+                    if let Some(slot) = member.device.post_frame(
+                        &mut member.queues.transmit,
+                        at,
+                        length as u16,
+                        false,
+                    ) {
+                        let queue = member.queues.transmit_queue;
+                        let tail = member.device.transmit_tail();
+                        member.device.transmit_doorbell(queue, tail);
+                        for _ in 0..SPINS {
+                            if member.device.frame_completed(&member.queues.transmit, slot) {
+                                break;
+                            }
+                            core::hint::spin_loop();
+                        }
+                        sent += 1;
+                    }
+                }
+                publish(handed, sent, seen);
             }
         }
 
@@ -2769,6 +2855,12 @@ fn failover_requested() -> bool {
     // SAFETY: the report page this program mapped writable, at a word outside
     // the report itself. The kernel writes it; this reads it.
     unsafe { core::ptr::read_volatile((RINGS_AT + ring::FAILOVER_REQUEST) as *const u64) != 0 }
+}
+
+/// Whether the bond is 802.3ad -- [`ring::BOND_IS_LACP`].
+fn bond_is_lacp() -> bool {
+    // SAFETY: as `failover_requested`, one word further on.
+    unsafe { core::ptr::read_volatile((RINGS_AT + ring::BOND_IS_LACP) as *const u64) != 0 }
 }
 
 /// The bond's words, for a bond whose members are X722 ports.
