@@ -768,3 +768,105 @@ saying `ipd report INCOMPLETE` instead. **Watched both ways on real boots**:
 red with the tail write removed, green with it restored -- after two earlier
 checks that proved nothing, because a lane prints only its verdict on success
 and the logs I grepped never contained the report at all.
+
+### Where the LACPDUs went, 2026-09-09
+
+The switch said DEFAULTED: it had never received a usable LACPDU. This side
+counted 44 sent. Both were true, and the frames died in between — inside the
+X722 itself.
+
+**The device carries an internal switch, and a transmit descriptor with no
+switch control tag is *"routed according to hardware filters"*.** A frame
+addressed to `01:80:C2:00:00:02` — a reserved group address — is therefore
+consumed by that switch rather than put on the wire. Two things lift it out,
+and the crate has had both since 2026-09-06:
+
+* `SWTCH = 01b` in a transmit **context** descriptor: *"uplink packet. The
+  packet is transmitted to the network bypassing hardware filters."*
+* The VSI's *Allow Destination Override* flag, without which a switch control
+  tag is **not permitted at all** — C620: *"Can be set to non-zero only by
+  control VSI as programmed by the Allow Destination Override flag per VSI."*
+
+**Neither was ever wired into `bin/netd`.** `post_frame`'s `uplink` argument was
+passed `false` at both call sites, and `allow_destination_override` had no
+caller outside the crate's own tests. The reasoning was written out in full at
+`TX_SWTCH_UPLINK`, naming the exact symptom — *"posted and completed and never
+counted out of the MAC"* — and then the mechanism sat unused for three days
+while four hardware boots looked for the fault somewhere else.
+
+**A mechanism nobody calls is not a mechanism.** The lesson is not about this
+register: a constant with a careful doc comment reads exactly like working code
+in every grep, every review and every recollection, and the only thing that
+distinguishes them is a caller. `grep` for the definition finds it; what was
+needed was a grep for the *use*.
+
+It also explains the shape of the evidence, which had been consistent all along
+and pointed inward rather than at the switch:
+
+| observation | explanation |
+|---|---|
+| `bin/ipd`: 44 LACPDUs sent | it handed 44 to the driver |
+| `bin/netd`: posted, descriptors completed | the device accepted all 44 |
+| switch: DEFAULTED, partner key 0 port 0 | none reached the wire |
+| the switch's own LLDP arrives here | receive is unaffected by any of this |
+| all four links identical | it is the device, not a cable or a port |
+
+**What the fix is.** `bin/netd` calls `allow_destination_override` during
+bring-up, and posts a frame with the uplink tag when `bin/ipd` asks for it.
+Which frames ask is `bin/ipd`'s to say and not the driver's: RFC 0018 keeps the
+frame opaque to the domain holding DMA, so the driver cannot tell an LACPDU from
+a datagram. It travels as **bit 28 of the ring's length prefix**, beside the
+member index — `ring::UPLINK`, host-tested and watched red, with the test
+asserting that neither the length nor the member can forge it.
+
+### The frames do leave, and the counter is how we know — 2026-09-10
+
+```
+net x722   34 multicast frame(s) left the vsi by its own count; destination override taken
+net bond   4 member(s), 802.3ad; traffic on port 0, link up on every one of them
+ipd lacp   44 LACPDU(s) sent, 12 slow-protocol frame(s) heard back
+ipd lacp   state 0x05 -- a partner is heard but the link is not yet aggregated
+           the partner says: link 0 0x45, link 1 0x45, link 2 0x45, link 3 0x45
+           so the switch is LACP active
+           and records its partner as key 0, port 0 -- ours are key 1, port 1
+```
+
+**Both halves of the uplink fix took.** `allow_destination_override` was accepted
+and the VSI's own multicast transmit counter moved. The internal switch is no
+longer eating the frames.
+
+**And the first report of this change was wrong.** The boot immediately after the
+fix said `0x45` exactly as before, and it was written up here as "the fix did not
+change the outcome". It had changed the outcome; what had not changed was the
+*switch's answer*, and nothing in the system could tell those apart. `GLV_MPTCL`
+counts multicast packets the VSI put out, and until this build it was not mapped
+— so every figure in the report counted frames **handed over** and none counted
+frames **transmitted**. Three days of boots turned on a distinction no instrument
+could make.
+
+That is the same error as the report-page words and the partner's flag byte, in
+its third form: a quantity that was never measured, read as a measurement of
+zero. The register addresses here were taken out of the C620 datasheet rather
+than recalled — `GLV_MPTCL[n]` at `0x0033CC00 + 8n`, *"Counts number of multicast
+packets transmitted by this VSI"* — and cost three register pages, so
+`grant::SPAN` is 45 and four ports take 196 of 256 capability slots.
+
+**What is ruled out now**: the internal switch consuming the frames, the
+destination override being refused, and the transmit path being dead. **What
+remains**: a switch that is LACP *active*, hears nothing usable from us, and runs
+on made-up partner information — key 0, port 0.
+
+### The next hypothesis, stated as a hypothesis
+
+**Every LACPDU on all four links carries the same Ethernet source address.**
+`bin/ipd` is told exactly one MAC on its configuration page and uses it — port
+0's — for all four machines. That the LACP *system id* is shared is correct and
+required by 802.3ad; that the *Ethernet source* is shared is not. Four ports of
+one channel-group all sourcing from one address is a MAC-flap signature, and a
+switch may drop such frames before its LACP ever sees them.
+
+This is a **code fact that was checked, not a measurement of the switch.** It
+fits the evidence — all four links identical, frames leaving, nothing arriving —
+and it is the first thing to try. Testing it means carrying every member's
+address on the configuration page so each machine sources from its own port,
+which is a change to that interface rather than a one-line fix.

@@ -247,29 +247,44 @@ pub const MEMBER_SHIFT: u32 = 24;
 /// capability space affords.
 pub const MEMBER_MASK: u32 = 0xf << MEMBER_SHIFT;
 
-/// The length itself, once the member is taken off.
+/// **Bit 28: this frame must reach the wire, not the device's own switch.**
+///
+/// An X722 carries an internal switch, and a transmit descriptor with no
+/// switch control tag is *"routed according to hardware filters"* -- so a frame
+/// addressed to a reserved group address is consumed by that switch rather than
+/// sent out. Every LACPDU this system built between 2026-09-06 and 2026-09-09
+/// died there: posted, completed, and never counted out of the MAC, while the
+/// switch at the far end reported DEFAULTED because nothing had ever arrived.
+///
+/// The frame is opaque to the driver -- RFC 0018 -- so the driver cannot know
+/// an LACPDU from a datagram. `bin/ipd` knows, and says so here in a bit.
+pub const UPLINK: u32 = 1 << 28;
+
+/// The length itself, once the member and the flags are taken off.
 pub const LENGTH_MASK: u32 = (1 << MEMBER_SHIFT) - 1;
 
 /// Puts `member` -- an index, or `None` for the carrying member -- into a
-/// length prefix.
+/// length prefix, and says whether the frame must bypass the device's switch.
 #[must_use]
-pub const fn mark(length: u32, member: Option<u8>) -> u32 {
-    match member {
+pub const fn mark(length: u32, member: Option<u8>, uplink: bool) -> u32 {
+    let named = match member {
         Some(index) => (length & LENGTH_MASK) | ((index as u32 + 1) << MEMBER_SHIFT),
         None => length & LENGTH_MASK,
-    }
+    };
+    if uplink { named | UPLINK } else { named }
 }
 
-/// Reads back what [`mark`] wrote: the length, and the member if one was named.
+/// Reads back what [`mark`] wrote: the length, the member if one was named, and
+/// whether the frame must go straight to the wire.
 #[must_use]
-pub const fn marked(prefix: u32) -> (usize, Option<u8>) {
+pub const fn marked(prefix: u32) -> (usize, Option<u8>, bool) {
     let member = (prefix & MEMBER_MASK) >> MEMBER_SHIFT;
     let which = if member == 0 {
         None
     } else {
         Some((member - 1) as u8)
     };
-    ((prefix & LENGTH_MASK) as usize, which)
+    ((prefix & LENGTH_MASK) as usize, which, prefix & UPLINK != 0)
 }
 
 /// Where a frame of `length` bytes goes, and where the head lands after it.
@@ -626,17 +641,50 @@ mod tests {
     #[test]
     fn a_length_prefix_carries_a_member_without_losing_the_length() {
         for length in [1u32, 42, 60, 1500, 2048, LENGTH_MASK] {
-            assert_eq!(marked(mark(length, None)), (length as usize, None));
+            assert_eq!(
+                marked(mark(length, None, false)),
+                (length as usize, None, false)
+            );
             for member in 0..8u8 {
-                let (back, which) = marked(mark(length, Some(member)));
+                let (back, which, _) = marked(mark(length, Some(member), false));
                 assert_eq!(back, length as usize, "length survived member {member}");
                 assert_eq!(which, Some(member));
             }
         }
         // Zero is *the carrying member*, not member zero -- the distinction the
         // plus-one encoding exists for.
-        assert_eq!(marked(mark(64, None)).1, None);
-        assert_eq!(marked(mark(64, Some(0))).1, Some(0));
-        assert_ne!(mark(64, None), mark(64, Some(0)));
+        assert_eq!(marked(mark(64, None, false)).1, None);
+        assert_eq!(marked(mark(64, Some(0), false)).1, Some(0));
+        assert_ne!(mark(64, None, false), mark(64, Some(0), false));
+    }
+
+    /// **The uplink flag survives beside a member and a length**, and neither
+    /// of the other two can forge it.
+    ///
+    /// RFC 0076. An X722's internal switch eats a frame addressed to a reserved
+    /// group address unless its descriptor carries a switch control tag, so this
+    /// bit is the difference between an LACPDU that reaches the switch and one
+    /// that is posted, completed, and never seen -- which is what every LACPDU
+    /// this system built did until 2026-09-09. Watched red by dropping the
+    /// `| UPLINK`.
+    #[test]
+    fn a_length_prefix_carries_the_uplink_flag_beside_the_rest() {
+        for length in [1u32, 42, 60, 1500, LENGTH_MASK] {
+            for member in [None, Some(0u8), Some(3)] {
+                let (back, which, uplink) = marked(mark(length, member, true));
+                assert_eq!(back, length as usize, "length survived the flag");
+                assert_eq!(which, member, "member survived the flag");
+                assert!(uplink, "the flag survived length {length}");
+
+                let (_, _, quiet) = marked(mark(length, member, false));
+                assert!(!quiet, "a frame that did not ask does not get it");
+            }
+        }
+        // **The length cannot forge the flag.** `LENGTH_MASK` is every bit a
+        // length may use; if the flag sat inside it, the longest frame would
+        // silently demand the wire.
+        assert!(!marked(mark(LENGTH_MASK, None, false)).2);
+        assert_eq!(UPLINK & LENGTH_MASK, 0, "the flag is outside the length");
+        assert_eq!(UPLINK & MEMBER_MASK, 0, "and outside the member");
     }
 }

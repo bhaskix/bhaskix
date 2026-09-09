@@ -772,7 +772,9 @@ unsafe fn send(frame: &[u8]) -> bool {
 /// As [`send`].
 unsafe fn send_untagged(frame: &[u8]) -> bool {
     // SAFETY: the caller's obligation.
-    unsafe { send_from(frame, None) }
+    // Ordinary traffic is switched normally: it is addressed to somebody the
+    // internal switch can route to, and the wire is where that lands anyway.
+    unsafe { send_from(frame, None, false) }
 }
 
 /// The same, naming the **member** the frame must leave by.
@@ -781,10 +783,15 @@ unsafe fn send_untagged(frame: &[u8]) -> bool {
 /// LACPDU. An LACPDU speaks for one link and carries that link's port id, so it
 /// names the member its machine belongs to.
 ///
+/// `uplink` says the frame must reach the wire rather than the device's own
+/// switch -- see [`ring::UPLINK`]. Only this service can say so: the driver
+/// holds DMA and may not read a frame, so it cannot tell a control frame from a
+/// datagram, and an X722's internal switch eats the former unless told.
+///
 /// # Safety
 ///
 /// As [`send`].
-unsafe fn send_from(frame: &[u8], member: Option<u8>) -> bool {
+unsafe fn send_from(frame: &[u8], member: Option<u8>, uplink: bool) -> bool {
     let Some(layout) = ring::Layout::for_region(RING_BYTES) else {
         return false;
     };
@@ -806,7 +813,7 @@ unsafe fn send_from(frame: &[u8], member: Option<u8>) -> bool {
     };
     // The length, and the mark that says where it goes. `bin/netd` reads an
     // index and never the frame -- see `ring::mark`.
-    let prefix = ring::mark(frame.len() as u32, member).to_le_bytes();
+    let prefix = ring::mark(frame.len() as u32, member, uplink).to_le_bytes();
     // SAFETY: every offset is `abi::ring`'s, inside the region this program
     // mapped writable, and `frame` is a slice it owns.
     unsafe {
@@ -1554,7 +1561,7 @@ fn drain_ring(
         // The length, and the member the frame arrived on. `bin/netd` stamps
         // the index; an LACPDU is answered by the machine that speaks for that
         // link and by no other. See `ring::marked`.
-        let (length, from_member) = ring::marked(u32::from_le_bytes(prefix));
+        let (length, from_member, _) = ring::marked(u32::from_le_bytes(prefix));
         if length == 0 || length > MAX_FRAME {
             // A length this program has stopped believing. Skip the prefix and
             // carry on rather than wedging on it for ever.
@@ -1634,7 +1641,7 @@ fn drain_ring(
                             &body,
                         )
                         // SAFETY: the return ring is mapped writable.
-                        && unsafe { send_from(&out[..length], Some(index)) }
+                        && unsafe { send_from(&out[..length], Some(index), true) }
                 {
                     lacp_sent();
                     *openings = openings.saturating_sub(1);
@@ -1810,7 +1817,7 @@ fn serve(
                             &body,
                         )
                         // SAFETY: the return ring is mapped writable.
-                        && unsafe { send_from(&out[..length], Some(member)) }
+                        && unsafe { send_from(&out[..length], Some(member), true) }
                     {
                         lacp_sent();
                     }
@@ -2818,7 +2825,7 @@ extern "C" fn ipd_main() -> ! {
         // 189 refusals, the tail walked forward four bytes at a time, and
         // nothing ever parsed. The frame's own bytes are the same either way;
         // what broke was the arithmetic in front of them.
-        let (length, _) = ring::marked(u32::from_le_bytes(prefix));
+        let (length, _, _) = ring::marked(u32::from_le_bytes(prefix));
         // A number the other side chose. Bounded before it is used, and a
         // refusal rather than a clamp: a frame that does not fit is not a
         // shorter frame, it is a producer this program has stopped believing.

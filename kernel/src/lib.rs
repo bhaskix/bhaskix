@@ -16613,7 +16613,7 @@ fn time_the_burst(hhdm: u64) {
 /// such a NIC on its bus where the service was not given it. That is a fact
 /// about this kernel rather than about the machine, and leaving it unsaid is
 /// how a delegation that quietly stopped working would go unnoticed.
-fn report_x722(words: &[u64; 28]) {
+fn report_x722(words: &[u64; 29]) {
     /// Word 22's low four bits: delegated, reset, queues enabled, link up.
     const DELEGATED: u64 = 1;
     const RESET: u64 = 1 << 1;
@@ -16651,6 +16651,25 @@ fn report_x722(words: &[u64; 28]) {
             "REFUSED"
         }
     );
+    // **What the device says it transmitted, which is not what the driver says.**
+    //
+    // Every other figure in this report counts frames *handed over* -- a
+    // descriptor posted, a write-back seen. `GLV_MPTCL` counts multicast packets
+    // the VSI put out, and an LACPDU is multicast, so this is the one number
+    // that separates a frame that reached the wire from one the device
+    // swallowed. Both were consistent with "44 sent, none received" and neither
+    // could tell them apart.
+    let out = words[27] & 0xffff_ffff;
+    let override_ok = words[27] >> 32 & 1 != 0;
+    println!(
+        "    net x722       {out} multicast frame(s) left the vsi by its own count; destination \
+         override {}",
+        if override_ok {
+            "\x1b[92mtaken\x1b[0m"
+        } else {
+            "\x1b[93mREFUSED -- a switch control tag is not permitted without it\x1b[0m"
+        }
+    );
     println!(
         "    net x722       its LAN queues {} -- private memory, contexts, buffers and the \
          write-back path, all from ring 3; it reached step {}",
@@ -16677,9 +16696,9 @@ fn report_x722(words: &[u64; 28]) {
 /// the bond still carries. So this waits for both, and says which one it got —
 /// a failover with no traffic after it is a bond that failed over into silence,
 /// and it must not print as a pass.
-fn report_bond(words: &mut [u64; 28], take: impl Fn(&mut [u64; 28])) {
+fn report_bond(words: &mut [u64; 29], take: impl Fn(&mut [u64; 29])) {
     /// Which member the bond is on, and what each member's link says.
-    fn members(words: &[u64; 28]) -> (u64, u64, u64) {
+    fn members(words: &[u64; 29]) -> (u64, u64, u64) {
         (words[17], words[18], words[19])
     }
 
@@ -16856,7 +16875,7 @@ fn report_net_after_exchange(hhdm: u64) {
     // frames that arrived on a member that is not carrying traffic. The length is
     // derived from the array, for the reason the `bin/ipd` report below gives
     // at length: a length written twice is wrong in one of the two places.
-    let mut words = [0u64; 28];
+    let mut words = [0u64; 29];
     let at = hhdm + frames[NETD_REPORT_PAGE];
     // **Read again rather than once, and read it *volatile*.**
     //
@@ -16873,7 +16892,7 @@ fn report_net_after_exchange(hhdm: u64) {
     // before the numbers said it: the words read `2 0 3 0 0` -- the state
     // *before* the link went down -- while `bin/netd` had long since failed
     // over. The intent was in the comment; the guarantee was not in the code.
-    let take = |words: &mut [u64; 28]| {
+    let take = |words: &mut [u64; 29]| {
         for (index, word) in words.iter_mut().enumerate() {
             // SAFETY: a frame this object owns, through the direct map, at a
             // word inside it -- `words.len() * 8` is far short of a page.

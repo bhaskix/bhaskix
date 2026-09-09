@@ -339,6 +339,22 @@ const GLPRT_RDPC: u64 = 0x0030_0600;
 /// free and informative if it holds, and the boot report says plainly that it
 /// is an assumption so that nobody later reads it as a measurement.
 const GLV_RDPC: u64 = 0x0031_0000;
+/// 38.39.2.16.79, `GLV_UPTCL[n]` (`0x0033C000 + 0x8*n`): *"Counts number of
+/// unicast packets transmitted by this VSI."*
+const GLV_UPTCL: u64 = 0x0033_C000;
+/// 38.39.2.16.81, `GLV_MPTCL[n]` (`0x0033CC00 + 0x8*n`): *"Counts number of
+/// multicast packets transmitted by this VSI."*
+///
+/// **The counter that says whether an LACPDU left.** A slow protocol goes to
+/// `01:80:C2:00:00:02`, which is a multicast address, so this and no other
+/// counter distinguishes a frame the VSI put on its way out from one the device
+/// swallowed. Everything above it -- a completed descriptor, a driver's own
+/// tally -- counts frames *handed over*, which is a different fact and was the
+/// one being mistaken for this one.
+const GLV_MPTCL: u64 = 0x0033_CC00;
+/// 38.39.2.16.83, `GLV_BPTCL[n]` (`0x0033D800 + 0x8*n`): *"Counts number of
+/// broadcast packets transmitted by this VSI."*
+const GLV_BPTCL: u64 = 0x0033_D800;
 /// 38.39.2.16.103, `GLV_UPRCL[n]` (`0x0036C000 + 0x8*n`).
 const GLV_UPRCL: u64 = 0x0036_C000;
 /// 38.39.2.16.105, `GLV_MPRCL[n]` (`0x0036CC00 + 0x8*n`).
@@ -902,6 +918,7 @@ const _: () = assert!(REGISTER_WINDOW_BYTES > QRX_TAIL + 4 * MAX_RECEIVE_QUEUE);
 const _: () = assert!(REGISTER_WINDOW_BYTES > PFCM_LANCTXSTAT);
 const _: () = assert!(REGISTER_WINDOW_BYTES > PFHMC_SDDATAHIGH);
 const _: () = assert!(REGISTER_WINDOW_BYTES > GLV_BPRCL + 8 * MAX_VSI);
+const _: () = assert!(REGISTER_WINDOW_BYTES > GLV_BPTCL + 8 * MAX_VSI);
 const _: () = assert!(REGISTER_WINDOW_BYTES > GLPRT_RDPC + 8 * MAX_PORT);
 const _: () = assert!(REGISTER_WINDOW_BYTES > PFGEN_PORTNUM);
 const _: () = assert!(REGISTER_WINDOW_BYTES > QTX_TAIL + 4 * MAX_RECEIVE_QUEUE);
@@ -1397,7 +1414,7 @@ impl ReceiveContext {
 /// faults instead of being reachable, which is strictly less authority than the
 /// kernel had when it drove this itself. `page_is_mapped` and the test beside it
 /// are what keep this list and the constants above from drifting apart.
-pub const REGISTER_PAGES: [u64; 37] = [
+pub const REGISTER_PAGES: [u64; 40] = [
     // The interrupt registers, added when the write-back path was found -- and
     // added to the test below in the same change, which is the only reason
     // they are not still missing: `bin/netd` faulted on the first of them and
@@ -1407,8 +1424,14 @@ pub const REGISTER_PAGES: [u64; 37] = [
     0x08_0000, 0x09_2000, 0x09_c000, 0x0c_0000, 0x0c_2000, 0x0c_6000, 0x0e_4000, 0x0e_5000,
     0x0e_6000, 0x10_0000, 0x10_1000, 0x10_2000, 0x10_4000, 0x10_5000, 0x10_6000, 0x10_8000,
     0x10_9000, 0x10_a000, 0x10_c000, 0x12_0000, 0x12_1000, 0x12_2000, 0x12_8000, 0x12_9000,
-    0x12_a000, 0x1c_0000, 0x1e_4000, 0x20_c000, 0x20_d000, 0x30_0000, 0x31_0000, 0x36_c000,
-    0x36_d000, 0x36_e000,
+    0x12_a000, 0x1c_0000, 0x1e_4000, 0x20_c000, 0x20_d000, 0x30_0000, 0x31_0000,
+    // The VSI's **transmit** counters, three pages, added 2026-09-10. Only the
+    // receive side was ever mapped, so nothing in this system could say whether
+    // a frame reached the wire -- every number it had counted frames handed to
+    // the device, which is what made "44 sent" and "the switch received none"
+    // both true and neither useful.
+    0x33_c000, 0x33_d000, 0x33_e000, //
+    0x36_c000, 0x36_d000, 0x36_e000,
 ];
 
 /// How many bytes a transmit queue context occupies -- Table 38-428's 128.
@@ -1867,6 +1890,38 @@ impl PortCounters {
 /// See [`GLV_RDPC`]: the statistics set is assigned when a VSI is added, and
 /// this driver did not add the VSI it uses. Read at the VSI's own number, and
 /// reported as an assumption.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct VsiTransmitted {
+    /// `GLV_UPTCL/H`: unicast packets transmitted by the VSI.
+    pub unicast: u64,
+    /// `GLV_MPTCL/H`: multicast packets transmitted by the VSI.
+    ///
+    /// **An LACPDU is counted here and nowhere else**, because a slow protocol
+    /// is addressed to a reserved multicast group.
+    pub multicast: u64,
+    /// `GLV_BPTCL/H`: broadcast packets transmitted by the VSI.
+    pub broadcast: u64,
+}
+
+impl VsiTransmitted {
+    /// What left between an earlier reading and this one, saturating.
+    #[must_use]
+    pub const fn since(&self, baseline: &Self) -> Self {
+        Self {
+            unicast: self.unicast.saturating_sub(baseline.unicast),
+            multicast: self.multicast.saturating_sub(baseline.multicast),
+            broadcast: self.broadcast.saturating_sub(baseline.broadcast),
+        }
+    }
+
+    /// Every packet the VSI put out, of whatever address.
+    #[must_use]
+    pub const fn packets(&self) -> u64 {
+        self.unicast + self.multicast + self.broadcast
+    }
+}
+
+/// What a VSI has received.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct VsiCounters {
     /// `GLV_UPRCL/H`: unicast packets received by the VSI.
@@ -2608,6 +2663,21 @@ impl<R: Registers> Device<R> {
 
     /// A VSI's receive counters, at an index this driver assumes is the VSI
     /// number -- see [`VsiCounters`] and [`GLV_RDPC`].
+    #[must_use]
+    pub fn vsi_transmitted(&self, vsi: u16) -> VsiTransmitted {
+        if u64::from(vsi) > MAX_VSI {
+            return VsiTransmitted::default();
+        }
+        let at = 8 * u64::from(vsi);
+        VsiTransmitted {
+            unicast: self.read64(GLV_UPTCL + at),
+            multicast: self.read64(GLV_MPTCL + at),
+            broadcast: self.read64(GLV_BPTCL + at),
+        }
+    }
+
+    /// What the VSI has taken in, as [`Device::vsi_transmitted`] is what it has
+    /// put out.
     #[must_use]
     pub fn vsi_counters(&self, vsi: u16) -> VsiCounters {
         let at = 8 * u64::from(u64::from(vsi).min(MAX_VSI) as u32);
@@ -4473,10 +4543,14 @@ mod tests {
     /// kernel's number down here rather than inferring it.
     ///
     /// **The bound is six, not five, and saying five would have been a guess.**
-    /// Four ports take 184 slots and five take 226, both inside 256; six take
-    /// 268 and do not. The device has four functions, so five is unreachable
+    /// Four ports take 196 slots and five take 241, both inside 256; six take
+    /// 286 and do not. The device has four functions, so five is unreachable
     /// on this hardware -- but a test that asserted a false edge would be
     /// asserting arithmetic nobody had done.
+    ///
+    /// The span was 42 until 2026-09-10, when the VSI's transmit counters cost
+    /// three more register pages. This test is what said so: it is the only
+    /// place the kernel's table size and the driver's appetite are compared.
     #[test]
     fn four_ports_fit_a_capability_space_and_six_do_not() {
         /// `cap::CSPACE_SLOTS`.
@@ -4484,7 +4558,7 @@ mod tests {
         /// The first slot a port may use; below it are the domain's own.
         const FIRST: u64 = 16;
 
-        assert_eq!(grant::SPAN, 42, "five fixed slots and thirty-seven pages");
+        assert_eq!(grant::SPAN, 45, "five fixed slots and forty pages");
         assert!(
             grant::base(FIRST, 4) <= SLOTS,
             "four ports must fit: {} slots used of {SLOTS}",

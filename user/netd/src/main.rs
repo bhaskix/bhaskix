@@ -1062,7 +1062,9 @@ unsafe fn hand_to_ipd(frame_at: u64, length: usize, member: Option<u8>) -> bool 
     let Some(framed) = chan::frame_to_write(layout, cursor, length) else {
         return false;
     };
-    let prefix = chan::mark(length as u32, member).to_le_bytes();
+    // The uplink flag is an instruction about *leaving*, so an arriving frame
+    // never carries one.
+    let prefix = chan::mark(length as u32, member, false).to_le_bytes();
     // SAFETY: every offset is one `abi::ring` computed inside the region this
     // program mapped writable, `frame_at` is a receive buffer readable for
     // `length`, and the runs of a transfer do not overlap -- they are the two
@@ -1131,7 +1133,7 @@ unsafe fn read_runs_into(into: *mut u8, runs: (chan::Run, chan::Run)) {
 /// # Safety
 ///
 /// The return ring must be mapped at [`BACK_AT`] and the rings at [`RINGS_AT`].
-unsafe fn take_from_ipd_into(buffer: u64, header: u64) -> Option<(usize, Option<u8>)> {
+unsafe fn take_from_ipd_into(buffer: u64, header: u64) -> Option<(usize, Option<u8>, bool)> {
     let layout = chan::Layout::for_region(RING_BYTES)?;
     // SAFETY: the ring's header, in the region this program mapped. Volatile
     // because the producer is another domain and takes no lock.
@@ -1150,13 +1152,13 @@ unsafe fn take_from_ipd_into(buffer: u64, header: u64) -> Option<(usize, Option<
     let runs = chan::length_to_read(layout, cursor)?;
     // SAFETY: the ring is mapped and `prefix` is `PREFIX` writable bytes.
     unsafe { read_runs_into(prefix.as_mut_ptr(), runs) };
-    // **The member, then the length.** `bin/ipd` names the member a frame must
-    // leave by -- an LACPDU carries the port id of the link it goes out of, so
-    // it can go out of that link and no other. Everything else names none and
-    // leaves by whichever member carries traffic. This program reads an index
-    // and never the frame, which is the rule RFC 0018 set for the domain that
-    // holds DMA.
-    let (length, for_member) = chan::marked(u32::from_le_bytes(prefix));
+    // **The member and the route, then the length.** `bin/ipd` names the member
+    // a frame must leave by -- an LACPDU carries the port id of the link it goes
+    // out of, so it can go out of that link and no other -- and says whether the
+    // frame must reach the *wire* rather than this device's own switch. Both are
+    // its to say: this program reads an index and a bit, never the frame, which
+    // is the rule RFC 0018 set for the domain that holds DMA.
+    let (length, for_member, uplink) = chan::marked(u32::from_le_bytes(prefix));
     // A length the *other side* wrote. Bounded before it is used, and refused
     // rather than clamped: a frame that does not fit a buffer is not a shorter
     // frame, it is a producer this program has stopped believing.
@@ -1189,7 +1191,7 @@ unsafe fn take_from_ipd_into(buffer: u64, header: u64) -> Option<(usize, Option<
             framed.next,
         );
     }
-    Some((length, for_member))
+    Some((length, for_member, uplink))
 }
 
 /// Takes a frame `bin/ipd` built into a virtio port's transmit buffer.
@@ -1205,7 +1207,8 @@ unsafe fn take_from_ipd(w: Windows) -> Option<usize> {
     //
     // SAFETY: the caller's obligation, and the buffer is inside the rings
     // object this program mapped writable.
-    unsafe { take_from_ipd_into(w.rings + ring::TX_BUFFER, VIRTIO_NET_HEADER) }.map(|(len, _)| len)
+    unsafe { take_from_ipd_into(w.rings + ring::TX_BUFFER, VIRTIO_NET_HEADER) }
+        .map(|(len, _, _)| len)
 }
 
 /// Looks once, without spinning and without blocking.
@@ -1946,6 +1949,13 @@ struct Progress {
     /// The backing pages the layout wanted and the page its context fell in --
     /// the two `grant::HMC_PAGES` is checked against.
     layout: (u8, u8),
+    /// Whether `allow_destination_override` succeeded.
+    ///
+    /// **Kept because it was discarded.** Without that flag a switch control tag
+    /// is *"not permitted"*, so a failure here makes every uplink-tagged frame
+    /// behave exactly like an untagged one -- silently, and with the driver
+    /// still counting them sent.
+    override_ok: bool,
 }
 
 /// Brings the X722's queues up: private memory, contexts, buffers, filters and
@@ -2123,6 +2133,33 @@ fn bring_up_x722(
         0,
         X722_QUEUES as u16,
     );
+
+    // **And the VSI is allowed to fix a transmit packet's destination itself.**
+    //
+    // Without this flag a switch control tag in a transmit descriptor is *"not
+    // permitted"*, and without that tag a frame is "routed according to hardware
+    // filters" -- so this device's internal switch consumes one addressed to a
+    // reserved group address instead of sending it out. Every LACPDU this system
+    // built died there: `bin/ipd` counted 44 sent, `bin/netd` posted them and saw
+    // them complete, and the switch at the far end reported DEFAULTED because
+    // nothing had ever arrived.
+    //
+    // **The crate has had the command and the tag since 2026-09-06** -- the
+    // reasoning is written out at `TX_SWTCH_UPLINK` -- and neither was ever
+    // wired into this service. A mechanism nobody calls is not a mechanism.
+    let override_ok = device
+        .allow_destination_override(
+            admin,
+            // The switch element id, which is what this parameter is despite its
+            // name -- `set_promiscuous` and `map_receive_queues` beside it take the
+            // same value for the same field.
+            vsi,
+            admin_device + i40e::VSI_BUFFER_OFFSET,
+            &mut vsi_buffer,
+            SPINS,
+        )
+        .is_ok();
+    progress.override_ok = override_ok;
     device.report_completions(queue, X722_QUEUES);
 
     progress.stage = 10;
@@ -2435,7 +2472,7 @@ fn carry_x722(mut members: [Option<X722Member>; X722_MEMBERS], facts: [X722; X72
             // page this program mapped for this member's transmit ring. No
             // header: an X722 takes the frame as it stands.
             let taken = unsafe { take_from_ipd_into(carrier.queues.transmit.at + 2048, 0) };
-            if let Some((length, for_member)) = taken {
+            if let Some((length, for_member, uplink)) = taken {
                 idle = 0;
                 // The frame landed in the active member's buffer, because that
                 // is the buffer `bin/ipd`'s ring writes into. A frame marked
@@ -2469,11 +2506,18 @@ fn carry_x722(mut members: [Option<X722Member>; X722_MEMBERS], facts: [X722; X72
                 }
                 if let Some(member) = members[leaves_by].as_mut() {
                     let at = member.queues.transmit_device + 2048;
+                    // **The switch control tag, where `bin/ipd` asked for it.**
+                    // Without it the descriptor is *"routed according to
+                    // hardware filters"*, and this device's internal switch
+                    // consumes a frame addressed to a reserved group address
+                    // rather than sending it -- which is where every LACPDU this
+                    // system built went until 2026-09-09: posted, completed, and
+                    // never counted out of the MAC.
                     if let Some(slot) = member.device.post_frame(
                         &mut member.queues.transmit,
                         at,
                         length as u16,
-                        false,
+                        uplink,
                     ) {
                         let queue = member.queues.transmit_queue;
                         let tail = member.device.transmit_tail();
@@ -2537,6 +2581,23 @@ fn carry_x722(mut members: [Option<X722Member>; X722_MEMBERS], facts: [X722; X72
         let count = members.iter().flatten().count() as u64;
         x722_bond_report(count, active as u64, links, failovers, off_member);
         carried_since_report(carried_since);
+
+        // **What the device itself says it put out.** Every other number in this
+        // report is a tally this program keeps; this one is the VSI's own
+        // multicast transmit counter, and an LACPDU is multicast -- so it is the
+        // only figure that distinguishes a frame that reached the wire from one
+        // the device swallowed. Summed across members, because the question is
+        // whether *any* left.
+        let out = members
+            .iter()
+            .zip(facts.iter())
+            .filter_map(|(member, fact)| {
+                member
+                    .as_ref()
+                    .map(|m| m.device.vsi_transmitted(fact.vsi).multicast)
+            })
+            .sum();
+        x722_transmit_report(out, facts.iter().any(|fact| fact.override_ok));
 
         // **Yield rather than spin.** This program is pinned, and there is no
         // interrupt delegated for this device -- the completions are reported
@@ -2626,6 +2687,11 @@ struct X722 {
     switch_elements: u16,
     /// The VSI number firmware assigned, which is what indexes its registers.
     vsi: u16,
+    /// Whether this port's VSI was allowed to fix a transmit packet's
+    /// destination -- see `Progress::override_ok`. Without it a switch
+    /// control tag is not permitted, so an uplink-tagged frame behaves
+    /// exactly like an untagged one and nothing says so.
+    override_ok: bool,
     /// Whether its **LAN** queues came up -- the ones that carry frames, as
     /// against the admin queues that carry commands.
     carrying: bool,
@@ -2803,6 +2869,7 @@ fn take_x722(nth: u64) -> (X722, Option<X722Member>) {
     let mut progress = Progress {
         stage: found.stage,
         layout: (0, 0),
+        override_ok: false,
     };
     let brought_up = bring_up_x722(
         &mut device,
@@ -2817,6 +2884,7 @@ fn take_x722(nth: u64) -> (X722, Option<X722Member>) {
     // behind are the whole reason they are collected.
     found.stage = progress.stage;
     found.layout = progress.layout;
+    found.override_ok = progress.override_ok;
     if let Some(queues) = brought_up {
         found.carrying = true;
         // **Asked of firmware, not read out of `PRTPM_SAL`.** RFC 0076 step 1:
@@ -2861,6 +2929,27 @@ fn take_x722(nth: u64) -> (X722, Option<X722Member>) {
         });
     }
     (found, carrying)
+}
+
+/// Publishes what the **device** says it transmitted -- word 27.
+///
+/// **The only number here that is not a driver's own tally.** Everything else
+/// counts frames handed over: a descriptor posted, a write-back seen, a loop
+/// iteration. `GLV_MPTCL` counts multicast packets the VSI put out, and an
+/// LACPDU is multicast, so this is the one counter that can tell a frame that
+/// reached the wire from one the device swallowed. Without it "44 LACPDUs sent"
+/// and "the switch received none" were both true and neither was informative.
+///
+/// Multicast in the low half, and in the high half whether
+/// `allow_destination_override` succeeded -- because a switch control tag is
+/// *"not permitted"* without it, and that command's result was being discarded.
+fn x722_transmit_report(multicast: u64, override_ok: bool) {
+    let at = RINGS_AT + ring::REPORT + 27 * 8;
+    // SAFETY: the report page this program mapped writable, one word past the
+    // failover count and far short of the kernel's own words at 40 and 41.
+    unsafe {
+        core::ptr::write_volatile(at as *mut u64, multicast | u64::from(override_ok) << 32);
+    }
 }
 
 /// Publishes how much the bond has carried since it failed over -- word 26.
