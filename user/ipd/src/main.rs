@@ -134,13 +134,13 @@ const MARKER: u64 = 0x3154_5052_4450_4931;
 /// sentence, that the switch recorded no partner: a conclusion drawn entirely
 /// from memory nobody had assigned. The array literal that feeds this function
 /// must have exactly this many entries, and the compiler now says so.
-const REPORT_WORDS: usize = 41;
+const REPORT_WORDS: usize = 44;
 
 /// **And tied to the machines behind its last four words.** Those four are
 /// written out one per line, because an array literal is what `write_report`
 /// takes -- so a fifth LACP machine would be a fifth address with nowhere to
 /// go, and the total would still add up. This is what says it would not.
-const _: () = assert!(REPORT_WORDS == 37 + LACP_MACHINES);
+const _: () = assert!(REPORT_WORDS == 36 + 2 * LACP_MACHINES);
 
 /// The last word, written with a sentinel so a reader can prove the page was
 /// written to its full length rather than trusting that it was.
@@ -425,12 +425,18 @@ static LACP_PARTNER_STATE: core::sync::atomic::AtomicU64 = core::sync::atomic::A
 /// seen at all.
 static LLDP_SEEN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
-/// The neighbour's port id: its subtype in bits 48-55 and its first six octets
-/// below, or zero before one has arrived.
+/// The neighbour's port id **per member**: its subtype in bits 48-55 and its
+/// first six octets below, or zero before one has arrived on that link.
 ///
 /// **The port id is the half that names the switch's own port**, which is what
-/// a question about a port-channel is ultimately about.
-static LLDP_PORT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// a question about a port-channel is ultimately about -- and one global was
+/// the wrong shape for it. LLDP arrives on all four members and the first
+/// version of this kept whichever frame landed last, so a bond facing four
+/// switch ports reported one of them and could not have shown otherwise. Four
+/// links reaching one port and four links reaching four are the two answers
+/// that matter, and a single word cannot tell them apart.
+static LLDP_PORT: [core::sync::atomic::AtomicU64; LACP_MACHINES] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; LACP_MACHINES];
 
 /// The first organizationally specific TLV's OUI in bits 0-23 and subtype in
 /// 24-31.
@@ -1363,8 +1369,11 @@ fn refresh() {
         // what the C620 datasheet grounds is decoded; what the switch actually
         // sends decides what is worth decoding next.
         LLDP_SEEN.load(Relaxed),
-        LLDP_PORT.load(Relaxed),
         LLDP_ORGANISATION.load(Relaxed),
+        LLDP_PORT[0].load(Relaxed),
+        LLDP_PORT[1].load(Relaxed),
+        LLDP_PORT[2].load(Relaxed),
+        LLDP_PORT[3].load(Relaxed),
     ]);
 }
 
@@ -1787,9 +1796,13 @@ fn drain_ring(
                     | 1 << 49,
                 core::sync::atomic::Ordering::Relaxed,
             );
+            // **Recorded against the link it arrived on**, which is the whole
+            // point: the switch names its own port, and whether four links
+            // reach one port or four is what a port-channel question is.
             if let Some((subtype, id)) = seen.port {
                 let packed = id.iter().fold(0u64, |word, o| (word << 8) | u64::from(*o));
-                LLDP_PORT.store(
+                let link = from_member.map_or(0, usize::from).min(LACP_MACHINES - 1);
+                LLDP_PORT[link].store(
                     packed | u64::from(subtype) << 48,
                     core::sync::atomic::Ordering::Relaxed,
                 );
@@ -3559,8 +3572,11 @@ fn report(
         // what the C620 datasheet grounds is decoded; what the switch actually
         // sends decides what is worth decoding next.
         LLDP_SEEN.load(core::sync::atomic::Ordering::Relaxed),
-        LLDP_PORT.load(core::sync::atomic::Ordering::Relaxed),
         LLDP_ORGANISATION.load(core::sync::atomic::Ordering::Relaxed),
+        LLDP_PORT[0].load(core::sync::atomic::Ordering::Relaxed),
+        LLDP_PORT[1].load(core::sync::atomic::Ordering::Relaxed),
+        LLDP_PORT[2].load(core::sync::atomic::Ordering::Relaxed),
+        LLDP_PORT[3].load(core::sync::atomic::Ordering::Relaxed),
     ];
     V6_PREFIX.store(v6_prefix, core::sync::atomic::Ordering::Relaxed);
     V6_STATE.store(v6_state, core::sync::atomic::Ordering::Relaxed);

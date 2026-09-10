@@ -17057,6 +17057,50 @@ fn report_bond(words: &mut [u64; 29], take: impl Fn(&mut [u64; 29])) {
     }
 }
 
+/// Which switch port each link reaches, as the neighbour's own LLDP names it.
+///
+/// **The distinction this exists for**: four links reaching one switch port and
+/// four links reaching four are the two answers a port-channel question turns
+/// on. A port id is printed as text where it is printable, because subtype 7 is
+/// *locally assigned* and a switch names its ports the way a human would --
+/// `xg12` rather than a number worth reading in hex.
+struct LldpPorts([u64; NETD_MEMBER_COUNT]);
+
+impl core::fmt::Display for LldpPorts {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let mut named = false;
+        for (link, packed) in self.0.iter().enumerate() {
+            if *packed == 0 {
+                continue;
+            }
+            if named {
+                write!(f, ", ")?;
+            }
+            named = true;
+            write!(f, "link {link} subtype {} ", packed >> 48 & 0xff)?;
+            // The six octets, most significant first, as text where every
+            // non-zero byte is printable and as hex otherwise.
+            let octets: [u8; 6] = core::array::from_fn(|n| (packed >> (40 - n * 8)) as u8);
+            let printable = octets
+                .iter()
+                .all(|byte| *byte == 0 || (0x20..0x7f).contains(byte));
+            if printable {
+                write!(f, "\"")?;
+                for byte in octets.iter().take_while(|byte| **byte != 0) {
+                    write!(f, "{}", *byte as char)?;
+                }
+                write!(f, "\"")?;
+            } else {
+                write!(f, "{:#014x}", packed & 0xffff_ffff_ffff)?;
+            }
+        }
+        if !named {
+            return write!(f, "no link has heard one");
+        }
+        Ok(())
+    }
+}
+
 /// Each bond member's **own** station address, for one line of the report.
 ///
 /// **The line exists because the thing it prints was unverifiable without it.**
@@ -17313,7 +17357,7 @@ fn report_net_after_exchange(hhdm: u64) {
     // to be wrong instead of three.
     // Thirty-eight words and a sentinel, and the last four are `bin/ipd`'s own:
     // the address each of its LACP machines speaks under -- RFC 0076 step 4.
-    let mut ipd = [0u64; 42];
+    let mut ipd = [0u64; 45];
     // SAFETY: a frame this object owns, through the direct map, read as the
     // little-endian words the service wrote there -- `ipd.len() * 8` bytes of
     // a page, so the read cannot reach past the frame.
@@ -17515,7 +17559,7 @@ fn report_net_after_exchange(hhdm: u64) {
     // the boot report said in a sentence that the switch recorded no partner.
     // Checked on every boot, not only where the words are used, because the
     // cheapest place to catch it is before anybody believes a number.
-    let complete = ipd[41] == IPD_REPORT_TAIL;
+    let complete = ipd[44] == IPD_REPORT_TAIL;
     if !complete {
         println!(
             "\x1b[93m    ipd report     INCOMPLETE: this kernel reads {} words and bin/ipd \
@@ -17616,14 +17660,20 @@ fn report_net_after_exchange(hhdm: u64) {
                 types >> 3 & 1
             );
             println!(
-                "    lldp neighbour its port id, subtype {}: {:#014x}; first org tlv oui \
-                 {:02x}-{:02x}-{:02x} subtype {:#04x}",
-                ipd[39] >> 48 & 0xff,
-                ipd[39] & 0xffff_ffff_ffff,
-                ipd[40] >> 16 & 0xff,
-                ipd[40] >> 8 & 0xff,
-                ipd[40] & 0xff,
-                ipd[40] >> 24 & 0xff
+                "    lldp neighbour first org tlv oui {:02x}-{:02x}-{:02x} subtype {:#04x}",
+                ipd[39] >> 16 & 0xff,
+                ipd[39] >> 8 & 0xff,
+                ipd[39] & 0xff,
+                ipd[39] >> 24 & 0xff
+            );
+            // **Per link, because that is the question.** Four links reaching
+            // one switch port and four links reaching four are the two answers
+            // a port-channel question turns on, and one word could not tell
+            // them apart -- the first version of this kept whichever frame
+            // landed last.
+            println!(
+                "    lldp neighbour the port it reaches, per link: {}",
+                LldpPorts(core::array::from_fn(|n| ipd[40 + n]))
             );
         }
         if heard {

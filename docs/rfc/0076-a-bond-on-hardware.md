@@ -1723,8 +1723,10 @@ interface to look at if its configuration can be read directly.
 
 **A limit of the instrument as built**, stated rather than discovered later: the
 port id is a single global, while LLDP arrives on all four members. `xg12` is
-whichever link's frame landed last. If the four ports are `xg12` through `xg15`
-this would not say so.
+whichever link's frame landed last.
+
+> **Fixed the same day, and it was worth fixing.** Recorded per member, the four
+> links report `xg12`, `xg11`, `xg10` and `xg9` — see below.
 
 **Grounded rather than recalled.** Table 38-171 gives the TLV header as seven
 bits of type and nine of length; 38-172 gives an organizationally specific TLV
@@ -1740,3 +1742,38 @@ byte of type and a byte of length — which halves every type and shifts every
 length, after which the walk wanders through the frame finding plausible
 rubbish — and a truncated-frame test, since a neighbour's frame is hostile
 input and reading past its end is the real danger.
+
+
+### Four links, four switch ports — 2026-09-10
+
+The port id is recorded against the link it arrived on now, and the answer is
+not the one a single global could have given:
+
+```
+lldp neighbour the port it reaches, per link:
+  link 0 subtype 7 "xg12", link 1 subtype 7 "xg11",
+  link 2 subtype 7 "xg10", link 3 subtype 7 "xg9"
+```
+
+**Four distinct switch ports, consecutive, in reverse order of this bond's
+members** — member 0 reaches the switch's `xg12`. So the physical topology is
+confirmed from the wire rather than from description: four cables into four
+adjacent ports of one switch, which is the shape a four-port channel-group
+should have. And the switch's own names for them are now known, which is what a
+question about its configuration needs: **`xg9` through `xg12`**.
+
+Rendered as text because subtype 7 is *locally assigned* — a switch names its
+ports the way a human would, so `"xg12"` is worth more than `0x786731320000`; a
+non-printable id still falls back to hex.
+
+Still **zero organizationally specific TLVs on all four links**, so no
+aggregation TLV from any of them. That remains *cannot be learned this way*
+rather than *there is no channel-group*.
+
+**Why one word was the wrong shape**, since it is the general lesson: four links
+reaching one port and four links reaching four are the two answers a
+port-channel question turns on, and a single value cannot distinguish them. The
+first version kept whichever frame landed last and would have reported `xg12`
+either way. A per-thing question needs a per-thing instrument — the same
+correction this document already made for the LACP machines, the link states,
+the member addresses and the partner flags.
