@@ -1576,3 +1576,59 @@ uncorrectable processor error, and they should be read with that beside them.
 The `Stop LLDP Agent` result above is a firmware answer to an admin command,
 which is about as robust a reading as this report contains; it is not withdrawn,
 and it is not independent of a machine in this state either.
+
+
+### The last unverified link in the uplink path — 2026-09-10
+
+The question left standing is narrow: the device fetches an uplink-tagged
+descriptor, transmits some of them, and mostly does not write one back, while
+plain frames are 27 of 27. The only difference between the two is the context
+descriptor carrying `SWTCH = 01b`.
+
+**Four things were ruled out from the datasheet rather than by reasoning.**
+
+* The **context descriptor is correct** — `DTYP` `0x1`, `SWTCH` `01b` at qword 1
+  bits 9:8, `TSO` clear, `TLEN` and `MSS` zero, checked field by field against
+  §38.31.2.2.1.
+* The **VSI buffer offsets are correct**. Table 38-216 puts *"allow destination
+  override"* at byte **6.0** and *"switching section is valid"* at Valid Sections
+  bit **0**, which is what the driver writes.
+* The **read-modify-write reads what it writes**. Table 38-224: the Get VSI
+  Parameters response buffer is *"same parameters as listed in Table 38-216"*.
+  This was checked because a mismatched layout would have explained everything at
+  a stroke — firmware accepting a command that wrote a switch id where a flag
+  belonged.
+* The **line structure is not it**. With the padding in front, a plain frame and
+  an uplink frame have the same shape: NOPs, then the command, data descriptor
+  last, one `RS` per line. Plain frames complete every time.
+
+**What is left is the fifth instance of one pattern.**
+`allow_destination_override` does the read-modify-write and reports whether
+`Update VSI` was **accepted**. It never reads the bit back. Without that bit a
+switch control tag is *"not permitted"* — and an accepted command whose bit did
+not stick reads exactly like a working one, which is how this path has been
+reported healthy while every frame carrying the tag died.
+
+That is the same shape as `TX_SWTCH_UPLINK` with no caller, the `GLPRT_*`
+constants with no reader, `VsiTransmitted::since` with no baseline, and
+`stop_lldp_agent`'s discarded result. Five times, in one driver, over one line of
+questioning. The lesson has stopped being *"a mechanism nobody calls is not a
+mechanism"* and become the more uncomfortable general form: **anything this
+driver has not read back, it does not know.**
+
+So the section is read back and published as read — the flag, and with it the
+switch id and both loopback bits, because setting the flag rewrites the whole
+switching section and a mistake there would show as one of those moving when
+nothing asked it to. The decode is held to Table 38-216's own byte and bit
+numbering by a host test, watched red by reading byte 6.**1** — the *security*
+section's VLAN anti-spoof — as the override.
+
+**This is an instrument and not an answer.** It will print either
+
+```
+the vsi's switching section reads back: destination override set, switch id N, loopback a/b
+```
+
+or `CLEAR -- the command was taken and the bit is not there`, and only the
+machine can say which. The SR550 is reporting a critical processor fault and has
+been left alone, so this is what to run first on a healthy one.

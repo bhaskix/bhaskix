@@ -2067,6 +2067,9 @@ struct Progress {
     override_ok: bool,
     /// What `Stop LLDP Agent` answered -- see [`LldpOutcome`].
     lldp: LldpOutcome,
+    /// The VSI's switching section **as read back** after the override was
+    /// commanded -- not what was asked for.
+    switching: bhaskix_i40e::VsiSwitching,
 }
 
 /// Brings the X722's queues up: private memory, contexts, buffers, filters and
@@ -2287,6 +2290,30 @@ fn bring_up_x722(
         )
         .is_ok();
     progress.override_ok = override_ok;
+    // **And what the device holds now, which is a different question.**
+    //
+    // `Update VSI` returning `Ok` says firmware took the command. It does not
+    // say the bit stuck, and an accepted command whose bit did not stick reads
+    // exactly like a working one -- which is how the uplink path has been
+    // reported as healthy while every frame carrying a switch control tag was
+    // fetched and never written back.
+    //
+    // The same shape as `stop_lldp_agent`'s discarded result, `GLPRT_MPTC`,
+    // and `VsiTransmitted::since`: the fifth time in this driver that what a
+    // mechanism *did* went unread. So the section is read back and published as
+    // read, and its neighbours come with it -- setting the flag is a
+    // read-modify-write over the whole switching section, so a mistake in it
+    // shows as a switch id or a loopback bit that moved when nothing asked.
+    progress.switching = device
+        .vsi_parameters(
+            admin,
+            vsi,
+            admin_device + i40e::VSI_BUFFER_OFFSET,
+            &mut vsi_buffer,
+            SPINS,
+        )
+        .map(|read| read.switching())
+        .unwrap_or_default();
     device.report_completions(queue, X722_QUEUES);
 
     progress.stage = 10;
@@ -2838,22 +2865,28 @@ fn carry_x722(mut members: [Option<X722Member>; X722_MEMBERS], facts: [X722; X72
             .flatten()
             .map(|m| u64::from(m.device.transmit_head(m.queues.transmit_queue)))
             .sum();
-        x722_transmit_report(
-            out,
-            on_the_wire,
-            facts.iter().any(|fact| fact.override_ok),
+        x722_transmit_report(TransmitReport {
+            multicast: out,
+            port_multicast: on_the_wire,
+            override_ok: facts.iter().any(|fact| fact.override_ok),
             // **Port 0's answer.** All four are asked and all four should agree;
             // the first driven port is the one reported, because a line naming
             // four outcomes would be four times the width for a distinction that
             // has never differed.
-            facts
+            lldp: facts
                 .iter()
                 .find(|fact| fact.lldp != LldpOutcome::NotAsked)
                 .map_or(LldpOutcome::NotAsked, |fact| fact.lldp),
-            (uplink_posted, post_refused),
-            (uncompleted, uplink_uncompleted),
-            (tails, heads),
-        );
+            // The same port's switching section as the device holds it -- what
+            // the override command achieved, against what it returned.
+            switching: facts
+                .iter()
+                .find(|fact| fact.lldp != LldpOutcome::NotAsked)
+                .map_or_else(Default::default, |fact| fact.switching),
+            posted: (uplink_posted, post_refused),
+            unfinished: (uncompleted, uplink_uncompleted),
+            cursors: (tails, heads),
+        });
 
         // **Yield rather than spin.** This program is pinned, and there is no
         // interrupt delegated for this device -- the completions are reported
@@ -2953,6 +2986,10 @@ struct X722 {
     /// answer was discarded; it is the notification 38.28 requires of a PF
     /// taking ownership of the MAC's control port.
     lldp: LldpOutcome,
+    /// The VSI's switching section as the device holds it, read back after the
+    /// destination override was commanded. `override_ok` is what firmware said
+    /// to the command; this is what the command achieved.
+    switching: bhaskix_i40e::VsiSwitching,
     /// Whether its **LAN** queues came up -- the ones that carry frames, as
     /// against the admin queues that carry commands.
     carrying: bool,
@@ -3132,6 +3169,7 @@ fn take_x722(nth: u64) -> (X722, Option<X722Member>) {
         layout: (0, 0),
         override_ok: false,
         lldp: LldpOutcome::NotAsked,
+        switching: bhaskix_i40e::VsiSwitching::default(),
     };
     let brought_up = bring_up_x722(
         &mut device,
@@ -3148,6 +3186,7 @@ fn take_x722(nth: u64) -> (X722, Option<X722Member>) {
     found.layout = progress.layout;
     found.override_ok = progress.override_ok;
     found.lldp = progress.lldp;
+    found.switching = progress.switching;
     if let Some(queues) = brought_up {
         found.carrying = true;
         // **Asked of firmware, not read out of `PRTPM_SAL`.** RFC 0076 step 1:
@@ -3217,15 +3256,38 @@ fn take_x722(nth: u64) -> (X722, Option<X722Member>) {
 /// measured at all**, since zero is what both a port that sent nothing and a
 /// word nobody wrote look like, and this file has three times read the second
 /// as the first. Word 28: the port's multicast.
-fn x722_transmit_report(
+struct TransmitReport {
+    /// What the VSI's own counter says left it, since bring-up.
     multicast: u64,
+    /// And what the MAC's counter says, at the boundary past it.
     port_multicast: u64,
+    /// Whether `Update VSI` was **accepted** -- not whether the bit stuck.
     override_ok: bool,
+    /// What `Stop LLDP Agent` answered.
     lldp: LldpOutcome,
+    /// The VSI's switching section as **read back**, which is what the override
+    /// command achieved rather than what it returned.
+    switching: bhaskix_i40e::VsiSwitching,
+    /// Uplink-tagged posts, and posts `post_frame` refused and this program
+    /// then dropped.
     posted: (u64, u64),
+    /// Posts the device never wrote back, and the uplink-tagged ones of them.
     unfinished: (u64, u64),
+    /// This program's transmit cursor and the device's head, summed.
     cursors: (u64, u64),
-) {
+}
+
+fn x722_transmit_report(report: TransmitReport) {
+    let TransmitReport {
+        multicast,
+        port_multicast,
+        override_ok,
+        lldp,
+        switching,
+        posted,
+        unfinished,
+        cursors,
+    } = report;
     let at = RINGS_AT + ring::REPORT + 27 * 8;
     // **Word 29: what this program did with the frames it was given.** The
     // uplink-tagged posts in the low half, the refusals in the high.
@@ -3268,6 +3330,13 @@ fn x722_transmit_report(
         core::ptr::write_volatile(
             (at + 32) as *mut u64,
             (cursors.0 & 0xffff_ffff) | (cursors.1 & 0xffff_ffff) << 32,
+        );
+        // **Word 37: the VSI's switching section as read back**, with bit 16
+        // saying it was read at all -- zero is a legitimate section and is also
+        // what an unwritten word looks like.
+        core::ptr::write_volatile(
+            (RINGS_AT + ring::REPORT + 37 * 8) as *mut u64,
+            switching.packed() | 1 << 16,
         );
     }
     // SAFETY: the report page this program mapped writable, past the failover

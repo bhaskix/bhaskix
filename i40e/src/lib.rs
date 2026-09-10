@@ -2241,6 +2241,65 @@ pub struct VsiParameters {
     pub queue_set: u16,
 }
 
+/// A VSI's switching section, as the device holds it -- Table 38-216 bytes 2-6.
+///
+/// **Because commanding a bit is not setting it.** `allow_destination_override`
+/// reports whether `Update VSI` was accepted, and an accepted command whose bit
+/// did not stick reads exactly like a working one. That distinction is the last
+/// unverified link in the uplink path: without this flag a switch control tag is
+/// *"not permitted"*, and a frame carrying one is what the SR550 fetches and
+/// does not write back.
+///
+/// The neighbours come with it because `allow_destination_override` is a
+/// read-modify-write over this whole section, so a mistake in it would show as
+/// a switch id or a loopback bit that changed when nothing asked them to.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct VsiSwitching {
+    /// Bytes 2 to 3.3: *"the switch ID to which this VSI belongs"*.
+    pub switch_id: u16,
+    /// Byte 3.4, *"Is not S-tag"*.
+    pub not_stag: bool,
+    /// Byte 3.5, *"should be set for VSIs that are connected to a VEB"*.
+    pub allow_loopback: bool,
+    /// Byte 3.6, *"set for VSIs that are used as uplink of a software
+    /// (cascaded) VEB, VEPA or port virtualizer"*.
+    pub allow_local_loopback: bool,
+    /// Byte 6.0, *"allow the VSI to override the switching decision and fix the
+    /// destination of a transmit packet. This bit should be set only for
+    /// control ports."*
+    pub allow_destination_override: bool,
+}
+
+impl VsiSwitching {
+    /// The section as one word, for a report page.
+    #[must_use]
+    pub const fn packed(&self) -> u64 {
+        (self.switch_id as u64)
+            | (self.not_stag as u64) << 12
+            | (self.allow_loopback as u64) << 13
+            | (self.allow_local_loopback as u64) << 14
+            | (self.allow_destination_override as u64) << 15
+    }
+}
+
+impl VsiParameters {
+    /// The switching section of the context firmware returned.
+    #[must_use]
+    pub fn switching(&self) -> VsiSwitching {
+        // Bytes 2-3: twelve bits of switch id, then three flags.
+        let pair = u16::from_le_bytes([self.context[2], self.context[3]]);
+        VsiSwitching {
+            switch_id: pair & 0xfff,
+            not_stag: pair & (1 << 12) != 0,
+            allow_loopback: pair & (1 << 13) != 0,
+            allow_local_loopback: pair & (1 << 14) != 0,
+            allow_destination_override: self.context[VSI_SWITCHING_FLAGS_AT]
+                & VSI_ALLOW_DESTINATION_OVERRIDE
+                != 0,
+        }
+    }
+}
+
 impl Default for VsiParameters {
     fn default() -> Self {
         Self {
@@ -4652,6 +4711,45 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The switching section is decoded at the bytes Table 38-216 gives it.
+    ///
+    /// **The bit this is really about is byte 6.0.** Without *Allow destination
+    /// override* a switch control tag is not permitted, and `Update VSI`
+    /// returning `Ok` says only that firmware took the command -- not that the
+    /// bit stuck. Reading it back is the difference, and this holds the decode
+    /// to the datasheet's own byte and bit numbering so the read-back means what
+    /// it says.
+    #[test]
+    fn the_vsi_switching_section_decodes_at_table_38_216s_bytes() {
+        let mut parameters = VsiParameters::default();
+        // Switch id 0xabc at bytes 2 to 3.3, and byte 3.5 "allow loopback".
+        parameters.context[2] = 0xbc;
+        parameters.context[3] = 0x0a | 1 << 5;
+        // Byte 6.0 is the flag; byte 6.1 is the *security* section's VLAN
+        // anti-spoof and must not be read as it.
+        parameters.context[VSI_SWITCHING_FLAGS_AT] = 1 << 1;
+
+        let seen = parameters.switching();
+        assert_eq!(seen.switch_id, 0xabc, "twelve bits, bytes 2 to 3.3");
+        assert!(seen.allow_loopback, "byte 3.5");
+        assert!(!seen.not_stag, "byte 3.4");
+        assert!(!seen.allow_local_loopback, "byte 3.6");
+        assert!(
+            !seen.allow_destination_override,
+            "byte 6.1 is VLAN anti-spoof, not the override"
+        );
+
+        parameters.context[VSI_SWITCHING_FLAGS_AT] |= VSI_ALLOW_DESTINATION_OVERRIDE;
+        let set = parameters.switching();
+        assert!(set.allow_destination_override, "byte 6.0");
+        assert_eq!(
+            set.packed() >> 15 & 1,
+            1,
+            "and it survives the trip through a report word"
+        );
+        assert_eq!(set.packed() & 0xfff, 0xabc);
     }
 
     /// The port's transmit counters are the **MAC's**, not the VSI's.

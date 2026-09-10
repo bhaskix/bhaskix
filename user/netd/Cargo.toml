@@ -248,4 +248,18 @@ asm_budget = 3
 # buffer and a ring eight deep: a descriptor the device has not fetched is one
 # this program is about to overwrite, which is a defect here, while one it
 # fetched and dropped is a defect there.
-unsafe_budget = 390
+# 397 at the read-back: seven lines, a second `Get VSI Parameters` after the
+# destination override is commanded and one volatile store of what it found.
+#
+# **Because commanding a bit is not setting it.** This driver has reported the
+# uplink path as healthy on the strength of `Update VSI` returning Ok, while
+# every frame carrying a switch control tag was fetched and never written back.
+# The section is read back and published as read, and its neighbours -- switch
+# id, the two loopback bits -- come with it, because setting the flag is a
+# read-modify-write over the whole switching section and a mistake in it would
+# show as one of them moving when nothing asked.
+#
+# The fifth time in this driver that what a mechanism *did* went unread, after
+# `TX_SWTCH_UPLINK`, the `GLPRT_*` constants, `VsiTransmitted::since` and
+# `stop_lldp_agent`'s discarded result.
+unsafe_budget = 397

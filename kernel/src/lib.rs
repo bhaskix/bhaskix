@@ -14790,6 +14790,15 @@ const NETD_MEMBER_ADDRESSES: u64 = 32 * 8;
 /// a comparison of one instant.
 const NETD_TRANSMITTED: u64 = 27 * 8;
 
+/// Byte offset in that page of the VSI's switching section as `bin/netd` read
+/// it **back** from the device, with bit 16 saying it was read at all.
+///
+/// `allow_destination_override` reports whether `Update VSI` was accepted; this
+/// is whether the bit stuck. Without it a switch control tag is *"not
+/// permitted"*, and an accepted command whose bit did not stick reads exactly
+/// like a working one.
+const NETD_VSI_SWITCHING: u64 = 37 * 8;
+
 /// The sentinel `bin/netd` writes there.
 const NETD_MEMBER_ADDRESSES_WRITTEN: u64 = 0x5352_4444_414d_454d;
 
@@ -16556,7 +16565,7 @@ fn net_domain_transmitted(hhdm: u64) -> Option<Transmitted> {
     // `x722_transmit_report` writes and the driver's own `sent` tally at word
     // 10, read volatile because the driver is still running and rewrites them
     // on every pass of its loop.
-    let (packed, port, posted, unfinished, cursors, sent) = unsafe {
+    let (packed, port, posted, unfinished, cursors, sent, switching) = unsafe {
         (
             core::ptr::read_volatile(at as *const u64),
             core::ptr::read_volatile((at + 8) as *const u64),
@@ -16564,6 +16573,7 @@ fn net_domain_transmitted(hhdm: u64) -> Option<Transmitted> {
             core::ptr::read_volatile((at + 24) as *const u64),
             core::ptr::read_volatile((at + 32) as *const u64),
             core::ptr::read_volatile((page + 10 * 8) as *const u64),
+            core::ptr::read_volatile((page + NETD_VSI_SWITCHING) as *const u64),
         )
     };
     // Bit 33 says the driver measured them. Without it, zero is what a port
@@ -16578,6 +16588,7 @@ fn net_domain_transmitted(hhdm: u64) -> Option<Transmitted> {
         tail: cursors & 0xffff_ffff,
         head: cursors >> 32 & 0xffff_ffff,
         sent,
+        switching,
     })
 }
 
@@ -16608,6 +16619,9 @@ struct Transmitted {
     tail: u64,
     head: u64,
     sent: u64,
+    /// The VSI's switching section as the driver read it back, bit 16 set when
+    /// it was read at all -- see [`NETD_VSI_SWITCHING`].
+    switching: u64,
 }
 
 /// Whether `bin/netd` has written its report yet.
@@ -17418,6 +17432,28 @@ fn report_net_after_exchange(hhdm: u64) {
                     "\x1b[93mfewer than were sent, read at the same instant\x1b[0m"
                 }
             );
+            // **And whether the bit that permits the tag is actually set.**
+            //
+            // `destination override taken` above says firmware accepted
+            // `Update VSI`. This says what the device holds now. Without the
+            // flag a switch control tag is "not permitted", which is the last
+            // unverified link in the path a frame carrying one takes -- and an
+            // accepted command whose bit did not stick reads exactly like a
+            // working one.
+            if out.switching >> 16 & 1 != 0 {
+                println!(
+                    "                   the vsi's switching section reads back: destination \
+                     override {}, switch id {}, loopback {}/{}",
+                    if out.switching >> 15 & 1 != 0 {
+                        "\x1b[92mset\x1b[0m"
+                    } else {
+                        "\x1b[91mCLEAR -- the command was taken and the bit is not there\x1b[0m"
+                    },
+                    out.switching & 0xfff,
+                    out.switching >> 13 & 1,
+                    out.switching >> 14 & 1
+                );
+            }
             // **Where the missing ones stopped**, read at the same instant as
             // both of the numbers above. The first boot to print the line above
             // showed 43 sent against 38 out of the device and neither moving,

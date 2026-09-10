@@ -804,7 +804,16 @@ asm_budget = 10
 # two ways that happens -- descriptors it never fetched, which this driver then
 # overwrites, and descriptors it fetched and dropped -- are told apart by whether
 # `QTX_HEAD` caught the tail while the write-backs did not arrive.
-unsafe_budget = 2030
+# 2031 at the read-back: **one** more volatile read, the VSI's switching section
+# as `bin/netd` found it after commanding the destination override.
+#
+# `allow_destination_override` reports whether `Update VSI` was accepted. An
+# accepted command whose bit did not stick reads exactly like a working one --
+# and without that bit a switch control tag is "not permitted", which is the last
+# unverified link in the path a frame carrying one takes. Every other link in it
+# has now been measured; this is the one that was still being reported by its
+# command's return value.
+unsafe_budget = 2031
 # Up thirty-one for RFC 0005 step 9's socket probe -- `ring3_socketeer`, which
 # is `ring3_lister` with a `sockaddr_in6` copied in beside its code instead of
 # two filenames. The same two blocks every hosted probe has: one
