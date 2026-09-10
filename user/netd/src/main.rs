@@ -2677,7 +2677,17 @@ fn carry_x722(mut members: [Option<X722Member>; X722_MEMBERS], facts: [X722; X72
                     .map(|m| m.device.vsi_transmitted(fact.vsi).multicast)
             })
             .sum();
-        x722_transmit_report(out, facts.iter().any(|fact| fact.override_ok));
+        // **And the same frames one boundary further out.** `GLPRT_MPTCL` is
+        // indexed by physical port, which each member's own device answers for
+        // itself -- not by VSI, and not by the member's position in this array,
+        // which are three different numbers that happen to agree on a
+        // single-port card.
+        let on_the_wire = members
+            .iter()
+            .flatten()
+            .map(|m| m.device.port_transmitted(m.device.port_number()).multicast)
+            .sum();
+        x722_transmit_report(out, on_the_wire, facts.iter().any(|fact| fact.override_ok));
 
         // **Yield rather than spin.** This program is pinned, and there is no
         // interrupt delegated for this device -- the completions are reported
@@ -3011,24 +3021,42 @@ fn take_x722(nth: u64) -> (X722, Option<X722Member>) {
     (found, carrying)
 }
 
-/// Publishes what the **device** says it transmitted -- word 27.
+/// Publishes what the **device** says it transmitted -- words 27 and 28.
 ///
-/// **The only number here that is not a driver's own tally.** Everything else
+/// **The only numbers here that are not a driver's own tally.** Everything else
 /// counts frames handed over: a descriptor posted, a write-back seen, a loop
 /// iteration. `GLV_MPTCL` counts multicast packets the VSI put out, and an
-/// LACPDU is multicast, so this is the one counter that can tell a frame that
-/// reached the wire from one the device swallowed. Without it "44 LACPDUs sent"
-/// and "the switch received none" were both true and neither was informative.
+/// LACPDU is multicast, so it can tell a frame the VSI let go of from one the
+/// device swallowed. Without it "44 LACPDUs sent" and "the switch received
+/// none" were both true and neither was informative.
 ///
-/// Multicast in the low half, and in the high half whether
-/// `allow_destination_override` succeeded -- because a switch control tag is
-/// *"not permitted"* without it, and that command's result was being discarded.
-fn x722_transmit_report(multicast: u64, override_ok: bool) {
+/// **And one boundary was not enough.** The VSI is not the wire: a frame
+/// crosses from the VSI to the device's internal switch, and from that switch
+/// to the MAC. The SR550 reported 44 sent against 38 out of the VSI on
+/// 2026-09-10, and 44 against 34 the boot before, and nothing here could say
+/// whether those 38 reached the MAC -- so every statement about what the switch
+/// received rested on a boundary one layer short of the wire. `GLPRT_MPTCL`
+/// counts what the **port** put out, and the pair is the instrument.
+///
+/// Word 27: the VSI's multicast in the low half; bit 32 whether
+/// `allow_destination_override` succeeded, because a switch control tag is
+/// *"not permitted"* without it; **bit 33 that the port's count behind it was
+/// measured at all**, since zero is what both a port that sent nothing and a
+/// word nobody wrote look like, and this file has three times read the second
+/// as the first. Word 28: the port's multicast.
+fn x722_transmit_report(multicast: u64, port_multicast: u64, override_ok: bool) {
     let at = RINGS_AT + ring::REPORT + 27 * 8;
-    // SAFETY: the report page this program mapped writable, one word past the
-    // failover count and far short of the kernel's own words at 40 and 41.
+    // SAFETY: the report page this program mapped writable, past the failover
+    // count and far short of the members' addresses at 32 and the kernel's own
+    // words at 40 and 41. The port's count goes first and the word that says it
+    // is there goes second, so a reader that catches this half-written finds
+    // the bit clear rather than a number nobody wrote.
     unsafe {
-        core::ptr::write_volatile(at as *mut u64, multicast | u64::from(override_ok) << 32);
+        core::ptr::write_volatile((at + 8) as *mut u64, port_multicast);
+        core::ptr::write_volatile(
+            at as *mut u64,
+            multicast | u64::from(override_ok) << 32 | 1 << 33,
+        );
     }
 }
 

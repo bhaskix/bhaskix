@@ -207,4 +207,16 @@ asm_budget = 3
 # "read by nobody" and that was true -- which is the whole reason the eight
 # lines are here rather than the address being read where it always could have
 # been.
-unsafe_budget = 372
+# 376 at RFC 0076's port transmit counter: four lines, one more volatile store
+# and the word beside it. `GLV_MPTCL` counts what the *VSI* put out and
+# `GLPRT_MPTCL` what the *MAC* put out, and the pair is the instrument -- a
+# frame that left the VSI and never reached the wire is the difference between
+# them and is nothing else anywhere.
+#
+# **The constants were already here and nothing read them.** `GLPRT_UPTCL`,
+# `GLPRT_MPTCL` and `GLPRT_BPTCL` have sat in `bhaskix-i40e` since 2026-09-06
+# with their datasheet sections quoted beside them and no caller, which is the
+# same shape as `TX_SWTCH_UPLINK` and cost three days there. The extra word also
+# carries a *measured* bit, because zero is what a port that sent nothing and a
+# word nobody wrote both look like.
+unsafe_budget = 376

@@ -16753,6 +16753,12 @@ fn report_x722(words: &[u64; 29]) {
     // could tell them apart.
     let out = words[27] & 0xffff_ffff;
     let override_ok = words[27] >> 32 & 1 != 0;
+    // **Bit 33 says the port's count behind word 28 was measured.** Zero is
+    // what a port that sent nothing and a word nobody wrote both look like, and
+    // reading the second as the first is the mistake this report has made three
+    // times. The driver sets it in the same store that publishes the rest.
+    let measured = words[27] >> 33 & 1 != 0;
+    let wire = words[28] & 0xffff_ffff;
     println!(
         "    net x722       {out} multicast frame(s) left the vsi by its own count; destination \
          override {}",
@@ -16762,6 +16768,27 @@ fn report_x722(words: &[u64; 29]) {
             "\x1b[93mREFUSED -- a switch control tag is not permitted without it\x1b[0m"
         }
     );
+    // **The same frames one boundary further out**, and the pair is the
+    // instrument rather than either half. A frame crosses from the VSI to the
+    // device's internal switch and from that switch to the MAC; `GLV_MPTCL`
+    // counts the first crossing and `GLPRT_MPTCL` the second, so a frame that
+    // left the VSI and never reached the wire is a difference between these two
+    // numbers and is nothing else anywhere.
+    if measured {
+        println!(
+            "    net x722       {wire} of them reached the mac by the port's own count -- {}",
+            if wire >= out {
+                "\x1b[92mthe wire is where they went\x1b[0m"
+            } else {
+                "\x1b[93mthe rest died between the internal switch and the mac\x1b[0m"
+            }
+        );
+    } else {
+        println!(
+            "\x1b[93m    net x722       the port's own transmit count was not reported; this \
+             kernel reads further than bin/netd wrote\x1b[0m"
+        );
+    }
     println!(
         "    net x722       its LAN queues {} -- private memory, contexts, buffers and the \
          write-back path, all from ring 3; it reached step {}",

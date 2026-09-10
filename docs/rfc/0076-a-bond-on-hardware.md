@@ -1016,3 +1016,86 @@ question `GLV_MPTCL` itself was added to answer one step earlier.
 Until that is measured, the honest position is that **the transmit path is proven
 as far as the VSI and no further**, and every conclusion about what the switch
 did or did not receive rests on that boundary.
+
+
+### The frames reach the wire — 2026-09-10, third boot
+
+`GLPRT_MPTCL` is mapped, and it answers.
+
+```
+net x722   38 multicast frame(s) left the vsi by its own count; destination override taken
+net x722   38 of them reached the mac by the port's own count -- the wire is where they went
+ipd lacp   44 LACPDU(s) sent, 12 slow-protocol frame(s) heard back
+ipd lacp   state 0x05 -- a partner is heard but the link is not yet aggregated
+           the partner says: link 0 0x45, link 1 0x45, link 2 0x45, link 3 0x45
+           so the switch is LACP active
+           and records its partner as key 0, port 0 -- ours are key 1, port 1
+```
+
+**Thirty-eight out of the VSI, thirty-eight out of the MAC.** Nothing is lost
+inside the device between those two boundaries. The section above said the
+transmit path was *"proven as far as the VSI and no further"*; it is now proven
+as far as the MAC, which is the last boundary this host owns.
+
+So the position has changed, and it is worth stating precisely because it is the
+first time in this work that it can be: **everything measurable on this side says
+the LACPDUs go out onto the wire, and the switch says it has never received a
+usable one.** Those are no longer reconcilable by anything inside this machine.
+
+**The counters were already in the crate and nothing read them.**
+`GLPRT_UPTCL`, `GLPRT_MPTCL` and `GLPRT_BPTCL` have been declared in
+`bhaskix-i40e` since 2026-09-06, each with its datasheet section quoted beside
+it, and no caller. That is the same shape as `TX_SWTCH_UPLINK`, which cost three
+days one step earlier, and it means the measurement that moved this question was
+available the whole time. `Device::port_counters` — the receive half — still has
+no caller today.
+
+**The datasheet contradicts itself here, and the reading is recorded rather than
+assumed.** §38.39.2.16.62 is headed *"Port Multicast Packets Transmit Count Low
+- GLPRT_MPTCL[n]"* with `n=0...3`, while its field description says *"Counts
+number of multicast packets transmitted by this VSI"* — word for word
+`GLV_MPTCL`'s, evidently copied. Table 38-369 gives the prefixes (`GLPRT` = port,
+4 instances; `GLV` = VSI, 384) and §38.28.4.1 puts the `GLPRT` set under *"MAC or
+Physical Uplink Interface Statistics"*. Three things say port and one says VSI,
+so it is read as a port counter — and the host test asserts the two sets return
+different numbers, watched red by making the reader use the VSI offsets, which
+is exactly the bug the description invites.
+
+**What the remaining gap is not.** 44 LACPDUs sent against 38 transmitted is now
+known to be *upstream* of the device: the VSI and the MAC agree, so the six
+frames never reached the VSI at all. That is a question about `bin/ipd`'s ring
+and `bin/netd`'s posting — this side of the DMA boundary — and not about the
+card. It is smaller than it looks, too: some of those are in flight when the
+report is read.
+
+### What is left
+
+The next question is the switch's own configuration, and this host cannot read
+it off the wire. What the wire does say is already exhausted: the switch is LACP
+active, it advertises all four ports as aggregatable, it answers on all four
+links, and it runs on default partner information. Everything this end can vary
+has been varied — one machine per link, four ports offered, the uplink tag, the
+destination override, per-port source addresses — and none of it changed
+`DEFAULTED`.
+
+### The BMC procedure, corrected
+
+Two things written down after earlier boots were wrong, and cost about an hour
+here:
+
+* **`rdmount` mappings are not session-scoped.** After the previous boot this was
+  reported as *"media unmapped (session-scoped, ended)"*. It was not: killing the
+  SSH session left `bhaskix-memmac.iso` mapped with `Mounted: true`, and it was
+  still there an hour later.
+* **Redfish virtual media works.** The Lenovo `RemoteMap` service — POST to
+  `MountImages`, then `LenovoRemoteMapService.Mount`, and `UMount` to clear —
+  mounts, unmounts and reports state correctly, and needs no shell session at
+  all. It had been recorded as returning HTTP 500.
+
+That matters because the XCC allows **two** concurrent command-shell sessions and
+no more (`CommandShell.MaxConcurrentSessions`), so a procedure that spends one on
+the media leaves exactly one for the console. Both were stuck held after the
+previous boot and did not free in fifty minutes of quiet; the project lead
+approved a `Manager.Reset`, which cleared them in about 210 seconds and also
+cleared the stale mapping. Mounting over Redfish spends none, so a boot now needs
+one session rather than two.

@@ -1921,6 +1921,59 @@ impl VsiTransmitted {
     }
 }
 
+/// What a **MAC port** has transmitted, as [`VsiTransmitted`] is what a VSI has.
+///
+/// **The pair is the instrument, not either half.** A frame this driver posts
+/// crosses two boundaries on its way out: the VSI hands it to the device's
+/// internal switch, and the switch hands it to the MAC. `GLV_MPTCL` counts the
+/// first crossing and this counts the second, so a frame that left the VSI and
+/// never reached the wire shows up as a difference between them and as nothing
+/// else at all.
+///
+/// That gap was measured before it could be read. On 2026-09-10 the SR550
+/// reported 44 LACPDUs sent against 38 out of the VSI, and 44 against 34 the
+/// boot before -- and there was no counter in this driver that could say
+/// whether the 38 reached the MAC. Every statement about what the switch
+/// received rested on a boundary one layer short of the wire.
+///
+/// **These constants have existed since 2026-09-06 with nothing reading them.**
+/// `GLPRT_UPTCL`, `GLPRT_MPTCL` and `GLPRT_BPTCL` were declared beside their
+/// datasheet sections and never given a reader, which is the same shape as
+/// `TX_SWTCH_UPLINK` -- a careful doc comment that reads like working code in
+/// every grep, and only a caller distinguishes them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PortTransmitted {
+    /// `GLPRT_UPTCL/H`: unicast packets the port put on the wire.
+    pub unicast: u64,
+    /// `GLPRT_MPTCL/H`: multicast packets the port put on the wire.
+    ///
+    /// **An LACPDU is counted here**, for the reason
+    /// [`VsiTransmitted::multicast`] gives: a slow protocol is addressed to a
+    /// reserved multicast group. The two counters see the same frame at two
+    /// different boundaries.
+    pub multicast: u64,
+    /// `GLPRT_BPTCL/H`: broadcast packets the port put on the wire.
+    pub broadcast: u64,
+}
+
+impl PortTransmitted {
+    /// What left between an earlier reading and this one, saturating.
+    #[must_use]
+    pub const fn since(&self, baseline: &Self) -> Self {
+        Self {
+            unicast: self.unicast.saturating_sub(baseline.unicast),
+            multicast: self.multicast.saturating_sub(baseline.multicast),
+            broadcast: self.broadcast.saturating_sub(baseline.broadcast),
+        }
+    }
+
+    /// Every packet the port put out, of whatever address.
+    #[must_use]
+    pub const fn packets(&self) -> u64 {
+        self.unicast + self.multicast + self.broadcast
+    }
+}
+
 /// What a VSI has received.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct VsiCounters {
@@ -2658,6 +2711,36 @@ impl<R: Registers> Device<R> {
             length_errors: self.read(GLPRT_RLEC + at),
             undersize: self.read(GLPRT_RUC + at),
             oversize: self.read(GLPRT_ROC + at),
+        }
+    }
+
+    /// The port's transmit counters, at this instant -- see [`PortTransmitted`].
+    ///
+    /// Indexed by **physical port**, 0 to 3, which is what `PFGEN_PORTNUM`
+    /// answers and what [`Device::port_number`] returns. Table 38-369 gives the
+    /// prefixes: `GLPRT` is the port and has four instances, `GLV` is the VSI
+    /// and has 384, and §38.28.4.1 puts the `GLPRT` set under *"MAC or Physical
+    /// Uplink Interface Statistics"* -- which is why this and not the VSI set
+    /// answers whether a frame reached the wire.
+    ///
+    /// **The datasheet contradicts itself here and the section title wins.**
+    /// §38.39.2.16.62 is headed *"Port Multicast Packets Transmit Count Low -
+    /// GLPRT_MPTCL[n]"* while its field description reads *"Counts number of
+    /// multicast packets transmitted by this VSI"* -- the same sentence as
+    /// `GLV_MPTCL`'s, evidently copied. The heading, the `GLPRT` prefix and the
+    /// `n=0...3` range all say port, and only the description says VSI, so it
+    /// is read as a port counter. Recorded because a reader of this code
+    /// deserves to know the specification is ambiguous rather than discover it.
+    ///
+    /// Clears nothing: these are `RW1C`, so a reader leaves them as found and
+    /// firmware's own accounting of a shared LOM is undisturbed.
+    #[must_use]
+    pub fn port_transmitted(&self, port: u32) -> PortTransmitted {
+        let at = 8 * u64::from(port.min(MAX_PORT as u32));
+        PortTransmitted {
+            unicast: self.read64(GLPRT_UPTCL + at),
+            multicast: self.read64(GLPRT_MPTCL + at),
+            broadcast: self.read64(GLPRT_BPTCL + at),
         }
     }
 
@@ -3416,7 +3499,7 @@ mod tests {
     #[test]
     fn every_register_this_driver_names_is_in_a_page_it_asks_for() {
         // (offset, highest index, stride) -- an unindexed register is (r, 0, 0).
-        let registers: [(u64, u64, u64); 43] = [
+        let registers: [(u64, u64, u64); 45] = [
             (PFGEN_CTRL, 0, 0),
             (PF_ATQBAL, 0, 0),
             (PF_ATQT, 0, 0),
@@ -3457,6 +3540,8 @@ mod tests {
             (PRTPM_SAH, MAX_PORT, 32),
             (GLPRT_GORCL, MAX_PORT, 8),
             (GLPRT_UPRCL, MAX_PORT, 8),
+            (GLPRT_UPTCL, MAX_PORT, 8),
+            (GLPRT_MPTCL, MAX_PORT, 8),
             (GLPRT_BPTCL, MAX_PORT, 8),
             (GLV_RDPC, MAX_VSI, 8),
             (GLV_BPRCL, MAX_VSI, 8),
@@ -4362,6 +4447,57 @@ mod tests {
         assert_eq!(
             FrameHeader::parse(&bytes).ethertype_name(),
             "an 802.3 length"
+        );
+    }
+
+    /// The port's transmit counters are the **MAC's**, not the VSI's.
+    ///
+    /// **The whole value of this reader is that it disagrees with
+    /// `vsi_transmitted`.** A frame that left the VSI and never reached the
+    /// wire shows up as a difference between the two and as nothing else, so a
+    /// reader that quietly read the VSI set would report a difference of zero
+    /// and close a question it had not asked. That is not hypothetical here:
+    /// the datasheet's own field description for `GLPRT_MPTCL` says *"by this
+    /// VSI"*, copied from `GLV_MPTCL`, and a reader who believed the
+    /// description rather than the heading would write exactly that bug.
+    ///
+    /// So the two sets are seeded with different values and the port's is what
+    /// must come back -- at a port index that is not zero, because zero is the
+    /// index at which every wrong stride is still right.
+    #[test]
+    fn the_port_transmit_counters_are_the_macs_and_not_the_vsis() {
+        const PORT: u32 = 2;
+        const VSI: u16 = 2;
+        let device = Device::new(Fake::new());
+        // The MAC's, at 0x3009E0 + 8*port and its high half four bytes on.
+        device.registers.put(GLPRT_UPTCL + 8 * u64::from(PORT), 11);
+        device.registers.put(GLPRT_MPTCL + 8 * u64::from(PORT), 38);
+        device.registers.put(GLPRT_BPTCL + 8 * u64::from(PORT), 5);
+        // The VSI's, at 0x33CC00 + 8*vsi -- different registers, and here
+        // deliberately different numbers.
+        device.registers.put(GLV_UPTCL + 8 * u64::from(VSI), 111);
+        device.registers.put(GLV_MPTCL + 8 * u64::from(VSI), 44);
+        device.registers.put(GLV_BPTCL + 8 * u64::from(VSI), 55);
+
+        let mac = device.port_transmitted(PORT);
+        assert_eq!(mac.multicast, 38, "the multicast count is the port's");
+        assert_eq!(mac.unicast, 11);
+        assert_eq!(mac.broadcast, 5);
+        assert_eq!(mac.packets(), 54);
+
+        let vsi = device.vsi_transmitted(VSI);
+        assert_eq!(vsi.multicast, 44, "and the VSI's is a different number");
+        assert_ne!(
+            mac.multicast, vsi.multicast,
+            "if these two ever read the same register, the gap between them \
+             becomes unmeasurable and the boot report says so about nothing"
+        );
+
+        // A port index past the four the datasheet allows is clamped rather
+        // than allowed to walk off the end of the set.
+        assert_eq!(
+            device.port_transmitted(9),
+            device.port_transmitted(MAX_PORT as u32)
         );
     }
 
