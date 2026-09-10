@@ -134,13 +134,13 @@ const MARKER: u64 = 0x3154_5052_4450_4931;
 /// sentence, that the switch recorded no partner: a conclusion drawn entirely
 /// from memory nobody had assigned. The array literal that feeds this function
 /// must have exactly this many entries, and the compiler now says so.
-const REPORT_WORDS: usize = 44;
+const REPORT_WORDS: usize = 48;
 
 /// **And tied to the machines behind its last four words.** Those four are
 /// written out one per line, because an array literal is what `write_report`
 /// takes -- so a fifth LACP machine would be a fifth address with nowhere to
 /// go, and the total would still add up. This is what says it would not.
-const _: () = assert!(REPORT_WORDS == 36 + 2 * LACP_MACHINES);
+const _: () = assert!(REPORT_WORDS == 36 + 3 * LACP_MACHINES);
 
 /// The last word, written with a sentinel so a reader can prove the page was
 /// written to its full length rather than trusting that it was.
@@ -405,6 +405,49 @@ static LACP_STATE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64
 /// partner's flags may legitimately be `0x00` and a zero byte would otherwise
 /// be indistinguishable from silence.
 static LACP_PARTNER_STATE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// **Which VLANs the switch tags on each link**, up to four per link.
+///
+/// Four slots of sixteen bits: the id in bits 0-11 and bit 15 as *this slot
+/// holds one*, so a VLAN of zero is distinguishable from an empty slot.
+///
+/// **The tag was being thrown away by the code that named it.**
+/// `EthFrame::parse_on` refuses a foreign tag with `Unsupported { field:
+/// "802.1Q tag for another VLAN", value: id }` -- the id is right there in the
+/// refusal -- and `refuse` recorded only the reason. A trunk's whole character
+/// is which VLANs it carries, and this service was discarding that on every
+/// frame it declined.
+///
+/// Per link, because the question is what the switch sends *on those ports* and
+/// four ports need not be configured alike.
+static VLANS_SEEN: [core::sync::atomic::AtomicU64; LACP_MACHINES] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; LACP_MACHINES];
+
+/// Records a VLAN seen on a link, if there is a slot free and it is new.
+///
+/// This service runs one loop on one thread, so a plain read-modify-write is
+/// the whole of it; a race here would cost a duplicate slot and nothing else.
+fn saw_vlan(member: Option<u8>, id: u16) {
+    use core::sync::atomic::Ordering::Relaxed;
+    let link = member.map_or(0, usize::from).min(LACP_MACHINES - 1);
+    let held = VLANS_SEEN[link].load(Relaxed);
+    let tagged = 1u64 << 15;
+    let entry = u64::from(id & 0xfff) | tagged;
+    let mut free = None;
+    for slot in 0..4 {
+        let at = slot * 16;
+        let seen = held >> at & 0xffff;
+        if seen == entry {
+            return;
+        }
+        if seen == 0 && free.is_none() {
+            free = Some(at);
+        }
+    }
+    if let Some(at) = free {
+        VLANS_SEEN[link].store(held | entry << at, Relaxed);
+    }
+}
 
 /// **What the neighbour says it is**, from its LLDP frames.
 ///
@@ -1374,6 +1417,13 @@ fn refresh() {
         LLDP_PORT[1].load(Relaxed),
         LLDP_PORT[2].load(Relaxed),
         LLDP_PORT[3].load(Relaxed),
+        // **Words 44 to 47: the VLANs the switch tags on each link** -- see
+        // `VLANS_SEEN`. A trunk's character is which VLANs it carries, and the
+        // tag was being discarded by the code that named it.
+        VLANS_SEEN[0].load(Relaxed),
+        VLANS_SEEN[1].load(Relaxed),
+        VLANS_SEEN[2].load(Relaxed),
+        VLANS_SEEN[3].load(Relaxed),
     ]);
 }
 
@@ -1772,9 +1822,30 @@ fn drain_ring(
         let untagged = EthFrame::parse_on(&frame[..length], None)
             .ok()
             .filter(|frame| is_link_control(frame.ethertype));
-        let Some(parsed) =
-            untagged.or_else(|| EthFrame::parse_on(&frame[..length], bound_vlan()).ok())
-        else {
+        let on_our_vlan = EthFrame::parse_on(&frame[..length], bound_vlan());
+        // **What VLAN the switch put on it**, before deciding whether to take
+        // it. `parse_on` already names the tag when it refuses one -- the error
+        // is `Unsupported { field: "802.1Q tag for another VLAN", value: id }`
+        // -- and `refuse` threw that value away, so this service has been
+        // discarding the one fact that says what a trunk is carrying.
+        //
+        // Recorded against the link it arrived on: the question is what the
+        // switch sends *on those ports*, and four ports need not agree.
+        match &on_our_vlan {
+            Err(bhaskix_net::NetError::Unsupported { field, value })
+                if field.starts_with("802.1Q tag for another") =>
+            {
+                saw_vlan(from_member, *value as u16);
+            }
+            // Accepted means it carried the tag this interface is bound to.
+            Ok(_) if untagged.is_none() => {
+                if let Some(ours) = bound_vlan() {
+                    saw_vlan(from_member, ours);
+                }
+            }
+            _ => {}
+        }
+        let Some(parsed) = untagged.or_else(|| on_our_vlan.ok()) else {
             refuse(why::NOT_A_FRAME, length, seen);
             continue;
         };
@@ -3577,6 +3648,10 @@ fn report(
         LLDP_PORT[1].load(core::sync::atomic::Ordering::Relaxed),
         LLDP_PORT[2].load(core::sync::atomic::Ordering::Relaxed),
         LLDP_PORT[3].load(core::sync::atomic::Ordering::Relaxed),
+        VLANS_SEEN[0].load(core::sync::atomic::Ordering::Relaxed),
+        VLANS_SEEN[1].load(core::sync::atomic::Ordering::Relaxed),
+        VLANS_SEEN[2].load(core::sync::atomic::Ordering::Relaxed),
+        VLANS_SEEN[3].load(core::sync::atomic::Ordering::Relaxed),
     ];
     V6_PREFIX.store(v6_prefix, core::sync::atomic::Ordering::Relaxed);
     V6_STATE.store(v6_state, core::sync::atomic::Ordering::Relaxed);

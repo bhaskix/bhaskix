@@ -1777,3 +1777,55 @@ first version kept whichever frame landed last and would have reported `xg12`
 either way. A per-thing question needs a per-thing instrument — the same
 correction this document already made for the LACP machines, the link states,
 the member addresses and the partner flags.
+
+
+### The switch forwards nothing but link control — 2026-09-10
+
+LLDP cannot answer what VLANs the switch tags, because a Port VLAN ID TLV is an
+organizationally specific TLV and this switch sends none. But the tags are on
+the frames themselves, and `bin/ipd` was discarding them: `EthFrame::parse_on`
+refuses a foreign tag with `Unsupported { field: "802.1Q tag for another VLAN",
+value: id }` — the id is *in the refusal* — and `refuse` recorded only the
+reason. Seventh instance of this work's pattern, and the seventh where the answer
+was already inside a value being thrown away.
+
+Recorded per link, four VLANs deep, the machine answers:
+
+**Nothing.** The `switch vlans` line does not print, and it is a real zero rather
+than a suppressed print — the LLDP block immediately above it prints under the
+same `complete` guard and does appear, so all four words are zero on all four
+links. Corroborated by `ipd after`: **31 frames taken, 0 refused**. Every frame
+that arrived was accepted, which on a VLAN-17-bound interface means every one was
+untagged link control — LACP and LLDP. Not one 802.1Q tag crossed.
+
+**What that is and is not evidence of.** It is consistent with what this document
+already records as the reason DHCP goes unanswered: a switch does not forward
+VLAN data to a channel-group member it has not bundled. The ports carry
+link-level protocol only, which is exactly what an unbundled aggregation looks
+like from this end — so it is *another consequence of the same unformed bundle*,
+not independent evidence about the VLAN configuration.
+
+What it does rule out is any theory in which the switch is forwarding VLAN 17 and
+this stack mishandles the tag. Nothing tagged is arriving to mishandle.
+
+The instrument is worth keeping regardless: the moment the channel-group bundles,
+the report will say which VLANs arrive on which ports without another change.
+
+### Where the question stands
+
+Confirmed from the wire, none of it from description:
+
+* Four cables into four adjacent ports of one switch — `xg9`, `xg10`, `xg11`,
+  `xg12`, named by the switch itself.
+* The switch is **LACP active**, answers on all four links, and records its
+  partner as key 0 / port 0 — administrative defaults, so it has never accepted
+  anything this host sent.
+* It forwards **no data at all**, only LACP and LLDP.
+* On this side: every precondition for an uplink-tagged transmit is verified
+  present, and 25% of uplink-tagged descriptors complete while plain frames are
+  100%.
+
+The two ends of that are a host whose frames mostly do not leave the descriptor
+ring, and a switch that has never heard a usable LACPDU. Whether those are one
+fault or two is the open question, and this side has run out of things it can
+vary.

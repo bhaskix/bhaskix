@@ -17057,6 +17057,40 @@ fn report_bond(words: &mut [u64; 29], take: impl Fn(&mut [u64; 29])) {
     }
 }
 
+/// Which VLANs the switch tags on each link, up to four per link.
+///
+/// Four slots of sixteen bits, the id in bits 0-11 and bit 15 saying the slot
+/// holds one. A trunk's whole character is which VLANs it carries, and until
+/// 2026-09-10 `bin/ipd` discarded that on every frame it declined -- the tag was
+/// named in the refusal it threw away.
+struct TaggedVlans([u64; NETD_MEMBER_COUNT]);
+
+impl core::fmt::Display for TaggedVlans {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let mut named = false;
+        for (link, held) in self.0.iter().enumerate() {
+            if *held == 0 {
+                continue;
+            }
+            if named {
+                write!(f, "; ")?;
+            }
+            named = true;
+            write!(f, "link {link}")?;
+            for slot in 0..4 {
+                let entry = held >> (slot * 16) & 0xffff;
+                if entry >> 15 & 1 != 0 {
+                    write!(f, " {}", entry & 0xfff)?;
+                }
+            }
+        }
+        if !named {
+            return write!(f, "no link has seen a tagged frame");
+        }
+        Ok(())
+    }
+}
+
 /// Which switch port each link reaches, as the neighbour's own LLDP names it.
 ///
 /// **The distinction this exists for**: four links reaching one switch port and
@@ -17357,7 +17391,7 @@ fn report_net_after_exchange(hhdm: u64) {
     // to be wrong instead of three.
     // Thirty-eight words and a sentinel, and the last four are `bin/ipd`'s own:
     // the address each of its LACP machines speaks under -- RFC 0076 step 4.
-    let mut ipd = [0u64; 45];
+    let mut ipd = [0u64; 49];
     // SAFETY: a frame this object owns, through the direct map, read as the
     // little-endian words the service wrote there -- `ipd.len() * 8` bytes of
     // a page, so the read cannot reach past the frame.
@@ -17559,7 +17593,7 @@ fn report_net_after_exchange(hhdm: u64) {
     // the boot report said in a sentence that the switch recorded no partner.
     // Checked on every boot, not only where the words are used, because the
     // cheapest place to catch it is before anybody believes a number.
-    let complete = ipd[44] == IPD_REPORT_TAIL;
+    let complete = ipd[48] == IPD_REPORT_TAIL;
     if !complete {
         println!(
             "\x1b[93m    ipd report     INCOMPLETE: this kernel reads {} words and bin/ipd \
@@ -17674,6 +17708,19 @@ fn report_net_after_exchange(hhdm: u64) {
             println!(
                 "    lldp neighbour the port it reaches, per link: {}",
                 LldpPorts(core::array::from_fn(|n| ipd[40 + n]))
+            );
+        }
+        // **What the switch tags on each link**, words 44 to 47.
+        //
+        // A trunk's character is which VLANs it carries, and `bin/ipd` was
+        // discarding that on every frame it declined: `parse_on` names the tag
+        // in its refusal and `refuse` recorded only the reason. Independent of
+        // the LLDP block above, because a switch that sends no LLDP still tags
+        // its frames.
+        if complete && ipd[44..48].iter().any(|word| *word != 0) {
+            println!(
+                "    switch vlans   tagged on each link: {}",
+                TaggedVlans(core::array::from_fn(|n| ipd[44 + n]))
             );
         }
         if heard {
