@@ -134,13 +134,13 @@ const MARKER: u64 = 0x3154_5052_4450_4931;
 /// sentence, that the switch recorded no partner: a conclusion drawn entirely
 /// from memory nobody had assigned. The array literal that feeds this function
 /// must have exactly this many entries, and the compiler now says so.
-const REPORT_WORDS: usize = 38;
+const REPORT_WORDS: usize = 41;
 
 /// **And tied to the machines behind its last four words.** Those four are
 /// written out one per line, because an array literal is what `write_report`
 /// takes -- so a fifth LACP machine would be a fifth address with nowhere to
 /// go, and the total would still add up. This is what says it would not.
-const _: () = assert!(REPORT_WORDS == 34 + LACP_MACHINES);
+const _: () = assert!(REPORT_WORDS == 37 + LACP_MACHINES);
 
 /// The last word, written with a sentinel so a reader can prove the page was
 /// written to its full length rather than trusting that it was.
@@ -405,6 +405,36 @@ static LACP_STATE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64
 /// partner's flags may legitimately be `0x00` and a zero byte would otherwise
 /// be indistinguishable from silence.
 static LACP_PARTNER_STATE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// **What the neighbour says it is**, from its LLDP frames.
+///
+/// The switch has been describing itself on every boot and this service refused
+/// the frames -- `last refusal reason 2, on a frame of 171 bytes with ethertype
+/// 0x88cc`. RFC 0076 spent a week asking what the switch thinks of a
+/// port-channel this host has no login to, with 171 bytes of its own account
+/// arriving every thirty seconds.
+///
+/// An **inventory rather than a reading**: which TLV types it sends, how many,
+/// and the first organizationally specific TLV's OUI and subtype. Only what the
+/// C620 datasheet grounds is decoded -- see `bhaskix_net::lldp`. What the switch
+/// actually sends decides what is worth decoding next, which is a question for
+/// evidence rather than for recall.
+///
+/// Bits 0-31 the type bitmap, 32-39 the count, 40-47 the organizationally
+/// specific count, 48 whether the walk ended cleanly, 49 whether any frame was
+/// seen at all.
+static LLDP_SEEN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// The neighbour's port id: its subtype in bits 48-55 and its first six octets
+/// below, or zero before one has arrived.
+///
+/// **The port id is the half that names the switch's own port**, which is what
+/// a question about a port-channel is ultimately about.
+static LLDP_PORT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// The first organizationally specific TLV's OUI in bits 0-23 and subtype in
+/// 24-31.
+static LLDP_ORGANISATION: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// **What the partner records as its own partner** -- what the switch believes
 /// is at our end of link 0.
@@ -1327,6 +1357,14 @@ fn refresh() {
         SPEAKING_AS[1].load(Relaxed),
         SPEAKING_AS[2].load(Relaxed),
         SPEAKING_AS[3].load(Relaxed),
+        // **Words 38 to 40: what the neighbour says it is**, from its LLDP.
+        // An inventory of the TLV types it sends, its port id, and the first
+        // organizationally specific OUI and subtype -- see `LLDP_SEEN`. Only
+        // what the C620 datasheet grounds is decoded; what the switch actually
+        // sends decides what is worth decoding next.
+        LLDP_SEEN.load(Relaxed),
+        LLDP_PORT.load(Relaxed),
+        LLDP_ORGANISATION.load(Relaxed),
     ]);
 }
 
@@ -1736,6 +1774,36 @@ fn drain_ring(
         // group frame; what makes it ours is the EtherType. The machine
         // decides what to believe, and a reply goes back on the same wake,
         // which is how two peers converge without either holding a clock.
+        // **What the neighbour says it is.** These frames have arrived on every
+        // boot and been refused; the switch's own account of itself was on the
+        // wire the whole time RFC 0076 was asking for it.
+        if parsed.ethertype.0 == bhaskix_net::lldp::ETHERTYPE {
+            let seen = bhaskix_net::lldp::inventory(parsed.payload);
+            LLDP_SEEN.store(
+                u64::from(seen.types)
+                    | u64::from(seen.count.min(0xff)) << 32
+                    | u64::from(seen.organisations.min(0xff)) << 40
+                    | u64::from(seen.whole) << 48
+                    | 1 << 49,
+                core::sync::atomic::Ordering::Relaxed,
+            );
+            if let Some((subtype, id)) = seen.port {
+                let packed = id.iter().fold(0u64, |word, o| (word << 8) | u64::from(*o));
+                LLDP_PORT.store(
+                    packed | u64::from(subtype) << 48,
+                    core::sync::atomic::Ordering::Relaxed,
+                );
+            }
+            if let Some((oui, subtype)) = seen.organisation {
+                LLDP_ORGANISATION.store(
+                    u64::from(oui[0]) << 16
+                        | u64::from(oui[1]) << 8
+                        | u64::from(oui[2])
+                        | u64::from(subtype) << 24,
+                    core::sync::atomic::Ordering::Relaxed,
+                );
+            }
+        }
         if parsed.ethertype.0 == bhaskix_net::lacp::ETHERTYPE {
             lacp_heard();
             // **To the machine for the link it came in on.** A partner is a
@@ -3485,6 +3553,14 @@ fn report(
         SPEAKING_AS[1].load(core::sync::atomic::Ordering::Relaxed),
         SPEAKING_AS[2].load(core::sync::atomic::Ordering::Relaxed),
         SPEAKING_AS[3].load(core::sync::atomic::Ordering::Relaxed),
+        // **Words 38 to 40: what the neighbour says it is**, from its LLDP.
+        // An inventory of the TLV types it sends, its port id, and the first
+        // organizationally specific OUI and subtype -- see `LLDP_SEEN`. Only
+        // what the C620 datasheet grounds is decoded; what the switch actually
+        // sends decides what is worth decoding next.
+        LLDP_SEEN.load(core::sync::atomic::Ordering::Relaxed),
+        LLDP_PORT.load(core::sync::atomic::Ordering::Relaxed),
+        LLDP_ORGANISATION.load(core::sync::atomic::Ordering::Relaxed),
     ];
     V6_PREFIX.store(v6_prefix, core::sync::atomic::Ordering::Relaxed);
     V6_STATE.store(v6_state, core::sync::atomic::Ordering::Relaxed);

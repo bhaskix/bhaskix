@@ -1693,3 +1693,50 @@ found a mechanism whose result nobody read. This is the fifth kind: a number tha
 measurement. The write-back counts were beside it the whole time, unchanged
 across every one of those boots, and they were the ones telling the truth. **A
 derived verdict is not evidence; the count it was derived from is.**
+
+
+### The switch's own account of itself — 2026-09-10
+
+RFC 0076 spent a week asking what the switch thinks of a port-channel this host
+has no login to. The switch has been answering every thirty seconds and
+`bin/ipd` refused the frames: `last refusal reason 2, on a frame of 171 bytes
+with ethertype 0x88cc`. Sixth instance of the pattern, and the one where the
+answer was arriving unasked.
+
+```
+lldp neighbour 9 tlv(s), 0 organizationally specific; chassis/port/ttl 1/1/1
+lldp neighbour its port id, subtype 7: 0x786731320000
+```
+
+`0x786731320000` is ASCII **`xg12`** — port id subtype 7, *locally assigned*, so
+the switch's own name for the port this link lands on.
+
+**And zero organizationally specific TLVs.** That is the load-bearing part: a
+link-aggregation TLV lives inside a type-127 organizationally specific TLV, and
+so does DCBx. Nine TLVs, a walk reaching a clean end, and not one of type 127.
+
+**What that does and does not establish.** It does not say the port-channel is
+absent — plenty of switches never emit that TLV with a channel-group configured,
+so what is ruled out is learning the answer *this way*. What it establishes is
+that the switch is reachable, talkative, and names its port, so `xg12` is the
+interface to look at if its configuration can be read directly.
+
+**A limit of the instrument as built**, stated rather than discovered later: the
+port id is a single global, while LLDP arrives on all four members. `xg12` is
+whichever link's frame landed last. If the four ports are `xg12` through `xg15`
+this would not say so.
+
+**Grounded rather than recalled.** Table 38-171 gives the TLV header as seven
+bits of type and nine of length; 38-172 gives an organizationally specific TLV
+as that header plus a three-octet OUI and a one-octet subtype; §38.29.4.2 names
+types 0, 1, 2 and 3 and their subtypes. Everything else is left as an inventory
+on purpose — Table 38-173 lists only DCBx for that OUI, so the aggregation TLV's
+number is **not** grounded by anything in this project and the parser does not
+pretend to know it. What the switch actually sends decides what is worth
+decoding next.
+
+Two host tests, watched red against the obvious misreading of the header as a
+byte of type and a byte of length — which halves every type and shifts every
+length, after which the walk wanders through the frame finding plausible
+rubbish — and a truncated-frame test, since a neighbour's frame is hostile
+input and reading past its end is the real danger.

@@ -17313,7 +17313,7 @@ fn report_net_after_exchange(hhdm: u64) {
     // to be wrong instead of three.
     // Thirty-eight words and a sentinel, and the last four are `bin/ipd`'s own:
     // the address each of its LACP machines speaks under -- RFC 0076 step 4.
-    let mut ipd = [0u64; 39];
+    let mut ipd = [0u64; 42];
     // SAFETY: a frame this object owns, through the direct map, read as the
     // little-endian words the service wrote there -- `ipd.len() * 8` bytes of
     // a page, so the read cannot reach past the frame.
@@ -17515,7 +17515,7 @@ fn report_net_after_exchange(hhdm: u64) {
     // the boot report said in a sentence that the switch recorded no partner.
     // Checked on every boot, not only where the words are used, because the
     // cheapest place to catch it is before anybody believes a number.
-    let complete = ipd[38] == IPD_REPORT_TAIL;
+    let complete = ipd[41] == IPD_REPORT_TAIL;
     if !complete {
         println!(
             "\x1b[93m    ipd report     INCOMPLETE: this kernel reads {} words and bin/ipd \
@@ -17589,6 +17589,41 @@ fn report_net_after_exchange(hhdm: u64) {
             println!(
                 "                   speaking as: {}",
                 MemberAddresses(core::array::from_fn(|n| ipd[34 + n]))
+            );
+        }
+        // **What the neighbour says it is**, from its own LLDP -- words 38 to 40.
+        //
+        // The switch has described itself on every boot and `bin/ipd` refused
+        // the frames. This is an inventory rather than a reading: which TLV
+        // types it sends, its port id, and the first organizationally specific
+        // OUI and subtype. Only what the C620 datasheet grounds is decoded,
+        // because the TLV that would answer the port-channel question outright
+        // is not in it -- Table 38-173 lists DCBx and nothing else for that OUI.
+        if complete && ipd[38] >> 49 & 1 != 0 {
+            let types = ipd[38] & 0xffff_ffff;
+            println!(
+                "    lldp neighbour {} tlv(s){}, {} organizationally specific; chassis/port/ttl \
+                 {}/{}/{}",
+                ipd[38] >> 32 & 0xff,
+                if ipd[38] >> 48 & 1 != 0 {
+                    ""
+                } else {
+                    " \x1b[93m(the walk did not reach an end tlv)\x1b[0m"
+                },
+                ipd[38] >> 40 & 0xff,
+                types >> 1 & 1,
+                types >> 2 & 1,
+                types >> 3 & 1
+            );
+            println!(
+                "    lldp neighbour its port id, subtype {}: {:#014x}; first org tlv oui \
+                 {:02x}-{:02x}-{:02x} subtype {:#04x}",
+                ipd[39] >> 48 & 0xff,
+                ipd[39] & 0xffff_ffff_ffff,
+                ipd[40] >> 16 & 0xff,
+                ipd[40] >> 8 & 0xff,
+                ipd[40] & 0xff,
+                ipd[40] >> 24 & 0xff
             );
         }
         if heard {
