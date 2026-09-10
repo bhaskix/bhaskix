@@ -498,21 +498,10 @@ pub const TRANSMIT_DESCRIPTOR_BYTES: u64 = 16;
 
 /// How many descriptors the transmit ring this driver builds holds.
 ///
-/// **Four cache lines, because the device fetches a line at a time.**
-///
-/// This was 8 -- `QLEN`'s floor, *"from 8 descriptors"* -- chosen because the
-/// driver sends one frame at a time and waits for it, so a longer ring looked
-/// like a wrap-around nothing tests. That reasoning missed
-/// [`TRANSMIT_FETCH_LINE`]: outside PXE mode the device fetches eight
-/// descriptors at once, so a ring of eight is a single cache line and every
-/// frame posted into it is either the whole line or an unfetchable fragment.
-///
-/// 38.31.3.4.2's transmit `QLEN`: *"at smaller queue size than 32 descriptors
-/// the QLEN must be a whole number of 8 descriptors"*, so 32 is legal and is
-/// four lines. It costs 512 bytes of a page whose packet buffer starts at 2048.
-pub const TRANSMIT_DESCRIPTORS: u16 = 32;
-
-const _: () = assert!(TRANSMIT_DESCRIPTORS.is_multiple_of(TRANSMIT_FETCH_LINE));
+/// `QLEN`'s floor is *"from 8 descriptors"* and this is that floor: the driver
+/// sends one self-contained frame at a time and waits for it, so a longer ring
+/// is a wrap-around nothing tests.
+pub const TRANSMIT_DESCRIPTORS: u16 = 8;
 
 /// And how many bytes that ring occupies.
 ///
@@ -2093,41 +2082,6 @@ pub const fn transmit_descriptor(buffer: u64, bytes: u16) -> (u64, u64) {
     (buffer, TX_CMD_EOP | TX_CMD_RS | length)
 }
 
-/// Descriptors the device fetches at once once PXE mode is cleared.
-///
-/// **The rule the transmit ring did not have and the receive ring did.**
-/// 38.30.2.1: *"When the PXE_MODE flag is cleared, software should bump the tail
-/// at the entire 8 x descriptors granularity. In this mode, hardware fetches
-/// descriptors in the entire cache lines (4 x 32 byte descriptors or 8 x 16 byte
-/// descriptors)."* These are 16-byte descriptors, so the device fetches eight.
-///
-/// A tail bumped by one or two leaves a partial cache line, which the device
-/// will not fetch -- so the descriptors sit there, `QTX_HEAD` stays behind the
-/// cursor, and this driver overwrites them on its next pass. Measured on the
-/// SR550 on 2026-09-10: 32 of 36 uplink-tagged posts never written back, head 6
-/// against cursor 13.
-pub const TRANSMIT_FETCH_LINE: u16 = 8;
-
-/// A transmit **NOP** descriptor, for padding a cache line out.
-///
-/// 38.31.2.1.2: *"A NOP descriptor can be used if there is a software need to
-/// align descriptors... implemented by a null setting of a context descriptor as
-/// follows: DTYP should be set to 0x1 (LAN context descriptor) and all other
-/// fields should be cleared. Note that NOP descriptors are permitted only
-/// between commands."* Between packets is exactly where these go.
-#[must_use]
-pub const fn transmit_nop_descriptor() -> (u64, u64) {
-    (0, TX_DTYP_CONTEXT)
-}
-
-/// Writes a NOP descriptor into a ring, as [`post_transmit_context`].
-pub fn post_transmit_nop(ring: &mut impl Dma, index: u32) {
-    let (low, high) = transmit_nop_descriptor();
-    let at = TRANSMIT_DESCRIPTOR_BYTES as usize * index as usize;
-    put_dma64(ring, at, low);
-    put_dma64(ring, at + 8, high);
-}
-
 /// A transmit context descriptor carrying a switch control tag.
 ///
 /// Qword 0 is entirely reserved for what this uses it for; qword 1 carries the
@@ -3169,22 +3123,14 @@ impl<R: Registers> Device<R> {
         bytes: u16,
         uplink: bool,
     ) -> Option<u32> {
-        let line = u32::from(TRANSMIT_FETCH_LINE);
-        // **A frame takes a whole cache line**, because the device fetches one
-        // and will not fetch part of one -- see `TRANSMIT_FETCH_LINE`. The frame
-        // is one or two descriptors and the rest of the line is NOPs, so the
-        // tail this driver publishes is always a boundary the device can act on.
-        //
-        // Wasteful of descriptors and not of anything scarce: this driver sends
-        // one self-contained frame at a time and waits for it, so the ring holds
-        // four frames where it could hold thirty-two, and thirty-two frames in
-        // flight is not a thing it has ever had.
-        if self.transmit_depth < line {
+        let needed = if uplink { 2 } else { 1 };
+        if self.transmit_depth < needed {
             return None;
         }
-        // Wrap before writing rather than across the line, so a frame's
-        // descriptors are always contiguous and the tail is always a boundary.
-        if self.transmit_next + line > self.transmit_depth {
+        // Wrap before writing rather than across the pair, so a frame's
+        // descriptors are always contiguous and the tail is always the slot
+        // after the last one written.
+        if self.transmit_next + needed > self.transmit_depth {
             self.transmit_next = 0;
         }
         let slot = self.transmit_next;
@@ -3193,11 +3139,7 @@ impl<R: Registers> Device<R> {
             post_transmit_context(ring, slot, TX_SWTCH_UPLINK);
         }
         post_transmit_descriptor(ring, data, buffer, bytes);
-        // The rest of the line, so the tail lands where the device fetches.
-        for index in (data + 1)..(slot + line) {
-            post_transmit_nop(ring, index);
-        }
-        self.transmit_next = slot + line;
+        self.transmit_next = data + 1;
         // **Wrap the cursor, because the tail is an index and not a count.**
         // `QTX_TAIL` takes a descriptor index, so a ring of eight accepts 0 to
         // 7; writing 8 after filling the last slot is out of range and the
@@ -4214,25 +4156,16 @@ mod tests {
     /// last slot stops the queue. On 2026-09-06 four LACPDUs left the wire and
     /// the fifth put the tail at eight, after which the head sat at six and
     /// forty more frames went nowhere.
-    ///
-    /// **Rewritten 2026-09-10, because it encoded a packing that was wrong.** It
-    /// asserted one descriptor per frame, in order, which was true of the code
-    /// and not of the device: outside PXE mode the device fetches a whole
-    /// eight-descriptor cache line and will not fetch part of one, so a frame
-    /// per descriptor left seven-eighths of every line unfetchable. A frame now
-    /// takes a line. What the test is *for* is unchanged and is the half that
-    /// mattered: the cursor must stay a valid index and must come back to zero.
     #[test]
     fn the_transmit_cursor_wraps_instead_of_running_past_the_ring() {
-        const DEPTH: u16 = 32;
-        let line = u32::from(TRANSMIT_FETCH_LINE);
+        const DEPTH: u16 = 8;
         let mut ring = FakeDma::new();
         let mut device = Device::new(Fake::new());
         device.attach_transmit_ring(DEPTH);
 
-        for round in 0..(u32::from(DEPTH) / line) {
+        for expected in 0..u32::from(DEPTH) {
             let at = device.post_frame(&mut ring, 0x1_0000_0000, 60, false);
-            assert_eq!(at, Some(round * line), "one frame per cache line, in order");
+            assert_eq!(at, Some(expected), "one descriptor per frame, in order");
             assert!(
                 device.transmit_tail() < u32::from(DEPTH),
                 "a tail of {} is not a valid index into {DEPTH} descriptors",
@@ -4242,7 +4175,7 @@ mod tests {
         assert_eq!(
             device.transmit_tail(),
             0,
-            "the fifth frame starts the ring again"
+            "the ninth frame starts the ring again"
         );
     }
 
@@ -4250,15 +4183,9 @@ mod tests {
     /// descriptor, and the pair must be contiguous -- so a frame that would
     /// straddle the end of the ring starts again rather than wrapping between
     /// its own two halves.
-    ///
-    /// **Rewritten 2026-09-10 with the line rule**, as
-    /// `the_transmit_cursor_wraps_instead_of_running_past_the_ring` was: the
-    /// pair still has to be contiguous and still starts a line, and the rest of
-    /// the line behind it is NOPs.
     #[test]
     fn an_uplink_frame_takes_two_contiguous_descriptors() {
-        const DEPTH: u16 = 16;
-        let line = u32::from(TRANSMIT_FETCH_LINE);
+        const DEPTH: u16 = 4;
         let mut ring = FakeDma::new();
         let mut device = Device::new(Fake::new());
         device.attach_transmit_ring(DEPTH);
@@ -4266,14 +4193,10 @@ mod tests {
         assert_eq!(
             device.post_frame(&mut ring, 0x2000, 60, true),
             Some(1),
-            "context at 0, data at 1"
+            "context, data"
         );
-        assert_eq!(device.transmit_tail(), line, "and the line is closed");
-        assert_eq!(
-            device.post_frame(&mut ring, 0x2000, 60, true),
-            Some(line + 1),
-            "the next pair opens the next line"
-        );
+        assert_eq!(device.transmit_tail(), 2);
+        assert_eq!(device.post_frame(&mut ring, 0x2000, 60, true), Some(3));
         assert_eq!(device.transmit_tail(), 0, "and the ring is full");
         assert_eq!(
             device.post_frame(&mut ring, 0x2000, 60, true),
@@ -4281,11 +4204,10 @@ mod tests {
             "the next pair starts at zero, not straddling the end"
         );
 
-        // A ring shorter than one fetch line takes nothing: the device could
-        // not fetch what it held.
+        // A ring too short for the pair takes neither half.
         let mut narrow = FakeDma::new();
         let mut small = Device::new(Fake::new());
-        small.attach_transmit_ring(TRANSMIT_FETCH_LINE - 1);
+        small.attach_transmit_ring(1);
         assert_eq!(small.post_frame(&mut narrow, 0x2000, 60, true), None);
     }
 
@@ -4526,66 +4448,6 @@ mod tests {
             FrameHeader::parse(&bytes).ethertype_name(),
             "an 802.3 length"
         );
-    }
-
-    /// The transmit tail always lands where the device will fetch it.
-    ///
-    /// **This is the rule the transmit ring did not have.** Outside PXE mode the
-    /// device fetches eight 16-byte descriptors at a time and will not fetch a
-    /// partial cache line, so a tail bumped by one or two leaves the frame
-    /// sitting in the ring unfetched -- and this driver then overwrites it. The
-    /// SR550 measured exactly that on 2026-09-10: 32 of 36 uplink-tagged posts
-    /// never written back, `QTX_HEAD` at 6 against a cursor of 13.
-    ///
-    /// So every post must leave the cursor on a line boundary, whether the frame
-    /// took one descriptor or two, and the slack must be NOPs rather than
-    /// whatever the previous pass left there.
-    #[test]
-    fn every_transmit_post_leaves_the_tail_on_a_fetch_boundary() {
-        let line = u32::from(TRANSMIT_FETCH_LINE);
-        // Alternating, because a plain frame takes one descriptor and an
-        // uplink-tagged one takes two: if the padding were computed from the
-        // frame rather than to the boundary, one of the two would drift.
-        for uplink in [false, true, true, false, true] {
-            let mut ring = FakeDma::new();
-            let mut device = Device::new(Fake::new());
-            device.attach_transmit_ring(TRANSMIT_DESCRIPTORS);
-            for round in 0..(TRANSMIT_DESCRIPTORS as u32 / line + 2) {
-                let slot = device
-                    .post_frame(&mut ring, 0x4000, 124, uplink)
-                    .expect("the ring is deeper than one line");
-                let tail = device.transmit_tail();
-                assert_eq!(
-                    tail % line,
-                    0,
-                    "round {round}: a tail of {tail} is inside a cache line the device will \
-                     not fetch"
-                );
-                assert!(
-                    tail <= u32::from(TRANSMIT_DESCRIPTORS),
-                    "round {round}: the tail is a descriptor index, not a count"
-                );
-                // The data descriptor is inside the line the tail closes.
-                let opened = if tail == 0 {
-                    u32::from(TRANSMIT_DESCRIPTORS) - line
-                } else {
-                    tail - line
-                };
-                assert!(
-                    (opened..opened + line).contains(&slot),
-                    "round {round}: the frame at {slot} is not in the line ending at {tail}"
-                );
-                // And the slack is NOPs, not what the last pass left behind.
-                for index in (slot + 1)..(opened + line) {
-                    let at = TRANSMIT_DESCRIPTOR_BYTES as usize * index as usize;
-                    assert_eq!(
-                        (dma64(&ring, at), dma64(&ring, at + 8)),
-                        transmit_nop_descriptor(),
-                        "round {round}: descriptor {index} is not a NOP"
-                    );
-                }
-            }
-        }
     }
 
     /// The port's transmit counters are the **MAC's**, not the VSI's.
