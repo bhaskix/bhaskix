@@ -1492,3 +1492,87 @@ had nothing to do with the crate the change was in.
 was still attached, so the next `console 1` was refused with `clish launch
 SerRedir exist` and the machine booted blind. The BMC allows one console session:
 closing it belongs to finishing a boot, not to tidying up afterwards.
+
+
+### `Stop LLDP Agent` succeeds, and always has — 2026-09-10
+
+The control-VSI reading was the last hypothesis standing. It is dead, and the
+way it died is the pattern this document keeps recording.
+
+```
+net x722   stop lldp agent: firmware took it -- the control port of the mac,
+           which 38.28 says a driver taking it must ask for
+net x722   22 multicast frame(s) left the vsi by its own count since bring-up
+ipd lacp   45 LACPDU(s) sent, 13 slow-protocol frame(s) heard back
+           bin/netd posted 75 frame(s), 48 of them uplink-tagged, 0 refused
+           36 of those posts were never written back (36 of them uplink-tagged)
+```
+
+**Firmware hands over the control port when asked.** So the EMP holding it is not
+why uplink-tagged frames die. The switch is unchanged — `0x45`, `DEFAULTED`,
+partner key 0, port 0.
+
+**And the command was never missing.** `OPCODE_STOP_LLDP_AGENT`, `LLDP_SHUTDOWN`
+and `Device::stop_lldp_agent` were already in `bhaskix-i40e`, with the stop /
+shutdown distinction already reasoned out in a doc comment — *"Stop is the
+reversible half"* — and `bin/netd` already called it, on every boot since it was
+written:
+
+```rust
+let _ = device.stop_lldp_agent(admin, false, SPINS);
+```
+
+The answer went on the floor. So whether this driver held the control port was
+unknown for the whole of this investigation, while the section above named it as
+the leading explanation.
+
+That is the **fourth** mechanism in this driver to be written, documented and
+never checked, after `TX_SWTCH_UPLINK`, the `GLPRT_*` constants and
+`VsiTransmitted::since`. It differs from the other three in kind, and the
+difference is worth keeping: this one *was* called. Only its result was
+discarded. A mechanism nobody calls and a mechanism whose answer nobody reads
+are the same blindness one layer apart, and the second is harder to see, because
+every grep finds a caller.
+
+### A CPU uncorrectable error on the SR550, 2026-09-10
+
+**The machine logged a critical processor fault during this boot, and it is
+recorded here because it happened, not because it is understood.**
+
+```
+2026-09-10T14:29:52.810Z  Critical  An Uncorrectable Error has occurred on CPUs.
+2026-09-10T14:30:23.404Z  Critical  An uncorrectable error has been detected on processor 1.
+```
+
+The `ForceRestart` that began this boot went out at **14:28:51Z**, so the first
+entry is **sixty-one seconds** later. On this machine POST takes four to five
+minutes — measured across today's boots, where the first Bhaskix console line
+never appears sooner — so the fault was logged while firmware was still running,
+before this image loaded.
+
+**That is evidence and not exoneration.** This node was force-restarted many
+times over one day to answer the questions above, and a driver that programs a
+NIC's DMA is not a thing to declare innocent from a timestamp. What can be said
+precisely:
+
+* Redfish reports the system `Health: Critical`, `HealthRollup: Critical`,
+  `State: Enabled`; `ProcessorSummary` health `Critical`; processor 1 health
+  `Critical`; memory `OK`, 192 GiB.
+* The boot completed and printed its whole report afterwards, so the machine
+  went on running.
+* The two entries are the only ones in the BMC's active log. The standard log's
+  most recent entries are from 2026-07-21 and are unrelated drive faults that
+  recovered.
+
+**The log has been left intact and the machine has been left alone.** Clearing a
+hardware fault record destroys the evidence for whoever looks next, and this is
+somebody's cluster node rather than a test rig. No further boots were made after
+the fault was found.
+
+**What this costs the work.** Every measurement in this document that came from
+this machine was taken before that entry, on a machine reporting healthy — but
+the last boot's numbers were taken from a machine that had just logged an
+uncorrectable processor error, and they should be read with that beside them.
+The `Stop LLDP Agent` result above is a firmware answer to an admin command,
+which is about as robust a reading as this report contains; it is not withdrawn,
+and it is not independent of a machine in this state either.

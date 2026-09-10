@@ -2015,6 +2015,38 @@ fn select(active: usize, up: &[bool]) -> usize {
 /// **One argument rather than two**, because `bring_up_x722` had eight and the
 /// limit is seven -- and because these belong together anyway: they are the
 /// whole of what a bring-up reports about itself when it does not finish.
+/// What firmware said to `Stop LLDP Agent`.
+///
+/// **Three answers, not two.** *Refused* carries firmware's own code, because
+/// 38.28's note says the command is *"silently dropped"* when the agent is
+/// already off -- so a refusal may mean the port was already ours and may mean
+/// firmware would not give it up, and a boolean cannot tell those apart. That
+/// distinction is the entire reason this is published.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum LldpOutcome {
+    /// The command was never reached -- the port did not get that far.
+    #[default]
+    NotAsked,
+    /// Firmware completed it.
+    Stopped,
+    /// Firmware completed it with `ERR` set, and this is Table 38-350's code.
+    Refused(u16),
+    /// Firmware never answered inside the spins allowed.
+    NoAnswer,
+}
+
+impl LldpOutcome {
+    /// The two report bits and the refusal code, as one packed field.
+    fn packed(self) -> u64 {
+        match self {
+            Self::NotAsked => 0,
+            Self::Stopped => 1,
+            Self::NoAnswer => 2,
+            Self::Refused(code) => 3 | (u64::from(code) << 4),
+        }
+    }
+}
+
 struct Progress {
     /// **How far the bring-up got.**
     ///
@@ -2033,6 +2065,8 @@ struct Progress {
     /// behave exactly like an untagged one -- silently, and with the driver
     /// still counting them sent.
     override_ok: bool,
+    /// What `Stop LLDP Agent` answered -- see [`LldpOutcome`].
+    lldp: LldpOutcome,
 }
 
 /// Brings the X722's queues up: private memory, contexts, buffers, filters and
@@ -2193,7 +2227,23 @@ fn bring_up_x722(
     ] {
         let _ = device.set_promiscuous(admin, vsi, mode, true, SPINS);
     }
-    let _ = device.stop_lldp_agent(admin, false, SPINS);
+    // **And whether firmware took it**, which nothing has ever asked.
+    //
+    // This command has gone out on every boot since it was written and its
+    // answer was dropped on the floor -- `let _ =`. It is the notification
+    // 38.28 requires of a PF taking ownership of the MAC's control port, and
+    // the standing explanation for uplink-tagged frames being fetched and
+    // discarded is that this driver does not hold that port. Whether the port
+    // changed hands is exactly what the discarded value says.
+    //
+    // The same shape as `allow_destination_override` before RFC 0076 published
+    // its result, and as the uplink tag before anything called it: a mechanism
+    // whose outcome nobody reads is a mechanism nobody has tested.
+    progress.lldp = match device.stop_lldp_agent(admin, false, SPINS) {
+        Ok(()) => LldpOutcome::Stopped,
+        Err(i40e::CommandError::Refused(code)) => LldpOutcome::Refused(code),
+        Err(_) => LldpOutcome::NoAnswer,
+    };
 
     // The VSI is told which queues are its own, and the completions are routed
     // to an interrupt that reports and never raises -- without which the frames
@@ -2792,6 +2842,14 @@ fn carry_x722(mut members: [Option<X722Member>; X722_MEMBERS], facts: [X722; X72
             out,
             on_the_wire,
             facts.iter().any(|fact| fact.override_ok),
+            // **Port 0's answer.** All four are asked and all four should agree;
+            // the first driven port is the one reported, because a line naming
+            // four outcomes would be four times the width for a distinction that
+            // has never differed.
+            facts
+                .iter()
+                .find(|fact| fact.lldp != LldpOutcome::NotAsked)
+                .map_or(LldpOutcome::NotAsked, |fact| fact.lldp),
             (uplink_posted, post_refused),
             (uncompleted, uplink_uncompleted),
             (tails, heads),
@@ -2890,6 +2948,11 @@ struct X722 {
     /// control tag is not permitted, so an uplink-tagged frame behaves
     /// exactly like an untagged one and nothing says so.
     override_ok: bool,
+    /// What `Stop LLDP Agent` answered for this port -- see [`LldpOutcome`].
+    /// The command has gone out on every boot since it was written and its
+    /// answer was discarded; it is the notification 38.28 requires of a PF
+    /// taking ownership of the MAC's control port.
+    lldp: LldpOutcome,
     /// Whether its **LAN** queues came up -- the ones that carry frames, as
     /// against the admin queues that carry commands.
     carrying: bool,
@@ -3068,6 +3131,7 @@ fn take_x722(nth: u64) -> (X722, Option<X722Member>) {
         stage: found.stage,
         layout: (0, 0),
         override_ok: false,
+        lldp: LldpOutcome::NotAsked,
     };
     let brought_up = bring_up_x722(
         &mut device,
@@ -3083,6 +3147,7 @@ fn take_x722(nth: u64) -> (X722, Option<X722Member>) {
     found.stage = progress.stage;
     found.layout = progress.layout;
     found.override_ok = progress.override_ok;
+    found.lldp = progress.lldp;
     if let Some(queues) = brought_up {
         found.carrying = true;
         // **Asked of firmware, not read out of `PRTPM_SAL`.** RFC 0076 step 1:
@@ -3156,6 +3221,7 @@ fn x722_transmit_report(
     multicast: u64,
     port_multicast: u64,
     override_ok: bool,
+    lldp: LldpOutcome,
     posted: (u64, u64),
     unfinished: (u64, u64),
     cursors: (u64, u64),
@@ -3213,7 +3279,7 @@ fn x722_transmit_report(
         core::ptr::write_volatile((at + 8) as *mut u64, port_multicast);
         core::ptr::write_volatile(
             at as *mut u64,
-            multicast | u64::from(override_ok) << 32 | 1 << 33,
+            multicast | u64::from(override_ok) << 32 | 1 << 33 | lldp.packed() << 34,
         );
     }
 }

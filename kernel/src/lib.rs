@@ -16866,6 +16866,45 @@ fn report_x722(words: &[u64; 29]) {
     // times. The driver sets it in the same store that publishes the rest.
     let measured = words[27] >> 33 & 1 != 0;
     let wire = words[28] & 0xffff_ffff;
+    // **What firmware said to `Stop LLDP Agent`**, at bits 34 onward.
+    //
+    // 38.28 assigns the MAC's control VSI to the EMP at initialisation and says
+    // a PF taking ownership *"should be notified of the change using Stop LLDP
+    // Agent command"*. `bin/netd` has sent it on every boot since it was
+    // written and dropped the answer -- so whether this driver holds the control
+    // port, which is the standing explanation for uplink-tagged frames being
+    // fetched and discarded, has never been known either way.
+    //
+    // Three outcomes and not two: the datasheet says the command is *"silently
+    // dropped"* when the agent is already off, so a refusal may mean the port
+    // was already ours and may mean firmware would not give it up.
+    let lldp = words[27] >> 34 & 0xf;
+    let lldp_code = words[27] >> 38 & 0xffff;
+    if lldp == 3 {
+        // `0xD` is `EEXIST` in Table 38-350, which for this command is the
+        // agent having already been off -- the port was already this driver's,
+        // rather than firmware declining to hand it over.
+        println!(
+            "    net x722       stop lldp agent: \x1b[93mfirmware refused it, code \
+             {lldp_code:#x}{}\x1b[0m -- the control port of the mac, which 38.28 says a driver \
+             taking it must ask for",
+            if lldp_code == 0xd {
+                " (EEXIST: the agent was already off)"
+            } else {
+                ""
+            }
+        );
+    } else {
+        println!(
+            "    net x722       stop lldp agent: {} -- the control port of the mac, which 38.28 \
+             says a driver taking it must ask for",
+            match lldp {
+                1 => "\x1b[92mfirmware took it\x1b[0m",
+                2 => "\x1b[93mfirmware never answered\x1b[0m",
+                _ => "\x1b[93mnever asked; this port did not get that far\x1b[0m",
+            }
+        );
+    }
     println!(
         "    net x722       {out} multicast frame(s) left the vsi by its own count since bring-up; \
          destination override {}",
