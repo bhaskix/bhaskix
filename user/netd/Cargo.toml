@@ -219,4 +219,19 @@ asm_budget = 3
 # same shape as `TX_SWTCH_UPLINK` and cost three days there. The extra word also
 # carries a *measured* bit, because zero is what a port that sent nothing and a
 # word nobody wrote both look like.
-unsafe_budget = 376
+# 382 at the same-instant split: six lines, one volatile store of the word that
+# says what this program did with the frames it was given -- uplink-tagged posts
+# in the low half, `post_frame` refusals in the high.
+#
+# `sent` cannot answer it. That counts every frame this program puts out, the
+# bond's own broadcast announcements included, while the device counter it is
+# compared against counts multicast -- so the two are not the same population
+# and subtracting them means nothing. An uplink-tagged frame is an LACPDU and
+# nothing else this bond sends is.
+#
+# The refusal half counts a drop that had no counter at all: `carry_x722` takes
+# a frame out of the ring and, when `post_frame` will not have it, moves on. The
+# frame is gone, and a drop that leaves no number behind is indistinguishable
+# from a frame the device swallowed -- which is the confusion three days of
+# boots have been spent inside.
+unsafe_budget = 382

@@ -1179,3 +1179,85 @@ explains the gap, and both are worth writing down rather than rediscovering:
 `take_from_ipd_into` is clean, and that was checked rather than assumed: every
 early return happens before the ring's tail advances, so nothing is consumed and
 dropped there.
+
+
+### The device counters were never per-boot — 2026-09-10
+
+The same-instant line was built to settle whether six frames were lost. It
+settled something larger instead, and in the opposite direction to the section
+above it.
+
+**First it refuted the sampling explanation.** Read at one instant:
+
+```
+ipd lacp   43 LACPDU(s) sent, 11 slow-protocol frame(s) heard back
+           and the device now counts 38 out of the vsi and 38 out of the mac
+           -- fewer than were sent, read at the same instant
+```
+
+So the gap was not two clocks. Good — the instrument earned itself, and the
+section above is wrong where it guessed.
+
+**Then a second reading, with the split added, said there was no loss at all:**
+
+```
+ipd lacp   35 LACPDU(s) sent, 15 slow-protocol frame(s) heard back
+           and the device now counts 38 out of the vsi and 38 out of the mac
+           bin/netd posted 63 frame(s), 36 of them uplink-tagged, 0 refused
+           -- every one bin/ipd sent reached a descriptor
+```
+
+`0 refused`, and 36 uplink-tagged posts against 35 LACPDUs — every frame
+`bin/ipd` handed over reached a descriptor. Those two numbers are `bin/netd`'s
+own, kept per boot, and they answer the original question: **nothing is lost
+between `bin/ipd` and the ring.**
+
+**And the two readings disagree, which is the finding.** 43 against 38 says loss;
+35 against 38 says none. What is constant across them is the **38**.
+
+> `GLV_MPTCL` and `GLPRT_MPTCL` are *"totals since power-on, not for this
+> boot"* — the crate's own doc comment, at both readers — and nothing baselined
+> them.
+
+This machine is warm-restarted between boots far more often than it is
+power-cycled, so a raw reading carries the previous boot's traffic into this
+one's report. Three boots printed **38** while the traffic behind it went from 43
+LACPDUs to 35. A number that does not move while the thing it counts does is not
+measuring that thing.
+
+So every subtraction in the two sections above was between a per-boot count and a
+possibly-cross-boot total. The conclusion *"38 out of the VSI, 38 out of the MAC,
+the wire is where they went"* is not withdrawn — the VSI and MAC agreeing with
+each other is still meaningful, since both are totals over the same window — but
+**any comparison of either against `bin/ipd`'s count was unsound**, in both
+directions, and the "six lost frames" that started this was one of them.
+
+**`since` existed for exactly this and had no caller.** `VsiTransmitted::since`
+and `PortTransmitted::since` are written, documented and tested, and outside the
+crate's own tests nothing called them. That is the **third** mechanism in this
+driver to be written, documented and never called — after `TX_SWTCH_UPLINK`,
+which cost three days, and the `GLPRT_*` constants, which cost this whole line of
+questioning. The pattern is now the most reliable finding in this document: *a
+mechanism nobody calls is not a mechanism*, and the way it presents is a report
+that looks complete.
+
+`bin/netd` takes a baseline before it sends anything and publishes differences
+now, and the report says `since bring-up` where it used to imply this boot.
+
+**Two limits of the instrument, stated so they are not rediscovered as bugs.**
+
+* *"The same instant"* is same-**print**, not same-cycle: `bin/ipd`'s page is
+  snapshotted just before `bin/netd`'s words are read, so the two can differ by a
+  frame in flight. 36 posted against 35 sent is that, not an impossibility.
+* The device's multicast count legitimately **exceeds** the LACPDU count, because
+  IPv6 neighbour discovery is multicast too. `uplink_posted` is the like-for-like
+  number, and it is why that counter is kept apart from `sent` — which in turn
+  counts the bond's broadcast announcements and cannot be compared with either.
+
+**And one earlier claim in this document is withdrawn.** It said `sent` minus
+`heard` is `LACP_OPENINGS × machines` in every boot. It is not: this boot reads
+35 − 15 = 20, because a reply consumes an opening pass, so replies arriving
+during the opening burst reduce the openings actually sent. The rule is
+`openings_used × machines + replies`, with `openings_used ≤ LACP_OPENINGS`. The
+three boots that fitted the simpler rule were the ones whose partner answered
+late.

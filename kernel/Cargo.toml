@@ -786,7 +786,16 @@ asm_budget = 10
 # and "44 sent, 38 out of the VSI, six lost" was a subtraction across a
 # ninety-nine-second gap. Read together the arithmetic is exact, because an
 # LACPDU is multicast and nothing else this bond sends is.
-unsafe_budget = 2026
+# 2028 at the same-instant split: two more volatile reads in the same block --
+# the driver's own `sent` tally and the word carrying its uplink-tagged posts
+# and its refusals.
+#
+# The first boot with the line above read **43 LACPDUs sent against 38 out of
+# the device, at one instant, and neither number moving across ninety-nine
+# seconds**. That says a frame was lost and does not say where, and the two ends
+# of that question -- a driver that never posted it, and a device that took it
+# and did not send it -- are told apart by exactly these words.
+unsafe_budget = 2028
 # Up thirty-one for RFC 0005 step 9's socket probe -- `ring3_socketeer`, which
 # is `ring3_lister` with a `sockaddr_in6` copied in beside its code instead of
 # two filenames. The same two blocks every hosted probe has: one

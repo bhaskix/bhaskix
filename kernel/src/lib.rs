@@ -16539,7 +16539,7 @@ fn net_domain_members(hhdm: u64) -> Option<[u64; NETD_MEMBER_COUNT]> {
 /// `None` when the driver never wrote them -- the bit that says so is
 /// [`x722_transmit_report`'s](../../user/netd/src/main.rs) bit 33, and a
 /// machine with no X722 never sets it, so no lane prints this line.
-fn net_domain_transmitted(hhdm: u64) -> Option<(u64, u64)> {
+fn net_domain_transmitted(hhdm: u64) -> Option<Transmitted> {
     use core::sync::atomic::Ordering;
 
     let raw = NET_RINGS.load(Ordering::Acquire);
@@ -16550,19 +16550,50 @@ fn net_domain_transmitted(hhdm: u64) -> Option<(u64, u64)> {
     if count <= NETD_REPORT_PAGE {
         return None;
     }
-    let at = hhdm + frames[NETD_REPORT_PAGE] + NETD_TRANSMITTED;
-    // SAFETY: a frame this object owns, through the direct map -- the two words
-    // `x722_transmit_report` writes, read volatile because the driver is still
-    // running and rewrites them on every pass of its loop.
-    let (packed, port) = unsafe {
+    let page = hhdm + frames[NETD_REPORT_PAGE];
+    let at = page + NETD_TRANSMITTED;
+    // SAFETY: a frame this object owns, through the direct map -- the words
+    // `x722_transmit_report` writes and the driver's own `sent` tally at word
+    // 10, read volatile because the driver is still running and rewrites them
+    // on every pass of its loop.
+    let (packed, port, posted, sent) = unsafe {
         (
             core::ptr::read_volatile(at as *const u64),
             core::ptr::read_volatile((at + 8) as *const u64),
+            core::ptr::read_volatile((at + 16) as *const u64),
+            core::ptr::read_volatile((page + 10 * 8) as *const u64),
         )
     };
     // Bit 33 says the driver measured them. Without it, zero is what a port
     // that sent nothing and a word nobody wrote both look like.
-    (packed >> 33 & 1 != 0).then_some((packed & 0xffff_ffff, port & 0xffff_ffff))
+    (packed >> 33 & 1 != 0).then_some(Transmitted {
+        vsi: packed & 0xffff_ffff,
+        port: port & 0xffff_ffff,
+        uplink: posted & 0xffff_ffff,
+        refused: posted >> 32 & 0xffff_ffff,
+        sent,
+    })
+}
+
+/// What `bin/netd` and its device have transmitted, all read together.
+///
+/// **One instant, because the question is a subtraction.** `sent` is the
+/// driver's own tally of frames it posted, `uplink` the subset it posted with
+/// the switch control tag -- which is the LACPDUs and nothing else, since
+/// `sent` counts the bond's broadcast announcements too -- `refused` the frames
+/// `post_frame` would not take and that were dropped for it, and `vsi` and
+/// `port` what the device says it put out at each of its two boundaries.
+///
+/// Read together they say where a frame stopped: `uplink` short of what
+/// `bin/ipd` sent means it never reached a descriptor, `vsi` short of `uplink`
+/// means the device took it and did not send it, and `port` short of `vsi`
+/// means it died between the internal switch and the MAC.
+struct Transmitted {
+    vsi: u64,
+    port: u64,
+    uplink: u64,
+    refused: u64,
+    sent: u64,
 }
 
 /// Whether `bin/netd` has written its report yet.
@@ -16799,6 +16830,14 @@ fn report_x722(words: &[u64; 29]) {
     );
     // **What the device says it transmitted, which is not what the driver says.**
     //
+    // **Since bring-up, not since power-on.** `GLV_MPTCL` and `GLPRT_MPTCL` are
+    // running totals the device never clears, and this machine is warm-restarted
+    // far more often than it is power-cycled -- so read raw they carry the last
+    // boot's traffic into this report. Three boots printed the same `38` while
+    // the traffic behind it went from 43 LACPDUs to 35, which is what that looks
+    // like from here. `bin/netd` takes a baseline before it sends anything and
+    // publishes the difference.
+    //
     // Every other figure in this report counts frames *handed over* -- a
     // descriptor posted, a write-back seen. `GLV_MPTCL` counts multicast packets
     // the VSI put out, and an LACPDU is multicast, so this is the one number
@@ -16814,8 +16853,8 @@ fn report_x722(words: &[u64; 29]) {
     let measured = words[27] >> 33 & 1 != 0;
     let wire = words[28] & 0xffff_ffff;
     println!(
-        "    net x722       {out} multicast frame(s) left the vsi by its own count; destination \
-         override {}",
+        "    net x722       {out} multicast frame(s) left the vsi by its own count since bring-up; \
+         destination override {}",
         if override_ok {
             "\x1b[92mtaken\x1b[0m"
         } else {
@@ -17314,14 +17353,36 @@ fn report_net_after_exchange(hhdm: u64) {
         // both read together the arithmetic is exact: equal means every frame
         // reached the wire, and short means the difference is real and worth
         // hunting.
-        if let Some((vsi, port)) = net_domain_transmitted(hhdm) {
+        if let Some(out) = net_domain_transmitted(hhdm) {
             println!(
-                "                   and the device now counts {vsi} out of the vsi and {port} \
-                 out of the mac -- {}",
-                if port >= lacp_sent {
+                "                   and the device now counts {} out of the vsi and {} out of the \
+                 mac since bring-up -- {}",
+                out.vsi,
+                out.port,
+                if out.port >= lacp_sent {
                     "\x1b[92mevery one of them reached the wire\x1b[0m"
                 } else {
                     "\x1b[93mfewer than were sent, read at the same instant\x1b[0m"
+                }
+            );
+            // **Where the missing ones stopped**, read at the same instant as
+            // both of the numbers above. The first boot to print the line above
+            // showed 43 sent against 38 out of the device and neither moving,
+            // which says a frame was lost and not where -- and the two ends of
+            // that question are a driver that never posted it and a device that
+            // took it and did not send it.
+            println!(
+                "                   bin/netd posted {} frame(s), {} of them uplink-tagged, {} \
+                 refused -- {}",
+                out.sent,
+                out.uplink,
+                out.refused,
+                if out.uplink < lacp_sent {
+                    "\x1b[93mfewer tagged than bin/ipd sent: they stopped before a descriptor\x1b[0m"
+                } else if out.vsi < out.uplink {
+                    "\x1b[93mthe device took them and did not send them\x1b[0m"
+                } else {
+                    "\x1b[92mevery one bin/ipd sent reached a descriptor\x1b[0m"
                 }
             );
         }

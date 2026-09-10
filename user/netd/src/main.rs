@@ -2404,6 +2404,33 @@ fn carry_x722(mut members: [Option<X722Member>; X722_MEMBERS], facts: [X722; X72
     // because that is exactly when the switch's idea of where this address
     // lives has become wrong.
     let mut probes = 0u32;
+    // **Frames posted with the uplink tag, and frames `post_frame` refused.**
+    // The two numbers that say whether an LACPDU `bin/ipd` handed over ever
+    // reached a descriptor at all -- see `x722_transmit_report`.
+    let mut uplink_posted = 0u64;
+    let mut post_refused = 0u64;
+    // **Where the device's counters stood before this program sent anything.**
+    //
+    // `GLV_MPTCL` and `GLPRT_MPTCL` are totals since **power-on**, not for this
+    // boot, and this machine is warm-restarted between boots far more often than
+    // it is power-cycled. Read raw they carry the previous boot's traffic into
+    // this one's report, and a number that does not move while the thing it
+    // counts does is not measuring anything. Everything published from here is
+    // a difference against these.
+    let vsi_baseline: [bhaskix_i40e::VsiTransmitted; X722_MEMBERS] =
+        core::array::from_fn(|index| {
+            members[index]
+                .as_ref()
+                .map(|m| m.device.vsi_transmitted(facts[index].vsi))
+                .unwrap_or_default()
+        });
+    let port_baseline: [bhaskix_i40e::PortTransmitted; X722_MEMBERS] =
+        core::array::from_fn(|index| {
+            members[index]
+                .as_ref()
+                .map(|m| m.device.port_transmitted(m.device.port_number()))
+                .unwrap_or_default()
+        });
     // **The failover test, once, and only when asked.** Nothing here takes a
     // link down unless the boot asked for it, because this is somebody's
     // cluster node and a port that goes dark for no reason is a fault report.
@@ -2609,6 +2636,22 @@ fn carry_x722(mut members: [Option<X722Member>; X722_MEMBERS], facts: [X722; X72
                             core::hint::spin_loop();
                         }
                         sent += 1;
+                        // **Counted apart from `sent`**, because `sent` includes
+                        // this bond's own broadcast announcements while the
+                        // device counter it is compared against counts
+                        // multicast. An uplink-tagged frame is an LACPDU, and
+                        // nothing else this bond sends is.
+                        if uplink {
+                            uplink_posted += 1;
+                        }
+                    } else {
+                        // **The drop nothing was counting.** The frame is out of
+                        // the ring already and there is no way to put it back,
+                        // so it is gone -- and a refusal that leaves no number
+                        // behind is indistinguishable from a frame the device
+                        // swallowed, which is the confusion this report has
+                        // spent three days inside.
+                        post_refused += 1;
                     }
                 }
                 publish(handed, sent, seen);
@@ -2662,19 +2705,32 @@ fn carry_x722(mut members: [Option<X722Member>; X722_MEMBERS], facts: [X722; X72
         x722_bond_report(count, active as u64, links, failovers, off_member);
         carried_since_report(carried_since);
 
-        // **What the device itself says it put out.** Every other number in this
-        // report is a tally this program keeps; this one is the VSI's own
-        // multicast transmit counter, and an LACPDU is multicast -- so it is the
-        // only figure that distinguishes a frame that reached the wire from one
-        // the device swallowed. Summed across members, because the question is
-        // whether *any* left.
+        // **What the device itself says it put out, since this program started
+        // driving it.** Every other number in this report is a tally this
+        // program keeps; this one is the VSI's own multicast transmit counter,
+        // and an LACPDU is multicast -- so it is the figure that distinguishes a
+        // frame that reached the wire from one the device swallowed. Summed
+        // across members, because the question is whether *any* left.
+        //
+        // **Against a baseline, because these are totals since power-on.** The
+        // crate says so at both readers and it was read as a per-boot number
+        // anyway, for three boots: the same `38` came back while the traffic
+        // behind it went from 43 LACPDUs to 35, which is what a running total
+        // looks like when it is mistaken for a measurement. `since` existed for
+        // this the whole time and had no caller outside the crate's own tests --
+        // the third mechanism in this driver to be written, documented and never
+        // called, after the uplink tag and the port counters themselves.
         let out = members
             .iter()
             .zip(facts.iter())
-            .filter_map(|(member, fact)| {
-                member
-                    .as_ref()
-                    .map(|m| m.device.vsi_transmitted(fact.vsi).multicast)
+            .enumerate()
+            .filter_map(|(index, (member, fact))| {
+                member.as_ref().map(|m| {
+                    m.device
+                        .vsi_transmitted(fact.vsi)
+                        .since(&vsi_baseline[index])
+                        .multicast
+                })
             })
             .sum();
         // **And the same frames one boundary further out.** `GLPRT_MPTCL` is
@@ -2684,10 +2740,22 @@ fn carry_x722(mut members: [Option<X722Member>; X722_MEMBERS], facts: [X722; X72
         // single-port card.
         let on_the_wire = members
             .iter()
-            .flatten()
-            .map(|m| m.device.port_transmitted(m.device.port_number()).multicast)
+            .enumerate()
+            .filter_map(|(index, member)| {
+                member.as_ref().map(|m| {
+                    m.device
+                        .port_transmitted(m.device.port_number())
+                        .since(&port_baseline[index])
+                        .multicast
+                })
+            })
             .sum();
-        x722_transmit_report(out, on_the_wire, facts.iter().any(|fact| fact.override_ok));
+        x722_transmit_report(
+            out,
+            on_the_wire,
+            facts.iter().any(|fact| fact.override_ok),
+            (uplink_posted, post_refused),
+        );
 
         // **Yield rather than spin.** This program is pinned, and there is no
         // interrupt delegated for this device -- the completions are reported
@@ -3044,8 +3112,33 @@ fn take_x722(nth: u64) -> (X722, Option<X722Member>) {
 /// measured at all**, since zero is what both a port that sent nothing and a
 /// word nobody wrote look like, and this file has three times read the second
 /// as the first. Word 28: the port's multicast.
-fn x722_transmit_report(multicast: u64, port_multicast: u64, override_ok: bool) {
+fn x722_transmit_report(
+    multicast: u64,
+    port_multicast: u64,
+    override_ok: bool,
+    posted: (u64, u64),
+) {
     let at = RINGS_AT + ring::REPORT + 27 * 8;
+    // **Word 29: what this program did with the frames it was given.** The
+    // uplink-tagged posts in the low half, the refusals in the high.
+    //
+    // `sent` at word 10 counts every frame this program puts out, the bond's own
+    // broadcast announcements included, so it cannot be compared with a count of
+    // multicast. This can: `bin/ipd` marks an LACPDU and nothing else for the
+    // uplink, so the low half is exactly the frames the device's multicast
+    // counter should have counted.
+    //
+    // The high half is a drop nothing was counting. `carry_x722` takes a frame
+    // out of the ring and, when `post_frame` refuses it, goes on to the next --
+    // the frame is gone, and no number said so.
+    // SAFETY: the report page this program mapped writable, two words past the
+    // transmit counts and short of the members' addresses at 32.
+    unsafe {
+        core::ptr::write_volatile(
+            (at + 16) as *mut u64,
+            (posted.0 & 0xffff_ffff) | (posted.1 & 0xffff_ffff) << 32,
+        );
+    }
     // SAFETY: the report page this program mapped writable, past the failover
     // count and far short of the members' addresses at 32 and the kernel's own
     // words at 40 and 41. The port's count goes first and the word that says it
