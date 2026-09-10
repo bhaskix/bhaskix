@@ -333,7 +333,7 @@ $(PROBE): $(PROBE_DIR)/src/main.rs $(PROBE_DIR)/link.ld $(PROBE_DIR)/Cargo.toml
 # ABI is compiled into both sides of the boundary, so a change there changes
 # the program as surely as a change here.
 $(USER_SHELL): $(SHELL_DIR)/src/main.rs $(SHELL_DIR)/link.ld $(SHELL_DIR)/Cargo.toml \
-               $(wildcard abi/src/*.rs)
+               $(wildcard abi/src/*.rs) $(wildcard pkg/src/*.rs)
 	cd $(SHELL_DIR) && RUSTFLAGS="$(SHELL_FLAGS)" \
 	    $(CARGO) build --release --target $(TARGET)
 	@echo "built $@"
@@ -410,7 +410,7 @@ $(USER_CONSOLED): $(CONSOLED_DIR)/src/main.rs $(CONSOLED_DIR)/link.ld $(CONSOLED
 # The block driver as a program. It shares no code with the kernel's driver --
 # only the specification -- so its dependencies are the ABI and nothing else.
 $(USER_BLKD): $(BLKD_DIR)/src/main.rs $(BLKD_DIR)/link.ld $(BLKD_DIR)/Cargo.toml \
-              $(wildcard abi/src/*.rs)
+              $(wildcard abi/src/*.rs) $(wildcard device/src/*.rs)
 	cd $(BLKD_DIR) && RUSTFLAGS="$(BLKD_FLAGS)" \
 	    $(CARGO) build --release --target $(TARGET)
 	@echo "built $@"
@@ -431,7 +431,8 @@ $(USER_AHCID): $(AHCID_DIR)/src/main.rs $(AHCID_DIR)/link.ld $(AHCID_DIR)/Cargo.
 # kernel driver for this device class at all. It does not depend on
 # `bhaskix-net`: the parsers live in the domain that has no device.
 $(USER_NETD): $(NETD_DIR)/src/main.rs $(NETD_DIR)/link.ld $(NETD_DIR)/Cargo.toml \
-              $(wildcard abi/src/*.rs) $(wildcard device/src/*.rs)
+              $(wildcard abi/src/*.rs) $(wildcard device/src/*.rs) \
+              $(wildcard i40e/src/*.rs)
 	cd $(NETD_DIR) && RUSTFLAGS="$(NETD_FLAGS)" \
 	    $(CARGO) build --release --target $(TARGET)
 	@echo "built $@"
@@ -478,7 +479,8 @@ $(USER_TCPD): $(TCPD_DIR)/src/main.rs $(TCPD_DIR)/link.ld $(TCPD_DIR)/Cargo.toml
 # kernel, and this is what that separation was for: the move changes where the
 # code runs and not what it says.
 $(USER_LINUXD): $(LINUXD_DIR)/src/main.rs $(LINUXD_DIR)/link.ld $(LINUXD_DIR)/Cargo.toml \
-              $(wildcard abi/src/*.rs) $(wildcard personality/src/*.rs)
+              $(wildcard abi/src/*.rs) $(wildcard personality/src/*.rs) \
+              $(wildcard elf/src/*.rs) $(wildcard rand/src/*.rs) $(wildcard sock/src/*.rs)
 	cd $(LINUXD_DIR) && RUSTFLAGS="$(LINUXD_FLAGS)" \
 	    $(CARGO) build --release --target $(TARGET)
 	@echo "built $@"
