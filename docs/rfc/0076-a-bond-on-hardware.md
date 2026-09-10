@@ -1359,3 +1359,64 @@ with two cautions that belong with it:
 
 Neither is established. What is established is the boundary: **the frames reach
 a descriptor and the device does not fetch it.**
+
+
+### The fetch granularity, and a regression of my own — 2026-09-10
+
+38.30.2.1, on descriptor fetch policy:
+
+> *"During normal operating mode, the PXE_MODE flag must be cleared by
+> software… **When the PXE_MODE flag is cleared, software should bump the tail at
+> the entire 8 × descriptors granularity.** In this mode, hardware fetches
+> descriptors in the entire cache lines (4 × 32 byte descriptors or 8 × 16 byte
+> descriptors)."*
+
+`bin/netd` clears PXE mode at bring-up, and these are 16-byte descriptors, so the
+device fetches **eight at a time**. The transmit ring held exactly eight — one
+cache line — and an uplink frame takes two descriptors, so its frames could never
+fill a line without wrapping onto themselves. **The receive ring already honoured
+the rule**: `bin/netd`'s own constant reads *"a whole multiple of 32 outside PXE
+mode"*. It was learned once, written down on one side of the driver, and never
+applied to the other.
+
+**Then I made it worse, and the machine said so.** The first attempt changed two
+things at once: the ring from 8 descriptors to 32, *and* padding every line out
+with NOP descriptors so the tail always landed on a boundary. On the SR550:
+
+| | before | after |
+|---|---|---|
+| multicast out of the VSI | 14 | **0** |
+| posts never written back | 36 of 63 | **70 of 71** |
+| uplink posts never written back | 32 of 36 | **44 of 44** |
+| device head vs cursor | 6 vs 13 | **0** vs 88 |
+
+The transmit head did not move at all. That is worse than the partial fetching it
+replaced, and — because two things changed together — **it names neither of them
+as the cause**. Either would do it: a queue length the device will not run, or a
+line ending in six trailing context descriptors that the device reads as a
+command whose data descriptor never arrives.
+
+Reverted, and the depth re-landed alone. The padding stays out until the depth by
+itself has been measured. That is the whole correction: changing one thing at a
+time is not a style preference on a machine that costs a reboot to ask.
+
+**And nothing gated the shipped depth.** Both existing ring tests attach their
+own local depth — 8 and 4 — so `TRANSMIT_DESCRIPTORS` could have been any value
+at all and every test would still have passed. It was 8 for months on that basis.
+Compile-time assertions beside the constant now hold it to 38.31.3.4.2's own
+rule — *"at smaller queue size than 32 descriptors the QLEN must be a whole
+number of 8 descriptors. At a larger size than 32 descriptors, QLEN must be a
+whole number of 32"* — plus the fetch line and the 2048-byte page it shares with
+the packet buffer. A build is the right place for it, as it is for the register
+tables: these are constants, so a *test* asserting them is a test that cannot
+fail at run time, and clippy says so. Watched red at a depth of 12, where the
+crate no longer compiles: *"QLEN must be a whole number of 8 descriptors below
+32, and of 32 above it"*.
+
+**What this predicts, so the next boot can falsify it.** A deeper ring does not
+make the tail land on a line boundary; it makes four lines available instead of
+one, so a frame is less likely to be overwritten before the device gets to it.
+If the head starts moving and the multicast count climbs, the depth was the
+constraint. If it reads as it did before — head short of the cursor, most posts
+unwritten-back — then the granularity is the constraint after all and the padding
+is the thing to get right, one change at a time.

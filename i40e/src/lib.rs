@@ -498,10 +498,73 @@ pub const TRANSMIT_DESCRIPTOR_BYTES: u64 = 16;
 
 /// How many descriptors the transmit ring this driver builds holds.
 ///
-/// `QLEN`'s floor is *"from 8 descriptors"* and this is that floor: the driver
-/// sends one self-contained frame at a time and waits for it, so a longer ring
-/// is a wrap-around nothing tests.
-pub const TRANSMIT_DESCRIPTORS: u16 = 8;
+/// **Thirty-two, and the reason is the device's fetch granularity.**
+///
+/// This was 8 -- `QLEN`'s floor, *"from 8 descriptors"* -- chosen because the
+/// driver sends one frame at a time and waits for it, so a longer ring looked
+/// like a wrap-around nothing tests. 38.30.2.1 says otherwise: *"When the
+/// PXE_MODE flag is cleared, software should bump the tail at the entire 8 x
+/// descriptors granularity. In this mode, hardware fetches descriptors in the
+/// entire cache lines (4 x 32 byte descriptors or 8 x 16 byte descriptors)."*
+/// `bin/netd` clears PXE mode, and these are 16-byte descriptors, so the device
+/// fetches eight at a time -- and a ring of eight is exactly one cache line,
+/// which an uplink frame's two descriptors can never fill without wrapping onto
+/// themselves.
+///
+/// 38.31.3.4.2 permits it: *"at smaller queue size than 32 descriptors the QLEN
+/// must be a whole number of 8 descriptors"*. Four lines rather than one, at 512
+/// bytes of a page whose packet buffer starts at 2048.
+///
+/// **This is deliberately the depth and nothing else.** An earlier attempt
+/// changed the depth *and* padded every line out with NOP descriptors, and the
+/// SR550 answered with a transmit head that never moved at all -- worse than the
+/// partial fetching it replaced, and naming neither half as the cause. The
+/// padding stays out until the depth alone has been measured.
+pub const TRANSMIT_DESCRIPTORS: u16 = 32;
+
+// **The shipped depth is gated, which it was not.** Both ring tests attach their
+// own local depth -- 8 and 4 -- so this constant could have been any value at all
+// and every test would still have passed. It was 8 for months on that basis, and
+// 8 is one cache line.
+//
+// 38.31.3.4.2: *"from 8 descriptors (QLEN=0x8) up to 8 KB-32 descriptors... At
+// smaller queue size than 32 descriptors the QLEN must be a whole number of 8
+// descriptors. At a larger size than 32 descriptors, QLEN must be a whole number
+// of 32 descriptors."* A build is the right place to say so: these are constants,
+// so a test asserting them is a test that cannot fail at run time, and clippy
+// says as much.
+const _: () = assert!(
+    TRANSMIT_DESCRIPTORS >= 8,
+    "QLEN's floor is eight descriptors"
+);
+const _: () = assert!(
+    TRANSMIT_DESCRIPTORS <= 8 * 1024 - 32,
+    "QLEN's ceiling is 8 KB minus 32"
+);
+const _: () = assert!(
+    if TRANSMIT_DESCRIPTORS > 32 {
+        TRANSMIT_DESCRIPTORS.is_multiple_of(32)
+    } else {
+        TRANSMIT_DESCRIPTORS.is_multiple_of(8)
+    },
+    "QLEN must be a whole number of 8 descriptors below 32, and of 32 above it"
+);
+const _: () = assert!(
+    TRANSMIT_DESCRIPTORS.is_multiple_of(TRANSMIT_FETCH_LINE),
+    "the device fetches whole cache lines, so the ring must hold whole cache lines"
+);
+
+/// Descriptors the device fetches at once once PXE mode is cleared.
+///
+/// 38.30.2.1: *"When the PXE_MODE flag is cleared, software should bump the tail
+/// at the entire 8 x descriptors granularity. In this mode, hardware fetches
+/// descriptors in the entire cache lines (4 x 32 byte descriptors or 8 x 16 byte
+/// descriptors)."* These are 16-byte descriptors, so the device fetches eight.
+///
+/// Named because [`TRANSMIT_DESCRIPTORS`] must be a whole number of them, and
+/// because the ring was a single line until 2026-09-10 without anything saying
+/// that was a decision.
+pub const TRANSMIT_FETCH_LINE: u16 = 8;
 
 /// And how many bytes that ring occupies.
 ///
@@ -510,6 +573,10 @@ pub const TRANSMIT_DESCRIPTORS: u16 = 8;
 /// into an eight-descriptor ring; a caller that sizes its memory from here and
 /// its depth from here cannot make the two disagree.
 pub const TRANSMIT_RING_BYTES: u64 = TRANSMIT_DESCRIPTOR_BYTES * TRANSMIT_DESCRIPTORS as u64;
+
+/// The ring shares a page with the packet buffer its driver puts at 2048, which
+/// was true by accident while the ring was 128 bytes.
+const _: () = assert!(TRANSMIT_RING_BYTES <= 2048);
 /// `DTYP`, qword 1 bits 3:0 -- *"0x0 stands for a transmit data descriptor"*.
 const TX_DTYP_MASK: u64 = 0xf;
 /// What `DTYP` reads once hardware has completed the descriptor:
