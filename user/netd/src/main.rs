@@ -2409,6 +2409,13 @@ fn carry_x722(mut members: [Option<X722Member>; X722_MEMBERS], facts: [X722; X72
     // reached a descriptor at all -- see `x722_transmit_report`.
     let mut uplink_posted = 0u64;
     let mut post_refused = 0u64;
+    // **Posts whose write-back never arrived.** This loop already waits for one
+    // after every frame and has always thrown the answer away, so "the device
+    // took 36 descriptors and sent 19" had no follow-up question it could ask.
+    // A descriptor that is never written back is one the device did not finish
+    // with, and the next frame for that member overwrites it.
+    let mut uncompleted = 0u64;
+    let mut uplink_uncompleted = 0u64;
     // **Where the device's counters stood before this program sent anything.**
     //
     // `GLV_MPTCL` and `GLPRT_MPTCL` are totals since **power-on**, not for this
@@ -2554,11 +2561,16 @@ fn carry_x722(mut members: [Option<X722Member>; X722_MEMBERS], facts: [X722; X72
                 let queue = member.queues.transmit_queue;
                 let tail = member.device.transmit_tail();
                 member.device.transmit_doorbell(queue, tail);
+                let mut completed = false;
                 for _ in 0..SPINS {
                     if member.device.frame_completed(&member.queues.transmit, slot) {
+                        completed = true;
                         break;
                     }
                     core::hint::spin_loop();
+                }
+                if !completed {
+                    uncompleted += 1;
                 }
                 probes += 1;
                 sent += 1;
@@ -2629,11 +2641,19 @@ fn carry_x722(mut members: [Option<X722Member>; X722_MEMBERS], facts: [X722; X72
                         let queue = member.queues.transmit_queue;
                         let tail = member.device.transmit_tail();
                         member.device.transmit_doorbell(queue, tail);
+                        let mut completed = false;
                         for _ in 0..SPINS {
                             if member.device.frame_completed(&member.queues.transmit, slot) {
+                                completed = true;
                                 break;
                             }
                             core::hint::spin_loop();
+                        }
+                        if !completed {
+                            uncompleted += 1;
+                            if uplink {
+                                uplink_uncompleted += 1;
+                            }
                         }
                         sent += 1;
                         // **Counted apart from `sent`**, because `sent` includes
@@ -2750,11 +2770,26 @@ fn carry_x722(mut members: [Option<X722Member>; X722_MEMBERS], facts: [X722; X72
                 })
             })
             .sum();
+        // **Where each member's transmit ring stands**, summed: the cursor this
+        // program has advanced to, and the one the device has consumed to. Equal
+        // means every descriptor was fetched.
+        let tails: u64 = members
+            .iter()
+            .flatten()
+            .map(|m| u64::from(m.device.transmit_tail()))
+            .sum();
+        let heads: u64 = members
+            .iter()
+            .flatten()
+            .map(|m| u64::from(m.device.transmit_head(m.queues.transmit_queue)))
+            .sum();
         x722_transmit_report(
             out,
             on_the_wire,
             facts.iter().any(|fact| fact.override_ok),
             (uplink_posted, post_refused),
+            (uncompleted, uplink_uncompleted),
+            (tails, heads),
         );
 
         // **Yield rather than spin.** This program is pinned, and there is no
@@ -3117,6 +3152,8 @@ fn x722_transmit_report(
     port_multicast: u64,
     override_ok: bool,
     posted: (u64, u64),
+    unfinished: (u64, u64),
+    cursors: (u64, u64),
 ) {
     let at = RINGS_AT + ring::REPORT + 27 * 8;
     // **Word 29: what this program did with the frames it was given.** The
@@ -3133,10 +3170,33 @@ fn x722_transmit_report(
     // the frame is gone, and no number said so.
     // SAFETY: the report page this program mapped writable, two words past the
     // transmit counts and short of the members' addresses at 32.
+    // **Word 30: posts the device never wrote back**, all of them in the low
+    // half and the uplink-tagged ones in the high. This loop has waited for a
+    // write-back after every frame since it was written and thrown the answer
+    // away, so a boot that said *"36 descriptors posted, 19 frames sent"* had no
+    // way to ask whether the other seventeen were ever finished with.
+    //
+    // **Word 31: the two cursors**, the driver's tail in the low half and the
+    // device's `QTX_HEAD` in the high, summed across members. A write-back is
+    // the device saying it is *done*; the head is the device saying it *looked*.
+    // Where they disagree is the difference between a descriptor the device
+    // never fetched -- which this program then overwrote, since a member's
+    // frames share one buffer and a ring eight deep -- and one it fetched and
+    // dropped. Those are different defects with different fixes.
+    // SAFETY: the report page this program mapped writable, four words past the
+    // transmit counts and short of the members' addresses at 32.
     unsafe {
         core::ptr::write_volatile(
             (at + 16) as *mut u64,
             (posted.0 & 0xffff_ffff) | (posted.1 & 0xffff_ffff) << 32,
+        );
+        core::ptr::write_volatile(
+            (at + 24) as *mut u64,
+            (unfinished.0 & 0xffff_ffff) | (unfinished.1 & 0xffff_ffff) << 32,
+        );
+        core::ptr::write_volatile(
+            (at + 32) as *mut u64,
+            (cursors.0 & 0xffff_ffff) | (cursors.1 & 0xffff_ffff) << 32,
         );
     }
     // SAFETY: the report page this program mapped writable, past the failover

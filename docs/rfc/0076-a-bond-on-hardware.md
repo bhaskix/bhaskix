@@ -1261,3 +1261,101 @@ during the opening burst reduce the openings actually sent. The rule is
 `openings_used × machines + replies`, with `openings_used ≤ LACP_OPENINGS`. The
 three boots that fitted the simpler rule were the ones whose partner answered
 late.
+
+
+### Where the frames stop, measured — 2026-09-10
+
+With the counters baselined and the write-back question asked, the chain is
+measured end to end at one instant:
+
+```
+ipd lacp   35 LACPDU(s) sent, 15 slow-protocol frame(s) heard back
+           and the device now counts 14 out of the vsi and 14 out of the mac since bring-up
+           bin/netd posted 63 frame(s), 36 of them uplink-tagged, 0 refused
+                  -- the device took them and did not send them
+           36 of those posts were never written back (32 of them uplink-tagged);
+           transmit cursor 13 against the device's head 6
+                  -- not fetched: the head is behind
+```
+
+| boundary | verdict |
+|---|---|
+| `bin/ipd` → ring → descriptor | **clean** — 36 posts for 35 sends, `0 refused` |
+| descriptor → device | **stalled** — 32 of 36 uplink posts never consumed |
+| VSI → MAC | **clean** — 14 and 14 |
+
+**And it is not a uniform failure.** Split by kind: 32 of 36 uplink-tagged posts
+were never written back (89%), against 4 of the other 27 (15%). `QTX_HEAD` is
+*behind* the driver's cursor — 6 against 13, summed across four members — so the
+device is not fetching those descriptors at all. It does not fetch and drop them;
+it stops fetching.
+
+That is the whole three-day shape of this RFC in one measurement: the LACPDUs are
+exactly the frames carrying the uplink tag, and exactly the frames the switch
+never receives.
+
+### The context descriptor is correct — §38.31.2.2.1, read
+
+The obvious suspect was the descriptor the tag rides in. It is **not** the
+defect, and this was checked field by field rather than assumed. The driver
+writes qword 0 = 0 and qword 1 = `0x0101`:
+
+| field | bits | required | written |
+|---|---|---|---|
+| `DTYP` | 0:3 | `0x1`, *"stands for a LAN context descriptor"* | `0x1` |
+| `SWTCH` | CMD 5:4 = qword 1 bits 9:8 | `01b`, *"uplink packet… bypassing hardware filters"* | `01b` |
+| `TSO` | CMD 0 | clear | clear |
+| `TLEN` | 47:30 | *"if the TSO flag is cleared, the TLEN should be set by software to zero"* | 0 |
+| `MSS`/`TARGET_VSI` | 63:50 | *"if both the TSO flag is cleared and the SWTCH field is not equal to 11b then this field should be set to zero"* | 0 |
+| tunnelling / `L2TAG2` | qword 0 | unused | 0 |
+
+Every field is what the datasheet asks for. The suspect is cleared.
+
+### What §38.31.2.2.1 pointed at instead, which is a hypothesis and not a finding
+
+Two sentences elsewhere in the same chapter are worth more than the descriptor
+check was.
+
+**The first settles that the approach is right.** §38.28's *Control VSI*: *"Any
+VSI can be used as a control VSI as long as the adequate packets are routed to
+it. A control VSI should have the Allow Destination Override flag set to enable
+it to bypass the switch when sending packets."* So there is no separate
+make-this-a-control-VSI bit; the flag this driver already sets, and that the boot
+reports as *taken*, is the mechanism. And *Transmitting Packets from a Control
+VSI* describes this exact case: *"A control VSI might need to send directed
+multicast packets… According to the regular forwarding rules of the switch, such
+packets are forwarded back to the control port or dropped. To overcome this, the
+control VSI should set the SWTCH field."*
+
+**The second is the lead.** *"At initialization time, the control VSI of the MAC
+is assigned to the EMP. If at a later stage, one of the PFs decides to take
+ownership of this control port, it should assign one of its VSI as the control
+port of the MAC. The EMP should be notified of the change using **Stop LLDP
+Agent** command and should disconnect the EMP control port."*
+
+On this machine the EMP — the manageability firmware the BMC drives — holds the
+MAC's control port, and it is demonstrably active: the switch's LLDP arrives
+here every thirty seconds or so, and `bin/ipd` refuses those frames by
+EtherType `0x88cc` on every boot. So this driver is asking to bypass the switch
+from a VSI that has the Allow Destination Override flag but is **not** the
+control port of the MAC, while another owner holds it.
+
+That is consistent with everything measured — uplink-tagged descriptors accepted
+and not consumed, ordinary ones fine — and it is **a reading of the
+specification, not a measurement.** It is written here as the next thing to test,
+with two cautions that belong with it:
+
+* `Stop LLDP Agent` changes what the *management firmware* does, not just what
+  this driver does, and this is a live cluster node whose BMC has reasons to run
+  an LLDP agent. Whether the change survives a power cycle is not established.
+  It is not a command to send casually, and not one to send without the machine's
+  owner deciding.
+* The alternative reading is simpler and cheaper to test: the ring is eight
+  descriptors deep, an uplink frame takes two, so four fit — and this driver
+  posts the next frame anyway when a write-back does not arrive, overwriting a
+  descriptor the device has not fetched and a packet buffer every frame of that
+  member shares. That would turn one stall into a run of them, which is the shape
+  of 32 out of 36.
+
+Neither is established. What is established is the boundary: **the frames reach
+a descriptor and the device does not fetch it.**

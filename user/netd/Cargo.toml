@@ -234,4 +234,18 @@ asm_budget = 3
 # frame is gone, and a drop that leaves no number behind is indistinguishable
 # from a frame the device swallowed -- which is the confusion three days of
 # boots have been spent inside.
-unsafe_budget = 382
+# 390 at the write-back question: eight lines, two volatile stores of what this
+# loop has always known and never published.
+#
+# It waits for a write-back after every frame it posts and has thrown the answer
+# away since it was written, so the boot that measured "36 uplink-tagged
+# descriptors posted, 19 frames transmitted" had no follow-up question it could
+# ask. Word 30 counts the posts never written back; word 31 carries this
+# program's transmit cursor against the device's `QTX_HEAD`.
+#
+# A write-back is the device saying it is *done*; the head is the device saying
+# it *looked*. The difference matters because a member's frames share one packet
+# buffer and a ring eight deep: a descriptor the device has not fetched is one
+# this program is about to overwrite, which is a defect here, while one it
+# fetched and dropped is a defect there.
+unsafe_budget = 390

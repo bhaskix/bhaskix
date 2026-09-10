@@ -795,7 +795,16 @@ asm_budget = 10
 # seconds**. That says a frame was lost and does not say where, and the two ends
 # of that question -- a driver that never posted it, and a device that took it
 # and did not send it -- are told apart by exactly these words.
-unsafe_budget = 2028
+# 2030 at the write-back question: two more volatile reads in the same block --
+# the posts the device never wrote back, and the two transmit cursors.
+#
+# The boot before this one localised the loss and could not name it: 36
+# uplink-tagged descriptors posted, 19 frames transmitted, nothing refused, and
+# the VSI agreeing with the MAC. So the frames stop inside the device, and the
+# two ways that happens -- descriptors it never fetched, which this driver then
+# overwrites, and descriptors it fetched and dropped -- are told apart by whether
+# `QTX_HEAD` caught the tail while the write-backs did not arrive.
+unsafe_budget = 2030
 # Up thirty-one for RFC 0005 step 9's socket probe -- `ring3_socketeer`, which
 # is `ring3_lister` with a `sockaddr_in6` copied in beside its code instead of
 # two filenames. The same two blocks every hosted probe has: one

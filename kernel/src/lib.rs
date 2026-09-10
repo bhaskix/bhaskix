@@ -16556,11 +16556,13 @@ fn net_domain_transmitted(hhdm: u64) -> Option<Transmitted> {
     // `x722_transmit_report` writes and the driver's own `sent` tally at word
     // 10, read volatile because the driver is still running and rewrites them
     // on every pass of its loop.
-    let (packed, port, posted, sent) = unsafe {
+    let (packed, port, posted, unfinished, cursors, sent) = unsafe {
         (
             core::ptr::read_volatile(at as *const u64),
             core::ptr::read_volatile((at + 8) as *const u64),
             core::ptr::read_volatile((at + 16) as *const u64),
+            core::ptr::read_volatile((at + 24) as *const u64),
+            core::ptr::read_volatile((at + 32) as *const u64),
             core::ptr::read_volatile((page + 10 * 8) as *const u64),
         )
     };
@@ -16571,6 +16573,10 @@ fn net_domain_transmitted(hhdm: u64) -> Option<Transmitted> {
         port: port & 0xffff_ffff,
         uplink: posted & 0xffff_ffff,
         refused: posted >> 32 & 0xffff_ffff,
+        unfinished: unfinished & 0xffff_ffff,
+        uplink_unfinished: unfinished >> 32 & 0xffff_ffff,
+        tail: cursors & 0xffff_ffff,
+        head: cursors >> 32 & 0xffff_ffff,
         sent,
     })
 }
@@ -16593,6 +16599,14 @@ struct Transmitted {
     port: u64,
     uplink: u64,
     refused: u64,
+    /// Posts the device never wrote back, and the uplink-tagged ones among them.
+    unfinished: u64,
+    uplink_unfinished: u64,
+    /// The driver's transmit cursor and the device's, summed across members: a
+    /// write-back is the device saying it is *done*, and the head is the device
+    /// saying it *looked*.
+    tail: u64,
+    head: u64,
     sent: u64,
 }
 
@@ -17383,6 +17397,32 @@ fn report_net_after_exchange(hhdm: u64) {
                     "\x1b[93mthe device took them and did not send them\x1b[0m"
                 } else {
                     "\x1b[92mevery one bin/ipd sent reached a descriptor\x1b[0m"
+                }
+            );
+            // **And whether the device ever finished with them.** The driver
+            // waits for a write-back after every frame and threw the answer away
+            // until now, so "36 posted, 19 sent" had no follow-up question it
+            // could ask. A write-back is the device saying it is *done*; the
+            // head is the device saying it *looked*. Where the head has caught
+            // the tail and the write-backs have not arrived, the device fetched
+            // the descriptors and dropped them; where the head is short, it
+            // never fetched them -- and the driver then overwrote them, since a
+            // member's frames share one buffer and a ring eight deep.
+            println!(
+                "                   {} of those posts were never written back ({} of them \
+                 uplink-tagged); transmit cursor {} against the device's head {} -- {}",
+                out.unfinished,
+                out.uplink_unfinished,
+                out.tail,
+                out.head,
+                if out.unfinished == 0 {
+                    "\x1b[92mthe device finished with every one\x1b[0m"
+                } else if out.head >= out.tail {
+                    "\x1b[93mfetched and dropped: the head caught up and the write-backs did \
+                     not\x1b[0m"
+                } else {
+                    "\x1b[93mnot fetched: the head is behind, and this driver overwrites what \
+                     it does not wait for\x1b[0m"
                 }
             );
         }
