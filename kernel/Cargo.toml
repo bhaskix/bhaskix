@@ -774,7 +774,19 @@ asm_budget = 10
 # members with no address of their own, which is a thing that can also be true.
 # This kernel has three times read a quantity that was never measured as a
 # measurement of zero; the extra word is what makes the fourth time impossible.
-unsafe_budget = 2020
+# 2026 at RFC 0076's same-instant read: six lines, two volatile reads of the
+# words `bin/netd` already publishes, taken again where they are compared.
+#
+# **They pay for a finding that was never measured.** The `net x722` counts are
+# printed by `report_net_domain`; `bin/ipd`'s LACPDU count is printed by
+# `report_net_after_exchange`, which runs after a five-second wait for DHCP, a
+# four-second one for the ring and up to ninety seconds waiting for LACP to
+# aggregate. The switch sends LACPDUs across that whole window and `bin/ipd`
+# answers every one, so its count is later than the device's by construction --
+# and "44 sent, 38 out of the VSI, six lost" was a subtraction across a
+# ninety-nine-second gap. Read together the arithmetic is exact, because an
+# LACPDU is multicast and nothing else this bond sends is.
+unsafe_budget = 2026
 # Up thirty-one for RFC 0005 step 9's socket probe -- `ring3_socketeer`, which
 # is `ring3_lister` with a `sockaddr_in6` copied in beside its code instead of
 # two filenames. The same two blocks every hosted probe has: one

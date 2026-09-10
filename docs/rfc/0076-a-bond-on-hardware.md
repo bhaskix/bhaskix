@@ -1061,12 +1061,14 @@ so it is read as a port counter — and the host test asserts the two sets retur
 different numbers, watched red by making the reader use the VSI offsets, which
 is exactly the bug the description invites.
 
-**What the remaining gap is not.** 44 LACPDUs sent against 38 transmitted is now
-known to be *upstream* of the device: the VSI and the MAC agree, so the six
-frames never reached the VSI at all. That is a question about `bin/ipd`'s ring
-and `bin/netd`'s posting — this side of the DMA boundary — and not about the
-card. It is smaller than it looks, too: some of those are in flight when the
-report is read.
+**What the remaining gap is not.** 44 LACPDUs sent against 38 transmitted is not
+a loss inside the device: the VSI and the MAC agree, so whatever the difference
+is, it is not frames dying between those two boundaries.
+
+> **Corrected 2026-09-10.** This paragraph went on to say the six frames *“never
+> reached the VSI at all”* and named `bin/ipd`'s ring and `bin/netd`'s posting as
+> where to look. That was a subtraction across two clocks, and the section at the
+> end of this document shows why it should not have been made.
 
 ### What is left
 
@@ -1099,3 +1101,81 @@ previous boot and did not free in fifty minutes of quiet; the project lead
 approved a `Manager.Reset`, which cleared them in about 210 seconds and also
 cleared the stale mapping. Mounting over Redfish spends none, so a boot now needs
 one session rather than two.
+
+
+### The six frames were never lost — 2026-09-10
+
+**The two numbers are not read at the same time, and the later one is bigger for
+that reason alone.**
+
+`report_net_domain` prints the `net x722` lines, including the VSI and MAC
+multicast counts. `bin/ipd`'s LACPDU count is printed by
+`report_net_after_exchange`, and between the two the kernel waits:
+
+| wait | for | up to |
+|---|---|---|
+| `for _ in 0..50 { wait_millis(100) }` | DHCP | 5 s |
+| `for _ in 0..80 { wait_millis(50) }` | the ring | 4 s |
+| `LACP_PATIENCE_MS` | LACP to aggregate — and on this wire it never does | 90 s |
+
+So `44 LACPDUs sent` is sampled up to **ninety-nine seconds** after `38 multicast
+frames left the vsi`. Across that window the switch keeps sending LACPDUs, and
+`bin/ipd` answers every one of them.
+
+**That it answers every one is exact arithmetic, not an estimate.** `sent` minus
+`heard` is `LACP_OPENINGS × machines` in every boot this project has recorded:
+
+| boot | sent | heard | difference | machines |
+|---|---|---|---|---|
+| two ports | 23 | 7 | **16** | 2 |
+| four ports | 44 | 12 | **32** | 4 |
+| four ports | 47 | 15 | **32** | 4 |
+
+Eight openings per machine, and one reply per frame heard. Every LACPDU
+`bin/ipd` counts is either one of the thirty-two openings — all sent at
+start-up — or a reply to a PDU that arrived, and the PDUs arrive across the whole
+boot. Replies sent during the ninety-nine-second window are in `bin/ipd`'s count
+and cannot be in a device counter that was printed before them. Six is exactly
+the size that window would produce.
+
+**So "why do six frames never reach the VSI" has a likely answer of "they do, and
+they reached it after the counter was printed"** — and this is the project's own
+recurring error in a new form. The three earlier ones were quantities nobody
+measured, read as measurements of zero. This is two quantities measured at
+different times, subtracted as though they were simultaneous.
+
+**The instrument, so the next boot settles it rather than argues it.** The kernel
+re-reads `bin/netd`'s two transmit words beside the LACPDU count they are being
+compared with, and prints them there:
+
+```
+ipd lacp       44 LACPDU(s) sent, 12 slow-protocol frame(s) heard back
+               and the device now counts 44 out of the vsi and 44 out of the mac
+               -- every one of them reached the wire
+```
+
+An LACPDU is multicast and nothing else this bond sends is — announcements are
+broadcast and DHCP is broadcast — so with both read together the arithmetic is
+exact. Equal means every frame reached the wire and the gap was sampling; short
+means the difference is real, measured at one instant, and worth hunting. The
+line prints only where the driver set the *measured* bit, which needs an X722, so
+no lane's output changes.
+
+**Two things read while looking, which are real and are not this.** Neither
+explains the gap, and both are worth writing down rather than rediscovering:
+
+* `carry_x722` takes a frame out of `bin/ipd`'s ring and then, if `post_frame`
+  returns `None`, drops it with nothing counting the drop. `post_frame` returns
+  `None` only when no ring is attached or the ring is shorter than the
+  descriptors a frame needs, so it should not fire — but *"should not fire"* and
+  *"is known not to have fired"* are the distinction this document keeps being
+  about.
+* When `bin/ipd` names a member `bin/netd` does not hold, the frame leaves by the
+  *active* member instead. For an ordinary frame that is right. For an LACPDU it
+  is not: the PDU carries the port id of the link it speaks for, so sending it
+  out of another link tells the switch something false. It cannot fire while all
+  four members are held, which is every boot so far.
+
+`take_from_ipd_into` is clean, and that was checked rather than assumed: every
+early return happens before the ring's tail advances, so nothing is consumed and
+dropped there.

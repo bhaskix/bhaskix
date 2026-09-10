@@ -14782,6 +14782,14 @@ const NETD_BOND_IS_LACP: u64 = 41 * 8;
 /// and the sentinel last.
 const NETD_MEMBER_ADDRESSES: u64 = 32 * 8;
 
+/// Byte offset in that page of what the device says it transmitted: the VSI's
+/// multicast count packed with its flags, and the port's beside it.
+///
+/// The same words `report_x722` prints from, read again later by
+/// [`net_domain_transmitted`] so that a comparison against `bin/ipd`'s count is
+/// a comparison of one instant.
+const NETD_TRANSMITTED: u64 = 27 * 8;
+
 /// The sentinel `bin/netd` writes there.
 const NETD_MEMBER_ADDRESSES_WRITTEN: u64 = 0x5352_4444_414d_454d;
 
@@ -16511,6 +16519,52 @@ fn net_domain_members(hhdm: u64) -> Option<[u64; NETD_MEMBER_COUNT]> {
     Some(addresses)
 }
 
+/// What the device says it has transmitted, **read now** rather than when the
+/// driver's own report was printed.
+///
+/// **Because those are up to ninety-nine seconds apart, and nobody noticed.**
+/// `report_net_domain` prints the VSI and MAC multicast counts; the LACPDU
+/// count `bin/ipd` publishes is printed by `report_net_after_exchange`, which
+/// runs after a five-second wait for DHCP, a four-second one for the ring, and
+/// up to ninety seconds waiting for LACP to aggregate. The switch keeps sending
+/// LACPDUs across that window and `bin/ipd` answers every one, so its count
+/// grows after the counters that would have counted those frames were already
+/// on the console.
+///
+/// That is what the 44-against-38 gap looked like: 44 sent, 38 out of the VSI,
+/// and a conclusion about six lost frames drawn from two numbers read a minute
+/// and a half apart. This reads them again beside the count they are being
+/// compared with, so the comparison is of one instant.
+///
+/// `None` when the driver never wrote them -- the bit that says so is
+/// [`x722_transmit_report`'s](../../user/netd/src/main.rs) bit 33, and a
+/// machine with no X722 never sets it, so no lane prints this line.
+fn net_domain_transmitted(hhdm: u64) -> Option<(u64, u64)> {
+    use core::sync::atomic::Ordering;
+
+    let raw = NET_RINGS.load(Ordering::Acquire);
+    if raw == u64::MAX {
+        return None;
+    }
+    let (frames, count) = shared::frames_of(shared::MemoryId::from_u64(raw))?;
+    if count <= NETD_REPORT_PAGE {
+        return None;
+    }
+    let at = hhdm + frames[NETD_REPORT_PAGE] + NETD_TRANSMITTED;
+    // SAFETY: a frame this object owns, through the direct map -- the two words
+    // `x722_transmit_report` writes, read volatile because the driver is still
+    // running and rewrites them on every pass of its loop.
+    let (packed, port) = unsafe {
+        (
+            core::ptr::read_volatile(at as *const u64),
+            core::ptr::read_volatile((at + 8) as *const u64),
+        )
+    };
+    // Bit 33 says the driver measured them. Without it, zero is what a port
+    // that sent nothing and a word nobody wrote both look like.
+    (packed >> 33 & 1 != 0).then_some((packed & 0xffff_ffff, port & 0xffff_ffff))
+}
+
 /// Whether `bin/netd` has written its report yet.
 fn net_domain_reported(hhdm: u64) -> bool {
     use core::sync::atomic::Ordering;
@@ -17247,6 +17301,30 @@ fn report_net_after_exchange(hhdm: u64) {
             "    ipd lacp       {lacp_sent} LACPDU(s) sent, {lacp_heard} slow-protocol frame(s) \
              heard back"
         );
+        // **And what the device has transmitted as of *this* moment.**
+        //
+        // The `net x722` lines above were printed before three waits totalling
+        // up to ninety-nine seconds, and `bin/ipd` answers every LACPDU the
+        // switch sends across that window -- so its count is later than theirs
+        // by construction. Comparing the two as printed is comparing two
+        // clocks, and it produced a finding about six lost frames that may
+        // never have been lost at all.
+        //
+        // An LACPDU is multicast and nothing else this bond sends is, so with
+        // both read together the arithmetic is exact: equal means every frame
+        // reached the wire, and short means the difference is real and worth
+        // hunting.
+        if let Some((vsi, port)) = net_domain_transmitted(hhdm) {
+            println!(
+                "                   and the device now counts {vsi} out of the vsi and {port} \
+                 out of the mac -- {}",
+                if port >= lacp_sent {
+                    "\x1b[92mevery one of them reached the wire\x1b[0m"
+                } else {
+                    "\x1b[93mfewer than were sent, read at the same instant\x1b[0m"
+                }
+            );
+        }
     }
     // **Did `bin/ipd` write as far as this kernel reads?** Word 34 is a
     // sentinel it puts one past its report. Without it, every word beyond what
