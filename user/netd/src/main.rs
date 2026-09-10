@@ -114,6 +114,12 @@ const X722_FIRST_SLOT: u64 = 16;
 /// one channel-group, so a bond of two was the wrong shape for that wire.
 const X722_MEMBERS: usize = 4;
 
+/// A member's transmit descriptors and its packet buffer share one page, the
+/// ring at offset 0 and the frame at 2048. Nothing said the two could not meet
+/// until the ring went from eight descriptors to thirty-two -- see
+/// `bhaskix_i40e::TRANSMIT_FETCH_LINE`, which is why it had to.
+const _: () = assert!(bhaskix_i40e::TRANSMIT_RING_BYTES <= 2048);
+
 /// And the report's block of member addresses is the same width, because a
 /// fifth port would have an address with nowhere to publish it. Asserted rather
 /// than commented: two constants that must agree and do not have to is how this
