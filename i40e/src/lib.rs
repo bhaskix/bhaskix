@@ -3355,6 +3355,32 @@ impl<R: Registers> Device<R> {
         self.write(QTX_TAIL + 4 * u64::from(queue), tail & 0x1fff);
     }
 
+    /// Descriptors posted that the device has not consumed -- `(tail - head)`
+    /// around the ring.
+    ///
+    /// **Because comparing a tail with a head is wrong the moment either
+    /// wraps.** A boot report summed both across four members and compared the
+    /// sums, which flips on a wrap alone: the same code read *"head 31 against
+    /// cursor 24 -- caught up"* on one boot and *"head 15 against cursor 88 --
+    /// behind"* on the next, and the difference was arithmetic rather than
+    /// hardware. That flip was read as evidence a change had fixed the fetch,
+    /// and it was not evidence of anything.
+    ///
+    /// Zero means the device has consumed everything this driver posted. Any
+    /// other value is descriptors sitting in the ring, and it is a *count*, so
+    /// summing it across members means something.
+    #[must_use]
+    pub fn transmit_outstanding(&self, queue: u32) -> u32 {
+        if self.transmit_depth == 0 {
+            return 0;
+        }
+        // A head outside the ring is firmware answering nonsense; treat it as
+        // zero rather than letting it underflow the subtraction below.
+        let head = self.transmit_head(queue);
+        let head = if head < self.transmit_depth { head } else { 0 };
+        (self.transmit_next + self.transmit_depth - head) % self.transmit_depth
+    }
+
     /// What the device says its transmit head is -- `QTX_HEAD`, which advances
     /// as descriptors are consumed.
     #[must_use]
@@ -4750,6 +4776,59 @@ mod tests {
             "and it survives the trip through a report word"
         );
         assert_eq!(set.packed() & 0xfff, 0xabc);
+    }
+
+    /// Outstanding descriptors are counted around the ring, not subtracted.
+    ///
+    /// **This is the arithmetic a boot report got wrong.** It summed tails and
+    /// heads across four members and compared the sums, which flips on a wrap
+    /// alone -- so the same code called the device *caught up* on one boot and
+    /// *behind* on the next, and a change was credited with fixing the fetch on
+    /// the strength of it.
+    #[test]
+    fn outstanding_descriptors_are_counted_around_the_ring() {
+        const QUEUE: u32 = 3;
+        let depth = TRANSMIT_DESCRIPTORS;
+        let mut ring = FakeDma::new();
+        let mut device = Device::new(Fake::new());
+        device.attach_transmit_ring(depth);
+
+        // Nothing posted, head at zero: nothing outstanding.
+        assert_eq!(device.transmit_outstanding(QUEUE), 0);
+
+        // One frame posted and unconsumed: a line's worth outstanding.
+        let line = u32::from(TRANSMIT_FETCH_LINE);
+        device.post_frame(&mut ring, 0x4000, 124, true);
+        assert_eq!(device.transmit_outstanding(QUEUE), line);
+
+        // The device consumes it: nothing outstanding, and the naive
+        // subtraction would agree here.
+        device.registers.put(QTX_HEAD + 4 * u64::from(QUEUE), line);
+        assert_eq!(device.transmit_outstanding(QUEUE), 0);
+
+        // **Now the case the sums got wrong.** Fill the ring so the cursor
+        // wraps to zero while the head sits mid-ring: the tail is *less* than
+        // the head, and a subtraction says the device is ahead of the driver.
+        for _ in 0..(u32::from(depth) / line - 1) {
+            device.post_frame(&mut ring, 0x4000, 124, true);
+        }
+        assert_eq!(device.transmit_tail(), 0, "the cursor has wrapped");
+        assert!(
+            device.transmit_head(QUEUE) > device.transmit_tail(),
+            "and the head now reads higher than the tail, which is the trap"
+        );
+        assert_eq!(
+            device.transmit_outstanding(QUEUE),
+            u32::from(depth) - line,
+            "everything posted since the head, counted around the wrap"
+        );
+
+        // A head firmware never moved off a nonsense value is not a negative
+        // count.
+        device
+            .registers
+            .put(QTX_HEAD + 4 * u64::from(QUEUE), 0x1fff);
+        assert_eq!(device.transmit_outstanding(QUEUE), 0);
     }
 
     /// The port's transmit counters are the **MAC's**, not the VSI's.

@@ -2852,19 +2852,27 @@ fn carry_x722(mut members: [Option<X722Member>; X722_MEMBERS], facts: [X722; X72
                 })
             })
             .sum();
-        // **Where each member's transmit ring stands**, summed: the cursor this
-        // program has advanced to, and the one the device has consumed to. Equal
-        // means every descriptor was fetched.
-        let tails: u64 = members
+        // **Descriptors the device has not consumed**, counted around each
+        // member's ring and then summed.
+        //
+        // This was a sum of tails against a sum of heads, which is wrong the
+        // moment either wraps: four cursors wrapping independently at 32 make
+        // the comparison flip on arithmetic rather than on hardware, and it did
+        // -- the same code called the device *caught up* on one boot and
+        // *behind* on the next. A count is summable; two positions are not.
+        let outstanding: u64 = members
             .iter()
             .flatten()
-            .map(|m| u64::from(m.device.transmit_tail()))
+            .map(|m| u64::from(m.device.transmit_outstanding(m.queues.transmit_queue)))
             .sum();
-        let heads: u64 = members
+        // And the worst single member, because four rings averaging two
+        // outstanding and one ring holding eight are different machines.
+        let worst: u64 = members
             .iter()
             .flatten()
-            .map(|m| u64::from(m.device.transmit_head(m.queues.transmit_queue)))
-            .sum();
+            .map(|m| u64::from(m.device.transmit_outstanding(m.queues.transmit_queue)))
+            .max()
+            .unwrap_or(0);
         x722_transmit_report(TransmitReport {
             multicast: out,
             port_multicast: on_the_wire,
@@ -2885,7 +2893,7 @@ fn carry_x722(mut members: [Option<X722Member>; X722_MEMBERS], facts: [X722; X72
                 .map_or_else(Default::default, |fact| fact.switching),
             posted: (uplink_posted, post_refused),
             unfinished: (uncompleted, uplink_uncompleted),
-            cursors: (tails, heads),
+            cursors: (outstanding, worst),
         });
 
         // **Yield rather than spin.** This program is pinned, and there is no
@@ -3273,7 +3281,8 @@ struct TransmitReport {
     posted: (u64, u64),
     /// Posts the device never wrote back, and the uplink-tagged ones of them.
     unfinished: (u64, u64),
-    /// This program's transmit cursor and the device's head, summed.
+    /// Descriptors the device has not consumed: the total across members, and
+    /// the worst single member.
     cursors: (u64, u64),
 }
 
@@ -3309,13 +3318,17 @@ fn x722_transmit_report(report: TransmitReport) {
     // away, so a boot that said *"36 descriptors posted, 19 frames sent"* had no
     // way to ask whether the other seventeen were ever finished with.
     //
-    // **Word 31: the two cursors**, the driver's tail in the low half and the
-    // device's `QTX_HEAD` in the high, summed across members. A write-back is
-    // the device saying it is *done*; the head is the device saying it *looked*.
-    // Where they disagree is the difference between a descriptor the device
-    // never fetched -- which this program then overwrote, since a member's
-    // frames share one buffer and a ring eight deep -- and one it fetched and
-    // dropped. Those are different defects with different fixes.
+    // **Word 31: descriptors the device has not consumed**, the total across
+    // members in the low half and the worst single member in the high. A
+    // write-back is the device saying it is *done*; an outstanding descriptor is
+    // one it has not *looked* at. Where they disagree is the difference between
+    // a descriptor never fetched -- which this program then overwrites, since a
+    // member's frames share one buffer -- and one fetched and dropped, which are
+    // different defects with different fixes.
+    //
+    // Counted around each ring rather than subtracted, because two positions
+    // that wrap independently cannot be compared and the earlier version of this
+    // word tried to.
     // SAFETY: the report page this program mapped writable, four words past the
     // transmit counts and short of the members' addresses at 32.
     unsafe {

@@ -1632,3 +1632,64 @@ the vsi's switching section reads back: destination override set, switch id N, l
 or `CLEAR -- the command was taken and the bit is not there`, and only the
 machine can say which. The SR550 is reporting a critical processor fault and has
 been left alone, so this is what to run first on a healthy one.
+
+
+### The verdict line was doing arithmetic that wraps — 2026-09-10
+
+**A correction to two earlier readings in this document, and to a conclusion
+drawn from them.**
+
+The report compared *"transmit cursor N against the device's head M"* by summing
+both across four members. Four cursors wrapping independently at 32 make that
+comparison flip on arithmetic alone, and it did:
+
+| boot | printed | the packing |
+|---|---|---|
+| leading NOPs | *"head 31 against cursor 24 — caught up"* | padding in front |
+| read-back | *"head 15 against cursor 88 — behind"* | padding in front |
+
+Same code, same packing, opposite verdicts. **The first was read as evidence that
+the leading-NOP padding had fixed the fetch.** It was evidence of a wrap.
+
+`Device::transmit_outstanding` counts around the ring instead —
+`(tail - head)` modulo the depth, per member, then summed, which is a *count* and
+so means something added up. Its host test builds exactly the trap: the cursor
+wrapped to zero with the head mid-ring, so the head reads *higher* than the tail.
+Against the old subtraction it reports **0** outstanding where **24** descriptors
+are pending.
+
+**What the corrected instrument says**, on the boot after:
+
+```
+30 of those posts were never written back (30 of them uplink-tagged);
+49 descriptor(s) still unconsumed, worst ring 16
+       -- not fetched: descriptors are sitting in the ring
+```
+
+Forty-nine descriptors unconsumed across four rings, the worst holding sixteen of
+its thirty-two. **The device is not fetching them.** So the padding never fixed
+the fetch, and the section above that credits it with doing so is wrong on that
+point — what it fixed was the queue *stopping altogether*, which trailing NOPs
+caused and leading NOPs do not.
+
+**The signature, on numbers that can now be trusted:**
+
+| | posted | never written back |
+|---|---|---|
+| plain frames | 27 | **0** |
+| uplink-tagged | 40 | **30** |
+
+Plain frames are consumed promptly and complete every time; lines carrying an
+uplink-tagged frame accumulate. That rules out the device merely being slow,
+which would hit both alike.
+
+And every precondition remains verified present in the same boot: `destination
+override set, switch id 2` read back off the device, and `stop lldp agent:
+firmware took it`.
+
+**The lesson, which is the same one again in a new place.** Four times this work
+found a mechanism whose result nobody read. This is the fifth kind: a number that
+*was* read, printed, and reasoned from — and was arithmetic rather than
+measurement. The write-back counts were beside it the whole time, unchanged
+across every one of those boots, and they were the ones telling the truth. **A
+derived verdict is not evidence; the count it was derived from is.**

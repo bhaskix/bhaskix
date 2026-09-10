@@ -16585,8 +16585,8 @@ fn net_domain_transmitted(hhdm: u64) -> Option<Transmitted> {
         refused: posted >> 32 & 0xffff_ffff,
         unfinished: unfinished & 0xffff_ffff,
         uplink_unfinished: unfinished >> 32 & 0xffff_ffff,
-        tail: cursors & 0xffff_ffff,
-        head: cursors >> 32 & 0xffff_ffff,
+        outstanding: cursors & 0xffff_ffff,
+        worst: cursors >> 32 & 0xffff_ffff,
         sent,
         switching,
     })
@@ -16613,11 +16613,16 @@ struct Transmitted {
     /// Posts the device never wrote back, and the uplink-tagged ones among them.
     unfinished: u64,
     uplink_unfinished: u64,
-    /// The driver's transmit cursor and the device's, summed across members: a
-    /// write-back is the device saying it is *done*, and the head is the device
-    /// saying it *looked*.
-    tail: u64,
-    head: u64,
+    /// Descriptors the device has not consumed: the total across members, and
+    /// the worst single member. A write-back is the device saying it is *done*;
+    /// an outstanding descriptor is one it has not *looked* at.
+    ///
+    /// **Counted around each ring, not subtracted.** This was a sum of tails
+    /// against a sum of heads, which flips on a wrap alone -- and it did, so the
+    /// same code called the device caught up on one boot and behind on the next,
+    /// and a change was credited with fixing the fetch on the strength of it.
+    outstanding: u64,
+    worst: u64,
     sent: u64,
     /// The VSI's switching section as the driver read it back, bit 16 set when
     /// it was read at all -- see [`NETD_VSI_SWITCHING`].
@@ -17485,19 +17490,19 @@ fn report_net_after_exchange(hhdm: u64) {
             // member's frames share one buffer and a ring eight deep.
             println!(
                 "                   {} of those posts were never written back ({} of them \
-                 uplink-tagged); transmit cursor {} against the device's head {} -- {}",
+                 uplink-tagged); {} descriptor(s) still unconsumed, worst ring {} -- {}",
                 out.unfinished,
                 out.uplink_unfinished,
-                out.tail,
-                out.head,
+                out.outstanding,
+                out.worst,
                 if out.unfinished == 0 {
                     "\x1b[92mthe device finished with every one\x1b[0m"
-                } else if out.head >= out.tail {
-                    "\x1b[93mfetched and dropped: the head caught up and the write-backs did \
-                     not\x1b[0m"
+                } else if out.outstanding == 0 {
+                    "\x1b[93mfetched and dropped: the device consumed every descriptor and \
+                     wrote none back\x1b[0m"
                 } else {
-                    "\x1b[93mnot fetched: the head is behind, and this driver overwrites what \
-                     it does not wait for\x1b[0m"
+                    "\x1b[93mnot fetched: descriptors are sitting in the ring, and this driver \
+                     overwrites what it does not wait for\x1b[0m"
                 }
             );
         }
