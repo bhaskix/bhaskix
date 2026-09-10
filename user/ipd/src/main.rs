@@ -134,7 +134,13 @@ const MARKER: u64 = 0x3154_5052_4450_4931;
 /// sentence, that the switch recorded no partner: a conclusion drawn entirely
 /// from memory nobody had assigned. The array literal that feeds this function
 /// must have exactly this many entries, and the compiler now says so.
-const REPORT_WORDS: usize = 34;
+const REPORT_WORDS: usize = 38;
+
+/// **And tied to the machines behind its last four words.** Those four are
+/// written out one per line, because an array literal is what `write_report`
+/// takes -- so a fifth LACP machine would be a fifth address with nowhere to
+/// go, and the total would still add up. This is what says it would not.
+const _: () = assert!(REPORT_WORDS == 34 + LACP_MACHINES);
 
 /// The last word, written with a sentinel so a reader can prove the page was
 /// written to its full length rather than trusting that it was.
@@ -186,10 +192,21 @@ fn read_interface() -> Option<(MacAddr, Ipv4Addr)> {
     if marker != CONFIG_MARKER {
         return None;
     }
-    let mut octets = [0u8; 6];
-    for (index, octet) in octets.iter_mut().enumerate() {
-        *octet = (mac >> (40 - index * 8)) as u8;
+    // **What each member is called**, words 7 onward, read only once the marker
+    // says the page is true. Word 1 above is the *bond's* address, which is
+    // what every datagram leaves under; these are the links' own, and an
+    // LACPDU's source is the individual address of the link it goes out of.
+    let mut members = [MacAddr::UNSPECIFIED; LACP_MACHINES];
+    for (index, member) in members.iter_mut().enumerate() {
+        // SAFETY: the same page, one word per member past the interface's own
+        // seven -- `NETD_MEMBER_COUNT` of them, which is `LACP_MACHINES`.
+        let word = unsafe {
+            core::ptr::read_volatile((CONFIG_AT + CONFIG_MEMBERS + index as u64 * 8) as *const u64)
+        };
+        MEMBER_ADDRESSES[index].store(word, core::sync::atomic::Ordering::Relaxed);
+        *member = mac_of(word);
     }
+    let octets = mac_of(mac).0;
     // **RFC 0074: an address lives on an interface.** One port is a port;
     // several are a bond over them, and the address goes on the bond. Only the
     // first is driven -- `bin/netd` holds one device -- so the rest are
@@ -215,9 +232,16 @@ fn read_interface() -> Option<(MacAddr, Ipv4Addr)> {
         {
             let mut joined = faces.enslave(bond, first).is_ok();
             for port in 1..ports.min(u64::from(u8::MAX)) {
-                // A member whose address this service does not know: it is not
-                // driven, so nothing here can read one, and it is down anyway.
-                if let Ok(other) = faces.add_physical(port as u16, MacAddr([0; 6]), mtu) {
+                // **The member's own address, where the kernel published one.**
+                // This was `MacAddr([0; 6])` with a comment saying the service
+                // could not know it, and that was true until `bin/netd` began
+                // reading every port's address and passing it up. A member the
+                // driver never reached still has none, and zero still says so.
+                let own = usize::try_from(port)
+                    .ok()
+                    .and_then(|index| members.get(index).copied())
+                    .unwrap_or(MacAddr::UNSPECIFIED);
+                if let Ok(other) = faces.add_physical(port as u16, own, mtu) {
                     joined |= faces.enslave(bond, other).is_ok();
                 }
             }
@@ -289,21 +313,48 @@ const _: () = assert!(LACP_MACHINES as u32 <= ring::MEMBER_MASK >> ring::MEMBER_
 /// shared, because the key is what says these links may aggregate together.
 struct Bundle {
     each: [Option<bhaskix_net::lacp::Machine>; LACP_MACHINES],
+    /// **The address each machine's frames leave under.**
+    ///
+    /// Not the system id, which is `Machine::actor.system` and is shared:
+    /// 802.3ad says the links of one aggregation carry one system id, and that
+    /// is what makes them aggregatable at all. This is the Ethernet header's
+    /// source, which 802.1AX gives as *the individual MAC address of the port*
+    /// -- a different field with a different rule, and both were the bond's
+    /// address until 2026-09-10.
+    source: [MacAddr; LACP_MACHINES],
 }
 
 impl Bundle {
     const fn new() -> Self {
         Self {
             each: [const { None }; LACP_MACHINES],
+            source: [MacAddr::UNSPECIFIED; LACP_MACHINES],
         }
     }
 
     /// Starts a machine per member, once this service knows its own address.
     ///
     /// `members` is what the bond is made of; zero means the address sits
-    /// straight on a port, which is one link and so one machine.
-    fn arm(&mut self, me: MacAddr, members: usize) {
+    /// straight on a port, which is one link and so one machine. `own` is what
+    /// each of those links is called, as the kernel published it.
+    fn arm(&mut self, me: MacAddr, members: usize, own: [MacAddr; LACP_MACHINES]) {
         for index in 0..members.clamp(1, LACP_MACHINES) {
+            // **Set every pass, not only when the machine is created.** The
+            // configuration page is read from the serve loop and a member's
+            // address arrives when its port has been brought up, which can be
+            // after this service has already started speaking for it. A source
+            // fixed at creation would keep the fallback for the life of the
+            // boot and nothing would say so.
+            //
+            // A member with no address of its own falls back to the bond's,
+            // which is where this service was before there were any: worse than
+            // the port's, and better than a frame with no source at all.
+            let own = own[index];
+            self.source[index] = if own == MacAddr::UNSPECIFIED { me } else { own };
+            SPEAKING_AS[index].store(
+                word_of(self.source[index]),
+                core::sync::atomic::Ordering::Relaxed,
+            );
             self.each[index].get_or_insert_with(|| {
                 // The port id is what distinguishes the links. Numbered from
                 // one because 802.3ad reserves zero for "no port".
@@ -316,12 +367,14 @@ impl Bundle {
         }
     }
 
-    /// The machine speaking for `member`, if one is running.
-    fn member(&mut self, member: usize) -> Option<(u8, &mut bhaskix_net::lacp::Machine)> {
+    /// The machine speaking for `member`, if one is running, and the address it
+    /// speaks under.
+    fn member(&mut self, member: usize) -> Option<(u8, MacAddr, &mut bhaskix_net::lacp::Machine)> {
         let index = if member < LACP_MACHINES { member } else { 0 };
+        let source = self.source[index];
         self.each[index]
             .as_mut()
-            .map(|machine| (index as u8, machine))
+            .map(|machine| (index as u8, source, machine))
     }
 
     /// Whether every running machine has aggregated.
@@ -486,6 +539,62 @@ fn bound_vlan() -> Option<u16> {
 
 /// The marker the kernel writes before this program's configuration is true.
 const CONFIG_MARKER: u64 = 0x3146_4e43_5049_5f4e;
+
+/// Byte offset on that page of the members' own station addresses.
+///
+/// Seven words in, after the interface's own: the marker, the bond's address,
+/// the protocol address, the VLAN, the MTU, the port count and the bond mode.
+/// The kernel's `NETD_MEMBER_COUNT` addresses follow, and that number is this
+/// program's [`LACP_MACHINES`] -- four in three places, which is the width of
+/// the interface between them.
+const CONFIG_MEMBERS: u64 = 7 * 8;
+
+/// A station address as the configuration page carries it.
+///
+/// Six octets in the low 48 bits, most significant first, which is the order a
+/// MAC is written in. Named because the members' addresses would otherwise have
+/// been the second place in this file writing that shift out, and the pair with
+/// [`word_of`] is what says the two directions agree.
+fn mac_of(word: u64) -> MacAddr {
+    let mut octets = [0u8; 6];
+    for (index, octet) in octets.iter_mut().enumerate() {
+        *octet = (word >> (40 - index * 8)) as u8;
+    }
+    MacAddr(octets)
+}
+
+/// Each bond member's **own** station address, as the kernel last published it.
+///
+/// Static because the page is read in one place and the addresses are wanted in
+/// another: `read_interface` runs from the serve loop, and the LACP machines are
+/// armed beside it.
+static MEMBER_ADDRESSES: [core::sync::atomic::AtomicU64; LACP_MACHINES] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; LACP_MACHINES];
+
+/// Them, as addresses.
+fn member_addresses() -> [MacAddr; LACP_MACHINES] {
+    core::array::from_fn(|index| {
+        mac_of(MEMBER_ADDRESSES[index].load(core::sync::atomic::Ordering::Relaxed))
+    })
+}
+
+/// A station address as one word -- [`mac_of`] the other way about.
+fn word_of(address: MacAddr) -> u64 {
+    address
+        .0
+        .iter()
+        .fold(0u64, |word, octet| (word << 8) | u64::from(*octet))
+}
+
+/// **What each LACP machine's frames actually leave under**, for the report.
+///
+/// Distinct from [`MEMBER_ADDRESSES`], which is what the kernel published: a
+/// member the driver never read an address for falls back to the bond's, and
+/// this is the address after that fallback. The report carries this one,
+/// because "four links, four addresses" is the claim being made and the
+/// published half cannot prove it.
+static SPEAKING_AS: [core::sync::atomic::AtomicU64; LACP_MACHINES] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; LACP_MACHINES];
 
 /// The address this program asks about, to prove it can send.
 ///
@@ -1206,6 +1315,18 @@ fn refresh() {
         // answers why SYNC never sets. See `lacp_publish`.
         LACP_PARTNER_STATE.load(Relaxed),
         LACP_RECORDED.load(Relaxed),
+        // **Words 34 to 37: the address each link's LACPDU leaves under.**
+        //
+        // Appended, for the reason written at 23. The kernel prints what it
+        // *published* to this service, which says nothing about what this
+        // service did with it -- and "four links, four addresses" is the whole
+        // claim of RFC 0076 step 4. This is the address after the fallback a
+        // member with none takes, so a boot that shows four identical words
+        // here has found the bug rather than hidden it.
+        SPEAKING_AS[0].load(Relaxed),
+        SPEAKING_AS[1].load(Relaxed),
+        SPEAKING_AS[2].load(Relaxed),
+        SPEAKING_AS[3].load(Relaxed),
     ]);
 }
 
@@ -1622,7 +1743,7 @@ fn drain_ring(
             // machine would let the second link's partner overwrite the
             // first's, and the report would show a bundle neither link had.
             let member = from_member.map_or(0, usize::from);
-            if let Some((index, machine)) = lacp.member(member)
+            if let Some((index, source, machine)) = lacp.member(member)
                 && machine.received(parsed.payload)
             {
                 // Answer while awake. A partner that has just told us
@@ -1633,10 +1754,12 @@ fn drain_ring(
                 // `crate::frame`, because the local buffer above shadows
                 // the builder's name in this function.
                 if pdu.write(&mut body).is_ok()
+                        // **The link's own address, not the bond's.** See
+                        // `Bundle::source`.
                         && let Some(length) = crate::frame(
                             &mut out,
                             bhaskix_net::lacp::GROUP_ADDRESS,
-                            me.0,
+                            source,
                             EtherType(bhaskix_net::lacp::ETHERTYPE),
                             &body,
                         )
@@ -1795,11 +1918,11 @@ fn serve(
             // is one link.
             let members =
                 (BOUND_SHAPE.load(core::sync::atomic::Ordering::Relaxed) & 0xffff_ffff) as usize;
-            lacp.arm(me.0, members);
+            lacp.arm(me.0, members, member_addresses());
             if openings > 0 && !lacp.aggregated() {
                 // One opening frame per link, each carrying its own port id.
                 for index in 0..LACP_MACHINES {
-                    let Some((member, machine)) = lacp.member(index) else {
+                    let Some((member, source, machine)) = lacp.member(index) else {
                         continue;
                     };
                     if machine.aggregated() {
@@ -1809,10 +1932,12 @@ fn serve(
                     let mut body = [0u8; bhaskix_net::lacp::PDU];
                     let mut out = [0u8; eth::HEADER + bhaskix_net::lacp::PDU];
                     if pdu.write(&mut body).is_ok()
+                        // **The link's own address, not the bond's.** See
+                        // `Bundle::source`.
                         && let Some(length) = frame(
                             &mut out,
                             bhaskix_net::lacp::GROUP_ADDRESS,
-                            me.0,
+                            source,
                             EtherType(bhaskix_net::lacp::ETHERTYPE),
                             &body,
                         )
@@ -3348,6 +3473,18 @@ fn report(
         // that zero from a word nobody wrote.
         LACP_PARTNER_STATE.load(core::sync::atomic::Ordering::Relaxed),
         LACP_RECORDED.load(core::sync::atomic::Ordering::Relaxed),
+        // **Words 34 to 37: the address each link's LACPDU leaves under.**
+        //
+        // Appended, for the reason written at 23. The kernel prints what it
+        // *published* to this service, which says nothing about what this
+        // service did with it -- and "four links, four addresses" is the whole
+        // claim of RFC 0076 step 4. This is the address after the fallback a
+        // member with none takes, so a boot that shows four identical words
+        // here has found the bug rather than hidden it.
+        SPEAKING_AS[0].load(core::sync::atomic::Ordering::Relaxed),
+        SPEAKING_AS[1].load(core::sync::atomic::Ordering::Relaxed),
+        SPEAKING_AS[2].load(core::sync::atomic::Ordering::Relaxed),
+        SPEAKING_AS[3].load(core::sync::atomic::Ordering::Relaxed),
     ];
     V6_PREFIX.store(v6_prefix, core::sync::atomic::Ordering::Relaxed);
     V6_STATE.store(v6_state, core::sync::atomic::Ordering::Relaxed);

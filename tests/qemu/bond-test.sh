@@ -140,8 +140,38 @@ else
     fail "nothing crossed after the failover: the bond selected a member that carries nothing"
 fi
 
+# **Each member under its own address** -- RFC 0076 step 4.
+#
+# A bond's *data* leaves under the bond's address whichever member carries it,
+# and that is deliberate: it is what makes the failover above invisible to the
+# far end. An LACPDU is the exception -- its source is the individual address of
+# the port it leaves by -- and until 2026-09-10 every link's PDU carried the
+# bond's, because `bin/netd` published one address, the kernel passed on one, and
+# `bin/ipd` had one to put on all four machines.
+#
+# **Two lines, because they answer different questions.** The first is what the
+# kernel published to `bin/ipd`; the second is what `bin/ipd` did with it, read
+# back off its own report. A chain that breaks anywhere makes the two addresses
+# equal -- a member with none falls back to the bond's -- so equality is the
+# failure and this profile's two virtio ports, which QEMU gives distinct
+# addresses, are what make the difference visible.
+addresses_on() {
+    grep -m1 "$1" "$LOG" | sed 's/\x1b\[[0-9;]*m//g' | grep -oE '0x[0-9a-f]{12}' | sort -u | tr '\n' ' '
+}
+
+for line in "each link speaks under its own address:|the kernel told bin/ipd" \
+            "speaking as:|bin/ipd put on its LACPDUs"; do
+    marker="${line%%|*}"; what="${line##*|}"
+    seen="$(addresses_on "$marker")"
+    if [[ "$(wc -w <<<"$seen")" -eq 2 ]]; then
+        pass "two members, two addresses -- $what: $seen"
+    else
+        fail "$what: expected two distinct addresses, got '${seen:-nothing; the line was never printed}'"
+    fi
+done
+
 if [[ $status -ne 0 ]]; then
-    grep -E "net |iommu window" "$LOG" | tail -25 >&2
+    grep -E "net |iommu window|speaking as" "$LOG" | tail -25 >&2
 elif [[ -z ${BHASKIX_BOND_LOG:-} ]]; then
     rm -f "$LOG"
 fi

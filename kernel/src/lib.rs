@@ -14767,6 +14767,34 @@ const NETD_FAILOVER_REQUEST: u64 = 40 * 8;
 /// fact, so the driver may hold it without reading a frame.
 const NETD_BOND_IS_LACP: u64 = 41 * 8;
 
+/// Byte offset in that page of the members' own station addresses.
+///
+/// Read, not written: `bin/netd`'s `ring::MEMBER_ADDRESSES` is the same number
+/// from the other side. The word at this offset is a sentinel saying the block
+/// behind it has been filled in, and [`NETD_MEMBER_COUNT`] addresses follow it,
+/// zero where there is no member.
+///
+/// **Why the sentinel and not just the addresses.** `bin/netd` publishes its
+/// report after every port it brings up, so a report read one port in is a
+/// perfectly good report -- and three addresses that had not been asked for yet
+/// would read as three members with no address, which is a thing that can also
+/// be true. The driver writes this block once, after every port has been tried,
+/// and the sentinel last.
+const NETD_MEMBER_ADDRESSES: u64 = 32 * 8;
+
+/// The sentinel `bin/netd` writes there.
+const NETD_MEMBER_ADDRESSES_WRITTEN: u64 = 0x5352_4444_414d_454d;
+
+/// How many addresses follow it.
+///
+/// The width of the interface between the driver, this kernel and `bin/ipd`:
+/// `bin/netd`'s `ring::MEMBER_ADDRESS_COUNT` and `bin/ipd`'s `LACP_MACHINES`
+/// are the same four, and the assertion below ties it to the ports this kernel
+/// actually delegates so the two cannot drift apart in silence.
+const NETD_MEMBER_COUNT: usize = 4;
+
+const _: () = assert!(X722_MEMBERS as usize <= NETD_MEMBER_COUNT);
+
 /// The VLAN this interface's frames carry, or zero for untagged.
 ///
 /// Zero on every lane, because QEMU's built-in network is untagged. It is a
@@ -14801,11 +14829,12 @@ const NET_ADDRESS: [u8; 4] = [10, 0, 2, 15];
 /// Called once `netd` has reported the MAC, because the MAC is a number only a
 /// driver holding the device can read. Until then the page is zeroes with no
 /// marker, and `ipd` waits rather than believing them.
-fn publish_net_config(hhdm: u64, mac: u64) -> bool {
+fn publish_net_config(hhdm: u64, mac: u64, members: [u64; NETD_MEMBER_COUNT]) -> bool {
     publish_net_config_with(
         hhdm,
         mac,
         NET_PORTS.load(core::sync::atomic::Ordering::Acquire),
+        members,
     )
 }
 
@@ -14818,7 +14847,12 @@ fn publish_net_config(hhdm: u64, mac: u64) -> bool {
 static NET_PORTS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
 
 /// As [`publish_net_config`], with the port count stated.
-fn publish_net_config_with(hhdm: u64, mac: u64, ports: u64) -> bool {
+fn publish_net_config_with(
+    hhdm: u64,
+    mac: u64,
+    ports: u64,
+    members: [u64; NETD_MEMBER_COUNT],
+) -> bool {
     use core::sync::atomic::Ordering;
 
     let raw = NET_CONFIG.load(Ordering::Acquire);
@@ -14832,6 +14866,9 @@ fn publish_net_config_with(hhdm: u64, mac: u64, ports: u64) -> bool {
         return false;
     }
     let address = u32::from_be_bytes(NET_ADDRESS);
+    /// Words of the configuration page that are the interface's own, before the
+    /// members' addresses are appended.
+    const FIXED_CONFIG_WORDS: usize = 7;
     // **What the interface is, not only what address it holds.** RFC 0074:
     // `bin/ipd` binds to an interface, so it needs the VLAN its frames carry
     // and the largest one it may build. A VLAN of zero means untagged, which
@@ -14850,6 +14887,20 @@ fn publish_net_config_with(hhdm: u64, mac: u64, ports: u64) -> bool {
         // switch will not forward data to a member it has not bundled.
         u64::from(NET_BOND_LACP.load(core::sync::atomic::Ordering::Relaxed)),
     ];
+    // **Each member's own address, words 7 onward.** The bond's address is at
+    // word 1 and is what data leaves under; these are what the links are
+    // *called*, and an LACPDU's source is the address of the link it goes out of
+    // rather than the bond's. Word 7 is member zero's, which normally repeats
+    // word 1 -- said again rather than left implicit, so `bin/ipd` reads every
+    // member the same way instead of special-casing the first.
+    //
+    // Appended by length rather than written out, because a written-out pair
+    // outliving the count beside it is how this file's bond arrived at a
+    // two-element array with four members to put in it -- twice.
+    let mut page = [0u64; FIXED_CONFIG_WORDS + NETD_MEMBER_COUNT];
+    page[..FIXED_CONFIG_WORDS].copy_from_slice(&words);
+    page[FIXED_CONFIG_WORDS..].copy_from_slice(&members);
+    let words = page;
     // SAFETY: a frame this object owns, through the direct map. The marker goes
     // last, so a reader that catches this half-written sees no marker rather
     // than half a configuration.
@@ -16419,6 +16470,47 @@ fn net_domain_mac(hhdm: u64) -> Option<u64> {
     (marker == NETD_MARKER && mac != 0).then_some(mac)
 }
 
+/// Each bond member's **own** station address, once the driver has read them.
+///
+/// [`net_domain_mac`] answers with the *bond's* address, which is member zero's
+/// and which every frame leaves under. This answers with the members', which is
+/// what an LACPDU's source has to be: 802.1AX gives it as the individual
+/// address of the port the PDU goes out of, and four links claiming one address
+/// is not an aggregation any switch can form.
+///
+/// `None` means *not yet* and nothing more. Where there is no report page at
+/// all this answers `Some` zeros, for the same reason [`net_domain_reported`]
+/// answers `true` there: a caller waiting on this is waiting for the driver,
+/// and there is no driver to wait for.
+fn net_domain_members(hhdm: u64) -> Option<[u64; NETD_MEMBER_COUNT]> {
+    use core::sync::atomic::Ordering;
+
+    let none = [0u64; NETD_MEMBER_COUNT];
+    let raw = NET_RINGS.load(Ordering::Acquire);
+    if raw == u64::MAX {
+        return Some(none);
+    }
+    let Some((frames, count)) = shared::frames_of(shared::MemoryId::from_u64(raw)) else {
+        return Some(none);
+    };
+    if count <= NETD_REPORT_PAGE {
+        return Some(none);
+    }
+    let at = hhdm + frames[NETD_REPORT_PAGE] + NETD_MEMBER_ADDRESSES;
+    // SAFETY: a frame this object owns, through the direct map: the sentinel
+    // and then the addresses behind it, which the driver wrote first.
+    let sentinel = unsafe { core::ptr::read_volatile(at as *const u64) };
+    if sentinel != NETD_MEMBER_ADDRESSES_WRITTEN {
+        return None;
+    }
+    let mut addresses = none;
+    for (index, address) in addresses.iter_mut().enumerate() {
+        // SAFETY: as above, one word per member inside the same page.
+        *address = unsafe { core::ptr::read_volatile((at + (index as u64 + 1) * 8) as *const u64) };
+    }
+    Some(addresses)
+}
+
 /// Whether `bin/netd` has written its report yet.
 fn net_domain_reported(hhdm: u64) -> bool {
     use core::sync::atomic::Ordering;
@@ -16773,6 +16865,40 @@ fn report_bond(words: &mut [u64; 29], take: impl Fn(&mut [u64; 29])) {
     }
 }
 
+/// Each bond member's **own** station address, for one line of the report.
+///
+/// **The line exists because the thing it prints was unverifiable without it.**
+/// `bin/ipd` sources each link's LACPDU from that link's own address, and a
+/// boot that printed only the bond's address could not tell four links speaking
+/// under four addresses from four links speaking under one -- which is exactly
+/// the bug being fixed, and exactly the shape of bug this project has three
+/// times mistaken for a measurement: a quantity nobody measured, read as a
+/// measurement of zero.
+///
+/// A `Display` rather than a built string for the reason [`LinkStates`] gives:
+/// this kernel has no allocator where the report is printed.
+struct MemberAddresses([u64; NETD_MEMBER_COUNT]);
+
+impl core::fmt::Display for MemberAddresses {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let mut named = false;
+        for (index, address) in self.0.iter().enumerate() {
+            if *address == 0 {
+                continue;
+            }
+            if named {
+                write!(f, ", ")?;
+            }
+            named = true;
+            write!(f, "port {index} {address:#014x}")?;
+        }
+        if !named {
+            return write!(f, "none -- no member reported one");
+        }
+        Ok(())
+    }
+}
+
 /// Which of a bond's members have their link up, for one line of the report.
 ///
 /// **This was a chain of `if`s written for exactly two members** -- "both",
@@ -16993,7 +17119,9 @@ fn report_net_after_exchange(hhdm: u64) {
     // stayed at 224: the kernel panicked reading past the end and the boot
     // stalled. The length is derived from the array now, so there is one place
     // to be wrong instead of three.
-    let mut ipd = [0u64; 35];
+    // Thirty-eight words and a sentinel, and the last four are `bin/ipd`'s own:
+    // the address each of its LACP machines speaks under -- RFC 0076 step 4.
+    let mut ipd = [0u64; 39];
     // SAFETY: a frame this object owns, through the direct map, read as the
     // little-endian words the service wrote there -- `ipd.len() * 8` bytes of
     // a page, so the read cannot reach past the frame.
@@ -17101,7 +17229,7 @@ fn report_net_after_exchange(hhdm: u64) {
     // the boot report said in a sentence that the switch recorded no partner.
     // Checked on every boot, not only where the words are used, because the
     // cheapest place to catch it is before anybody believes a number.
-    let complete = ipd[34] == IPD_REPORT_TAIL;
+    let complete = ipd[38] == IPD_REPORT_TAIL;
     if !complete {
         println!(
             "\x1b[93m    ipd report     INCOMPLETE: this kernel reads {} words and bin/ipd \
@@ -17159,6 +17287,24 @@ fn report_net_after_exchange(hhdm: u64) {
                 }
             );
         }
+        // **The address each link speaks under** -- words 34 to 37, RFC 0076
+        // step 4.
+        //
+        // Not the system id, which 802.3ad requires every link of one
+        // aggregation to share and which `bin/ipd` does share. This is the
+        // Ethernet header's source, which 802.1AX gives as the individual
+        // address of the port the PDU leaves by -- and it was the bond's
+        // address on every link until 2026-09-10, four ports of one
+        // channel-group each claiming the same one.
+        //
+        // Printed rather than derived into a verdict, because what makes it
+        // wrong is the addresses being *equal* and the reader can see that.
+        if complete {
+            println!(
+                "                   speaking as: {}",
+                MemberAddresses(core::array::from_fn(|n| ipd[34 + n]))
+            );
+        }
         if heard {
             println!(
                 "                   the partner's key is {}",
@@ -17170,8 +17316,8 @@ fn report_net_after_exchange(hhdm: u64) {
             // configured *passive* advertises it clear. That distinction is
             // the difference between "it will never speak first" and "it
             // speaks and refuses us".
-            // **Only if `bin/ipd` actually wrote this far.** Word 34 is a
-            // sentinel it writes past the report; without it these words are
+            // **Only if `bin/ipd` actually wrote this far.** The sentinel it
+            // writes past its last word is what says so; without it these are
             // whatever the page held, and zero is a legitimate value for both
             // of them. That is not hypothetical: `write_report` took a
             // `[u64; 32]` while this read 34, so the two words below went
@@ -20453,8 +20599,17 @@ fn user_shell(handoff: &Handoff) -> Result<(), &'static str> {
         // driver waits on a *remote* party. Its transmit completes at once and
         // its receive does not, so the window has to cover a reply that a
         // network chooses the timing of rather than a disk that answers.
+        //
+        // **And for the members, not only for the report.** `bin/netd`
+        // publishes after every port it brings up, so the marker appears one
+        // port in -- and the configuration below carries every member's own
+        // address, which the driver cannot know until it has asked every port
+        // for one. Reading it at the marker would have published three zeros
+        // and called them addresses. `net_domain_members` answers `Some` at
+        // once where there is no driver to wait for, so no machine without a
+        // NIC pays for this.
         for _ in 0..160 {
-            if net_domain_reported(hhdm) {
+            if net_domain_reported(hhdm) && net_domain_members(hhdm).is_some() {
                 break;
             }
             wait_millis(50);
@@ -20462,10 +20617,15 @@ fn user_shell(handoff: &Handoff) -> Result<(), &'static str> {
         // The configuration, as soon as the driver knows it rather than when its
         // report is printed. `ipd` cannot build an ARP packet without the
         // hardware address, and it holds no device to ask for one.
+        let members = net_domain_members(hhdm).unwrap_or([0; NETD_MEMBER_COUNT]);
         match net_domain_mac(hhdm) {
-            Some(mac) if publish_net_config(hhdm, mac) => {
+            Some(mac) if publish_net_config(hhdm, mac, members) => {
                 println!(
                     "    net config     interface told to ipd: mac {mac:#014x}, address 10.0.2.15"
+                );
+                println!(
+                    "    net config     each link speaks under its own address: {}",
+                    MemberAddresses(members)
                 );
             }
             Some(_) => println!(

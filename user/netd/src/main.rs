@@ -114,6 +114,12 @@ const X722_FIRST_SLOT: u64 = 16;
 /// one channel-group, so a bond of two was the wrong shape for that wire.
 const X722_MEMBERS: usize = 4;
 
+/// And the report's block of member addresses is the same width, because a
+/// fifth port would have an address with nowhere to publish it. Asserted rather
+/// than commented: two constants that must agree and do not have to is how this
+/// file's bond spent two changes with a two-element array and four members.
+const _: () = assert!(X722_MEMBERS == ring::MEMBER_ADDRESS_COUNT);
+
 /// Slot `offset` of port `nth`'s grant.
 ///
 /// **The layout is `bhaskix_i40e::grant`'s**, not this file's and not the
@@ -383,6 +389,33 @@ mod ring {
     /// across; in active-backup only the one carrying does, and a backup's
     /// frames would arrive twice.
     pub const BOND_IS_LACP: u64 = REPORT + 41 * 8;
+
+    /// **Each member's own station address**, one word each, at word 32.
+    ///
+    /// Word 1 of the report is the *bond's* address, which is member zero's,
+    /// and until 2026-09-10 it was the only address anything above this program
+    /// could see. So every frame `bin/ipd` built left under one address
+    /// whichever link carried it -- including the four LACPDUs of a four-link
+    /// aggregation, and 802.1AX says an LACPDU's source is the individual
+    /// address *of the port* it goes out of.
+    ///
+    /// The word here is a sentinel and the addresses follow it, one per member,
+    /// zero where there is no member. The sentinel is what makes *not written
+    /// yet* different from *no address*: the kernel waits for it before telling
+    /// `bin/ipd` what the interface is, and without it a bring-up that reports
+    /// after every port would be read one port in, with three addresses that
+    /// had not been asked for yet published as zeros.
+    pub const MEMBER_ADDRESSES: u64 = REPORT + 32 * 8;
+
+    /// Written at [`MEMBER_ADDRESSES`], after the addresses behind it.
+    pub const MEMBER_ADDRESSES_WRITTEN: u64 = 0x5352_4444_414d_454d;
+
+    /// How many addresses follow the sentinel.
+    ///
+    /// The same four `X722_MEMBERS` is and `bin/ipd`'s `LACP_MACHINES` is: this
+    /// is the width of the interface between them, so all three are one number
+    /// or two of them are wrong.
+    pub const MEMBER_ADDRESS_COUNT: usize = 4;
 }
 
 /// Offsets into the common configuration structure, from the specification.
@@ -1314,6 +1347,18 @@ extern "C" fn netd_main() -> ! {
                 found[X722_MEMBERS - 1].pair(),
             );
         }
+        // **Every member's own address, now that every member is known.**
+        //
+        // Deliberately outside the loop above, which publishes after each port
+        // so that a port that faults does not take the previous port's findings
+        // with it. This block is the opposite case: it is read by the kernel to
+        // decide what to tell `bin/ipd`, and a block published one port in
+        // would say three of the four links have no address of their own.
+        let mut addresses = [0u64; ring::MEMBER_ADDRESS_COUNT];
+        for (slot, fact) in addresses.iter_mut().zip(found.iter()) {
+            *slot = fact.address();
+        }
+        member_address_report(addresses);
         if members.iter().any(Option::is_some) {
             carry_x722(members, found);
         }
@@ -1343,6 +1388,10 @@ extern "C" fn netd_main() -> ! {
     };
 
     let Some((mut receive, mut transmit, reports_link)) = bring_up(first) else {
+        // No member came up, so no member has an address -- said rather than
+        // left unwritten, because the kernel waits for this block and a driver
+        // that never publishes it would hold the boot for the whole window.
+        member_address_report([0; ring::MEMBER_ADDRESS_COUNT]);
         report(0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
         exit()
     };
@@ -1498,10 +1547,15 @@ extern "C" fn netd_main() -> ! {
         if mapped == status::OK
             && let Some((mut receive, transmit, reports_link)) = bring_up(second)
         {
-            // **This member's own address is read by nobody**, and that is
-            // the bond saying what it is: every frame leaves under the first
-            // member's address whichever member carries it, so a second address
-            // would be a fact with no consumer. See `bond_mac`.
+            // **This member's own address is read below**, and until
+            // 2026-09-10 it was read by nobody -- every frame left under the
+            // first member's address whichever member carried it, so a second
+            // address was a fact with no consumer. It has one now: RFC 0076
+            // step 4 sources each link's LACPDU from the link's own address,
+            // which is what 802.1AX says an LACPDU's source is. What has *not*
+            // changed is where data leaves under: that is still the bond's
+            // address, which is RFC 0074's rule and the reason a failover does
+            // not change what the far end has learnt.
             post_receive_buffers(&mut receive, second);
             // SAFETY: the second common window is mapped and its queues are
             // enabled.
@@ -1530,6 +1584,24 @@ extern "C" fn netd_main() -> ! {
             });
         }
     }
+
+    // **Every member's own address, now that both ports have been tried.**
+    //
+    // This member's address used to be read by nobody, and the comment where it
+    // is brought up said so: every frame left under the first member's address
+    // whichever member carried it, so a second address was a fact with no
+    // consumer. RFC 0076 step 4 gave it one -- `bin/ipd` sources each link's
+    // LACPDU from the link's own address -- so it is read here, off the device
+    // configuration window each port was brought up through.
+    let mut addresses = [0u64; ring::MEMBER_ADDRESS_COUNT];
+    for (slot, port) in addresses.iter_mut().zip(ports.iter()) {
+        if let Some(port) = port {
+            // SAFETY: the device configuration window this port was brought up
+            // through, mapped read-only above.
+            *slot = unsafe { station_address(port.at.device) };
+        }
+    }
+    member_address_report(addresses);
 
     // **Which member carries traffic.** Active-backup, which is RFC 0074's
     // first mode because it needs no protocol and no cooperation from the
@@ -2288,9 +2360,17 @@ fn carry_x722(mut members: [Option<X722Member>; X722_MEMBERS], facts: [X722; X72
     }
 
     // **The bond's address is its first member's**, RFC 0074's rule, and the
-    // kernel has already told `bin/ipd` that same address. So everything this
-    // sends carries port 0's address whichever port carries it -- which is
-    // exactly the case a real switch may refuse, and the reason step 3 exists.
+    // kernel has already told `bin/ipd` that same address. So the *data* this
+    // sends carries port 0's address whichever port carries it, which is what
+    // makes a failover invisible to the far end.
+    //
+    // **Control frames are the exception, and were not.** An LACPDU is not
+    // traffic on the bond -- it is a link talking about itself -- and 802.1AX
+    // gives its source as the individual address of the port it leaves by.
+    // Every one of them left under port 0's address until 2026-09-10, four
+    // links claiming one address on four ports of one channel-group. The
+    // members' own addresses go on the report at `ring::MEMBER_ADDRESSES` so
+    // `bin/ipd` can put each link's own address on each link's PDU.
     let (state, firmware) = facts[0].words();
     let bond_address = facts[0].address();
     let address = facts[0].mac;
@@ -2950,6 +3030,44 @@ fn x722_transmit_report(multicast: u64, override_ok: bool) {
     unsafe {
         core::ptr::write_volatile(at as *mut u64, multicast | u64::from(override_ok) << 32);
     }
+}
+
+/// Publishes each member's own station address -- [`ring::MEMBER_ADDRESSES`].
+///
+/// **Called once every member is known**, not after each one, and the sentinel
+/// is written last. Those two together are what let the kernel read this block
+/// and believe it: a member whose address has not been asked for yet is
+/// indistinguishable from one that has none, and the whole point of the block
+/// is to tell `bin/ipd` which link speaks under which address.
+fn member_address_report(addresses: [u64; ring::MEMBER_ADDRESS_COUNT]) {
+    let at = RINGS_AT + ring::MEMBER_ADDRESSES;
+    // SAFETY: the report page this program mapped writable, past the report
+    // itself and short of the kernel's own words at 40 and 41.
+    unsafe {
+        for (index, address) in addresses.iter().enumerate() {
+            core::ptr::write_volatile((at + (index as u64 + 1) * 8) as *mut u64, *address);
+        }
+        core::ptr::write_volatile(at as *mut u64, ring::MEMBER_ADDRESSES_WRITTEN);
+    }
+}
+
+/// A virtio network device's station address, as one word.
+///
+/// The same six bytes the bring-up reads for its own use, in the shape the
+/// report carries an address in -- most significant octet first, so a MAC
+/// prints as it is written.
+///
+/// # Safety
+///
+/// `device_at` must be a device-configuration window this program has mapped:
+/// a network device's MAC is its first six bytes.
+unsafe fn station_address(device_at: u64) -> u64 {
+    let mut value = 0u64;
+    for octet in 0..6 {
+        // SAFETY: delegated to the caller.
+        value = (value << 8) | u64::from(unsafe { read8(device_at + octet) });
+    }
+    value
 }
 
 /// Publishes how much the bond has carried since it failed over -- word 26.

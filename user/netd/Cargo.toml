@@ -192,4 +192,19 @@ asm_budget = 3
 # on. The word also carries whether `allow_destination_override` succeeded,
 # because that command's result was being discarded and a switch control tag is
 # not permitted without it.
-unsafe_budget = 364
+# 372 at RFC 0076 step 4, the members' own addresses: eight lines across three
+# places. One writes the block of station addresses the kernel reads to tell
+# `bin/ipd` what each link is called; one reads a virtio port's address out of
+# its device configuration window, which is six bytes this driver already read
+# for the first port and had no consumer for on the second; and one calls that
+# for each member of the virtio bond.
+#
+# **The address a control frame leaves under is not the address data leaves
+# under**, and this driver published only the second. 802.1AX gives an LACPDU's
+# source as the individual address of the port it goes out of; every one of them
+# left under port 0's address, four links of one channel-group claiming one
+# address. The comment beside the second port's bring-up said its address was
+# "read by nobody" and that was true -- which is the whole reason the eight
+# lines are here rather than the address being read where it always could have
+# been.
+unsafe_budget = 372

@@ -764,7 +764,17 @@ asm_budget = 10
 #
 # One line and not six: the address is computed before the block, so what is
 # unsafe is the store and nothing else.
-unsafe_budget = 2019
+# 2020 at RFC 0076 step 4: **one** volatile read, the sentinel that says
+# `bin/netd` has finished filling in its members' addresses. The addresses
+# themselves are read in a loop whose body is one already-counted line.
+#
+# The sentinel is the point of it. That driver publishes its report after every
+# port it brings up, so the marker appears one port in -- and three addresses
+# nobody had asked for yet would have been published to `bin/ipd` as three
+# members with no address of their own, which is a thing that can also be true.
+# This kernel has three times read a quantity that was never measured as a
+# measurement of zero; the extra word is what makes the fourth time impossible.
+unsafe_budget = 2020
 # Up thirty-one for RFC 0005 step 9's socket probe -- `ring3_socketeer`, which
 # is `ring3_lister` with a `sockaddr_in6` copied in beside its code instead of
 # two filenames. The same two blocks every hosted probe has: one

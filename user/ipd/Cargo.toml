@@ -143,4 +143,9 @@ asm_budget = 4
 # report lets the kernel prove the page was written to its full length instead
 # of assuming it. A marker at word 0 says *a* report is here; the tail says
 # *all* of it is. That is the seven lines.
-unsafe_budget = 172
+# 175 at RFC 0076 step 4: three lines, one volatile read per bond member off the
+# configuration page. What each link is *called* -- as against what the bond is
+# called, which is word 1 and which every datagram still leaves under. An
+# LACPDU's source is the individual address of the port it leaves by, and this
+# service had only one address to put on all four.
+unsafe_budget = 175

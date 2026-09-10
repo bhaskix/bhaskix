@@ -870,3 +870,149 @@ fits the evidence — all four links identical, frames leaving, nothing arriving
 and it is the first thing to try. Testing it means carrying every member's
 address on the configuration page so each machine sources from its own port,
 which is a change to that interface rather than a one-line fix.
+
+### Every link under its own address — 2026-09-10
+
+The hypothesis above is now built. What it took was not a one-line fix, because
+the address a link is called by had nowhere to travel: `bin/netd` published one
+address, the kernel passed on one address, and `bin/ipd` had one address to put
+on four frames. Three interfaces widened, in the same shape each time — a block
+of member addresses, and a sentinel saying the block has been filled in.
+
+**`bin/netd`, `ring::MEMBER_ADDRESSES`.** Word 32 of the report page is a
+sentinel and four addresses follow it, one per member, zero where there is no
+member. Every X722 port already read its own address off firmware and threw
+three of them away; every virtio port already had its device-configuration
+window mapped, and the comment beside the second one said in as many words that
+its address *was read by nobody*. Both are read now.
+
+**The sentinel is not decoration.** That driver publishes its report after each
+port it brings up — deliberately, so a port that faults does not take the
+previous port's findings with it — so the marker appears one port in. The kernel
+reads the configuration the moment the marker appears. Without a sentinel it
+would have read three addresses that had not been asked for yet, published them
+as zeros, and `bin/ipd` could not have told those from three members that have no
+address. That is the same defect as the report-page words, the partner's flag
+byte and `GLV_MPTCL`, in its **fourth** form, and this time it was designed
+against rather than discovered.
+
+**The kernel, configuration words 7 to 10.** One address per member, appended by
+length rather than written out — this file has twice recorded a written-out pair
+outliving the count beside it, and the bond's link bitmap is one of them.
+
+**`bin/ipd`, `Bundle::source`.** Each machine's Ethernet header now carries its
+own member's address. The LACP **system id** is untouched and shared, which
+802.3ad requires: the system id is what says these links may aggregate together,
+and four links advertising four system ids would be four aggregations of one.
+What changed is a different field with a different rule.
+
+A member with no address of its own falls back to the bond's, which is where
+this service was before — worse than the port's, better than a frame with no
+source at all. The source is refreshed on every pass rather than fixed when the
+machine is created, because a member's address arrives when its port comes up
+and that can be after this service has started speaking for it.
+
+**What the boot says now**, from the `test-bond` lane, which has two virtio ports
+with distinct addresses and is the first lane able to see any of this:
+
+```
+net config   interface told to ipd: mac 0x525400123456, address 10.0.2.15
+net config   each link speaks under its own address: port 0 0x525400123456, port 1 0x525400123457
+ipd lacp     state 0x07 -- speaking, and nothing has answered
+             speaking as: port 0 0x525400123456, port 1 0x525400123457
+```
+
+Two lines, because they answer different questions. The first is what the kernel
+*published*; the second is what `bin/ipd` *did with it*, read back off its own
+report at words 34 to 37. A boot that shows four identical addresses on the
+second line has found the bug rather than hidden it, and `tests/qemu/bond-test.sh`
+fails on exactly that.
+
+### What this does not claim
+
+**The switch has not been asked yet.** This is a conformance fix with a
+hypothesis attached, and the two should not be confused:
+
+* That an LACPDU's source is the individual address of the port it leaves by is
+  **recalled from 802.1AX §6.4.4 and not verified against a copy of the standard
+  on this machine.** The project's rule is to say so rather than assert a
+  specification from memory. It is also the only reading under which a
+  per-port `Actor_Port` makes sense, which is weak evidence and is offered as
+  such.
+* **The MAC-flap reasoning is weaker than it was written.** Linux's bonding
+  driver puts the *bond's* address on every slave in 802.3ad mode by default, so
+  if one address across four links were on its own fatal to LACP, Linux would
+  not aggregate either — and it plainly does. That argument is recorded here
+  because it was the one that motivated the work, and it should not be quoted
+  later as though it survived.
+
+So what is now true is narrower and worth stating plainly: **the frames are
+correct in a way they were not before, and whether the switch cares is the next
+boot's question.** If `DEFAULTED` clears, the hypothesis was right. If it does
+not, the remaining suspects are what the switch's channel-group is configured to
+expect and whether the VLAN tag on an uplink-tagged frame is what that
+configuration will accept — neither of which this host can read off the wire.
+
+
+### The switch was asked, and said no — 2026-09-10
+
+The boot happened. Same command line as the one before it, so the two are
+comparable: `bhaskix.bondlacp bhaskix.vlan=17 bhaskix.lacp=90000
+bhaskix.x722=120000`.
+
+```
+net config   each link speaks under its own address:
+             port 0 0x0894ef7afc8e, port 1 0x0894ef7afc8f,
+             port 2 0x0894ef7afc90, port 3 0x0894ef7afc91
+net x722     38 multicast frame(s) left the vsi by its own count; destination override taken
+net bond     4 member(s), 802.3ad; traffic on port 0, link up on every one of them
+ipd lacp     44 LACPDU(s) sent, 12 slow-protocol frame(s) heard back
+ipd lacp     state 0x05 -- a partner is heard but the link is not yet aggregated
+             per link: link 0 0x05, link 1 0x05, link 2 0x05, link 3 0x05
+             speaking as: port 0 0x0894ef7afc8e, port 1 0x0894ef7afc8f,
+                          port 2 0x0894ef7afc90, port 3 0x0894ef7afc91
+             the partner says: link 0 0x45, link 1 0x45, link 2 0x45, link 3 0x45
+             so the switch is LACP active
+             and records its partner as key 0, port 0 -- ours are key 1, port 1
+```
+
+**The change works and the hypothesis is dead.** Four links speak under four
+addresses, the card's own port MACs, carried the whole way from firmware through
+`bin/netd`'s report and the kernel's configuration page into `bin/ipd`'s Ethernet
+headers. And the switch's answer did not move by one bit: `0x45` on all four
+links, `DEFAULTED` still set, partner still recorded as key 0, port 0.
+
+So the section above stands as written, including the part that said the
+MAC-flap reasoning was the weaker half. It was the weaker half. **A shared source
+address is not what is keeping this switch from aggregating**, and the fix that
+came out of that reasoning is worth keeping on conformance grounds alone —
+which is the only claim that survives.
+
+**The other suspect named above is also ruled out, from the code rather than by
+guessing.** `bin/ipd`'s `frame` writes a plain untagged Ethernet header, so the
+LACPDUs go out untagged despite `bhaskix.vlan=17`. That is what the standard
+asks for — a slow protocol is a link talking about itself, not traffic on a
+VLAN — and it means the tag cannot be what the switch is refusing.
+
+**What this boot also confirmed**, none of it the subject and all of it worth
+having: the widened report is written in full, with no `ipd report INCOMPLETE`,
+so the sentinel survives a report that grew by four words; `4 x722 port(s)
+delegated` with domains 8 to 11; `56 of 64` memory objects and `365 KiB` of fixed
+tables, both tables landing where the arithmetic said.
+
+### What is left, and the instrument it needs
+
+**A gap that has been in every one of these reports and was not read until now**:
+44 LACPDUs sent, **38** multicast frames out of the VSI. The boot before it was
+44 and 34. Six frames are unaccounted for in both, and nothing here says where.
+
+`GLV_MPTCL` counts what the **VSI** put out. There is a port-level counter,
+`GLPRT_MPTC`, that counts what the **MAC** put out, and it is not mapped. That
+pair is the one measurement that would separate the two remaining stories — a
+frame that left the internal switch and reached the wire, against one that left
+the internal switch and died before the MAC — and it is exactly the shape of
+question `GLV_MPTCL` itself was added to answer one step earlier.
+
+Until that is measured, the honest position is that **the transmit path is proven
+as far as the VSI and no further**, and every conclusion about what the switch
+did or did not receive rests on that boundary.
