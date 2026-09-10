@@ -1420,3 +1420,75 @@ If the head starts moving and the multicast count climbs, the depth was the
 constraint. If it reads as it did before — head short of the cursor, most posts
 unwritten-back — then the granularity is the constraint after all and the padding
 is the thing to get right, one change at a time.
+
+
+### Where the padding goes decides whether the queue runs at all — 2026-09-10
+
+The depth landed alone and helped. The padding was then tried alone, twice, and
+the two placements are opposite results on the same depth and the same command
+line:
+
+| | no padding | NOPs **behind** the frame | NOPs **in front** |
+|---|---|---|---|
+| `QTX_HEAD` vs cursor | 10 vs 59 — behind | **0 vs 88 — dead** | **31 vs 24 — caught up** |
+| plain frames unwritten | 0 of 27 | 26 of 27 | 0 of 27 |
+| uplink frames unwritten | 24 of 32 | 44 of 44 | 27 of 36 |
+| multicast out of the VSI | 18 | **0** | 19 |
+
+**A NOP is a context descriptor, and a context descriptor is also how a command
+begins.** Six of them at the end of a fetched line read as a command whose data
+descriptor has not arrived, and the device waits — which is a head pinned at
+zero and nothing transmitted at all. In front of the frame they sit between the
+previous command's `EOP` and this one, the line ends on a data descriptor, and
+**the device consumes everything the driver posts.** 38.31.2.1.2's *"permitted
+only between commands"* is satisfied either way on a plain reading; only the
+machine distinguishes them.
+
+So the ring side is now correct, and it was a real defect: the receive ring
+honoured the fetch granularity and the transmit ring never did. Plain frames went
+from 85% completed to **27 of 27**.
+
+**And the frames still do not go out.** 18 → 19 multicast is not a result. What
+changed is *where* they stop, and the report's own verdict flipped from *"not
+fetched: the head is behind"* to *"fetched and dropped: the head caught up and
+the write-backs did not"* — which is the discrimination that line exists for.
+
+**The device now fetches uplink-tagged descriptors and discards them without a
+write-back, while plain frames are perfect.** That is as specific as this side
+can get, and it is no longer a statement about the ring. It points at the
+control-VSI reading recorded earlier: the EMP holds the MAC's control port, this
+driver's VSI carries the Allow Destination Override flag but is not that control
+port, and §38.28 says a PF taking ownership *"should notify the EMP using Stop
+LLDP Agent"*. Sending that command changes the management firmware's behaviour on
+a live cluster node, so it is the machine owner's decision and not a thing to try
+casually.
+
+### A build defect that invalidated a boot, and three others like it
+
+The first attempt at the padding alone measured *nothing at all* — every figure
+byte-identical to the boot before it, including a transmit cursor of 59, which
+cannot be a sum of four multiples of eight. The image did not contain the change:
+`bin/netd` in it was built forty-five minutes before the edit.
+
+Its make rule named its own sources and two crates:
+
+```make
+$(USER_NETD): $(NETD_DIR)/src/main.rs $(NETD_DIR)/link.ld $(NETD_DIR)/Cargo.toml \
+              $(wildcard abi/src/*.rs) $(wildcard device/src/*.rs)
+```
+
+`bin/netd` links `bhaskix-i40e`, and `i40e/src` is not there — so a change
+confined to that crate never rebuilt it. **A survey of every user-binary rule
+found four that could ship a stale binary**: `netd` missing `i40e`, `blkd`
+missing `device`, `linuxd` missing `elf`, `rand` and `sock`, and `shell` missing
+`pkg`. All four are fixed, and the fix was proven rather than assumed — `touch
+i40e/src/lib.rs` now rebuilds `netd`, where before it did not.
+
+The earlier boots are unaffected, and that was checked rather than hoped: each of
+them also changed `user/netd/src/main.rs`, so the rule fired for a reason that
+had nothing to do with the crate the change was in.
+
+**A second boot was wasted for a reason of my own.** The previous serial session
+was still attached, so the next `console 1` was refused with `clish launch
+SerRedir exist` and the machine booted blind. The BMC allows one console session:
+closing it belongs to finishing a boot, not to tidying up afterwards.
