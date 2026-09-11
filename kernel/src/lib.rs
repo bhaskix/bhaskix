@@ -14890,6 +14890,30 @@ const NETD_MEMBER_OUT_WRITTEN: u64 = 1 << 63;
 /// Bits each member's count takes in those two words.
 const NETD_MEMBER_OUT_BITS: u32 = 13;
 
+/// Byte offset of the first thirty-two bytes of the last uplink-tagged frame
+/// handed to the device, four words.
+///
+/// **Because the LACPDU has only ever been checked by reading the code that
+/// builds it.** Every fix in this driver came from reading what the machine
+/// holds -- `RDYList`, `GLLAN_TXPRE_QDIS`, the malicious-driver clear -- and the
+/// protocol was verified by reading `Pdu::write` and its TLV offsets, which is
+/// the code checked against itself. Thirty-two bytes covers the Ethernet
+/// header, the subtype and version and the whole actor TLV: everything a switch
+/// looks at before deciding an LACPDU is one.
+const NETD_SENT_FRAME: u64 = 48 * 8;
+/// Both frames' lengths, sent at 15:0 and heard at 31:16, bit 63 set when taken.
+///
+/// **The length is the one thing code review cannot check.** A frame truncated
+/// anywhere between `frame()` and the descriptor's `BSIZE` reaches the switch
+/// short and is discarded, and every counter in this report still reads exactly
+/// as it does now.
+const NETD_FRAME_LENGTHS: u64 = 52 * 8;
+/// And the first thirty-two bytes of the last slow-protocol frame the switch
+/// sent us -- the one LACPDU on this wire known to be acceptable to something.
+const NETD_HEARD_FRAME: u64 = 53 * 8;
+/// Bit 63 of [`NETD_FRAME_LENGTHS`]: both were taken.
+const NETD_FRAMES_WRITTEN: u64 = 1 << 63;
+
 /// The sentinel `bin/netd` writes there.
 const NETD_MEMBER_ADDRESSES_WRITTEN: u64 = 0x5352_4444_414d_454d;
 
@@ -16689,6 +16713,7 @@ fn net_domain_transmitted(hhdm: u64) -> Option<Transmitted> {
         member_vlan_flags,
         member_vsi_out,
         member_port_out,
+        frame_lengths,
     ) = unsafe {
         (
             core::ptr::read_volatile(at as *const u64),
@@ -16706,6 +16731,7 @@ fn net_domain_transmitted(hhdm: u64) -> Option<Transmitted> {
             core::ptr::read_volatile((page + NETD_MEMBER_VLAN_FLAGS) as *const u64),
             core::ptr::read_volatile((page + NETD_MEMBER_VSI_OUT) as *const u64),
             core::ptr::read_volatile((page + NETD_MEMBER_PORT_OUT) as *const u64),
+            core::ptr::read_volatile((page + NETD_FRAME_LENGTHS) as *const u64),
         )
     };
     // Bit 33 says the driver measured them. Without it, zero is what a port
@@ -16729,6 +16755,20 @@ fn net_domain_transmitted(hhdm: u64) -> Option<Transmitted> {
         member_vlan_flags,
         member_vsi_out,
         member_port_out,
+        frame_lengths,
+        // SAFETY: the same frame, through the direct map -- eight more words
+        // `x722_transmit_report` writes, read volatile for the same reason.
+        sent_frame: unsafe {
+            core::array::from_fn(|index| {
+                core::ptr::read_volatile((page + NETD_SENT_FRAME + index as u64 * 8) as *const u64)
+            })
+        },
+        // SAFETY: as above, for the four words beside them.
+        heard_frame: unsafe {
+            core::array::from_fn(|index| {
+                core::ptr::read_volatile((page + NETD_HEARD_FRAME + index as u64 * 8) as *const u64)
+            })
+        },
     })
 }
 
@@ -16787,6 +16827,12 @@ struct Transmitted {
     member_vsi_out: u64,
     /// And out of its MAC port -- see [`NETD_MEMBER_PORT_OUT`].
     member_port_out: u64,
+    /// Both frames' lengths -- see [`NETD_FRAME_LENGTHS`].
+    frame_lengths: u64,
+    /// The frame handed to the device -- see [`NETD_SENT_FRAME`].
+    sent_frame: [u64; 4],
+    /// The frame the switch sent -- see [`NETD_HEARD_FRAME`].
+    heard_frame: [u64; 4],
 }
 
 /// Whether `bin/netd` has written its report yet.
@@ -17892,6 +17938,43 @@ fn report_net_after_exchange(hhdm: u64) {
                             "                   \x1b[91mone port carried them all -- the other \
                              members' frames left by somebody else's mac, so their switch ports \
                              heard nothing\x1b[0m"
+                        );
+                    }
+                }
+                // **The bytes, both directions.** The protocol has only ever
+                // been checked by reading the code that builds it; this is what
+                // the device is handed, beside the switch's own frame, which is
+                // the one slow-protocol frame on this wire something accepts.
+                if out.frame_lengths & NETD_FRAMES_WRITTEN != 0 {
+                    let sent = out.frame_lengths & 0xffff;
+                    let heard = out.frame_lengths >> 16 & 0xffff;
+                    for (what, length, words) in [
+                        ("sent ", sent, &out.sent_frame),
+                        ("heard", heard, &out.heard_frame),
+                    ] {
+                        print!("                   lacpdu {what} {length:>3} bytes:");
+                        if length == 0 {
+                            println!(" none taken");
+                            continue;
+                        }
+                        for (index, word) in words.iter().enumerate() {
+                            for byte in 0..8 {
+                                if index * 8 + byte >= 32 {
+                                    break;
+                                }
+                                print!(" {:02x}", word >> (8 * byte) & 0xff);
+                            }
+                        }
+                        println!();
+                    }
+                    // An LACPDU is 110 bytes behind a 14-byte header. A frame
+                    // that leaves this host shorter than that arrives at the
+                    // switch short and is discarded, and nothing else here
+                    // would say so.
+                    if sent != 0 && sent != 124 {
+                        println!(
+                            "                   \x1b[91mthe frame handed to the device is \
+                             {sent} bytes, not 124 -- a short LACPDU is discarded\x1b[0m"
                         );
                     }
                 }

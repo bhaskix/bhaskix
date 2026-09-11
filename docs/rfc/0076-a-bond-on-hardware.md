@@ -2541,3 +2541,51 @@ with each member's MAC port number beside them — because *"which port did this
 member read"* is the other half of believing the answer, and the three numbers
 that agree on a single-port card (VSI, member index, MAC port) have already been
 confused once in this driver.
+
+
+### All four wires carry — 2026-09-12
+
+```
+per member, multicast out of the vsi / the mac: member 0 (mac port 0) 21/21;
+  member 1 (mac port 1) 11/11; member 2 (mac port 2) 11/11; member 3 (mac port 3) 11/11;
+```
+
+Four **distinct** MAC ports, all four transmitting, and on every member the VSI
+count equals the MAC count — nothing is lost between the VSI and the wire.
+Member 0's 21 is its extra share: it also carries the bond's announcements.
+
+So the single-uplink reading is dead, and with it the last structural
+explanation on this side. **Four hypotheses killed in a row** — `QTX_CTL`, the
+descriptor checks, the VLAN section, the single uplink — each fitting the
+evidence before its boot.
+
+### What was never done — 2026-09-12
+
+Every fix in this work came from reading what the machine holds: `RDYList` out
+of the VSI's own context, `GLLAN_TXPRE_QDIS`'s absolute index, the
+malicious-driver clear that did not clear. The LACPDU has only ever been checked
+by **reading the code that builds it** — `Pdu::write`, the TLV offsets, the
+frame builder, the tagging exemption. That is the code checked against itself,
+which is exactly the mistake the `QS_Handle` test made until its parse was
+factored into `VsiParameters::from_context`.
+
+The bytes that reach the device have never been printed, and neither have the
+bytes of a switch LACPDU that arrives here and parses.
+
+So both go on the report: thirty-two bytes of the last uplink-tagged frame,
+taken out of the packet buffer the descriptor names, after the copy and before
+the doorbell — and thirty-two bytes of the last slow-protocol frame the switch
+sent, which is the one LACPDU on this wire known to be acceptable to something.
+Thirty-two covers the Ethernet header, the subtype and version, and the whole
+actor TLV: everything a switch reads before deciding an LACPDU is one.
+
+**With both lengths, because a length is what code review cannot check.** An
+LACPDU is 110 bytes behind a 14-byte header. A frame truncated anywhere between
+`frame()`'s return and the descriptor's `BSIZE` reaches the switch short and is
+discarded — and every counter in this report would still read exactly as it does
+now: posted, completed, counted out of the VSI, counted out of the MAC. The
+kernel says so outright when the sent frame is not 124 bytes.
+
+If the two dumps differ in structure, that is the fault. If they do not, the
+frame leaving this host is correct on the wire and what remains is the switch's
+configuration — which is the one thing this machine cannot read.

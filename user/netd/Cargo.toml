@@ -338,4 +338,19 @@ asm_budget = 3
 # is what a `SWTCH` uplink resolving to one switch element's uplink would do.
 # Each member's MAC port number rides with them, because "which port did this
 # member read" is the other half of believing the answer.
-unsafe_budget = 461
+#
+# That answered it: 21/21, 11/11, 11/11, 11/11 across MAC ports 0, 1, 2 and 3.
+# All four wires carry, VSI count equals MAC count on every member, and the
+# single-uplink reading is dead. Four hypotheses killed in a row.
+#
+# 490 for the thing never done. Every fix in this driver came from reading what
+# the machine holds -- RDYList, GLLAN_TXPRE_QDIS, the malicious-driver clear --
+# and the LACPDU has only ever been checked by reading `Pdu::write` and its TLV
+# offsets, which is the code checked against itself. So thirty-two bytes of the
+# frame handed to the device, taken out of the buffer the descriptor names, and
+# thirty-two of the switch's own frame arriving beside it: the one slow-protocol
+# frame on this wire that something accepts. With both lengths, because a length
+# is what code review cannot check -- a frame truncated anywhere between
+# `frame()` and the descriptor's BSIZE reaches the switch short and is
+# discarded, and every counter here still reads exactly as it does now.
+unsafe_budget = 490

@@ -1188,6 +1188,37 @@ unsafe fn read_runs_into(into: *mut u8, runs: (chan::Run, chan::Run)) {
 /// # Safety
 ///
 /// The return ring must be mapped at [`BACK_AT`] and the rings at [`RINGS_AT`].
+/// The Slow Protocols EtherType, which LACP rides on -- IEEE 802.3 Clause 57.
+const SLOW_PROTOCOLS: u16 = 0x8809;
+
+/// The first thirty-two bytes at `at`, as four little-endian words.
+///
+/// **Because every fix in this driver came from reading what the machine holds,
+/// and the LACPDU's bytes have never been read.** The protocol was checked by
+/// reading `Pdu::write` and the TLV offsets, which is checking the code against
+/// itself -- the same mistake the `QS_Handle` test made until its parse was
+/// factored out. Thirty-two bytes covers the Ethernet header, the subtype and
+/// version, and the whole actor TLV: everything a switch looks at before
+/// deciding whether an LACPDU is one.
+///
+/// # Safety
+///
+/// `at` must be thirty-two readable bytes in a region this program mapped.
+unsafe fn first_thirty_two(at: u64) -> [u64; 4] {
+    let mut words = [0u64; 4];
+    for (index, word) in words.iter_mut().enumerate() {
+        let mut value = 0u64;
+        for byte in 0..8u64 {
+            // SAFETY: the caller's, for an offset inside the thirty-two bytes.
+            let octet =
+                unsafe { core::ptr::read_volatile((at + index as u64 * 8 + byte) as *const u8) };
+            value |= u64::from(octet) << (8 * byte);
+        }
+        *word = value;
+    }
+    words
+}
+
 unsafe fn take_from_ipd_into(buffer: u64, header: u64) -> Option<(usize, Option<u8>, bool)> {
     let layout = chan::Layout::for_region(RING_BYTES)?;
     // SAFETY: the ring's header, in the region this program mapped. Volatile
@@ -2586,6 +2617,15 @@ fn carry_x722(mut members: [Option<X722Member>; X722_MEMBERS], facts: [X722; X72
     // with, and the next frame for that member overwrites it.
     let mut uncompleted = 0u64;
     let mut uplink_uncompleted = 0u64;
+    // **The bytes themselves, both directions.** Every fix in this driver came
+    // from reading what the machine holds; the LACPDU has only ever been
+    // checked by reading the code that builds it. These are the frame the
+    // device is handed and the switch's own frame arriving beside it -- the one
+    // example on this wire of a slow-protocol frame that something accepts.
+    let mut sent_frame = [0u64; 4];
+    let mut sent_length = 0u64;
+    let mut heard_frame = [0u64; 4];
+    let mut heard_length = 0u64;
     // **Where the device's counters stood before this program sent anything.**
     //
     // `GLV_MPTCL` and `GLPRT_MPTCL` are totals since **power-on**, not for this
@@ -2688,6 +2728,22 @@ fn carry_x722(mut members: [Option<X722Member>; X722_MEMBERS], facts: [X722; X72
             // would never hear that link's partner, and the machine speaking
             // for it could not aggregate.
             if length > 0 && (index == active || lacp_bond) {
+                // **And a known-good LACPDU to compare it against.** The
+                // switch's own frames arrive on this ring and are the one
+                // example on this wire of a slow-protocol frame that something
+                // accepts. EtherType at bytes 12-13, big-endian.
+                //
+                // SAFETY: the same buffer the hand-off below reads, which the
+                // device has finished with.
+                let ethertype = unsafe {
+                    u16::from(core::ptr::read_volatile((buffer + 12) as *const u8)) << 8
+                        | u16::from(core::ptr::read_volatile((buffer + 13) as *const u8))
+                };
+                if ethertype == SLOW_PROTOCOLS && length >= 32 {
+                    // SAFETY: as above, with the length checked.
+                    heard_frame = unsafe { first_thirty_two(buffer) };
+                    heard_length = length as u64;
+                }
                 // SAFETY: a buffer this program mapped and the device has
                 // finished with -- the descriptor's write-back is what says so
                 // -- and the ring to `bin/ipd`, mapped writable above.
@@ -2796,6 +2852,18 @@ fn carry_x722(mut members: [Option<X722Member>; X722_MEMBERS], facts: [X722; X72
                     }
                 }
                 if let Some(member) = members[leaves_by].as_mut() {
+                    // **What the device will actually read**, taken after the
+                    // copy and before the doorbell. Only the tagged ones: the
+                    // LACPDU is the frame in question, and a snapshot the
+                    // bond's own announcement overwrote would show the wrong
+                    // one.
+                    if uplink {
+                        // SAFETY: this member's transmit packet buffer, a page
+                        // this program mapped, at the offset the descriptor
+                        // below names.
+                        sent_frame = unsafe { first_thirty_two(member.queues.transmit.at + 2048) };
+                        sent_length = length as u64;
+                    }
                     let at = member.queues.transmit_device + 2048;
                     // **The switch control tag, where `bin/ipd` asked for it.**
                     // Without it the descriptor is *"routed according to
@@ -3105,6 +3173,10 @@ fn carry_x722(mut members: [Option<X722Member>; X722_MEMBERS], facts: [X722; X72
             member_vlan_flags,
             member_vsi_out,
             member_port_out,
+            sent_frame,
+            sent_length,
+            heard_frame,
+            heard_length,
         });
 
         // **Yield rather than spin.** This program is pinned, and there is no
@@ -3542,6 +3614,14 @@ struct TransmitReport {
     /// Each member's multicast frames out of its **MAC port**, thirteen bits
     /// each -- the same frames one boundary further out.
     member_port_out: u64,
+    /// The first thirty-two bytes of the last uplink-tagged frame handed to the
+    /// device, and its length.
+    sent_frame: [u64; 4],
+    sent_length: u64,
+    /// The same for the last slow-protocol frame the switch sent us, which is
+    /// the one LACPDU on this wire known to be acceptable to something.
+    heard_frame: [u64; 4],
+    heard_length: u64,
 }
 
 fn x722_transmit_report(report: TransmitReport) {
@@ -3564,6 +3644,10 @@ fn x722_transmit_report(report: TransmitReport) {
         member_vlan_flags,
         member_vsi_out,
         member_port_out,
+        sent_frame,
+        sent_length,
+        heard_frame,
+        heard_length,
     } = report;
     let at = RINGS_AT + ring::REPORT + 27 * 8;
     // **Word 29: what this program did with the frames it was given.** The
@@ -3682,6 +3766,28 @@ fn x722_transmit_report(report: TransmitReport) {
         core::ptr::write_volatile(
             (RINGS_AT + ring::REPORT + 47 * 8) as *mut u64,
             member_port_out | 1 << 63,
+        );
+        // **Words 48-51 and 53-56: the two frames, thirty-two bytes each.**
+        // Word 52 carries both lengths and the bit that says they were taken --
+        // a length is the one thing code review cannot check, because a frame
+        // truncated anywhere between `frame()` and the descriptor's `BSIZE`
+        // reaches the switch short and is discarded, and every counter here
+        // still reads exactly as it does now.
+        for (index, word) in sent_frame.iter().enumerate() {
+            core::ptr::write_volatile(
+                (RINGS_AT + ring::REPORT + (48 + index as u64) * 8) as *mut u64,
+                *word,
+            );
+        }
+        for (index, word) in heard_frame.iter().enumerate() {
+            core::ptr::write_volatile(
+                (RINGS_AT + ring::REPORT + (53 + index as u64) * 8) as *mut u64,
+                *word,
+            );
+        }
+        core::ptr::write_volatile(
+            (RINGS_AT + ring::REPORT + 52 * 8) as *mut u64,
+            (sent_length & 0xffff) | (heard_length & 0xffff) << 16 | 1 << 63,
         );
     }
     // SAFETY: the report page this program mapped writable, past the failover
