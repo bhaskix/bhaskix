@@ -2635,11 +2635,13 @@ fn carry_x722(mut members: [Option<X722Member>; X722_MEMBERS], facts: [X722; X72
             // takes the frame as it stands.
             let length = unsafe { fill_announcement(member.queues.transmit.at + 2048, 0, address) };
             let at = member.queues.transmit_device + 2048;
-            if let Some(slot) =
-                member
-                    .device
-                    .post_frame(&mut member.queues.transmit, at, length as u16, false)
-            {
+            if let Some(slot) = member.device.post_frame(
+                &mut member.queues.transmit,
+                member.queues.transmit_queue,
+                at,
+                length as u16,
+                false,
+            ) {
                 let queue = member.queues.transmit_queue;
                 let tail = member.device.transmit_tail();
                 member.device.transmit_doorbell(queue, tail);
@@ -2716,6 +2718,7 @@ fn carry_x722(mut members: [Option<X722Member>; X722_MEMBERS], facts: [X722; X72
                     // never counted out of the MAC.
                     if let Some(slot) = member.device.post_frame(
                         &mut member.queues.transmit,
+                        member.queues.transmit_queue,
                         at,
                         length as u16,
                         uplink,
@@ -2747,12 +2750,14 @@ fn carry_x722(mut members: [Option<X722Member>; X722_MEMBERS], facts: [X722; X72
                             uplink_posted += 1;
                         }
                     } else {
-                        // **The drop nothing was counting.** The frame is out of
-                        // the ring already and there is no way to put it back,
-                        // so it is gone -- and a refusal that leaves no number
-                        // behind is indistinguishable from a frame the device
-                        // swallowed, which is the confusion this report has
-                        // spent three days inside.
+                        // **The drop, now counted and now the honest outcome.**
+                        // The frame is out of the ring already and there is no
+                        // way to put it back, so it is still gone -- but it is
+                        // gone *visibly*. `post_frame` refuses when the device
+                        // has not consumed enough of the ring to make room,
+                        // where it used to write over a descriptor the device
+                        // still owned: a frame silently lost, and a packet
+                        // buffer changed under a transmit in flight.
                         post_refused += 1;
                     }
                 }

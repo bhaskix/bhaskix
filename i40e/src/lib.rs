@@ -3275,6 +3275,7 @@ impl<R: Registers> Device<R> {
     pub fn post_frame(
         &mut self,
         ring: &mut impl Dma,
+        queue: u32,
         buffer: u64,
         bytes: u16,
         uplink: bool,
@@ -3293,6 +3294,23 @@ impl<R: Registers> Device<R> {
         // reads as NOPs, then the command, and ends on a data descriptor
         // carrying `EOP`.
         if self.transmit_depth < line {
+            return None;
+        }
+        // **Refuse rather than overwrite a descriptor the device has not
+        // consumed.** Until now this posted regardless, and the boot report has
+        // been saying so for days -- *"this driver overwrites what it does not
+        // wait for"* -- while nothing acted on it. With one frame per cache line
+        // and four lines in the ring, sixty-seven frames in a boot means the
+        // ring is rewritten many times over, and a descriptor rewritten while
+        // the device still owns it is a frame silently lost and, worse, a buffer
+        // changed under a transmit in flight.
+        //
+        // One line is always left free, because a tail that catches the head
+        // reads as *empty* rather than full: `outstanding` is `(tail - head)`
+        // around the ring, so it cannot represent a completely full one.
+        //
+        // A refusal is a fact the caller can count. An overwrite is not.
+        if self.transmit_outstanding(queue) + line >= self.transmit_depth {
             return None;
         }
         // Wrap before writing rather than across the line, so a frame's
@@ -4371,7 +4389,7 @@ mod tests {
         device.attach_transmit_ring(DEPTH);
 
         for round in 0..(u32::from(DEPTH) / line) {
-            let at = device.post_frame(&mut ring, 0x1_0000_0000, 60, false);
+            let at = device.post_frame(&mut ring, 0, 0x1_0000_0000, 60, false);
             assert_eq!(
                 at,
                 Some(round * line + line - 1),
@@ -4382,6 +4400,10 @@ mod tests {
                 "a tail of {} is not a valid index into {DEPTH} descriptors",
                 device.transmit_tail()
             );
+            // A device that keeps up. Without this the ring fills and the post
+            // is refused, which is a different test -- see
+            // `a_full_transmit_ring_refuses_rather_than_overwriting`.
+            device.registers.put(QTX_HEAD, device.transmit_tail());
         }
         assert_eq!(
             device.transmit_tail(),
@@ -4408,11 +4430,13 @@ mod tests {
         // Context at line-2, data at line-1: contiguous, and the line ends on
         // the data descriptor.
         assert_eq!(
-            device.post_frame(&mut ring, 0x2000, 60, true),
+            device.post_frame(&mut ring, 0, 0x2000, 60, true),
             Some(line - 1),
             "the data descriptor closes the line"
         );
         assert_eq!(device.transmit_tail(), line);
+        // A device that keeps up, so this stays a test about packing.
+        device.registers.put(QTX_HEAD, device.transmit_tail());
         let at = TRANSMIT_DESCRIPTOR_BYTES as usize * (line - 2) as usize;
         assert_eq!(
             (dma64(&ring, at), dma64(&ring, at + 8)),
@@ -4420,13 +4444,14 @@ mod tests {
             "and its context descriptor is immediately in front of it"
         );
         assert_eq!(
-            device.post_frame(&mut ring, 0x2000, 60, true),
+            device.post_frame(&mut ring, 0, 0x2000, 60, true),
             Some(2 * line - 1),
             "the next pair closes the next line"
         );
-        assert_eq!(device.transmit_tail(), 0, "and the ring is full");
+        assert_eq!(device.transmit_tail(), 0, "and the cursor has wrapped");
+        device.registers.put(QTX_HEAD, device.transmit_tail());
         assert_eq!(
-            device.post_frame(&mut ring, 0x2000, 60, true),
+            device.post_frame(&mut ring, 0, 0x2000, 60, true),
             Some(line - 1),
             "the next pair starts at zero, not straddling the end"
         );
@@ -4436,7 +4461,7 @@ mod tests {
         let mut narrow = FakeDma::new();
         let mut small = Device::new(Fake::new());
         small.attach_transmit_ring(TRANSMIT_FETCH_LINE - 1);
-        assert_eq!(small.post_frame(&mut narrow, 0x2000, 60, true), None);
+        assert_eq!(small.post_frame(&mut narrow, 0, 0x2000, 60, true), None);
     }
 
     /// A receive queue is enabled by asking and then waiting for hardware to
@@ -4700,7 +4725,7 @@ mod tests {
             device.attach_transmit_ring(TRANSMIT_DESCRIPTORS);
             for round in 0..(u32::from(TRANSMIT_DESCRIPTORS) / line + 2) {
                 let data = device
-                    .post_frame(&mut ring, 0x4000, 124, uplink)
+                    .post_frame(&mut ring, 0, 0x4000, 124, uplink)
                     .expect("the ring is deeper than one line");
                 let tail = device.transmit_tail();
                 assert_eq!(
@@ -4735,6 +4760,8 @@ mod tests {
                     opened + line,
                     "round {round}: a descriptor after the frame is one the device waits on"
                 );
+                // A device that keeps up, so this stays a test about packing.
+                device.registers.put(QTX_HEAD, device.transmit_tail());
             }
         }
     }
@@ -4798,7 +4825,7 @@ mod tests {
 
         // One frame posted and unconsumed: a line's worth outstanding.
         let line = u32::from(TRANSMIT_FETCH_LINE);
-        device.post_frame(&mut ring, 0x4000, 124, true);
+        device.post_frame(&mut ring, QUEUE, 0x4000, 124, true);
         assert_eq!(device.transmit_outstanding(QUEUE), line);
 
         // The device consumes it: nothing outstanding, and the naive
@@ -4810,7 +4837,7 @@ mod tests {
         // wraps to zero while the head sits mid-ring: the tail is *less* than
         // the head, and a subtraction says the device is ahead of the driver.
         for _ in 0..(u32::from(depth) / line - 1) {
-            device.post_frame(&mut ring, 0x4000, 124, true);
+            device.post_frame(&mut ring, QUEUE, 0x4000, 124, true);
         }
         assert_eq!(device.transmit_tail(), 0, "the cursor has wrapped");
         assert!(
@@ -4829,6 +4856,66 @@ mod tests {
             .registers
             .put(QTX_HEAD + 4 * u64::from(QUEUE), 0x1fff);
         assert_eq!(device.transmit_outstanding(QUEUE), 0);
+    }
+
+    /// A full transmit ring refuses a frame rather than overwriting one.
+    ///
+    /// **The boot report named this defect for days and nothing acted on it** --
+    /// *"this driver overwrites what it does not wait for"*. With one frame per
+    /// cache line and four lines in the ring, a boot posting sixty-seven frames
+    /// rewrites the ring many times over, and a descriptor rewritten while the
+    /// device still owns it is a frame silently lost -- worse, a packet buffer
+    /// changed under a transmit in flight.
+    ///
+    /// A refusal is a fact the caller can count. An overwrite is not, which is
+    /// exactly why the SR550 could report 30 of 40 posts never written back with
+    /// nothing saying whether they were lost or merely late.
+    #[test]
+    fn a_full_transmit_ring_refuses_rather_than_overwriting() {
+        const QUEUE: u32 = 0;
+        let line = u32::from(TRANSMIT_FETCH_LINE);
+        let depth = u32::from(TRANSMIT_DESCRIPTORS);
+        let mut ring = FakeDma::new();
+        let mut device = Device::new(Fake::new());
+        device.attach_transmit_ring(TRANSMIT_DESCRIPTORS);
+
+        // A device that consumes nothing. One line is always left free, because
+        // a tail that catches the head reads as empty rather than full.
+        let lines = depth / line - 1;
+        for round in 0..lines {
+            assert!(
+                device
+                    .post_frame(&mut ring, QUEUE, 0x4000, 124, false)
+                    .is_some(),
+                "round {round} fits: the device has consumed nothing and the ring is {depth} deep"
+            );
+        }
+        let full = device.transmit_tail();
+        assert_eq!(
+            device.post_frame(&mut ring, QUEUE, 0x4000, 124, false),
+            None,
+            "the ring is full and the next frame must be refused, not written over one the \
+             device still owns"
+        );
+        assert_eq!(
+            device.transmit_tail(),
+            full,
+            "and a refusal moves nothing -- the cursor is where it was"
+        );
+
+        // The device consumes one line; one frame fits again, and exactly one.
+        device.registers.put(QTX_HEAD + 4 * u64::from(QUEUE), line);
+        assert!(
+            device
+                .post_frame(&mut ring, QUEUE, 0x4000, 124, false)
+                .is_some(),
+            "a consumed line is a line free"
+        );
+        assert_eq!(
+            device.post_frame(&mut ring, QUEUE, 0x4000, 124, false),
+            None,
+            "and only one"
+        );
     }
 
     /// The port's transmit counters are the **MAC's**, not the VSI's.

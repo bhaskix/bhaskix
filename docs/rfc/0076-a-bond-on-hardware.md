@@ -1829,3 +1829,47 @@ The two ends of that are a host whose frames mostly do not leave the descriptor
 ring, and a switch that has never heard a usable LACPDU. Whether those are one
 fault or two is the open question, and this side has run out of things it can
 vary.
+
+
+### The driver was overwriting what the device still owned — 2026-09-11
+
+The boot report has printed this for days and nothing acted on it:
+
+> *not fetched: descriptors are sitting in the ring, and **this driver overwrites
+> what it does not wait for***
+
+`post_frame` posted regardless of what the device had consumed. With one frame
+per cache line and four lines in the ring, a boot posting sixty-seven frames
+rewrites the ring many times over — and a descriptor rewritten while the device
+still owns it is a frame silently lost, plus a packet buffer changed under a
+transmit in flight. Both of those are on this side, and neither needed the
+switch to diagnose.
+
+It refuses now, leaving one line free: `outstanding` is `(tail - head)` around
+the ring, so a completely full ring is indistinguishable from an empty one and
+the last line is never taken. The refusal lands in `post_refused`, which the
+report already carries — so what was a silent overwrite is a counted fact.
+
+**That matters for the measurement as much as for the correctness.** The SR550
+has been reporting *30 of 40 posts never written back* with nothing able to say
+whether those frames were lost or merely late.
+
+`a_full_transmit_ring_refuses_rather_than_overwriting` fills the ring with a
+device that consumes nothing, asserts the next post is refused **and that the
+cursor did not move**, then consumes one line and checks exactly one more frame
+fits. Watched red by deleting the guard: *"the ring is full and the next frame
+must be refused, not written over one the device still owns"*.
+
+**Three existing tests failed on the change**, because they encoded *post
+regardless* — the fourth time in this work that tests have pinned behaviour that
+turned out to be wrong, after the one-descriptor-per-frame packing, the tail
+after an uplink pair, and the ungated ring depth. They advance `QTX_HEAD` after
+each post now, modelling a device that keeps up, so they stay tests about
+*packing* and the new rule gets a test of its own rather than being smeared
+across four.
+
+**What the next boot decides, stated before it happens.** If overwriting was the
+cause, `post_refused` becomes non-zero and the write-back count climbs. If
+`post_refused` stays zero while 30 of 40 still go unwritten, the driver was never
+overwriting anything and the loss is elsewhere. Either way the result is clean,
+which is more than the last several attempts could say in advance.
