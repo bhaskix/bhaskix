@@ -2266,3 +2266,65 @@ accident of ordering, not a property anything enforces.
 This is the eleventh mechanism in this driver to be written, documented and then
 asked a question it does not answer. The list is no longer interesting as a list;
 what the entries have in common is that each one *looked* read.
+
+
+### What the finished instrument said — 2026-09-11
+
+```
+malicious-driver record: FLAGGED; transmit queues enabled 0b1111
+queue 384, function 0, MAL_TYPE 21
+per member, its queue and its own flag: member 0 queue 0 FLAGGED; member 1 queue 384 clear;
+                                        member 2 queue 768 clear; member 3 queue 1152 clear
+the recorded queue 384 is member 1's
+bin/netd posted 59 frame(s), 32 of them uplink-tagged, 0 refused
+24 of those posts were never written back (24 of them uplink-tagged)
+```
+
+The register definitions leave no room to read these another way. 38.39.2.10.3:
+`QNUM` is *"absolute queue ID on which the event was detected"*, `PF_NUM` is
+*"PF/parent PF number on which the event was detected"*. 38.39.2.10.2:
+`PF_MDET_TX.VALID` is *"a malicious event has been detected on **this
+function**"*.
+
+So the device is saying: **an event on absolute queue 384 — member 1's —
+attributed to PF 0**, and the only function whose own flag is set is member 0.
+The members sit at 0, 384, 768 and 1152, so `FIRSTQ` steps by 384 and each takes
+queue 0 in its own PF space.
+
+**The completion counts have been saying the same thing for boots.** The plain
+frame site posts on `members[active]`, which is port 0; the uplink site posts on
+all four. Across the two boots of 2026-09-11:
+
+| | uplink posted | never written back | completed |
+|---|---|---|---|
+| first | 40 | 30 (75%) | 10 = 40/4 |
+| second | 32 | 24 (75%) | 8 = 32/4 |
+
+Exactly three quarters fail and exactly one member's worth completes, and the
+member that completes is member 0. **So the failing set is not "uplink frames"
+and not "late frames" — it is members 1, 2 and 3.** The correction written
+earlier today said the uplink correlation was confounded with time; it was right
+that the correlation was not independent evidence and wrong about the confound,
+which is *which member*, not *when*.
+
+**The hypothesis this boot was built to test next.** `QTX_CTL` is the only
+statement of who owns a transmit queue — a receive queue's owner is implied by
+the VSI that steers to it — and `own_transmit_queue` fills its `PF_INDX` from
+`PF_FUNC_RID.FUNCTION_NUMBER`. If that window answers `0` on every member, then
+`bin/netd` has told the device **PF0 owns all four transmit queues**. Queue 0 is
+genuinely PF0's, so member 0 works; 384, 768 and 1152 are owned by a function
+that is not the one posting to them, their descriptors are never fetched, and an
+event on one of them is attributed to PF0 — whose flag is then the only one set.
+Every line of the report above follows from that one reading.
+
+It is a hypothesis. `own_transmit_queue` has written that register since the
+transmit side existed and **nothing has ever read it back** — the twelfth
+mechanism in this driver in that state. So the next boot reads it back, per
+member, beside each member's `PF_FUNC_RID`, and the kernel says outright when a
+queue's owner is not the function posting to it.
+
+The datasheet's own wording is worth keeping in view either way: `PF_FUNC_RID`
+gives *"the function number assigned to the function based on BIOS/OS
+enumeration"*, in a register whose other fields are the PCI device and bus
+numbers, while `QTX_CTL.PF_INDX` is *"index between 0 and 15"*. They coincide on
+an ordinary card and are not defined to be the same thing.

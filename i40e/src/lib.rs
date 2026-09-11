@@ -2300,6 +2300,35 @@ pub struct VsiParameters {
     pub queue_set: u16,
 }
 
+/// What `QTX_CTL` says about a transmit queue's owner -- 38.39.2.18.11.
+///
+/// `kind` is `PFVF_Q`: `00b` a VF queue, `01b` a VM queue, `10b` a PF queue.
+/// `function` is `PF_INDX`, and `vfvm` is `VFVM_INDX`, which *"must be set to
+/// zero"* for a PF's own queue.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TransmitQueueOwner {
+    /// `PFVF_Q` 1:0.
+    pub kind: u8,
+    /// `PF_INDX` 5:2.
+    pub function: u8,
+    /// `VFVM_INDX` 15:7.
+    pub vfvm: u16,
+}
+
+impl TransmitQueueOwner {
+    /// Whether this reads as a PF's own queue -- `PFVF_Q` = `10b`.
+    #[must_use]
+    pub const fn is_pf_queue(&self) -> bool {
+        self.kind == QTX_CTL_PF_QUEUE as u8
+    }
+
+    /// The owner in the six bits the report carries: `PFVF_Q` then `PF_INDX`.
+    #[must_use]
+    pub const fn packed(&self) -> u64 {
+        (self.kind as u64 & 0b11) | (self.function as u64 & 0xf) << 2
+    }
+}
+
 /// What the device's malicious-driver detection says about this function's
 /// transmit -- 38.39.2.10.2 and 38.39.2.10.3.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -2599,7 +2628,7 @@ impl<R: Registers> Device<R> {
     /// size.
     #[must_use]
     pub fn private_memory(&self) -> PrivateMemory {
-        let function = self.read(PF_FUNC_RID) & 0b111;
+        let function = self.function_number();
         let at = 4 * u64::from(function);
         let partition = self.read(GLHMC_SDPART + at);
         PrivateMemory {
@@ -2744,7 +2773,7 @@ impl<R: Registers> Device<R> {
     /// which is the PF's whole allocation because the objects are indexed by
     /// absolute queue number -- and reads the four registers back.
     pub fn program_lan_private_memory(&mut self, queues: u32) -> PrivateMemory {
-        let function = self.read(PF_FUNC_RID) & 0b111;
+        let function = self.function_number();
         let at = 4 * u64::from(function);
         let tx_size = self.read(GLHMC_LANTXOBJSZ) & 0xf;
         self.write(GLHMC_LANTXBASE + at, 0);
@@ -3306,6 +3335,45 @@ impl<R: Registers> Device<R> {
     pub fn set_transmit_queue_disable(&mut self, queue: u32) {
         let register = GLLAN_TXPRE_QDIS + 4 * u64::from(queue / QDIS_QUEUES_PER_REGISTER);
         self.write(register, (queue & 0x7ff) | TXPRE_SET_QDIS);
+    }
+
+    /// Which of the sixteen PF spaces this window reaches --
+    /// `PF_FUNC_RID.FUNCTION_NUMBER`, bits 2:0.
+    ///
+    /// **Everything a member does to a shared structure is stamped with this**,
+    /// and it was read in two places and never once printed. It chooses the
+    /// `GLHMC_*` partition registers and it is what
+    /// [`Device::own_transmit_queue`] puts in `QTX_CTL.PF_INDX` -- the field
+    /// that tells the device which function owns a transmit queue. A window
+    /// answering `0` on every member would hand every queue to PF0, and nothing
+    /// in this driver would notice.
+    ///
+    /// Note the datasheet's own words: *"function number assigned to the
+    /// function based on BIOS/OS enumeration"*, in a register whose other fields
+    /// are the device and bus numbers. It is a PCI identity, and `PF_INDX` is
+    /// *"index between 0 and 15"* -- they coincide on an ordinary card and are
+    /// not defined to.
+    #[must_use]
+    pub fn function_number(&self) -> u32 {
+        self.read(PF_FUNC_RID) & 0b111
+    }
+
+    /// What `QTX_CTL` reads back for a queue -- who the device thinks owns it.
+    ///
+    /// **`own_transmit_queue` has written this register since the transmit side
+    /// existed and nothing has ever read it back.** It is the only statement of
+    /// queue ownership on the transmit side -- a receive queue's owner is
+    /// implied by the VSI that steers to it -- so a wrong `PF_INDX` is a queue
+    /// whose frames belong to a function that is not posting them, and the
+    /// symptom is descriptors that are never fetched.
+    #[must_use]
+    pub fn transmit_queue_owner(&self, queue: u32) -> TransmitQueueOwner {
+        let value = self.read(QTX_CTL + 4 * u64::from(queue));
+        TransmitQueueOwner {
+            kind: (value & 0b11) as u8,
+            function: ((value >> 2) & 0xf) as u8,
+            vfvm: ((value >> 7) & 0x1ff) as u16,
+        }
     }
 
     /// Says which function owns a transmit queue -- `QTX_CTL`, a statement a
@@ -5292,6 +5360,66 @@ mod tests {
         let words = high.words();
         assert_eq!(words[1], 0x0200_0000, "0x1_0000_0000 / 128");
         assert_eq!(words[2], 0);
+    }
+
+    /// Queue ownership is written and read back at 38.39.2.18.11's fields.
+    ///
+    /// **`QTX_CTL` is the only statement of who owns a transmit queue** -- a
+    /// receive queue's owner is implied by the VSI that steers to it -- and
+    /// `own_transmit_queue` has written it since the transmit side existed with
+    /// nothing ever reading it back. A `PF_INDX` that does not match the
+    /// function posting to the queue is a queue whose descriptors are never
+    /// fetched, and it looks exactly like a slow device.
+    ///
+    /// The function number comes from `PF_FUNC_RID`, so that is pinned here
+    /// too: the three bits the datasheet gives it, and nothing above them.
+    #[test]
+    fn a_transmit_queue_says_which_function_owns_it() {
+        const QUEUE: u32 = 3;
+        let mut device = Device::new(Fake::new());
+
+        // `PF_FUNC_RID.FUNCTION_NUMBER` is bits 2:0, in a register whose upper
+        // bits are `DEVICE_NUMBER` 7:3 and `BUS_NUMBER` 15:8 -- both filled here
+        // so a mask that reaches past bit 2 is caught rather than described.
+        device.registers.put(PF_FUNC_RID, 0xb1 << 8 | 0x1f << 3 | 1);
+        assert_eq!(device.function_number(), 1, "FUNCTION_NUMBER 2:0");
+        device.registers.put(PF_FUNC_RID, 0xffff_fff8);
+        assert_eq!(device.function_number(), 0, "and nothing above bit 2");
+
+        // Written: PFVF_Q 1:0 = 10b for a PF queue, PF_INDX 5:2, and
+        // VFVM_INDX 15:7 left zero because it "must be set to zero" for one.
+        device.own_transmit_queue(QUEUE, 1);
+        let wrote = device.registers.at(QTX_CTL + 4 * u64::from(QUEUE));
+        assert_eq!(wrote & 0b11, 0b10, "PFVF_Q = 10b, a PF queue");
+        assert_eq!(wrote >> 2 & 0xf, 1, "PF_INDX 5:2 carries the function");
+        assert_eq!(wrote >> 7 & 0x1ff, 0, "VFVM_INDX must be zero for a PF");
+
+        // Read back: the same fields, at the same places.
+        let owner = device.transmit_queue_owner(QUEUE);
+        assert_eq!(owner.kind, 0b10);
+        assert_eq!(owner.function, 1, "and the read-back agrees with the write");
+        assert_eq!(owner.vfvm, 0);
+        assert!(owner.is_pf_queue());
+        assert_eq!(owner.packed(), 0b10 | 1 << 2, "and survives the report");
+
+        // **The failure this exists to catch.** A member whose window answers
+        // function 0 writes PF0 into its own queue's `PF_INDX`, and the device
+        // then believes PF0 owns a queue PF1 is posting to. The read-back is
+        // the only thing that can see it, because the write succeeds either way.
+        device.own_transmit_queue(QUEUE, 0);
+        let wrong = device.transmit_queue_owner(QUEUE);
+        assert_eq!(wrong.function, 0);
+        assert_ne!(
+            wrong.function, owner.function,
+            "a queue handed to the wrong function reads back differently, and \
+             nothing else in this driver would notice"
+        );
+
+        // A queue nobody has claimed reads as a VF queue owned by function 0,
+        // which is not the same as a PF queue owned by function 0.
+        let untouched = device.transmit_queue_owner(QUEUE + 1);
+        assert_eq!(untouched, TransmitQueueOwner::default());
+        assert!(!untouched.is_pf_queue(), "PFVF_Q 00b is a VF queue");
     }
 
     /// Every field of the context descriptor, against 38.31.2.2.1's table.

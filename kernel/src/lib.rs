@@ -14822,6 +14822,23 @@ const NETD_MALICIOUS: u64 = 38 * 8;
 /// calling the whole record global.
 const NETD_MEMBER_QUEUES: u64 = 39 * 8;
 
+/// Byte offset of each member's function number and its queue's `QTX_CTL`
+/// read-back, with bit 63 saying it was written.
+///
+/// **`QTX_CTL` is the only statement of who owns a transmit queue** -- a
+/// receive queue's owner is implied by the VSI that steers to it -- and
+/// `bin/netd` has written it since the transmit side existed without once
+/// reading it back. Its `PF_INDX` comes from `PF_FUNC_RID`, so both are here:
+/// four bits of `FUNCTION_NUMBER`, then `PFVF_Q` and `PF_INDX`, ten bits per
+/// member. Words 40 and 41 are this kernel's own, so this is word 42.
+const NETD_MEMBER_OWNERS: u64 = 42 * 8;
+/// Bits each member takes there.
+const NETD_MEMBER_OWNER_BITS: u32 = 10;
+/// Bit 63 of it: the word was written.
+const NETD_MEMBER_OWNERS_WRITTEN: u64 = 1 << 63;
+
+const _: () = assert!(NETD_MEMBER_OWNER_BITS as usize * NETD_MEMBER_COUNT < 63);
+
 /// The sentinel `bin/netd` writes there.
 const NETD_MEMBER_ADDRESSES_WRITTEN: u64 = 0x5352_4444_414d_454d;
 
@@ -16605,7 +16622,18 @@ fn net_domain_transmitted(hhdm: u64) -> Option<Transmitted> {
     // `x722_transmit_report` writes and the driver's own `sent` tally at word
     // 10, read volatile because the driver is still running and rewrites them
     // on every pass of its loop.
-    let (packed, port, posted, unfinished, cursors, sent, switching, malicious, member_queues) = unsafe {
+    let (
+        packed,
+        port,
+        posted,
+        unfinished,
+        cursors,
+        sent,
+        switching,
+        malicious,
+        member_queues,
+        member_owners,
+    ) = unsafe {
         (
             core::ptr::read_volatile(at as *const u64),
             core::ptr::read_volatile((at + 8) as *const u64),
@@ -16616,6 +16644,7 @@ fn net_domain_transmitted(hhdm: u64) -> Option<Transmitted> {
             core::ptr::read_volatile((page + NETD_VSI_SWITCHING) as *const u64),
             core::ptr::read_volatile((page + NETD_MALICIOUS) as *const u64),
             core::ptr::read_volatile((page + NETD_MEMBER_QUEUES) as *const u64),
+            core::ptr::read_volatile((page + NETD_MEMBER_OWNERS) as *const u64),
         )
     };
     // Bit 33 says the driver measured them. Without it, zero is what a port
@@ -16633,6 +16662,7 @@ fn net_domain_transmitted(hhdm: u64) -> Option<Transmitted> {
         switching,
         malicious,
         member_queues,
+        member_owners,
     })
 }
 
@@ -16677,6 +16707,9 @@ struct Transmitted {
     /// Each member's transmit queue and each member's own flag, bit 63 set when
     /// written -- see [`NETD_MEMBER_QUEUES`].
     member_queues: u64,
+    /// Each member's function number and its queue's `QTX_CTL` read-back, bit
+    /// 63 set when written -- see [`NETD_MEMBER_OWNERS`].
+    member_owners: u64,
 }
 
 /// Whether `bin/netd` has written its report yet.
@@ -17656,6 +17689,44 @@ fn report_net_after_exchange(hhdm: u64) {
                                  queue this driver posts to\x1b[0m"
                             ),
                         }
+                    }
+                }
+                // **Who the device thinks owns each of those queues**, which is
+                // the statement `QTX_CTL` exists to make and which nothing has
+                // ever read back. `PF_INDX` comes from `PF_FUNC_RID`, so both
+                // are printed: a member whose window answers function 0 hands
+                // its queue to PF0, and then the function posting to it is not
+                // the function that owns it.
+                if out.member_owners & NETD_MEMBER_OWNERS_WRITTEN != 0 {
+                    print!("                   per member, what it is and who owns its queue:");
+                    let mut disagreed = false;
+                    for member in 0..NETD_MEMBER_COUNT as u32 {
+                        let field = out.member_owners >> (NETD_MEMBER_OWNER_BITS * member) & 0x3ff;
+                        let function = field & 0xf;
+                        let kind = field >> 4 & 0b11;
+                        let owner = field >> 6 & 0xf;
+                        // A PF queue is `PFVF_Q` = 10b, and the function that
+                        // owns it should be the function posting to it.
+                        let agrees = kind == 0b10 && owner == function;
+                        disagreed |= !agrees;
+                        print!(
+                            " member {member} is function {function}, queue owned by {}{}{};",
+                            if kind == 0b10 { "PF " } else { "VF/VM " },
+                            owner,
+                            if agrees {
+                                ""
+                            } else {
+                                " \x1b[91m<- not itself\x1b[0m"
+                            }
+                        );
+                    }
+                    println!();
+                    if disagreed {
+                        println!(
+                            "                   \x1b[91ma queue owned by a function that is not \
+                             the one posting to it is never fetched -- \
+                             QTX_CTL.PF_INDX\x1b[0m"
+                        );
                     }
                 }
             }

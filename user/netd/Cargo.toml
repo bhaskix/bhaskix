@@ -285,4 +285,16 @@ asm_budget = 3
 # read on any boot this reader has existed. And the record names a queue, which
 # for five boots was printed beside no member's queue at all, so `queue 384`
 # could not be attributed to anyone.
-unsafe_budget = 414
+# 424 for the register that says who owns a transmit queue: one more volatile
+# store for word 42, carrying each member's `PF_FUNC_RID.FUNCTION_NUMBER` and
+# the `QTX_CTL` its queue reads back.
+#
+# `QTX_CTL` is the only statement of transmit-queue ownership -- a receive
+# queue's owner is implied by the VSI that steers to it -- and
+# `own_transmit_queue` has written it since the transmit side existed with
+# nothing ever reading it back. Its `PF_INDX` comes from `PF_FUNC_RID`. A window
+# answering function 0 on every member would hand all four queues to PF0, and
+# the device would then be fetching for a function that is not the one posting.
+# That is what the SR550's record describes: an event on absolute queue 384,
+# which is member 1's, attributed to PF 0, with only member 0's own flag set.
+unsafe_budget = 424

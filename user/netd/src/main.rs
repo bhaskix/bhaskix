@@ -135,6 +135,13 @@ const MEMBER_QUEUE_BITS: usize = 13;
 // fifth member would run its queue into the first member's flag.
 const _: () = assert!(MEMBER_QUEUE_BITS * X722_MEMBERS <= 52);
 
+/// Bits each member's function number and queue owner take in report word 42.
+///
+/// Four for `PF_FUNC_RID.FUNCTION_NUMBER`, then `QTX_CTL`'s `PFVF_Q` and
+/// `PF_INDX` as six more -- ten, matching the kernel's own constant.
+const MEMBER_OWNER_BITS: usize = 10;
+const _: () = assert!(MEMBER_OWNER_BITS * X722_MEMBERS < 63);
+
 /// Slot `offset` of port `nth`'s grant.
 ///
 /// **The layout is `bhaskix_i40e::grant`'s**, not this file's and not the
@@ -2926,6 +2933,13 @@ fn carry_x722(mut members: [Option<X722Member>; X722_MEMBERS], facts: [X722; X72
         // to compare it against.
         let mut flagged_members = 0u64;
         let mut member_queues = 0u64;
+        // **And who the device thinks owns each of those queues.** `QTX_CTL` is
+        // the only statement of transmit-queue ownership, `own_transmit_queue`
+        // has written it since the transmit side existed, and nothing has ever
+        // read it back. Its `PF_INDX` comes from `PF_FUNC_RID`, so both go on
+        // the report: a window answering function 0 on every member would hand
+        // all four queues to PF0 and no code here would notice.
+        let mut member_owners = 0u64;
         for (index, member) in members.iter().enumerate() {
             let Some(member) = member else { continue };
             if member.device.malicious_flagged() {
@@ -2934,6 +2948,11 @@ fn carry_x722(mut members: [Option<X722Member>; X722_MEMBERS], facts: [X722; X72
             let absolute = member.queues.first + member.queues.transmit_queue;
             member_queues |=
                 u64::from(absolute & ((1 << MEMBER_QUEUE_BITS) - 1)) << (MEMBER_QUEUE_BITS * index);
+            let owner = member
+                .device
+                .transmit_queue_owner(member.queues.transmit_queue);
+            let field = u64::from(member.device.function_number() & 0xf) | owner.packed() << 4;
+            member_owners |= (field & 0x3ff) << (MEMBER_OWNER_BITS * index);
         }
         // And whether each member's transmit queue still reads as enabled --
         // `transmit_queue_state` has existed since the queues did and has never
@@ -2994,6 +3013,7 @@ fn carry_x722(mut members: [Option<X722Member>; X722_MEMBERS], facts: [X722; X72
             queues_up,
             flagged_members,
             member_queues,
+            member_owners,
         });
 
         // **Yield rather than spin.** This program is pinned, and there is no
@@ -3399,6 +3419,9 @@ struct TransmitReport {
     /// Each member's transmit queue in the device's own numbering, thirteen
     /// bits each -- what `GL_MDET_TX.QNUM` can be compared against.
     member_queues: u64,
+    /// Each member's `PF_FUNC_RID.FUNCTION_NUMBER` and the `QTX_CTL` its queue
+    /// reads back, ten bits each.
+    member_owners: u64,
 }
 
 fn x722_transmit_report(report: TransmitReport) {
@@ -3415,6 +3438,7 @@ fn x722_transmit_report(report: TransmitReport) {
         queues_up,
         flagged_members,
         member_queues,
+        member_owners,
     } = report;
     let at = RINGS_AT + ring::REPORT + 27 * 8;
     // **Word 29: what this program did with the frames it was given.** The
@@ -3486,6 +3510,16 @@ fn x722_transmit_report(report: TransmitReport) {
         core::ptr::write_volatile(
             (RINGS_AT + ring::REPORT + 39 * 8) as *mut u64,
             member_queues | (flagged_members & 0xf) << 52 | 1 << 63,
+        );
+        // **Word 42: what each member says it is, and who the device says owns
+        // its queue.** Ten bits each -- `PF_FUNC_RID.FUNCTION_NUMBER` in the
+        // low four, then `QTX_CTL`'s `PFVF_Q` and `PF_INDX`. Words 40 and 41
+        // are the kernel's, so this is the next free one. Bit 63 says it was
+        // written, since function 0 owning queue 0 is a legitimate reading and
+        // so is a word nobody wrote.
+        core::ptr::write_volatile(
+            (RINGS_AT + ring::REPORT + 42 * 8) as *mut u64,
+            member_owners | 1 << 63,
         );
     }
     // SAFETY: the report page this program mapped writable, past the failover
