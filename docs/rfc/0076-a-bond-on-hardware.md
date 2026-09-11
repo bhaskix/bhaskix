@@ -1973,14 +1973,14 @@ queue, same code. So `M_CONTEXTS` is eliminated, and the padding is eliminated
 with it: uplink completion returned to ~25% and `post_refused` to zero, which is
 where it was before the padding existed.
 
-> **Retracted, 2026-09-11 — the elimination of `M_CONTEXTS` does not stand.**
-> The reasoning above requires that the flag read after the padding was removed
-> be a *new* event. It need not have been: `clear_malicious_transmit` wrote
-> `0xFFFF` to an `RW1C` register whose `VALID` bit is 31, so it never cleared
-> anything that mattered and the reading may be latched from any earlier boot.
-> See *A clear that did not clear* below. The padding's elimination is
-> untouched — it rests on the completion and refusal counts, not on this
-> register. **Across its whole life the padding
+> **Retracted and then restored, both on 2026-09-11.** The reasoning above
+> requires that the flag read after the padding was removed be a *new* event,
+> and for a few hours it could not be: `clear_malicious_transmit` wrote `0xFFFF`
+> to an `RW1C` register whose `VALID` bit is 31, so the reading might have been
+> latched from any earlier boot. With the clear fixed the record reads the same
+> — `queue 384, function 0, MAL_TYPE 21`, with no padding in the ring — so the
+> elimination stands on evidence that can now be trusted. See *A clear that did
+> not clear* below, and the boot beneath it. **Across its whole life the padding
 changed nothing in either direction**, and it cost several boots to establish
 that. It came from reading the fetch-granularity rule as requiring aligned tails;
 that reading is not supported by anything measured.
@@ -2001,8 +2001,7 @@ is not.
 ### What is left, and what it cost
 
 `ENDLESS_TX`, `BAD_DESC_TYPE` and `NO_PACKET` remain, none with an obvious match
-in what this driver posts. (`M_CONTEXTS` is back among them — see the retraction
-above.) `GL_MDCK_TCMD` would say which checks are even
+in what this driver posts. `GL_MDCK_TCMD` would say which checks are even
 enabled, and **has no published MMIO address in either datasheet** — thirteen
 mentions across the two, and the only addresses near them are the NVM words the
 defaults load from.
@@ -2059,15 +2058,17 @@ are cleared by writing ones to them."* The specific-looking number was believed
 over the accurate sentence, and the register's own field table — printed two
 lines above the constant, `VALID` at 31 — was not checked against it.
 
-**What this retracts.** The eliminations of `M_CONTEXTS` and `BAD_DESC_TYPE`
-both rest on a `MAL_TYPE` read back after a clear, and there was no clear, so
-both are withdrawn. `ENDLESS_TX` and `NO_PACKET` stay eliminated, because
-neither argument touches this register.
+**What this puts in doubt.** The elimination of `M_CONTEXTS` rests on a
+`MAL_TYPE` read back after a clear, and there was no clear, so it cannot be
+relied on until a boot with a working one repeats it. (`BAD_DESC_TYPE` was never
+eliminated — it has been on the "what is left" list throughout. An earlier
+version of this section said the fix retracted that too, which was an
+over-claim.) `ENDLESS_TX` and `NO_PACKET` are untouched, because neither
+argument goes near this register.
 
-What is *not* retracted is that something is being flagged. `FLAGGED` came off
-`PF_MDET_TX`, which was cleared properly, on the boot where PF1's queue first
-fetched. The device is refusing this driver's descriptors; the next boot is the
-first one that can say which check.
+What is *not* in doubt is that something is being flagged. `FLAGGED` came off
+`PF_MDET_TX`, which was cleared properly. The device is refusing this driver's
+descriptors; the next boot is the first that can say which check.
 
 **The pattern, now counted.** Nine mechanisms in this driver were written,
 documented, and then never called or never read back — `TX_SWTCH_UPLINK`, the
@@ -2092,3 +2093,64 @@ own test — five removed where one was meant. The mechanisms survived; only the
 cover went, silently, because a suite that shrinks still passes. All four are
 restored here, the two that describe `post_frame` rewritten for a ring with no
 padding in it.
+
+
+### The record, read once it could be trusted — 2026-09-11
+
+With `MDET_CLEAR` writing every bit, the SR550 was booted again. The record is
+unchanged:
+
+```
+malicious-driver record: FLAGGED; transmit queues enabled 0b1111
+queue 384, function 0, MAL_TYPE 21
+bin/netd posted 67 frame(s), 40 of them uplink-tagged, 0 refused
+30 of those posts were never written back (30 of them uplink-tagged)
+61 descriptor(s) still unconsumed, worst ring 20
+```
+
+**So the `M_CONTEXTS` elimination is restored**, and this time on a reading that
+means what it says: event 21 is raised with no padding anywhere in the ring, so
+it is not seven consecutive non-data descriptors. `no_run_of_seven_non_data_descriptors_is_ever_posted`
+pins that in the crate.
+
+**And event 21 now has one candidate left.** Of its four checks:
+
+| Check | Status |
+|---|---|
+| `ENDLESS_TX` — tail update bigger than ring size | eliminated: `QLEN` and the cursor's wrap come from the one constant `TRANSMIT_DESCRIPTORS` |
+| `M_CONTEXTS` — 7+ consecutive non-data descriptors | eliminated: no padding in the ring, and the flag is still raised |
+| `NO_PACKET` — tail update without a full packet | eliminated: both doorbell sites are inside `if let Some(slot) = post_frame(…)`, and the data descriptor carries `EOP` and `RS` |
+| **`BAD_DESC_TYPE` — illegal descriptor type used** | **the only one left** |
+
+**A second, independent line points at the same place.** All 30 posts that were
+never written back were uplink-tagged, and 30 of the 40 uplink-tagged posts
+failed; the plain frames complete. The uplink path is the only one that writes a
+**context descriptor**. A check named *illegal descriptor type* and a failure
+confined to the frames carrying an extra descriptor type are the same finger
+pointing.
+
+That is not proof — `DTYP = 0x1` is what 38.31.2.2.1 calls a LAN context
+descriptor, and `SWTCH` at qword-1 bits 9:8 is where `CMD[5:4]` puts it — so if
+the encoding is wrong it is wrong in a field not yet compared against the table.
+The next step is a field-by-field read of the context descriptor, which costs no
+boot.
+
+**Two corrections this boot forced, both of mine and both written hours before
+it.** The retraction of `M_CONTEXTS` was correct to make and is now withdrawn by
+measurement — that is the instrument working, not a mistake. The other two were
+mistakes:
+
+* The retraction claimed to withdraw an elimination of `BAD_DESC_TYPE`. There
+  was none to withdraw; it has been on the *what is left* list since the table
+  was found. Corrected above.
+* It explained `function 0` on queue 384 as a stale record naming the function
+  that raised it. **That explanation is dead** — the reading is this boot's. The
+  real explanation is narrower and duller: `bin/netd` reads the record from
+  **port 0's device only**, with the comment *"because the record is global"*.
+  `GL_MDET_TX` is indeed global, but `PF_MDET_TX` is per-function, so `FLAGGED`
+  is PF0's flag and no other member's is ever read. What `function 0` means
+  cannot be settled without the per-member first-queue numbers, which the report
+  does not print.
+
+So the instrument is still not finished: it reads one of four functions, and it
+reports a queue number with nothing to compare it to.
