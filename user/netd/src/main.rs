@@ -2099,6 +2099,15 @@ struct Progress {
     /// The VSI's switching section **as read back** after the override was
     /// commanded -- not what was asked for.
     switching: bhaskix_i40e::VsiSwitching,
+    /// The VLAN handling section from the same read -- Table 38-216 bytes 8-9
+    /// and 12.
+    ///
+    /// **What the device does to a frame after this service has written it.**
+    /// `bin/ipd` builds LACPDUs untagged and `send_from` copies them verbatim,
+    /// so nothing here can see a tag hardware adds on egress -- the counters
+    /// still count the frame out of the MAC and the partner just stays
+    /// `Defaulted`.
+    vlan: bhaskix_i40e::VsiVlan,
     /// `QS_Handle 0` from the same read: the transmit arbitration queue set
     /// this VSI's TC0 queues belong to.
     ///
@@ -2385,6 +2394,7 @@ fn bring_up_x722(
         SPINS,
     );
     progress.switching = parameters.map(|read| read.switching()).unwrap_or_default();
+    progress.vlan = parameters.map(|read| read.vlan()).unwrap_or_default();
     let queue_set = parameters.map(|read| read.queue_set).unwrap_or_default() & 0x3ff;
     progress.queue_set = queue_set;
     device.report_completions(queue, X722_QUEUES);
@@ -2965,6 +2975,14 @@ fn carry_x722(mut members: [Option<X722Member>; X722_MEMBERS], facts: [X722; X72
         // all four queues to PF0 and no code here would notice.
         let mut member_owners = 0u64;
         let mut member_queue_sets = 0u64;
+        // **And what the VSI does to a frame on the way out.** `Insert PVID`
+        // puts an 802.1Q tag on every egress frame, and a switch does not hand
+        // a tagged slow-protocol frame to its LACP machine -- so an LACPDU this
+        // service wrote untagged can leave the MAC, be counted, and never be
+        // seen as an LACPDU. Two words, because the section does not fit in one
+        // beside the queue sets.
+        let mut member_pvids = 0u64;
+        let mut member_vlan_flags = 0u64;
         for (index, member) in members.iter().enumerate() {
             let Some(member) = member else { continue };
             if member.device.malicious_flagged() {
@@ -2984,6 +3002,10 @@ fn carry_x722(mut members: [Option<X722Member>; X722_MEMBERS], facts: [X722; X72
             // context is never fetched and its descriptors sit in the ring.
             member_queue_sets |=
                 u64::from(facts[index].queue_set & 0x3ff) << (MEMBER_OWNER_BITS * index);
+            let vlan = facts[index].vlan.packed();
+            member_pvids |= (vlan & 0xfff) << (12 * index);
+            member_pvids |= (vlan >> 13 & 1) << (48 + index);
+            member_vlan_flags |= (vlan >> 12 & 0x7f) << (8 * index);
         }
         // And whether each member's transmit queue still reads as enabled --
         // `transmit_queue_state` has existed since the queues did and has never
@@ -3046,6 +3068,8 @@ fn carry_x722(mut members: [Option<X722Member>; X722_MEMBERS], facts: [X722; X72
             member_queues,
             member_owners,
             member_queue_sets,
+            member_pvids,
+            member_vlan_flags,
         });
 
         // **Yield rather than spin.** This program is pinned, and there is no
@@ -3150,6 +3174,9 @@ struct X722 {
     /// destination override was commanded. `override_ok` is what firmware said
     /// to the command; this is what the command achieved.
     switching: bhaskix_i40e::VsiSwitching,
+    /// The VSI's VLAN handling section, which decides whether a frame this
+    /// service wrote untagged leaves the card untagged.
+    vlan: bhaskix_i40e::VsiVlan,
     /// `QS_Handle 0`'s bits 9:0 -- the arbitration queue set this member's
     /// transmit context was given as its `RDYList`.
     ///
@@ -3338,6 +3365,7 @@ fn take_x722(nth: u64) -> (X722, Option<X722Member>) {
         override_ok: false,
         lldp: LldpOutcome::NotAsked,
         switching: bhaskix_i40e::VsiSwitching::default(),
+        vlan: bhaskix_i40e::VsiVlan::default(),
         queue_set: 0,
     };
     let brought_up = bring_up_x722(
@@ -3357,6 +3385,7 @@ fn take_x722(nth: u64) -> (X722, Option<X722Member>) {
     found.lldp = progress.lldp;
     found.switching = progress.switching;
     found.queue_set = progress.queue_set;
+    found.vlan = progress.vlan;
     if let Some(queues) = brought_up {
         found.carrying = true;
         // **Asked of firmware, not read out of `PRTPM_SAL`.** RFC 0076 step 1:
@@ -3466,6 +3495,12 @@ struct TransmitReport {
     member_owners: u64,
     /// Each member's `RDYList` -- `QS_Handle 0`'s bits 9:0 -- ten bits each.
     member_queue_sets: u64,
+    /// Each member's PVID, twelve bits each, with the VLAN section's valid bit
+    /// at 48:51.
+    member_pvids: u64,
+    /// Each member's VLAN handling flags -- `Insert PVID`, valid, insertion
+    /// mode, expose mode -- seven bits at an eight-bit stride.
+    member_vlan_flags: u64,
 }
 
 fn x722_transmit_report(report: TransmitReport) {
@@ -3484,6 +3519,8 @@ fn x722_transmit_report(report: TransmitReport) {
         member_queues,
         member_owners,
         member_queue_sets,
+        member_pvids,
+        member_vlan_flags,
     } = report;
     let at = RINGS_AT + ring::REPORT + 27 * 8;
     // **Word 29: what this program did with the frames it was given.** The
@@ -3575,6 +3612,21 @@ fn x722_transmit_report(report: TransmitReport) {
         core::ptr::write_volatile(
             (RINGS_AT + ring::REPORT + 43 * 8) as *mut u64,
             member_queue_sets | 1 << 63,
+        );
+        // **Words 44 and 45: the VSI's VLAN handling section per member.**
+        // Word 44 is the four PVIDs, twelve bits each, with the section's valid
+        // bit at 48:51. Word 45 is the rest of `packed()` -- `Insert PVID`, the
+        // valid bit again, the insertion mode and the expose mode -- seven bits
+        // each at an eight-bit stride, so the kernel can name any of them. Bit
+        // 63 on each says it was written, because an all-clear section is a
+        // legitimate reading.
+        core::ptr::write_volatile(
+            (RINGS_AT + ring::REPORT + 44 * 8) as *mut u64,
+            member_pvids | 1 << 63,
+        );
+        core::ptr::write_volatile(
+            (RINGS_AT + ring::REPORT + 45 * 8) as *mut u64,
+            member_vlan_flags | 1 << 63,
         );
     }
     // SAFETY: the report page this program mapped writable, past the failover

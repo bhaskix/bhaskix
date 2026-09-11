@@ -312,4 +312,19 @@ asm_budget = 3
 # that is not its function's is never scheduled and nothing errors. PF0's handle
 # is zero, which is why the hardcoded zero looked right -- the same shape as
 # FIRSTQ and GLLAN_TXPRE_QDIS, both invisible on function 0 too.
-unsafe_budget = 434
+#
+# That fix worked: 0 of 36 uplink posts unwritten against 30 of 40 before, 4
+# descriptors outstanding against 61, no malicious-driver event at all, and 46
+# frames out of the VSI matched by 46 out of the MAC. What did not change is
+# LACP -- the switch still reports Defaulted and records its own defaults, key 0
+# port 0, as its partner.
+#
+# 449 for the next thing that can explain that: Table 38-216's VLAN handling
+# section, two words for the four members. `Insert PVID` puts an 802.1Q tag on
+# every egress frame and an insertion mode of 10b admits only tagged ones.
+# Either ruins an untagged slow-protocol frame with nothing above the device
+# able to see it -- `bin/ipd` writes the LACPDU untagged, `send_from` copies it
+# verbatim, the MAC counts it out, and the switch never hands it to LACP. The
+# section has been in the `Get VSI Parameters` buffer from the first boot that
+# ran the command, and only bytes 2-6 were ever read out of it.
+unsafe_budget = 449

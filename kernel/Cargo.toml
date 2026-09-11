@@ -833,7 +833,11 @@ asm_budget = 10
 # life of `bin/netd` while the VSI carried the handle, and a queue in the wrong
 # set is never scheduled -- so its descriptors sit in the ring and nothing
 # anywhere reports an error.
-unsafe_budget = 2035
+# 2037 for report words 44 and 45: the VSI's VLAN handling section per member.
+# `Insert PVID` tags every egress frame and insertion mode 10b admits only
+# tagged ones -- either makes an untagged LACPDU invisible to a switch's LACP
+# machine while every counter above still says the frame left.
+unsafe_budget = 2037
 # Up thirty-one for RFC 0005 step 9's socket probe -- `ring3_socketeer`, which
 # is `ring3_lister` with a `sockaddr_in6` copied in beside its code instead of
 # two filenames. The same two blocks every hosted probe has: one

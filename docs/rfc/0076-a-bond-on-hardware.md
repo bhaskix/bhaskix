@@ -2405,3 +2405,80 @@ uses, so corrupting the parser left it green: it compared a copy of the code wit
 itself. The parse is now `VsiParameters::from_context` and the test calls it —
 watched red by moving the offset one byte, which the first version could not
 have caught.
+
+
+### The transmit path is fixed — 2026-09-12
+
+```
+per member, its transmit queue set (RDYList): member 0 0; member 1 1; member 2 2; member 3 3;
+```
+
+Exactly what the datasheet predicted: PF0's handle is zero, which is why the
+hardcoded zero was invisible, and members 1-3 needed 1, 2 and 3.
+
+| | before | after |
+|---|---|---|
+| uplink posts never written back | 30 of 40, 24 of 32 (75%) | **0 of 36** |
+| descriptors unconsumed | 61, worst ring 20 | **4, worst ring 1** |
+| malicious-driver record | FLAGGED, `MAL_TYPE 21` | **none** |
+| out of the VSI / out of the MAC | 18 / 18, fewer than sent | **46 / 46** |
+
+The report's own verdicts flipped with it: *"every one bin/ipd sent reached a
+descriptor"*, *"the device finished with every one"*. The PF0 malicious event is
+gone too, so even that was downstream of the same fault.
+
+### Why the switch records key 0, port 0 — 2026-09-12
+
+It is still `0x05` on all four links, and the switch still says:
+
+```
+the partner says: link 0 0x45, link 1 0x45, link 2 0x45, link 3 0x45
+and records its partner as key 0, port 0 -- ours are key 1, port 1
+```
+
+`0x45` is `Activity | Aggregation | `**`Defaulted`**. Defaulted means the
+switch's receive machine is running on administratively-configured partner
+information — so `key 0, port 0` is **its own default**, not anything it read
+from us. It has accepted no LACPDU from this host.
+
+**Everything on our side checks out**, and all of it was verified rather than
+assumed:
+
+* The PDU matches 802.1AX byte for byte — subtype 1, version 1, actor TLV
+  `0x01`/20 at offset 2, partner `0x02`/20 at 22, collector `0x03`/16 at 42,
+  terminator at 58, 110 bytes.
+* The actor identity is what aggregation requires: one system MAC for all four
+  links, one key, distinct ports 1-4, priorities at the standard `0x8000`.
+* The frame is untagged. `send_from` copies it verbatim, and the tagging path in
+  `send` exempts link-control ethertypes anyway.
+* Destination `01:80:C2:00:00:02`, EtherType `0x8809`, 124 bytes.
+* They leave: 46 multicast out of the VSI, 46 out of the MAC, nothing unwritten.
+* `allow_destination_override` is a read-modify-write that ORs in only the
+  switching-section bit, so this driver does not disturb any other section.
+
+That exhausts what software controls, which leaves the device altering the frame
+on egress — and Table 38-216 has exactly one place where that happens silently:
+
+| byte | field |
+|---|---|
+| 0-1 bit 2 | whether the VLAN handling section is valid at all |
+| 8-9 | `PVID + Default UP` — *"VLAN ID to use in port-based VLAN insertion"* |
+| 12 bit 2 | **`Insert PVID`** — *"port-based insertion of VLANs"* |
+| 12 bits 0:1 | insertion mode — `10b` is *"admit .1Q tagged only"* |
+
+`Insert PVID` puts an 802.1Q tag on every egress frame from the VSI. A switch
+does not hand a tagged slow-protocol frame to its LACP machine, and **nothing
+above the device could ever see it**: the bytes written are untagged, the MAC's
+own counter still counts the frame out, and the partner just sits `Defaulted`.
+An insertion mode of `10b` does the same damage from the other direction, by
+refusing an untagged frame outright.
+
+This card ran PXE before Bhaskix, so a firmware-left port VLAN is not a
+hypothetical. And the section has been in the `Get VSI Parameters` buffer since
+the first boot that ran the command, with only bytes 2-6 ever read out of it —
+the fourteenth mechanism in this driver written, fetched, and never read. It is
+decoded and published per member now, with the kernel naming either failure
+outright.
+
+The reading is still a hypothesis; what is established is that it is the only
+remaining place the frame can be changed between this host and that switch.

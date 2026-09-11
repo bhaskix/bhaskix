@@ -14857,6 +14857,22 @@ const NETD_MEMBER_QUEUE_SETS: u64 = 43 * 8;
 /// Bit 63 of it: the word was written.
 const NETD_MEMBER_QUEUE_SETS_WRITTEN: u64 = 1 << 63;
 
+/// Byte offset of each member's PVID -- twelve bits each, the VLAN section's
+/// valid bit at 48:51 -- with bit 63 saying it was written.
+const NETD_MEMBER_PVIDS: u64 = 44 * 8;
+/// And of the VLAN handling flags beside it: `Insert PVID`, valid, insertion
+/// mode and expose mode, seven bits at an eight-bit stride.
+///
+/// **The section that can tag a frame the host wrote untagged.** `bin/ipd`
+/// builds LACPDUs with no 802.1Q tag and `bin/netd` copies them verbatim, so a
+/// tag hardware inserts on egress is invisible from above: the frame is counted
+/// out of the MAC and the switch simply never hands it to LACP. A partner in
+/// that state reports `Defaulted` and records its own defaults -- key 0, port 0
+/// -- as its partner, which is what the SR550's switch says on all four links.
+const NETD_MEMBER_VLAN_FLAGS: u64 = 45 * 8;
+/// Bit 63 of either: the word was written.
+const NETD_MEMBER_VLAN_WRITTEN: u64 = 1 << 63;
+
 /// The sentinel `bin/netd` writes there.
 const NETD_MEMBER_ADDRESSES_WRITTEN: u64 = 0x5352_4444_414d_454d;
 
@@ -16652,6 +16668,8 @@ fn net_domain_transmitted(hhdm: u64) -> Option<Transmitted> {
         member_queues,
         member_owners,
         member_queue_sets,
+        member_pvids,
+        member_vlan_flags,
     ) = unsafe {
         (
             core::ptr::read_volatile(at as *const u64),
@@ -16665,6 +16683,8 @@ fn net_domain_transmitted(hhdm: u64) -> Option<Transmitted> {
             core::ptr::read_volatile((page + NETD_MEMBER_QUEUES) as *const u64),
             core::ptr::read_volatile((page + NETD_MEMBER_OWNERS) as *const u64),
             core::ptr::read_volatile((page + NETD_MEMBER_QUEUE_SETS) as *const u64),
+            core::ptr::read_volatile((page + NETD_MEMBER_PVIDS) as *const u64),
+            core::ptr::read_volatile((page + NETD_MEMBER_VLAN_FLAGS) as *const u64),
         )
     };
     // Bit 33 says the driver measured them. Without it, zero is what a port
@@ -16684,6 +16704,8 @@ fn net_domain_transmitted(hhdm: u64) -> Option<Transmitted> {
         member_queues,
         member_owners,
         member_queue_sets,
+        member_pvids,
+        member_vlan_flags,
     })
 }
 
@@ -16734,6 +16756,10 @@ struct Transmitted {
     /// Each member's `RDYList`, bit 63 set when written -- see
     /// [`NETD_MEMBER_QUEUE_SETS`].
     member_queue_sets: u64,
+    /// Each member's PVID -- see [`NETD_MEMBER_PVIDS`].
+    member_pvids: u64,
+    /// Each member's VLAN handling flags -- see [`NETD_MEMBER_VLAN_FLAGS`].
+    member_vlan_flags: u64,
 }
 
 /// Whether `bin/netd` has written its report yet.
@@ -17767,6 +17793,49 @@ fn report_net_after_exchange(hhdm: u64) {
                         print!(" member {member} {set};");
                     }
                     println!();
+                }
+                // **What the VSI does to a frame after the host has written
+                // it.** Table 38-216's VLAN handling section: `Insert PVID`
+                // tags every egress frame, and an insertion mode of `10b`
+                // admits only tagged ones. Either ruins an untagged
+                // slow-protocol frame without anything above the device seeing
+                // it -- the frame is still counted out of the MAC, and the
+                // switch simply never hands it to LACP.
+                if out.member_vlan_flags & NETD_MEMBER_VLAN_WRITTEN != 0
+                    && out.member_pvids & NETD_MEMBER_VLAN_WRITTEN != 0
+                {
+                    print!("                   per member, its vlan section:");
+                    let mut disturbs = false;
+                    for member in 0..NETD_MEMBER_COUNT as u32 {
+                        let pvid = out.member_pvids >> (12 * member) & 0xfff;
+                        let flags = out.member_vlan_flags >> (8 * member) & 0x7f;
+                        let insert = flags & 1 != 0;
+                        let valid = flags >> 1 & 1 != 0;
+                        let insertion = flags >> 2 & 0b11;
+                        let expose = flags >> 4 & 0b11;
+                        // An invalid section is not a zeroed one: the datasheet
+                        // gives each field a default when it does not apply.
+                        let bad = valid && (insert || insertion == 0b10);
+                        disturbs |= bad;
+                        if valid {
+                            print!(
+                                " member {member} pvid {pvid}, insert {}, admit {}, expose {};",
+                                u8::from(insert),
+                                insertion,
+                                expose
+                            );
+                        } else {
+                            print!(" member {member} section not valid;");
+                        }
+                    }
+                    println!();
+                    if disturbs {
+                        println!(
+                            "                   \x1b[91mthis VSI tags or refuses an untagged \
+                             frame, so a slow-protocol frame never reaches the switch's LACP \
+                             machine -- Table 38-216 byte 12\x1b[0m"
+                        );
+                    }
                 }
             }
             // **Where the missing ones stopped**, read at the same instant as

@@ -853,6 +853,8 @@ const VSI_SECTION_SWITCHING: u16 = 1 << 0;
 ///
 /// The boot that uses this is what confirms it: a mapping written with the
 /// wrong bit is a mapping that reads back unchanged.
+/// Valid-sections bit 2: *"VLAN handling section is valid"*.
+const VSI_SECTION_VLAN: u16 = 1 << 2;
 const VSI_SECTION_QUEUE_MAP: u16 = 1 << 6;
 /// Where the queue mapping section starts in the buffer: the mapping flags,
 /// then sixteen queue entries, then eight per-traffic-class entries.
@@ -879,6 +881,24 @@ const VSI_TC_QUEUES_SHIFT: u16 = 9;
 const VSI_ALLOW_DESTINATION_OVERRIDE: u8 = 1 << 0;
 /// Where that byte sits in the buffer.
 const VSI_SWITCHING_FLAGS_AT: usize = 6;
+
+/// Table 38-216 bytes 8-9: *"VLAN ID to use in port-based VLAN insertion. This
+/// field is relevant only if the Insert PVID field is set."*
+///
+/// The low twelve bits are the VLAN id; the top three are the default user
+/// priority that rides with it.
+const VSI_PVID_AT: usize = 8;
+/// Table 38-216 byte 12, which carries the whole VLAN handling behaviour.
+const VSI_VLAN_FLAGS_AT: usize = 12;
+/// Byte 12 bit 2: *"Port-based VLAN insertion. This bit controls the port-based
+/// insertion of VLANs."*
+///
+/// **The one bit that can put a tag on a frame this driver built untagged.** A
+/// slow-protocol frame that reaches a switch with an 802.1Q tag on it is not
+/// handed to that switch's LACP machine, and nothing on the host side can see
+/// it happen: the bytes written are untagged, the transmit counters still count
+/// the frame out of the MAC, and the partner simply stays `Defaulted`.
+const VSI_INSERT_PVID: u8 = 1 << 2;
 
 /// A LAN transmit **context** descriptor -- 38.31.2.2.1, `DTYP` `0x1`.
 const TX_DTYP_CONTEXT: u64 = 0x1;
@@ -2300,6 +2320,64 @@ pub struct VsiParameters {
     pub queue_set: u16,
 }
 
+/// Table 38-216's VLAN handling section, as the device holds it.
+///
+/// **Read because a frame can be tagged after this driver has written it.**
+/// `bin/ipd` builds LACPDUs untagged, `send_from` writes them verbatim, and the
+/// transmit counters agree they left the MAC -- and none of that says what the
+/// VSI did to them on the way out. If `insert_pvid` is set, hardware puts an
+/// 802.1Q tag on every egress frame from this VSI, and a switch does not hand a
+/// tagged slow-protocol frame to LACP. The partner then sits `Defaulted` for
+/// ever, recording its own defaults as its partner, which is exactly what the
+/// SR550's switch reports.
+///
+/// The section was in the buffer from the first `Get VSI Parameters` and only
+/// bytes 2-6 were ever read out of it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct VsiVlan {
+    /// Valid-sections bit 2: whether this section means anything at all.
+    ///
+    /// *"If section not valid"* the datasheet gives defaults per field --
+    /// insertion mode `11b`, expose mode `11b`, `Insert PVID` cleared -- so an
+    /// invalid section is not the same as a zeroed one.
+    pub valid: bool,
+    /// Bytes 8-9 bits 0:11 -- the VLAN id port-based insertion would use.
+    pub pvid: u16,
+    /// Bytes 8-9 bits 13:15 -- the default user priority beside it.
+    pub default_up: u8,
+    /// Byte 12 bit 2 -- *"port-based VLAN insertion"*.
+    pub insert_pvid: bool,
+    /// Byte 12 bits 0:1 -- what the driver is allowed to send.
+    ///
+    /// `01b` admit untagged or priority-tagged only, `10b` admit 802.1Q tagged
+    /// only, `11b` allow all. `00b` is reserved. **`10b` is the other way this
+    /// can bite**: a VSI that admits only tagged frames refuses an untagged
+    /// LACPDU on transmit, and again nothing says so.
+    pub insertion_mode: u8,
+    /// Byte 12 bits 3:4 -- how received VLANs are exposed in the descriptor.
+    pub expose_mode: u8,
+}
+
+impl VsiVlan {
+    /// The section in the bits a report word carries.
+    #[must_use]
+    pub const fn packed(&self) -> u64 {
+        (self.pvid as u64 & 0xfff)
+            | (self.insert_pvid as u64) << 12
+            | (self.valid as u64) << 13
+            | (self.insertion_mode as u64 & 0b11) << 14
+            | (self.expose_mode as u64 & 0b11) << 16
+            | (self.default_up as u64 & 0b111) << 18
+    }
+
+    /// Whether anything here would put a tag on a frame this driver built
+    /// untagged, or refuse one.
+    #[must_use]
+    pub const fn would_disturb_an_untagged_frame(&self) -> bool {
+        self.valid && (self.insert_pvid || self.insertion_mode == 0b10)
+    }
+}
+
 /// What `QTX_CTL` says about a transmit queue's owner -- 38.39.2.18.11.
 ///
 /// `kind` is `PFVF_Q`: `00b` a VF queue, `01b` a VM queue, `10b` a PF queue.
@@ -2416,6 +2494,25 @@ impl VsiParameters {
             // transmit context needs.
             queue_set: u16::from_le_bytes([context[QS_HANDLE_AT], context[QS_HANDLE_AT + 1]]),
             context,
+        }
+    }
+
+    /// The VLAN handling section of the context firmware returned.
+    ///
+    /// Table 38-216: bytes 8-9 the `PVID + Default UP`, byte 12 the insertion
+    /// mode at bits 0:1, `Insert PVID` at bit 2 and the receive expose mode at
+    /// bits 3:4, with valid-sections bit 2 saying whether the section is live.
+    #[must_use]
+    pub fn vlan(&self) -> VsiVlan {
+        let pvid = u16::from_le_bytes([self.context[VSI_PVID_AT], self.context[VSI_PVID_AT + 1]]);
+        let flags = self.context[VSI_VLAN_FLAGS_AT];
+        VsiVlan {
+            valid: u16::from_le_bytes([self.context[0], self.context[1]]) & VSI_SECTION_VLAN != 0,
+            pvid: pvid & 0xfff,
+            default_up: (pvid >> 13) as u8 & 0b111,
+            insert_pvid: flags & VSI_INSERT_PVID != 0,
+            insertion_mode: flags & 0b11,
+            expose_mode: flags >> 3 & 0b11,
         }
     }
 
@@ -5374,6 +5471,94 @@ mod tests {
         let words = high.words();
         assert_eq!(words[1], 0x0200_0000, "0x1_0000_0000 / 128");
         assert_eq!(words[2], 0);
+    }
+
+    /// The VLAN handling section decodes at Table 38-216's bytes 8-9 and 12.
+    ///
+    /// **The section that can tag a frame this driver built untagged.**
+    /// `bin/ipd` writes LACPDUs with no 802.1Q tag, `send_from` copies them
+    /// verbatim, and the MAC's own counter agrees they left -- and none of that
+    /// says what the VSI did to them on the way out. `Insert PVID` is
+    /// *"port-based VLAN insertion"*, and a switch does not hand a tagged
+    /// slow-protocol frame to its LACP machine; the partner then stays
+    /// `Defaulted` and records its own defaults as its partner, which is what
+    /// the SR550's switch reports on all four links.
+    ///
+    /// `insertion_mode` `10b` -- *"admit .1Q tagged only"* -- is the other way
+    /// the same thing happens, from the other side: a VSI that admits only
+    /// tagged frames refuses an untagged one, silently.
+    ///
+    /// An invalid section is not a zeroed one. The datasheet gives defaults per
+    /// field *"if section not valid"* -- insertion mode `11b`, expose `11b` --
+    /// so the valid bit is decoded too rather than assumed.
+    #[test]
+    fn the_vlan_section_decodes_at_table_38_216s_bytes() {
+        // Every field distinct, and neighbours filled so an offset that reads
+        // one byte early or late picks up something that is not zero.
+        let mut context = [0u8; VSI_BUFFER_BYTES as usize];
+        context[0..2].copy_from_slice(&VSI_SECTION_VLAN.to_le_bytes());
+        context[VSI_PVID_AT - 1] = 0xaa;
+        // PVID 17 at bits 0:11, default UP 5 at bits 13:15.
+        context[VSI_PVID_AT..VSI_PVID_AT + 2].copy_from_slice(&(17u16 | 5 << 13).to_le_bytes());
+        context[VSI_PVID_AT + 2] = 0xbb;
+        context[VSI_VLAN_FLAGS_AT - 1] = 0xcc;
+        // Insertion mode 01b, Insert PVID set, expose mode 10b.
+        context[VSI_VLAN_FLAGS_AT] = 0b01 | VSI_INSERT_PVID | 0b10 << 3;
+        context[VSI_VLAN_FLAGS_AT + 1] = 0xdd;
+
+        let vlan = VsiParameters::from_context(3, context).vlan();
+        assert!(vlan.valid, "valid-sections bit 2");
+        assert_eq!(vlan.pvid, 17, "PVID at bytes 8-9 bits 0:11");
+        assert_eq!(
+            vlan.default_up, 5,
+            "default UP above it, not part of the id"
+        );
+        assert!(vlan.insert_pvid, "byte 12 bit 2");
+        assert_eq!(vlan.insertion_mode, 0b01, "byte 12 bits 0:1");
+        assert_eq!(vlan.expose_mode, 0b10, "byte 12 bits 3:4");
+
+        // And it survives a report word.
+        let packed = vlan.packed();
+        assert_eq!(packed & 0xfff, 17);
+        assert_eq!(packed >> 12 & 1, 1, "Insert PVID");
+        assert_eq!(packed >> 13 & 1, 1, "valid");
+        assert_eq!(packed >> 14 & 0b11, 0b01, "insertion mode");
+        assert_eq!(packed >> 16 & 0b11, 0b10, "expose mode");
+        assert_eq!(packed >> 18 & 0b111, 5, "default UP");
+
+        // **What the reading is for.** Either of these silently ruins an
+        // untagged control frame, and neither shows anywhere else.
+        assert!(vlan.would_disturb_an_untagged_frame(), "Insert PVID is set");
+        let tagged_only = VsiVlan {
+            insert_pvid: false,
+            insertion_mode: 0b10,
+            ..vlan
+        };
+        assert!(
+            tagged_only.would_disturb_an_untagged_frame(),
+            "admit .1Q tagged only refuses an untagged frame instead"
+        );
+        let harmless = VsiVlan {
+            insert_pvid: false,
+            insertion_mode: 0b11,
+            ..vlan
+        };
+        assert!(!harmless.would_disturb_an_untagged_frame(), "allow all");
+
+        // An invalid section is not a zeroed one: nothing it says applies.
+        let mut clear = context;
+        clear[0..2].copy_from_slice(&0u16.to_le_bytes());
+        let invalid = VsiParameters::from_context(3, clear).vlan();
+        assert!(!invalid.valid);
+        assert!(
+            !invalid.would_disturb_an_untagged_frame(),
+            "an invalid section disturbs nothing, whatever its bytes hold"
+        );
+        assert_eq!(invalid.pvid, 17, "though the bytes are still reported");
+
+        // A context nobody filled says nothing is set.
+        let empty = VsiParameters::default().vlan();
+        assert_eq!(empty, VsiVlan::default());
     }
 
     /// `QS_Handle 0` is parsed at Table 38-216's bytes and reaches `RDYList`.
