@@ -2099,6 +2099,13 @@ struct Progress {
     /// The VSI's switching section **as read back** after the override was
     /// commanded -- not what was asked for.
     switching: bhaskix_i40e::VsiSwitching,
+    /// `QS_Handle 0` from the same read: the transmit arbitration queue set
+    /// this VSI's TC0 queues belong to.
+    ///
+    /// **The transmit context's `RDYList`, which was hardcoded to zero.** The
+    /// VSI parameters have carried this since the crate learned to parse them
+    /// and nothing has ever read it.
+    queue_set: u16,
 }
 
 /// Brings the X722's queues up: private memory, contexts, buffers, filters and
@@ -2355,16 +2362,31 @@ fn bring_up_x722(
     // read, and its neighbours come with it -- setting the flag is a
     // read-modify-write over the whole switching section, so a mistake in it
     // shows as a switch id or a loopback bit that moved when nothing asked.
-    progress.switching = device
-        .vsi_parameters(
-            admin,
-            vsi,
-            admin_device + i40e::VSI_BUFFER_OFFSET,
-            &mut vsi_buffer,
-            SPINS,
-        )
-        .map(|read| read.switching())
-        .unwrap_or_default();
+    //
+    // **And `QS_Handle 0` comes back with it, which is the whole transmit
+    // side.** 38.31.3.4's transmit context Line 7 bits 84:93: *"Transmit
+    // arbitration queue set. The RDYList index is absolute so it should be set
+    // to those RDYList allocated to the function."* Table 38-216 bytes 96-97:
+    // *"the handle for queue set of TC0. Bits [9:0] of this handle are used by
+    // software to program the RDYList field in the transmit queues context."*
+    //
+    // This service wrote `ready_list: 0`. §38.31.3.3 says a queue context is
+    // *"fetched on demand ... when it is scheduled"*, so a queue in an
+    // arbitration set that is not the function's is never scheduled, its
+    // context is never fetched, and its descriptors sit in the ring -- which is
+    // what three of the four members have done on every boot. PF0's handle is
+    // zero, so the hardcoded zero was accidentally right for it, exactly as
+    // `FIRSTQ` and `GLLAN_TXPRE_QDIS` were.
+    let parameters = device.vsi_parameters(
+        admin,
+        vsi,
+        admin_device + i40e::VSI_BUFFER_OFFSET,
+        &mut vsi_buffer,
+        SPINS,
+    );
+    progress.switching = parameters.map(|read| read.switching()).unwrap_or_default();
+    let queue_set = parameters.map(|read| read.queue_set).unwrap_or_default() & 0x3ff;
+    progress.queue_set = queue_set;
     device.report_completions(queue, X722_QUEUES);
 
     progress.stage = 10;
@@ -2393,7 +2415,9 @@ fn bring_up_x722(
         &i40e::TransmitContext {
             ring: transmit_device,
             descriptors: i40e::TRANSMIT_DESCRIPTORS,
-            ready_list: 0,
+            // `QS_Handle 0`'s bits 9:0, read off this VSI above -- not zero,
+            // which is only PF0's answer.
+            ready_list: queue_set,
         },
     );
     // **Absolute here and PF-relative everywhere else.** See `FIRSTQ` above:
@@ -2940,6 +2964,7 @@ fn carry_x722(mut members: [Option<X722Member>; X722_MEMBERS], facts: [X722; X72
         // the report: a window answering function 0 on every member would hand
         // all four queues to PF0 and no code here would notice.
         let mut member_owners = 0u64;
+        let mut member_queue_sets = 0u64;
         for (index, member) in members.iter().enumerate() {
             let Some(member) = member else { continue };
             if member.device.malicious_flagged() {
@@ -2953,6 +2978,12 @@ fn carry_x722(mut members: [Option<X722Member>; X722_MEMBERS], facts: [X722; X72
                 .transmit_queue_owner(member.queues.transmit_queue);
             let field = u64::from(member.device.function_number() & 0xf) | owner.packed() << 4;
             member_owners |= (field & 0x3ff) << (MEMBER_OWNER_BITS * index);
+            // And the arbitration queue set its transmit context was given --
+            // `QS_Handle 0`'s bits 9:0, read off the VSI rather than assumed to
+            // be zero. A queue in the wrong set is never scheduled, so its
+            // context is never fetched and its descriptors sit in the ring.
+            member_queue_sets |=
+                u64::from(facts[index].queue_set & 0x3ff) << (MEMBER_OWNER_BITS * index);
         }
         // And whether each member's transmit queue still reads as enabled --
         // `transmit_queue_state` has existed since the queues did and has never
@@ -3014,6 +3045,7 @@ fn carry_x722(mut members: [Option<X722Member>; X722_MEMBERS], facts: [X722; X72
             flagged_members,
             member_queues,
             member_owners,
+            member_queue_sets,
         });
 
         // **Yield rather than spin.** This program is pinned, and there is no
@@ -3118,6 +3150,14 @@ struct X722 {
     /// destination override was commanded. `override_ok` is what firmware said
     /// to the command; this is what the command achieved.
     switching: bhaskix_i40e::VsiSwitching,
+    /// `QS_Handle 0`'s bits 9:0 -- the arbitration queue set this member's
+    /// transmit context was given as its `RDYList`.
+    ///
+    /// **Published because it was hardcoded to zero for the life of this
+    /// service**, and because a value read off the device and written straight
+    /// back is exactly the kind nobody checks. If this reads zero on a member
+    /// whose queue still will not fetch, the handle is not the answer.
+    queue_set: u16,
     /// Whether its **LAN** queues came up -- the ones that carry frames, as
     /// against the admin queues that carry commands.
     carrying: bool,
@@ -3298,6 +3338,7 @@ fn take_x722(nth: u64) -> (X722, Option<X722Member>) {
         override_ok: false,
         lldp: LldpOutcome::NotAsked,
         switching: bhaskix_i40e::VsiSwitching::default(),
+        queue_set: 0,
     };
     let brought_up = bring_up_x722(
         &mut device,
@@ -3315,6 +3356,7 @@ fn take_x722(nth: u64) -> (X722, Option<X722Member>) {
     found.override_ok = progress.override_ok;
     found.lldp = progress.lldp;
     found.switching = progress.switching;
+    found.queue_set = progress.queue_set;
     if let Some(queues) = brought_up {
         found.carrying = true;
         // **Asked of firmware, not read out of `PRTPM_SAL`.** RFC 0076 step 1:
@@ -3422,6 +3464,8 @@ struct TransmitReport {
     /// Each member's `PF_FUNC_RID.FUNCTION_NUMBER` and the `QTX_CTL` its queue
     /// reads back, ten bits each.
     member_owners: u64,
+    /// Each member's `RDYList` -- `QS_Handle 0`'s bits 9:0 -- ten bits each.
+    member_queue_sets: u64,
 }
 
 fn x722_transmit_report(report: TransmitReport) {
@@ -3439,6 +3483,7 @@ fn x722_transmit_report(report: TransmitReport) {
         flagged_members,
         member_queues,
         member_owners,
+        member_queue_sets,
     } = report;
     let at = RINGS_AT + ring::REPORT + 27 * 8;
     // **Word 29: what this program did with the frames it was given.** The
@@ -3520,6 +3565,16 @@ fn x722_transmit_report(report: TransmitReport) {
         core::ptr::write_volatile(
             (RINGS_AT + ring::REPORT + 42 * 8) as *mut u64,
             member_owners | 1 << 63,
+        );
+        // **Word 43: the arbitration queue set each transmit context was given.**
+        // Ten bits each, the same stride as word 42. `RDYList` was hardcoded to
+        // zero for the life of this service while the VSI carried the real
+        // handle, so the value is published rather than trusted -- a number read
+        // off the device and written straight back is exactly the kind nobody
+        // checks. Bit 63 says it was written, since zero is PF0's real answer.
+        core::ptr::write_volatile(
+            (RINGS_AT + ring::REPORT + 43 * 8) as *mut u64,
+            member_queue_sets | 1 << 63,
         );
     }
     // SAFETY: the report page this program mapped writable, past the failover

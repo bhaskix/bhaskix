@@ -2401,6 +2401,24 @@ impl VsiSwitching {
 }
 
 impl VsiParameters {
+    /// The reply's VSI number and its context buffer, parsed.
+    ///
+    /// **Separated from the command so a test can drive the parse itself.**
+    /// The first version of the `QS_Handle` test asserted against a
+    /// `VsiParameters` it built by hand using the same expression the parser
+    /// uses, so breaking the parser left the test green -- it was checking a
+    /// copy of the code against itself. This is the code, and the test calls it.
+    #[must_use]
+    pub fn from_context(number: u16, context: [u8; VSI_BUFFER_BYTES as usize]) -> Self {
+        Self {
+            number,
+            // Table 38-216 bytes 96-97, whose bits 9:0 are the `RDYList` a
+            // transmit context needs.
+            queue_set: u16::from_le_bytes([context[QS_HANDLE_AT], context[QS_HANDLE_AT + 1]]),
+            context,
+        }
+    }
+
     /// The switching section of the context firmware returned.
     #[must_use]
     pub fn switching(&self) -> VsiSwitching {
@@ -3310,12 +3328,8 @@ impl<R: Registers> Device<R> {
         let reply = self.command(ring, request, spins)?;
         let mut context = [0u8; VSI_BUFFER_BYTES as usize];
         buffer.read(0, &mut context);
-        Ok(VsiParameters {
-            // Bytes 18-19 of the descriptor: "returns the assigned VSI number".
-            number: reply.half(18),
-            queue_set: u16::from_le_bytes([context[QS_HANDLE_AT], context[QS_HANDLE_AT + 1]]),
-            context,
-        })
+        // Bytes 18-19 of the descriptor: "returns the assigned VSI number".
+        Ok(VsiParameters::from_context(reply.half(18), context))
     }
 
     /// Clears a transmit queue's internal disable flag -- 38.31.3.1.1's
@@ -5360,6 +5374,72 @@ mod tests {
         let words = high.words();
         assert_eq!(words[1], 0x0200_0000, "0x1_0000_0000 / 128");
         assert_eq!(words[2], 0);
+    }
+
+    /// `QS_Handle 0` is parsed at Table 38-216's bytes and reaches `RDYList`.
+    ///
+    /// **This is the value `bin/netd` hardcoded to zero.** Table 38-216 bytes
+    /// 96-97: *"the handle for queue set of TC0. Bits [9:0] of this handle are
+    /// used by software to program the RDYList field in the transmit queues
+    /// context for queues associated with TC0."* The transmit context's Line 7
+    /// bits 84:93: *"transmit arbitration queue set. The RDYList index is
+    /// absolute so it should be set to those RDYList allocated to the
+    /// function."*
+    ///
+    /// 38.31.3.3 is what makes a wrong one silent: a queue context is *"fetched
+    /// on demand ... when it is scheduled"*, and scheduling happens per queue
+    /// set -- so a queue in a set that is not its function's is simply never
+    /// scheduled. Nothing errors, nothing is flagged, and its descriptors sit in
+    /// the ring.
+    ///
+    /// The field was parsed the day the VSI parameters were and never read, so
+    /// it was never asserted either. Both halves are pinned here: where the
+    /// handle is read from, and that its low ten bits are what the context
+    /// carries.
+    #[test]
+    fn the_queue_set_handle_reaches_the_transmit_contexts_ready_list() {
+        // Bytes 96-97, little-endian, with a neighbour on each side so an
+        // off-by-one offset reads one of them instead.
+        let mut context = [0u8; VSI_BUFFER_BYTES as usize];
+        context[QS_HANDLE_AT - 1] = 0xee;
+        context[QS_HANDLE_AT] = 0x34;
+        context[QS_HANDLE_AT + 1] = 0x12;
+        context[QS_HANDLE_AT + 2] = 0xff;
+        let parameters = VsiParameters::from_context(7, context);
+        assert_eq!(parameters.queue_set, 0x1234, "QS_Handle 0 at bytes 96-97");
+        assert_eq!(QS_HANDLE_AT, 96, "which Table 38-216 puts at byte 96");
+
+        // Only bits 9:0 of the handle are the RDYList, and the context field is
+        // ten bits wide -- so a handle with rubbish above bit 9 must not spill
+        // into the reserved bits beside it.
+        let ready = parameters.queue_set & 0x3ff;
+        assert_eq!(ready, 0x234, "bits 9:0 of the handle");
+        let words = TransmitContext {
+            ring: 0,
+            descriptors: TRANSMIT_DESCRIPTORS,
+            ready_list: ready,
+        }
+        .words();
+        assert_eq!(
+            words[30] >> 20 & 0x3ff,
+            0x234,
+            "and it arrives at Line 7 bits 84:93"
+        );
+        for (index, word) in words.iter().enumerate() {
+            if ![1, 2, 5, 30].contains(&index) && index != 0 {
+                assert_eq!(*word, 0, "dword {index} must stay clear");
+            }
+        }
+
+        // Zero is a legitimate handle -- it is PF0's -- which is exactly why a
+        // hardcoded zero looked right for the life of the service.
+        let zero = TransmitContext {
+            ring: 0,
+            descriptors: TRANSMIT_DESCRIPTORS,
+            ready_list: 0,
+        }
+        .words();
+        assert_eq!(zero[30], 0, "and it is indistinguishable from unset");
     }
 
     /// Queue ownership is written and read back at 38.39.2.18.11's fields.

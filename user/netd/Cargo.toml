@@ -297,4 +297,19 @@ asm_budget = 3
 # the device would then be fetching for a function that is not the one posting.
 # That is what the SR550's record describes: an event on absolute queue 384,
 # which is member 1's, attributed to PF 0, with only member 0's own flag set.
-unsafe_budget = 424
+#
+# That hypothesis was wrong: the boot read function 0/1/2/3 and PF_INDX 0/1/2/3,
+# every member owning its own queue. What it did prove is that the per-queue
+# registers really are PF-relative through each function's window -- four
+# distinct values from four BARs at the same offset -- which until then was only
+# ever confirmed on member 0, where relative and absolute coincide.
+#
+# 434 for the value that fits every observation instead: `QS_Handle 0`, the
+# transmit arbitration queue set, published per member at word 43. `RDYList` in
+# the transmit context was hardcoded to zero while the VSI carried the real
+# handle on every boot. 38.31.3.3 says a queue context is fetched "on demand ...
+# when it is scheduled", and scheduling is per queue set, so a queue in a set
+# that is not its function's is never scheduled and nothing errors. PF0's handle
+# is zero, which is why the hardcoded zero looked right -- the same shape as
+# FIRSTQ and GLLAN_TXPRE_QDIS, both invisible on function 0 too.
+unsafe_budget = 434

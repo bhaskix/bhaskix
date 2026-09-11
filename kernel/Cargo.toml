@@ -828,7 +828,12 @@ asm_budget = 10
 # 2034 for report word 42 beside it: each member's function number and the
 # `QTX_CTL` read-back for its queue, which is the only statement of who owns a
 # transmit queue and had never been read back at all.
-unsafe_budget = 2034
+# 2035 for report word 43 beside it: each member's `RDYList`, the transmit
+# arbitration queue set its context was given. It was hardcoded to zero for the
+# life of `bin/netd` while the VSI carried the handle, and a queue in the wrong
+# set is never scheduled -- so its descriptors sit in the ring and nothing
+# anywhere reports an error.
+unsafe_budget = 2035
 # Up thirty-one for RFC 0005 step 9's socket probe -- `ring3_socketeer`, which
 # is `ring3_lister` with a `sockaddr_in6` copied in beside its code instead of
 # two filenames. The same two blocks every hosted probe has: one

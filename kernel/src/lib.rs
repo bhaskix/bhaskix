@@ -14839,6 +14839,24 @@ const NETD_MEMBER_OWNERS_WRITTEN: u64 = 1 << 63;
 
 const _: () = assert!(NETD_MEMBER_OWNER_BITS as usize * NETD_MEMBER_COUNT < 63);
 
+/// Byte offset of each member's `RDYList` -- the transmit arbitration queue set
+/// its context was given -- with bit 63 saying it was written.
+///
+/// **Hardcoded to zero for the life of `bin/netd`.** The transmit context's
+/// Line 7 bits 84:93 are *"transmit arbitration queue set. The RDYList index is
+/// absolute so it should be set to those RDYList allocated to the function"*,
+/// and Table 38-216 bytes 96-97 say *"bits [9:0] of this handle are used by
+/// software to program the RDYList field in the transmit queues context"*. The
+/// VSI carried the handle on every boot and nothing read it.
+///
+/// 38.31.3.3: a queue context is *"fetched on demand ... when it is
+/// scheduled"*, so a queue in an arbitration set that is not the function's is
+/// never scheduled, its context is never fetched, and its descriptors sit in
+/// the ring. Ten bits per member, the same stride as [`NETD_MEMBER_OWNERS`].
+const NETD_MEMBER_QUEUE_SETS: u64 = 43 * 8;
+/// Bit 63 of it: the word was written.
+const NETD_MEMBER_QUEUE_SETS_WRITTEN: u64 = 1 << 63;
+
 /// The sentinel `bin/netd` writes there.
 const NETD_MEMBER_ADDRESSES_WRITTEN: u64 = 0x5352_4444_414d_454d;
 
@@ -16633,6 +16651,7 @@ fn net_domain_transmitted(hhdm: u64) -> Option<Transmitted> {
         malicious,
         member_queues,
         member_owners,
+        member_queue_sets,
     ) = unsafe {
         (
             core::ptr::read_volatile(at as *const u64),
@@ -16645,6 +16664,7 @@ fn net_domain_transmitted(hhdm: u64) -> Option<Transmitted> {
             core::ptr::read_volatile((page + NETD_MALICIOUS) as *const u64),
             core::ptr::read_volatile((page + NETD_MEMBER_QUEUES) as *const u64),
             core::ptr::read_volatile((page + NETD_MEMBER_OWNERS) as *const u64),
+            core::ptr::read_volatile((page + NETD_MEMBER_QUEUE_SETS) as *const u64),
         )
     };
     // Bit 33 says the driver measured them. Without it, zero is what a port
@@ -16663,6 +16683,7 @@ fn net_domain_transmitted(hhdm: u64) -> Option<Transmitted> {
         malicious,
         member_queues,
         member_owners,
+        member_queue_sets,
     })
 }
 
@@ -16710,6 +16731,9 @@ struct Transmitted {
     /// Each member's function number and its queue's `QTX_CTL` read-back, bit
     /// 63 set when written -- see [`NETD_MEMBER_OWNERS`].
     member_owners: u64,
+    /// Each member's `RDYList`, bit 63 set when written -- see
+    /// [`NETD_MEMBER_QUEUE_SETS`].
+    member_queue_sets: u64,
 }
 
 /// Whether `bin/netd` has written its report yet.
@@ -17728,6 +17752,21 @@ fn report_net_after_exchange(hhdm: u64) {
                              QTX_CTL.PF_INDX\x1b[0m"
                         );
                     }
+                }
+                // **The arbitration queue set each transmit context was given.**
+                // 38.31.3.3: a queue context is fetched *"on demand ... when it
+                // is scheduled"*, and scheduling is per queue set -- so a queue
+                // whose `RDYList` is not one allocated to its function is never
+                // scheduled and its descriptors sit in the ring for ever. This
+                // was hardcoded to zero while the VSI carried the real handle.
+                if out.member_queue_sets & NETD_MEMBER_QUEUE_SETS_WRITTEN != 0 {
+                    print!("                   per member, its transmit queue set (RDYList):");
+                    for member in 0..NETD_MEMBER_COUNT as u32 {
+                        let set =
+                            out.member_queue_sets >> (NETD_MEMBER_OWNER_BITS * member) & 0x3ff;
+                        print!(" member {member} {set};");
+                    }
+                    println!();
                 }
             }
             // **Where the missing ones stopped**, read at the same instant as

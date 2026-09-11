@@ -2328,3 +2328,80 @@ gives *"the function number assigned to the function based on BIOS/OS
 enumeration"*, in a register whose other fields are the PCI device and bus
 numbers, while `QTX_CTL.PF_INDX` is *"index between 0 and 15"*. They coincide on
 an ordinary card and are not defined to be the same thing.
+
+
+### The owners were right, and that was the useful answer — 2026-09-12
+
+```
+per member, what it is and who owns its queue: member 0 is function 0, queue owned by PF 0;
+  member 1 is function 1, queue owned by PF 1; member 2 is function 2, queue owned by PF 2;
+  member 3 is function 3, queue owned by PF 3;
+```
+
+**The hypothesis is dead.** Every member reads its own `PF_FUNC_RID` and every
+`QTX_CTL.PF_INDX` matches it. Nothing is mis-owned.
+
+Two things came out of it anyway.
+
+**The index convention is now confirmed rather than assumed.** Four distinct
+values read back from four BARs at the same offset is proof that the per-queue
+registers really are PF-relative through each function's own window. Until this
+boot that had only ever been confirmed on member 0, where PF-relative and
+absolute coincide — the exact blind spot that hid the `GLLAN_TXPRE_QDIS` bug for
+days.
+
+**And the malicious-driver line is retired.** Member 0 is the only function
+flagged, and member 0 is the only member that *works*. Members 1, 2 and 3 carry
+no malicious event at all; their descriptors are simply never fetched. So
+`MAL_TYPE 21`, its four descriptor checks, and the context descriptor were never
+the cause of this symptom — which is consistent with the field-by-field check
+finding every field legal. The descriptors were always fine. Several days of
+this document chase a register that was reporting something else.
+
+### `RDYList` — 2026-09-12
+
+Transmit context, Line 7, bits 84:93:
+
+> `RDYList` — *"Transmit arbitration queue set. The RDYList index is **absolute**
+> so it should be set to those RDYList allocated to the function."*
+
+VSI parameters, Table 38-216, bytes 96-97:
+
+> `QS_Handle 0` — *"The handle for queue set of TC0. **Bits [9:0] of this handle
+> are used by software to program the RDYList field in the transmit queues
+> context** for queues associated with TC0."*
+
+`bin/netd` wrote `ready_list: 0`, hardcoded, for the life of the service. And
+38.31.3.3 is what makes a wrong one silent:
+
+> *"A queue context is fetched on demand (if not already in the cache) **when it
+> is scheduled**. Then hardware fetches the transmit descriptors."*
+
+Scheduling happens per arbitration queue set. A queue whose `RDYList` is not one
+allocated to its function is never scheduled, so its context is never fetched,
+so its descriptors are never fetched — and nothing errors, nothing is flagged,
+and `QTX_ENA` still reads enabled. That is the symptom this document has
+described from the start: *"descriptors are sitting in the ring, not fetched"*,
+with `transmit queues enabled 0b1111`.
+
+**Why member 0 worked.** PF0's handle is zero, so the hardcoded zero was
+accidentally right for it. The third defect in this driver with that exact
+shape, after `FIRSTQ` and `GLLAN_TXPRE_QDIS`: correct on function 0, wrong
+everywhere else, and invisible until a second port was driven.
+
+`VsiParameters::queue_set` has parsed those two bytes since the crate learned to
+read VSI parameters, with a doc comment already saying *"its bits 9:0 are the
+RDYList a transmit context needs"*, and `bring_up_x722` threw the whole reply
+away but for `switching()`. The thirteenth mechanism in this driver written,
+documented, and never read.
+
+It is now read, written into the context, **and published per member at report
+word 43** — because a value taken off the device and handed straight back is
+exactly the kind nobody checks, and this document has a list of those.
+
+**A note on the test, which was hollow first.** The assertion was written against
+a `VsiParameters` built by hand in the test using the same expression the parser
+uses, so corrupting the parser left it green: it compared a copy of the code with
+itself. The parse is now `VsiParameters::from_context` and the test calls it —
+watched red by moving the offset one byte, which the first version could not
+have caught.
