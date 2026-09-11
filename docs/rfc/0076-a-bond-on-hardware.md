@@ -2223,3 +2223,46 @@ here, because the report prints no per-member queue numbers and reads
 
 Finish the instrument before trusting another reading off it: `PF_MDET_TX` per
 member, and each member's absolute queue printed beside it.
+
+
+### Finishing the instrument — 2026-09-11
+
+Two gaps, both found by reading the code rather than by booting, and both of
+the same kind: a reader that answers a narrower question than the one it is
+asked.
+
+**`PF_MDET_TX` is per port and was read from one.** `bin/netd` took the whole
+malicious-driver record off member 0 with the comment *"port 0's, because the
+record is global"*. `GL_MDET_TX` is indeed global — one register for the card,
+holding the first event since it was cleared, whoever raised it. `PF_MDET_TX` is
+**one register per function**. So `FLAGGED` has always meant *port 0 was
+flagged*, and three members' flags have never been read on any boot this reader
+has existed. `Device::malicious_flagged` reads that half alone, and the report
+now carries one bit per member.
+
+**The record names a queue and nothing was printed beside it.** `GL_MDET_TX.QNUM`
+has read `384` for five boots, and whether that was a member's queue at all —
+and whose — could not be said from the report, because the report contains no
+member's queue number. It does now: each member's transmit queue in the device's
+own numbering, thirteen bits each, at report word 39 with the flags, and the
+kernel says outright whether the recorded queue is a member's and which.
+
+The absolute number is `FIRSTQ + queue`, and `X722Queues::first` is kept for it.
+Its neighbour's doc comment claimed `queue` was *"the absolute index of the
+receive queue taken"*; it never was — it comes from `vsi_queue_base`, and
+§38.30.3.4.2's *"'n' is the queue index within the PF space"* is the rule every
+queue register but `GLLAN_TXPRE_QDIS` follows. Corrected in place.
+
+**One thing noticed and deliberately left alone.** `clear_malicious_transmit` is
+called once per member at bring-up, and each call clears the *global* register
+as well as that function's. So the global record is baselined at the **last**
+member's bring-up, not the first, and an event raised while members 0–2 were
+coming up would be wiped by member 3's clear. It is harmless today because
+nothing is posted to any transmit ring until every member is up — the rings are
+attached at the end of bring-up and the first frame is sent later — so the last
+clear still precedes all traffic. It is written down here because that is an
+accident of ordering, not a property anything enforces.
+
+This is the eleventh mechanism in this driver to be written, documented and then
+asked a question it does not answer. The list is no longer interesting as a list;
+what the entries have in common is that each one *looked* read.

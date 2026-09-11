@@ -3475,6 +3475,25 @@ impl<R: Registers> Device<R> {
         }
     }
 
+    /// Whether **this function** was flagged -- `PF_MDET_TX` bit 0, alone.
+    ///
+    /// **The record has two halves and only one of them is per-function.**
+    /// `GL_MDET_TX` is global: every function's BAR reaches the same register,
+    /// holding the *first* event since it was cleared, whoever raised it.
+    /// `PF_MDET_TX` is the function's own, and there is one per port.
+    ///
+    /// [`Device::malicious_transmit`] returns both together, which reads
+    /// correctly for one port and quietly wrong for four: a caller holding four
+    /// members and reading the record off one of them gets that one's flag and
+    /// the global details, and cannot tell whether the other three were flagged
+    /// at all. `bin/netd` did exactly that, commented *"port 0's, because the
+    /// record is global"* -- true of the half it names and false of the half it
+    /// does not.
+    #[must_use]
+    pub fn malicious_flagged(&self) -> bool {
+        self.read(PF_MDET_TX) & 1 != 0
+    }
+
     /// Clears both malicious-driver transmit records, so a later reading is
     /// this boot's -- see [`MDET_CLEAR`] for why that is every bit and not
     /// the datasheet's `0xFFFF`.
@@ -5012,6 +5031,22 @@ mod tests {
         assert_eq!(event.function, 2, "PF_NUM at 24:21");
         assert_eq!(event.kind, 9, "MAL_TYPE at 29:25, and it is not the queue");
         assert_eq!(event.packed() >> 16 & 0x1f, 9, "and it survives the report");
+
+        // **The per-function half, read alone.** `PF_MDET_TX` is one register
+        // per port; `GL_MDET_TX` is one register for the card. A driver holding
+        // four members that reads the whole record off one of them learns that
+        // one's flag and nothing about the other three.
+        assert!(device.malicious_flagged(), "PF_MDET_TX bit 0, by itself");
+        device.registers.put(PF_MDET_TX, 0);
+        assert!(
+            !device.malicious_flagged(),
+            "and it follows PF_MDET_TX, not the global record beside it"
+        );
+        assert!(
+            device.malicious_transmit().recorded,
+            "which is still standing"
+        );
+        device.registers.put(PF_MDET_TX, 1);
 
         // The clear must reach the fields that carry the event, not just the
         // low half of the register.

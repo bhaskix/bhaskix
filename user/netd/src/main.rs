@@ -125,6 +125,16 @@ const _: () = assert!(bhaskix_i40e::TRANSMIT_RING_BYTES <= 2048);
 /// file's bond spent two changes with a two-element array and four members.
 const _: () = assert!(X722_MEMBERS == ring::MEMBER_ADDRESS_COUNT);
 
+/// Bits each member's transmit queue takes in report word 39.
+///
+/// Thirteen, matching the kernel's `NETD_MEMBER_QUEUE_BITS`: the X722 numbers
+/// queues 0..1535, and `GL_MDET_TX.QNUM` is twelve bits, so a queue the record
+/// can name fits here.
+const MEMBER_QUEUE_BITS: usize = 13;
+// Four at thirteen bits end at 51 and the members' own flags start at 52. A
+// fifth member would run its queue into the first member's flag.
+const _: () = assert!(MEMBER_QUEUE_BITS * X722_MEMBERS <= 52);
+
 /// Slot `offset` of port `nth`'s grant.
 ///
 /// **The layout is `bhaskix_i40e::grant`'s**, not this file's and not the
@@ -1970,10 +1980,22 @@ struct X722Queues {
     transmit: X722Memory,
     /// Where the device reads them.
     transmit_device: u64,
-    /// The absolute index of the receive queue taken.
+    /// The index of the receive queue taken, **in this PF's own space**.
+    ///
+    /// This said *absolute* until 2026-09-11 and it never was: it comes from
+    /// `vsi_queue_base`, and §38.30.3.4.2's *"'n' is the queue index within the
+    /// PF space"* is the rule every queue register here follows. The absolute
+    /// number is this plus [`X722Queues::first`], and the one register that
+    /// wants it is `GLLAN_TXPRE_QDIS`.
     queue: u32,
     /// The transmit queue, which is the same index in the other direction.
     transmit_queue: u32,
+    /// This PF's `FIRSTQ` -- what turns the index above into the device's.
+    ///
+    /// **Kept because the malicious-driver record names a queue and nothing
+    /// could be compared against it.** `GL_MDET_TX` reported `queue 384` for
+    /// boots on end with no way to say whose queue that was.
+    first: u32,
     /// Descriptors handed over, which is also the tail.
     posted: u32,
 }
@@ -2386,6 +2408,7 @@ fn bring_up_x722(
         transmit_device,
         queue,
         transmit_queue: queue,
+        first: u32::from(first),
         posted: X722_POSTED,
     })
 }
@@ -2884,13 +2907,34 @@ fn carry_x722(mut members: [Option<X722Member>; X722_MEMBERS], facts: [X722; X72
         // **Whether the device stopped a queue on purpose**, which is the one
         // thing a stopped queue and a slow one differ by. A malicious-driver
         // event *stops the respective queue*, and `MAL_TYPE` names the check it
-        // decided this driver failed. Port 0's, because the record is global.
+        // decided this driver failed.
+        //
+        // **Port 0's, because the *details* are global -- and only the details.**
+        // `GL_MDET_TX` is one register for the card and holds the first event
+        // since it was cleared, whoever raised it. `PF_MDET_TX` is one register
+        // per port, and this read it from port 0 and called the whole record
+        // global. Three members' flags were never read at all, for every boot
+        // this reader has existed.
         let malicious = members
             .iter()
             .flatten()
             .next()
             .map(|m| m.device.malicious_transmit())
             .unwrap_or_default();
+        // So each member's own flag, and each member's own queue in the number
+        // the record uses -- without which `queue 384` is a number with nothing
+        // to compare it against.
+        let mut flagged_members = 0u64;
+        let mut member_queues = 0u64;
+        for (index, member) in members.iter().enumerate() {
+            let Some(member) = member else { continue };
+            if member.device.malicious_flagged() {
+                flagged_members |= 1 << index;
+            }
+            let absolute = member.queues.first + member.queues.transmit_queue;
+            member_queues |=
+                u64::from(absolute & ((1 << MEMBER_QUEUE_BITS) - 1)) << (MEMBER_QUEUE_BITS * index);
+        }
         // And whether each member's transmit queue still reads as enabled --
         // `transmit_queue_state` has existed since the queues did and has never
         // had a caller.
@@ -2948,6 +2992,8 @@ fn carry_x722(mut members: [Option<X722Member>; X722_MEMBERS], facts: [X722; X72
             cursors: (outstanding, worst),
             malicious,
             queues_up,
+            flagged_members,
+            member_queues,
         });
 
         // **Yield rather than spin.** This program is pinned, and there is no
@@ -3344,6 +3390,15 @@ struct TransmitReport {
     malicious: bhaskix_i40e::MaliciousTransmit,
     /// One bit per member: its transmit queue still reads as enabled.
     queues_up: u64,
+    /// One bit per member: **its own** `PF_MDET_TX` flag.
+    ///
+    /// The record above carries the *global* `GL_MDET_TX` details and port 0's
+    /// flag. These are the four functions' own, which nothing read until
+    /// 2026-09-11.
+    flagged_members: u64,
+    /// Each member's transmit queue in the device's own numbering, thirteen
+    /// bits each -- what `GL_MDET_TX.QNUM` can be compared against.
+    member_queues: u64,
 }
 
 fn x722_transmit_report(report: TransmitReport) {
@@ -3358,6 +3413,8 @@ fn x722_transmit_report(report: TransmitReport) {
         cursors,
         malicious,
         queues_up,
+        flagged_members,
+        member_queues,
     } = report;
     let at = RINGS_AT + ring::REPORT + 27 * 8;
     // **Word 29: what this program did with the frames it was given.** The
@@ -3420,6 +3477,15 @@ fn x722_transmit_report(report: TransmitReport) {
         core::ptr::write_volatile(
             (RINGS_AT + ring::REPORT + 38 * 8) as *mut u64,
             malicious.packed() | (queues_up & 0xf) << 32 | 1 << 40,
+        );
+        // **Word 39: what the record can now be compared against.** Each
+        // member's transmit queue in the device's own numbering, thirteen bits
+        // each, and each member's own `PF_MDET_TX` flag at 55:52. Bit 63 says
+        // it was written, because a member on queue 0 with nothing flagged is
+        // all zeroes and so is a word nobody wrote.
+        core::ptr::write_volatile(
+            (RINGS_AT + ring::REPORT + 39 * 8) as *mut u64,
+            member_queues | (flagged_members & 0xf) << 52 | 1 << 63,
         );
     }
     // SAFETY: the report page this program mapped writable, past the failover

@@ -14808,6 +14808,20 @@ const NETD_VSI_SWITCHING: u64 = 37 * 8;
 /// whose descriptors are consumed and then are not has exactly this to ask.
 const NETD_MALICIOUS: u64 = 38 * 8;
 
+/// Byte offset of each member's transmit queue and each member's **own**
+/// malicious-driver flag, with bit 63 saying it was written.
+///
+/// **Because `queue 384` was a number with nothing to compare it against.** The
+/// record at [`NETD_MALICIOUS`] names the queue an event was raised on, and for
+/// five boots the report printed that number beside no others -- so whether it
+/// was a member's queue at all, and whose, could not be said. Thirteen bits per
+/// member at 51:0, the four functions' own `PF_MDET_TX` flags at 55:52.
+///
+/// The flags matter separately: `GL_MDET_TX` is one register for the card, but
+/// `PF_MDET_TX` is one per port, and `bin/netd` read it from port 0 alone while
+/// calling the whole record global.
+const NETD_MEMBER_QUEUES: u64 = 39 * 8;
+
 /// The sentinel `bin/netd` writes there.
 const NETD_MEMBER_ADDRESSES_WRITTEN: u64 = 0x5352_4444_414d_454d;
 
@@ -14820,6 +14834,23 @@ const NETD_MEMBER_ADDRESSES_WRITTEN: u64 = 0x5352_4444_414d_454d;
 const NETD_MEMBER_COUNT: usize = 4;
 
 const _: () = assert!(X722_MEMBERS as usize <= NETD_MEMBER_COUNT);
+
+/// Bits each member's queue takes in [`NETD_MEMBER_QUEUES`].
+///
+/// Thirteen, because the X722 numbers queues 0..1535 and `GL_MDET_TX.QNUM` is
+/// twelve bits wide -- so a queue that fits the record fits here.
+const NETD_MEMBER_QUEUE_BITS: u32 = 13;
+/// Where the members' own `PF_MDET_TX` flags begin in that word.
+const NETD_MEMBER_FLAGS_SHIFT: u32 = 52;
+/// Bit 63 of it: the word was written.
+const NETD_MEMBER_QUEUES_WRITTEN: u64 = 1 << 63;
+
+// Four queues at thirteen bits each end at 51, and the flags start at 52. A
+// fifth member would run its queue into the first member's flag.
+const _: () = assert!(
+    NETD_MEMBER_QUEUE_BITS as usize * NETD_MEMBER_COUNT <= NETD_MEMBER_FLAGS_SHIFT as usize
+);
+const _: () = assert!(NETD_MEMBER_FLAGS_SHIFT as usize + NETD_MEMBER_COUNT < 63);
 
 /// The VLAN this interface's frames carry, or zero for untagged.
 ///
@@ -16574,7 +16605,7 @@ fn net_domain_transmitted(hhdm: u64) -> Option<Transmitted> {
     // `x722_transmit_report` writes and the driver's own `sent` tally at word
     // 10, read volatile because the driver is still running and rewrites them
     // on every pass of its loop.
-    let (packed, port, posted, unfinished, cursors, sent, switching, malicious) = unsafe {
+    let (packed, port, posted, unfinished, cursors, sent, switching, malicious, member_queues) = unsafe {
         (
             core::ptr::read_volatile(at as *const u64),
             core::ptr::read_volatile((at + 8) as *const u64),
@@ -16584,6 +16615,7 @@ fn net_domain_transmitted(hhdm: u64) -> Option<Transmitted> {
             core::ptr::read_volatile((page + 10 * 8) as *const u64),
             core::ptr::read_volatile((page + NETD_VSI_SWITCHING) as *const u64),
             core::ptr::read_volatile((page + NETD_MALICIOUS) as *const u64),
+            core::ptr::read_volatile((page + NETD_MEMBER_QUEUES) as *const u64),
         )
     };
     // Bit 33 says the driver measured them. Without it, zero is what a port
@@ -16600,6 +16632,7 @@ fn net_domain_transmitted(hhdm: u64) -> Option<Transmitted> {
         sent,
         switching,
         malicious,
+        member_queues,
     })
 }
 
@@ -16641,6 +16674,9 @@ struct Transmitted {
     /// The malicious-driver transmit record and the queue enables, bit 40 set
     /// when read -- see [`NETD_MALICIOUS`].
     malicious: u64,
+    /// Each member's transmit queue and each member's own flag, bit 63 set when
+    /// written -- see [`NETD_MEMBER_QUEUES`].
+    member_queues: u64,
 }
 
 /// Whether `bin/netd` has written its report yet.
@@ -17580,6 +17616,47 @@ fn report_net_after_exchange(hhdm: u64) {
                         out.malicious >> 12 & 0xf,
                         out.malicious >> 16 & 0x1f
                     );
+                }
+                // **What that queue number can be compared against**, which is
+                // the whole reason this word exists. `PF_MDET_TX` is per port
+                // and was read from port 0 alone, so three members' flags were
+                // never read; `GL_MDET_TX.QNUM` named a queue with no member's
+                // queue printed beside it.
+                if out.member_queues & NETD_MEMBER_QUEUES_WRITTEN != 0 {
+                    let recorded_queue = (out.malicious & 0xfff) as u32;
+                    print!("                   per member, its queue and its own flag:");
+                    let mut matched = None;
+                    for member in 0..NETD_MEMBER_COUNT as u32 {
+                        let queue = (out.member_queues >> (NETD_MEMBER_QUEUE_BITS * member)
+                            & ((1 << NETD_MEMBER_QUEUE_BITS) - 1))
+                            as u32;
+                        let own = out.member_queues >> (NETD_MEMBER_FLAGS_SHIFT + member) & 1 != 0;
+                        if queue == recorded_queue && (flagged || recorded) {
+                            matched = Some(member);
+                        }
+                        print!(
+                            " member {member} queue {queue} {};",
+                            if own {
+                                "\x1b[91mFLAGGED\x1b[0m"
+                            } else {
+                                "clear"
+                            }
+                        );
+                    }
+                    println!();
+                    if flagged || recorded {
+                        match matched {
+                            Some(member) => println!(
+                                "                   the recorded queue {recorded_queue} is \
+                                 member {member}'s"
+                            ),
+                            None => println!(
+                                "                   \x1b[93mthe recorded queue \
+                                 {recorded_queue} is no member's -- so the event is not on a \
+                                 queue this driver posts to\x1b[0m"
+                            ),
+                        }
+                    }
                 }
             }
             // **Where the missing ones stopped**, read at the same instant as

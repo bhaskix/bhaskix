@@ -275,4 +275,14 @@ asm_budget = 3
 # report, which is the mistake that made `GLV_MPTCL` read the same 38 three boots
 # running. `transmit_queue_state` comes with it and had never had a caller: the
 # eighth mechanism in this driver written, documented and never asked.
-unsafe_budget = 405
+# 414 for the instrument that record needs to be readable: one more volatile
+# store for word 39, carrying each member's transmit queue in the device's own
+# numbering and each member's **own** `PF_MDET_TX` flag.
+#
+# `GL_MDET_TX` is one register for the card; `PF_MDET_TX` is one per port. This
+# program read the whole record off port 0 and commented that it was global --
+# true of the details and false of the flag, so three members' flags were never
+# read on any boot this reader has existed. And the record names a queue, which
+# for five boots was printed beside no member's queue at all, so `queue 384`
+# could not be attributed to anyone.
+unsafe_budget = 414
