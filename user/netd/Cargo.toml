@@ -262,4 +262,17 @@ asm_budget = 3
 # The fifth time in this driver that what a mechanism *did* went unread, after
 # `TX_SWTCH_UPLINK`, the `GLPRT_*` constants, `VsiTransmitted::since` and
 # `stop_lldp_agent`'s discarded result.
-unsafe_budget = 397
+# 405 at the malicious-driver record: eight lines, one volatile store carrying
+# `PF_MDET_TX`, `GL_MDET_TX` and the members' transmit queue enables.
+#
+# The SR550 leaves uplink-tagged descriptors unconsumed while plain frames are
+# perfect, and with the overwriting fixed the rings simply fill and stay full.
+# The device stopping a queue on purpose is the one explanation that is written
+# down in the datasheet rather than inferred, and this is where it says so.
+#
+# **Baselined at bring-up**, because `GL_MDET_TX` holds the *first* event until
+# written -- an uncleared one carries a previous boot's event into this boot's
+# report, which is the mistake that made `GLV_MPTCL` read the same 38 three boots
+# running. `transmit_queue_state` comes with it and had never had a caller: the
+# eighth mechanism in this driver written, documented and never asked.
+unsafe_budget = 405

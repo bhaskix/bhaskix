@@ -366,6 +366,26 @@ const GLV_BPRCL: u64 = 0x0036_D800;
 /// (`0x000E4000 + 0x4*Q`). Cleared by software before a queue is enabled.
 const QTX_HEAD: u64 = 0x000E_4000;
 
+/// Malicious Driver Detected on Tx -- 38.39.2.10.2, `PF_MDET_TX`
+/// (`0x000E6400`, RW1C). Bit 0 is `VALID`: *"a malicious event has been detected
+/// on this function"*.
+///
+/// **This is how a transmit queue stops without anyone asking it to.** The
+/// datasheet says so in as many words of the packet-size check: *"Packets
+/// outside this range are considered malicious. **The respective queue is
+/// stopped** and an interrupt is issued to the PF."* A queue that consumed
+/// descriptors and then stopped is exactly that shape, and this register is
+/// where the device says whether that is what happened.
+const PF_MDET_TX: u64 = 0x000E_6400;
+/// Malicious Driver Tx Event Details -- 38.39.2.10.3, `GL_MDET_TX`
+/// (`0x000E6480`, RW1C): *"records the details of the first Tx event
+/// detected"*. `QNUM` 11:0, `VF_NUM` 20:12, `PF_NUM` 24:21, `MAL_TYPE` 29:25
+/// -- *"ID of the event that has been recorded"* -- and `VALID` at 31.
+const GL_MDET_TX: u64 = 0x000E_6480;
+/// What the datasheet says to write to clear either: *"once read, driver must
+/// write 0xFFFF to clear"*.
+const MDET_CLEAR: u32 = 0xffff;
+
 /// Global Transmit Pre Queue Disable -- 38.39.2.18.9, `GLLAN_TXPRE_QDIS[n]`
 /// (`0x000E6500 + 0x4*n`, n = 0..11).
 ///
@@ -2241,6 +2261,36 @@ pub struct VsiParameters {
     pub queue_set: u16,
 }
 
+/// What the device's malicious-driver detection says about this function's
+/// transmit -- 38.39.2.10.2 and 38.39.2.10.3.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MaliciousTransmit {
+    /// `PF_MDET_TX.VALID`: an event was detected on this function.
+    pub flagged: bool,
+    /// `GL_MDET_TX.VALID`: the details register holds an event.
+    pub recorded: bool,
+    /// `QNUM`, the absolute queue the event was detected on.
+    pub queue: u16,
+    /// `PF_NUM`, the function it was detected on.
+    pub function: u8,
+    /// `MAL_TYPE`, *"ID of the event that has been recorded"* -- which
+    /// descriptor check the device decided this driver had failed.
+    pub kind: u8,
+}
+
+impl MaliciousTransmit {
+    /// The event as one word, for a report page: the details in the low bits
+    /// and the two valid flags above them.
+    #[must_use]
+    pub const fn packed(&self) -> u64 {
+        (self.queue as u64)
+            | (self.function as u64) << 12
+            | (self.kind as u64) << 16
+            | (self.recorded as u64) << 21
+            | (self.flagged as u64) << 22
+    }
+}
+
 /// A VSI's switching section, as the device holds it -- Table 38-216 bytes 2-6.
 ///
 /// **Because commanding a bit is not setting it.** `allow_destination_override`
@@ -3373,6 +3423,42 @@ impl<R: Registers> Device<R> {
         self.write(QTX_TAIL + 4 * u64::from(queue), tail & 0x1fff);
     }
 
+    /// Whether the device has flagged this function's transmit as malicious,
+    /// and the details of the first such event.
+    ///
+    /// **A stopped queue with no error anywhere else looks exactly like a slow
+    /// one.** This is the register that separates them: a malicious-driver
+    /// event *stops the respective queue*, and `MAL_TYPE` names which descriptor
+    /// check failed.
+    ///
+    /// Reading does not clear -- these are `RW1C` and only a write clears them,
+    /// which [`Device::clear_malicious_transmit`] does at bring-up so that what
+    /// is read afterwards belongs to this boot. Reading leaves the evidence
+    /// where it is.
+    #[must_use]
+    pub fn malicious_transmit(&self) -> MaliciousTransmit {
+        let details = self.read(GL_MDET_TX);
+        MaliciousTransmit {
+            flagged: self.read(PF_MDET_TX) & 1 != 0,
+            recorded: details >> 31 & 1 != 0,
+            queue: (details & 0xfff) as u16,
+            function: (details >> 21 & 0xf) as u8,
+            kind: (details >> 25 & 0x1f) as u8,
+        }
+    }
+
+    /// Clears both malicious-driver transmit records, so a later reading is
+    /// this boot's -- *"once read, driver must write 0xFFFF to clear"*.
+    ///
+    /// **The same baseline lesson as the transmit counters.** `GL_MDET_TX`
+    /// records the *first* event and holds it until written, so an uncleared
+    /// one carries a previous boot's event into this boot's report -- which is
+    /// the mistake that made `GLV_MPTCL` read the same 38 three boots running.
+    pub fn clear_malicious_transmit(&mut self) {
+        self.write(PF_MDET_TX, MDET_CLEAR);
+        self.write(GL_MDET_TX, MDET_CLEAR);
+    }
+
     /// Descriptors posted that the device has not consumed -- `(tail - head)`
     /// around the ring.
     ///
@@ -3716,7 +3802,7 @@ mod tests {
     #[test]
     fn every_register_this_driver_names_is_in_a_page_it_asks_for() {
         // (offset, highest index, stride) -- an unindexed register is (r, 0, 0).
-        let registers: [(u64, u64, u64); 45] = [
+        let registers: [(u64, u64, u64); 47] = [
             (PFGEN_CTRL, 0, 0),
             (PF_ATQBAL, 0, 0),
             (PF_ATQT, 0, 0),
@@ -3746,6 +3832,8 @@ mod tests {
             (QTX_HEAD, MAX_RECEIVE_QUEUE, 4),
             (QTX_CTL, MAX_RECEIVE_QUEUE, 4),
             (GLLAN_TXPRE_QDIS, 11, 4),
+            (PF_MDET_TX, 0, 0),
+            (GL_MDET_TX, 0, 0),
             (PFCM_LANCTXDATA, 3, 4),
             (PFCM_LANCTXCTL, 0, 0),
             (PFINT_ITR0, 2, 0x80),
@@ -4856,6 +4944,86 @@ mod tests {
             .registers
             .put(QTX_HEAD + 4 * u64::from(QUEUE), 0x1fff);
         assert_eq!(device.transmit_outstanding(QUEUE), 0);
+    }
+
+    /// The pre-queue-disable register names its queue **absolutely**.
+    ///
+    /// **A `GL_` register is a global array whose field names the queue**, so a
+    /// BAR cannot disambiguate it the way it does for `QTX_TAIL[Q]` and its
+    /// neighbours -- those are per-queue registers reached through a function's
+    /// own window and take the PF-relative index. This one is not, and
+    /// `bin/netd` handed it the PF-relative index anyway.
+    ///
+    /// On PF0 `FIRSTQ` is zero and the two coincide, which is why it worked
+    /// there and nowhere else. 38.31.3.1.1 requires this flag cleared *before
+    /// the queue is enabled*; a queue with it still set reads as enabled and
+    /// does not fetch descriptors.
+    ///
+    /// Both halves are pinned here: the register chosen is the **absolute**
+    /// queue over 128, and the value written carries the absolute queue in
+    /// `QINDX` -- so a caller passing a PF-relative index is wrong in two ways
+    /// at once on any function but the first.
+    #[test]
+    fn the_pre_queue_disable_register_names_its_queue_absolutely() {
+        // PF1 on this card starts at queue 384 -- the number that made the
+        // difference invisible on PF0 and fatal beyond it.
+        const FIRST: u32 = 384;
+        const RELATIVE: u32 = 3;
+        let absolute = FIRST + RELATIVE;
+        let mut device = Device::new(Fake::new());
+        device.clear_transmit_queue_disable(absolute);
+
+        // 387 / 128 = 3, so the fourth register of the array.
+        let chosen = GLLAN_TXPRE_QDIS + 4 * u64::from(absolute / QDIS_QUEUES_PER_REGISTER);
+        let wrote = device.registers.at(chosen);
+        assert_eq!(
+            wrote & 0x7ff,
+            absolute,
+            "QINDX carries the absolute queue, not the PF-relative one"
+        );
+        assert!(wrote & TXPRE_CLEAR_QDIS != 0, "and asks for a clear");
+
+        // The PF-relative index would have picked register 0 and named queue 3 --
+        // a different queue in a different register, both wrong.
+        let relative_register =
+            GLLAN_TXPRE_QDIS + 4 * u64::from(RELATIVE / QDIS_QUEUES_PER_REGISTER);
+        assert_ne!(
+            chosen, relative_register,
+            "the two indices do not even choose the same register"
+        );
+    }
+
+    /// The malicious-driver event decodes at 38.39.2.10.3's fields.
+    ///
+    /// **This register is the difference between a slow queue and a stopped
+    /// one.** The datasheet says a malicious event *stops the respective
+    /// queue*, so a driver whose descriptors are consumed and then are not has
+    /// exactly one register to ask -- and `MAL_TYPE` names which descriptor
+    /// check it failed. Getting the field positions wrong would report a queue
+    /// number as a reason code.
+    #[test]
+    fn a_malicious_transmit_event_decodes_at_its_own_fields() {
+        let mut device = Device::new(Fake::new());
+        // Nothing flagged: every field false and zero.
+        assert_eq!(device.malicious_transmit(), MaliciousTransmit::default());
+
+        // QNUM 11:0, PF_NUM 24:21, MAL_TYPE 29:25, VALID 31.
+        let details = 0x321 | 2 << 21 | 9 << 25 | 1 << 31;
+        device.registers.put(GL_MDET_TX, details);
+        device.registers.put(PF_MDET_TX, 1);
+
+        let event = device.malicious_transmit();
+        assert!(event.flagged, "PF_MDET_TX bit 0");
+        assert!(event.recorded, "GL_MDET_TX bit 31");
+        assert_eq!(event.queue, 0x321, "QNUM is twelve bits");
+        assert_eq!(event.function, 2, "PF_NUM at 24:21");
+        assert_eq!(event.kind, 9, "MAL_TYPE at 29:25, and it is not the queue");
+        assert_eq!(event.packed() >> 16 & 0x1f, 9, "and it survives the report");
+
+        // Clearing writes what the datasheet asks for, to both.
+        device.clear_malicious_transmit();
+        assert_eq!(device.registers.at(PF_MDET_TX), MDET_CLEAR);
+        assert_eq!(device.registers.at(GL_MDET_TX), MDET_CLEAR);
     }
 
     /// A full transmit ring refuses a frame rather than overwriting one.

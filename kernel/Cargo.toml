@@ -813,7 +813,15 @@ asm_budget = 10
 # unverified link in the path a frame carrying one takes. Every other link in it
 # has now been measured; this is the one that was still being reported by its
 # command's return value.
-unsafe_budget = 2031
+# 2032 at the malicious-driver record: **one** more volatile read.
+#
+# C620 38.31.1, of the transmit packet-size check: "Packets outside this range
+# are considered malicious. The respective queue is stopped and an interrupt is
+# issued to the PF." A driver whose descriptors are consumed and then are not
+# has exactly one register to ask, and `MAL_TYPE` names the check the device
+# decided it failed. A stopped queue with no error anywhere else looks exactly
+# like a slow one, and this line is the difference.
+unsafe_budget = 2032
 # Up thirty-one for RFC 0005 step 9's socket probe -- `ring3_socketeer`, which
 # is `ring3_lister` with a `sockaddr_in6` copied in beside its code instead of
 # two filenames. The same two blocks every hosted probe has: one

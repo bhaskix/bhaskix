@@ -1873,3 +1873,65 @@ cause, `post_refused` becomes non-zero and the write-back count climbs. If
 `post_refused` stays zero while 30 of 40 still go unwritten, the driver was never
 overwriting anything and the loss is elsewhere. Either way the result is clean,
 which is more than the last several attempts could say in advance.
+
+
+### The queue index, and why three ports in four never fetched — 2026-09-11
+
+The device was not stopping the queues. `PF_MDET_TX` and `GL_MDET_TX` both read
+clear and all four transmit queues read enabled, which kills the one explanation
+the datasheet documents for a queue that stops:
+
+```
+malicious-driver record: none -- the device did not stop a queue on purpose;
+transmit queues enabled 0b1111
+```
+
+That negative is what sent the question back to the index, and the index is where
+it was.
+
+**Two kinds of register, and they were treated as one.**
+
+* `QTX_TAIL[Q]`, `QTX_ENA[Q]`, `QTX_HEAD[Q]`, `QTX_CTL[Q]` are *per-queue*
+  registers reached through a function's own BAR, so the index is **PF-relative**
+  — which this project established in step 1 with a page fault as the evidence.
+* **`GLLAN_TXPRE_QDIS` is a `GL_` register**: one global array covering all 1536
+  queues, in which `QINDX` is a *field* naming the queue. A BAR cannot
+  disambiguate a field. The crate said so at `clear_transmit_queue_disable` —
+  *"`queue` is the **absolute** index, which is what `QINDX` takes"* — and
+  `bin/netd` handed it the PF-relative one, reading `FIRSTQ` only to discard it
+  under a comment asserting it *"must not be added"*.
+
+On PF0 `FIRSTQ` is zero, so the two coincide and it works. On PF1, PF2 and PF3 it
+cleared some other queue's pre-queue-disable flag and left this one's set — and
+38.31.3.1.1 requires that flag cleared **before the queue is enabled**. A queue
+with it still set reads as enabled, records no error, and does not fetch
+descriptors.
+
+**The ratio is the tell, and it is exact:**
+
+| | leaves by | completion |
+|---|---|---|
+| plain frames | the active member only — member 0 = **PF0** | **100%** |
+| uplink LACPDUs | all four links, one per member | **~25%** |
+
+Three of four failing is three of four functions with the wrong flag cleared.
+
+**And it accounts for every negative result before it.** Queues enabled, no
+malicious-driver event, destination override read back set, control port taken
+from the EMP, context descriptor correct field by field — not one of those would
+notice a pre-queue-disable flag left set on somebody else's queue.
+
+`the_pre_queue_disable_register_names_its_queue_absolutely` pins both halves
+using PF1's real base of 384: the register chosen is `absolute / 128`, and the
+value carries the absolute queue in `QINDX`. The PF-relative index picks a
+*different register* naming a *different queue* — wrong twice over, which is why
+it could not half-work.
+
+**Same class as the defect that cost step 1 several boots** — absolute against
+PF-relative — and the same trap: invisible on the first function of a card. The
+lesson this time is narrower and worth keeping: **a `GL_` register that names its
+target in a field takes the absolute number; a per-queue register reached through
+a function's window takes the relative one.** The prefix says which.
+
+**The prediction, before the boot**: uplink completion goes from ~25% to near
+100%, and the outstanding-descriptor count collapses.

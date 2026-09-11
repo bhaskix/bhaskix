@@ -14799,6 +14799,15 @@ const NETD_TRANSMITTED: u64 = 27 * 8;
 /// like a working one.
 const NETD_VSI_SWITCHING: u64 = 37 * 8;
 
+/// Byte offset in that page of the device's malicious-driver transmit record
+/// and the members' transmit queue enables, with bit 40 saying it was read.
+///
+/// **The one register that separates a stopped queue from a slow one.** C620
+/// 38.31.1: *"Packets outside this range are considered malicious. The
+/// respective queue is stopped and an interrupt is issued to the PF."* A driver
+/// whose descriptors are consumed and then are not has exactly this to ask.
+const NETD_MALICIOUS: u64 = 38 * 8;
+
 /// The sentinel `bin/netd` writes there.
 const NETD_MEMBER_ADDRESSES_WRITTEN: u64 = 0x5352_4444_414d_454d;
 
@@ -16565,7 +16574,7 @@ fn net_domain_transmitted(hhdm: u64) -> Option<Transmitted> {
     // `x722_transmit_report` writes and the driver's own `sent` tally at word
     // 10, read volatile because the driver is still running and rewrites them
     // on every pass of its loop.
-    let (packed, port, posted, unfinished, cursors, sent, switching) = unsafe {
+    let (packed, port, posted, unfinished, cursors, sent, switching, malicious) = unsafe {
         (
             core::ptr::read_volatile(at as *const u64),
             core::ptr::read_volatile((at + 8) as *const u64),
@@ -16574,6 +16583,7 @@ fn net_domain_transmitted(hhdm: u64) -> Option<Transmitted> {
             core::ptr::read_volatile((at + 32) as *const u64),
             core::ptr::read_volatile((page + 10 * 8) as *const u64),
             core::ptr::read_volatile((page + NETD_VSI_SWITCHING) as *const u64),
+            core::ptr::read_volatile((page + NETD_MALICIOUS) as *const u64),
         )
     };
     // Bit 33 says the driver measured them. Without it, zero is what a port
@@ -16589,6 +16599,7 @@ fn net_domain_transmitted(hhdm: u64) -> Option<Transmitted> {
         worst: cursors >> 32 & 0xffff_ffff,
         sent,
         switching,
+        malicious,
     })
 }
 
@@ -16627,6 +16638,9 @@ struct Transmitted {
     /// The VSI's switching section as the driver read it back, bit 16 set when
     /// it was read at all -- see [`NETD_VSI_SWITCHING`].
     switching: u64,
+    /// The malicious-driver transmit record and the queue enables, bit 40 set
+    /// when read -- see [`NETD_MALICIOUS`].
+    malicious: u64,
 }
 
 /// Whether `bin/netd` has written its report yet.
@@ -17536,6 +17550,37 @@ fn report_net_after_exchange(hhdm: u64) {
                     out.switching >> 13 & 1,
                     out.switching >> 14 & 1
                 );
+            }
+            // **Whether the device stopped the queue on purpose.**
+            //
+            // 38.31.1 says a malicious-driver event stops the respective queue,
+            // and `MAL_TYPE` names the descriptor check the device decided this
+            // driver failed. That is the difference between a device that will
+            // not take descriptors and one that has been told to stop taking
+            // them -- and a stopped queue with no error anywhere else looks
+            // exactly like a slow one.
+            if out.malicious >> 40 & 1 != 0 {
+                let flagged = out.malicious >> 22 & 1 != 0;
+                let recorded = out.malicious >> 21 & 1 != 0;
+                println!(
+                    "                   malicious-driver record: {}; transmit queues enabled \
+                     {:#06b}",
+                    if flagged || recorded {
+                        "\x1b[91mFLAGGED\x1b[0m"
+                    } else {
+                        "\x1b[92mnone -- the device did not stop a queue on purpose\x1b[0m"
+                    },
+                    out.malicious >> 32 & 0xf
+                );
+                if flagged || recorded {
+                    println!(
+                        "                   \x1b[91mqueue {}, function {}, MAL_TYPE {} -- the \
+                         descriptor check this driver failed\x1b[0m",
+                        out.malicious & 0xfff,
+                        out.malicious >> 12 & 0xf,
+                        out.malicious >> 16 & 0x1f
+                    );
+                }
             }
             // **Where the missing ones stopped**, read at the same instant as
             // both of the numbers above. The first boot to print the line above

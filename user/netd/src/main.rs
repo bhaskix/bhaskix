@@ -2114,9 +2114,25 @@ fn bring_up_x722(
     // `0x23ffc000000` on this machine), so a queue register named `Q=0...1535`
     // globally is still reached PF-relative through that window.
     //
-    // `FIRSTQ` itself is not needed once the index is PF-relative -- it is the
-    // thing that must *not* be added -- so it is read and discarded.
-    let (_first, queue_count) = device.queue_allocation()?;
+    // `FIRSTQ` must *not* be added for any of those -- which is why this said
+    // it was "not needed" and discarded it, and that was wrong.
+    //
+    // **One register is not like the others, and it is the one that decides
+    // whether the device fetches at all.** `GLLAN_TXPRE_QDIS` is a `GL_`
+    // register: a single global array covering all 1536 queues, where `QINDX`
+    // is a *field* naming the queue. A BAR cannot disambiguate a field, so that
+    // field takes the **absolute** number -- the crate says so at
+    // `clear_transmit_queue_disable`, and this code handed it the PF-relative
+    // one.
+    //
+    // On PF0 `FIRSTQ` is zero, so the two coincide and it works. On PF1, PF2
+    // and PF3 it cleared some other queue's pre-queue-disable flag and left
+    // this one's set -- and 38.31.3.1.1 says that flag must be cleared *before
+    // the queue is enabled*. A queue with it still set reads as enabled and
+    // does not fetch descriptors, which is exactly what the SR550 shows: plain
+    // frames leave by the active member (PF0) and complete every time, while
+    // uplink LACPDUs go out on all four links and three in four never complete.
+    let (first, queue_count) = device.queue_allocation()?;
     progress.stage = 5;
     let (base, _scattered) = device.vsi_queue_base(vsi_number)?;
     let queue = u32::from(base);
@@ -2125,6 +2141,12 @@ fn bring_up_x722(
     // **Out of PXE mode first** -- 38.30.2.1's "operating system driver only
     // step", and the queue-length rule depends on it.
     let _ = device.clear_pxe_mode(admin, SPINS);
+    // **Baseline the malicious-driver records**, so what is read at report time
+    // belongs to this boot. `GL_MDET_TX` holds the *first* event until written,
+    // and an uncleared one carries a previous boot's into this one -- the same
+    // mistake that made `GLV_MPTCL` read the same 38 for three boots running.
+    // The datasheet asks a driver to write 0xFFFF once it has read them.
+    device.clear_malicious_transmit();
 
     // The private memory the HMC fetches contexts from, sized to the queues
     // this function owns rather than to the one it takes.
@@ -2345,7 +2367,9 @@ fn bring_up_x722(
             ready_list: 0,
         },
     );
-    device.clear_transmit_queue_disable(queue);
+    // **Absolute here and PF-relative everywhere else.** See `FIRSTQ` above:
+    // this one register names its queue in a field of a global array.
+    device.clear_transmit_queue_disable(u32::from(first) + queue);
     device.own_transmit_queue(queue, memory.function);
     let _ = device.enable_transmit_queue(queue, SPINS);
     device.attach_transmit_ring(i40e::TRANSMIT_DESCRIPTORS);
@@ -2857,6 +2881,29 @@ fn carry_x722(mut members: [Option<X722Member>; X722_MEMBERS], facts: [X722; X72
                 })
             })
             .sum();
+        // **Whether the device stopped a queue on purpose**, which is the one
+        // thing a stopped queue and a slow one differ by. A malicious-driver
+        // event *stops the respective queue*, and `MAL_TYPE` names the check it
+        // decided this driver failed. Port 0's, because the record is global.
+        let malicious = members
+            .iter()
+            .flatten()
+            .next()
+            .map(|m| m.device.malicious_transmit())
+            .unwrap_or_default();
+        // And whether each member's transmit queue still reads as enabled --
+        // `transmit_queue_state` has existed since the queues did and has never
+        // had a caller.
+        let queues_up = members
+            .iter()
+            .enumerate()
+            .filter_map(|(index, member)| {
+                member.as_ref().map(|m| {
+                    let (_, live) = m.device.transmit_queue_state(m.queues.transmit_queue);
+                    u64::from(live) << index
+                })
+            })
+            .fold(0u64, |bits, bit| bits | bit);
         // **Descriptors the device has not consumed**, counted around each
         // member's ring and then summed.
         //
@@ -2899,6 +2946,8 @@ fn carry_x722(mut members: [Option<X722Member>; X722_MEMBERS], facts: [X722; X72
             posted: (uplink_posted, post_refused),
             unfinished: (uncompleted, uplink_uncompleted),
             cursors: (outstanding, worst),
+            malicious,
+            queues_up,
         });
 
         // **Yield rather than spin.** This program is pinned, and there is no
@@ -3289,6 +3338,12 @@ struct TransmitReport {
     /// Descriptors the device has not consumed: the total across members, and
     /// the worst single member.
     cursors: (u64, u64),
+    /// Whether the device flagged this function's transmit as malicious, which
+    /// **stops the respective queue** -- the one thing that separates a stopped
+    /// queue from a slow one.
+    malicious: bhaskix_i40e::MaliciousTransmit,
+    /// One bit per member: its transmit queue still reads as enabled.
+    queues_up: u64,
 }
 
 fn x722_transmit_report(report: TransmitReport) {
@@ -3301,6 +3356,8 @@ fn x722_transmit_report(report: TransmitReport) {
         posted,
         unfinished,
         cursors,
+        malicious,
+        queues_up,
     } = report;
     let at = RINGS_AT + ring::REPORT + 27 * 8;
     // **Word 29: what this program did with the frames it was given.** The
@@ -3355,6 +3412,14 @@ fn x722_transmit_report(report: TransmitReport) {
         core::ptr::write_volatile(
             (RINGS_AT + ring::REPORT + 37 * 8) as *mut u64,
             switching.packed() | 1 << 16,
+        );
+        // **Word 38: the malicious-driver record and the queue enables.** A
+        // malicious event stops the queue it was detected on, so this is what
+        // separates a device that will not take descriptors from one that has
+        // been told to stop taking them. Bit 40 says it was read at all.
+        core::ptr::write_volatile(
+            (RINGS_AT + ring::REPORT + 38 * 8) as *mut u64,
+            malicious.packed() | (queues_up & 0xf) << 32 | 1 << 40,
         );
     }
     // SAFETY: the report page this program mapped writable, past the failover
