@@ -382,9 +382,26 @@ const PF_MDET_TX: u64 = 0x000E_6400;
 /// detected"*. `QNUM` 11:0, `VF_NUM` 20:12, `PF_NUM` 24:21, `MAL_TYPE` 29:25
 /// -- *"ID of the event that has been recorded"* -- and `VALID` at 31.
 const GL_MDET_TX: u64 = 0x000E_6480;
-/// What the datasheet says to write to clear either: *"once read, driver must
-/// write 0xFFFF to clear"*.
-const MDET_CLEAR: u32 = 0xffff;
+/// What to write to clear either -- **every bit**, and `0xFFFF` was wrong.
+///
+/// The C620 says *"once read, driver must write 0xFFFF to clear"* and repeats
+/// it for all three MDET registers, `GL_MDET_TX` included. But `GL_MDET_TX`
+/// carries `VALID` at bit **31**, `MAL_TYPE` at 29:25 and `PF_NUM` at 24:21,
+/// and these registers are `RW1C` -- a zero written to a bit leaves that bit
+/// exactly as it was. `0xFFFF` cleared `QNUM` and half of `VF_NUM` and left the
+/// event itself standing.
+///
+/// **So the clear did not clear, and the instrument lied in the safe-looking
+/// direction.** A stale event survived every boot after the one that raised it
+/// and read as this boot's, because the reader cannot tell a latched event from
+/// a fresh one -- that is what clearing is for. Three descriptor checks were
+/// eliminated on the strength of a `MAL_TYPE` that may have been recorded boots
+/// earlier.
+///
+/// The X710 datasheet states the same rule generally and correctly -- *"The
+/// registers are cleared by writing ones to them"* -- and the specific-looking
+/// number was believed over the accurate sentence.
+const MDET_CLEAR: u32 = u32::MAX;
 
 /// Global Transmit Pre Queue Disable -- 38.39.2.18.9, `GLLAN_TXPRE_QDIS[n]`
 /// (`0x000E6500 + 0x4*n`, n = 0..11).
@@ -3459,7 +3476,8 @@ impl<R: Registers> Device<R> {
     }
 
     /// Clears both malicious-driver transmit records, so a later reading is
-    /// this boot's -- *"once read, driver must write 0xFFFF to clear"*.
+    /// this boot's -- see [`MDET_CLEAR`] for why that is every bit and not
+    /// the datasheet's `0xFFFF`.
     ///
     /// **The same baseline lesson as the transmit counters.** `GL_MDET_TX`
     /// records the *first* event and holds it until written, so an uncleared
@@ -4852,6 +4870,222 @@ mod tests {
             longest < 7,
             "a run of {longest} non-data descriptors is what the device calls malicious \
              (M_CONTEXTS, event 21), and it stops the queue"
+        );
+    }
+
+    /// Outstanding descriptors are counted around the ring, not subtracted.
+    ///
+    /// **This is the arithmetic a boot report got wrong.** It summed tails and
+    /// heads across four members and compared the sums, which flips on a wrap
+    /// alone -- so the same code called the device *caught up* on one boot and
+    /// *behind* on the next, and a change was credited with fixing the fetch on
+    /// the strength of it.
+    #[test]
+    fn outstanding_descriptors_are_counted_around_the_ring() {
+        const QUEUE: u32 = 3;
+        let depth = u32::from(TRANSMIT_DESCRIPTORS);
+        let mut ring = FakeDma::new();
+        let mut device = Device::new(Fake::new());
+        device.attach_transmit_ring(TRANSMIT_DESCRIPTORS);
+
+        // Nothing posted, head at zero: nothing outstanding.
+        assert_eq!(device.transmit_outstanding(QUEUE), 0);
+
+        // An uplink frame is a context descriptor and its data descriptor, and
+        // both are outstanding until the device consumes them.
+        device.post_frame(&mut ring, QUEUE, 0x4000, 124, true);
+        assert_eq!(device.transmit_outstanding(QUEUE), 2);
+
+        // The device consumes them: nothing outstanding, and the naive
+        // subtraction would agree here.
+        device.registers.put(QTX_HEAD + 4 * u64::from(QUEUE), 2);
+        assert_eq!(device.transmit_outstanding(QUEUE), 0);
+
+        // **Now the case the sums got wrong.** Post until the ring refuses, so
+        // the cursor has wrapped past the head: the tail reads *lower* than the
+        // head, and a subtraction says the device is ahead of the driver.
+        for _ in 0..depth {
+            if device
+                .post_frame(&mut ring, QUEUE, 0x4000, 124, false)
+                .is_none()
+            {
+                break;
+            }
+        }
+        assert!(
+            device.transmit_tail() < device.transmit_head(QUEUE),
+            "the cursor has wrapped and reads lower than the head, which is the trap"
+        );
+        assert_eq!(
+            device.transmit_outstanding(QUEUE),
+            depth - 1,
+            "everything posted since the head, counted around the wrap"
+        );
+
+        // A head firmware never moved off a nonsense value is not a negative
+        // count -- it is read as zero, so the answer is the cursor itself.
+        device
+            .registers
+            .put(QTX_HEAD + 4 * u64::from(QUEUE), 0x1fff);
+        assert_eq!(device.transmit_outstanding(QUEUE), device.transmit_tail());
+    }
+
+    /// The pre-queue-disable register names its queue **absolutely**.
+    ///
+    /// **A `GL_` register is a global array whose field names the queue**, so a
+    /// BAR cannot disambiguate it the way it does for `QTX_TAIL[Q]` and its
+    /// neighbours -- those are per-queue registers reached through a function's
+    /// own window and take the PF-relative index. This one is not, and
+    /// `bin/netd` handed it the PF-relative index anyway.
+    ///
+    /// On PF0 `FIRSTQ` is zero and the two coincide, which is why it worked
+    /// there and nowhere else. 38.31.3.1.1 requires this flag cleared *before
+    /// the queue is enabled*; a queue with it still set reads as enabled and
+    /// does not fetch descriptors.
+    ///
+    /// Both halves are pinned here: the register chosen is the **absolute**
+    /// queue over 128, and the value written carries the absolute queue in
+    /// `QINDX` -- so a caller passing a PF-relative index is wrong in two ways
+    /// at once on any function but the first.
+    #[test]
+    fn the_pre_queue_disable_register_names_its_queue_absolutely() {
+        // PF1 on this card starts at queue 384 -- the number that made the
+        // difference invisible on PF0 and fatal beyond it.
+        const FIRST: u32 = 384;
+        const RELATIVE: u32 = 3;
+        let absolute = FIRST + RELATIVE;
+        let mut device = Device::new(Fake::new());
+        device.clear_transmit_queue_disable(absolute);
+
+        // 387 / 128 = 3, so the fourth register of the array.
+        let chosen = GLLAN_TXPRE_QDIS + 4 * u64::from(absolute / QDIS_QUEUES_PER_REGISTER);
+        let wrote = device.registers.at(chosen);
+        assert_eq!(
+            wrote & 0x7ff,
+            absolute,
+            "QINDX carries the absolute queue, not the PF-relative one"
+        );
+        assert!(wrote & TXPRE_CLEAR_QDIS != 0, "and asks for a clear");
+
+        // The PF-relative index would have picked register 0 and named queue 3 --
+        // a different queue in a different register, both wrong.
+        let relative_register =
+            GLLAN_TXPRE_QDIS + 4 * u64::from(RELATIVE / QDIS_QUEUES_PER_REGISTER);
+        assert_ne!(
+            chosen, relative_register,
+            "the two indices do not even choose the same register"
+        );
+    }
+
+    /// The malicious-driver event decodes at 38.39.2.10.3's fields, and the
+    /// clear reaches **every** one of them.
+    ///
+    /// **This register is the difference between a slow queue and a stopped
+    /// one.** The datasheet says a malicious event *stops the respective
+    /// queue*, so a driver whose descriptors are consumed and then are not has
+    /// exactly one register to ask -- and `MAL_TYPE` names which descriptor
+    /// check it failed. Getting the field positions wrong would report a queue
+    /// number as a reason code.
+    ///
+    /// **The clear is asserted here because it was broken and nothing caught
+    /// it.** This test existed and checked only that `MDET_CLEAR` was written
+    /// back, which a wrong constant passes trivially. `GL_MDET_TX` is `RW1C`
+    /// with `VALID` at bit 31, so a clear of `0xFFFF` left the event standing
+    /// and every later reading reported a stale event as a fresh one. So what
+    /// is pinned now is the *field*, not the constant: a one must reach bit 31
+    /// and `MAL_TYPE`, or the clear does not clear.
+    #[test]
+    fn a_malicious_transmit_event_decodes_at_its_own_fields() {
+        let mut device = Device::new(Fake::new());
+        // Nothing flagged: every field false and zero.
+        assert_eq!(device.malicious_transmit(), MaliciousTransmit::default());
+
+        // QNUM 11:0, PF_NUM 24:21, MAL_TYPE 29:25, VALID 31.
+        let details = 0x321 | 2 << 21 | 9 << 25 | 1 << 31;
+        device.registers.put(GL_MDET_TX, details);
+        device.registers.put(PF_MDET_TX, 1);
+
+        let event = device.malicious_transmit();
+        assert!(event.flagged, "PF_MDET_TX bit 0");
+        assert!(event.recorded, "GL_MDET_TX bit 31");
+        assert_eq!(event.queue, 0x321, "QNUM is twelve bits");
+        assert_eq!(event.function, 2, "PF_NUM at 24:21");
+        assert_eq!(event.kind, 9, "MAL_TYPE at 29:25, and it is not the queue");
+        assert_eq!(event.packed() >> 16 & 0x1f, 9, "and it survives the report");
+
+        // The clear must reach the fields that carry the event, not just the
+        // low half of the register.
+        device.clear_malicious_transmit();
+        for register in [PF_MDET_TX, GL_MDET_TX] {
+            let wrote = device.registers.at(register);
+            assert_eq!(
+                wrote >> 31 & 1,
+                1,
+                "a one must reach VALID at bit 31 or the event survives the clear"
+            );
+            assert_eq!(
+                wrote >> 25 & 0x1f,
+                0x1f,
+                "and MAL_TYPE at 29:25 or the reason survives it"
+            );
+            assert_eq!(wrote, u32::MAX, "every bit, because these are RW1C");
+        }
+    }
+
+    /// A full transmit ring refuses a frame rather than overwriting one.
+    ///
+    /// **The boot report named this defect for days and nothing acted on it** --
+    /// *"this driver overwrites what it does not wait for"*. A descriptor
+    /// rewritten while the device still owns it is a frame silently lost --
+    /// worse, a packet buffer changed under a transmit in flight.
+    ///
+    /// A refusal is a fact the caller can count. An overwrite is not, which is
+    /// exactly why the SR550 could report 30 of 40 posts never written back with
+    /// nothing saying whether they were lost or merely late.
+    #[test]
+    fn a_full_transmit_ring_refuses_rather_than_overwriting() {
+        const QUEUE: u32 = 0;
+        let depth = u32::from(TRANSMIT_DESCRIPTORS);
+        let mut ring = FakeDma::new();
+        let mut device = Device::new(Fake::new());
+        device.attach_transmit_ring(TRANSMIT_DESCRIPTORS);
+
+        // A device that consumes nothing. One slot is always left free, because
+        // a tail that catches the head reads as empty rather than full.
+        for round in 0..depth - 1 {
+            assert!(
+                device
+                    .post_frame(&mut ring, QUEUE, 0x4000, 124, false)
+                    .is_some(),
+                "round {round} fits: the device has consumed nothing and the ring is {depth} deep"
+            );
+        }
+        let full = device.transmit_tail();
+        assert_eq!(
+            device.post_frame(&mut ring, QUEUE, 0x4000, 124, false),
+            None,
+            "the ring is full and the next frame must be refused, not written over one the \
+             device still owns"
+        );
+        assert_eq!(
+            device.transmit_tail(),
+            full,
+            "and a refusal moves nothing -- the cursor is where it was"
+        );
+
+        // The device consumes one descriptor; one frame fits again, and exactly
+        // one.
+        device.registers.put(QTX_HEAD + 4 * u64::from(QUEUE), 1);
+        assert!(
+            device
+                .post_frame(&mut ring, QUEUE, 0x4000, 124, false)
+                .is_some(),
+            "a consumed slot is a slot free"
+        );
+        assert_eq!(
+            device.post_frame(&mut ring, QUEUE, 0x4000, 124, false),
+            None,
+            "and only one"
         );
     }
 

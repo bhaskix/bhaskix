@@ -1971,7 +1971,16 @@ before its data one — the threshold, to the descriptor.
 **It was wrong.** With the padding removed entirely the flag is still there, same
 queue, same code. So `M_CONTEXTS` is eliminated, and the padding is eliminated
 with it: uplink completion returned to ~25% and `post_refused` to zero, which is
-where it was before the padding existed. **Across its whole life the padding
+where it was before the padding existed.
+
+> **Retracted, 2026-09-11 — the elimination of `M_CONTEXTS` does not stand.**
+> The reasoning above requires that the flag read after the padding was removed
+> be a *new* event. It need not have been: `clear_malicious_transmit` wrote
+> `0xFFFF` to an `RW1C` register whose `VALID` bit is 31, so it never cleared
+> anything that mattered and the reading may be latched from any earlier boot.
+> See *A clear that did not clear* below. The padding's elimination is
+> untouched — it rests on the completion and refusal counts, not on this
+> register. **Across its whole life the padding
 changed nothing in either direction**, and it cost several boots to establish
 that. It came from reading the fetch-granularity rule as requiring aligned tails;
 that reading is not supported by anything measured.
@@ -1992,7 +2001,8 @@ is not.
 ### What is left, and what it cost
 
 `ENDLESS_TX`, `BAD_DESC_TYPE` and `NO_PACKET` remain, none with an obvious match
-in what this driver posts. `GL_MDCK_TCMD` would say which checks are even
+in what this driver posts. (`M_CONTEXTS` is back among them — see the retraction
+above.) `GL_MDCK_TCMD` would say which checks are even
 enabled, and **has no published MMIO address in either datasheet** — thirteen
 mentions across the two, and the only addresses near them are the NVM words the
 defaults load from.
@@ -2003,3 +2013,82 @@ malicious-driver reader that surfaced event 21 at all, and this documentation
 correction. Two confident hypotheses failed on hardware in one day, both of which
 fitted the evidence before the boot. The next one should be cheaper to test than
 a boot.
+
+
+### A clear that did not clear — 2026-09-11
+
+`ENDLESS_TX` and `NO_PACKET` were eliminated by reading the code rather than by
+booting, which was the point: both arguments hold without hardware.
+
+* **`ENDLESS_TX`** — *"tail update bigger than ring size"*. `QLEN` in the
+  transmit context and the cursor's wrap in `post_frame` both come from the one
+  constant `TRANSMIT_DESCRIPTORS`, so the tail cannot name a descriptor outside
+  the ring the device was told about.
+* **`NO_PACKET`** — *"tail update not containing at least one full packet"*.
+  Both doorbell sites sit inside `if let Some(slot) = post_frame(…)`, so the
+  tail is only ever rung after a data descriptor has been written.
+
+Then the instrument that produced the evidence turned out to be broken.
+
+```rust
+const MDET_CLEAR: u32 = 0xffff;
+```
+
+`GL_MDET_TX` is `RW1C` with `VALID` at bit **31**, `MAL_TYPE` at 29:25 and
+`PF_NUM` at 24:21. Writing `0xFFFF` clears `QNUM` and half of `VF_NUM` and
+leaves the event itself standing — and a zero written to an `RW1C` bit is not a
+clear, it is a no-op.
+
+**Which half of the report this spoils, precisely.** `PF_MDET_TX.VALID` is bit
+**0**, so `0xFFFF` did clear that one: `FLAGGED` has always meant *a malicious
+event was raised against this function on this boot*, and that much stands.
+`GL_MDET_TX` is the register that carries *what the event was* — the queue, the
+function, the `MAL_TYPE` — and it was never cleared. It records the **first**
+event since its last clear and holds it, so what has been read as "this boot's
+details" is the first event this card ever raised under this driver, on any
+boot.
+
+That also answers a loose end this document has been carrying: `function 0` on
+queue 384, which belongs to PF1. Not a puzzle about how the device numbers
+functions — a record from a boot where the event really was PF0's, still
+sitting there.
+
+The C620 says *"once read, driver must write 0xFFFF to clear"* for all three MDET
+registers. The X710 says the same rule generally and correctly: *"The registers
+are cleared by writing ones to them."* The specific-looking number was believed
+over the accurate sentence, and the register's own field table — printed two
+lines above the constant, `VALID` at 31 — was not checked against it.
+
+**What this retracts.** The eliminations of `M_CONTEXTS` and `BAD_DESC_TYPE`
+both rest on a `MAL_TYPE` read back after a clear, and there was no clear, so
+both are withdrawn. `ENDLESS_TX` and `NO_PACKET` stay eliminated, because
+neither argument touches this register.
+
+What is *not* retracted is that something is being flagged. `FLAGGED` came off
+`PF_MDET_TX`, which was cleared properly, on the boot where PF1's queue first
+fetched. The device is refusing this driver's descriptors; the next boot is the
+first one that can say which check.
+
+**The pattern, now counted.** Nine mechanisms in this driver were written,
+documented, and then never called or never read back — `TX_SWTCH_UPLINK`, the
+`GLPRT_*` constants, `VsiTransmitted::since`, `stop_lldp_agent`'s discarded
+result, `allow_destination_override`'s unread bit, `transmit_queue_state`,
+`Device::port_counters`, the VLAN tag `parse_on` discarded in its refusal, and
+the LLDP frames refused on every boot. This is a tenth and a worse kind: a
+mechanism that *was* called, on every boot, and did nothing. A clear that does
+not clear reads exactly like a condition that persists.
+
+And the test that covered it passed. It asserted that `MDET_CLEAR` was written
+back to both registers — which any constant satisfies, including a wrong one.
+The assertion now names the fields instead: a one must reach bit 31 and
+`MAL_TYPE`, watched red against `0xFFFF`.
+
+**Four tests were also lost.** The commit that dropped the padding removed
+`outstanding_descriptors_are_counted_around_the_ring`,
+`the_pre_queue_disable_register_names_its_queue_absolutely`,
+`a_malicious_transmit_event_decodes_at_its_own_fields` and
+`a_full_transmit_ring_refuses_rather_than_overwriting` along with the padding's
+own test — five removed where one was meant. The mechanisms survived; only their
+cover went, silently, because a suite that shrinks still passes. All four are
+restored here, the two that describe `post_frame` rewritten for a ring with no
+padding in it.
