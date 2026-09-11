@@ -2482,3 +2482,62 @@ outright.
 
 The reading is still a hypothesis; what is established is that it is the only
 remaining place the frame can be changed between this host and that switch.
+
+
+### The VLAN section was not it either — 2026-09-12
+
+```
+per member, its vlan section: member 0 pvid 0, insert 0, admit 3, expose 3;
+  member 1 pvid 0, insert 0, admit 3, expose 3; member 2 ... ; member 3 ...
+```
+
+Identical on all four and entirely permissive: no PVID insertion, insertion mode
+`11b` *"allow all packets"*, expose mode `11b` *"do nothing"*. The VSI neither
+tags a frame nor refuses one. Three hypotheses in a row now — `QTX_CTL`, the
+descriptor checks, the VLAN section — each fitting the evidence beforehand and
+each killed by a boot.
+
+**What the same boot said that matters more:**
+
+```
+dhcp client    nobody answered -- FAILED
+net reply      ipd built 11 frames, 0 arp mappings learned
+tcpd           0 segments in, 7 out
+```
+
+**Nothing this host transmits has ever been answered by anything.** Everything
+received is unsolicited — the switch's own LLDP and LACPDUs.
+
+Half of that is circular and must be said so: a switch port in a channel-group
+that has not bundled suspends data forwarding, so DHCP and ARP would fail anyway
+while LACP is down. It is not independent evidence about the transmit path. What
+it does establish is that there is **no independent probe of transmit from this
+side**, which puts all the weight on a question the report has never been able
+to answer.
+
+### A sum is not a measurement — 2026-09-12
+
+`bin/netd` reads both transmit counters **per member** — `vsi_transmitted(fact.vsi)`
+and `port_transmitted(m.device.port_number())`, each against its own baseline —
+and publishes only their sum. So
+
+* four ports sending twelve frames each, and
+* one port sending forty-six,
+
+are the same line in every report this document has quoted. They are different
+machines.
+
+The second is what `SWTCH = 01b` would look like if *"transmitted to the network"*
+resolves to the single switch element's uplink rather than to each VSI's own
+port: every member's LACPDU leaves by one MAC, the total still reads 46, and
+three of the four switch ports have heard nothing at all — `Defaulted` on three
+links, for a reason nothing in the report could name. The card reports **1 switch
+element**, which is what makes the reading possible rather than idle.
+
+It does not explain link 0, and that is stated rather than smoothed over.
+
+So the per-member counts are published at words 46 and 47, thirteen bits each,
+with each member's MAC port number beside them — because *"which port did this
+member read"* is the other half of believing the answer, and the three numbers
+that agree on a single-port card (VSI, member index, MAC port) have already been
+confused once in this driver.

@@ -14873,6 +14873,23 @@ const NETD_MEMBER_VLAN_FLAGS: u64 = 45 * 8;
 /// Bit 63 of either: the word was written.
 const NETD_MEMBER_VLAN_WRITTEN: u64 = 1 << 63;
 
+/// Byte offset of each member's multicast frames out of its **VSI**, thirteen
+/// bits each, with its MAC port number at 59:52 and bit 63 saying written.
+///
+/// **Because a sum cannot answer the question that is left.** "All four ports
+/// sent twelve frames each" and "one port sent forty-six" are different
+/// machines, and the report has only ever published the total. The second is
+/// what a `SWTCH` uplink resolving to one switch element's uplink looks like,
+/// and it would leave three of the four switch ports having heard no LACPDU at
+/// all -- `Defaulted` on three links, for a reason nothing here could name.
+const NETD_MEMBER_VSI_OUT: u64 = 46 * 8;
+/// And the same frames one boundary further out, at the MAC port.
+const NETD_MEMBER_PORT_OUT: u64 = 47 * 8;
+/// Bit 63 of either: the word was written.
+const NETD_MEMBER_OUT_WRITTEN: u64 = 1 << 63;
+/// Bits each member's count takes in those two words.
+const NETD_MEMBER_OUT_BITS: u32 = 13;
+
 /// The sentinel `bin/netd` writes there.
 const NETD_MEMBER_ADDRESSES_WRITTEN: u64 = 0x5352_4444_414d_454d;
 
@@ -16670,6 +16687,8 @@ fn net_domain_transmitted(hhdm: u64) -> Option<Transmitted> {
         member_queue_sets,
         member_pvids,
         member_vlan_flags,
+        member_vsi_out,
+        member_port_out,
     ) = unsafe {
         (
             core::ptr::read_volatile(at as *const u64),
@@ -16685,6 +16704,8 @@ fn net_domain_transmitted(hhdm: u64) -> Option<Transmitted> {
             core::ptr::read_volatile((page + NETD_MEMBER_QUEUE_SETS) as *const u64),
             core::ptr::read_volatile((page + NETD_MEMBER_PVIDS) as *const u64),
             core::ptr::read_volatile((page + NETD_MEMBER_VLAN_FLAGS) as *const u64),
+            core::ptr::read_volatile((page + NETD_MEMBER_VSI_OUT) as *const u64),
+            core::ptr::read_volatile((page + NETD_MEMBER_PORT_OUT) as *const u64),
         )
     };
     // Bit 33 says the driver measured them. Without it, zero is what a port
@@ -16706,6 +16727,8 @@ fn net_domain_transmitted(hhdm: u64) -> Option<Transmitted> {
         member_queue_sets,
         member_pvids,
         member_vlan_flags,
+        member_vsi_out,
+        member_port_out,
     })
 }
 
@@ -16760,6 +16783,10 @@ struct Transmitted {
     member_pvids: u64,
     /// Each member's VLAN handling flags -- see [`NETD_MEMBER_VLAN_FLAGS`].
     member_vlan_flags: u64,
+    /// Each member's frames out of its VSI -- see [`NETD_MEMBER_VSI_OUT`].
+    member_vsi_out: u64,
+    /// And out of its MAC port -- see [`NETD_MEMBER_PORT_OUT`].
+    member_port_out: u64,
 }
 
 /// Whether `bin/netd` has written its report yet.
@@ -17834,6 +17861,37 @@ fn report_net_after_exchange(hhdm: u64) {
                             "                   \x1b[91mthis VSI tags or refuses an untagged \
                              frame, so a slow-protocol frame never reaches the switch's LACP \
                              machine -- Table 38-216 byte 12\x1b[0m"
+                        );
+                    }
+                }
+                // **Which wire the frames actually went down.** The totals
+                // above cannot separate four ports sending a share each from
+                // one port sending all of them, and only the second would
+                // explain three switch ports that have heard nothing.
+                if out.member_vsi_out & NETD_MEMBER_OUT_WRITTEN != 0
+                    && out.member_port_out & NETD_MEMBER_OUT_WRITTEN != 0
+                {
+                    let mask = (1u64 << NETD_MEMBER_OUT_BITS) - 1;
+                    print!("                   per member, multicast out of the vsi / the mac:");
+                    let mut sending = 0;
+                    let mut silent = 0;
+                    for member in 0..NETD_MEMBER_COUNT as u32 {
+                        let vsi = out.member_vsi_out >> (NETD_MEMBER_OUT_BITS * member) & mask;
+                        let port = out.member_port_out >> (NETD_MEMBER_OUT_BITS * member) & mask;
+                        let number = out.member_vsi_out >> (52 + 2 * member) & 0b11;
+                        if port > 0 {
+                            sending += 1;
+                        } else {
+                            silent += 1;
+                        }
+                        print!(" member {member} (mac port {number}) {vsi}/{port};");
+                    }
+                    println!();
+                    if sending <= 1 && silent > 0 {
+                        println!(
+                            "                   \x1b[91mone port carried them all -- the other \
+                             members' frames left by somebody else's mac, so their switch ports \
+                             heard nothing\x1b[0m"
                         );
                     }
                 }

@@ -327,4 +327,15 @@ asm_budget = 3
 # verbatim, the MAC counts it out, and the switch never hands it to LACP. The
 # section has been in the `Get VSI Parameters` buffer from the first boot that
 # ran the command, and only bytes 2-6 were ever read out of it.
-unsafe_budget = 449
+#
+# That was wrong too: the section reads pvid 0, insert 0, admit 11b "allow all",
+# expose 11b on all four members. The VSI neither tags nor refuses anything.
+#
+# 461 for the measurement the report has never been able to make: the two
+# transmit counts **per member** rather than summed. A total cannot separate
+# "four ports sent twelve frames each" from "one port sent forty-six", and only
+# the second would explain three switch ports that have heard no LACPDU -- which
+# is what a `SWTCH` uplink resolving to one switch element's uplink would do.
+# Each member's MAC port number rides with them, because "which port did this
+# member read" is the other half of believing the answer.
+unsafe_budget = 461

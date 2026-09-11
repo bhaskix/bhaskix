@@ -2945,6 +2945,39 @@ fn carry_x722(mut members: [Option<X722Member>; X722_MEMBERS], facts: [X722; X72
                 })
             })
             .sum();
+        // **The same two counts per member, not only their sum.**
+        //
+        // A total cannot tell "all four ports sent twelve frames each" from
+        // "one port sent forty-six", and those are different machines. The
+        // second is what a `SWTCH` uplink resolving to a single switch
+        // element's uplink would look like, and it would leave three of the
+        // four switch ports having heard nothing -- which is `Defaulted` on
+        // three links, for a reason nothing in this report could name.
+        //
+        // Thirteen bits each, saturating: a count larger than that is already
+        // far past the question being asked. The port *number* goes with them,
+        // two bits each, because "which MAC port did this member read" is the
+        // other half of believing the answer.
+        let mut member_vsi_out = 0u64;
+        let mut member_port_out = 0u64;
+        for (index, member) in members.iter().enumerate() {
+            let Some(m) = member else { continue };
+            let vsi = m
+                .device
+                .vsi_transmitted(facts[index].vsi)
+                .since(&vsi_baseline[index])
+                .multicast
+                .min(0x1fff);
+            let port = m
+                .device
+                .port_transmitted(m.device.port_number())
+                .since(&port_baseline[index])
+                .multicast
+                .min(0x1fff);
+            member_vsi_out |= vsi << (13 * index);
+            member_vsi_out |= u64::from(m.device.port_number() & 0b11) << (52 + 2 * index);
+            member_port_out |= port << (13 * index);
+        }
         // **Whether the device stopped a queue on purpose**, which is the one
         // thing a stopped queue and a slow one differ by. A malicious-driver
         // event *stops the respective queue*, and `MAL_TYPE` names the check it
@@ -3070,6 +3103,8 @@ fn carry_x722(mut members: [Option<X722Member>; X722_MEMBERS], facts: [X722; X72
             member_queue_sets,
             member_pvids,
             member_vlan_flags,
+            member_vsi_out,
+            member_port_out,
         });
 
         // **Yield rather than spin.** This program is pinned, and there is no
@@ -3501,6 +3536,12 @@ struct TransmitReport {
     /// Each member's VLAN handling flags -- `Insert PVID`, valid, insertion
     /// mode, expose mode -- seven bits at an eight-bit stride.
     member_vlan_flags: u64,
+    /// Each member's multicast frames out of its **VSI**, thirteen bits each,
+    /// with its MAC port number at 59:52.
+    member_vsi_out: u64,
+    /// Each member's multicast frames out of its **MAC port**, thirteen bits
+    /// each -- the same frames one boundary further out.
+    member_port_out: u64,
 }
 
 fn x722_transmit_report(report: TransmitReport) {
@@ -3521,6 +3562,8 @@ fn x722_transmit_report(report: TransmitReport) {
         member_queue_sets,
         member_pvids,
         member_vlan_flags,
+        member_vsi_out,
+        member_port_out,
     } = report;
     let at = RINGS_AT + ring::REPORT + 27 * 8;
     // **Word 29: what this program did with the frames it was given.** The
@@ -3627,6 +3670,18 @@ fn x722_transmit_report(report: TransmitReport) {
         core::ptr::write_volatile(
             (RINGS_AT + ring::REPORT + 45 * 8) as *mut u64,
             member_vlan_flags | 1 << 63,
+        );
+        // **Words 46 and 47: the two transmit counts per member.** Thirteen
+        // bits each at 51:0, and in word 46 each member's MAC port number at
+        // 59:52. Bit 63 says written, because a member that sent nothing is a
+        // real reading.
+        core::ptr::write_volatile(
+            (RINGS_AT + ring::REPORT + 46 * 8) as *mut u64,
+            member_vsi_out | 1 << 63,
+        );
+        core::ptr::write_volatile(
+            (RINGS_AT + ring::REPORT + 47 * 8) as *mut u64,
+            member_port_out | 1 << 63,
         );
     }
     // SAFETY: the report page this program mapped writable, past the failover

@@ -837,7 +837,11 @@ asm_budget = 10
 # `Insert PVID` tags every egress frame and insertion mode 10b admits only
 # tagged ones -- either makes an untagged LACPDU invisible to a switch's LACP
 # machine while every counter above still says the frame left.
-unsafe_budget = 2037
+# 2039 for report words 46 and 47: each member's multicast out of its VSI and
+# out of its MAC port, with the port number beside them. The sums have been
+# published since the counters were read and cannot answer which wire the
+# frames went down.
+unsafe_budget = 2039
 # Up thirty-one for RFC 0005 step 9's socket probe -- `ring3_socketeer`, which
 # is `ring3_lister` with a `sockaddr_in6` copied in beside its code instead of
 # two filenames. The same two blocks every hosted probe has: one
