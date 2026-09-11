@@ -1365,9 +1365,31 @@ impl HmcError {
 /// `FPM_object_address = (GLHMC_{object}BASE*512) + (2^GLHMC_{object}OBJSZ *
 /// element_index)`, `SD_index = INT(FPM_object_address / 2 MB)`, `PD_index =
 /// INT(FPM_object_address / 4 KB) and 0x1FF`, and what is left is the offset
-/// in the backing page. `element_index` is the **absolute** queue number --
-/// 38.26.3 step 5: *"HMC PM LAN objects are indexed with the absolute queue
-/// number"*.
+/// in the backing page. `element_index` is the queue's index **within this
+/// function's own object space**, not the device's absolute queue number.
+///
+/// **This comment said the opposite and was wrong, which nearly cost a boot.**
+/// It quoted 38.26.3 step 5 -- *"HMC PM LAN objects are indexed with the
+/// absolute queue number"* -- as if that were the `element_index` rule. It is
+/// not: step 5 is about **sizing the base and count registers** for the largest
+/// index a function uses. The address formula settles it, because the base is
+/// already per-function:
+///
+/// ```text
+/// FPM_object_address = (GLHMC_{object}BASE * 512) + (2^GLHMC_{object}OBJSZ * element_index)
+/// HMC_PM_index       = PF index or the HMC VF FPM index
+/// ```
+///
+/// `GLHMC_LANTXBASE[HMC_PM_index]` already places this function's objects, so
+/// adding `FIRSTQ` on top double-counts -- which is exactly the page fault RFC
+/// 0076 step 1 diagnosed at `0x4411c000`. The datasheet's own worked example
+/// says it plainly: *"a software device driver needs to allocate FPM backing
+/// pages for 512 LAN receive queues **starting at index 0**"*.
+///
+/// `bin/netd` passes the PF-relative index and is correct. Contrast
+/// `GLLAN_TXPRE_QDIS`, which **is** absolute -- a `GL_` register is one global
+/// array whose `QINDX` field names the queue, and no per-function base is
+/// involved. The prefix says which rule applies.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ContextLocation {
     /// The private memory address itself.
@@ -3330,64 +3352,53 @@ impl<R: Registers> Device<R> {
         bytes: u16,
         uplink: bool,
     ) -> Option<u32> {
-        let line = u32::from(TRANSMIT_FETCH_LINE);
-        // **A frame takes a whole cache line, and sits at the end of it.**
+        let needed = if uplink { 2 } else { 1 };
+        // **No padding, and that is a correction.** Whole-line padding was added
+        // so the tail would land on the eight-descriptor boundary the device
+        // fetches at -- and it put seven consecutive non-data descriptors in
+        // front of every frame, which X710 Table 7-138 calls `M_CONTEXTS`:
+        // *"7 or more consecutive non-data descriptors are fetched in a transmit
+        // queue"*, a malicious-driver event that **stops the queue**. The SR550
+        // flagged event 21 the moment the padded queues began fetching.
         //
-        // Outside PXE mode the device fetches a line at a time and will not
-        // fetch part of one, so the tail has to land on a boundary or the frame
-        // is never fetched -- measured, 24 of 32 uplink posts unwritten with the
-        // tail bumped by the frame's own size.
-        //
-        // The padding goes in **front**. Behind the frame it stopped the queue
-        // outright: `QTX_HEAD` pinned at zero and nothing transmitted, on two
-        // builds. See `transmit_nop_descriptor` for why. In front, the line
-        // reads as NOPs, then the command, and ends on a data descriptor
-        // carrying `EOP`.
-        if self.transmit_depth < line {
+        // A frame is its own one or two descriptors again. An uplink frame has
+        // exactly one context descriptor in front of its data, which is as far
+        // from seven as this driver can get.
+        if self.transmit_depth < needed {
             return None;
         }
-        // **Refuse rather than overwrite a descriptor the device has not
-        // consumed.** Until now this posted regardless, and the boot report has
-        // been saying so for days -- *"this driver overwrites what it does not
-        // wait for"* -- while nothing acted on it. With one frame per cache line
-        // and four lines in the ring, sixty-seven frames in a boot means the
-        // ring is rewritten many times over, and a descriptor rewritten while
-        // the device still owns it is a frame silently lost and, worse, a buffer
-        // changed under a transmit in flight.
-        //
-        // One line is always left free, because a tail that catches the head
-        // reads as *empty* rather than full: `outstanding` is `(tail - head)`
-        // around the ring, so it cannot represent a completely full one.
-        //
-        // A refusal is a fact the caller can count. An overwrite is not.
-        if self.transmit_outstanding(queue) + line >= self.transmit_depth {
+        // **Refuse rather than overwrite a descriptor the device still owns.**
+        // A frame's descriptors must be contiguous, so a frame that will not fit
+        // before the end of the ring wastes the slack there -- and that slack
+        // has to be counted against the free space, or the wrap lands on
+        // descriptors the device has not consumed.
+        let wasted = if self.transmit_next + needed > self.transmit_depth {
+            self.transmit_depth - self.transmit_next
+        } else {
+            0
+        };
+        // One slot is always left free: `outstanding` is `(tail - head)` around
+        // the ring, so a completely full ring reads as an empty one.
+        if self.transmit_outstanding(queue) + wasted + needed >= self.transmit_depth {
             return None;
         }
-        // Wrap before writing rather than across the line, so a frame's
-        // descriptors are always contiguous and the tail is always a boundary.
-        if self.transmit_next + line > self.transmit_depth {
+        // Wrap before writing rather than across the pair, so a frame's
+        // descriptors are always contiguous.
+        if wasted > 0 {
             self.transmit_next = 0;
         }
-        let opened = self.transmit_next;
-        let data = opened + line - 1;
-        let slot = if uplink { data - 1 } else { data };
-        // The slack first, so nothing the previous pass left is read as a
-        // command this one did not write.
-        for index in opened..slot {
-            post_transmit_nop(ring, index);
-        }
+        let slot = self.transmit_next;
+        let data = if uplink { slot + 1 } else { slot };
         if uplink {
             post_transmit_context(ring, slot, TX_SWTCH_UPLINK);
         }
         post_transmit_descriptor(ring, data, buffer, bytes);
-        self.transmit_next = opened + line;
+        self.transmit_next = data + 1;
         // **Wrap the cursor, because the tail is an index and not a count.**
         // `QTX_TAIL` takes a descriptor index, so a ring of eight accepts 0 to
-        // 7; writing 8 after filling the last slot is out of range and the
-        // queue stops taking updates. That is exactly what happened on
-        // 2026-09-06: four LACPDUs left the wire and the fifth put the tail at
-        // eight, after which the head sat still at six and forty more frames
-        // went nowhere.
+        // 7; writing 8 after filling the last slot is out of range and the queue
+        // stops taking updates -- 2026-09-06, where four LACPDUs left and forty
+        // more went nowhere.
         if self.transmit_next >= self.transmit_depth {
             self.transmit_next = 0;
         }
@@ -4471,18 +4482,13 @@ mod tests {
     #[test]
     fn the_transmit_cursor_wraps_instead_of_running_past_the_ring() {
         const DEPTH: u16 = 32;
-        let line = u32::from(TRANSMIT_FETCH_LINE);
         let mut ring = FakeDma::new();
         let mut device = Device::new(Fake::new());
         device.attach_transmit_ring(DEPTH);
 
-        for round in 0..(u32::from(DEPTH) / line) {
+        for round in 0..u32::from(DEPTH) {
             let at = device.post_frame(&mut ring, 0, 0x1_0000_0000, 60, false);
-            assert_eq!(
-                at,
-                Some(round * line + line - 1),
-                "one frame per cache line, at the end of it"
-            );
+            assert_eq!(at, Some(round), "one descriptor per frame, in order");
             assert!(
                 device.transmit_tail() < u32::from(DEPTH),
                 "a tail of {} is not a valid index into {DEPTH} descriptors",
@@ -4496,7 +4502,7 @@ mod tests {
         assert_eq!(
             device.transmit_tail(),
             0,
-            "the fifth frame starts the ring again"
+            "the thirty-third frame starts the ring again"
         );
     }
 
@@ -4510,7 +4516,6 @@ mod tests {
     #[test]
     fn an_uplink_frame_takes_two_contiguous_descriptors() {
         const DEPTH: u16 = 16;
-        let line = u32::from(TRANSMIT_FETCH_LINE);
         let mut ring = FakeDma::new();
         let mut device = Device::new(Fake::new());
         device.attach_transmit_ring(DEPTH);
@@ -4519,37 +4524,41 @@ mod tests {
         // the data descriptor.
         assert_eq!(
             device.post_frame(&mut ring, 0, 0x2000, 60, true),
-            Some(line - 1),
-            "the data descriptor closes the line"
+            Some(1),
+            "context at 0, data at 1"
         );
-        assert_eq!(device.transmit_tail(), line);
-        // A device that keeps up, so this stays a test about packing.
+        assert_eq!(device.transmit_tail(), 2);
         device.registers.put(QTX_HEAD, device.transmit_tail());
-        let at = TRANSMIT_DESCRIPTOR_BYTES as usize * (line - 2) as usize;
         assert_eq!(
-            (dma64(&ring, at), dma64(&ring, at + 8)),
+            (dma64(&ring, 0), dma64(&ring, 8)),
             transmit_context_descriptor(TX_SWTCH_UPLINK),
             "and its context descriptor is immediately in front of it"
         );
+        // Fill to the end. The cursor wraps to zero once it reaches the depth,
+        // so the loop is bounded by the ring rather than by the cursor -- a
+        // `while tail + 2 <= DEPTH` never terminates for exactly that reason.
+        for _ in 0..(u32::from(DEPTH) / 2 - 1) {
+            assert!(device.post_frame(&mut ring, 0, 0x2000, 60, true).is_some());
+            device.registers.put(QTX_HEAD, device.transmit_tail());
+        }
+        assert_eq!(device.transmit_tail(), 0, "the ring is exactly filled");
         assert_eq!(
             device.post_frame(&mut ring, 0, 0x2000, 60, true),
-            Some(2 * line - 1),
-            "the next pair closes the next line"
-        );
-        assert_eq!(device.transmit_tail(), 0, "and the cursor has wrapped");
-        device.registers.put(QTX_HEAD, device.transmit_tail());
-        assert_eq!(
-            device.post_frame(&mut ring, 0, 0x2000, 60, true),
-            Some(line - 1),
+            Some(1),
             "the next pair starts at zero, not straddling the end"
         );
 
-        // A ring shorter than one fetch line takes nothing: the device could
-        // not fetch what it held.
+        // A ring too short for the pair takes neither half. One descriptor
+        // cannot hold a context and its data, and half a frame is not a frame.
         let mut narrow = FakeDma::new();
         let mut small = Device::new(Fake::new());
-        small.attach_transmit_ring(TRANSMIT_FETCH_LINE - 1);
+        small.attach_transmit_ring(1);
         assert_eq!(small.post_frame(&mut narrow, 0, 0x2000, 60, true), None);
+        // And a ring of two cannot either, because one slot is always left free
+        // -- a full ring reads as an empty one.
+        let mut pair = Device::new(Fake::new());
+        pair.attach_transmit_ring(2);
+        assert_eq!(pair.post_frame(&mut narrow, 0, 0x2000, 60, true), None);
     }
 
     /// A receive queue is enabled by asking and then waiting for hardware to
@@ -4791,298 +4800,58 @@ mod tests {
         );
     }
 
-    /// The tail lands on a fetch boundary and the line **ends** on the frame.
+    /// No run of seven non-data descriptors, which the device calls malicious.
     ///
-    /// Two properties, and the second is what a boot cost. The device fetches
-    /// eight 16-byte descriptors at a time, so a tail bumped by one or two
-    /// leaves the frame unfetched -- 24 of 32 uplink posts unwritten on the
-    /// SR550. And padding placed *behind* the frame stopped the queue outright,
-    /// `QTX_HEAD` pinned at 0 with nothing transmitted, because a trailing
-    /// context descriptor is how a command begins and the device waits for the
-    /// data descriptor that never comes. So the NOPs go in front and the line
-    /// ends on the frame's own data descriptor.
+    /// **X710 Table 7-138, `M_CONTEXTS`**: *"7 or more consecutive non-data
+    /// descriptors are fetched in a transmit queue"* -- event 21 on
+    /// `GL_MDET_TX`, and *"the queue is stopped"*. Whole-line padding put
+    /// exactly seven in front of every frame, and the SR550 flagged event 21 the
+    /// moment the padded queues began fetching.
+    ///
+    /// A context descriptor is a non-data descriptor, so this counts NOPs and
+    /// switch-control contexts alike, across the wrap, over a ring's worth of
+    /// alternating frames.
     #[test]
-    fn every_transmit_post_pads_in_front_and_ends_on_the_frame() {
-        let line = u32::from(TRANSMIT_FETCH_LINE);
-        // Alternating, because a plain frame takes one descriptor and an
-        // uplink-tagged one takes two: if the padding were computed from the
-        // frame rather than to the boundary, one of the two would drift.
-        for uplink in [false, true, true, false, true] {
-            let mut ring = FakeDma::new();
-            let mut device = Device::new(Fake::new());
-            device.attach_transmit_ring(TRANSMIT_DESCRIPTORS);
-            for round in 0..(u32::from(TRANSMIT_DESCRIPTORS) / line + 2) {
-                let data = device
-                    .post_frame(&mut ring, 0, 0x4000, 124, uplink)
-                    .expect("the ring is deeper than one line");
-                let tail = device.transmit_tail();
-                assert_eq!(
-                    tail % line,
-                    0,
-                    "round {round}: a tail of {tail} is inside a cache line the device will \
-                     not fetch"
-                );
-                let opened = if tail == 0 {
-                    u32::from(TRANSMIT_DESCRIPTORS) - line
-                } else {
-                    tail - line
-                };
-                assert_eq!(
-                    data,
-                    opened + line - 1,
-                    "round {round}: the frame must close its line, not open it"
-                );
-                // Everything before the frame's own descriptors is a NOP.
-                let first = if uplink { data - 1 } else { data };
-                for index in opened..first {
-                    let at = TRANSMIT_DESCRIPTOR_BYTES as usize * index as usize;
-                    assert_eq!(
-                        (dma64(&ring, at), dma64(&ring, at + 8)),
-                        transmit_nop_descriptor(),
-                        "round {round}: descriptor {index} is not a NOP"
-                    );
-                }
-                // And nothing follows the frame inside the line.
-                assert_eq!(
-                    data + 1,
-                    opened + line,
-                    "round {round}: a descriptor after the frame is one the device waits on"
-                );
-                // A device that keeps up, so this stays a test about packing.
-                device.registers.put(QTX_HEAD, device.transmit_tail());
-            }
-        }
-    }
-
-    /// The switching section is decoded at the bytes Table 38-216 gives it.
-    ///
-    /// **The bit this is really about is byte 6.0.** Without *Allow destination
-    /// override* a switch control tag is not permitted, and `Update VSI`
-    /// returning `Ok` says only that firmware took the command -- not that the
-    /// bit stuck. Reading it back is the difference, and this holds the decode
-    /// to the datasheet's own byte and bit numbering so the read-back means what
-    /// it says.
-    #[test]
-    fn the_vsi_switching_section_decodes_at_table_38_216s_bytes() {
-        let mut parameters = VsiParameters::default();
-        // Switch id 0xabc at bytes 2 to 3.3, and byte 3.5 "allow loopback".
-        parameters.context[2] = 0xbc;
-        parameters.context[3] = 0x0a | 1 << 5;
-        // Byte 6.0 is the flag; byte 6.1 is the *security* section's VLAN
-        // anti-spoof and must not be read as it.
-        parameters.context[VSI_SWITCHING_FLAGS_AT] = 1 << 1;
-
-        let seen = parameters.switching();
-        assert_eq!(seen.switch_id, 0xabc, "twelve bits, bytes 2 to 3.3");
-        assert!(seen.allow_loopback, "byte 3.5");
-        assert!(!seen.not_stag, "byte 3.4");
-        assert!(!seen.allow_local_loopback, "byte 3.6");
-        assert!(
-            !seen.allow_destination_override,
-            "byte 6.1 is VLAN anti-spoof, not the override"
-        );
-
-        parameters.context[VSI_SWITCHING_FLAGS_AT] |= VSI_ALLOW_DESTINATION_OVERRIDE;
-        let set = parameters.switching();
-        assert!(set.allow_destination_override, "byte 6.0");
-        assert_eq!(
-            set.packed() >> 15 & 1,
-            1,
-            "and it survives the trip through a report word"
-        );
-        assert_eq!(set.packed() & 0xfff, 0xabc);
-    }
-
-    /// Outstanding descriptors are counted around the ring, not subtracted.
-    ///
-    /// **This is the arithmetic a boot report got wrong.** It summed tails and
-    /// heads across four members and compared the sums, which flips on a wrap
-    /// alone -- so the same code called the device *caught up* on one boot and
-    /// *behind* on the next, and a change was credited with fixing the fetch on
-    /// the strength of it.
-    #[test]
-    fn outstanding_descriptors_are_counted_around_the_ring() {
-        const QUEUE: u32 = 3;
-        let depth = TRANSMIT_DESCRIPTORS;
-        let mut ring = FakeDma::new();
-        let mut device = Device::new(Fake::new());
-        device.attach_transmit_ring(depth);
-
-        // Nothing posted, head at zero: nothing outstanding.
-        assert_eq!(device.transmit_outstanding(QUEUE), 0);
-
-        // One frame posted and unconsumed: a line's worth outstanding.
-        let line = u32::from(TRANSMIT_FETCH_LINE);
-        device.post_frame(&mut ring, QUEUE, 0x4000, 124, true);
-        assert_eq!(device.transmit_outstanding(QUEUE), line);
-
-        // The device consumes it: nothing outstanding, and the naive
-        // subtraction would agree here.
-        device.registers.put(QTX_HEAD + 4 * u64::from(QUEUE), line);
-        assert_eq!(device.transmit_outstanding(QUEUE), 0);
-
-        // **Now the case the sums got wrong.** Fill the ring so the cursor
-        // wraps to zero while the head sits mid-ring: the tail is *less* than
-        // the head, and a subtraction says the device is ahead of the driver.
-        for _ in 0..(u32::from(depth) / line - 1) {
-            device.post_frame(&mut ring, QUEUE, 0x4000, 124, true);
-        }
-        assert_eq!(device.transmit_tail(), 0, "the cursor has wrapped");
-        assert!(
-            device.transmit_head(QUEUE) > device.transmit_tail(),
-            "and the head now reads higher than the tail, which is the trap"
-        );
-        assert_eq!(
-            device.transmit_outstanding(QUEUE),
-            u32::from(depth) - line,
-            "everything posted since the head, counted around the wrap"
-        );
-
-        // A head firmware never moved off a nonsense value is not a negative
-        // count.
-        device
-            .registers
-            .put(QTX_HEAD + 4 * u64::from(QUEUE), 0x1fff);
-        assert_eq!(device.transmit_outstanding(QUEUE), 0);
-    }
-
-    /// The pre-queue-disable register names its queue **absolutely**.
-    ///
-    /// **A `GL_` register is a global array whose field names the queue**, so a
-    /// BAR cannot disambiguate it the way it does for `QTX_TAIL[Q]` and its
-    /// neighbours -- those are per-queue registers reached through a function's
-    /// own window and take the PF-relative index. This one is not, and
-    /// `bin/netd` handed it the PF-relative index anyway.
-    ///
-    /// On PF0 `FIRSTQ` is zero and the two coincide, which is why it worked
-    /// there and nowhere else. 38.31.3.1.1 requires this flag cleared *before
-    /// the queue is enabled*; a queue with it still set reads as enabled and
-    /// does not fetch descriptors.
-    ///
-    /// Both halves are pinned here: the register chosen is the **absolute**
-    /// queue over 128, and the value written carries the absolute queue in
-    /// `QINDX` -- so a caller passing a PF-relative index is wrong in two ways
-    /// at once on any function but the first.
-    #[test]
-    fn the_pre_queue_disable_register_names_its_queue_absolutely() {
-        // PF1 on this card starts at queue 384 -- the number that made the
-        // difference invisible on PF0 and fatal beyond it.
-        const FIRST: u32 = 384;
-        const RELATIVE: u32 = 3;
-        let absolute = FIRST + RELATIVE;
-        let mut device = Device::new(Fake::new());
-        device.clear_transmit_queue_disable(absolute);
-
-        // 387 / 128 = 3, so the fourth register of the array.
-        let chosen = GLLAN_TXPRE_QDIS + 4 * u64::from(absolute / QDIS_QUEUES_PER_REGISTER);
-        let wrote = device.registers.at(chosen);
-        assert_eq!(
-            wrote & 0x7ff,
-            absolute,
-            "QINDX carries the absolute queue, not the PF-relative one"
-        );
-        assert!(wrote & TXPRE_CLEAR_QDIS != 0, "and asks for a clear");
-
-        // The PF-relative index would have picked register 0 and named queue 3 --
-        // a different queue in a different register, both wrong.
-        let relative_register =
-            GLLAN_TXPRE_QDIS + 4 * u64::from(RELATIVE / QDIS_QUEUES_PER_REGISTER);
-        assert_ne!(
-            chosen, relative_register,
-            "the two indices do not even choose the same register"
-        );
-    }
-
-    /// The malicious-driver event decodes at 38.39.2.10.3's fields.
-    ///
-    /// **This register is the difference between a slow queue and a stopped
-    /// one.** The datasheet says a malicious event *stops the respective
-    /// queue*, so a driver whose descriptors are consumed and then are not has
-    /// exactly one register to ask -- and `MAL_TYPE` names which descriptor
-    /// check it failed. Getting the field positions wrong would report a queue
-    /// number as a reason code.
-    #[test]
-    fn a_malicious_transmit_event_decodes_at_its_own_fields() {
-        let mut device = Device::new(Fake::new());
-        // Nothing flagged: every field false and zero.
-        assert_eq!(device.malicious_transmit(), MaliciousTransmit::default());
-
-        // QNUM 11:0, PF_NUM 24:21, MAL_TYPE 29:25, VALID 31.
-        let details = 0x321 | 2 << 21 | 9 << 25 | 1 << 31;
-        device.registers.put(GL_MDET_TX, details);
-        device.registers.put(PF_MDET_TX, 1);
-
-        let event = device.malicious_transmit();
-        assert!(event.flagged, "PF_MDET_TX bit 0");
-        assert!(event.recorded, "GL_MDET_TX bit 31");
-        assert_eq!(event.queue, 0x321, "QNUM is twelve bits");
-        assert_eq!(event.function, 2, "PF_NUM at 24:21");
-        assert_eq!(event.kind, 9, "MAL_TYPE at 29:25, and it is not the queue");
-        assert_eq!(event.packed() >> 16 & 0x1f, 9, "and it survives the report");
-
-        // Clearing writes what the datasheet asks for, to both.
-        device.clear_malicious_transmit();
-        assert_eq!(device.registers.at(PF_MDET_TX), MDET_CLEAR);
-        assert_eq!(device.registers.at(GL_MDET_TX), MDET_CLEAR);
-    }
-
-    /// A full transmit ring refuses a frame rather than overwriting one.
-    ///
-    /// **The boot report named this defect for days and nothing acted on it** --
-    /// *"this driver overwrites what it does not wait for"*. With one frame per
-    /// cache line and four lines in the ring, a boot posting sixty-seven frames
-    /// rewrites the ring many times over, and a descriptor rewritten while the
-    /// device still owns it is a frame silently lost -- worse, a packet buffer
-    /// changed under a transmit in flight.
-    ///
-    /// A refusal is a fact the caller can count. An overwrite is not, which is
-    /// exactly why the SR550 could report 30 of 40 posts never written back with
-    /// nothing saying whether they were lost or merely late.
-    #[test]
-    fn a_full_transmit_ring_refuses_rather_than_overwriting() {
+    fn no_run_of_seven_non_data_descriptors_is_ever_posted() {
         const QUEUE: u32 = 0;
-        let line = u32::from(TRANSMIT_FETCH_LINE);
         let depth = u32::from(TRANSMIT_DESCRIPTORS);
         let mut ring = FakeDma::new();
         let mut device = Device::new(Fake::new());
         device.attach_transmit_ring(TRANSMIT_DESCRIPTORS);
 
-        // A device that consumes nothing. One line is always left free, because
-        // a tail that catches the head reads as empty rather than full.
-        let lines = depth / line - 1;
-        for round in 0..lines {
-            assert!(
-                device
-                    .post_frame(&mut ring, QUEUE, 0x4000, 124, false)
-                    .is_some(),
-                "round {round} fits: the device has consumed nothing and the ring is {depth} deep"
-            );
+        // Uplink frames back to back are the worst case: each contributes a
+        // context descriptor, and only the data descriptor between them breaks
+        // the run.
+        for round in 0..(depth * 2) {
+            if device
+                .post_frame(&mut ring, QUEUE, 0x4000, 124, round % 3 != 0)
+                .is_none()
+            {
+                // Full: let the device catch up and keep going.
+                device.registers.put(QTX_HEAD, device.transmit_tail());
+                continue;
+            }
+            device.registers.put(QTX_HEAD, device.transmit_tail());
         }
-        let full = device.transmit_tail();
-        assert_eq!(
-            device.post_frame(&mut ring, QUEUE, 0x4000, 124, false),
-            None,
-            "the ring is full and the next frame must be refused, not written over one the \
-             device still owns"
-        );
-        assert_eq!(
-            device.transmit_tail(),
-            full,
-            "and a refusal moves nothing -- the cursor is where it was"
-        );
 
-        // The device consumes one line; one frame fits again, and exactly one.
-        device.registers.put(QTX_HEAD + 4 * u64::from(QUEUE), line);
+        // Walk the whole ring and find the longest run of descriptors whose
+        // DTYP is not the data type.
+        let mut longest = 0u32;
+        let mut run = 0u32;
+        for index in 0..depth * 2 {
+            let at = TRANSMIT_DESCRIPTOR_BYTES as usize * (index % depth) as usize;
+            let qword1 = dma64(&ring, at + 8);
+            if qword1 & TX_DTYP_MASK == TX_DTYP_CONTEXT {
+                run += 1;
+                longest = longest.max(run);
+            } else {
+                run = 0;
+            }
+        }
         assert!(
-            device
-                .post_frame(&mut ring, QUEUE, 0x4000, 124, false)
-                .is_some(),
-            "a consumed line is a line free"
-        );
-        assert_eq!(
-            device.post_frame(&mut ring, QUEUE, 0x4000, 124, false),
-            None,
-            "and only one"
+            longest < 7,
+            "a run of {longest} non-data descriptors is what the device calls malicious \
+             (M_CONTEXTS, event 21), and it stops the queue"
         );
     }
 

@@ -1935,3 +1935,71 @@ a function's window takes the relative one.** The prefix says which.
 
 **The prediction, before the boot**: uplink completion goes from ~25% to near
 100%, and the outstanding-descriptor count collapses.
+
+
+### The padding was neither the cause nor a fix — 2026-09-11
+
+The queue-index fix let PF1's queue fetch for the first time, and the device
+immediately flagged what it found:
+
+```
+malicious-driver record: FLAGGED; transmit queues enabled 0b1111
+queue 384, function 0, MAL_TYPE 21 -- the descriptor check this driver failed
+```
+
+Queue 384 is PF1's `FIRSTQ`, which is the queue the fix newly addresses. **The
+prediction attached to that fix was wrong** — uplink completion did not go to
+100%, it stayed at ~25% — but the change was not inert: it moved the blocker from
+*the device is not looking* to *the device looks and refuses*.
+
+**The table the C620 references but does not contain.** `GL_MDET_TX.MAL_TYPE`
+points at a *"Malicious Driver - Tx descriptor checks table"* that is absent from
+this datasheet. It is Table 7-138 of the X710/XXV710/XL710 datasheet, and event
+**21 is four different checks**:
+
+| Check | `GL_MDCK_TCMD` bit | Description |
+|---|---|---|
+| Tail update bigger than ring size | 7 `ENDLESS_TX` | Endless transmit ring |
+| More than seven context descriptors | 12 `M_CONTEXTS` | 7 or more consecutive non-data descriptors fetched |
+| Descriptor type | 14 `BAD_DESC_TYPE` | Illegal descriptor type used |
+| No Packet | 15 `NO_PACKET` | Tail update not containing at least one full packet |
+
+`M_CONTEXTS` matched the whole-line padding exactly: a NOP *is* a context
+descriptor, and each padded line held seven consecutive non-data descriptors
+before its data one — the threshold, to the descriptor.
+
+**It was wrong.** With the padding removed entirely the flag is still there, same
+queue, same code. So `M_CONTEXTS` is eliminated, and the padding is eliminated
+with it: uplink completion returned to ~25% and `post_refused` to zero, which is
+where it was before the padding existed. **Across its whole life the padding
+changed nothing in either direction**, and it cost several boots to establish
+that. It came from reading the fetch-granularity rule as requiring aligned tails;
+that reading is not supported by anything measured.
+
+**Also eliminated: the queue index, in all three of its forms.** §38.26.3's
+address formula settles it — `FPM_object_address = (GLHMC_{object}BASE * 512) +
+(2^OBJSZ * element_index)` with `HMC_PM_index = PF index`, so the base is already
+per-function and `element_index` is relative to it. The worked example says
+*"512 LAN receive queues starting at index 0"*. `bin/netd` was right.
+
+The crate's `ContextLocation` doc said the opposite, quoting step 5's *"HMC PM
+LAN objects are indexed with the absolute queue number"* as though it were the
+`element_index` rule when it is about **sizing the base and count registers**.
+That comment is corrected in place, with the contrast spelled out: a `GL_`
+register's field-named queue is absolute, a per-function object's element index
+is not.
+
+### What is left, and what it cost
+
+`ENDLESS_TX`, `BAD_DESC_TYPE` and `NO_PACKET` remain, none with an obvious match
+in what this driver posts. `GL_MDCK_TCMD` would say which checks are even
+enabled, and **has no published MMIO address in either datasheet** — thirteen
+mentions across the two, and the only addresses near them are the NVM words the
+defaults load from.
+
+**Today's net movement on the symptom is zero.** What was gained is elsewhere and
+is real: the overwrite fix, the wrap-correct outstanding count, the
+malicious-driver reader that surfaced event 21 at all, and this documentation
+correction. Two confident hypotheses failed on hardware in one day, both of which
+fitted the evidence before the boot. The next one should be cheaper to test than
+a boot.
