@@ -2154,3 +2154,72 @@ mistakes:
 
 So the instrument is still not finished: it reads one of four functions, and it
 reports a queue number with nothing to compare it to.
+
+
+### The context descriptor, field by field — 2026-09-11
+
+`BAD_DESC_TYPE` is *illegal descriptor type used*, and the context descriptor is
+the only extra descriptor type this driver writes. So it was read against
+38.31.2.2.1's table, every field including the ones required to be zero.
+
+This driver emits `qword0 = 0x0`, `qword1 = 0x0000_0000_0000_0101`.
+
+| Field | Bits | Written | Table |
+|---|---|---|---|
+| `DTYP` | qw1 3:0 | `0x1` | LAN context descriptor (Table 38-425; `0x0` data, `0x8` FD filter, else illegal) |
+| `TSO` | qw1 4 | 0 | no segmentation |
+| `TSYN` | qw1 5 | 0 | no 1588 timestamp |
+| `IL2TAG2` | qw1 6 | 0 | no tag insert |
+| `IL2TAG_IL2H` | qw1 7 | 0 | no inner VLAN |
+| **`SWTCH`** | **qw1 9:8** | **`01b`** | uplink, bypassing hardware filters — `CMD[5:4]`, and `CMD` begins at qword-1 bit 4 |
+| reserved | qw1 10, 29:11 | 0 | — |
+| `TLEN` | qw1 47:30 | 0 | *"if the TSO flag is cleared, the TLEN should be set by software to zero"* |
+| reserved | qw1 49:48 | 0 | — |
+| `MSS`/`TARGET_VSI` | qw1 63:50 | 0 | *"if both the TSO flag is cleared and the SWTCH field is not equal to 11b then this field should be set to zero"* |
+| tunnelling params | qw0 23:0 | 0 | `EIPT` 00b, `EIPLEN` 0, `L4TUNT` 00b, `L4TUNLEN` 0 |
+| reserved | qw0 31:24 | 0 | — |
+| `L2TAG2` | qw0 47:32 | 0 | nothing to insert; `IL2TAG2` is clear |
+| reserved | qw0 63:48 | 0 | — |
+
+**Every field is legal, including every field the table requires to be zero.**
+The data descriptor beside it was checked the same way against 38.31.2.1.1 —
+`DTYP` `0x0`, `EOP` at bit 4, `RS` at bit 5, `IL2TAG1`/`DUMMY`/`IIPT`/`L4T` all
+clear, `OFFSET` zero (legal: `L4T` is `00b`, so `L4LEN` *must* be zero),
+`BSIZE` at 47:34, `L2TAG1` zero as required when `IL2TAG1` is clear. And the
+ordering rule holds: Table 38-425 lists context before data, which is the order
+`post_frame` writes them.
+
+Pinned by `a_context_descriptor_places_38_31_2_2_1s_fields`, watched red by
+moving `SWTCH` to bit 4 — where it lands on `TSO` and the test names it.
+
+**So the fields do not explain the event**, and the inference in the previous
+commit is weaker than it was written.
+
+**A correction to that commit.** It called the uplink-only signature *"a second,
+independent line"* pointing at the context descriptor. It is not independent. A
+malicious-driver event **stops the queue**, so every post after the stop fails
+whatever it carries; the 27 plain frames are bring-up traffic and the 39 LACPDUs
+run for ninety seconds, so "30 of 30 failures were uplink-tagged" is equally well
+explained by *the queue stopped at a moment after which only LACPDUs were being
+posted*. One correlation, confounded with time, described as two lines of
+evidence. The discriminator is cheap and costs no reasoning: post a plain frame
+*late*, after the failures begin, and see whether it completes.
+
+**What the tables do rule out.** An over-fetch past the tail would read
+descriptors this driver never wrote — but `shared::create` zeroes on allocation,
+proven on this same boot by `memory hygiene a page written full of 0xa5 and
+freed comes back zeroed to its next owner`. An all-zero descriptor is `DTYP`
+`0x0`, a legal data descriptor with `BSIZE` 0, which trips `ZERO_BSIZE` (event
+**23**) or `NO_PACKET`, not `BAD_DESC_TYPE`. So stale ring contents do not
+explain event 21 by that route either.
+
+**What is left is the record's own inconsistency**, and it is now the sharpest
+thing on the table. `GL_MDET_TX` names queue **384** with `PF_NUM` **0**. Read as
+an absolute queue, 384 is the second member's and belongs to PF1, not PF0. Read
+as PF-relative, it is a queue on PF0 that this driver never posts to — it takes
+one queue per port. Both readings are strange, and neither can be settled from
+here, because the report prints no per-member queue numbers and reads
+`PF_MDET_TX` — which is per-function — from port 0 alone.
+
+Finish the instrument before trusting another reading off it: `PF_MDET_TX` per
+member, and each member's absolute queue printed beside it.

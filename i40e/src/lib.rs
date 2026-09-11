@@ -5259,6 +5259,90 @@ mod tests {
         assert_eq!(words[2], 0);
     }
 
+    /// Every field of the context descriptor, against 38.31.2.2.1's table.
+    ///
+    /// **The device says this driver used an illegal descriptor type and this is
+    /// the descriptor under suspicion**, so "the fields look right" is not good
+    /// enough -- the positions have to be checked against the table and the
+    /// fields the table requires to be *zero* have to be checked too. Those are
+    /// the ones nothing would otherwise notice: `TLEN` and `MSS` are only ever
+    /// written by a TSO path this driver does not have, so a stray bit in either
+    /// would sit there unread.
+    ///
+    /// Qword 1: `DTYP` 3:0, `CMD` 10:4 (`TSO` 4, `TSYN` 5, `IL2TAG2` 6,
+    /// `IL2TAG_IL2H` 7, `SWTCH` 9:8, reserved 10), reserved 29:11, `TLEN` 47:30,
+    /// reserved 49:48, `MSS`/`TARGET_VSI` 63:50. Qword 0: tunnelling parameters
+    /// 23:0, reserved 31:24, `L2TAG2` 47:32, reserved 63:48.
+    #[test]
+    fn a_context_descriptor_places_38_31_2_2_1s_fields() {
+        let (low, high) = transmit_context_descriptor(TX_SWTCH_UPLINK);
+
+        // Table 38-425: 0x1 is a LAN context descriptor. 0x0 is data, 0x8 is an
+        // FD filter, and everything else is an illegal descriptor type.
+        assert_eq!(high & 0xf, 0x1, "DTYP 3:0 -- a LAN context descriptor");
+
+        // CMD 10:4, one bit at a time, because a tag in the wrong bit is a
+        // different command rather than a broken one.
+        assert_eq!(high >> 4 & 1, 0, "TSO clear: this driver does not segment");
+        assert_eq!(high >> 5 & 1, 0, "TSYN clear: no 1588 timestamp");
+        assert_eq!(high >> 6 & 1, 0, "IL2TAG2 clear: no tag to insert");
+        assert_eq!(high >> 7 & 1, 0, "IL2TAG_IL2H clear: no inner VLAN");
+        assert_eq!(
+            high >> 8 & 0b11,
+            0b01,
+            "SWTCH 9:8 = 01b -- uplink, which is CMD bits 5:4 at qword-1 bit 8"
+        );
+        assert_eq!(high >> 10 & 1, 0, "CMD bit 6 is reserved");
+
+        // The fields the table requires to be zero, which is the half a reader
+        // skims past.
+        assert_eq!(high >> 11 & 0x7_ffff, 0, "reserved 29:11");
+        assert_eq!(
+            high >> 30 & 0x3_ffff,
+            0,
+            "TLEN 47:30 -- 'if the TSO flag is cleared, the TLEN should be set \
+             by software to zero'"
+        );
+        assert_eq!(high >> 48 & 0b11, 0, "reserved 49:48");
+        assert_eq!(
+            high >> 50,
+            0,
+            "MSS/TARGET_VSI 63:50 -- 'if both the TSO flag is cleared and the \
+             SWTCH field is not equal to 11b then this field should be set to zero'"
+        );
+
+        // Qword 0 is tunnelling parameters, a tag and reserved bits, and this
+        // driver wants none of them.
+        assert_eq!(low, 0, "no outer IP header, no tunnel, no L2TAG2");
+        assert_eq!(low & 0b11, 0, "EIPT 1:0 = 00b -- no external IP header");
+        assert_eq!(
+            low >> 2 & 0x7f,
+            0,
+            "EIPLEN 8:2 -- 'when the packet has no outer IP header this field \
+             must be set to zero'"
+        );
+        assert_eq!(low >> 9 & 0b11, 0, "L4TUNT 10:9 -- no UDP or GRE tunnel");
+
+        // A NOP is the same descriptor with every other field cleared --
+        // 38.31.2.1.2 -- so the two must differ in exactly the switch tag.
+        let (nop_low, nop_high) = transmit_nop_descriptor();
+        assert_eq!(nop_low, 0);
+        assert_eq!(nop_high & 0xf, 0x1, "a NOP is a context descriptor too");
+        assert_eq!(
+            high ^ nop_high,
+            TX_SWTCH_UPLINK << TX_SWTCH_SHIFT,
+            "and the uplink context differs from a NOP in the switch tag alone"
+        );
+
+        // The other three tags encode where the table says, so a caller asking
+        // for one of them gets that one.
+        for (tag, name) in [(0b00, "no tag"), (0b10, "local"), (0b11, "target vsi")] {
+            let (_, coded) = transmit_context_descriptor(tag);
+            assert_eq!(coded >> 8 & 0b11, tag, "{name} at 9:8");
+            assert_eq!(coded & 0xf, 0x1, "{name} is still a context descriptor");
+        }
+    }
+
     /// 38.31.2.1.1's two quad-words.
     #[test]
     fn a_transmit_descriptor_carries_its_length_and_asks_for_a_completion() {
