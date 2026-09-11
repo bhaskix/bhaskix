@@ -2589,3 +2589,51 @@ kernel says so outright when the sent frame is not 124 bytes.
 If the two dumps differ in structure, that is the fault. If they do not, the
 frame leaving this host is correct on the wire and what remains is the switch's
 configuration — which is the one thing this machine cannot read.
+
+
+### The frame is correct — 2026-09-12
+
+```
+lacpdu sent  124 bytes: 01 80 c2 00 00 02 08 94 ef 7a fc 90 88 09 01 01
+                        01 14 80 00 08 94 ef 7a fc 8e 00 01 80 00 00 03
+lacpdu heard 124 bytes: 01 80 c2 00 00 02 08 bd 43 76 47 e3 88 09 01 01
+                        01 14 80 00 08 bd 43 76 47 e1 00 14 00 80 00 0a
+```
+
+| offset | ours | the switch's | |
+|---|---|---|---|
+| 0-5 | `01 80 c2 00 00 02` | `01 80 c2 00 00 02` | the Slow Protocols group address |
+| 6-11 | `08 94 ef 7a fc 90` | `08 bd 43 76 47 e3` | the sending port's own MAC, both sides |
+| 12-13 | `88 09` | `88 09` | Slow Protocols EtherType |
+| 14-15 | `01 01` | `01 01` | subtype LACP, version 1 |
+| 16-17 | `01 14` | `01 14` | actor TLV, length 20 |
+| 18-19 | `80 00` | `80 00` | system priority |
+| 20-25 | `08 94 ef 7a fc 8e` | `08 bd 43 76 47 e1` | system id, a card MAC on both sides |
+| 26-27 | `00 01` | `00 14` | key: ours 1, theirs 20 |
+| 28-29 | `80 00` | `00 80` | port priority |
+| 30-31 | `00 03` | `00 0a` | port: ours 3, theirs 10 |
+
+**Structurally identical**, same length, and the values that should differ differ
+exactly as they should. The fifth hypothesis dies and the most useful one: the
+frame itself is no longer under suspicion.
+
+So the transmit path is proven end to end. A well-formed 124-byte LACPDU sits in
+the buffer the descriptor names; it is posted, completed, counted out of the VSI
+and out of the MAC, on four distinct ports. There is no unverified step left
+between `bin/ipd` building an LACPDU and the wire.
+
+**What those thirty-two bytes did not cover.** The partner TLV at frame offset
+36, the collector at 56 and the terminator at 72 — and a receiver validates all
+three before accepting an LACPDU. This driver's *parser* checks them on every
+frame the switch sends, so the shapes are known-good; what has never been
+confirmed is that its *writer* produces them. That is the same code-checked-
+against-itself gap the first thirty-two bytes closed for the header.
+
+Both dumps are the whole frame now, sixteen bytes a row with the offset in
+front, so the two can be read against each other by eye and a field's position
+counted rather than guessed.
+
+If those three TLVs are right too then nothing this host emits is wrong, and the
+remaining variable is the switch's configuration — which this machine cannot
+read. That would be the point to say so plainly rather than keep going: the next
+move needs switch access or a capture on the wire.

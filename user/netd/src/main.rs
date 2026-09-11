@@ -1191,21 +1191,36 @@ unsafe fn read_runs_into(into: *mut u8, runs: (chan::Run, chan::Run)) {
 /// The Slow Protocols EtherType, which LACP rides on -- IEEE 802.3 Clause 57.
 const SLOW_PROTOCOLS: u16 = 0x8809;
 
-/// The first thirty-two bytes at `at`, as four little-endian words.
+/// Words each frame dump takes: sixteen, so 128 bytes, which covers an LACPDU's
+/// 124 with the slack rounded up to a whole word.
+const FRAME_WORDS: usize = 16;
+/// An LACPDU's frame length: a 14-byte Ethernet header and 110 bytes of PDU.
+const LACPDU_FRAME: u64 = 124;
+const _: () = assert!(FRAME_WORDS * 8 >= LACPDU_FRAME as usize);
+
+/// The first hundred and twenty-eight bytes at `at`, as sixteen words.
 ///
 /// **Because every fix in this driver came from reading what the machine holds,
 /// and the LACPDU's bytes have never been read.** The protocol was checked by
 /// reading `Pdu::write` and the TLV offsets, which is checking the code against
 /// itself -- the same mistake the `QS_Handle` test made until its parse was
-/// factored out. Thirty-two bytes covers the Ethernet header, the subtype and
-/// version, and the whole actor TLV: everything a switch looks at before
-/// deciding whether an LACPDU is one.
+/// factored out.
+///
+/// **The whole frame, not its first thirty-two bytes.** Those covered the
+/// Ethernet header and the actor TLV, and they were right; the partner TLV at
+/// frame offset 36, the collector at 56 and the terminator at 72 were left
+/// unexamined, and a receiver validates all three before accepting an LACPDU.
+/// This driver's *parser* checks them on every frame the switch sends, so the
+/// shapes are known-good -- what has never been confirmed is that its *writer*
+/// produces them.
 ///
 /// # Safety
 ///
-/// `at` must be thirty-two readable bytes in a region this program mapped.
-unsafe fn first_thirty_two(at: u64) -> [u64; 4] {
-    let mut words = [0u64; 4];
+/// `at` must be a hundred and twenty-eight readable bytes in a region this
+/// program mapped. The frame is 124; the receive buffers are 2 KiB and the
+/// transmit buffer is the second half of a page, so both have the room.
+unsafe fn frame_bytes(at: u64) -> [u64; FRAME_WORDS] {
+    let mut words = [0u64; FRAME_WORDS];
     for (index, word) in words.iter_mut().enumerate() {
         let mut value = 0u64;
         for byte in 0..8u64 {
@@ -2622,9 +2637,9 @@ fn carry_x722(mut members: [Option<X722Member>; X722_MEMBERS], facts: [X722; X72
     // checked by reading the code that builds it. These are the frame the
     // device is handed and the switch's own frame arriving beside it -- the one
     // example on this wire of a slow-protocol frame that something accepts.
-    let mut sent_frame = [0u64; 4];
+    let mut sent_frame = [0u64; FRAME_WORDS];
     let mut sent_length = 0u64;
-    let mut heard_frame = [0u64; 4];
+    let mut heard_frame = [0u64; FRAME_WORDS];
     let mut heard_length = 0u64;
     // **Where the device's counters stood before this program sent anything.**
     //
@@ -2739,9 +2754,9 @@ fn carry_x722(mut members: [Option<X722Member>; X722_MEMBERS], facts: [X722; X72
                     u16::from(core::ptr::read_volatile((buffer + 12) as *const u8)) << 8
                         | u16::from(core::ptr::read_volatile((buffer + 13) as *const u8))
                 };
-                if ethertype == SLOW_PROTOCOLS && length >= 32 {
+                if ethertype == SLOW_PROTOCOLS && length as u64 >= LACPDU_FRAME {
                     // SAFETY: as above, with the length checked.
-                    heard_frame = unsafe { first_thirty_two(buffer) };
+                    heard_frame = unsafe { frame_bytes(buffer) };
                     heard_length = length as u64;
                 }
                 // SAFETY: a buffer this program mapped and the device has
@@ -2861,7 +2876,7 @@ fn carry_x722(mut members: [Option<X722Member>; X722_MEMBERS], facts: [X722; X72
                         // SAFETY: this member's transmit packet buffer, a page
                         // this program mapped, at the offset the descriptor
                         // below names.
-                        sent_frame = unsafe { first_thirty_two(member.queues.transmit.at + 2048) };
+                        sent_frame = unsafe { frame_bytes(member.queues.transmit.at + 2048) };
                         sent_length = length as u64;
                     }
                     let at = member.queues.transmit_device + 2048;
@@ -3616,11 +3631,11 @@ struct TransmitReport {
     member_port_out: u64,
     /// The first thirty-two bytes of the last uplink-tagged frame handed to the
     /// device, and its length.
-    sent_frame: [u64; 4],
+    sent_frame: [u64; FRAME_WORDS],
     sent_length: u64,
     /// The same for the last slow-protocol frame the switch sent us, which is
     /// the one LACPDU on this wire known to be acceptable to something.
-    heard_frame: [u64; 4],
+    heard_frame: [u64; FRAME_WORDS],
     heard_length: u64,
 }
 
@@ -3767,8 +3782,8 @@ fn x722_transmit_report(report: TransmitReport) {
             (RINGS_AT + ring::REPORT + 47 * 8) as *mut u64,
             member_port_out | 1 << 63,
         );
-        // **Words 48-51 and 53-56: the two frames, thirty-two bytes each.**
-        // Word 52 carries both lengths and the bit that says they were taken --
+        // **Words 48-63 and 64-79: the two frames whole, 128 bytes each.**
+        // Word 80 carries both lengths and the bit that says they were taken --
         // a length is the one thing code review cannot check, because a frame
         // truncated anywhere between `frame()` and the descriptor's `BSIZE`
         // reaches the switch short and is discarded, and every counter here
@@ -3781,12 +3796,12 @@ fn x722_transmit_report(report: TransmitReport) {
         }
         for (index, word) in heard_frame.iter().enumerate() {
             core::ptr::write_volatile(
-                (RINGS_AT + ring::REPORT + (53 + index as u64) * 8) as *mut u64,
+                (RINGS_AT + ring::REPORT + (64 + index as u64) * 8) as *mut u64,
                 *word,
             );
         }
         core::ptr::write_volatile(
-            (RINGS_AT + ring::REPORT + 52 * 8) as *mut u64,
+            (RINGS_AT + ring::REPORT + 80 * 8) as *mut u64,
             (sent_length & 0xffff) | (heard_length & 0xffff) << 16 | 1 << 63,
         );
     }

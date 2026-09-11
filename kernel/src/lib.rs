@@ -14890,16 +14890,20 @@ const NETD_MEMBER_OUT_WRITTEN: u64 = 1 << 63;
 /// Bits each member's count takes in those two words.
 const NETD_MEMBER_OUT_BITS: u32 = 13;
 
-/// Byte offset of the first thirty-two bytes of the last uplink-tagged frame
-/// handed to the device, four words.
+/// Byte offset of the last uplink-tagged frame handed to the device, sixteen
+/// words -- the whole thing.
 ///
 /// **Because the LACPDU has only ever been checked by reading the code that
 /// builds it.** Every fix in this driver came from reading what the machine
 /// holds -- `RDYList`, `GLLAN_TXPRE_QDIS`, the malicious-driver clear -- and the
 /// protocol was verified by reading `Pdu::write` and its TLV offsets, which is
-/// the code checked against itself. Thirty-two bytes covers the Ethernet
-/// header, the subtype and version and the whole actor TLV: everything a switch
-/// looks at before deciding an LACPDU is one.
+/// the code checked against itself.
+///
+/// **The whole frame, because the first thirty-two bytes were not enough.**
+/// They covered the Ethernet header and the actor TLV and were correct, field
+/// for field, against the switch's own frame. The partner TLV at offset 36, the
+/// collector at 56 and the terminator at 72 were left unread -- and a receiver
+/// validates all three before it will accept an LACPDU.
 const NETD_SENT_FRAME: u64 = 48 * 8;
 /// Both frames' lengths, sent at 15:0 and heard at 31:16, bit 63 set when taken.
 ///
@@ -14907,10 +14911,14 @@ const NETD_SENT_FRAME: u64 = 48 * 8;
 /// anywhere between `frame()` and the descriptor's `BSIZE` reaches the switch
 /// short and is discarded, and every counter in this report still reads exactly
 /// as it does now.
-const NETD_FRAME_LENGTHS: u64 = 52 * 8;
-/// And the first thirty-two bytes of the last slow-protocol frame the switch
-/// sent us -- the one LACPDU on this wire known to be acceptable to something.
-const NETD_HEARD_FRAME: u64 = 53 * 8;
+const NETD_FRAME_LENGTHS: u64 = 80 * 8;
+/// And the last slow-protocol frame the switch sent us -- the one LACPDU on
+/// this wire known to be acceptable to something.
+const NETD_HEARD_FRAME: u64 = 64 * 8;
+/// Words each dump takes.
+const NETD_FRAME_WORDS: usize = 16;
+/// An LACPDU's frame length: a 14-byte Ethernet header and 110 bytes of PDU.
+const NETD_LACPDU_FRAME: u64 = 124;
 /// Bit 63 of [`NETD_FRAME_LENGTHS`]: both were taken.
 const NETD_FRAMES_WRITTEN: u64 = 1 << 63;
 
@@ -16830,9 +16838,9 @@ struct Transmitted {
     /// Both frames' lengths -- see [`NETD_FRAME_LENGTHS`].
     frame_lengths: u64,
     /// The frame handed to the device -- see [`NETD_SENT_FRAME`].
-    sent_frame: [u64; 4],
+    sent_frame: [u64; NETD_FRAME_WORDS],
     /// The frame the switch sent -- see [`NETD_HEARD_FRAME`].
-    heard_frame: [u64; 4],
+    heard_frame: [u64; NETD_FRAME_WORDS],
 }
 
 /// Whether `bin/netd` has written its report yet.
@@ -17952,29 +17960,38 @@ fn report_net_after_exchange(hhdm: u64) {
                         ("sent ", sent, &out.sent_frame),
                         ("heard", heard, &out.heard_frame),
                     ] {
-                        print!("                   lacpdu {what} {length:>3} bytes:");
                         if length == 0 {
-                            println!(" none taken");
+                            println!("                   lacpdu {what}   0 bytes: none taken");
                             continue;
                         }
-                        for (index, word) in words.iter().enumerate() {
-                            for byte in 0..8 {
-                                if index * 8 + byte >= 32 {
-                                    break;
-                                }
-                                print!(" {:02x}", word >> (8 * byte) & 0xff);
+                        // Sixteen bytes a row, with the offset in front, so the
+                        // two frames can be read against each other by eye and
+                        // a field's position can be counted rather than
+                        // guessed. The row at 32 is where the actor TLV ends
+                        // and the partner TLV begins.
+                        let shown = length.min(NETD_LACPDU_FRAME);
+                        for row in 0..shown.div_ceil(16) {
+                            let at = row * 16;
+                            print!("                   lacpdu {what} {at:>3}:");
+                            for byte in at..(at + 16).min(shown) {
+                                let word = words[(byte / 8) as usize];
+                                print!(" {:02x}", word >> (8 * (byte % 8)) & 0xff);
                             }
+                            if row == 0 {
+                                print!("   ({length} bytes)");
+                            }
+                            println!();
                         }
-                        println!();
                     }
                     // An LACPDU is 110 bytes behind a 14-byte header. A frame
                     // that leaves this host shorter than that arrives at the
                     // switch short and is discarded, and nothing else here
                     // would say so.
-                    if sent != 0 && sent != 124 {
+                    if sent != 0 && sent != NETD_LACPDU_FRAME {
                         println!(
                             "                   \x1b[91mthe frame handed to the device is \
-                             {sent} bytes, not 124 -- a short LACPDU is discarded\x1b[0m"
+                             {sent} bytes, not {NETD_LACPDU_FRAME} -- a short LACPDU is \
+                             discarded\x1b[0m"
                         );
                     }
                 }
