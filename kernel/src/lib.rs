@@ -17712,7 +17712,7 @@ fn report_net_after_exchange(hhdm: u64) {
     // to be wrong instead of three.
     // Thirty-eight words and a sentinel, and the last four are `bin/ipd`'s own:
     // the address each of its LACP machines speaks under -- RFC 0076 step 4.
-    let mut ipd = [0u64; 51];
+    let mut ipd = [0u64; 52];
     // SAFETY: a frame this object owns, through the direct map, read as the
     // little-endian words the service wrote there -- `ipd.len() * 8` bytes of
     // a page, so the read cannot reach past the frame.
@@ -18199,7 +18199,7 @@ fn report_net_after_exchange(hhdm: u64) {
     // the boot report said in a sentence that the switch recorded no partner.
     // Checked on every boot, not only where the words are used, because the
     // cheapest place to catch it is before anybody believes a number.
-    let complete = ipd[50] == IPD_REPORT_TAIL;
+    let complete = ipd[51] == IPD_REPORT_TAIL;
     if !complete {
         println!(
             "\x1b[93m    ipd report     INCOMPLETE: this kernel reads {} words and bin/ipd \
@@ -19918,13 +19918,19 @@ fn report_net_ring(hhdm: u64) -> bool {
         return false;
     }
 
-    let mut words = [0u64; 23];
+    let mut words = [0u64; 51];
     // SAFETY: a frame this object owns, through the direct map, read as the
-    // twenty-three little-endian words the service writes — nine consumed
-    // here since RFC 0018, plus RFC 0029's two v6 words at 21 and 22. Not
-    // 11 and 12: those carry the ring's own head and tail for the "ipd
-    // after" line, which the first v6 draft discovered by overwriting them.
-    let raw = unsafe { core::slice::from_raw_parts((hhdm + frames_of[0]) as *const u8, 184) };
+    // little-endian words the service writes — nine consumed here since RFC
+    // 0018, RFC 0029's two v6 words at 21 and 22, and word 50, where the ARP
+    // request's stall counts are **appended**. Not 11 and 12: those carry the
+    // ring's own head and tail for the "ipd after" line, which the first v6
+    // draft discovered by overwriting them.
+    //
+    // **Widened from twenty-three rather than the counts inserted early.** This
+    // report is read by index in a dozen places; a word placed among them
+    // renumbers every one, and the first attempt at these counters did exactly
+    // that before the compiler caught the array length.
+    let raw = unsafe { core::slice::from_raw_parts((hhdm + frames_of[0]) as *const u8, 51 * 8) };
     for (index, word) in words.iter_mut().enumerate() {
         let mut buffer = [0u8; 8];
         buffer.copy_from_slice(&raw[index * 8..index * 8 + 8]);
@@ -20047,6 +20053,17 @@ fn report_net_ring(hhdm: u64) -> bool {
         println!("    net ipv6       no router advertisement; link-local only");
     }
 
+    // **Where the request stopped**, when it never went. Appended at word 50,
+    // so every index above is the one it always was.
+    if words[6] == 0 && words[50] != 0 {
+        println!(
+            "    net reply      it stopped at: {} tr(ies), {} could not be built, {} the ring \
+             refused",
+            words[50] & 0xf_ffff,
+            words[50] >> 20 & 0xf_ffff,
+            words[50] >> 40 & 0xf_ffff
+        );
+    }
     if words[5] == 0 {
         println!("\x1b[91m    net reply      FAILED: the service built nothing to send\x1b[0m");
         return false;

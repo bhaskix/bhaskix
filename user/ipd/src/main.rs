@@ -134,13 +134,13 @@ const MARKER: u64 = 0x3154_5052_4450_4931;
 /// sentence, that the switch recorded no partner: a conclusion drawn entirely
 /// from memory nobody had assigned. The array literal that feeds this function
 /// must have exactly this many entries, and the compiler now says so.
-const REPORT_WORDS: usize = 50;
+const REPORT_WORDS: usize = 51;
 
 /// **And tied to the machines behind its last four words.** Those four are
 /// written out one per line, because an array literal is what `write_report`
 /// takes -- so a fifth LACP machine would be a fifth address with nowhere to
 /// go, and the total would still add up. This is what says it would not.
-const _: () = assert!(REPORT_WORDS == 38 + 3 * LACP_MACHINES);
+const _: () = assert!(REPORT_WORDS == 39 + 3 * LACP_MACHINES);
 
 /// The last word, written with a sentinel so a reader can prove the page was
 /// written to its full length rather than trusting that it was.
@@ -504,6 +504,25 @@ static LLDP_MANAGEMENT: core::sync::atomic::AtomicU64 = core::sync::atomic::Atom
 /// And what it calls itself -- the system name TLV, eight bytes, first on the
 /// wire in the low byte.
 static LLDP_NAME: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// **Where the ARP request stopped, when it stopped.** Tries at 19:0, frames it
+/// could not build at 39:20, sends the ring refused at 59:40.
+///
+/// A single zero for *asked none* is compatible with never reaching the block,
+/// with failing to build the frame, and with the ring refusing it, and those
+/// are three different faults. Hardware reported `asked 0 time(s)` beside a
+/// rising `built` and none of them could be told apart.
+///
+/// **A static because this report is built in two places** -- `refresh` and
+/// `report` -- and only one of them can see the loop's locals. Every other
+/// value that crosses that boundary here is a static for the same reason; a
+/// parameter would have been the third attempt at the same lesson.
+static ASK_STALLS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Packs the three counts the way [`ASK_STALLS`] carries them.
+fn ask_stalls(tries: u64, unbuilt: u64, unsent: u64) -> u64 {
+    tries.min(0xf_ffff) | (unbuilt.min(0xf_ffff) << 20) | (unsent.min(0xf_ffff) << 40)
+}
 
 /// **What the partner records as its own partner** -- what the switch believes
 /// is at our end of link 0.
@@ -1491,6 +1510,7 @@ fn refresh() {
         // See `LLDP_MANAGEMENT`.
         LLDP_MANAGEMENT.load(Relaxed),
         LLDP_NAME.load(Relaxed),
+        ASK_STALLS.load(Relaxed),
     ]);
 }
 
@@ -2590,6 +2610,16 @@ extern "C" fn ipd_main() -> ! {
     // report could say only the second while the first was true.
     let mut ask_pass = 0u64;
     let mut asks = 0u64;
+    // **Where the request stops, when it stops.** The count above read zero on
+    // hardware while `built` rose by nine, which says the block's inner `if`
+    // failed and says nothing about which half of it. Three separate counts,
+    // because *never reached*, *could not be built* and *the ring would not
+    // take it* are three different faults and a single zero is compatible with
+    // all of them. Inferring which from the outside was tried three times and
+    // cost more than the counters do.
+    let mut ask_tries = 0u64;
+    let mut ask_unbuilt = 0u64;
+    let mut ask_unsent = 0u64;
     let mut pinged = false;
     let mut quiet = 0u32;
     // **Empty passes since the demonstration began, which nothing resets.**
@@ -2749,6 +2779,11 @@ extern "C" fn ipd_main() -> ! {
         // One request of this program's own, so that something on the wire can
         // only have come from here. Built entirely by `bhaskix-net`.
         if can_send && !asked && me.0 != MacAddr::UNSPECIFIED {
+            ask_tries += 1;
+            ASK_STALLS.store(
+                ask_stalls(ask_tries, ask_unbuilt, ask_unsent),
+                core::sync::atomic::Ordering::Relaxed,
+            );
             let request = ArpPacket {
                 operation: ArpOp::Request,
                 sender_hardware: me.0,
@@ -2757,21 +2792,40 @@ extern "C" fn ipd_main() -> ! {
                 target_protocol: ask_about(),
             };
             let mut packet = [0u8; arp::PACKET];
-            if request.write(&mut packet).is_ok()
-                && let Some(length) = frame(
+            // Split from the `&&` chain it used to be, so a failure says which
+            // step failed rather than only that the whole thing did.
+            let framed = request.write(&mut packet).is_ok().then(|| {
+                frame(
                     &mut outgoing,
                     MacAddr::BROADCAST,
                     me.0,
                     EtherType::ARP,
                     &packet,
                 )
-                // SAFETY: the return ring is mapped writable.
-                && unsafe { send(&outgoing[..length]) }
-            {
-                built += 1;
-                asked = true;
-                ask_pass = passes;
-                asks += 1;
+            });
+            match framed.flatten() {
+                None => {
+                    ask_unbuilt += 1;
+                    ASK_STALLS.store(
+                        ask_stalls(ask_tries, ask_unbuilt, ask_unsent),
+                        core::sync::atomic::Ordering::Relaxed,
+                    );
+                }
+                Some(length) => {
+                    // SAFETY: the return ring is mapped writable.
+                    if unsafe { send(&outgoing[..length]) } {
+                        built += 1;
+                        asked = true;
+                        ask_pass = passes;
+                        asks += 1;
+                    } else {
+                        ask_unsent += 1;
+                        ASK_STALLS.store(
+                            ask_stalls(ask_tries, ask_unbuilt, ask_unsent),
+                            core::sync::atomic::Ordering::Relaxed,
+                        );
+                    }
+                }
             }
         }
 
@@ -3785,6 +3839,17 @@ fn report(
         // slot.
         LLDP_MANAGEMENT.load(core::sync::atomic::Ordering::Relaxed),
         LLDP_NAME.load(core::sync::atomic::Ordering::Relaxed),
+        // **Where the ARP request stopped, when it stopped.** Tries at 19:0,
+        // frames it could not build at 39:20, sends the ring refused at 59:40.
+        // A single zero for "asked none" is compatible with never reaching the
+        // block, with failing to build the frame, and with the ring refusing
+        // it, and those are three different faults.
+        //
+        // **Appended rather than inserted.** This array is read by index in the
+        // kernel in dozens of places -- `ipd[23]`, `ipd[40 + n]`, `ipd[44..48]`
+        // -- so a word placed in the middle silently renumbers all of them. The
+        // first attempt at this put it at index 6 and moved everything after.
+        ASK_STALLS.load(core::sync::atomic::Ordering::Relaxed),
     ];
     V6_PREFIX.store(v6_prefix, core::sync::atomic::Ordering::Relaxed);
     V6_STATE.store(v6_state, core::sync::atomic::Ordering::Relaxed);
