@@ -19974,7 +19974,17 @@ fn report_net_ring(hhdm: u64) -> bool {
         "    net reply      ipd built {} frames, asked {} time(s), {} arp mappings learned \
          about {}.{}.{}.{}{} (can send {}, configured {})",
         words[5] & 0xffff_ffff,
-        words[5] >> 32 & 0xffff,
+        // **Derived, not carried.** The count of *successful* asks is tries
+        // minus the two failures, all three of which travel in word 50 as a
+        // static. Carried as its own field it was a loop local that `refresh`
+        // -- the other of this report's two builders -- could not see, so that
+        // builder published a zero over it and the boot said `asked 0 time(s)`
+        // beside `it stopped at: 10 tries, 0 could not be built, 0 the ring
+        // refused`. Three attempts at carrying this value; the fourth does not
+        // carry it at all.
+        (words[50] & 0xf_ffff)
+            .saturating_sub(words[50] >> 20 & 0xf_ffff)
+            .saturating_sub(words[50] >> 40 & 0xf_ffff),
         words[6],
         net_peer() >> 24 & 0xff,
         net_peer() >> 16 & 0xff,

@@ -3440,3 +3440,118 @@ silent omission became a build error.
 That is the difference between a convention and a constraint, and this program
 has now demonstrated it in the most expensive available way: by publishing a
 wrong number to a hardware boot report and having it read as a finding.
+
+
+### The question was put ten times — 2026-09-13
+
+```
+net ring    8 frames crossed to ipd, 1178 bytes, first from 08:bd:43:76:47:e3
+net reply   ipd built 20 frames, asked 0 time(s), 0 arp mappings learned about 10.5.5.246
+net reply   it stopped at: 10 tr(ies), 0 could not be built, 0 the ring refused
+```
+
+**Ten tries, every frame built, every send accepted.** The retry works, the ARP
+request genuinely went out ten times on VLAN 5 asking for `10.5.5.246`, and the
+switch's own management interface did not answer.
+
+That is the first time in this work the question has been put fairly: a real
+address on a live subnet, a peer that certainly exists on that VLAN, a trunk
+that carries it, frames that leave the MAC intact — and ten asks rather than
+one.
+
+**And `asked 0 time(s)` was wrong for the third time, for the same reason.**
+`asks` was still a loop local, so `refresh` — the other of this report's two
+builders — published a zero over it, exactly as it had over the packed version
+and exactly as the parameter version was designed to prevent in the builder that
+*could* see it.
+
+The fourth version does not carry the value at all. Successful asks are tries
+minus the two failure counts, all three of which already live in `ASK_STALLS`
+where both builders read them, so the kernel derives it. A number that can be
+computed from two others is a number that cannot disagree with them.
+
+Four attempts at one counter:
+
+| attempt | what went wrong |
+|---|---|
+| packed at the call sites | five sites, two done; a missed one published zero to a hardware report |
+| a parameter | compiler-enforced, but `refresh` cannot know the value |
+| a static for the stalls, local for the count | the local half was invisible to `refresh` again |
+| **derived from the static** | nothing to carry, nothing to forget |
+
+#### What remains unexplained
+
+The switch receives our frames intact — that is measured, from its own port
+counters. It sends us LLDP and LACPDUs, which we receive and parse. It does not
+answer an ARP for its own management address on the VLAN its own configuration
+puts that address on.
+
+What is *not* verified is the VLAN tag on the wire. The whole-frame dump in
+`bin/netd` captures the last **uplink-tagged** frame, which is an LACPDU; an ARP
+is neither uplink-tagged nor captured, so what an ARP request actually looks
+like leaving this machine has never been seen.
+
+**That dump was written and then dropped, deliberately.** It is the right next
+measurement and the wrong next move: see *Where this stops* below.
+
+
+## Where this stops — 2026-09-13
+
+This work stops here, with the driver findings proven and the end-to-end claim
+explicitly **not** made.
+
+### What is established on hardware
+
+Four defects in this driver, every one measured rather than argued:
+
+| defect | evidence |
+|---|---|
+| `MDET_CLEAR` was `0xffff` on an RW1C register whose `VALID` is bit 31 | the malicious-driver record never cleared, so every `FLAGGED` reading was stale |
+| `RDYList` hardcoded to `0` | three of four transmit queues never scheduled; unwritten posts 30-of-40 → **0-of-36** |
+| `CRC Enable` never asserted | every transmitted frame arrived corrupt; switch CRC errors → **0**, received **+35** |
+| `LACP_Timeout` mirrored from the partner | the short-timeout request was erased; actor state `0x05` → `0x07` on the wire |
+
+And the transmit path is now verified end to end by measurement: a byte-correct
+124-byte frame in the buffer the descriptor names, compared field for field
+against one the switch itself emits; posted, completed and written back on four
+distinct queues; counted out of each VSI and each MAC port; arriving at the far
+MAC intact and error-free.
+
+### What is established about the lab, and is not this project's to fix
+
+* `PRD-SW1`'s lag 3 runs **static** while its saved config says LACP, so no
+  LACPDU of ours can ever be acted on and RFC 0076 step 3's aggregation gate is
+  unmeetable as wired.
+* Lag 3's members disagree: `xg11` has `vlan pvid 100` where `xg9`, `xg10` and
+  `xg12` have `5`.
+* The switch receives our frames intact, sends us LLDP and LACPDUs we parse
+  correctly, and will not answer an ARP for its own management address on the
+  VLAN its own configuration puts that address on. Ten requests, each built and
+  accepted by the ring, none answered.
+
+### What is not claimed
+
+**No exchange with a peer has been completed on this hardware.** No DHCP lease,
+no ARP resolution, no TCP connection. The driver carries frames to the wire and
+takes them off it; nothing beyond that is demonstrated, and this document does
+not say otherwise.
+
+### Why it stops rather than continuing
+
+The remaining question is about somebody else's switch, probed by this stack
+through a thirty-minute boot cycle with no packet capture. That is a poor loop
+and the last several rounds showed it: four attempts at a single report counter
+cost four hardware boots and as many suite runs while the actual question went
+untouched. Instrumenting one's own reporting is not progress, and it was being
+counted as progress.
+
+**The cheap decisive measurement is not ours to take.** One `ping 10.5.5.200`
+from any machine already on VLAN 5, while this host is booted, settles more than
+another five boots: answered means the stack works end to end and the ARP
+silence is a switch-side quirk; unanswered puts the fault on the wire and makes
+the switch's MAC table the next thing to read.
+
+Failing that, the three changes that would let this line resume are the switch's
+to make: a host in VLAN 20 or 5 that answers ARP, a LAG whose running mode
+matches its saved LACP configuration, and `xg11`'s PVID brought into line with
+its peers.

@@ -2603,13 +2603,14 @@ extern "C" fn ipd_main() -> ! {
     let mut ticks = 0u64;
     let mut me = (MacAddr::UNSPECIFIED, Ipv4Addr::UNSPECIFIED);
     let mut asked = false;
-    // The pass this program last asked on, and how many times it has asked.
+    // The pass this program last asked on.
     //
-    // Counted because *asked once and nothing answered* and *asked forty times
-    // and nothing answered* are different findings, and for a dozen boots the
-    // report could say only the second while the first was true.
+    // How many times it *has* asked is not kept here: it is tries minus the two
+    // failures, all three of which live in `ASK_STALLS` where both builders of
+    // this report can read them. Carried as a local it was invisible to
+    // `refresh`, which published a zero over it -- three attempts at carrying a
+    // value that did not need carrying.
     let mut ask_pass = 0u64;
-    let mut asks = 0u64;
     // **Where the request stops, when it stops.** The count above read zero on
     // hardware while `built` rose by nine, which says the block's inner `if`
     // failed and says nothing about which half of it. Three separate counts,
@@ -2700,7 +2701,6 @@ extern "C" fn ipd_main() -> ! {
         0,
         0,
         0,
-        0,
         state(can_send, MacAddr::UNSPECIFIED, can_tcp),
         0,
         0,
@@ -2726,7 +2726,6 @@ extern "C" fn ipd_main() -> ! {
             first_source,
             refused,
             built,
-            asks,
             cache.live(ticks) as u64,
             state(can_send, me.0, can_tcp),
             pongs,
@@ -2817,7 +2816,6 @@ extern "C" fn ipd_main() -> ! {
                         built += 1;
                         asked = true;
                         ask_pass = passes;
-                        asks += 1;
                     } else {
                         ask_unsent += 1;
                         ASK_STALLS.store(
@@ -3154,7 +3152,6 @@ extern "C" fn ipd_main() -> ! {
                         first_source,
                         refused,
                         built,
-                        asks,
                         cache.live(ticks) as u64,
                         state(can_send, me.0, can_tcp),
                         pongs,
@@ -3178,7 +3175,6 @@ extern "C" fn ipd_main() -> ! {
                         first_source,
                         refused,
                         built,
-                        asks,
                         cache.live(ticks) as u64,
                         state(can_send, me.0, can_tcp),
                         pongs,
@@ -3225,7 +3221,6 @@ extern "C" fn ipd_main() -> ! {
                     first_source,
                     refused,
                     built,
-                    asks,
                     cache.live(ticks) as u64,
                     state(can_send, me.0, can_tcp),
                     pongs,
@@ -3606,7 +3601,6 @@ extern "C" fn ipd_main() -> ! {
             first_source,
             refused,
             built,
-            asks,
             cache.live(ticks) as u64,
             state(can_send, me.0, can_tcp),
             pongs,
@@ -3701,7 +3695,6 @@ fn report(
     first_source: u64,
     refused: u64,
     built: u64,
-    asks: u64,
     learned: u64,
     state: u64,
     pongs: u64,
@@ -3727,7 +3720,7 @@ fn report(
         // one of the three missed -- published a zero over a real count, and
         // the boot said `asked 0 time(s)` while the frames had plainly been
         // built. A parameter makes that a compile error instead.
-        built | (asks.min(0xffff) << 32),
+        built,
         learned,
         // What this program was able to do, as bits: it could send at all, and
         // it had been told what this interface is. "Built nothing" has three
