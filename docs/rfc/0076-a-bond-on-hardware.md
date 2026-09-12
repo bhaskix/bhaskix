@@ -3408,3 +3408,35 @@ before.
 
 That is the fourth mechanism in this work where one of a pair was corrected and
 its twin left alone.
+
+
+### The retry worked and the count did not — 2026-09-12
+
+```
+net reply   ipd built 20 frames, asked 0 time(s), 0 arp mappings learned about 10.5.5.246
+net ring    8 frames crossed to ipd, 1178 bytes, first from 08:bd:43:76:47:e3
+net echo    echo request sent and nothing answered it
+```
+
+Frames built rose from 11 to 20, so the retry plainly fired — and the counter
+beside it read **zero**.
+
+**`bin/ipd` has five `report` call sites**, and the first version of this change
+packed the count at two of them. One of the three it missed is the last report
+written before the kernel reads, so it published a zero over a real count. The
+boot then said *asked 0 time(s)* while the frames it was counting had obviously
+been built.
+
+This is the duplication hazard recorded a few hours earlier, in this same
+document, about this same program — *"two hand-written arrays that must agree
+slot for slot, with nothing checking that they do"* — walked into directly, and
+worse than described: five sites rather than two.
+
+**The fix is not to patch five call sites.** `report` takes the count as a
+parameter now, so the compiler refuses a caller that omits it — which it
+promptly did, naming all four sites that would otherwise have stayed wrong. A
+silent omission became a build error.
+
+That is the difference between a convention and a constraint, and this program
+has now demonstrated it in the most expensive available way: by publishing a
+wrong number to a hardware boot report and having it read as a finding.

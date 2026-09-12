@@ -2670,6 +2670,7 @@ extern "C" fn ipd_main() -> ! {
         0,
         0,
         0,
+        0,
         state(can_send, MacAddr::UNSPECIFIED, can_tcp),
         0,
         0,
@@ -2694,11 +2695,8 @@ extern "C" fn ipd_main() -> ! {
             bytes,
             first_source,
             refused,
-            // **How many were asked for, beside how many were built.** The
-            // ARP count rides in the high half: "asked once and nothing
-            // answered" and "asked forty times and nothing answered" are
-            // different findings, and only the second could be reported before.
-            built | (asks.min(0xffff) << 32),
+            built,
+            asks,
             cache.live(ticks) as u64,
             state(can_send, me.0, can_tcp),
             pongs,
@@ -3102,6 +3100,7 @@ extern "C" fn ipd_main() -> ! {
                         first_source,
                         refused,
                         built,
+                        asks,
                         cache.live(ticks) as u64,
                         state(can_send, me.0, can_tcp),
                         pongs,
@@ -3125,6 +3124,7 @@ extern "C" fn ipd_main() -> ! {
                         first_source,
                         refused,
                         built,
+                        asks,
                         cache.live(ticks) as u64,
                         state(can_send, me.0, can_tcp),
                         pongs,
@@ -3171,6 +3171,7 @@ extern "C" fn ipd_main() -> ! {
                     first_source,
                     refused,
                     built,
+                    asks,
                     cache.live(ticks) as u64,
                     state(can_send, me.0, can_tcp),
                     pongs,
@@ -3550,11 +3551,8 @@ extern "C" fn ipd_main() -> ! {
             bytes,
             first_source,
             refused,
-            // **How many were asked for, beside how many were built.** The
-            // ARP count rides in the high half: "asked once and nothing
-            // answered" and "asked forty times and nothing answered" are
-            // different findings, and only the second could be reported before.
-            built | (asks.min(0xffff) << 32),
+            built,
+            asks,
             cache.live(ticks) as u64,
             state(can_send, me.0, can_tcp),
             pongs,
@@ -3649,6 +3647,7 @@ fn report(
     first_source: u64,
     refused: u64,
     built: u64,
+    asks: u64,
     learned: u64,
     state: u64,
     pongs: u64,
@@ -3661,11 +3660,20 @@ fn report(
         bytes,
         first_source,
         refused,
-        // Frames this program *built* and handed back, and how many mappings
-        // its cache holds. The first says the return path works from this end;
-        // the second is the neighbour cache running outside a host test for the
-        // first time since it was written.
-        built,
+        // Frames this program *built* and handed back, how many of them were
+        // ARP requests, and how many mappings its cache holds. The first says
+        // the return path works from this end; the second separates *asked
+        // once and nothing answered* from *asked forty times and nothing
+        // answered*; the third is the neighbour cache running outside a host
+        // test for the first time since it was written.
+        //
+        // **The count is a parameter rather than something each caller packs.**
+        // There are five `report` call sites and the first version packed it at
+        // two of them, so the last report written before the kernel reads --
+        // one of the three missed -- published a zero over a real count, and
+        // the boot said `asked 0 time(s)` while the frames had plainly been
+        // built. A parameter makes that a compile error instead.
+        built | (asks.min(0xffff) << 32),
         learned,
         // What this program was able to do, as bits: it could send at all, and
         // it had been told what this interface is. "Built nothing" has three
