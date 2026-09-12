@@ -148,4 +148,10 @@ asm_budget = 4
 # called, which is word 1 and which every datagram still leaves under. An
 # LACPDU's source is the individual address of the port it leaves by, and this
 # service had only one address to put on all four.
-unsafe_budget = 175
+# 176 for the peer the kernel names: one more word read off the configuration
+# page. `bin/ipd` held the address it asks about as constants of its own --
+# QEMU's `10.0.2.3` for the ARP request and `10.0.2.2` for the ping -- so every
+# SR550 boot asked that wire about an address nobody on it has, and reported
+# "0 arp mappings learned" as though it had asked a fair question. The twin of
+# the interface's own address, missed when that one was corrected.
+unsafe_budget = 176

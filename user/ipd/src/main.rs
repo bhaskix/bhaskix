@@ -177,7 +177,7 @@ const REPORT_TAIL: u64 = 0x4c49_4154_4450_4931;
 /// because both are derived from this page and neither has another source.
 fn read_interface() -> Option<(MacAddr, Ipv4Addr)> {
     // SAFETY: the configuration page, mapped read-only by this program.
-    let (marker, mac, address, vlan, mtu, ports, bond_lacp) = unsafe {
+    let (marker, mac, address, vlan, mtu, ports, bond_lacp, peer) = unsafe {
         (
             core::ptr::read_volatile(CONFIG_AT as *const u64),
             core::ptr::read_volatile((CONFIG_AT + 8) as *const u64),
@@ -186,12 +186,16 @@ fn read_interface() -> Option<(MacAddr, Ipv4Addr)> {
             core::ptr::read_volatile((CONFIG_AT + 32) as *const u64),
             core::ptr::read_volatile((CONFIG_AT + 40) as *const u64),
             core::ptr::read_volatile((CONFIG_AT + 48) as *const u64),
+            core::ptr::read_volatile((CONFIG_AT + 56) as *const u64),
         )
     };
     let lacp_wanted = bond_lacp != 0;
     if marker != CONFIG_MARKER {
         return None;
     }
+    // **The peer to ask about**, read only once the marker says the page is
+    // true. Zero means the kernel named none and the default stands.
+    GATEWAY_WORD.store(peer as u32, core::sync::atomic::Ordering::Relaxed);
     // **What each member is called**, words 7 onward, read only once the marker
     // says the page is true. Word 1 above is the *bond's* address, which is
     // what every datagram leaves under; these are the links' own, and an
@@ -637,12 +641,12 @@ const CONFIG_MARKER: u64 = 0x3146_4e43_5049_5f4e;
 
 /// Byte offset on that page of the members' own station addresses.
 ///
-/// Seven words in, after the interface's own: the marker, the bond's address,
-/// the protocol address, the VLAN, the MTU, the port count and the bond mode.
-/// The kernel's `NETD_MEMBER_COUNT` addresses follow, and that number is this
-/// program's [`LACP_MACHINES`] -- four in three places, which is the width of
-/// the interface between them.
-const CONFIG_MEMBERS: u64 = 7 * 8;
+/// Eight words in, after the interface's own: the marker, the bond's address,
+/// the protocol address, the VLAN, the MTU, the port count, the bond mode and
+/// the peer to ask about. The kernel's `NETD_MEMBER_COUNT` addresses follow,
+/// and that number is this program's [`LACP_MACHINES`] -- four in three places,
+/// which is the width of the interface between them.
+const CONFIG_MEMBERS: u64 = 8 * 8;
 
 /// A station address as the configuration page carries it.
 ///
@@ -700,12 +704,55 @@ static SPEAKING_AS: [core::sync::atomic::AtomicU64; LACP_MACHINES] =
 /// is what makes the two distinguishable to a test.
 const ASK_ABOUT: Ipv4Addr = Ipv4Addr::new(10, 0, 2, 3);
 
-/// The address this program pings, once it knows how to reach it.
+/// What an ARP request actually asks about.
+///
+/// **The third emulator constant in this pair of files, and the one that
+/// decided the answer.** [`ASK_ABOUT`] is deliberately a different address from
+/// the ping's target so a test can tell an ARP request from an echo request --
+/// sound under QEMU, and it means every SR550 boot asked the wire about
+/// `10.0.2.3` while the report said `0 arp mappings learned`.
+///
+/// When the kernel names a peer, that is the address worth resolving, so both
+/// follow it. The QEMU lanes name none and keep the two distinct addresses the
+/// test relies on.
+fn ask_about() -> Ipv4Addr {
+    let told = GATEWAY_WORD.load(core::sync::atomic::Ordering::Relaxed);
+    if told == 0 { ASK_ABOUT } else { Ipv4Addr(told) }
+}
+
+/// The address this program asks about and pings, when the kernel names none.
 ///
 /// QEMU's built-in network answers an echo request to its gateway, which makes
 /// a *sent* ping the demonstrable half of ICMP here. Answering one is written
-/// and untestable on this network: nothing has a reason to ping us.
-const GATEWAY: Ipv4Addr = Ipv4Addr::new(10, 0, 2, 2);
+/// and untestable on that network: nothing has a reason to ping us.
+///
+/// **On hardware it is a question nobody can answer.** `10.0.2.2` is what slirp
+/// replies at; on a real wire an ARP request for it resolves nothing, and every
+/// SR550 boot reported `0 arp mappings learned` while that was read as evidence
+/// about the segment rather than about the address being asked for.
+///
+/// The twin of the interface's own address, which was corrected first -- and
+/// the peer a host *asks about* is as much an emulator constant as the address
+/// it *claims*. `bhaskix.gw=<a.b.c.d>` sets it, through the configuration page.
+const GATEWAY_DEFAULT: Ipv4Addr = Ipv4Addr::new(10, 0, 2, 2);
+
+/// What the kernel said to ask about, or [`GATEWAY_DEFAULT`].
+static GATEWAY_WORD: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// The peer to ask about and ping.
+///
+/// Named for what it is rather than `gateway`, which is already a local binding
+/// for the *resolved MAC* of this address in two places -- and a function
+/// shadowed by a variable of the same name is a compile error today and a
+/// confusion for ever after.
+fn peer_address() -> Ipv4Addr {
+    let told = GATEWAY_WORD.load(core::sync::atomic::Ordering::Relaxed);
+    if told == 0 {
+        GATEWAY_DEFAULT
+    } else {
+        Ipv4Addr(told)
+    }
+}
 
 /// What this program puts in an echo request, and expects back unchanged.
 const PING_PAYLOAD: [u8; 17] = *b"bhaskix-icmp-0001";
@@ -2683,7 +2730,7 @@ extern "C" fn ipd_main() -> ! {
                 sender_hardware: me.0,
                 sender_protocol: me.1,
                 target_hardware: MacAddr::UNSPECIFIED,
-                target_protocol: ASK_ABOUT,
+                target_protocol: ask_about(),
             };
             let mut packet = [0u8; arp::PACKET];
             if request.write(&mut packet).is_ok()
@@ -2710,14 +2757,14 @@ extern "C" fn ipd_main() -> ! {
         if can_send
             && !pinged
             && me.0 != MacAddr::UNSPECIFIED
-            && let Some(gateway) = cache.lookup(Address::V4(GATEWAY), ticks)
+            && let Some(gateway) = cache.lookup(Address::V4(peer_address()), ticks)
         {
             let mut message = [0u8; icmp::HEADER + PING_PAYLOAD.len()];
             if let Ok(body) = icmp::write(&mut message, false, 0xbe57, 1, &PING_PAYLOAD)
                 && ipv4::write_header(
                     &mut outgoing[eth::HEADER..],
                     me.1,
-                    GATEWAY,
+                    peer_address(),
                     Protocol::ICMP,
                     body,
                     0x2601,
@@ -2847,7 +2894,7 @@ extern "C" fn ipd_main() -> ! {
         // held instead — a measurement keeps everything constant except the
         // thing it is measuring.
         if burst_gateway.is_none()
-            && let Some(found) = cache.lookup(Address::V4(GATEWAY), ticks)
+            && let Some(found) = cache.lookup(Address::V4(peer_address()), ticks)
         {
             burst_gateway = Some(found);
         }
@@ -2887,7 +2934,7 @@ extern "C" fn ipd_main() -> ! {
                 ) && ipv4::write_header(
                     &mut outgoing[eth::HEADER..],
                     me.1,
-                    GATEWAY,
+                    peer_address(),
                     Protocol::ICMP,
                     body,
                     0x2602,
@@ -2945,7 +2992,7 @@ extern "C" fn ipd_main() -> ! {
         // DHCP exchange depends on that already.
         if can_tcp && me.0 != MacAddr::UNSPECIFIED {
             let mac = cache
-                .lookup(Address::V4(GATEWAY), ticks)
+                .lookup(Address::V4(peer_address()), ticks)
                 .unwrap_or(MacAddr::BROADCAST);
             drain_tcp_back(me, mac, global6, router6_link, &mut tcp_tail);
         }
@@ -3034,7 +3081,7 @@ extern "C" fn ipd_main() -> ! {
                         v6_word(global6.is_some(), router6.is_some(), resolved6, pongs6),
                     );
                     let gateway = cache
-                        .lookup(Address::V4(GATEWAY), ticks)
+                        .lookup(Address::V4(peer_address()), ticks)
                         .unwrap_or(MacAddr::BROADCAST);
                     // Bound before serving, not before the demonstration: the
                     // loop above polls deliberately and would be woken for

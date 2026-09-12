@@ -486,6 +486,16 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
         // `bhaskix.ip=<a.b.c.d>` -- what this interface should claim. Without
         // it the default is QEMU's `10.0.2.15`, which is right for every lane
         // that runs under QEMU and meaningless on a wire.
+        // `bhaskix.gw=<a.b.c.d>` -- the peer to ARP for and ping. Without it
+        // the default is QEMU's gateway, which is right under the emulator and
+        // is a question nobody on a real wire can answer.
+        if let Some(value) = word
+            .strip_prefix("bhaskix.gw=")
+            .or_else(|| word.strip_prefix("gw="))
+            && let Some(peer) = bhaskix_net::addr::Ipv4Addr::parse(value)
+        {
+            NET_PEER_OVERRIDE.store(peer.0, core::sync::atomic::Ordering::Relaxed);
+        }
         if let Some(value) = word
             .strip_prefix("bhaskix.ip=")
             .or_else(|| word.strip_prefix("ip="))
@@ -15020,6 +15030,33 @@ const NET_MTU: u16 = 1500;
 /// arrive unintelligible, and nothing would have said why.
 const NET_ADDRESS: [u8; 4] = [10, 0, 2, 15];
 
+/// The peer `bin/ipd` asks about and pings, when the command line names none.
+///
+/// **`bin/ipd` held this as a constant of its own and it was QEMU's gateway.**
+/// `10.0.2.2` is what slirp answers at, so an ARP request for it resolves under
+/// the emulator and asks a question nobody on a real wire can answer. Every
+/// SR550 boot reported `0 arp mappings learned` and that was read as evidence
+/// about the segment; it was evidence about the address being asked for.
+///
+/// The twin of [`NET_ADDRESS`], and missed when that one was fixed: the peer a
+/// host *asks about* is as much an emulator constant as the address it
+/// *claims*, and fixing one without looking for the other is how a pair like
+/// this survives.
+const NET_PEER: [u8; 4] = [10, 0, 2, 2];
+
+/// What `bhaskix.gw=<a.b.c.d>` set instead, or zero for [`NET_PEER`].
+static NET_PEER_OVERRIDE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// The peer to ask about: the command line's, or the default.
+fn net_peer() -> u32 {
+    let asked = NET_PEER_OVERRIDE.load(core::sync::atomic::Ordering::Relaxed);
+    if asked == 0 {
+        u32::from_be_bytes(NET_PEER)
+    } else {
+        asked
+    }
+}
+
 /// What `bhaskix.ip=<a.b.c.d>` set instead, or zero for [`NET_ADDRESS`].
 ///
 /// Zero is not a usable host address, so it doubles as *nothing was asked for*
@@ -15080,7 +15117,7 @@ fn publish_net_config_with(
     let address = net_address();
     /// Words of the configuration page that are the interface's own, before the
     /// members' addresses are appended.
-    const FIXED_CONFIG_WORDS: usize = 7;
+    const FIXED_CONFIG_WORDS: usize = 8;
     // **What the interface is, not only what address it holds.** RFC 0074:
     // `bin/ipd` binds to an interface, so it needs the VLAN its frames carry
     // and the largest one it may build. A VLAN of zero means untagged, which
@@ -15098,6 +15135,11 @@ fn publish_net_config_with(
         // 802.3ad, and on that wire active-backup is not merely worse -- the
         // switch will not forward data to a member it has not bundled.
         u64::from(NET_BOND_LACP.load(core::sync::atomic::Ordering::Relaxed)),
+        // **Word 7: the peer to ask about.** `bin/ipd` held this as a constant
+        // of its own -- QEMU's gateway -- so every SR550 boot ARPed for an
+        // address nobody on that wire has, and reported `0 arp mappings
+        // learned` as though it had asked a fair question.
+        u64::from(net_peer()),
     ];
     // **Each member's own address, words 7 onward.** The bond's address is at
     // word 1 and is what data leaves under; these are what the links are
@@ -19923,9 +19965,19 @@ fn report_net_ring(hhdm: u64) -> bool {
     // and one number cannot say which -- the ambiguity that cost step 3 an
     // hour of looking at the wrong program.
     println!(
-        "    net reply      ipd built {} frames, {} arp mappings learned (can send {}, configured {})",
+        "    net reply      ipd built {} frames, {} arp mappings learned about {}.{}.{}.{}{} \
+         (can send {}, configured {})",
         words[5],
         words[6],
+        net_peer() >> 24 & 0xff,
+        net_peer() >> 16 & 0xff,
+        net_peer() >> 8 & 0xff,
+        net_peer() & 0xff,
+        if NET_PEER_OVERRIDE.load(Ordering::Relaxed) == 0 {
+            " (the default, which is QEMU's)"
+        } else {
+            " (bhaskix.gw)"
+        },
         words[7] & 1,
         (words[7] >> 1) & 1
     );

@@ -3304,3 +3304,51 @@ depend on any of this. What changes is the explanation of the *silence*: not an
 empty VLAN, but a trunk this host was reaching correctly on the tagged boots,
 behind a LAG that never bundled because until the CRC fix every frame it was
 sent arrived corrupt.
+
+
+### `0 arp mappings learned` was never about the segment — 2026-09-12
+
+`bin/ipd` held the addresses it asks about as constants of its own:
+
+```rust
+const ASK_ABOUT: Ipv4Addr = Ipv4Addr::new(10, 0, 2, 3);   // the ARP request's target
+const GATEWAY:   Ipv4Addr = Ipv4Addr::new(10, 0, 2, 2);   // the ping's
+```
+
+Both are QEMU's. `10.0.2.3` and `10.0.2.2` are what slirp answers at, and the
+two are deliberately different so a test can tell an ARP request from an echo
+request — sound reasoning, and it means **every SR550 boot asked that wire about
+an address nobody on it has**, while the report said `0 arp mappings learned`
+and this document read that as evidence about the segment.
+
+It was evidence about the question. A host that ARPs for an address that does
+not exist learns nothing, on any network, working or not.
+
+**And this is the twin of a defect corrected an hour earlier.** `NET_ADDRESS`
+was fixed for being QEMU's `10.0.2.15` on a real wire, and the peer it *asks
+about* was not looked at — though it is exactly the same kind of constant, in
+the same pair of files, for the same reason. Fixing one of a pair and not
+looking for the other is how the second survives; that is now three times in
+this work, after `FIRSTQ`/`GLLAN_TXPRE_QDIS` and after the padding's four
+deleted tests.
+
+`bhaskix.gw=<a.b.c.d>` names the peer, carried to `bin/ipd` as word 7 of the
+configuration page. Both the ARP target and the ping target follow it when it is
+set; the QEMU lanes set nothing and keep the two distinct addresses their test
+relies on. And the report now prints **which address it asked about** and
+whether that came from the command line — it could not have said before, which
+is why nobody noticed it was asking the wrong question.
+
+#### The test this makes possible
+
+The trunk on lag 3 carries **VLAN 5**, which is `MGMT` — the network the
+switch's own management interface (`10.5.5.246`) and this machine's BMC
+(`10.5.5.103`) sit on. Both have been answering all day, so unlike VLAN 17 or
+20 it is a segment *known* to contain live hosts.
+
+So the first end-to-end test this project can actually run on hardware is a boot
+tagged for VLAN 5, with `bhaskix.ip=` a free address on `10.5.5.0/24` and
+`bhaskix.gw=` something that answers — the switch itself, or the gateway at
+`10.5.5.1`. If ARP resolves, *"frames leave and arrive intact"* becomes *"frames
+are answered"*, which is the claim this project has never been able to make
+about real hardware.
