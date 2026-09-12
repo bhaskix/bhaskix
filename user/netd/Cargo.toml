@@ -353,4 +353,15 @@ asm_budget = 3
 # is what code review cannot check -- a frame truncated anywhere between
 # `frame()` and the descriptor's BSIZE reaches the switch short and is
 # discarded, and every counter here still reads exactly as it does now.
-unsafe_budget = 490
+#
+# The frames matched, structurally and to the byte, so nothing this host emits
+# is wrong -- and then `PRD-SW1`'s own port statistics gave the answer nothing
+# here could: received-without-error flat and **CRC errors climbing** on all
+# four of its ports. Every frame this machine sends arrives damaged.
+#
+# 499 for the two counters that say whether the damage is one-way: this side's
+# own `GLPRT_CRCERRS`, read since the port counters were written and used only
+# inside a boolean "is this wire live" test, and the link speed, published since
+# links were read and never printed. Frames arriving here intact while ours
+# arrive there broken is this side's transmit, not the cable.
+unsafe_budget = 499

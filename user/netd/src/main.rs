@@ -3091,6 +3091,20 @@ fn carry_x722(mut members: [Option<X722Member>; X722_MEMBERS], facts: [X722; X72
         // all four queues to PF0 and no code here would notice.
         let mut member_owners = 0u64;
         let mut member_queue_sets = 0u64;
+        // **Our own receive CRC errors, and what the link negotiated.**
+        //
+        // `GLPRT_CRCERRS` has been read into `PortCounters` since the counters
+        // were written and used only inside a boolean "is this wire live"
+        // test -- never printed. It is the other half of the switch's report: if
+        // frames arrive here intact while ours arrive there broken, the
+        // corruption is one-way and is this side's transmit, not the cable.
+        //
+        // The speed rides with it because four 10G ports negotiating 1 Gb/s is
+        // worth seeing without asking the BMC, and because it is already read
+        // and already published and the kernel has simply never printed it.
+        let mut member_crc = 0u64;
+        let mut member_speed = 0u64;
+        let mut member_mac_config = 0u64;
         // **And what the VSI does to a frame on the way out.** `Insert PVID`
         // puts an 802.1Q tag on every egress frame, and a switch does not hand
         // a tagged slow-protocol frame to its LACP machine -- so an LACPDU this
@@ -3118,6 +3132,15 @@ fn carry_x722(mut members: [Option<X722Member>; X722_MEMBERS], facts: [X722; X72
             // context is never fetched and its descriptors sit in the ring.
             member_queue_sets |=
                 u64::from(facts[index].queue_set & 0x3ff) << (MEMBER_OWNER_BITS * index);
+            member_crc |= u64::from(
+                member
+                    .device
+                    .port_counters(member.device.port_number())
+                    .crc_errors
+                    .min(0xffff),
+            ) << (16 * index);
+            member_speed |= u64::from(facts[index].link_speed) << (8 * index);
+            member_mac_config |= (facts[index].mac_config.packed() & 0xf) << (4 * index);
             let vlan = facts[index].vlan.packed();
             member_pvids |= (vlan & 0xfff) << (12 * index);
             member_pvids |= (vlan >> 13 & 1) << (48 + index);
@@ -3188,6 +3211,9 @@ fn carry_x722(mut members: [Option<X722Member>; X722_MEMBERS], facts: [X722; X72
             member_vlan_flags,
             member_vsi_out,
             member_port_out,
+            member_crc,
+            member_speed,
+            member_mac_config,
             sent_frame,
             sent_length,
             heard_frame,
@@ -3277,6 +3303,15 @@ struct X722 {
     link_up: bool,
     /// And the speed byte behind that, kept raw for the report.
     link_speed: u8,
+    /// The port's own maximum frame size, as `Get Link Status` reports it.
+    max_frame: u16,
+    /// What `Set MAC Config` answered when told to append the CRC.
+    ///
+    /// **The command this driver never sent.** Its outcome is published rather
+    /// than discarded, because a command whose answer nobody reads is a command
+    /// nobody has tested -- which is how `stop_lldp_agent` spent three weeks
+    /// looking like a suspect.
+    mac_config: LldpOutcome,
     /// How many switch elements it reported, which is what says a VSI exists
     /// for frames to be steered to.
     switch_elements: u16,
@@ -3426,6 +3461,30 @@ fn take_x722(nth: u64) -> (X722, Option<X722Member>) {
     if let Ok(link) = device.link_status(&mut admin, SPINS) {
         found.link_up = link.up();
         found.link_speed = link.speed;
+        found.max_frame = link.max_frame;
+        // **Assert that the MAC appends the frame check sequence.**
+        //
+        // §38.21.4.1.1: the controller inserts the Ethernet CRC *"according to
+        // a per port setting configured by setting the CRC Enable bit of the
+        // Set MAC Config Admin Queue command"*, and this service has never sent
+        // that command -- the opcode was not even in the crate. With the bit
+        // clear the MAC transmits exactly the bytes it is handed and the
+        // receiver reads the last four as the FCS, so every frame fails CRC
+        // while every counter here still says it left. `PRD-SW1` reported that
+        // on all four ports: received-without-error flat, CRC errors climbing.
+        //
+        // §38.10.6.8 says the default is to append, and that describes a fresh
+        // device rather than one inherited from firmware that appended its own.
+        // A driver asserts the MAC configuration it depends on: the same lesson
+        // as `RDYList` and `GLLAN_TXPRE_QDIS`, both also left as found.
+        //
+        // The frame size is the port's own, read a line above, so this states
+        // the one thing it is for instead of resetting the MTU on the way past.
+        found.mac_config = match device.set_mac_config(&mut admin, link.max_frame, SPINS) {
+            Ok(()) => LldpOutcome::Stopped,
+            Err(bhaskix_i40e::CommandError::Refused(code)) => LldpOutcome::Refused(code),
+            Err(_) => LldpOutcome::NoAnswer,
+        };
     }
     // The switch, into the buffer that follows both rings in the same page.
     let mut buffer = X722Memory {
@@ -3629,6 +3688,12 @@ struct TransmitReport {
     /// Each member's multicast frames out of its **MAC port**, thirteen bits
     /// each -- the same frames one boundary further out.
     member_port_out: u64,
+    /// Each member's own receive CRC errors, sixteen bits each.
+    member_crc: u64,
+    /// Each member's negotiated link speed, eight bits each.
+    member_speed: u64,
+    /// And what `Set MAC Config` answered on each, four bits each.
+    member_mac_config: u64,
     /// The first thirty-two bytes of the last uplink-tagged frame handed to the
     /// device, and its length.
     sent_frame: [u64; FRAME_WORDS],
@@ -3659,6 +3724,9 @@ fn x722_transmit_report(report: TransmitReport) {
         member_vlan_flags,
         member_vsi_out,
         member_port_out,
+        member_crc,
+        member_speed,
+        member_mac_config,
         sent_frame,
         sent_length,
         heard_frame,
@@ -3781,6 +3849,15 @@ fn x722_transmit_report(report: TransmitReport) {
         core::ptr::write_volatile(
             (RINGS_AT + ring::REPORT + 47 * 8) as *mut u64,
             member_port_out | 1 << 63,
+        );
+        // **Words 81 and 82: this side's receive CRC errors and link speeds.**
+        // Sixteen bits of error count each, eight bits of speed each. Word 82
+        // also carries each member's `Set MAC Config` outcome at 32:47, four
+        // bits apiece, and bit 63 says the three were taken.
+        core::ptr::write_volatile((RINGS_AT + ring::REPORT + 81 * 8) as *mut u64, member_crc);
+        core::ptr::write_volatile(
+            (RINGS_AT + ring::REPORT + 82 * 8) as *mut u64,
+            member_speed | member_mac_config << 32 | 1 << 63,
         );
         // **Words 48-63 and 64-79: the two frames whole, 128 bytes each.**
         // Word 80 carries both lengths and the bit that says they were taken --

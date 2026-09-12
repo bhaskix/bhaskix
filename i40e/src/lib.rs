@@ -825,6 +825,46 @@ const CONTROL_FILTER_IGNORE_MAC: u16 = 1 << 0;
 /// control VSI"* -- which is the behaviour a control packet filter is supposed
 /// to have and, on this machine, did not.
 const OPCODE_STOP_LLDP_AGENT: u16 = 0x0A05;
+
+/// Set MAC Config -- 38.11.3.1.2, opcode `0x0603`, direct.
+///
+/// **The command this driver never sent.** Its parameters live in the
+/// descriptor's bytes 16-31 (Table 38-56): the port's Max Frame Size at bytes
+/// 0-1 and, at byte 2, the reserved bits, `CRC Enable` and the pacing
+/// configuration.
+const OPCODE_SET_MAC_CONFIG: u16 = 0x0603;
+/// `CRC Enable`, byte 2 bit 2 of Table 38-56: *"set to 1b to enable the MAC to
+/// append the CRC on transmit. Set to 0b if software appends the CRC."*
+///
+/// **This is what makes a frame arrive intact.** §38.21.4.1.1: the controller
+/// *"calculates and inserts the Ethernet CRC for all packets transmitted to the
+/// network according to a per port setting configured by setting the CRC Enable
+/// bit of the Set MAC Config Admin Queue command"*. With it clear, the MAC
+/// transmits exactly the bytes it was handed and the receiver reads the last
+/// four of them as a frame check sequence -- so **every** frame fails CRC, on
+/// every port, for ever, while every counter on this side still says the frame
+/// left.
+///
+/// §38.10.6.8 says *"the default value is set for the MAC to append the CRC"*,
+/// and that describes a fresh device rather than one inherited from firmware
+/// that appended its own. A driver asserts the MAC configuration it depends on:
+/// the same lesson as `RDYList` and `GLLAN_TXPRE_QDIS`, both of which were also
+/// left as somebody else had them.
+const MAC_CONFIG_CRC_ENABLE: u8 = 1 << 2;
+
+/// The descriptor [`Device::set_mac_config`] posts.
+///
+/// Separated so a test drives the same construction the command does rather
+/// than a copy of it written beside the assertion -- which is the mistake the
+/// `QS_Handle` test made until its parse was factored out.
+#[must_use]
+fn mac_config_request(max_frame: u16) -> Descriptor {
+    let mut request = Descriptor::direct(OPCODE_SET_MAC_CONFIG);
+    // Table 38-56: Max Frame Size at parameter bytes 0-1, which are the
+    // descriptor's 16-17, and the flags byte at parameter byte 2.
+    request.words[4] = u32::from(max_frame) | u32::from(MAC_CONFIG_CRC_ENABLE) << 16;
+    request
+}
 /// `Stop LLDP Agent` byte 16 bit 0: 0 stops the agent, 1 shuts it down.
 ///
 /// **Stop, not shutdown.** Shutdown *"sends a last LLDP PDU on the wire with
@@ -3263,6 +3303,27 @@ impl<R: Registers> Device<R> {
         self.command(ring, request, spins).map(|_| ())
     }
 
+    /// Sets the port's MAC configuration -- 38.11.3.1.2's `Set MAC Config`.
+    ///
+    /// **Asserts `CRC Enable` and changes nothing else.** `max_frame` should be
+    /// what the port already reports through `Get Link Status`, so this command
+    /// states the one thing it is for rather than resetting the port's frame
+    /// size to a guess on the way past. Pacing stays zero, which is no pacing.
+    ///
+    /// # Errors
+    ///
+    /// As [`Device::command`]. Firmware answers `EPERM` if the caller may not
+    /// configure the port.
+    pub fn set_mac_config(
+        &mut self,
+        ring: &mut impl Dma,
+        max_frame: u16,
+        spins: u32,
+    ) -> Result<(), CommandError> {
+        self.command(ring, mac_config_request(max_frame), spins)
+            .map(|_| ())
+    }
+
     /// Lets a VSI fix a transmit packet's destination itself -- the *Allow
     /// Destination Override* flag, without which a switch control tag in a
     /// transmit context descriptor is not permitted.
@@ -5471,6 +5532,78 @@ mod tests {
         let words = high.words();
         assert_eq!(words[1], 0x0200_0000, "0x1_0000_0000 / 128");
         assert_eq!(words[2], 0);
+    }
+
+    /// `Set MAC Config` asserts CRC insertion and touches nothing else.
+    ///
+    /// **This is the command that decides whether a frame survives the wire.**
+    /// §38.21.4.1.1: the controller inserts the Ethernet CRC *"according to a
+    /// per port setting configured by setting the CRC Enable bit of the Set MAC
+    /// Config Admin Queue command"*. With it clear the MAC sends exactly the
+    /// bytes it was handed, and the receiver reads the last four of them as the
+    /// frame check sequence -- so every frame fails CRC while every counter on
+    /// this side still says it left. `PRD-SW1` reported precisely that on all
+    /// four ports: received-without-error flat, CRC errors climbing.
+    ///
+    /// A hundred percent failure is not a cabling signature. Marginal copper
+    /// gives intermittent errors and the occasional good frame; every frame bad
+    /// the same way on four ports at once is systematic.
+    ///
+    /// The frame size is passed in rather than chosen here, so the command
+    /// states the one thing it is for instead of resetting the port's MTU to a
+    /// guess on the way past.
+    #[test]
+    fn set_mac_config_asserts_crc_insertion_and_keeps_the_frame_size() {
+        assert_eq!(OPCODE_SET_MAC_CONFIG, 0x0603, "38.11.3.1.2's opcode");
+
+        // What the command writes into the parameter bytes.
+        let request = mac_config_request(1518);
+
+        // Parameter bytes 0-1 are the descriptor's 16-17: the frame size, kept.
+        assert_eq!(
+            request.words[4] & 0xffff,
+            1518,
+            "Max Frame Size at bytes 0-1"
+        );
+        // Parameter byte 2 is the descriptor's 18, and CRC Enable is its bit 2.
+        let flags = (request.words[4] >> 16 & 0xff) as u8;
+        assert_ne!(flags & MAC_CONFIG_CRC_ENABLE, 0, "CRC Enable, byte 2 bit 2");
+        assert_eq!(MAC_CONFIG_CRC_ENABLE, 0b100, "bit 2, not bit 0 or bit 3");
+        assert_eq!(flags & 0b11, 0, "byte 2 bits 0-1 are reserved, so zero");
+        assert_eq!(flags >> 3 & 0xf, 0, "and pacing is left at none");
+        // Everything past the parameters is reserved.
+        assert_eq!(request.words[5], 0);
+        assert_eq!(request.words[6], 0);
+        assert_eq!(request.words[7], 0);
+
+        // **The whole round trip**, so what a caller passes is what reaches the
+        // ring firmware reads. The opcode is checked before the reply is written
+        // over bytes 0-3, which is where the opcode lives.
+        let mut ring = FakeDma::new();
+        let mut device = Device::new(Fake::new());
+        device.enable_admin_queues(0x1_0000_0000, 0x1_0000_1000);
+        let slot = device
+            .post(&mut ring, mac_config_request(9728))
+            .expect("the ring is enabled");
+        assert_eq!(
+            dma32(&ring, slot) >> 16,
+            u32::from(OPCODE_SET_MAC_CONFIG),
+            "the opcode at bytes 2-3"
+        );
+        assert_eq!(
+            dma32(&ring, slot + 16) & 0xffff,
+            9728,
+            "and a jumbo frame size rides in the same field"
+        );
+        assert_ne!(
+            (dma32(&ring, slot + 16) >> 16 & 0xff) as u8 & MAC_CONFIG_CRC_ENABLE,
+            0,
+            "with CRC insertion asserted beside it, whatever the size"
+        );
+
+        // And firmware's half, so the command reports what it was told.
+        ring.write(slot, &u32::from(FLAG_DD).to_le_bytes());
+        assert!(device.collect(&ring, slot, 4).is_ok());
     }
 
     /// The VLAN handling section decodes at Table 38-216's bytes 8-9 and 12.

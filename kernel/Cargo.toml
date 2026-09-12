@@ -844,7 +844,11 @@ asm_budget = 10
 # 2050 for report words 48-56: thirty-two bytes of the LACPDU handed to the
 # device, thirty-two of the switch's own arriving beside it, and both lengths.
 # The protocol has only ever been checked by reading the code that builds it.
-unsafe_budget = 2050
+# 2052 for report words 81 and 82: this side's own receive CRC errors, the link
+# speed each member negotiated, and what `Set MAC Config` answered. The switch
+# says every frame from this host fails CRC; these say whether anything arriving
+# here is damaged too, which separates a bad cable from a bad transmit.
+unsafe_budget = 2052
 # Up thirty-one for RFC 0005 step 9's socket probe -- `ring3_socketeer`, which
 # is `ring3_lister` with a `sockaddr_in6` copied in beside its code instead of
 # two filenames. The same two blocks every hosted probe has: one

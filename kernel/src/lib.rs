@@ -14922,6 +14922,24 @@ const NETD_LACPDU_FRAME: u64 = 124;
 /// Bit 63 of [`NETD_FRAME_LENGTHS`]: both were taken.
 const NETD_FRAMES_WRITTEN: u64 = 1 << 63;
 
+/// Byte offset of this side's own receive CRC errors, sixteen bits per member.
+///
+/// **`GLPRT_CRCERRS` has been read since the port counters were written and
+/// used only inside a boolean "is this wire live" test.** It is the other half
+/// of the switch's report: if frames arrive here intact while ours arrive there
+/// broken, the corruption is one-way and belongs to this side's transmit rather
+/// than to the cable between them.
+const NETD_MEMBER_CRC: u64 = 81 * 8;
+/// And each member's negotiated speed at 31:0, its `Set MAC Config` outcome at
+/// 47:32, with bit 63 saying both were taken.
+///
+/// The speed is here because four 10G ports negotiating 1 Gb/s is worth seeing
+/// without asking the BMC -- `bin/netd` has published it since links were read
+/// and this kernel has never printed it.
+const NETD_MEMBER_SPEED: u64 = 82 * 8;
+/// Bit 63 of that word.
+const NETD_MEMBER_LINK_WRITTEN: u64 = 1 << 63;
+
 /// The sentinel `bin/netd` writes there.
 const NETD_MEMBER_ADDRESSES_WRITTEN: u64 = 0x5352_4444_414d_454d;
 
@@ -16722,6 +16740,8 @@ fn net_domain_transmitted(hhdm: u64) -> Option<Transmitted> {
         member_vsi_out,
         member_port_out,
         frame_lengths,
+        member_crc,
+        member_speed,
     ) = unsafe {
         (
             core::ptr::read_volatile(at as *const u64),
@@ -16740,6 +16760,8 @@ fn net_domain_transmitted(hhdm: u64) -> Option<Transmitted> {
             core::ptr::read_volatile((page + NETD_MEMBER_VSI_OUT) as *const u64),
             core::ptr::read_volatile((page + NETD_MEMBER_PORT_OUT) as *const u64),
             core::ptr::read_volatile((page + NETD_FRAME_LENGTHS) as *const u64),
+            core::ptr::read_volatile((page + NETD_MEMBER_CRC) as *const u64),
+            core::ptr::read_volatile((page + NETD_MEMBER_SPEED) as *const u64),
         )
     };
     // Bit 33 says the driver measured them. Without it, zero is what a port
@@ -16764,6 +16786,8 @@ fn net_domain_transmitted(hhdm: u64) -> Option<Transmitted> {
         member_vsi_out,
         member_port_out,
         frame_lengths,
+        member_crc,
+        member_speed,
         // SAFETY: the same frame, through the direct map -- eight more words
         // `x722_transmit_report` writes, read volatile for the same reason.
         sent_frame: unsafe {
@@ -16837,6 +16861,10 @@ struct Transmitted {
     member_port_out: u64,
     /// Both frames' lengths -- see [`NETD_FRAME_LENGTHS`].
     frame_lengths: u64,
+    /// This side's own receive CRC errors -- see [`NETD_MEMBER_CRC`].
+    member_crc: u64,
+    /// Link speeds and `Set MAC Config` outcomes -- see [`NETD_MEMBER_SPEED`].
+    member_speed: u64,
     /// The frame handed to the device -- see [`NETD_SENT_FRAME`].
     sent_frame: [u64; NETD_FRAME_WORDS],
     /// The frame the switch sent -- see [`NETD_HEARD_FRAME`].
@@ -17948,6 +17976,46 @@ fn report_net_after_exchange(hhdm: u64) {
                              heard nothing\x1b[0m"
                         );
                     }
+                }
+                // **This side's own receive CRC errors, and the link.**
+                //
+                // `PRD-SW1` reports received-without-error flat and CRC errors
+                // climbing on all four of its ports, which says every frame
+                // this host sends arrives damaged. A hundred percent failure is
+                // not a cabling signature -- marginal copper gives intermittent
+                // errors and the occasional good frame -- so the question is
+                // whether the damage is one-way. If frames arrive *here* intact
+                // while ours arrive *there* broken, it is this side's transmit.
+                if out.member_speed & NETD_MEMBER_LINK_WRITTEN != 0 {
+                    print!("                   per member, link / our own rx crc errors:");
+                    let mut ours = 0u64;
+                    for member in 0..NETD_MEMBER_COUNT as u32 {
+                        let crc = out.member_crc >> (16 * member) & 0xffff;
+                        let speed = out.member_speed >> (8 * member) & 0xff;
+                        let config = out.member_speed >> (32 + 4 * member) & 0xf;
+                        ours += crc;
+                        print!(
+                            " member {member} speed {speed} crc {crc} mac-config {};",
+                            match config & 0b11 {
+                                0 => "not asked",
+                                1 => "taken",
+                                2 => "no answer",
+                                _ => "REFUSED",
+                            }
+                        );
+                    }
+                    println!();
+                    println!(
+                        "                   {}",
+                        if ours == 0 {
+                            "\x1b[92mnothing arrives here damaged, so a switch seeing every \
+                             frame fail CRC is being sent them broken -- one-way, and this \
+                             side's\x1b[0m"
+                        } else {
+                            "\x1b[93mframes arrive here damaged too, so the wire is bad in \
+                             both directions rather than this side's transmit\x1b[0m"
+                        }
+                    );
                 }
                 // **The bytes, both directions.** The protocol has only ever
                 // been checked by reading the code that builds it; this is what

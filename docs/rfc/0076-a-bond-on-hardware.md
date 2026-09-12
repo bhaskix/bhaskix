@@ -2811,3 +2811,103 @@ slot for slot, with nothing checking that they do. The length assertion catches
 a missing word only because both feed the same `write_report`; two arrays of the
 right length carrying different things in the same slot would pass it. Both are
 updated here, and the hazard is written down where the second one lives.
+
+
+### The neighbour, named — 2026-09-12
+
+```
+lldp neighbour reachable at 10.5.5.246
+lldp neighbour calls itself "PRD-SW1"
+```
+
+It answers: 1.7 ms round trip from the build host, 0% loss, **port 80 open** and
+22, 23 and 443 silent. The page it serves identifies it as a **NETGEAR XS716T**,
+a sixteen-port 10G smart-managed switch, and asks for a login — so its
+configuration needs credentials this work does not have, and guessing them is
+not on the table for a switch named `PRD`.
+
+Both facts had been on the wire since the first boot that received an LLDPDU.
+
+**What only the switch can answer, and the screen that answers it.** Our
+LACPDUs demonstrably leave four distinct MAC ports — 21/21, 11/11, 11/11, 11/11
+out of each VSI and each MAC. The switch's own receive counters for ports 9-12
+decide between three different faults, and nothing on this side can:
+
+| reading | meaning |
+|---|---|
+| RX packets climbing | the frames arrive and its LACP rejects them — a configuration question |
+| RX flat, CRC/FCS errors climbing | the frames arrive **damaged** — correct in the buffer the device reads, wrong on the wire |
+| RX flat, no errors | they never arrive at all |
+
+The error counter is the sharp one, because this work has already proven the
+frame correct in memory: *arrived broken* would point at the physical layer and
+at nothing in this repository.
+
+And beside it, the same ports' **TX** counters. This host receives 11 to 15
+LACPDUs per ninety-second window, so TX should be climbing. TX climbing while RX
+stays flat is a one-way link, which is exactly what *"it is talking and not
+listening"* looks like from this end.
+
+
+### The switch answered it — 2026-09-12
+
+`PRD-SW1`'s port statistics for ports 9-12: **received-without-error flat, CRC
+errors climbing.** Every frame this host sends arrives damaged, is discarded at
+the switch's MAC, and never reaches its LACP machine — which is exactly why its
+partner record has been all zeroes while it transmits happily.
+
+It also retires a loose end this document flagged and called half-circular.
+Nothing this host transmits has ever been answered — no DHCP, no ARP, no TCP —
+and that was attributed to an unbundled channel-group port suspending data
+forwarding. It was not. Every frame is corrupt, so nothing could ever answer any
+of it.
+
+**A hundred percent failure is not a cabling signature.** Marginal copper gives
+intermittent errors and the occasional good frame, and one good LACPDU would
+have been enough for the switch to record a partner. Every frame bad, the same
+way, on four ports at once is systematic. The BMC reports all four links up at
+**1000 Mbps** on 10G ports into a 10GBASE-T switch, which is worth someone's
+attention on its own — but a link that negotiated down is a *stable* link, and
+it does not explain a total failure.
+
+So it is the one thing all four ports share: how this driver tells the MAC to
+build a frame.
+
+§38.21.4.1.1: the controller *"calculates and inserts the Ethernet CRC for all
+packets transmitted to the network according to a per port setting configured by
+setting the CRC Enable bit of the Set MAC Config Admin Queue command"*.
+Table 38-56 byte 2 bit 2: *"set to 1b to enable the MAC to append the CRC on
+transmit. Set to 0b if software appends the CRC."*
+
+**This driver has never issued that command.** Opcode `0x0603` was not in its
+opcode list. With the bit clear, the MAC transmits exactly the bytes it is
+handed and the receiver reads the last four of them — an LACPDU's trailing zero
+padding — as the frame check sequence. Wrong on every frame, on every port, for
+ever, while every counter on this side still says the frame left.
+
+§38.10.6.8 says *"the default value is set for the MAC to append the CRC"*, and
+that is worth stating against the hypothesis rather than hiding: on a fresh
+device the bit should already be set. It describes a device that has not been
+configured by somebody else, and this card ran PXE first. Either way the
+correction is the same, and it is this work's recurring lesson for the third
+time: **a driver asserts the MAC configuration it depends on rather than
+inheriting it**, as `RDYList` and `GLLAN_TXPRE_QDIS` both had to learn.
+
+`Set MAC Config` is sent at bring-up with the port's own frame size — read from
+`Get Link Status` a line above, so the command states the one thing it is for
+instead of resetting the MTU on the way past — and its answer is published
+rather than discarded.
+
+**And two counters that were already read and never shown**, because the next
+boot has to be able to tell a bad transmit from a bad cable:
+
+* `GLPRT_CRCERRS`, **this side's own receive CRC errors**, read into
+  `PortCounters` since the counters were written and used only inside a boolean
+  *is this wire live* test. If frames arrive here intact while ours arrive there
+  broken, the damage is one-way and belongs to this side's transmit.
+* The **link speed**, which `bin/netd` has published since links were read and
+  this kernel has never printed.
+
+That makes seventeen mechanisms in this work written, read or published and then
+not acted on — and this one is a new kind again: not a value ignored, but a
+command never sent at all.
