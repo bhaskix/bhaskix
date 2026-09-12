@@ -3175,3 +3175,132 @@ back, which looks exactly like a working configuration. Four octets, each in
 range, no empty parts, no fifth field, no trailing dot, no signs, no spaces, no
 hex — every rejected shape in the test is one somebody could type. Watched red
 on the trailing-part check, which is what lets `10.0.2.15.1` through.
+
+
+### VLAN 20, and nothing else in it — 2026-09-12
+
+`PRD-SW1`'s static LAG carrying `xg9`-`xg12` is in **VLAN 20**, and **no other
+port is in VLAN 20**.
+
+That is the end of the question. There is nobody on that segment to answer a
+DHCP discover or an ARP request, so nothing ever did. The silence was never a
+defect in anything this repository contains.
+
+It also accounts for both boots at once:
+
+* **tagged `bhaskix.vlan=17`** — the frames carried a VLAN the port does not
+  carry, and the switch dropped them;
+* **untagged** — the frames landed correctly in VLAN 20 by the LAG's PVID, and
+  VLAN 20 is empty.
+
+Neither could have been answered. The second is the more useful reading: the
+untagged configuration was *right*, and produced exactly the same observable as
+the wrong one, which is why the tag experiment could not distinguish them on its
+own.
+
+#### What is proven, and what is not
+
+**Proven on hardware**, every step by measurement rather than inference:
+
+* a well-formed frame is built and placed in the buffer the descriptor names —
+  the whole 124 bytes, read back and compared field for field against a frame
+  the switch itself emits;
+* it is posted, completed and written back, on four distinct transmit queues;
+* it is counted out of each VSI and out of each MAC port;
+* it **arrives at the switch intact and error-free** — received-without-error
+  +35 against 36 sent, CRC errors flat, measured around a single boot;
+* and nothing this host receives is ever damaged: `GLPRT_CRCERRS` reads zero on
+  all four ports.
+
+**Not proven, and now for a stated external reason**: that this machine can
+complete an exchange with a peer. No DHCP lease, no ARP resolution, no TCP
+connection, because there is no peer on VLAN 20 to have one with. RFC 0076
+step 3's failover gate is in the same position — it needs traffic that crosses
+and returns, and the wiring cannot supply it.
+
+**What would close it**, in ascending order of disruption to a production
+switch:
+
+1. another host in VLAN 20 — anything that answers ARP is enough to prove the
+   round trip;
+2. the LAG's PVID moved to a VLAN that has a DHCP server;
+3. those four ports moved out of the static LAG into an **LACP** LAG, which is
+   the only way RFC 0076's aggregation gate can ever be met here.
+
+The first is the smallest and proves the most: it converts *"frames leave and
+arrive intact"* into *"frames are answered"*, which is the claim this project
+has never been able to make about real hardware.
+
+
+### The switch's saved configuration contradicts two recorded findings — 2026-09-12
+
+`PRD-SW1`'s `startup-config` was read directly. Two things this document
+recorded as established, both taken from a reading of the web interface, are
+contradicted by it.
+
+**1. "The LAG is static" — the saved configuration says LACP.**
+
+```
+interface lag 3
+no port-channel static
+mtu 9100
+vlan participation include 2-5,7-10,17-18,20,50,90,100
+vlan tagging  2-5,7-10,17-18,20,50,90,100
+```
+
+`no port-channel static` is FASTPATH for *static mode disabled*, which is LACP.
+All six configured LAGs read the same way, and there is no `lacp` command
+anywhere in the file disabling it. Our four ports are **lag 3, named
+`Server3`** — `xg9`, `xg10`, `xg12`, `xg11`, in that order.
+
+**2. "VLAN 20, and nothing else in it" — VLAN 20 is on six LAGs.**
+
+VLAN 20 is `Storage`, and it is included and tagged on lags 1 through 6 and on
+`xg14`. Lag 1 is `Server1` and lag 2 is `Server2`. The segment is not empty; it
+has at least two other servers on it.
+
+**3. And a correction to a correction.** This document then said untagged was
+*"the correct configuration for these ports"*. It is not. Lag 3 carries VLANs
+2-5, 7-10, 17-18, 20, 50, 90 and 100 **all tagged**, with no VLAN untagged, so
+untagged frames fall to the LAG's PVID — VLAN 1, which carries nothing. The
+tagged `bhaskix.vlan=17` boots were **correctly tagged for a VLAN this trunk
+carries**; the untagged boot was the wrong one.
+
+#### Reconciling it
+
+The saved configuration and the web interface disagree, and the **running**
+configuration is what governs. The reading that fits every measurement is that
+the running config has lag 3 as *static* — which is what the interface showed —
+while the saved config still says LACP, because the change was made without
+being written back. That also explains the one thing LACP-enabled would not: our
+LACPDUs arriving intact on the last three boots and the switch still reporting
+`Defaulted` with an all-zero partner record.
+
+If that is right, then rebooting the switch would restore LACP from this file,
+and saving the running config would overwrite this file with static. Neither is
+this project's call to make.
+
+#### An inconsistency worth reporting regardless
+
+The members of lag 3 do not agree with each other:
+
+| port | PVID |
+|---|---|
+| `xg9` | 5 |
+| `xg10` | 5 |
+| **`xg11`** | **100** |
+| `xg12` | 5 |
+
+`xg11` is configured for VLAN 100 (`TG`) where its three peers are on VLAN 5
+(`MGMT`). FASTPATH expects a LAG's members to be configured alike and can refuse
+a member that is not. Whether it is refusing `xg11` here is not visible from this
+side, but a LAG with one member configured differently from the other three is
+worth somebody looking at whatever else is true.
+
+#### What this makes of the earlier conclusions
+
+The driver findings are untouched — they were measured on this host and do not
+depend on any of this. What changes is the explanation of the *silence*: not an
+empty VLAN, but a trunk this host was reaching correctly on the tagged boots,
+behind a LAG that never bundled because until the CRC fix every frame it was
+sent arrived corrupt.
