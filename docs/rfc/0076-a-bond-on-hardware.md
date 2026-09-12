@@ -2730,3 +2730,31 @@ something copies one onto the other. Something did. The test named the right
 behaviour and measured the mechanism instead, and it passed for as long as the
 defect existed. It now asserts the interval through `should_send`, and that the
 actor's own bit survives; watched red against the exact code it replaced.
+
+
+### The timeout fix, confirmed on the wire — 2026-09-12
+
+```
+lacpdu sent   32: 07 00 00 00 02 14 80 00 08 bd 43 76 47 e1 00 14
+lacpdu sent   48: 00 80 00 0b 45 00 00 00 03 10 00 00 00 00 00 00
+ipd lacp       state 0x07 -- per link: link 0 0x07, link 1 0x07, link 2 0x07, link 3 0x07
+```
+
+Byte 32 reads `07` where it read `05`. The short timeout `Bundle::arm` asks for
+now survives contact with a switch running the slow rate, instead of being
+erased by every PDU that switch sends.
+
+**LACP still has not aggregated, which is what was said before the boot.** The
+switch's partner block is unchanged — all zeroes from offset 38 on — so it has
+still never received anything from this host, and neither this station's own
+timeout bit nor its transmit rate could change that. Recording it here because a
+fix that lands and changes nothing about the symptom is worth stating as
+plainly as one that does.
+
+Our frame remains correct and complete: partner TLV `02 14` at 36 with the
+switch's real identity echoed back (`08 bd 43 76 47 e1`, key `00 14`, port
+`00 0b`, state `45`), collector `03 10` at 56, terminator at 72.
+
+The position is unchanged from the conclusion above: everything this host emits
+is verified correct by measurement, and the remaining variable cannot be read
+from this machine.
