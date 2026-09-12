@@ -483,6 +483,19 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
         {
             BOND_PATIENCE_MS.store(ms.min(120_000), core::sync::atomic::Ordering::Relaxed);
         }
+        // `bhaskix.ip=<a.b.c.d>` -- what this interface should claim. Without
+        // it the default is QEMU's `10.0.2.15`, which is right for every lane
+        // that runs under QEMU and meaningless on a wire.
+        if let Some(value) = word
+            .strip_prefix("bhaskix.ip=")
+            .or_else(|| word.strip_prefix("ip="))
+            && let Some(address) = bhaskix_net::addr::Ipv4Addr::parse(value)
+        {
+            // `Ipv4Addr::parse` rather than a copy here: the kernel has no test
+            // module, and a parser nothing can exercise is how an address
+            // becomes wrong in silence.
+            NET_ADDRESS_OVERRIDE.store(address.0, core::sync::atomic::Ordering::Relaxed);
+        }
         if let Some(value) = word
             .strip_prefix("bhaskix.lacp=")
             .or_else(|| word.strip_prefix("lacp="))
@@ -14991,13 +15004,37 @@ static NET_BOND_LACP: core::sync::atomic::AtomicBool = core::sync::atomic::Atomi
 /// The largest frame this interface carries.
 const NET_MTU: u16 = 1500;
 
-/// This interface's IPv4 address.
+/// This interface's IPv4 address, when the command line names none.
 ///
 /// Static, and RFC 0018 says why: *what owns the interface's address* is one of
 /// its open questions, DHCP is a client holding a socket, and sockets do not
 /// exist yet. `10.0.2.15` is what QEMU's built-in network hands a guest, so a
 /// static choice and the emulator agree without either negotiating.
+///
+/// **On hardware it is an emulator's address and means nothing.** Every SR550
+/// boot has published it, and it took `dhcp client nobody answered` on a segment
+/// that answers nothing at all before anyone looked at what the interface was
+/// claiming to be. It cannot be blamed for that -- a DHCP discover is broadcast
+/// and does not depend on the sender's address -- but a machine on a real wire
+/// asserting an emulator's address would have made the first reply that did
+/// arrive unintelligible, and nothing would have said why.
 const NET_ADDRESS: [u8; 4] = [10, 0, 2, 15];
+
+/// What `bhaskix.ip=<a.b.c.d>` set instead, or zero for [`NET_ADDRESS`].
+///
+/// Zero is not a usable host address, so it doubles as *nothing was asked for*
+/// without a second flag.
+static NET_ADDRESS_OVERRIDE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// The address this interface should claim: the command line's, or the default.
+fn net_address() -> u32 {
+    let asked = NET_ADDRESS_OVERRIDE.load(core::sync::atomic::Ordering::Relaxed);
+    if asked == 0 {
+        u32::from_be_bytes(NET_ADDRESS)
+    } else {
+        asked
+    }
+}
 
 /// Tells `bin/ipd` its hardware and protocol addresses.
 ///
@@ -15040,7 +15077,7 @@ fn publish_net_config_with(
     if count == 0 {
         return false;
     }
-    let address = u32::from_be_bytes(NET_ADDRESS);
+    let address = net_address();
     /// Words of the configuration page that are the interface's own, before the
     /// members' addresses are appended.
     const FIXED_CONFIG_WORDS: usize = 7;
@@ -21613,8 +21650,19 @@ fn user_shell(handoff: &Handoff) -> Result<(), &'static str> {
         let members = net_domain_members(hhdm).unwrap_or([0; NETD_MEMBER_COUNT]);
         match net_domain_mac(hhdm) {
             Some(mac) if publish_net_config(hhdm, mac, members) => {
+                let told = net_address();
                 println!(
-                    "    net config     interface told to ipd: mac {mac:#014x}, address 10.0.2.15"
+                    "    net config     interface told to ipd: mac {mac:#014x}, address \
+                     {}.{}.{}.{}{}",
+                    told >> 24 & 0xff,
+                    told >> 16 & 0xff,
+                    told >> 8 & 0xff,
+                    told & 0xff,
+                    if NET_ADDRESS_OVERRIDE.load(core::sync::atomic::Ordering::Relaxed) == 0 {
+                        " (the default, which is QEMU's)"
+                    } else {
+                        " (bhaskix.ip)"
+                    }
                 );
                 println!(
                     "    net config     each link speaks under its own address: {}",

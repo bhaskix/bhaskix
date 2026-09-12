@@ -83,6 +83,36 @@ impl Ipv4Addr {
         Self(u32::from_be_bytes([a, b, c, d]))
     }
 
+    /// Reads a dotted quad, or nothing.
+    ///
+    /// **Refuses rather than salvages.** A command line reading
+    /// `bhaskix.ip=10.5.5` has a typo in it, and a kernel that quietly takes
+    /// that for `10.5.5.0` puts a machine on the wrong address and then reports
+    /// the address it was told -- which reads exactly like a working
+    /// configuration. Four octets, each in range, nothing else: no leading
+    /// signs, no empty parts, no fifth field, no trailing dot.
+    ///
+    /// This lives here rather than in the kernel because the kernel has no test
+    /// module -- it is a `no_std` binary for a custom target -- and a parser
+    /// nothing can exercise is how an address becomes wrong in silence.
+    #[must_use]
+    pub fn parse(text: &str) -> Option<Self> {
+        let mut octets = [0u8; 4];
+        let mut parts = text.split('.');
+        for slot in &mut octets {
+            let part = parts.next()?;
+            // `u8::from_str` accepts a leading `+`; an address does not.
+            if part.is_empty() || !part.bytes().all(|byte| byte.is_ascii_digit()) {
+                return None;
+            }
+            *slot = part.parse::<u8>().ok()?;
+        }
+        parts
+            .next()
+            .is_none()
+            .then(|| Self::new(octets[0], octets[1], octets[2], octets[3]))
+    }
+
     /// The four octets, in wire order.
     #[must_use]
     pub const fn octets(self) -> [u8; 4] {
@@ -401,6 +431,61 @@ impl From<Ipv6Addr> for Address {
 
 #[cfg(test)]
 mod tests {
+    /// A dotted quad is read whole, or refused.
+    ///
+    /// **The failure this prevents is silent.** `bhaskix.ip=10.5.5` is a typo,
+    /// and a parser that salvages it into `10.5.5.0` puts a machine on an
+    /// address nobody chose and then reports that address back -- which reads
+    /// exactly like a working configuration. Every rejected shape here is one
+    /// somebody could actually type.
+    #[test]
+    fn a_dotted_quad_is_read_whole_or_refused() {
+        assert_eq!(
+            Ipv4Addr::parse("10.0.2.15"),
+            Some(Ipv4Addr::new(10, 0, 2, 15))
+        );
+        assert_eq!(Ipv4Addr::parse("0.0.0.0"), Some(Ipv4Addr::UNSPECIFIED));
+        assert_eq!(
+            Ipv4Addr::parse("255.255.255.255"),
+            Some(Ipv4Addr::BROADCAST)
+        );
+        assert_eq!(
+            Ipv4Addr::parse("10.5.5.246"),
+            Some(Ipv4Addr::new(10, 5, 5, 246))
+        );
+
+        // Too few parts -- the typo that matters, because it has a plausible
+        // salvage.
+        assert_eq!(
+            Ipv4Addr::parse("10.5.5"),
+            None,
+            "three octets is not an address"
+        );
+        assert_eq!(Ipv4Addr::parse("10.5"), None);
+        assert_eq!(Ipv4Addr::parse("10"), None);
+        assert_eq!(Ipv4Addr::parse(""), None);
+
+        // Too many, and a trailing dot, which `split` makes look like an empty
+        // fifth part rather than an error.
+        assert_eq!(Ipv4Addr::parse("10.0.2.15.1"), None, "five parts");
+        assert_eq!(Ipv4Addr::parse("10.0.2.15."), None, "a trailing dot");
+        assert_eq!(Ipv4Addr::parse(".10.0.2.15"), None, "a leading dot");
+        assert_eq!(Ipv4Addr::parse("10..2.15"), None, "an empty part");
+
+        // Out of range, which wraps into a different address if it is taken
+        // modulo anything.
+        assert_eq!(Ipv4Addr::parse("10.0.2.256"), None, "256 is not an octet");
+        assert_eq!(Ipv4Addr::parse("300.0.0.1"), None);
+
+        // Signs and spaces, both of which `u8::from_str` or a trim would let
+        // through.
+        assert_eq!(Ipv4Addr::parse("+10.0.2.15"), None, "no leading sign");
+        assert_eq!(Ipv4Addr::parse("-1.0.2.15"), None);
+        assert_eq!(Ipv4Addr::parse(" 10.0.2.15"), None, "no leading space");
+        assert_eq!(Ipv4Addr::parse("10.0.2.15 "), None, "no trailing space");
+        assert_eq!(Ipv4Addr::parse("10.0.2.0x0f"), None, "not hexadecimal");
+    }
+
     use super::*;
 
     #[test]

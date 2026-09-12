@@ -3117,3 +3117,61 @@ minutes, and nothing has, on any boot.
 DHCP is answered untagged, those ports are access ports and the tag was the last
 thing stopping traffic. If it is not answered either way, the next question is
 whether anything on that segment answers DHCP at all.
+
+
+### Untagged changes nothing — 2026-09-12
+
+```
+cmdline         bhaskix.bondlacp bhaskix.lacp=120000 bhaskix.x722=120000
+net reply       ipd built 11 frames, 0 arp mappings learned
+dhcp client     nobody answered -- FAILED
+```
+
+The VLAN tag was not the obstacle either. So the position is fully
+characterised, and everything still unknown is on the far side of those four
+ports:
+
+* frames **leave** — 46 out of the VSI, 46 out of the MAC, four distinct ports;
+* frames **arrive intact** — received +35, CRC flat, measured around one boot;
+* the LAG is **static**, so it forwards immediately with no LACP gate;
+* and **nothing on that segment answers anything**.
+
+Everything this host has ever received is the switch's own control traffic —
+LLDP and LACPDUs. Not one frame from any other machine, tagged or untagged, on
+any boot. A live VLAN with other hosts on it produces broadcast traffic, ARP if
+nothing else. There is none. The reading that fits is a static LAG in a VLAN
+with no DHCP server and no other active host.
+
+What would confirm it is the LAG's **PVID and VLAN membership**, and whether any
+other port shares that VLAN. If nothing does, then this driver works as far as
+this wiring allows and the remaining gap is the lab rather than the code.
+
+### The interface claimed an emulator's address — 2026-09-12
+
+`NET_ADDRESS` is `10.0.2.15`, chosen because *"that is what QEMU's built-in
+network hands a guest, so a static choice and the emulator agree without either
+negotiating"*. That reasoning is sound for every lane that runs under QEMU. On
+the SR550 it is an emulator's address on a real wire, published on every boot,
+and nobody looked at it until a segment that answers nothing made the question
+idle.
+
+It cannot be blamed for the silence — a DHCP discover is broadcast and does not
+depend on the sender's address — and that is worth saying plainly rather than
+letting a fix look like a cause. What it would have done is make the first reply
+that *did* arrive unintelligible, with nothing saying why.
+
+`bhaskix.ip=<a.b.c.d>` now sets it, defaulting to the same constant so no QEMU
+lane changes. The report prints the address it actually told `bin/ipd` and says
+whether it came from the command line or is the default — it used to print the
+string `10.0.2.15` regardless, which would have kept saying so however the
+address was set.
+
+**The parser lives in `bhaskix-net`, not the kernel.** The kernel is a `no_std`
+binary for a custom target with no test module, and a parser nothing can
+exercise is how an address becomes wrong in silence. `Ipv4Addr::parse` refuses
+rather than salvages: `bhaskix.ip=10.5.5` is a typo, and reading it as `10.5.5.0`
+would put a machine on an address nobody chose and then report that address
+back, which looks exactly like a working configuration. Four octets, each in
+range, no empty parts, no fifth field, no trailing dot, no signs, no spaces, no
+hex — every rejected shape in the test is one somebody could type. Watched red
+on the trailing-part check, which is what lets `10.0.2.15.1` through.
