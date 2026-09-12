@@ -2915,6 +2915,12 @@ command never sent at all.
 
 ### It was the CRC — 2026-09-12
 
+> **Retracted the same day. The heading is left standing because the claim was
+> published under it, and a correction that hides what it corrects is not one.**
+> See *The reading was ambiguous* below: the switch counters this rests on were
+> read while the SR550 was running **its own OS**, not Bhaskix, and the next
+> boot showed the switch still `Defaulted` with an all-zero partner record.
+
 `PRD-SW1`, after the boot that sends `Set MAC Config`: **CRC errors stopped,
 received-without-error climbing.** The frames arrive intact.
 
@@ -2967,3 +2973,47 @@ it byte for byte before the cause was found.
 else had them, and three of the four were invisible on function 0 or on a
 datasheet default. A driver asserts the configuration it depends on. It does not
 inherit it and hope.
+
+
+### The reading was ambiguous — 2026-09-12
+
+The boot after `Set MAC Config` shipped:
+
+```
+ipd lacp       36 LACPDU(s) sent, 16 slow-protocol frame(s) heard back
+per member, link / our own rx crc errors: member 0 speed 4 crc 0 mac-config taken; ...
+ipd lacp       state 0x07 -- a partner is heard but the link is not yet aggregated
+the partner says: link 0 0x45, link 1 0x45, link 2 0x45, link 3 0x45
+and records its partner as key 0, port 0
+```
+
+`0x45` still carries **Defaulted**, and the switch's partner record is still all
+zeroes. Had our LACPDUs arrived intact during this boot, its receive machine
+would have recorded us within one exchange. It did not.
+
+**So the previous section's conclusion does not follow, and the fault is in how
+it was accepted rather than in the report that produced it.** Every boot in this
+work ends with a `ForceRestart` back onto the SR550's own OS, which brings those
+four ports up with a working driver and sends ordinary traffic. *CRC errors
+stopped and received-without-error climbing* is exactly what that looks like too.
+The boot being credited ended around 08:03 UTC and the machine had been running
+its own OS ever since.
+
+The counters were real. What they were counting was not established, and the
+claim was published anyway — the same mistake as reading `FLAGGED` off a
+malicious-driver register that had never been cleared, and for the same reason:
+a plausible reading treated as a confirmed one because it agreed with the
+hypothesis in hand.
+
+**What settles it** is a reading taken *around* a single boot rather than after
+one: the switch's counters for ports 9-12 immediately before the machine is
+restarted onto Bhaskix, and again while it sits in the boot report. This host
+sends about 36 LACPDUs in that window. Received-without-error rising by roughly
+36 with CRC flat is the fix working; CRC rising by 36 with received flat is not.
+
+**And what remains possible either way.** `mac-config taken` says firmware
+returned success for `Set MAC Config`; it does not say the bit changed the MAC's
+behaviour. That distinction has already cost this work once, when
+`allow_destination_override` returned `Ok` and the flag had to be read back off
+the VSI to show it had stuck. There is no `Get MAC Config`, so the switch's
+counters are the only read-back that exists for this one.
