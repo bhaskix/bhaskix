@@ -2637,3 +2637,96 @@ If those three TLVs are right too then nothing this host emits is wrong, and the
 remaining variable is the switch's configuration — which this machine cannot
 read. That would be the point to say so plainly rather than keep going: the next
 move needs switch access or a capture on the wire.
+
+
+### The whole frame, and the end of what this side can answer — 2026-09-12
+
+```
+lacpdu sent    0: 01 80 c2 00 00 02 08 94 ef 7a fc 8e 88 09 01 01   (124 bytes)
+lacpdu sent   16: 01 14 80 00 08 94 ef 7a fc 8e 00 01 80 00 00 01
+lacpdu sent   32: 05 00 00 00 02 14 80 00 08 bd 43 76 47 e1 00 14
+lacpdu sent   48: 00 80 00 0c 45 00 00 00 03 10 00 00 00 00 00 00
+
+lacpdu heard   0: 01 80 c2 00 00 02 08 bd 43 76 47 e3 88 09 01 01   (124 bytes)
+lacpdu heard  16: 01 14 80 00 08 bd 43 76 47 e1 00 14 00 80 00 0c
+lacpdu heard  32: 45 00 00 00 02 14 00 00 00 00 00 00 00 00 00 00
+lacpdu heard  48: 00 00 00 00 0d 00 00 00 03 10 00 03 00 00 00 00
+```
+
+| offset | field | ours | the switch's |
+|---|---|---|---|
+| 16-17 | actor TLV, length | `01 14` | `01 14` |
+| 26-31 | key, port priority, port | `00 01`, `80 00`, `00 01` | `00 14`, `00 80`, `00 0c` |
+| 32 | actor state | `05` | `45` |
+| 36-37 | partner TLV, length | `02 14` | `02 14` |
+| 38-51 | **partner identity** | `80 00`, `08 bd 43 76 47 e1`, `00 14`, `00 80`, `00 0c` | all zeroes |
+| 52 | partner state | `45` | `0d` |
+| 56-57 | collector TLV, length | `03 10` | `03 10` |
+| 58-59 | collector max delay | `00 00` | `00 03` |
+| 72-73 | terminator | `00 00` | `00 00` |
+
+**The frame is complete and correct**: four TLVs at the right offsets with the
+right types and lengths, 124 bytes, structurally identical to the one frame on
+this wire known to be acceptable to something.
+
+**And the decisive row is the partner block.** Ours names the switch exactly —
+system `08:bd:43:76:47:e1`, key 20, port 12, state `0x45`. The switch's is all
+zeroes. This host hears the switch perfectly and echoes it back correctly; the
+switch has never heard this host.
+
+#### What is established, and what is not
+
+Everything from `bin/ipd`'s buffer to the MAC's transmit counter is now verified
+by measurement rather than by reading code: the frame's bytes, its length, the
+descriptor's `BSIZE`, the completion write-back, the VSI counter, the MAC
+counter, on four distinct MAC ports, with `QTX_CTL` ownership, `RDYList`, the
+VLAN section and the malicious-driver record all read back off the device.
+
+**Nothing this host emits is wrong.** Six hypotheses were raised and killed in
+order — `QTX_CTL.PF_INDX`, the four descriptor checks behind `MAL_TYPE 21`, the
+VLAN handling section, the single switch-element uplink, the frame header, the
+frame's TLVs — each fitting the evidence before its boot.
+
+What remains is the switch's configuration, or the physical host-to-switch
+direction, and **neither can be read from this machine**. The next move needs
+switch access or a capture on the wire. That is the honest end of this line of
+work rather than a seventh hypothesis.
+
+#### One defect the dump did find
+
+Our actor state on the wire is `0x05`. `Bundle::arm` sets `State::TIMEOUT`, so it
+should be `0x07`. `Machine::received` was copying the partner's `LACP_Timeout`
+onto this station's own:
+
+```rust
+self.actor.state = if pdu.actor.state.has(State::TIMEOUT) { … } else { … };
+```
+
+Those are two different statements in 802.1AX. `Actor_State.LACP_Timeout` says
+*what rate I want you to send at* — this station's administrative choice.
+`Partner_Oper_Port_State.LACP_Timeout` is the partner's version of it and is
+what drives **this** station's Periodic Transmission machine. The code
+conflated them, so a switch running the slow rate silently erased a request this
+system had made. It is not the cause of `Defaulted`; it is the fifteenth
+mechanism in this work set and then not present where it was supposed to take
+effect.
+
+`Machine::interval` now reads the partner's bit, and this station's own survives
+what the partner says.
+
+**And it nearly shipped a regression.** The first version defaulted a port that
+has heard no partner to the *slow* rate. The code being replaced read this
+station's own bit, which `Bundle::arm` sets, so an un-partnered port sent every
+second; separating the two bits without deciding what a defaulted partner means
+turned that into thirty — three PDUs in a ninety-second window where there had
+been eleven, on the one measurement this work rests on. A silent link is exactly
+the link that must keep speaking, so a defaulted partner gets the fast rate, and
+the test says so.
+
+**The covering test enforced the bug.** `the_partner_chooses_how_often_this_port_speaks`
+asserted `machine.actor.state.interval_seconds()` — reading *this* station's bit
+to discover what the partner had asked for, which is only a correct reading if
+something copies one onto the other. Something did. The test named the right
+behaviour and measured the mechanism instead, and it passed for as long as the
+defect existed. It now asserts the interval through `should_send`, and that the
+actor's own bit survives; watched red against the exact code it replaced.

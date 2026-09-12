@@ -58,6 +58,11 @@ const TLV_INFORMATION_LENGTH: u8 = 20;
 /// The collector TLV is sixteen.
 const TLV_COLLECTOR_LENGTH: u8 = 16;
 
+/// Seconds between LACPDUs when the short timeout is asked for.
+const FAST_INTERVAL_SECONDS: u32 = 1;
+/// And when it is not.
+const SLOW_INTERVAL_SECONDS: u32 = 30;
+
 /// Where each field sits, by the standard's layout.
 const ACTOR_AT: usize = 2;
 const PARTNER_AT: usize = 22;
@@ -215,9 +220,17 @@ impl State {
     }
 
     /// How long between LACPDUs, in seconds, as the timeout flag asks.
+    ///
+    /// Read this off the **partner's** state to decide when to transmit -- see
+    /// [`Machine::interval`]. Off this station's own it says what rate is being
+    /// asked *of the partner*, which is a different question.
     #[must_use]
     pub const fn interval_seconds(&self) -> u32 {
-        if self.has(Self::TIMEOUT) { 1 } else { 30 }
+        if self.has(Self::TIMEOUT) {
+            FAST_INTERVAL_SECONDS
+        } else {
+            SLOW_INTERVAL_SECONDS
+        }
     }
 }
 
@@ -428,13 +441,49 @@ impl Machine {
                 .with(State::COLLECTING | State::DISTRIBUTING);
         }
 
-        // The partner's timeout preference is the partner's to set.
-        self.actor.state = if pdu.actor.state.has(State::TIMEOUT) {
-            self.actor.state.with(State::TIMEOUT)
-        } else {
-            self.actor.state.without(State::TIMEOUT)
-        };
+        // **`LACP_Timeout` is not copied from the partner, and it was.**
+        //
+        // The two ends' timeout bits are different statements.
+        // `Actor_State.LACP_Timeout` says *what rate I want you to send at*;
+        // it is this station's administrative choice and nobody else's.
+        // `Partner_Oper_Port_State.LACP_Timeout` is the partner's version of
+        // the same statement, and it is what sets **this** station's transmit
+        // rate. Copying one onto the other conflates them.
+        //
+        // The cost was visible on the wire and nowhere else. `Bundle::arm` asks
+        // for the short timeout so a boot-length gate has something to measure,
+        // and the SR550's frame dump showed actor state `0x05` -- no `TIMEOUT`
+        // bit -- because the switch runs the slow rate and every LACPDU it sent
+        // erased the request. The fifteenth mechanism in this work set and then
+        // not present where it was supposed to take effect.
         true
+    }
+
+    /// How often this port must send, in seconds.
+    ///
+    /// **The partner's bit, not this station's.** 802.1AX puts the Periodic
+    /// Transmission machine under `Partner_Oper_Port_State.LACP_Timeout`: a
+    /// partner asking for the short timeout is asking *this* end to speak every
+    /// second. This station's own bit is a request in the other direction and
+    /// says nothing about when it should transmit.
+    ///
+    /// **A partner never heard from gets the fast rate**, which is what
+    /// `Partner_Admin_Port_State` defaults to and what this port needs: a link
+    /// whose partner is silent is exactly the link that must keep speaking, and
+    /// speaking once every thirty seconds is how a station waits out its own
+    /// boot.
+    ///
+    /// This is also what the code being replaced did, by accident. It read this
+    /// station's own bit, which `Bundle::arm` sets, so an un-partnered port sent
+    /// every second. Separating the two bits without deciding what a defaulted
+    /// partner means would have turned that into thirty -- three PDUs in a
+    /// ninety-second window where there had been eleven, on the one measurement
+    /// this work rests on.
+    #[must_use]
+    fn interval(&self) -> u32 {
+        self.partner.map_or(FAST_INTERVAL_SECONDS, |partner| {
+            partner.state.interval_seconds()
+        })
     }
 
     /// Advances the clock by `seconds`, expiring a partner that has gone quiet.
@@ -444,7 +493,7 @@ impl Machine {
         if self.partner.is_none() {
             return;
         }
-        let interval = self.actor.state.interval_seconds();
+        let interval = self.interval();
         if self.silent_for >= interval * EXPIRY_INTERVALS {
             // **Stop claiming to carry traffic before forgetting who the
             // partner was.** The order matters: a link whose partner has aged
@@ -461,7 +510,7 @@ impl Machine {
     /// Whether an LACPDU is due.
     #[must_use]
     pub fn should_send(&self) -> bool {
-        self.since_sent >= self.actor.state.interval_seconds()
+        self.since_sent >= self.interval()
     }
 
     /// The LACPDU to send now, and the fact that it was sent.
@@ -711,22 +760,83 @@ mod tests {
         );
     }
 
-    /// The partner's timeout preference sets the sending interval.
+    /// The partner's timeout preference sets the sending interval, and this
+    /// station's own bit is not touched by it.
+    ///
+    /// **This test passed against code that had the two confused**, because it
+    /// asserted `machine.actor.state.interval_seconds()` -- reading *this*
+    /// station's bit to find out what the partner had asked for, which is only
+    /// a correct reading if something copies one onto the other. Something did,
+    /// and that was the defect. The test named the right behaviour and measured
+    /// the mechanism instead.
+    ///
+    /// The two bits are different statements. `Actor_State.LACP_Timeout` says
+    /// *what rate I want you to send at*; the partner's copy says the same
+    /// thing in the other direction and is what sets this station's rate. So
+    /// the interval is asserted through `should_send` -- which is the behaviour
+    /// -- and the actor's own bit is asserted to survive, which is what the
+    /// SR550's frame dump showed it did not: actor state `0x05`, no `TIMEOUT`,
+    /// after a switch running the slow rate erased a request `Bundle::arm` had
+    /// made.
     #[test]
     fn the_partner_chooses_how_often_this_port_speaks() {
+        // As `Bundle::arm` builds one: asking the partner for the short
+        // timeout, because a boot-length gate needs a partner that answers
+        // promptly.
         let mut machine = Machine::new(US, 3, 1);
-        assert_eq!(machine.actor.state.interval_seconds(), 30);
+        machine.actor.state = machine.actor.state.with(State::TIMEOUT);
+        assert!(machine.actor.state.has(State::TIMEOUT), "asked for, by us");
 
-        machine.received(&partner_pdu(None, State::ACTIVITY | State::TIMEOUT));
-        assert_eq!(machine.actor.state.interval_seconds(), 1, "asked for fast");
-
-        machine.sending();
-        assert!(!machine.should_send());
-        machine.elapsed(1);
-        assert!(machine.should_send());
-
+        // A partner running the slow rate. **Our request must survive it.**
         machine.received(&partner_pdu(None, State::ACTIVITY));
-        assert_eq!(machine.actor.state.interval_seconds(), 30, "back to slow");
+        assert!(
+            machine.actor.state.has(State::TIMEOUT),
+            "the partner's rate is not this station's request -- the bit we send \
+             says what we want of them"
+        );
+
+        // And it is the partner's bit that decides when we speak.
+        machine.sending();
+        machine.elapsed(1);
+        assert!(!machine.should_send(), "a slow partner gets the slow rate");
+        machine.elapsed(29);
+        assert!(machine.should_send(), "thirty seconds, not one");
+
+        // The partner asks for fast: we speak fast, and our own bit is still
+        // ours.
+        machine.received(&partner_pdu(None, State::ACTIVITY | State::TIMEOUT));
+        machine.sending();
+        machine.elapsed(1);
+        assert!(machine.should_send(), "a fast partner gets the fast rate");
+        assert!(machine.actor.state.has(State::TIMEOUT), "still ours");
+
+        // A station that does *not* ask for the short timeout still speaks fast
+        // for a partner that does -- the two directions are independent.
+        let mut quiet = Machine::new(US, 3, 1);
+        assert!(!quiet.actor.state.has(State::TIMEOUT));
+        quiet.received(&partner_pdu(None, State::ACTIVITY | State::TIMEOUT));
+        quiet.sending();
+        quiet.elapsed(1);
+        assert!(quiet.should_send(), "the partner asked, so this end speaks");
+        assert!(
+            !quiet.actor.state.has(State::TIMEOUT),
+            "and still asks nothing of the partner"
+        );
+
+        // **A partner never heard from gets the fast rate.** A silent link is
+        // the one that must keep speaking -- and this is what the replaced code
+        // did by accident, since it read this station's own bit and `arm` sets
+        // it. Separating the two without deciding what a defaulted partner
+        // means would have made an un-partnered port wait thirty seconds for
+        // its first PDU, which is the measurement this work rests on.
+        let mut fresh = Machine::new(US, 3, 1);
+        assert_eq!(fresh.interval(), FAST_INTERVAL_SECONDS);
+        fresh.sending();
+        fresh.elapsed(1);
+        assert!(
+            fresh.should_send(),
+            "a port that has heard nothing speaks every second, not every thirty"
+        );
     }
 
     /// What goes on the wire carries what we last heard.
