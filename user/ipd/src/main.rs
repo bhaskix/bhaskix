@@ -2583,6 +2583,13 @@ extern "C" fn ipd_main() -> ! {
     let mut ticks = 0u64;
     let mut me = (MacAddr::UNSPECIFIED, Ipv4Addr::UNSPECIFIED);
     let mut asked = false;
+    // The pass this program last asked on, and how many times it has asked.
+    //
+    // Counted because *asked once and nothing answered* and *asked forty times
+    // and nothing answered* are different findings, and for a dozen boots the
+    // report could say only the second while the first was true.
+    let mut ask_pass = 0u64;
+    let mut asks = 0u64;
     let mut pinged = false;
     let mut quiet = 0u32;
     // **Empty passes since the demonstration began, which nothing resets.**
@@ -2687,7 +2694,11 @@ extern "C" fn ipd_main() -> ! {
             bytes,
             first_source,
             refused,
-            built,
+            // **How many were asked for, beside how many were built.** The
+            // ARP count rides in the high half: "asked once and nothing
+            // answered" and "asked forty times and nothing answered" are
+            // different findings, and only the second could be reported before.
+            built | (asks.min(0xffff) << 32),
             cache.live(ticks) as u64,
             state(can_send, me.0, can_tcp),
             pongs,
@@ -2722,6 +2733,21 @@ extern "C" fn ipd_main() -> ! {
             me = identity;
         }
 
+        // **Ask again if nothing answered.** The v6 solicitation beside this has
+        // retried since it was written, for the reason `passes` is declared
+        // with: on a quiet wire a lost frame freezes exactly the clock that
+        // should be resending it. This asked **once per boot** and nothing said
+        // so -- one broadcast at whatever instant the interface first came up,
+        // which on hardware is microseconds after four links appeared and the
+        // switch's aggregation is still settling. A frame lost there was lost
+        // for the whole boot, and the report said `0 arp mappings learned` as
+        // though the question had been fairly put.
+        if asked
+            && passes >= ask_pass + 200_000
+            && cache.lookup(Address::V4(ask_about()), ticks).is_none()
+        {
+            asked = false;
+        }
         // One request of this program's own, so that something on the wire can
         // only have come from here. Built entirely by `bhaskix-net`.
         if can_send && !asked && me.0 != MacAddr::UNSPECIFIED {
@@ -2746,6 +2772,8 @@ extern "C" fn ipd_main() -> ! {
             {
                 built += 1;
                 asked = true;
+                ask_pass = passes;
+                asks += 1;
             }
         }
 
@@ -3522,7 +3550,11 @@ extern "C" fn ipd_main() -> ! {
             bytes,
             first_source,
             refused,
-            built,
+            // **How many were asked for, beside how many were built.** The
+            // ARP count rides in the high half: "asked once and nothing
+            // answered" and "asked forty times and nothing answered" are
+            // different findings, and only the second could be reported before.
+            built | (asks.min(0xffff) << 32),
             cache.live(ticks) as u64,
             state(can_send, me.0, can_tcp),
             pongs,

@@ -3352,3 +3352,59 @@ tagged for VLAN 5, with `bhaskix.ip=` a free address on `10.5.5.0/24` and
 `10.5.5.1`. If ARP resolves, *"frames leave and arrive intact"* becomes *"frames
 are answered"*, which is the claim this project has never been able to make
 about real hardware.
+
+
+### VLAN 5, a real address, a real peer — and still nothing — 2026-09-12
+
+```
+cmdline        bhaskix.bondlacp bhaskix.vlan=5 bhaskix.ip=10.5.5.200 bhaskix.gw=10.5.5.246 ...
+net config     interface told to ipd: mac 0x0894ef7afc8e, address 10.5.5.200 (bhaskix.ip)
+net reply      ipd built 11 frames, 0 arp mappings learned about 10.5.5.246 (bhaskix.gw)
+```
+
+Every part of the question is right this time. VLAN 5 is `MGMT`, which lag 3's
+trunk carries tagged. `10.5.5.246` is the switch's own management interface —
+its config says `network mgmt_vlan 5` and `network parms 10.5.5.246`, so it is
+certainly on that VLAN, and it has answered this build host all day. The address
+claimed is a real one on that subnet. The report says what it asked about, which
+it could not before.
+
+And nothing answered.
+
+**The machine was also found powered off** before this boot — `ForceRestart`
+returned HTTP 400 with *"the chassis requires to be powered on"* — so it had
+shut down at some point after the previous boot returned it to its own OS. Noted
+because a machine that powers itself off between runs is a fact about the test
+rig worth having on the record.
+
+#### One ARP request per boot
+
+```rust
+if can_send && !asked && me.0 != MacAddr::UNSPECIFIED {
+    …
+    asked = true;
+}
+```
+
+`bin/ipd` asked **once per boot** and nothing said so. One broadcast at whatever
+instant the interface first came up — on hardware, microseconds after four links
+appeared and while the switch's aggregation is still settling. A frame lost
+there was lost for the whole boot, and the report read `0 arp mappings learned`
+as though the question had been fairly put.
+
+The neighbour solicitation beside it has retried since it was written, and the
+counter it retries on is declared with the reason:
+
+> *"The retry clock for the three sends above. Loop passes rather than `ticks`:
+> ticks advance one per **received** frame, and on the quiet wire this family
+> boots on, a lost reply would freeze exactly the clock that should be retrying
+> it."*
+
+The v6 path learned that lesson; the v4 path never did. It retries now on the
+same clock and the same interval, and the report says **how many times it
+asked** — because *asked once and nothing answered* and *asked forty times and
+nothing answered* are different findings, and only the second could be stated
+before.
+
+That is the fourth mechanism in this work where one of a pair was corrected and
+its twin left alone.

@@ -19965,9 +19965,10 @@ fn report_net_ring(hhdm: u64) -> bool {
     // and one number cannot say which -- the ambiguity that cost step 3 an
     // hour of looking at the wrong program.
     println!(
-        "    net reply      ipd built {} frames, {} arp mappings learned about {}.{}.{}.{}{} \
-         (can send {}, configured {})",
-        words[5],
+        "    net reply      ipd built {} frames, asked {} time(s), {} arp mappings learned \
+         about {}.{}.{}.{}{} (can send {}, configured {})",
+        words[5] & 0xffff_ffff,
+        words[5] >> 32 & 0xffff,
         words[6],
         net_peer() >> 24 & 0xff,
         net_peer() >> 16 & 0xff,
