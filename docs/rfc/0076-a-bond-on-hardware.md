@@ -3017,3 +3017,103 @@ behaviour. That distinction has already cost this work once, when
 `allow_destination_override` returned `Ok` and the flag had to be read back off
 the VSI to show it had stuck. There is no `Get MAC Config`, so the switch's
 counters are the only read-back that exists for this one.
+
+
+### Measured around one boot: the CRC fix is real — 2026-09-12
+
+The reading the retraction asked for, taken with the ports **down** beforehand so
+nothing but Bhaskix could be counted:
+
+| `PRD-SW1` ports 9-12 | before the restart | during the LACP window |
+|---|---|---|
+| received without error | baseline | **+35** |
+| CRC errors | baseline | **flat** |
+
+Against 36 LACPDUs sent. Our frames reach the switch intact and error-free, so
+`Set MAC Config` with `CRC Enable` did take effect and the correction to this
+driver stands.
+
+The earlier reading turned out to agree with this one. It was still right to
+retract: it was taken off the SR550's own OS and could not distinguish the two
+answers, and a conclusion that happens to be true is not the same as one that was
+established. Confirming it properly is worth more than having guessed it.
+
+### And the switch still does not record us — 2026-09-12
+
+The same boot:
+
+```
+ipd lacp       36 LACPDU(s) sent, 16 slow-protocol frame(s) heard back
+the partner says: link 0 0x45, link 1 0x45, link 2 0x45, link 3 0x45
+and records its partner as key 0, port 0 -- ours are key 1, port 1
+```
+
+`0x45` still carries **Defaulted** and the partner record is still all zeroes.
+
+**These two facts together are new.** Our LACPDUs now arrive at the switch's MAC
+— counted, error-free — and its LACP machine behaves as though nothing came. The
+frames are being *received and not delivered to LACP*. That is a different fault
+from every one considered here so far, and it is not on this host: this side is
+now verified from the buffer the descriptor names all the way to the far MAC's
+own receive counter.
+
+What would answer it, on a switch this work cannot read:
+
+* **LAG membership** for ports 9-12. The switch sends LACPDUs with key 20, so a
+  LAG with LACP exists — but a port can sit in a LAG whose LAG is itself
+  disabled, and a disabled LAG does not consume LACPDUs.
+* **LAG type and admin state**: LACP rather than static, and enabled.
+* Anything dropping control frames before protocol handling — storm control, an
+  ACL.
+
+One detail that is *not* a fault, stated so it is not chased: our key is 1 and
+the switch's is 20. An aggregation key is local to each end and the two are not
+required to match. It would only matter if the switch were configured to bundle
+partners with a particular key.
+
+
+### The LAG is static — 2026-09-12
+
+`PRD-SW1`'s LAG for ports 9-12 is configured **static, not LACP**.
+
+That is the whole LACP symptom, and none of it was on this host. A static LAG
+does not run the protocol. The ports have LACP enabled individually — which is
+why the switch emits LACPDUs with key 20 and why this work spent days treating
+it as an LACP peer — but the LAG itself never consumes them. So it reports
+`Defaulted` and an all-zero partner record for ever, no matter what arrives.
+Frames received, counters incrementing, nothing processing the protocol: exactly
+what was measured.
+
+**RFC 0076 step 3's gate cannot be met against this switch as configured.**
+Aggregation requires an LACP peer and there is not one. That is a fact about the
+wiring of this lab, not a defect in `bin/ipd`, and the step should say so rather
+than stay open against an impossible condition.
+
+### Data still does not flow, and the VLAN is the next suspect — 2026-09-12
+
+A static LAG forwards immediately; there is no suspend-pending-LACP state. So
+with the CRC fixed, ordinary traffic should work. It does not:
+
+```
+net reply      ipd built 11 frames, 0 arp mappings learned
+dhcp client    nobody answered -- FAILED
+tcpd           0 segments in, 8 out
+```
+
+**And the switch has never sent this host a tagged frame.** The `switch vlans`
+line has never printed on any boot, which means `bin/ipd` recorded zero tagged
+frames across all four links. Everything that arrives — LLDP, LACPDUs — is
+untagged.
+
+This host transmits with `bhaskix.vlan=17` on the kernel command line, so its
+DHCP discover goes out tagged for VLAN 17. The premise for that came from
+*"i was told sr550 have 4 nic on switch 4 port LACP with TRUNK and vlan tagged
+17,5,20,10,2,3,50"* — and the same sentence's claim about LACP has now turned
+out to be wrong. The wire does not confirm the trunk either: a trunk carrying
+seven VLANs would be expected to put *something* tagged on the wire over two
+minutes, and nothing has, on any boot.
+
+**The test is a command line and no code**: boot without `bhaskix.vlan=17`. If
+DHCP is answered untagged, those ports are access ports and the tag was the last
+thing stopping traffic. If it is not answered either way, the next question is
+whether anything on that segment answers DHCP at all.
