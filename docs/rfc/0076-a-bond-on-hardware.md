@@ -2911,3 +2911,59 @@ boot has to be able to tell a bad transmit from a bad cable:
 That makes seventeen mechanisms in this work written, read or published and then
 not acted on — and this one is a new kind again: not a value ignored, but a
 command never sent at all.
+
+
+### It was the CRC — 2026-09-12
+
+`PRD-SW1`, after the boot that sends `Set MAC Config`: **CRC errors stopped,
+received-without-error climbing.** The frames arrive intact.
+
+And this side said the same thing from the other direction, on the same boot:
+
+```
+per member, link / our own rx crc errors: member 0 speed 4 crc 0 mac-config taken;
+  member 1 speed 4 crc 0 mac-config taken; member 2 ... ; member 3 ...
+nothing arrives here damaged, so a switch seeing every frame fail CRC is being
+sent them broken -- one-way, and this side's
+```
+
+Our own `GLPRT_CRCERRS` is zero on all four ports: everything the switch sends
+arrives here intact, so the wire was never the problem in either direction. The
+damage was one-way and it was ours. (`speed 4` is `I40E_LINK_SPEED_1GB`, which
+agrees with the BMC's 1000 Mbps — two independent sources for a reading this
+document had only from one.)
+
+**The datasheet was wrong about this card.** §38.10.6.8 says *"the default value
+is set for the MAC to append the CRC"*, and that was stated plainly against the
+hypothesis before the boot rather than hidden. It is not what this device came
+up in: PXE firmware left `CRC Enable` clear, and because this driver had never
+issued `Set MAC Config` at all, every frame it transmitted went out with four
+bytes of its own payload where the frame check sequence belonged. A documented
+default describes a device nobody else configured.
+
+**Two real defects, and neither alone would have worked.**
+
+1. **`RDYList` hardcoded to zero.** Three of four transmit queues were in an
+   arbitration queue set that was not their function's, were never scheduled,
+   and so never had their descriptors fetched. Uplink posts never written back
+   went from 30-of-40 to 0-of-36 when it was fixed.
+2. **`CRC Enable` never asserted.** Everything that *did* transmit arrived
+   corrupt and was discarded at the receiver's MAC.
+
+The first made three quarters of the frames never leave. The second made the
+remaining quarter arrive broken. Fixing either alone would have changed nothing
+observable at the far end, which is why the symptom was stable across every
+boot for days while two independent faults sat behind it.
+
+**What this retires.** Every LACP hypothesis in this document was downstream of
+a frame that could not survive the wire: the switch's `Defaulted` state, its
+all-zero partner record, `key 0, port 0`, and the observation that nothing this
+host transmits has ever been answered by anything. None of it was a protocol
+question. The protocol was correct throughout, and the whole-frame dump proved
+it byte for byte before the cause was found.
+
+**The lesson, for the third time and now the most expensive.** `FIRSTQ`,
+`GLLAN_TXPRE_QDIS`, `RDYList` and now `CRC Enable` were all left as somebody
+else had them, and three of the four were invisible on function 0 or on a
+datasheet default. A driver asserts the configuration it depends on. It does not
+inherit it and hope.
