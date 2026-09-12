@@ -45,6 +45,62 @@ pub struct Inventory {
     pub organisation: Option<([u8; 3], u8)>,
     /// How many organizationally specific TLVs there were.
     pub organisations: u16,
+    /// The neighbour's management address, if it sent one.
+    pub management: Option<ManagementAddress>,
+    /// Its system name, truncated to what a report word carries.
+    pub name: [u8; NAME_BYTES],
+    /// How many of those bytes are real.
+    pub name_length: u8,
+}
+
+/// Bytes of a neighbour's system name this keeps.
+///
+/// Eight, because that is a report word and a switch's hostname is identifying
+/// well before it is complete.
+pub const NAME_BYTES: usize = 8;
+
+/// A neighbour's management address -- §38.29.4.2's TLV type eight.
+///
+/// The string is a length, an IANA address family, and the address itself:
+/// family `1` is IPv4 and `2` is IPv6. What follows -- the interface numbering
+/// subtype, the interface number and an object identifier -- says how to reach
+/// the agent within the device and is not what is wanted here.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ManagementAddress {
+    /// IANA address family: 1 IPv4, 2 IPv6.
+    pub family: u8,
+    /// The address octets, as many as `length` says.
+    pub address: [u8; 16],
+    /// How many octets the address has.
+    pub length: u8,
+}
+
+impl ManagementAddress {
+    /// The address as an IPv4 quad, when that is what it is.
+    #[must_use]
+    pub const fn ipv4(&self) -> Option<[u8; 4]> {
+        if self.family == 1 && self.length == 4 {
+            Some([
+                self.address[0],
+                self.address[1],
+                self.address[2],
+                self.address[3],
+            ])
+        } else {
+            None
+        }
+    }
+
+    /// Family, length and the first four octets, for a report word.
+    #[must_use]
+    pub const fn packed(&self) -> u64 {
+        (self.family as u64)
+            | (self.length as u64) << 8
+            | (self.address[0] as u64) << 16
+            | (self.address[1] as u64) << 24
+            | (self.address[2] as u64) << 32
+            | (self.address[3] as u64) << 40
+    }
 }
 
 /// The type of an end-of-LLDPDU TLV -- §38.29.4.2, *"uses TLV type value
@@ -56,6 +112,18 @@ pub const CHASSIS_ID: u8 = 1;
 pub const PORT_ID: u8 = 2;
 /// Time to live -- *"TLV type value three"*.
 pub const TIME_TO_LIVE: u8 = 3;
+/// System name -- *"TLV type value of five"*, the neighbour's own name for
+/// itself.
+pub const SYSTEM_NAME: u8 = 5;
+/// Management address -- *"TLV type value of eight"*.
+///
+/// **The switch has been announcing where to reach it since the first boot.**
+/// This walker counted nine TLVs on every frame and decoded four; types four to
+/// eight were passed over, and one of them is the neighbour's management
+/// address. A machine that cannot read a switch's configuration and a switch
+/// that says on every frame where its configuration lives is a gap worth
+/// closing before guessing again.
+pub const MANAGEMENT_ADDRESS: u8 = 8;
 /// Organizationally specific -- *"TLV type value of 127"*.
 pub const ORGANISATION: u8 = 127;
 
@@ -111,6 +179,32 @@ pub fn inventory(body: &[u8]) -> Inventory {
             TIME_TO_LIVE => {
                 if let Some(pair) = value.get(..2) {
                     seen.ttl = Some(u16::from_be_bytes([pair[0], pair[1]]));
+                }
+            }
+            SYSTEM_NAME => {
+                let taken = value.len().min(NAME_BYTES);
+                seen.name[..taken].copy_from_slice(&value[..taken]);
+                seen.name_length = taken as u8;
+            }
+            MANAGEMENT_ADDRESS => {
+                // Byte 0 is the string length, which counts the family octet
+                // with the address -- so an address of `length - 1` follows the
+                // family at byte 1. A length that does not fit the TLV is a
+                // malformed frame and is left alone rather than clamped into
+                // something that reads like an address.
+                if let Some(&string) = value.first()
+                    && string >= 2
+                    && let Some(&family) = value.get(1)
+                    && let Some(octets) = value.get(2..1 + string as usize)
+                    && octets.len() <= 16
+                {
+                    let mut address = [0u8; 16];
+                    address[..octets.len()].copy_from_slice(octets);
+                    seen.management = Some(ManagementAddress {
+                        family,
+                        address,
+                        length: octets.len() as u8,
+                    });
                 }
             }
             ORGANISATION => {
@@ -214,6 +308,85 @@ mod tests {
         // Type 127 is past the bitmap, which holds 0..31 -- so the count is how
         // a reader knows they were there.
         assert!(!seen.saw(ORGANISATION));
+    }
+
+    /// The management address and system name decode at §38.29.4.2's TLVs.
+    ///
+    /// **This is where the switch says where to reach it.** The walker counted
+    /// nine TLVs on every frame the SR550's switch sent and decoded four; types
+    /// four to eight went past unread, and one of them is the address of the
+    /// one machine whose configuration this work cannot otherwise see.
+    ///
+    /// The string length counts the family octet with the address, which is the
+    /// detail that makes an off-by-one here read as a different address rather
+    /// than as an error.
+    #[test]
+    fn a_neighbour_says_where_to_reach_it() {
+        // Type 8: string length 5, family 1 (IPv4), 10.5.5.7, then the
+        // interface numbering subtype, interface number and an empty OID --
+        // all of which follow the address and none of which is wanted.
+        let mut pdu = Pdu::new();
+        pdu.tlv(CHASSIS_ID, &[4, 0x08, 0xbd, 0x43, 0x76, 0x47, 0xe3])
+            .tlv(PORT_ID, &[3, 0x08, 0xbd, 0x43, 0x76, 0x47, 0xf0])
+            .tlv(TIME_TO_LIVE, &[0, 120])
+            .tlv(SYSTEM_NAME, b"switch-a-very-long-name")
+            .tlv(MANAGEMENT_ADDRESS, &[5, 1, 10, 5, 5, 7, 2, 0, 0, 0, 9, 0])
+            .tlv(END, &[]);
+        let seen = inventory(pdu.body());
+
+        let address = seen.management.expect("a management address was sent");
+        assert_eq!(address.family, 1, "IANA family 1 is IPv4");
+        assert_eq!(address.length, 4, "string length 5 is family plus four");
+        assert_eq!(address.ipv4(), Some([10, 5, 5, 7]));
+        assert_eq!(
+            address.packed() & 0xff,
+            1,
+            "and it survives a report word, family first"
+        );
+        assert_eq!(address.packed() >> 16 & 0xff, 10);
+        assert_eq!(address.packed() >> 40 & 0xff, 7);
+
+        // The name is kept to what a word carries, and truncated rather than
+        // dropped.
+        assert_eq!(seen.name_length as usize, NAME_BYTES);
+        assert_eq!(&seen.name[..], b"switch-a");
+
+        // An IPv6 address is carried whole, and is not an IPv4 quad.
+        let mut six_pdu = Pdu::new();
+        six_pdu.tlv(TIME_TO_LIVE, &[0, 120]).tlv(
+            MANAGEMENT_ADDRESS,
+            &[
+                17, 2, 0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 0, 0, 0, 0, 0,
+            ],
+        );
+        let six = inventory(six_pdu.body())
+            .management
+            .expect("an IPv6 address is still an address");
+        assert_eq!(six.family, 2);
+        assert_eq!(six.length, 16);
+        assert_eq!(six.ipv4(), None, "and is not read as a quad");
+        assert_eq!(six.address[0], 0xfe);
+        assert_eq!(six.address[15], 1);
+
+        // **A length that does not fit is left alone**, not clamped into
+        // something that reads like an address.
+        let mut short_pdu = Pdu::new();
+        short_pdu
+            .tlv(TIME_TO_LIVE, &[0, 120])
+            .tlv(MANAGEMENT_ADDRESS, &[9, 1, 10, 5]);
+        let short = inventory(short_pdu.body());
+        assert_eq!(short.management, None, "a string longer than its TLV");
+        assert!(
+            short.saw(MANAGEMENT_ADDRESS),
+            "though the type is still counted as having appeared"
+        );
+
+        // A neighbour that sends neither says so by absence.
+        let mut bare_pdu = Pdu::new();
+        bare_pdu.tlv(TIME_TO_LIVE, &[0, 120]);
+        let bare = inventory(bare_pdu.body());
+        assert_eq!(bare.management, None);
+        assert_eq!(bare.name_length, 0);
     }
 
     /// A frame that stops mid-TLV says how far it got and marks itself partial.

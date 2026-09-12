@@ -134,13 +134,13 @@ const MARKER: u64 = 0x3154_5052_4450_4931;
 /// sentence, that the switch recorded no partner: a conclusion drawn entirely
 /// from memory nobody had assigned. The array literal that feeds this function
 /// must have exactly this many entries, and the compiler now says so.
-const REPORT_WORDS: usize = 48;
+const REPORT_WORDS: usize = 50;
 
 /// **And tied to the machines behind its last four words.** Those four are
 /// written out one per line, because an array literal is what `write_report`
 /// takes -- so a fifth LACP machine would be a fifth address with nowhere to
 /// go, and the total would still add up. This is what says it would not.
-const _: () = assert!(REPORT_WORDS == 36 + 3 * LACP_MACHINES);
+const _: () = assert!(REPORT_WORDS == 38 + 3 * LACP_MACHINES);
 
 /// The last word, written with a sentinel so a reader can prove the page was
 /// written to its full length rather than trusting that it was.
@@ -484,6 +484,22 @@ static LLDP_PORT: [core::sync::atomic::AtomicU64; LACP_MACHINES] =
 /// The first organizationally specific TLV's OUI in bits 0-23 and subtype in
 /// 24-31.
 static LLDP_ORGANISATION: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// **Where the neighbour says it can be reached** -- its management address TLV,
+/// family in bits 0-7, length in 8-15, the first four octets above them, and
+/// bit 56 set when one was seen at all.
+///
+/// The switch has sent nine TLVs on every frame since the first boot and this
+/// service decoded four of them. One of the five it passed over is the address
+/// of the one machine whose configuration this work cannot otherwise read --
+/// six hypotheses were raised and killed about a host that turns out to be
+/// emitting correct frames, and the switch was saying where to go and look the
+/// whole time.
+static LLDP_MANAGEMENT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// And what it calls itself -- the system name TLV, eight bytes, first on the
+/// wire in the low byte.
+static LLDP_NAME: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// **What the partner records as its own partner** -- what the switch believes
 /// is at our end of link 0.
@@ -1424,6 +1440,10 @@ fn refresh() {
         VLANS_SEEN[1].load(Relaxed),
         VLANS_SEEN[2].load(Relaxed),
         VLANS_SEEN[3].load(Relaxed),
+        // **Words 48 and 49: where the neighbour says it lives, and its name.**
+        // See `LLDP_MANAGEMENT`.
+        LLDP_MANAGEMENT.load(Relaxed),
+        LLDP_NAME.load(Relaxed),
     ]);
 }
 
@@ -1877,6 +1897,20 @@ fn drain_ring(
                     packed | u64::from(subtype) << 48,
                     core::sync::atomic::Ordering::Relaxed,
                 );
+            }
+            if let Some(address) = seen.management {
+                LLDP_MANAGEMENT.store(
+                    address.packed() | 1 << 56,
+                    core::sync::atomic::Ordering::Relaxed,
+                );
+            }
+            if seen.name_length > 0 {
+                let name = seen
+                    .name
+                    .iter()
+                    .enumerate()
+                    .fold(0u64, |word, (at, byte)| word | u64::from(*byte) << (8 * at));
+                LLDP_NAME.store(name, core::sync::atomic::Ordering::Relaxed);
             }
             if let Some((oui, subtype)) = seen.organisation {
                 LLDP_ORGANISATION.store(
@@ -3652,6 +3686,18 @@ fn report(
         VLANS_SEEN[1].load(core::sync::atomic::Ordering::Relaxed),
         VLANS_SEEN[2].load(core::sync::atomic::Ordering::Relaxed),
         VLANS_SEEN[3].load(core::sync::atomic::Ordering::Relaxed),
+        // **Words 48 and 49: where the neighbour says it lives, and its name.**
+        // See `LLDP_MANAGEMENT`.
+        //
+        // **This array and `refresh`'s are the same report built twice**, and
+        // nothing checks that they agree. A word added to one and not the other
+        // publishes a different report depending on which path ran last, and
+        // the length assertion only catches it because both feed the same
+        // `write_report`. That is a weaker guarantee than it looks: two arrays
+        // of the right length can still carry different things in the same
+        // slot.
+        LLDP_MANAGEMENT.load(core::sync::atomic::Ordering::Relaxed),
+        LLDP_NAME.load(core::sync::atomic::Ordering::Relaxed),
     ];
     V6_PREFIX.store(v6_prefix, core::sync::atomic::Ordering::Relaxed);
     V6_STATE.store(v6_state, core::sync::atomic::Ordering::Relaxed);

@@ -17605,7 +17605,7 @@ fn report_net_after_exchange(hhdm: u64) {
     // to be wrong instead of three.
     // Thirty-eight words and a sentinel, and the last four are `bin/ipd`'s own:
     // the address each of its LACP machines speaks under -- RFC 0076 step 4.
-    let mut ipd = [0u64; 49];
+    let mut ipd = [0u64; 51];
     // SAFETY: a frame this object owns, through the direct map, read as the
     // little-endian words the service wrote there -- `ipd.len() * 8` bytes of
     // a page, so the read cannot reach past the frame.
@@ -18052,7 +18052,7 @@ fn report_net_after_exchange(hhdm: u64) {
     // the boot report said in a sentence that the switch recorded no partner.
     // Checked on every boot, not only where the words are used, because the
     // cheapest place to catch it is before anybody believes a number.
-    let complete = ipd[48] == IPD_REPORT_TAIL;
+    let complete = ipd[50] == IPD_REPORT_TAIL;
     if !complete {
         println!(
             "\x1b[93m    ipd report     INCOMPLETE: this kernel reads {} words and bin/ipd \
@@ -18168,6 +18168,54 @@ fn report_net_after_exchange(hhdm: u64) {
                 "    lldp neighbour the port it reaches, per link: {}",
                 LldpPorts(core::array::from_fn(|n| ipd[40 + n]))
             );
+        }
+        // **Where the neighbour says it can be reached**, word 48, and what it
+        // calls itself, word 49.
+        //
+        // The switch sent nine TLVs on every frame since the first boot and
+        // `bin/ipd` decoded four. One of the five it passed over is the address
+        // of the one machine whose configuration this work cannot otherwise
+        // read: six hypotheses were raised and killed about a host that emits
+        // correct frames, while the switch said on every frame where to go and
+        // look.
+        if complete && ipd[48] >> 56 & 1 != 0 {
+            let family = ipd[48] & 0xff;
+            let length = ipd[48] >> 8 & 0xff;
+            let octets: [u64; 4] = core::array::from_fn(|n| ipd[48] >> (16 + 8 * n) & 0xff);
+            // IANA address family 1 is IPv4 and 2 is IPv6. Only the first four
+            // octets ride in the word, so an IPv6 address is named as one and
+            // shown as far as it goes rather than printed as a quad.
+            if family == 1 && length == 4 {
+                println!(
+                    "    lldp neighbour reachable at {}.{}.{}.{}",
+                    octets[0], octets[1], octets[2], octets[3]
+                );
+            } else {
+                println!(
+                    "    lldp neighbour management address family {family}, {length} octet(s),                      starting {:02x}:{:02x}:{:02x}:{:02x}",
+                    octets[0], octets[1], octets[2], octets[3]
+                );
+            }
+        }
+        if complete && ipd[49] != 0 {
+            print!("    lldp neighbour calls itself \"");
+            for byte in 0..8u32 {
+                let octet = (ipd[49] >> (8 * byte) & 0xff) as u8;
+                if octet == 0 {
+                    break;
+                }
+                // Printable ASCII only: a name is what a person reads off a
+                // switch, and a control byte in it is a parse gone wrong.
+                print!(
+                    "{}",
+                    if octet.is_ascii_graphic() || octet == b' ' {
+                        octet as char
+                    } else {
+                        '?'
+                    }
+                );
+            }
+            println!("\"");
         }
         // **What the switch tags on each link**, words 44 to 47.
         //

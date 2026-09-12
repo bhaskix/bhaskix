@@ -2758,3 +2758,56 @@ switch's real identity echoed back (`08 bd 43 76 47 e1`, key `00 14`, port
 The position is unchanged from the conclusion above: everything this host emits
 is verified correct by measurement, and the remaining variable cannot be read
 from this machine.
+
+
+### The switch has been saying where to find it — 2026-09-12
+
+Asked to check the switch's configuration for those ports, the honest first
+answer is that there are no credentials and no management address for it. What
+*is* known about that configuration comes off the wire and is all measured:
+
+| | |
+|---|---|
+| ports | `xg12`, `xg11`, `xg10`, `xg9` — LLDP port id subtype 7, locally assigned |
+| system id | `08:bd:43:76:47:e1`, priority `0x8000` |
+| LACP mode | **active** — it speaks first and unprompted |
+| key | 20, identical on all four, so they are one channel-group |
+| its actor state | `0x45` — Activity, Aggregation, **Defaulted** |
+| its partner record | all zeroes: it has never received an LACPDU from here |
+| collector max delay | 3 |
+| LLDP | nine TLVs, **zero organizationally specific** |
+
+That last row is why the wire cannot answer the question directly: a switch
+normally advertises port VLAN id and link-aggregation status as
+organizationally specific TLVs, and this one sends none.
+
+**But it sends nine TLVs and `net/src/lldp.rs` decodes four** — chassis id,
+port id, TTL and organizationally specific. IEEE 802.1AB types 4 to 8 are Port
+Description, System Name, System Description, System Capabilities and
+**Management Address**. The switch has been announcing its name and the address
+of its own management agent on every frame, on all four links, since the first
+boot that received one, and both were dropped.
+
+Six hypotheses were raised and killed about a host that turns out to emit
+correct frames, while the one machine whose configuration could not be read was
+saying on every frame where to go and look. That is the fourth mechanism of this
+kind in this work: a fact arriving on the wire and being discarded by the code
+that walks past it.
+
+So `SYSTEM_NAME` and `MANAGEMENT_ADDRESS` are parsed now and published at
+`bin/ipd`'s report words 48 and 49, with the kernel printing an IPv4 address as
+a quad and naming any other family rather than pretending it is one. This host
+already routes to `10.5.5.0/24` — it reaches the BMC at `10.5.5.103` — so an
+address on that network stands a fair chance of being reachable from here.
+
+**The off-by-one this could have had.** The management address string length
+counts the family octet *with* the address, so reading the address from byte 1
+rather than byte 2 yields a plausible, wrong address rather than an error. The
+test pins it and was watched red against exactly that.
+
+**And a duplication found on the way.** `bin/ipd` builds its report in two
+places — `refresh` and `report` — as two hand-written arrays that must agree
+slot for slot, with nothing checking that they do. The length assertion catches
+a missing word only because both feed the same `write_report`; two arrays of the
+right length carrying different things in the same slot would pass it. Both are
+updated here, and the hazard is written down where the second one lives.
