@@ -63,15 +63,25 @@ assumption about ordering.
 
 ### How many ports, and it is the table that decides
 
-Each X722 port costs one DMA window, four memory objects and **37 register
-pages** — 42 capability slots, which is `bhaskix_i40e::grant::SPAN`. The net
+Each X722 port costs one DMA window, four memory objects and **40 register
+pages** — 45 capability slots, which is `bhaskix_i40e::grant::SPAN`. The net
 domain's first sixteen slots are spoken for, so with `cap::CSPACE_SLOTS` at 256:
 
 | ports | slots | fits 256 |
 |---|---|---|
-| 2 | 100 | yes |
-| 4 | 184 | yes |
-| 6 | 268 | no |
+| 2 | 106 | yes |
+| 4 | **196** | yes |
+| 6 | 286 | no |
+
+**This table read 37 pages, 42 slots and 100/184/268 until 2026-09-13**, which
+was true when it was written and stopped being true three sections down this
+same document: reading `GLV_MPTCL[n]` to count multicast out of the VSI cost
+three more register pages, and the paragraph that added them says so — *"so
+`grant::SPAN` is 45 and four ports take 196 of 256 capability slots"*. Two
+statements of one arithmetic in one file, and only the later one was maintained.
+`grant::SPAN` is asserted at 45 by `four_ports_fit_a_capability_space_and_six_do_not`,
+so the code was never wrong; the table above was. The 2026-09-13 boot reads
+`fixed tables … cspace 256 slots` and `memory objects 56 of 64 live at once`.
 
 **This section said "two, and two is not a preference" until 2026-09-08**, and
 against a 128-slot table that was arithmetic rather than opinion: two fit and
@@ -83,7 +93,7 @@ like to a host offering two. The table is 256 now, all four ports are
 delegated, and `bhaskix_i40e::grant`'s own test moved with it: it asserts four
 fit and **six** do not.
 
-Six, not five — five ports take 226 slots and would fit. The card has four
+Six, not five — five ports take 241 slots and would fit. The card has four
 functions so five is unreachable, but a test asserting a false edge would be
 asserting arithmetic nobody had done.
 
@@ -531,12 +541,25 @@ The shape now:
   bundle is up when each link is synchronised, so SYNC shown because one of two
   links had it would claim an aggregation that does not exist.
 
-**The honest limit, which the boot cannot hide.** This kernel delegates two of
+**The honest limit, which the boot cannot hide.** ~~This kernel delegates two of
 the four X722 ports, because a domain's capability space bounds how many it can
 hold. The switch's channel-group has four. Whether a switch will bundle two
 links of a four-port group depends on its configuration, and if it will not,
 per-member machines are still the right shape and still will not aggregate —
-the next step is then more ports, not a different state machine.
+the next step is then more ports, not a different state machine.~~
+
+**Struck 2026-09-13: the step this paragraph names was taken.** All four ports
+are delegated, and the 2026-09-13 boot proves it on the machine rather than in
+the arithmetic — `4 x722 port(s) delegated, each with its own dma window`, four
+IOMMU windows carrying four distinct domain ids (8, 9, 10, 11), and
+`net bond 4 member(s), 802.3ad; traffic on port 0, link up on every one of
+them`. What the paragraph predicted did **not** happen: offering four links to a
+four-port channel-group did not make it bundle. `per link: link 0 0x07, link 1
+0x07, link 2 0x07, link 3 0x07` — four machines, four partners heard, nothing
+selected, and the switch still records its partner as key 0, port 0. So the
+sentence that mattered was the last clause: it really was not a different state
+machine that was needed, and it was not more ports either. It is the switch,
+which runs lag 3 **static**, and no number of members changes that.
 
 ### What the machine said, 2026-09-08
 
@@ -3608,3 +3631,96 @@ more: **frames are answered.** What remains unproven is the *outbound*
 half against a peer that answers — a DHCP lease, an ARP this host initiates and
 gets a reply to — and RFC 0076 step 3's failover gate, which needs traffic that
 crosses and returns rather than one that arrives and is answered.
+
+## Four ports, and the ping answered again — 2026-09-13
+
+The first ping was one measurement of one boot, taken on a two-member bond. This
+boot ran the same test on the configuration this RFC had been arguing toward
+since it was written — `bhaskix.bondlacp bhaskix.vlan=5 bhaskix.ip=10.5.5.200
+bhaskix.gw=10.5.5.246 bhaskix.lacp=120000 bhaskix.x722=120000`, all four ports
+delegated — and **a VLAN 5 host pinged `10.5.5.200` and it replied again.** Two
+exchanges now, on different bond widths, so the first was not a coincidence of
+one boot's timing.
+
+### The two ceilings, measured rather than predicted
+
+Both tables were raised to carry four ports, and this boot is the first reading
+of them under load:
+
+| | before | raised to | this boot |
+|---|---|---|---|
+| `cap::CSPACE_SLOTS` | 128 | 256 | `cspace 256 slots`, 196 used by four ports |
+| `shared::MAX_OBJECTS` | 48 | 64 | **`memory objects 56 of 64 live at once`** |
+| fixed kernel tables | 269 KiB | — | `365 KiB of static kernel memory` |
+
+56 of 64 is the number the arithmetic predicted before the change, which is the
+point of having done it: `shared.rs` records that this table has been raised
+five times and **every raise was made against a boot that measured it full**.
+The boot before this work read `48 of 48` — exactly at the ceiling, with two
+ports, so the next object anything asked for would have been refused. That was a
+live fault independent of port count.
+
+Four IOMMU windows carry four distinct domain ids, which is the property that
+matters rather than the count:
+
+```
+iommu window   b1:00.0 translating too, x722 port 0's own page table and domain 8
+iommu window   b1:00.1 translating too, x722 port 1's own page table and domain 9
+iommu window   b1:00.2 translating too, x722 port 2's own page table and domain 10
+iommu window   b1:00.3 translating too, x722 port 3's own page table and domain 11
+```
+
+Shared domain ids would let the hardware share IOTLB entries between members, and
+two bond members carrying one address is exactly where a frame arriving on the
+backup would land in the active member's buffers.
+
+### What four members changed, and what they did not
+
+```
+net bond       4 member(s), 802.3ad; traffic on port 0, link up on every one of them
+ipd interface  4 port(s) published; the address is on an 802.3ad bond
+ipd lacp       state 0x07 -- a partner is heard but the link is not yet aggregated
+               per link: link 0 0x07, link 1 0x07, link 2 0x07, link 3 0x07
+lldp neighbour the port it reaches, per link: link 0 "xg12", link 1 "xg11",
+               link 2 "xg10", link 3 "xg9"
+               the partner says: link 0 0x45, link 1 0x45, link 2 0x45, link 3 0x45
+               and records its partner as key 0, port 0 -- ours are key 1, port 1
+```
+
+**The per-link LLDP line is the strongest identification in this document.** Four
+links, four distinct switch port names, in order — `xg12`, `xg11`, `xg10`, `xg9`.
+Nothing in this stack could invent that: each name arrives in a frame received on
+the member it names. It settles that four *separate* physical links are up and
+each is delivering its own receive traffic, not one port counted four times.
+
+**The actor state is `0x07`, not `0x05`.** That is the `LACP_Timeout` conflation
+fixed and visible on the wire: this machine stopped mirroring the partner's
+timeout bit back at it. It changes no verdict — the bundle still does not form —
+and it is the difference between a protocol bug of ours and a lab fact.
+
+**And it still does not aggregate.** The prediction that a four-port
+channel-group would bundle once offered four links is now falsified. The switch
+records key 0, port 0 as its partner while we send key 1, port 1, on all four
+links at once. Lag 3 runs **static**, which cannot run the protocol whatever it
+is shown. Four ports was worth doing for the ceilings, the IOMMU domains and the
+per-link identification; it was never going to open step 3's gate.
+
+### A defect this boot surfaced and this section does not chase
+
+```
+malicious-driver record: FLAGGED; transmit queues enabled 0b1111
+queue 0, function 0, MAL_TYPE 21 -- the descriptor check this driver failed
+per member: member 0 queue 0 FLAGGED; member 1 queue 384 clear;
+            member 2 queue 768 clear; member 3 queue 1152 clear
+bin/netd posted 84 frame(s), 48 of them uplink-tagged, 1 refused
+17 of those posts were never written back (12 uplink-tagged); 34 descriptor(s)
+still unconsumed, worst ring 31 -- this driver overwrites what it does not wait for
+```
+
+Member 0 alone is flagged, and member 0 is the one carrying traffic. The record
+is now trustworthy — `MDET_CLEAR` was `0xffff` against a `VALID` bit at 31 until
+this session, so every previous FLAGGED reading was stale and could not be acted
+on. This one is fresh and names a queue, a function and a type. It is stated here
+rather than diagnosed because the ping was the measurement this boot was for, and
+because a descriptor the device rejected on the *transmit* side is the outbound
+half — the half this document has never been able to demonstrate.
