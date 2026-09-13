@@ -4374,6 +4374,45 @@ fn adapter_bind_record() -> (u64, u64) {
     (record[0], record[1])
 }
 
+/// [`adapter_process_record`], read once its file-slot count has stopped moving.
+///
+/// **A live figure read at one instant is not a measurement, and this one was
+/// reported as a leak for a day.** `record[4]` is republished on every pass of
+/// `bin/linuxd`'s loop. The hosted probe's domain *ends* before the adapter has
+/// finished handing its descriptors back, so a single read here lands inside
+/// that window and counts slots as held that are already on their way home.
+///
+/// The gate above it asks whether the count came back **down**, so a reading
+/// taken mid-release answers a different question than the one it is asked --
+/// and answers it wrongly. It failed about one boot in eight before RFC 0060
+/// lengthened the probe and seven in eight afterwards, which is a window that
+/// was always there being widened rather than a defect being introduced.
+///
+/// Stability, not a fixed delay: three consecutive equal readings, polled at
+/// ten milliseconds, up to a second. A machine where it never settles gets the
+/// last reading and the gate's verdict on it, which is the honest outcome --
+/// this waits for a number to become meaningful and never invents one.
+fn settled_process_record() -> [u64; 6] {
+    const TRIES: usize = 100;
+    const STABLE: u32 = 3;
+    let mut record = adapter_process_record();
+    let mut stable = 0;
+    for _ in 0..TRIES {
+        time::sleep_micros(10_000);
+        let again = adapter_process_record();
+        if again[4] == record[4] {
+            stable += 1;
+            if stable >= STABLE {
+                return again;
+            }
+        } else {
+            stable = 0;
+        }
+        record = again;
+    }
+    record
+}
+
 fn adapter_process_record() -> [u64; 6] {
     let page = ADAPTER_REPORT.load(core::sync::atomic::Ordering::Acquire);
     if page == u64::MAX {
@@ -9701,7 +9740,7 @@ fn killed_domain_gives_its_socket_back(hhdm_base: u64, cpus: u32) -> bool {
     // because a number that only appears on the boot that fails has no
     // baseline to be compared against -- which is exactly how this gate came to
     // print a descriptor number for a week that nobody could read.
-    let record = adapter_process_record();
+    let record = settled_process_record();
     println!(
         "    process records {} admitted, {} found; last admitted for domain {} holding {} \
          descriptor(s)",

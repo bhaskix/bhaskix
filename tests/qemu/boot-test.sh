@@ -3198,7 +3198,15 @@ if grep -qE "adapter files   [0-9]+ of [0-9]+ slot\(s\) held now, [0-9]+ at the 
     files_now=$(echo "$files_line" | sed -E 's/adapter files   ([0-9]+) of.*/\1/')
     files_peak=$(echo "$files_line" | sed -E 's/.*, ([0-9]+) at the peak/\1/')
     if [ "$files_peak" -le "$files_now" ]; then
-        fail "the adapter's file slots never came back: $files_now held, peak $files_peak -- an execve's O_CLOEXEC descriptor kept its capability"
+        # **Says what was measured, not what probably caused it.** This named
+        # an `execve`'s `O_CLOEXEC` descriptor, which is one way to reach this
+        # number and was never the only one -- and when the number turned out
+        # to be a mid-release reading rather than a leak at all, the message
+        # sent a day of hunting into the keyboard, the controller and the
+        # IOMMU. A gate that names a cause it has not measured is the failure
+        # this tree keeps recording; the cause belongs in whatever the reader
+        # finds, not in the assertion.
+        fail "the adapter's file slots never came back: $files_now held, peak $files_peak -- one or more capabilities were not given back"
         status=1
     else
         pass "an O_CLOEXEC descriptor gave its capability back at execve (peak $files_peak, now $files_now)"
