@@ -3535,20 +3535,28 @@ extern "C" fn ipd_main() -> ! {
             && parsed.ethertype == EtherType::ARP
             && let Ok(packet) = ArpPacket::parse(parsed.payload)
         {
+            // **What the packet teaches, whichever operation it is.** RFC 826
+            // learns from a request as well as a reply, and this did not: a
+            // host that asks *who has 10.5.5.200* has named itself in the same
+            // frame. On hardware one did, this program answered it correctly,
+            // and recorded nothing -- so it could not then have addressed that
+            // host at all, which is the outbound half RFC 0076 has never been
+            // able to show. The v6 side has learned from a neighbour
+            // solicitation since it was written.
+            //
+            // `teaches` carries the rule and its refusals, where a host test
+            // can reach them.
+            if let Some((address, hardware)) = packet.teaches(me.1) {
+                cache.learn(Address::V4(address), hardware, ticks);
+            }
             match packet.operation {
-                // Somebody answered. The cache learns it, refusing on its own
-                // terms what should not be believed -- a group hardware
+                // Somebody answered. The cache learns it above, refusing on its
+                // own terms what should not be believed -- a group hardware
                 // address, an unspecified protocol address.
-                ArpOp::Reply => {
-                    cache.learn(
-                        Address::V4(packet.sender_protocol),
-                        packet.sender_hardware,
-                        ticks,
-                    );
-                }
+                ArpOp::Reply => {}
                 // Somebody asked, and if they asked for us we answer. Written
-                // and host-tested; on this network nothing has a reason to ask
-                // us yet, so it is not exercised live until something does.
+                // and host-tested; on this network nothing had a reason to ask
+                // us until 2026-09-13, when something finally did.
                 ArpOp::Request if can_send && packet.target_protocol == me.1 => {
                     let reply = ArpPacket {
                         operation: ArpOp::Reply,

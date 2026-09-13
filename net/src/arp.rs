@@ -57,6 +57,44 @@ pub struct ArpPacket {
 }
 
 impl ArpPacket {
+    /// What this packet teaches about its sender, if anything.
+    ///
+    /// **RFC 826 learns from a request, not only from a reply**, and this stack
+    /// did not. A host that asks *who has 10.5.5.200* has just said, in the same
+    /// frame, what its own address and hardware address are — and `bin/ipd`
+    /// answered such a request on hardware, correctly, and recorded nothing. It
+    /// could not then have addressed that host at all, which is exactly the
+    /// outbound half that work has never been able to demonstrate.
+    ///
+    /// The standard's rule in its own terms: merge into an existing entry for
+    /// any ARP packet seen, and *add* one when this station is the target —
+    /// *"if Merge_flag is false, add the triplet ⟨protocol type, sender
+    /// protocol address, sender hardware address⟩ to the translation table"*.
+    /// Only the target case is taken here, which is the unambiguous half: a
+    /// packet addressed to us, from a sender who named themselves.
+    ///
+    /// Refused for the same reasons a reply is: a sender that names a group
+    /// hardware address is describing something that cannot be a station, and
+    /// one that names `0.0.0.0` is asking a question about itself rather than
+    /// answering one. A probe of that shape is how a cache gets poisoned by a
+    /// host that has not finished booting.
+    ///
+    /// This lives here rather than in `bin/ipd` because that program has no
+    /// test module, and the v6 side of the same decision has been learning from
+    /// neighbour solicitations since it was written — the asymmetry survived
+    /// only because nothing could see it.
+    #[must_use]
+    pub fn teaches(&self, me: Ipv4Addr) -> Option<(Ipv4Addr, MacAddr)> {
+        if self.target_protocol != me
+            || self.sender_protocol == Ipv4Addr::UNSPECIFIED
+            || self.sender_hardware.is_group()
+            || self.sender_hardware == MacAddr::UNSPECIFIED
+        {
+            return None;
+        }
+        Some((self.sender_protocol, self.sender_hardware))
+    }
+
     /// Parses an ARP packet.
     ///
     /// Only IPv4 over Ethernet is accepted. The hardware and protocol length
@@ -163,6 +201,61 @@ impl ArpPacket {
 
 #[cfg(test)]
 mod tests {
+    /// An ARP packet addressed to us teaches its sender's mapping.
+    ///
+    /// **RFC 826 learns from a request and this stack did not.** On hardware, a
+    /// host asked *who has 10.5.5.200*, `bin/ipd` answered it correctly, and
+    /// recorded nothing about the asker -- so it could not have addressed that
+    /// host afterwards. The v6 side has learned from a neighbour solicitation
+    /// since it was written; the asymmetry survived because the decision lived
+    /// in a program with no tests.
+    #[test]
+    fn a_request_addressed_to_us_teaches_its_senders_mapping() {
+        let me = Ipv4Addr::new(10, 5, 5, 200);
+        let peer = Ipv4Addr::new(10, 5, 5, 40);
+        let peer_mac = MacAddr([0x02, 0, 0, 0, 0, 0x40]);
+        let ask = |target, sender, hardware| ArpPacket {
+            operation: ArpOp::Request,
+            sender_hardware: hardware,
+            sender_protocol: sender,
+            target_hardware: MacAddr::UNSPECIFIED,
+            target_protocol: target,
+        };
+
+        // The case that happened: somebody asked for us, and said who they are.
+        assert_eq!(ask(me, peer, peer_mac).teaches(me), Some((peer, peer_mac)));
+
+        // A reply teaches the same way -- the rule is about the sender fields,
+        // not about which operation carries them.
+        let mut reply = ask(me, peer, peer_mac);
+        reply.operation = ArpOp::Reply;
+        assert_eq!(reply.teaches(me), Some((peer, peer_mac)));
+
+        // **A packet for somebody else teaches nothing.** Only the target case
+        // is taken: RFC 826's other half merges into an entry that already
+        // exists, and adding from a broadcast meant for a third party is how a
+        // cache fills with hosts nobody asked about.
+        let elsewhere = Ipv4Addr::new(10, 5, 5, 99);
+        assert_eq!(ask(elsewhere, peer, peer_mac).teaches(me), None);
+
+        // A sender still probing for its own address names `0.0.0.0`, which is
+        // a question about itself rather than an answer about anything.
+        assert_eq!(
+            ask(me, Ipv4Addr::UNSPECIFIED, peer_mac).teaches(me),
+            None,
+            "an ARP probe is not a mapping"
+        );
+
+        // A group hardware address cannot be a station, and a zero one names
+        // nothing -- the same two refusals a reply already gets.
+        assert_eq!(
+            ask(me, peer, MacAddr([0x01, 0, 0x5e, 0, 0, 1])).teaches(me),
+            None,
+            "a group address is not a station"
+        );
+        assert_eq!(ask(me, peer, MacAddr::UNSPECIFIED).teaches(me), None);
+    }
+
     use super::*;
 
     const SENDER: MacAddr = MacAddr([0x52, 0x54, 0x00, 0x11, 0x22, 0x33]);
