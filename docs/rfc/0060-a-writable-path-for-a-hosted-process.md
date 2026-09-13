@@ -103,7 +103,7 @@ who trusted it.
 | **Make the existing `ROOT_DIR` writable** | One capability instead of two, and every path a hosted process can name becomes writable — including the files the read gates assert on. The containment claim in RFC 0031 I3 is that a hosted process reaches only what it was granted; making the one thing it was granted writable throws away the distinction between reading and changing for no gain | The root and the writable area ever need to be the same directory, which would itself want an RFC |
 | **A `tmpfs` in the adapter — writes to memory, not the disk** | No filesystem service needed, so it would work on every lane instead of two. It is also a second filesystem implementation inside the most authority-concentrated program in the system, which RFC 0031 exists to prevent, and it would not survive the process | Never for L1. A memory filesystem is a *service*, if it is anything |
 | **Per-process writable directories** | Closer to real isolation: each hosted process gets its own. It needs a directory created per process and destroyed with it, which is process lifetime work RFC 0033 does not have | L2, where process groups and users arrive |
-| **`ftruncate` and `O_TRUNC` on an existing file** | No protocol call exists; adding one is a change to a service two programs share | A program actually needs it — likely as soon as a real shell redirects onto an existing file |
+| ~~**`ftruncate` and `O_TRUNC` on an existing file**~~ — **superseded by [RFC 0077](0077-a-file-that-can-be-emptied.md)** | No protocol call existed; adding one is a change to a service two programs share. The reasoning held, and the trigger beside it is what retired it | **Triggered 2026-09-13** by this RFC's own step 3: a hosted shell can redirect, so a program needs it. Recorded rather than deleted, because a refusal with a written trigger that then fires is the mechanism working |
 
 ## Impact on existing design documents
 
@@ -182,7 +182,9 @@ comparable rather than one being asserted to be like the other.
    anyway. A write at an unaligned offset comes back short for an unrelated
    reason — the service stops at the end of a block — so a caller that could
    not cope with a short write was already broken.
-5. **`O_TRUNC` on a file that already exists is silently ignored, and the
+5. ~~**`O_TRUNC` on a file that already exists is silently ignored**~~ — **answered by [RFC 0077](0077-a-file-that-can-be-emptied.md), 2026-09-13.** `dir::TRUNCATE` is a method on the filesystem service, gated by the same writable badge as every other method that changes something, and `Volume::truncate` frees a file's blocks without removing its directory entry — so the inode, and with it every capability checked against its generation, survives. The original text is kept below because the trigger it wrote is the reason the RFC exists.
+
+   **`O_TRUNC` on a file that already exists is silently ignored, and the
    trigger this RFC wrote for it is now met.** The Design section says
    *"`O_TRUNC` on create is free because a created file is empty"*, which is
    true and is only half the cases; Alternatives considered refuses

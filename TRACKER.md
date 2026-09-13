@@ -1018,6 +1018,61 @@ checked, and one `grep` of the console after the prompt answers it from the firs
 The gate's own message is what aimed the hunt at the keyboard; this file calls that *"a gate naming
 a cause it had not measured"* and has recorded it three times before.
 
+### 2026-09-13 (a file can be emptied, and the test written to prove it passed against the bug first)
+
+**[RFC 0077](docs/rfc/0077-a-file-that-can-be-emptied.md) is built, all six steps, and **parked on the branch `rfc-0077-a-file-that-can-be-emptied` rather than landed**. It is *not* accepted: `make test` is red with it on RFC 0059's adapter file-slot gate -- one slot held that should have come back, 7 boots of 8 against 0 of 8 without it -- and the cause is not established. The RFC's own *What blocks acceptance* section carries the eight measurements and the one result that fits none of them. What is not in doubt is the feature: the emptying works and its five checks were each watched red.** `dir::TRUNCATE`
+is one method on the filesystem service, gated by the same writable badge as every other method that
+changes something, and `Volume::truncate` frees a file's blocks without removing its directory entry.
+A hosted `echo x > file` over a longer file now leaves nothing of the longer one, and
+`ftruncate(fd, 0)` empties one in place.
+
+**It closes a gap RFC 0060 opened that morning and named the same day.** `O_TRUNC` on an *existing*
+file was silently ignored -- the shell reported success, the file kept its old length, and the
+difference surfaced whenever somebody read it back. RFC 0060 had refused `ftruncate` with a written
+trigger, *"as soon as a real shell redirects onto an existing file"*, and its own step 3 met it.
+A refusal with a trigger that then fires is the mechanism working rather than a plan going wrong.
+
+**The freeing was extracted, not written twice.** `Volume::remove` already frees a file's contents
+correctly -- direct blocks, then what the indirect table names, then the table -- and that loop is
+RFC 0065's, which had to be fixed once when a delete stopping at the direct blocks leaked up to
+1,025 blocks per file. Truncation is that loop without removing the directory entry, so it became
+`free_contents` with two callers. **Arming proved the sharing**: breaking the extracted function
+fails *both* truncate's test and `remove`'s.
+
+**And the leak test was wrong first, which is the entry worth keeping.** Its first version wrote a
+file past the tenth block and truncated it twenty times, asserting the volume did not run dry. It
+passed -- against the leak. Twenty rounds strand forty blocks and a 256-block volume absorbs that
+without complaint, so a test named for the RFC 0065 leak could not see it. **Only arming found that**,
+because the arm failed a *different* test (`remove`'s) while the one written for the job reported ok.
+It asks the allocator for the two specific blocks back now, as `remove`'s own test does, and fails
+against the leak.
+
+A test that passes against the bug it is named for is worse than no test: it is a claim of coverage
+where there is none, and the next reader stops looking. This project's rule is that a gate is not
+believed until it has been watched failing; this is the case that shows the rule catching something
+review would not have.
+
+**The generation is carried forward and that is the load-bearing part.** It is what a stale
+capability is checked against, so a truncate that bumped it would revoke every handle to a file whose
+*contents* merely went away -- the opposite of what truncation means.
+
+**Five checks, every one watched red**: identity kept, the indirect table's blocks counted back out
+of the allocator, an empty file costing no transaction, a directory refused, and the boot gate. The
+boot gate asserts **by absence**, because a truncate that frees nothing is invisible from the write
+side -- the short body lands and the count is right. The probe writes 64 bytes, reopens with
+`O_TRUNC`, writes 5, then reads back **128**, and the gate requires the read to stop at 5. Both arms
+print the same sentence from opposite causes -- the adapter ignoring `O_TRUNC`, and the service
+truncating nothing -- `hosted trunc read back 64 bytes, wanted 5 -- the old body is still there`.
+
+**`ftruncate` is exercised rather than merely offered.** The probe used `O_TRUNC` alone at first and
+the `FTRUNCATE` constant sat unused -- which the compiler said and `clippy -D warnings` would have
+refused. A call declared and never made is how an untested syscall ships. The probe now empties the
+file both ways and checks that a non-zero length is refused with `EINVAL` rather than rounded to zero.
+
+**No new authority**, and that was checked rather than assumed: `security.md` T11 needs no change,
+because this is a method on a handle derived from the writable directory the adapter already held,
+and a program that could not write a file cannot empty one.
+
 ### 2026-09-13 (the write path turned the xhci deaf, and seven explanations died proving it was not what it looked like)
 
 **RFC 0060's probe broke `make test-usb-keyboard`, and finding out why cost more than
