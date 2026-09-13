@@ -601,6 +601,12 @@ in the same report and so is a measurement question before it is a device one;
 and DHCP, which cannot be answered while the bond is unbundled — a switch does
 not forward data to a member it has not selected.
 
+> **The first of those was answered on 2026-09-13** and the instinct here was
+> right: it was a measurement question, and not even a question about *when* the
+> measurement was taken. See *"A red line that was never about this machine"*
+> below. DHCP stands.
+
+
 **One operational note, because it cost an hour.** Redfish virtual media on this
 BMC returns HTTP 500 on every slot — `EXT1`–`EXT4`, `Remote1`–`Remote4`, and
 Lenovo's own `RemoteMap` action — after fetching the image successfully, and a
@@ -3724,3 +3730,72 @@ on. This one is fresh and names a queue, a function and a type. It is stated her
 rather than diagnosed because the ping was the measurement this boot was for, and
 because a descriptor the device rejected on the *transmit* side is the outbound
 half — the half this document has never been able to demonstrate.
+
+## A red line that was never about this machine — 2026-09-13
+
+Every SR550 boot in this document, from the first to the one above, has printed:
+
+```
+net domain     up: mac 08:94:ef:7a:fc:8e, rx queue 0, tx queue 0
+net domain     FAILED: nothing was transmitted
+net domain     FAILED
+```
+
+It was read as an open question about the device for five weeks, and stated in
+this RFC as *"a measurement question before it is a device one"*. That was the
+right instinct and it was never followed. **It is not a fact about the X722 at
+all.**
+
+`bin/netd`'s demonstration — fill a buffer, publish one descriptor, kick the
+queue, wait for a completion, wait for an answer — is written against
+**virtqueues**. Words 2 to 7 of its report are that self-test's findings. On a
+machine with no virtio device it does not run it; it writes
+`no_virtio_report_with` instead, whose own doc block has said all along:
+
+> *"The report `report` writes describes a virtio driver's rings and counters,
+> none of which exist here. This writes the marker, the X722's two words, and
+> zeroes for the rest — so the kernel reads a report rather than concluding the
+> service left none, and the X722 line is what says what was found."*
+
+The kernel then read those deliberate zeroes and gated on them. So did the
+harness. `rx queue 0, tx queue 0` was the same zeroes printed as queue indices —
+`queue::TRANSMIT` is 1, and no boot of this machine has ever shown a 1 there,
+which was visible in every capture and never looked at.
+
+**What it cost.** The line sat red beside an X722 that had, in the boot above,
+put 54 frames on the wire and had them counted out of both the VSI and the MAC.
+A gate that is always red on a whole class of machine stops being read, and this
+one was not read for five weeks — while real red lines in the same block were.
+
+**The fix is the same shape as `NET_CONTAINED`**, one device further along. That
+static exists because *"with no window there is no device address for the rings,
+so the driver cannot transmit and cannot receive — and reporting that as a
+failure would make every BIOS boot red for a refusal working exactly as
+designed."* `NET_HAS_VIRTIO` records the same kind of fact, and the report now
+says:
+
+```
+net domain     up: mac 08:94:ef:7a:fc:8e
+net domain     not asked: the demonstration is a virtio self-test and this
+               machine has no virtio device -- the net x722 lines below are
+               what report this one
+```
+
+`tests/qemu/boot-test.sh` gains the matching branch on both halves, beside the
+two excuses it already had.
+
+**Watched red, on a machine that does have virtio.** The branch is only
+reachable on hardware, so it was driven by storing `false` into the static on the
+IOMMU lane: both new harness branches fired, and exactly one downstream gate went
+red — `the return path did not carry a frame`, which is precisely what removing
+the virtio demonstration's numbers from a virtio machine should break. Reverted,
+the tree byte-identical, the lane green again.
+
+**And a correction to this session's own reasoning.** When the red line was first
+raised here it was explained as a report *read too early* — sampled during the
+five-second burst window, before the 120-second X722 wait had let the device come
+up. That was wrong, and it was a guess dressed as a diagnosis: the number it
+reads never becomes anything but zero on this machine, so waiting longer would
+have changed nothing. The precedent for waiting (`X722_PATIENCE_MS`, which really
+does turn a glance into a window for word 9) is what made the wrong answer
+plausible.

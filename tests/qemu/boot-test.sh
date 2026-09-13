@@ -2028,6 +2028,8 @@ elif grep -qE "net domain +no device on the bus" "$LOG"; then
     pass "no network device on this machine, so nothing to drive"
 elif grep -qE "net domain +driver reached the handshake and stopped" "$LOG"; then
     pass "no dma window for the network device, so it cannot be driven"
+elif grep -qE "net domain +not asked: the demonstration is a virtio self-test" "$LOG"; then
+    pass "no virtio device, so the virtio self-test is not what reports this machine"
 else
     fail "nothing was transmitted"
     grep -E "net domain|net frame" "$LOG" || true
@@ -2046,6 +2048,8 @@ elif grep -qE "net domain +no device on the bus" "$LOG"; then
     pass "no network device on this machine, so nothing to receive"
 elif grep -qE "net domain +driver reached the handshake and stopped" "$LOG"; then
     pass "no dma window for the network device, so nothing can arrive"
+elif grep -qE "net domain +not asked: the demonstration is a virtio self-test" "$LOG"; then
+    pass "no virtio device, so there is no virtio self-test to receive an answer to"
 else
     fail "nothing was received"
     grep -E "net domain|net frame" "$LOG" || true

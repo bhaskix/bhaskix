@@ -1925,6 +1925,34 @@ static BRINGUP_DONE: core::sync::atomic::AtomicBool = core::sync::atomic::Atomic
 /// "slow" from "stopped", and stopped is for ever.
 const BRINGUP_WATCHDOG_MICROS: u64 = 45_000_000;
 
+/// The same, plus whatever waiting *this* boot was explicitly asked to do.
+///
+/// **A watchdog that always fires is worth as little as a gate that is always
+/// red.** `bhaskix.lacp=`, `bhaskix.bond=` and `bhaskix.x722=` each buy a window
+/// for something that happens on a wire's schedule rather than this machine's,
+/// and the SR550 is booted with two of them at 120 seconds. Every one of those
+/// boots has printed `BRING-UP STOPPED` with a full thread dump at 45 seconds
+/// and then finished normally at 119 -- so the one report that exists to say
+/// *this machine is never coming back* has been crying wolf on every boot of the
+/// only physical machine this project has.
+///
+/// **Summed, not maximised.** The windows are not guaranteed to overlap: each is
+/// a separate bounded wait in the bring-up sequence, and in the worst case they
+/// are spent one after another. Summing is the upper bound, and erring long is
+/// the right direction here -- a stall inside a window the operator asked for is
+/// indistinguishable from the window itself, so there is nothing to lose by
+/// waiting it out and a false alarm every boot to avoid.
+///
+/// Zero on every ordinary boot, where this is exactly [`BRINGUP_WATCHDOG_MICROS`].
+fn bringup_watchdog_micros() -> u64 {
+    use core::sync::atomic::Ordering::Relaxed;
+    let asked = LACP_PATIENCE_MS
+        .load(Relaxed)
+        .saturating_add(BOND_PATIENCE_MS.load(Relaxed))
+        .saturating_add(X722_PATIENCE_MS.load(Relaxed));
+    BRINGUP_WATCHDOG_MICROS.saturating_add(asked.saturating_mul(1_000))
+}
+
 /// Says where bring-up got to, if it stops getting anywhere.
 ///
 /// # Why a thread on a timer, and not a check somewhere
@@ -1951,7 +1979,11 @@ const BRINGUP_WATCHDOG_MICROS: u64 = 45_000_000;
 extern "C" fn bringup_watchdog(_: u64) -> ! {
     use core::sync::atomic::Ordering;
 
-    time::sleep_micros(BRINGUP_WATCHDOG_MICROS);
+    // Read once, here, rather than baked in: the command line is parsed before
+    // this thread is spawned, so the windows this boot asked for are already
+    // known and a boot that asked for none is unaffected.
+    let patience = bringup_watchdog_micros();
+    time::sleep_micros(patience);
     if BRINGUP_DONE.load(Ordering::Acquire) {
         sched::exit()
     }
@@ -1960,8 +1992,14 @@ extern "C" fn bringup_watchdog(_: u64) -> ! {
     println!("==================================================================");
     println!(
         "  BRING-UP STOPPED. {} seconds have passed and it has not finished.",
-        BRINGUP_WATCHDOG_MICROS / 1_000_000
+        patience / 1_000_000
     );
+    if patience > BRINGUP_WATCHDOG_MICROS {
+        println!(
+            "  {} of those were windows this boot asked for on the command line.",
+            (patience - BRINGUP_WATCHDOG_MICROS) / 1_000_000
+        );
+    }
     println!("  The last line above is the last thing that completed. Every thread");
     println!("  on this machine, and what it was doing:");
 
@@ -13409,7 +13447,10 @@ pub fn start_net_domain(
     // page of that object and the kernel reads it there, so a machine with no
     // virtio device used to have no page to report through either.
     let shared_signal = match virtio_device {
-        Some((address, _)) => delegate_virtio_nic(realm, address, apic_id, rsdp, hhdm_base)?,
+        Some((address, _)) => {
+            NET_HAS_VIRTIO.store(true, core::sync::atomic::Ordering::Release);
+            delegate_virtio_nic(realm, address, apic_id, rsdp, hhdm_base)?
+        }
         None => {
             println!("    net domain     no virtio device; bin/netd drives what else is delegated");
             None
@@ -15197,6 +15238,25 @@ static NET_RINGS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64:
 /// was printed from the interrupt's failure and made a gate excuse the wrong
 /// thing.
 static NET_CONTAINED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Whether this machine has a virtio NIC, so the driver's self-test could run.
+///
+/// **Recorded for the same reason as [`NET_CONTAINED`], and it is the same
+/// mistake one device further along.** `bin/netd`'s demonstration -- fill a
+/// buffer, publish one descriptor, kick, wait for the completion, wait for an
+/// answer -- is written against virtqueues, and words 2 to 7 of its report are
+/// that self-test's findings. On a machine with no virtio device it writes
+/// `no_virtio_report_with` instead, whose own doc block says it *"writes the
+/// marker, the X722's two words, and zeroes for the rest"*. The kernel then
+/// read those deliberate zeroes and printed `FAILED: nothing was transmitted`
+/// on every SR550 boot since the first -- a gate on a device that is not there,
+/// reported as a fault in the one that is.
+///
+/// This was read the other way round on 2026-09-13 and written down wrong: that
+/// the gate sampled too early, before the 120-second X722 window. It does not.
+/// The number it reads never becomes anything but zero on this machine, and
+/// waiting longer would have changed nothing.
+static NET_HAS_VIRTIO: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 /// The endpoint the block service answers on, once it exists.
 static BLOCK_ENDPOINT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
@@ -19773,6 +19833,27 @@ fn report_net_domain(hhdm: u64) -> bool {
     }
 
     let [a, b, c, d, e, f] = octets(mac);
+    // **Words 2 to 7 are a virtio self-test's findings, and this machine may
+    // have no virtio device.** `bin/netd` writes `no_virtio_report_with` there
+    // instead, which its own doc block describes as *"the marker, the X722's
+    // two words, and zeroes for the rest"* -- so the queue indices below are
+    // zeroes rather than `queue::RECEIVE` and `queue::TRANSMIT`, and the two
+    // gates after them are asking a device that is not on this machine.
+    //
+    // Every SR550 boot has printed `FAILED: nothing was transmitted` for that
+    // reason, from the first one to 2026-09-13, next to an X722 that had by
+    // then put 54 frames on the wire and had them counted out of both the VSI
+    // and the MAC. A red line that is always red on a whole class of machine
+    // stops being read, which is the cost being paid here rather than the
+    // cosmetic one.
+    if !NET_HAS_VIRTIO.load(Ordering::Acquire) {
+        println!("    net domain     up: mac {a:02x}:{b:02x}:{c:02x}:{d:02x}:{e:02x}:{f:02x}");
+        println!(
+            "    net domain     not asked: the demonstration is a virtio self-test and this \
+             machine has no virtio device -- the net x722 lines below are what report this one"
+        );
+        return true;
+    }
     println!(
         "    net domain     up: mac {a:02x}:{b:02x}:{c:02x}:{d:02x}:{e:02x}:{f:02x}, \
          rx queue {}, tx queue {}",
