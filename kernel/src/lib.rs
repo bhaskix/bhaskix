@@ -26497,6 +26497,57 @@ fn verify_guard_page(handoff: &Handoff) {
 /// The exact string `Hello from Bhaskix` is the M1 exit criterion and is
 /// asserted by `tests/qemu/boot-test.sh`. Do not reword it without updating
 /// that test and `docs/roadmap.md`.
+/// Writes a line one character at a time, so the first thing the machine says
+/// arrives at a human pace.
+///
+/// **By `char`, never by byte.** The tagline is Devanagari, three to four bytes
+/// a character, and a terminal handed half a UTF-8 sequence followed by a pause
+/// has to decide what to do with it. Splitting on character boundaries means
+/// the terminal always has something whole to shape, and the bytes that reach a
+/// capture are byte-for-byte what a single `println!` would have written -- so
+/// no gate can tell the difference, and none has to be taught about this.
+///
+/// **The delay is not a duration, and this is honest rather than sloppy.**
+/// `banner` runs before the TSC is calibrated -- it is the first evidence that
+/// the framebuffer, the blitter and the serial port work, so it cannot wait for
+/// a clock. `time::sleep_micros` says what it does without one: *"no calibrated
+/// clock. Spinning is wrong but bounded"*. So this asks for a number of
+/// microseconds and gets a spin whose real length is whatever that CPU does in
+/// that many iterations. It is a visual effect and does not need to be accurate;
+/// what it must not be is unbounded, and it is not.
+fn type_out(line: &str) {
+    print!("\x1b[96m     ");
+    for character in line.chars() {
+        print!("{character}");
+        crate::time::sleep_micros(PER_CHARACTER_US);
+    }
+    println!("\x1b[0m");
+}
+
+/// What each character of the tagline waits for -- see [`type_out`].
+///
+/// **Measured, and the first value was wrong by two orders of magnitude.** The
+/// obvious 40_000 -- forty milliseconds, if anything here were in
+/// milliseconds -- takes the uncalibrated path's `duration_us * 100` to four
+/// million `spin_loop`s a character, twenty-six characters over, and the QEMU
+/// lanes stopped booting: *"the machine did not finish booting within 120s"*.
+///
+/// So it was measured instead. On the IOMMU lane, against a baseline of
+/// `up 10.75 seconds` with no tagline at all:
+///
+/// | value | boot |
+/// |---|---|
+/// | 1_000 | `up 13.070 seconds` (+2.3 s) |
+/// | 430 | `up 11.659 seconds` (**+0.9 s**) |
+///
+/// That is the ~1 second this was asked to cost, on the slowest machine this
+/// runs on. **It will not be 0.9 seconds everywhere** -- there is no clock here
+/// to make it so, and a `spin_loop` on a Xeon is not a `spin_loop` under an
+/// emulator. The SR550's number belongs beside these two once a boot has
+/// produced it; what is guaranteed on every machine is the bound, not the
+/// duration.
+const PER_CHARACTER_US: u64 = 430;
+
 fn banner() {
     // Colour via ANSI, which both console sinks now understand: the serial
     // line always did, and `framebuffer::FbConsole` learned the subset this
@@ -26506,6 +26557,27 @@ fn banner() {
     // person sees, and on a machine that has just been handed control by the
     // firmware it is also the first evidence that the framebuffer, the font
     // blitter and the serial port all work.
+    /// The project's motto, in Devanagari, exactly as the author wrote it.
+    ///
+    /// *Gyanam, Ganitam, Siddhih* -- knowledge, mathematics, attainment.
+    ///
+    /// **This renders correctly on a terminal and nowhere else yet, and that is
+    /// worth stating rather than discovering.** The serial console is where
+    /// every boot of this project's one physical machine is actually read, and a
+    /// terminal does the Devanagari shaping -- the `\u{91c}\u{94d}\u{91e}`
+    /// conjunct, and the matras that render before the consonant they follow in
+    /// memory. The framebuffer console does not: `font::glyph` takes a `u8` and
+    /// covers `0x20..=0x7e`, so every byte of this arrives as `?` on a physical
+    /// screen. The existing line above it has had that property since it was
+    /// written.
+    ///
+    /// Fixing that is not a font file. Noto Sans Devanagari would supply glyphs,
+    /// and a blitter that draws one fixed 8x16 cell per byte would still put the
+    /// pieces of `\u{938}\u{93f}\u{926}\u{94d}\u{927}\u{93f}\u{903}` on screen
+    /// in memory order, unjoined. Devanagari needs a shaping layer -- ligature
+    /// substitution and matra reordering -- which is a subsystem, not a
+    /// substitution, and would want an RFC.
+    const TAGLINE: &str = "ज्ञानम् • गणितम् • सिद्धिः";
     const SUN: &str = "\x1b[93m";
     const NAME: &str = "\x1b[96m";
     const TEXT: &str = "\x1b[97m";
@@ -26520,6 +26592,7 @@ fn banner() {
     println!("{SUN}     |____/|_| |_/_/   \\_\\____/|_|\\_\\___| /_/\\_\\{OFF}");
     println!();
     println!("{NAME}     भास्कर  —  the light-maker{OFF}");
+    type_out(TAGLINE);
     println!("{TEXT}     An open-source, AI-native, enterprise operating system,{OFF}");
     println!("{TEXT}     built from scratch, from India.{OFF}");
     println!();
