@@ -11,7 +11,7 @@
 | | |
 |---|---|
 | RFCs accepted | **47** |
-| RFCs open | 28 |
+| RFCs open | 29 |
 | RFCs closed without shipping | 1 |
 | Milestone rows done | **92 of 95** |
 | Phase 2 bullets done | **12 of 13** |
@@ -40,6 +40,7 @@ gantt
     RFC 0067 more than one block per round trip :active, r0067, 2026-09-02, 2026-09-13
     RFC 0068 a disk that can hold BusyBox :active, r0068, 2026-09-04, 2026-09-13
     RFC 0069 a format that need not hold the filesystem :active, r0069, 2026-09-04, 2026-09-13
+    RFC 0077 a file that can be emptied :active, r0077, 2026-09-13, 2026-09-13
     section Capabilities & IPC
     RFC 0008 The shape of the system-call and IPC interface :done, r0008, 2026-08-04, 1d
     RFC 0009 Shared memory and the objects that name it :done, r0009, 2026-08-04, 1d
@@ -182,6 +183,7 @@ gantt
 | 0074 | what a network interface is | 2026-09-06 |
 | 0075 | a driver that is not in the kernel | 2026-09-07 |
 | 0076 | a bond on hardware | 2026-09-08 |
+| 0077 | a file that can be emptied | 2026-09-13 |
 
 ## Annexes
 
