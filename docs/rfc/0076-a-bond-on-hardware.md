@@ -3555,3 +3555,56 @@ Failing that, the three changes that would let this line resume are the switch's
 to make: a host in VLAN 20 or 5 that answers ARP, a LAG whose running mode
 matches its saved LACP configuration, and `xg11`'s PVID brought into line with
 its peers.
+
+
+## A ping was answered — 2026-09-13
+
+A host on VLAN 5 pinged `10.5.5.200` while this machine was booted, and **it
+replied.**
+
+That is the first completed network exchange between Bhaskix and a peer on
+physical hardware, and it was measured from outside this machine rather than by
+its own report.
+
+### What it proves, because it is more than a ping
+
+A reply to that ping required every one of these to work, inbound and outbound,
+on real hardware:
+
+* the X722 received a frame and wrote it back to a descriptor this driver posted;
+* the frame carried an **802.1Q tag for VLAN 5**, and `bin/ipd` parsed it as
+  ours rather than refusing it;
+* an **ARP request for `10.5.5.200` was answered** — the responder whose own
+  comment read *"written and host-tested; on this network nothing has a reason
+  to ask us yet, so it is not exercised live until something does"*;
+* the reply was built, **tagged for VLAN 5**, handed to the device and put on
+  the wire with a frame check sequence the switch accepted;
+* the switch forwarded it, so its static LAG **does** carry our traffic;
+* an **ICMP echo request was answered**, through the same path, carrying its
+  payload back unchanged.
+
+Every one of those had been written and host-tested and none had ever run
+against anything but QEMU.
+
+### What it corrects
+
+**`0 arp mappings learned` was never about this stack.** Ten requests for
+`10.5.5.246` went unanswered, and the reading offered here was that something
+between this host and the switch was wrong. It was not: the same host, on the
+same VLAN, over the same LAG, answers and is answered. The switch's management
+interface not replying to ARP on that port is a property of the switch, and the
+narrowest remaining fact in this document.
+
+**And the report cannot see this.** It is printed once, during boot, and the
+ping arrived afterwards — so the console shows `4 frames crossed` and `0 arp
+mappings learned` from before the exchange and says nothing about it. The
+evidence is external. A boot report is a snapshot, and this is the first time
+that has mattered.
+
+### What can now be claimed
+
+Networking on this project has been QEMU-only since it existed. It is not any
+more: **frames are answered.** What remains unproven is the *outbound*
+half against a peer that answers — a DHCP lease, an ARP this host initiates and
+gets a reply to — and RFC 0076 step 3's failover gate, which needs traffic that
+crosses and returns rather than one that arrives and is answered.
