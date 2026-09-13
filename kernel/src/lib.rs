@@ -20011,12 +20011,21 @@ fn report_net_ring(hhdm: u64) -> bool {
     // report is read by index in a dozen places; a word placed among them
     // renumbers every one, and the first attempt at these counters did exactly
     // that before the compiler caught the array length.
-    let raw = unsafe { core::slice::from_raw_parts((hhdm + frames_of[0]) as *const u8, 51 * 8) };
-    for (index, word) in words.iter_mut().enumerate() {
-        let mut buffer = [0u8; 8];
-        buffer.copy_from_slice(&raw[index * 8..index * 8 + 8]);
-        *word = u64::from_le_bytes(buffer);
-    }
+    // **Volatile, and re-readable**, because the wait below needs both. A plain
+    // slice read lets the compiler hoist the load clean out of a loop -- nothing
+    // tells it the page has another writer -- so the wait would examine one
+    // snapshot until it gave up. That is the bug `report_bond`'s loop carries a
+    // note about, and this is the same shape waiting on the same kind of page.
+    let take = |words: &mut [u64; 51]| {
+        for (index, word) in words.iter_mut().enumerate() {
+            // SAFETY: a word inside a frame this object owns, through the
+            // direct map, at a page-aligned base -- so every offset is aligned.
+            *word = unsafe {
+                core::ptr::read_volatile((hhdm + frames_of[0] + index as u64 * 8) as *const u64)
+            };
+        }
+    };
+    take(&mut words);
     // No window means the driver could never make the device receive, so there
     // is nothing to hand across and nothing to count. Checked **before** the
     // count rather than only when the report is missing: `ipd` writes a report
@@ -20030,6 +20039,34 @@ fn report_net_ring(hhdm: u64) -> bool {
     if words[0] != IPD_MARKER {
         println!("\x1b[91m    net ring       FAILED: the service left no report\x1b[0m");
         return false;
+    }
+
+    // **Wait for a frame where this image was told to, as `net after` already
+    // does.** This gate is read about five seconds after `bin/ipd` starts, and
+    // on the one machine that has an X722 the device is not delivering yet --
+    // `bhaskix.x722=120000` exists because that port carries a frame about every
+    // thirty seconds. So `net ring FAILED: 0 frames crossed` has printed on
+    // every SR550 boot, on boots where thirty-two frames demonstrably crossed a
+    // few lines further down the same report, and on the 2026-09-13 boot where a
+    // host on VLAN 5 pinged this machine and **was answered while the line said
+    // nothing had crossed**.
+    //
+    // Glancing asks *"had a frame arrived by then?"*; waiting asks *"did one
+    // arrive within the window?"*, which is the question the gate means. Zero
+    // patience on every ordinary boot, where this loop does not run at all.
+    //
+    // Re-reading refreshes the whole report, not just this count -- so a
+    // neighbour learned during the window is reported too, which is the other
+    // number this line sits beside.
+    let patience = X722_PATIENCE_MS.load(Ordering::Relaxed);
+    if patience > 0 && words[1] == 0 {
+        for _ in 0..(patience / 50) {
+            take(&mut words);
+            if words[1] > 0 {
+                break;
+            }
+            wait_millis(50);
+        }
     }
 
     let (frames, bytes, source, refused) = (words[1], words[2], words[3], words[4]);

@@ -848,7 +848,13 @@ asm_budget = 10
 # speed each member negotiated, and what `Set MAC Config` answered. The switch
 # says every frame from this host fails CRC; these say whether anything arriving
 # here is damaged too, which separates a bad cable from a bad transmit.
-unsafe_budget = 2052
+# 2054 for the `net ring` gate's wait: that report is re-read in a loop now, and
+# a plain slice read is hoisted clean out of one -- nothing tells the compiler
+# the page has another writer -- so the wait would examine a single snapshot
+# until it gave up. Volatile, once per word, and the two lines buy a gate that
+# stops calling a working receive path FAILED in the same report that shows
+# thirty-two frames crossing.
+unsafe_budget = 2054
 # Up thirty-one for RFC 0005 step 9's socket probe -- `ring3_socketeer`, which
 # is `ring3_lister` with a `sockaddr_in6` copied in beside its code instead of
 # two filenames. The same two blocks every hosted probe has: one
