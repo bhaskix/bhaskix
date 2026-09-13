@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | 🔨 **Draft 2026-08-31 — step 1 of 6 built and gated; steps 2-5 attempted and withdrawn.** The authority exists and is granted; the adapter does not use it yet, and the reason is recorded below rather than left as a gap |
+| **Status** | ✅ **ACCEPTED 2026-09-13 — all six steps built and gated.** A hosted process creates a file under `/tmp`, writes to it, closes it, reopens it and reads its own bytes back off a journalled disk; it makes a directory and removes a file, with the removal proved by absence; and it is refused everywhere else, structurally. Five boot gates, each watched red. **This line read "steps 2-5 attempted and withdrawn" while the body below said step 2 was done and gated** — the body was right and the header was stale for thirteen days, which is the disagreement between two halves of one document that this project treats as a bug in both |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | libc / userspace |
 | **Milestone** | Phase 2 — Linux personality (L1) |
@@ -172,47 +172,88 @@ comparable rather than one being asserted to be like the other.
 2. **What creates it?** `bin/fsd` creates `pkg` at startup and reports its
    handle; this would follow that. The alternative is the kernel creating it
    when it formats the disk, beside `sub` and `inner`.
-3. **The file-size ceiling is 40 KiB** — `Volume::write` reaches ten direct
-   blocks and no indirect one. Every hosted write inherits that, and a program
-   that exceeds it gets a short write. Whether a short write or an error is the
-   honest answer is a decision this RFC should make before it is built.
+3. ~~**The file-size ceiling is 40 KiB**~~ — **stale, and corrected here
+   rather than deleted.** [RFC 0065](0065-the-block-the-format-already-had.md)
+   made `Volume::write` follow the indirect block the format had always
+   carried, on 2026-09-01, taking the ceiling from 40,960 bytes to 4,239,360.
+   The decision the question asked for is made and is **a short write**: that
+   is all `write(2)` promises, it is what `answer_writev` in the adapter
+   already loops on, and it is what a program that needs every byte handles
+   anyway. A write at an unaligned offset comes back short for an unrelated
+   reason — the service stops at the end of a block — so a caller that could
+   not cope with a short write was already broken.
+5. **`O_TRUNC` on a file that already exists is silently ignored, and the
+   trigger this RFC wrote for it is now met.** The Design section says
+   *"`O_TRUNC` on create is free because a created file is empty"*, which is
+   true and is only half the cases; Alternatives considered refuses
+   `ftruncate` and `O_TRUNC`-on-existing with the trigger *"a program actually
+   needs it — likely as soon as a real shell redirects onto an existing
+   file"*. A hosted shell can redirect as of this RFC, so that day has
+   arrived, and what happens today is the bad kind of wrong: `echo x > file`
+   over a longer file writes at offset zero and **leaves the old tail**, with
+   nothing said.
+
+   It is left rather than fixed here because the honest fixes are decisions,
+   not code. `REMOVE_AT` then `CREATE_AT` needs no new protocol and is what
+   truncation means, but it changes the inode — invisible to a shell, wrong
+   for anything holding a second descriptor. A real `ftruncate` is a new
+   method on a service two programs share, which is the change this RFC
+   declined to make in a paragraph that is still right. **Whichever is
+   chosen, it should be chosen in an RFC and not in an afternoon**, and until
+   one is, this is a named gap with a date rather than a surprise.
+
 4. **The adapter's CSpace is full.** RFC 0059 took slot 25 and moved
    `HANDLE_FLOOR` to 26; this takes another and moves it to 27, leaving 61
    hosted-domain handles against `MAX_DOMAINS` of 64. The trade is small and
    real, and the third such change should probably reorganise the map instead
    of shaving the same pool again.
 
-## What is built, and what was withdrawn — 2026-08-31
+## What was withdrawn on 2026-08-31, and what retired it on 2026-09-13
 
-**Step 1 is done and proved on a booted machine.** `bin/fsd` creates `sub/tmp`
-and reports its writable handle; the kernel mints it into
-`adapter::WRITABLE_DIR`; the boot says so:
+**The withdrawal was right, and it was right for a measured reason.** Steps 3
+to 5 were held back because exercising the write path reproducibly reddened the
+TCP inbound gate: with `O_CREAT`, **5 boots of 5 red**; the same routing,
+`EXPECT` and `CALL` without it, 3 of 3 green; a control tree with no hosted open
+at all, 3 of 3 green. Which side the fault was on was never established, and
+this document deliberately stopped pointing at one.
 
-```
-fs domain      ... writable handles: pkg 0x8000000100000007, tmp 0x8000000100000008
-linux domain   holds a writable directory now: a hosted program may change what
-               is under /tmp and nothing above it
-```
+**Re-measured on 2026-09-13, against a tree thirteen days newer.** The lever was
+one flag in `user/hosted`, which the probe carried a comment naming for exactly
+this purpose.
 
-**Step 2 is done and gated as of 2026-08-31, and the bug was never in it.** A
-hosted program opens `/tmp/<name>` through the writable capability: with
-`O_CREAT` it gets a real file and `fd 3`, and without it a clean `ENOENT` from
-the writable directory rather than the `EROFS` every writable open used to get.
-The gate asserts that errno, because `ENOENT` and `EROFS` distinguish "the path
-and the capability worked" from "the routing or the grant regressed".
+| | 2026-08-31 | 2026-09-13 |
+|---|---|---|
+| Boots with the create | 5 | 10 |
+| TCP inbound gate red | **5** | **0** |
+| Other assertions differing from baseline | — | **none of 159** |
 
-**And what broke was measured rather than blamed.** Exercising the path
-reproducibly reddened a network gate, and the first write-up guessed at the
-adapter. It is neither: the failure follows the **journalled disk write**, not
-the code path. With `O_CREAT`, 5 boots of 5 red; the same routing, `EXPECT` and
-`CALL` without `O_CREAT`, 3 of 3 green; a control tree with no hosted open at
-all, 3 of 3 green. The victim is the TCP inbound gate, which §3 has called
-environmental since 2026-08-26 — so RFC 0060 has handed that defect a lever it
-did not have, and the finding is recorded there.
+The only difference from a baseline boot, across all ten, was the step-2 gate
+itself: its success arm demanded `ENOENT` from an open that deliberately did not
+create, so a *successful* open failed it by construction. Every other assertion
+was identical and green.
 
-**Step 3 remains out**, for the same reason: a write is a disk write, and until
-the interaction above is understood a gate that writes would be a gate that
-reddens the lane 5 times in 5 for something that is not its own fault.
+**The control matters, so it is stated rather than assumed.** A measurement of
+the create that did not actually commit to disk would measure nothing.
+`open_writable` returns a descriptor only when `CREATE_AT` replies `dir::OK`;
+`bin/fsd`'s `create_at` answers `dir::OK` only after `writing(|v| v.create(..))`
+returns; and `Volume::create_ordered` ends in `self.commit(order)?`. A journal
+commit to the virtio disk completed on every one of the ten boots.
+
+**And the write half, which did not exist to be measured then.** Steps 3 and 4
+add three more journalled commits per boot — a `WRITE_FROM`, a
+`MAKE_DIRECTORY_AT` and a `REMOVE_AT`. Ten boots of the complete path: **161
+assertions, 0 failures, 10 of 10**, every inbound line reading *host tried N and
+opened N*.
+
+What this does **not** claim is that the 2026-08-31 observation was mistaken. It
+was five of five, and the tree has since taken the nucleus bulk-copy fix
+(2026-09-03) and `bin/tcpd`'s report page being read one word out of step
+(2026-09-04, which had three numbers printed under the wrong names and the
+SYN-cookie gate asserting on the reclaim count). Which of those retired it is
+not established and is not worth another ten boots to establish: the lever is
+gone, and §3's remaining intermittent keeps its own row.
+
+### The record of the withdrawal, kept
 
 **The earlier write-up of this said something different and was wrong.** The adapter's
 `open_writable` and `write_to_file` worked far enough to reach the service —
@@ -279,12 +320,79 @@ steps 2 and 3 are done properly.
    it, because one cannot — steps 2 and 3 are withdrawn, and claiming the
    authority works because it was granted is the same gap between "the counter
    exists" and "the counter is read" that this tree has paid for repeatedly.
-2. `open_the_file` stops discarding `plan_openat`'s answer: writable opens go
-   to the writable directory, `O_CREAT` to `CREATE_AT`, and the read-only root
-   still answers `EROFS`.
-3. `write` on a `Kind::File` descriptor: `COPY_IN`, then `WRITE_FROM` at the
-   descriptor's offset, looping a page at a time.
-4. `unlink` and `mkdir`.
-5. The gate, armed both ways — the write, and the refusal on the read-only
-   root.
-6. `docs/security.md` T11, `docs/roadmap.md`'s L1 row, and `TRACKER.md`.
+2. ✅ **Done and gated 2026-08-31.** `open_the_file` stops discarding
+   `plan_openat`'s answer: writable opens go to the writable directory,
+   `O_CREAT` to `CREATE_AT`, and the read-only root still answers `EROFS`.
+3. ✅ **Done and gated 2026-09-13.** `write` on a `Kind::File` descriptor:
+   `COPY_IN`, then `WRITE_FROM` at the descriptor's offset, a page per call
+   with the loop in the adapter.
+
+   **It cost no `unsafe`, which was not the plan and is the better answer.**
+   The obvious construction is `bin/shell`'s: map a transfer page and `memcpy`
+   into it. `COPY_IN` already names its destination as *an object and an
+   offset* rather than an address — RFC 0032's shape, so that a supervisor
+   "cannot ask for bytes to land anywhere it could not already write" — and
+   `WRITE_FROM` drains that same object from offset zero. So the bytes go from
+   the hosted process's address space to the filesystem service without this
+   program ever holding a pointer to them, and `bin/linuxd`'s exact budget is
+   **still 117**. The two facts are the same fact: the program `security.md`
+   §1 calls the largest concentration of authority in the system gained a
+   write path and no new way to dereference anything.
+
+   What is decided by the descriptor's own `writable` flag, which
+   `open_writable` has set since step 2 and which nothing had ever read. A
+   file under the read-only root can never carry it, because a writable open
+   there is refused before an `Entry` exists.
+
+   **The loop is the adapter's, as this RFC said, and writing it that way
+   found a disclosure bug.** `COPY_IN` answers *how many bytes it moved*, and
+   it comes back short when the hosted program's buffer runs into a page it
+   does not have mapped. A first draft passed the length it had *asked for* to
+   `WRITE_FROM`. Since the object those bytes cross in is RFC 0059's staging
+   object, the tail of a hosted program's file would have been the tail of the
+   last program this adapter exec'd. It is the one place in the function where
+   ignoring a returned count discloses somebody else's bytes rather than
+   merely losing some of these, and it is why the moved count is clamped and
+   used rather than assumed.
+
+   **Bounded at sixteen pages**, which is the staging object's own size. An
+   unbounded loop would put a hosted `write` of a gigabyte inside one reply —
+   exactly the latency `MAX_SUPERVISED_COPY` exists to prevent, one layer up.
+   A program asking for more than 64 KiB gets a short write, which is a size
+   at which software expects one.
+4. ✅ **Done and gated 2026-09-13.** `unlink` and `mkdir` — and `rmdir`, and
+   the plain forms as well as the `at` ones, because a static BusyBox emits
+   `unlink(2)` and `mkdir(2)` directly. The `at` forms' directory descriptor is
+   **not read**, and that is structural rather than lazy: this adapter resolves
+   an absolute name against the two directory capabilities it holds, so there
+   is no third directory an `AT_FDCWD` could name.
+5. ✅ **Done 2026-09-13. Five gates, each watched red before being believed.**
+
+   | Gate | Armed by | What it printed |
+   |---|---|---|
+   | The write round trip | dropping the write and reporting it as done | `hosted tmp read back 0 of 48` |
+   | A write past one page | stopping the loop after one chunk | `hosted bulk wrote 4096 of 5000` |
+   | `mkdir` / `unlink` | an `unlink` that reports success and removes nothing | `hosted change unlinked but STILL THERE` |
+   | Containment, write | removing `open_the_file`'s `EROFS` on the root | `CONTAINMENT: a hosted program opened the read-only root for writing` |
+   | Containment, unlink | an `unlink` that refuses nothing outside `/tmp` | `CONTAINMENT: a hosted program unlinked a file under the read-only root` |
+
+   **A 48-byte line cannot test the loop**, which is why the second row exists:
+   5,000 bytes cannot cross in one round trip, so a `write` answering 5,000 has
+   been round the loop at least twice and one answering 4,096 has not.
+
+   **The assertion is the body, not a return value.** The forty-eight bytes
+   live in one place on this machine — the hosted program's own `.rodata` —
+   and appear a second time only by having gone out to a journalled disk and
+   come back through a fresh `open`. A gate on the count would pass on a
+   filesystem that discarded every write, which is exactly what arming the
+   first row produced.
+
+   **Two things the arming caught that review had not.** The probe's log line
+   began `hosted write ok`, which is *already* RFC 0032 step 10's sixteen
+   hand-assembled bytes, gated elsewhere — two producers of one string leave
+   that gate unable to say which program printed it; the prefix is `hosted tmp`
+   now. And the containment check named `/greeting`, which does not exist, so
+   it was passing on absence rather than on refusal; it names `/inner` now,
+   which the kernel creates under `sub` on every machine that formats the disk.
+6. ✅ **Done 2026-09-13.** `docs/security.md` T11, `docs/rfc/0031` I3,
+   `docs/roadmap.md`'s L1 row, and `TRACKER.md`.

@@ -190,6 +190,24 @@ We will not pretend to cover these. Each has a note on whether it becomes in-sco
 > exec resolves in is the one the adapter already held, and it is still `sub` rather than the root:
 > a hosted `execve` can run what is inside it and can name nothing above it.
 >
+> **[RFC 0060](rfc/0060-a-writable-path-for-a-hosted-process.md) closed on 2026-09-13, and it is the
+> first authority in this list that lets the adapter *change* something outside its own memory.**
+> Everything above it reads, prints, waits or builds a domain. This writes: one directory capability
+> whose badge carries `dir::WRITABLE`, minted by the kernel, naming `sub/tmp` and nothing else.
+>
+> So the price, stated as plainly as the rest: a compromised `bin/linuxd` can create, fill, remove
+> and make directories **under that one directory**. It cannot touch the read-only root above it,
+> the packages, the image, or any other domain's memory — not because a check refuses, but because
+> the capability names a directory and carries no path, which is the same structural property the
+> read-only root has had since RFC 0033. Two boot gates assert the refusal rather than the
+> permission, and both were watched failing: a hosted program opening the read-only root for
+> writing, and one unlinking a file there.
+>
+> **The gap this opens is between hosted processes, not between a hosted process and Bhaskix.**
+> One directory is shared by every hosted process, for no principled reason beyond L1's cost. That
+> is RFC 0060's own unresolved question 1, said there as it is said here: a shared scratch directory
+> between mutually distrusting processes is a real weakness and not a simplification.
+
 > "Every boot today" stopped being true on 2026-08-28: a boot with `busybox=sh` grants the console
 > to the BusyBox domain, and it is the only one. Every other boot grants nothing and reaches no
 > keystroke at all. It is not
