@@ -1925,32 +1925,42 @@ static BRINGUP_DONE: core::sync::atomic::AtomicBool = core::sync::atomic::Atomic
 /// "slow" from "stopped", and stopped is for ever.
 const BRINGUP_WATCHDOG_MICROS: u64 = 45_000_000;
 
-/// The same, plus whatever waiting *this* boot was explicitly asked to do.
+/// Bounded waits that have ticked, so a deliberate pause is not silence.
 ///
-/// **A watchdog that always fires is worth as little as a gate that is always
-/// red.** `bhaskix.lacp=`, `bhaskix.bond=` and `bhaskix.x722=` each buy a window
-/// for something that happens on a wire's schedule rather than this machine's,
-/// and the SR550 is booted with two of them at 120 seconds. Every one of those
-/// boots has printed `BRING-UP STOPPED` with a full thread dump at 45 seconds
-/// and then finished normally at 119 -- so the one report that exists to say
-/// *this machine is never coming back* has been crying wolf on every boot of the
-/// only physical machine this project has.
+/// See [`bringup_progress`].
+static BRINGUP_WAITS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Whether bring-up is getting anywhere, as one number that only goes up.
 ///
-/// **Summed, not maximised.** The windows are not guaranteed to overlap: each is
-/// a separate bounded wait in the bring-up sequence, and in the worst case they
-/// are spent one after another. Summing is the upper bound, and erring long is
-/// the right direction here -- a stall inside a window the operator asked for is
-/// indistinguishable from the window itself, so there is nothing to lose by
-/// waiting it out and a false alarm every boot to avoid.
+/// **Elapsed time was the wrong question, and it took three tries to say so.**
+/// The watchdog's job is to separate *slow* from *stopped*, and it measured
+/// neither: it measured *total time since boot*, which on a machine asked for
+/// two 120-second windows is a number about the command line rather than about
+/// the machine. Every SR550 boot printed `BRING-UP STOPPED` and then finished.
 ///
-/// Zero on every ordinary boot, where this is exactly [`BRINGUP_WATCHDOG_MICROS`].
-fn bringup_watchdog_micros() -> u64 {
+/// Adding the windows to the patience -- 45 + 240 = 285 -- was arithmetically
+/// right and practically useless: [`BRINGUP_DONE`] is not set until the whole
+/// report has printed, which on that machine is past 350 seconds, so it fired
+/// anyway. Raising the base instead would trade a false alarm there for a slow
+/// alarm everywhere else.
+///
+/// **A stalled machine stops making progress; a slow one does not.** That is the
+/// distinction the watchdog wanted all along, and it needs no arithmetic about
+/// windows because a window that is being waited through *is* progress. Two
+/// sources, both monotone:
+///
+/// * `console::PRINTS` -- bring-up narrates itself, so a line is progress.
+/// * [`BRINGUP_WAITS`] -- a bounded wait ticking is a thread still running.
+///
+/// The fault this exists for is *"every CPU is in `hlt` with interrupts enabled
+/// ... something was waiting for a wake that never arrived"*. Neither source
+/// moves in that state, so it still fires -- and it fires on a machine that is
+/// genuinely stuck rather than on one that was told to be patient.
+fn bringup_progress() -> u64 {
     use core::sync::atomic::Ordering::Relaxed;
-    let asked = LACP_PATIENCE_MS
+    console::PRINTS
         .load(Relaxed)
-        .saturating_add(BOND_PATIENCE_MS.load(Relaxed))
-        .saturating_add(X722_PATIENCE_MS.load(Relaxed));
-    BRINGUP_WATCHDOG_MICROS.saturating_add(asked.saturating_mul(1_000))
+        .wrapping_add(BRINGUP_WAITS.load(Relaxed))
 }
 
 /// Says where bring-up got to, if it stops getting anywhere.
@@ -1979,27 +1989,37 @@ fn bringup_watchdog_micros() -> u64 {
 extern "C" fn bringup_watchdog(_: u64) -> ! {
     use core::sync::atomic::Ordering;
 
-    // Read once, here, rather than baked in: the command line is parsed before
-    // this thread is spawned, so the windows this boot asked for are already
-    // known and a boot that asked for none is unaffected.
-    let patience = bringup_watchdog_micros();
-    time::sleep_micros(patience);
-    if BRINGUP_DONE.load(Ordering::Acquire) {
-        sched::exit()
+    // **Sampled, not slept through.** A single sleep measures elapsed time, which
+    // is what this got wrong. Waking every second and asking whether anything
+    // moved measures progress, and only an unbroken run of no progress counts
+    // against the patience.
+    const SLICE_US: u64 = 1_000_000;
+    let mut last = bringup_progress();
+    let mut quiet = 0u64;
+    loop {
+        time::sleep_micros(SLICE_US);
+        if BRINGUP_DONE.load(Ordering::Acquire) {
+            sched::exit()
+        }
+        let now = bringup_progress();
+        if now == last {
+            quiet = quiet.saturating_add(SLICE_US);
+        } else {
+            last = now;
+            quiet = 0;
+        }
+        if quiet >= BRINGUP_WATCHDOG_MICROS {
+            break;
+        }
     }
 
     println!();
     println!("==================================================================");
+    println!("  BRING-UP STOPPED. Nothing has been printed and no bounded wait has",);
     println!(
-        "  BRING-UP STOPPED. {} seconds have passed and it has not finished.",
-        patience / 1_000_000
+        "  ticked for {} seconds, so this machine is stuck rather than slow.",
+        BRINGUP_WATCHDOG_MICROS / 1_000_000
     );
-    if patience > BRINGUP_WATCHDOG_MICROS {
-        println!(
-            "  {} of those were windows this boot asked for on the command line.",
-            (patience - BRINGUP_WATCHDOG_MICROS) / 1_000_000
-        );
-    }
     println!("  The last line above is the last thing that completed. Every thread");
     println!("  on this machine, and what it was doing:");
 
@@ -28516,6 +28536,10 @@ fn wait_until(mut done: impl FnMut() -> bool, limit_millis: u64) -> bool {
 /// count limits this thread, the clock limits everything else. A thread that
 /// is not being scheduled spins zero times, so a spin bound alone never fires.
 fn wait_millis(millis: u64) {
+    // **A deliberate pause is not silence** -- see [`bringup_progress`]. Counted
+    // on entry rather than per spin: what the watchdog needs to know is that a
+    // thread reached this call, not how hard it span inside it.
+    BRINGUP_WAITS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     let started = bhaskix_arch::tsc::read();
     let Some(limit) = bhaskix_arch::tsc::from_micros(millis.saturating_mul(1_000)) else {
         // No calibrated clock. Fall back to counting interrupts, which is what
