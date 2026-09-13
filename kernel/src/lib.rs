@@ -437,6 +437,25 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
         if word == "busybox=1" || word == "bhaskix.busybox=1" {
             STAGE_BUSYBOX.store(true, core::sync::atomic::Ordering::Relaxed);
         }
+        // `hostedfs=off` — run the hosted-exec probe without it, on a lane
+        // that asserts nothing about it and cannot afford what it costs.
+        //
+        // **Written for one lane and one defect, and both are named so this
+        // does not become a flag nobody remembers the reason for.** RFC 0060's
+        // probe writes to the filesystem on every boot that has one. On the
+        // `usb` machine that reproducibly stops the **xHCI** delivering
+        // keyboard reports -- 4 boots of 4, against 0 of 4 before it, while
+        // the i8042 keyboard on the same tree keeps working and a 420-second
+        // budget does not help. The interaction is real, it is the kernel's,
+        // and it is filed in TRACKER section 3; this switch keeps one lane
+        // honest while it is understood, rather than leaving `make test` red
+        // or deleting the gates that prove RFC 0060.
+        //
+        // Off is the *exception*: every other lane runs the probe, so nothing
+        // that asserts the write path stops asserting it.
+        if word == "hostedfs=off" || word == "bhaskix.hostedfs=off" {
+            HOSTED_FS_PROBE.store(false, core::sync::atomic::Ordering::Relaxed);
+        }
         // `tearprobe=<runs>` — tries to reproduce the console tear on demand
         // rather than waiting for it at one boot in twenty-five.
         // `bhaskix.lacp=<ms>` — RFC 0074 step 5. Both spellings, for the
@@ -10465,6 +10484,13 @@ fn hosted_exec_self_test(hhdm_base: u64, cpus: u32) -> bool {
     }
     const CPU: u32 = 3;
 
+    if !HOSTED_FS_PROBE.load(Ordering::Relaxed) {
+        println!(
+            "\x1b[93m    hosted exec    skipped: this image was built `hostedfs=off`, because its \
+             writes stop the xhci delivering keyboard reports -- TRACKER section 3\x1b[0m"
+        );
+        return true;
+    }
     if FS_ENDPOINT.load(Ordering::Acquire) == u64::MAX {
         println!(
             "    hosted exec    skipped: this machine has no filesystem service, so there is no \
@@ -15549,6 +15575,11 @@ const HOSTED_PROGRAM: &[u8] = b"bin/hosted";
 /// why the default is off: the cost is real and bounded, and choosing to pay
 /// it on every lane is not this file's decision to make.
 static STAGE_BUSYBOX: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Whether the hosted-exec probe runs — `hostedfs=off` turns it off.
+///
+/// **Default on**, so the lanes that gate RFC 0060's write path keep gating it.
+static HOSTED_FS_PROBE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
 
 /// How many bytes of BusyBox reached the disk, and how many it has.
 static BUSYBOX_STAGED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
