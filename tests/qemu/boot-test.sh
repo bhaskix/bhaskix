@@ -4071,6 +4071,28 @@ else
     status=1
 fi
 
+# A boot that finished must not have been declared stopped on the way.
+#
+# **Nothing here noticed this, and it cost a bad commit.** The bring-up watchdog
+# exists to say "this machine is never coming back", and a debug build that cut
+# its patience from 45 seconds to 3 dumped every thread on every lane, printed
+# the banner, and passed the whole suite -- because no gate had ever looked at
+# it. The same blindness on the SR550 let the banner print on every boot of the
+# only physical machine this project has, for as long as that machine has been
+# booted with `bhaskix.lacp=` and `bhaskix.x722=` windows.
+#
+# The assertion is deliberately narrow: the watchdog *firing* is a real finding
+# and must stay loud. What must never happen is a boot that reaches the end and
+# also claimed it had stopped -- those two cannot both be true, and whichever is
+# wrong is worth knowing about.
+if grep -qF "BRING-UP STOPPED" "$LOG"; then
+    fail "the watchdog declared bring-up stopped, and then it finished"
+    grep -E "BRING-UP STOPPED|windows this boot asked for" "$LOG" || true
+    status=1
+else
+    pass "the bring-up watchdog stayed quiet, as it must on a boot that finished"
+fi
+
 if [[ $status -ne 0 ]]; then
     echo
     echo "--- captured serial output ---"
