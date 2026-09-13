@@ -3615,8 +3615,15 @@ impl<R: Registers> Device<R> {
         // fetches at -- and it put seven consecutive non-data descriptors in
         // front of every frame, which X710 Table 7-138 calls `M_CONTEXTS`:
         // *"7 or more consecutive non-data descriptors are fetched in a transmit
-        // queue"*, a malicious-driver event that **stops the queue**. The SR550
-        // flagged event 21 the moment the padded queues began fetching.
+        // queue"*, a malicious-driver event that **stops the queue**.
+        //
+        // **That reading was too confident, and the next boot said so.** Event
+        // 21 on `GL_MDET_TX` has *four* causes in Table 7-138 -- `ENDLESS_TX`,
+        // `M_CONTEXTS`, `BAD_DESC_TYPE` and `NO_PACKET` -- and the ID alone
+        // cannot tell them apart. The padding really was seven in a row and
+        // really had to go; it was not the only thing raising 21, because the
+        // SR550 raised it again on 2026-09-13 with the padding long gone. See
+        // the wrap below for what was left.
         //
         // A frame is its own one or two descriptors again. An uplink frame has
         // exactly one context descriptor in front of its data, which is as far
@@ -3625,40 +3632,46 @@ impl<R: Registers> Device<R> {
             return None;
         }
         // **Refuse rather than overwrite a descriptor the device still owns.**
-        // A frame's descriptors must be contiguous, so a frame that will not fit
-        // before the end of the ring wastes the slack there -- and that slack
-        // has to be counted against the free space, or the wrap lands on
-        // descriptors the device has not consumed.
-        let wasted = if self.transmit_next + needed > self.transmit_depth {
-            self.transmit_depth - self.transmit_next
-        } else {
-            0
-        };
         // One slot is always left free: `outstanding` is `(tail - head)` around
         // the ring, so a completely full ring reads as an empty one.
-        if self.transmit_outstanding(queue) + wasted + needed >= self.transmit_depth {
+        if self.transmit_outstanding(queue) + needed >= self.transmit_depth {
             return None;
         }
-        // Wrap before writing rather than across the pair, so a frame's
-        // descriptors are always contiguous.
-        if wasted > 0 {
-            self.transmit_next = 0;
-        }
         let slot = self.transmit_next;
-        let data = if uplink { slot + 1 } else { slot };
-        if uplink {
+        // **A frame's pair may straddle the end of the ring, and used not to.**
+        // This wrapped the cursor early so that a context descriptor and its
+        // data descriptor were adjacent *in the array*, wasting the last slot
+        // when a pair would not fit before it. The device never asked for that:
+        // §8.4.1's rules are about how many buffers a packet may span and what
+        // *order* the descriptors come in, and a ring is circular, so wrapping
+        // preserves the order. What the device does require is that everything
+        // between head and tail be a descriptor it can fetch -- and the skipped
+        // slot was not rewritten, so it still held the previous lap's, whose
+        // `DTYP` the *device* had set to `0xF` on write-back.
+        //
+        // `0xF` is not a type a driver may post. X710 Table 7-138 gives event 21
+        // four causes and `BAD_DESC_TYPE` -- *"illegal descriptor type used"* --
+        // is one of them, as is `NO_PACKET`, *"tail update that does not contain
+        // at least one full packet"*. Either fits a fetched write-back marker.
+        // The SR550 flagged event 21 on member 0 on 2026-09-13, after the
+        // padding that had been blamed for it was gone, with 34 descriptors
+        // sitting unconsumed. Reproduced on the host by
+        // `every_descriptor_between_head_and_tail_was_written_by_this_driver`,
+        // which needs a *mixed* stream to see it: two-descriptor frames alone
+        // only ever land on even slots of an even ring.
+        let data = if uplink {
             post_transmit_context(ring, slot, TX_SWTCH_UPLINK);
-        }
+            (slot + 1) % self.transmit_depth
+        } else {
+            slot
+        };
         post_transmit_descriptor(ring, data, buffer, bytes);
-        self.transmit_next = data + 1;
         // **Wrap the cursor, because the tail is an index and not a count.**
         // `QTX_TAIL` takes a descriptor index, so a ring of eight accepts 0 to
         // 7; writing 8 after filling the last slot is out of range and the queue
         // stops taking updates -- 2026-09-06, where four LACPDUs left and forty
         // more went nowhere.
-        if self.transmit_next >= self.transmit_depth {
-            self.transmit_next = 0;
-        }
+        self.transmit_next = (data + 1) % self.transmit_depth;
         Some(data)
     }
 
@@ -5082,8 +5095,12 @@ mod tests {
     /// **X710 Table 7-138, `M_CONTEXTS`**: *"7 or more consecutive non-data
     /// descriptors are fetched in a transmit queue"* -- event 21 on
     /// `GL_MDET_TX`, and *"the queue is stopped"*. Whole-line padding put
-    /// exactly seven in front of every frame, and the SR550 flagged event 21 the
-    /// moment the padded queues began fetching.
+    /// exactly seven in front of every frame.
+    ///
+    /// **Event 21 does not identify this check on its own** -- Table 7-138 gives
+    /// it four causes, and the SR550 raised 21 again once the padding was gone.
+    /// This test still earns its place: it holds the run below seven whatever
+    /// else changes, and it is the only guard on a limit nothing else counts.
     ///
     /// A context descriptor is a non-data descriptor, so this counts NOPs and
     /// switch-control contexts alike, across the wrap, over a ring's worth of
@@ -5129,6 +5146,84 @@ mod tests {
             longest < 7,
             "a run of {longest} non-data descriptors is what the device calls malicious \
              (M_CONTEXTS, event 21), and it stops the queue"
+        );
+    }
+
+    /// Every descriptor the device will fetch was written by this driver.
+    ///
+    /// **X710 Table 7-138 gives event 21 four causes, not one.** `M_CONTEXTS`
+    /// is the one this driver already knew about; the others are
+    /// `ENDLESS_TX` (*"tail update bigger than ring size"*), `BAD_DESC_TYPE`
+    /// (*"illegal descriptor type used"*) and `NO_PACKET` (*"tail update that
+    /// does not contain at least one full packet"*). The padding that caused
+    /// `M_CONTEXTS` was removed on 2026-09-12 and the SR550 flagged event 21
+    /// again on 2026-09-13, so `M_CONTEXTS` is ruled out and one of the other
+    /// three is left.
+    ///
+    /// **`post_frame` skips a slot.** When an uplink frame's two descriptors
+    /// will not fit before the end of the ring it wraps the cursor to zero and
+    /// leaves the last slot unwritten -- so that a frame's pair is contiguous.
+    /// The device does not care about contiguity: §8.4.1's rules are about
+    /// buffer counts and descriptor *order*, which a wrap preserves. What it
+    /// does care about is that the descriptors between head and tail are
+    /// descriptors. The skipped slot still holds the previous lap's, whose
+    /// `DTYP` the device itself rewrote to `0xF` on write-back -- not a type
+    /// any driver may post.
+    ///
+    /// The ring starts written-back here because that is what a ring that has
+    /// been round once looks like.
+    #[test]
+    fn every_descriptor_between_head_and_tail_was_written_by_this_driver() {
+        const QUEUE: u32 = 0;
+        let depth = u32::from(TRANSMIT_DESCRIPTORS);
+        let mut ring = FakeDma::new();
+        let mut device = Device::new(Fake::new());
+        device.attach_transmit_ring(TRANSMIT_DESCRIPTORS);
+
+        for index in 0..depth {
+            let at = TRANSMIT_DESCRIPTOR_BYTES as usize * index as usize;
+            put_dma64(&mut ring, at + 8, TX_DTYP_DONE);
+        }
+
+        // **Mixed, because all-uplink cannot reach the case.** Two-descriptor
+        // frames on an even ring only ever land on even slots, so the cursor
+        // never stands at the last one with a pair to place. A single-descriptor
+        // frame is what puts it there -- and the wire this is about carries
+        // both: 84 frames posted, 48 of them uplink-tagged.
+        let mut skips = 0u32;
+        let mut head = device.transmit_tail();
+        for round in 0..(depth * 6) {
+            let uplink = round % 3 != 0;
+            if uplink && head + 2 > depth {
+                skips += 1;
+            }
+            if device
+                .post_frame(&mut ring, QUEUE, 0x4000, 124, uplink)
+                .is_none()
+            {
+                device.registers.put(QTX_HEAD, device.transmit_tail());
+                head = device.transmit_tail();
+                continue;
+            }
+            let tail = device.transmit_tail();
+            let mut index = head;
+            while index != tail {
+                let at = TRANSMIT_DESCRIPTOR_BYTES as usize * index as usize;
+                assert_ne!(
+                    dma64(&ring, at + 8) & TX_DTYP_MASK,
+                    TX_DTYP_DONE,
+                    "round {round}: descriptor {index} lies between head {head} and tail \
+                     {tail}, so the device fetches it, and it still carries the write-back \
+                     type -- an illegal descriptor type, event 21"
+                );
+                index = (index + 1) % depth;
+            }
+            device.registers.put(QTX_HEAD, tail);
+            head = tail;
+        }
+        assert!(
+            skips > 0,
+            "the wrap this test is about never happened, so it asserted nothing"
         );
     }
 
