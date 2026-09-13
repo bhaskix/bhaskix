@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | 🔨 **Draft 2026-09-13 — all six steps built, and parked on a branch rather than landed.** The feature works and its five checks all pass on the `iommu` lane, each watched red. **It is not accepted, because `make test` is red with it**: RFC 0059's adapter file-slot gate reports one slot held that should have come back, on 7 boots of 8, against 0 of 8 without this change. The cause is **not established** — see *What blocks acceptance* below. A status line that said ACCEPTED while the suite was red would be the one thing this project's documents are not allowed to do |
+| **Status** | ✅ **ACCEPTED 2026-09-13 — all six steps built and gated.** A hosted `echo x > file` over a longer file leaves nothing of the longer one, and `ftruncate(fd, 0)` empties one in place. Five checks, each watched red. **It was parked for part of a day on a slot-accounting gate that turned out to be reading a live number mid-release**; nothing was leaking, the reading was. See *What blocked it, and what it turned out to be* |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | fs / libc |
 | **Milestone** | Phase 2 — Linux personality (L1) |
@@ -203,46 +203,55 @@ does, the number goes here.
    here too, by `plan_openat`'s existing access-mode arithmetic. Worth a host
    test; not worth a design decision.
 
-## What blocks acceptance — 2026-09-13
+## What blocked it, and what it turned out to be — 2026-09-13
 
-**`make test` is red with this change and the reason is unresolved.** Everything below is
-measured; the explanation is not.
+**Resolved: nothing was leaking.** RFC 0059's adapter file-slot gate reported one slot held
+that should have come back, on 7 boots of 8 with this change and 0 of 8 without it. The
+measurements below were all sound and the conclusion drawn from them was wrong.
+
+**What settled it was asking the positive question.** Every reading of that count came from the
+boot report, which reads it **once**. A thread that samples it repeatedly *past* bring-up shows:
+
+```
+boot 1: report[2 of 3]  ->  settled[held 2 peak 3]
+boot 2: report[3 of 3]  ->  settled[held 2 peak 3]
+boot 3: report[2 of 3]  ->  settled[held 2 peak 3]
+boot 4: report[3 of 3]  ->  settled[held 2 peak 3]
+```
+
+**Every boot settles at the healthy value.** Whether the gate passed depended entirely on
+whether its single reading landed while the probe still had a file open. `record[4]` is
+republished on every pass of `bin/linuxd`'s loop, and the hosted probe's domain *ends* before the
+adapter has finished handing its descriptors back — so a read there counts slots that are
+already on their way home. RFC 0060's longer probe widened a window that was always open; before
+it, the same gate failed about one boot in eight.
+
+**The fix is in the instrument, not here**: `settled_process_record` waits for the count to stop
+moving — three equal readings at ten milliseconds, up to a second — before the gate reads it.
+With it, 6 boots of 6 pass at `2 held, peak 3`. **And it still catches a real leak**: with
+`give_back_descriptor` forced never to release, the gate reports `12 held, peak 12` and fails.
+A fix that made the gate quieter would have been worse than the bug.
+
+### The eliminations, kept
+
+They were right, and they are kept because the conclusion drawn from them was not — eliminating
+causes does not establish the one left standing.
 
 | measurement | result |
 |---|---|
-| `HEAD` (40dff2e), unmodified | **0 of 8** boots leak |
-| this branch | **7 of 8** boots leak |
-| `HEAD` plus five extra plain opens | 0 of 6 — so it is **not traffic volume** |
-| probe phases reordered | 5 of 6 — so it is **not phase ordering** |
-| the probe quiescent at sample time (short spin) | 3 of 3 leak |
-| which slot | index 2 (slot 125), exactly one, read off a held-slot bitmask |
-| claims against releases | claims **equal**; one **release** missing |
-| `holders()` miscounting? | **no** — the not-last counter is 0 on every boot |
+| `HEAD` unmodified | 0 of 8 leak |
+| this branch | 7 of 8 |
+| `HEAD` plus five extra plain opens | 0 of 6 — not traffic volume |
+| probe phases reordered | 5 of 6 — not ordering |
+| which slot | index 2, exactly one, from a bitmask |
+| claims against releases | claims equal; one release "missing" — also read mid-flight |
+| `holders()` miscounting | no — the not-last counter is 0 on every boot |
 
-So: one slot, one missing release, not a bad holder count, not volume, not ordering.
-
-**And one result that fits none of it.** A *long* spin added after everything the probe does
-makes the count read clean 3 of 3 — while the log shows the report sampled at line ~531 and the
-spin beginning at ~536. A change after the measurement cannot alter the measurement. Either the
-log's order is not the time order, or the probe's *exit* is involved, or the instrument is
-wrong. That contradiction is the reason this is parked rather than pushed through: the next
-person should start by timestamping the sample rather than trusting log position, which is
-exactly what stopped being trustworthy here.
-
-**What is not in doubt**: the feature itself. `Volume::truncate`, the service method, the
-adapter paths and all five checks behave as specified, and four of the five were watched failing
-against the rule each guards. The block is the slot accounting around it, not the emptying.
-
-**Bisected as far as it goes**: removing the whole `ftruncate` phase from the probe is clean
-(4 of 4), as is removing the truncate phase (4 of 4); within the phase no single call owns it —
-dropping the `EINVAL` probe still leaks 3 of 4, dropping the reopen-and-read still leaks 1 of 4,
-and open-and-close alone is clean 3 of 3. That pattern is monotonic in how much the phase does,
-which is what made volume the obvious suspect — and the attribution test above refuted it.
+The reading that fit none of them — a long spin making the count read clean — fits perfectly
+now: the spin moved when the sample landed. It was evidence for the answer and was read as
+evidence against it.
 
 ## Implementation plan
-
-**Every step below is built and its checks pass; none of it is landed.** The ticks are about
-the code, not about the tree — see *What blocks acceptance* above.
 
 
 1. ✅ **Done.** `Volume::free_contents` extracted from `Volume::remove`, with

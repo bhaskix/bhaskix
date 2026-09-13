@@ -10,7 +10,7 @@
 
 | | |
 |---|---|
-| RFCs accepted | **47** |
+| RFCs accepted | **48** |
 | RFCs open | 28 |
 | RFCs closed without shipping | 1 |
 | Milestone rows done | **92 of 95** |
@@ -40,6 +40,7 @@ gantt
     RFC 0067 more than one block per round trip :active, r0067, 2026-09-02, 2026-09-13
     RFC 0068 a disk that can hold BusyBox :active, r0068, 2026-09-04, 2026-09-13
     RFC 0069 a format that need not hold the filesystem :active, r0069, 2026-09-04, 2026-09-13
+    RFC 0077 a file that can be emptied :done, r0077, 2026-09-13, 1d
     section Capabilities & IPC
     RFC 0008 The shape of the system-call and IPC interface :done, r0008, 2026-08-04, 1d
     RFC 0009 Shared memory and the objects that name it :done, r0009, 2026-08-04, 1d

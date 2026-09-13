@@ -980,6 +980,42 @@ the distinction is in the table rather than in somebody's head.
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-09-13 (the second number read at the wrong moment, on the same day as the first)
+
+**RFC 0077 is accepted after all, and what parked it was not a leak.** RFC 0059's adapter
+file-slot gate reported one slot held that should have come back -- 7 boots of 8 with the change,
+0 of 8 without. Eight measurements were taken and every one was sound; the conclusion drawn from
+them was wrong.
+
+**What settled it was the positive question, and it is the second time today.** Every reading of
+that count came from the boot report, which reads it **once**. A thread sampling it past bring-up
+shows every boot settling at the healthy `2 held, peak 3` -- pass or fail depended purely on
+whether the single reading landed while the probe still had a file open. `record[4]` is
+republished on every pass of `bin/linuxd`'s loop, and the hosted probe's domain *ends* before the
+adapter has finished giving its descriptors back.
+
+**RFC 0060's longer probe widened a window that was always open.** Before it, the same gate failed
+about one boot in eight -- which is why nobody had looked.
+
+**The fix is in the instrument**: `settled_process_record` waits for the count to stop moving --
+three equal readings at ten milliseconds, up to a second -- before the gate reads it. 6 boots of 6
+pass. **And the gate still catches a real leak**: with `give_back_descriptor` forced never to
+release, it reports `12 held, peak 12` and fails. A fix that only made it quieter would have been
+worse than the bug, which is why that arm was run before this was believed.
+
+**The gate's message is corrected too.** It said *"an execve's `O_CLOEXEC` descriptor kept its
+capability"* -- one way to reach that number, never the only one, and not what was measured. Today
+that sentence sent a day of hunting into the keyboard, the controller and the IOMMU. It states
+what it measured now and leaves the cause to whoever finds it.
+
+**Two numbers read at the wrong moment, in one day, in two subsystems.** The xHCI row above and
+this one are the same defect wearing different clothes: a live figure sampled once, at an instant
+nobody checked, believed because it was printed. This file has recorded that trap four times
+before; both of today's were found only by building an instrument that could see *past bring-up*,
+which no existing instrument here can. That is the thing worth taking forward -- not the two
+fixes, but that the tree's reporting is almost entirely boot-shaped, and anything that fails after
+the shell prompts is invisible to it.
+
 ### 2026-09-13 (the xhci was never deaf: the gate asserted the echo shares a line with the prompt)
 
 **The entry below this one is wrong, and this corrects it rather than replacing it.** There is no
@@ -1020,7 +1056,7 @@ a cause it had not measured"* and has recorded it three times before.
 
 ### 2026-09-13 (a file can be emptied, and the test written to prove it passed against the bug first)
 
-**[RFC 0077](docs/rfc/0077-a-file-that-can-be-emptied.md) is built, all six steps, and **parked on the branch `rfc-0077-a-file-that-can-be-emptied` rather than landed**. It is *not* accepted: `make test` is red with it on RFC 0059's adapter file-slot gate -- one slot held that should have come back, 7 boots of 8 against 0 of 8 without it -- and the cause is not established. The RFC's own *What blocks acceptance* section carries the eight measurements and the one result that fits none of them. What is not in doubt is the feature: the emptying works and its five checks were each watched red.** `dir::TRUNCATE`
+**[RFC 0077](docs/rfc/0077-a-file-that-can-be-emptied.md) is accepted, all six steps.** It was parked for part of a day on RFC 0059's adapter file-slot gate, which turned out to be reading a live count **mid-release**: the hosted probe's domain ends before the adapter has finished handing its descriptors back, so a single reading there counts slots already on their way home. Nothing was leaking. Every boot settles at `2 held, peak 3`; the gate now reads a settled figure and still fails at `12 held, peak 12` when descriptors really are kept. `dir::TRUNCATE`
 is one method on the filesystem service, gated by the same writable badge as every other method that
 changes something, and `Volume::truncate` frees a file's blocks without removing its directory entry.
 A hosted `echo x > file` over a longer file now leaves nothing of the longer one, and
