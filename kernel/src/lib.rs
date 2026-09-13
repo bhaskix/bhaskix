@@ -22963,7 +22963,7 @@ fn user_shell(handoff: &Handoff) -> Result<(), &'static str> {
         // either way, and must say so instead of reporting ABSENT and being
         // read as evidence. This verdict was three-valued for one afternoon
         // and the third value was doing exactly that.
-        let whole = crate::console::recorded_contains(b"hosted open refused errno 2\n");
+        let whole = crate::console::recorded_contains(b"hosted pid ");
         // **A short needle, because a long one has the defect it is looking
         // for.** This asked for `b"hosted open "` -- twelve bytes -- and the
         // tear it exists to detect splits the line at an arbitrary offset,
@@ -22974,7 +22974,16 @@ fn user_shell(handoff: &Handoff) -> Result<(), &'static str> {
         // correct it. Seven bytes can still be split; they are split far less
         // often, and the verdict says TORN rather than ABSENT when they
         // survive.
-        let started = crate::console::recorded_contains(b"errno 2");
+        //
+        // **And the needle must be a line the probe still prints.** It looked
+        // for `hosted open refused errno 2` until 2026-09-13, when RFC 0060
+        // gave the probe a write path and that line stopped existing -- so
+        // this instrument reported ABSENT on every boot and could no longer
+        // detect the tear it was written for. An instrument keyed to a string
+        // somebody else owns goes quiet when they rename it, and nothing
+        // fails. It now keys on the probe's *first* line, which is printed on
+        // every boot that runs it at all and does not depend on a filesystem.
+        let started = crate::console::recorded_contains(b"auxv ok");
         let (kept, refused) = crate::console::recorded();
         println!(
             "    console record  the hosted line is {} in this kernel's own record ({kept} bytes \
