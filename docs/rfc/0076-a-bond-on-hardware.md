@@ -3799,3 +3799,82 @@ reads never becomes anything but zero on this machine, so waiting longer would
 have changed nothing. The precedent for waiting (`X722_PATIENCE_MS`, which really
 does turn a glance into a window for word 9) is what made the wrong answer
 plausible.
+
+
+## Settled: the frames arrive and nothing on those ports consumes them — 2026-09-13
+
+Three measurements, taken on three different days by two different parties, close
+the question this document has carried since 2026-09-07.
+
+**1. Our LACPDU is well-formed.** Both PDUs decoded field by field out of the
+VLAN 17 boot:
+
+| | ours | the switch's |
+|---|---|---|
+| destination | `01:80:c2:00:00:02` | `01:80:c2:00:00:02` |
+| ethertype | `8809` | `8809` |
+| length | 124 + FCS = **128** | 124 + FCS = **128** |
+| subtype / version | 1 / 1 | 1 / 1 |
+| actor system | `08:94:ef:7a:fc:8e` | `08:bd:43:76:47:e1` |
+| actor key / port | 1 / **3** | 20 / 10 |
+| actor state | `0x07` Activity\|Timeout\|Aggregation | `0x45` Activity\|Aggregation\|**Defaulted** |
+| partner system | `08:bd:43:76:47:e1` | **`00:00:00:00:00:00`** |
+| partner key / port | 20 / 10 | **0 / 0** |
+
+One actor system across all four links with a *distinct* actor port on each, and
+a partner section correctly echoing the switch's own system, key, port and state
+back at it. There is nothing here for a peer to reject on syntax.
+
+**2. They arrive, intact.** Recorded above under *"Measured around one boot"*,
+2026-09-12, taken with the ports down beforehand so nothing but Bhaskix could be
+counted: *received without error* **+35**, *CRC errors* **flat**, against **36
+LACPDUs sent**. Thirty-five of thirty-six reach the switch error-free.
+
+**3. The switch counts none of them.** The project lead read its per-port LACP
+counters on 2026-09-13: **zero received**.
+
+**Therefore the frames arrive and nothing on those ports processes them.** That
+is not a transmit defect, not the CRC, and not the PDU — all three are excluded
+by the measurements above rather than by argument. It is a port with no LACP
+receive machine running.
+
+Everything else follows without strain. The switch *transmits* LACPDUs because
+LACP is enabled on the individual ports; its partner record stays all zeros with
+`Defaulted` set because no aggregator consumes what arrives; and data frames are
+forwarded normally, which is why the ping on VLAN 5 was answered.
+
+### Where the disagreement actually lives
+
+Not between this host and the switch. **Inside the switch, between its running
+configuration and its saved one.** `startup-config` carries
+`no port-channel static` — FASTPATH for static mode *off*, which is LACP, and
+which matches what the project lead describes as the intended configuration. The
+running configuration read on 2026-09-12 said **static**. The behaviour on the
+wire matches the running configuration.
+
+### Two corrections to this document, both mine
+
+**"Lag 3 runs static, so the gate is unmeetable as wired"** (2026-09-12) was right
+in substance and wrong in standing: it was asserted from reading a configuration
+file, which is not a measurement. It is now established by three of them.
+
+**"Withdrawn — the asymmetry points at us"** (earlier on 2026-09-13) was simply
+wrong. It was written after decoding the two PDUs and finding the switch's
+partner record empty, and it reasoned that since our data frames arrive, our
+LACPDUs must not. **The measurement that refutes it was already in this document**
+— the +35 against 36 *LACPDUs* — and it was read as a general statement about
+frames rather than the specific one about LACPDUs that it is. Re-reading one's own
+record before theorising would have cost a minute.
+
+### What this means for step 3
+
+The aggregation gate is **blocked on a switch-side change**, and that change has
+a cost that is not this project's to spend: `PRD-SW1` is production, lag 3 is
+`Server3`, and moving the LAG from static to LACP bounces it — every host on the
+aggregate loses its links while the protocol converges. That is the project
+lead's maintenance window to choose, not a gate to be cleared on this document's
+account. Nothing here is to be changed on that switch by this project.
+
+What is *not* blocked, and is now free of any question about the driver: the
+transmit path is verified end to end on hardware, frame by frame, to a peer that
+receives it intact.
