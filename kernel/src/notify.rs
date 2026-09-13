@@ -426,6 +426,12 @@ impl Armed {
 
 static DEADLINES: [Armed; MAX_DEADLINES] = [const { Armed::new() }; MAX_DEADLINES];
 
+/// A slot claimed but not yet filled in -- see the claim loop in [`arm`].
+///
+/// No notification can have this index: `who` holds `index + 1`, and the index
+/// is bounded by the notification table, which is nowhere near `u32::MAX`.
+const ARMING: u32 = u32::MAX;
+
 /// Arms `id` to be signalled at `deadline`, replacing any deadline it has.
 ///
 /// **A second arming replaces the first**, which is the opposite of the
@@ -456,14 +462,41 @@ pub fn arm(id: NotificationId, deadline: u64, badge: u64) -> Result<(), NotifyEr
     }
 
     for slot in &DEADLINES {
+        // **Claimed under a marker, and published only when it is whole.**
+        //
+        // This used to claim with `want` itself and store the deadline a few
+        // instructions later, which left the slot briefly readable as
+        // `who = want, deadline = 0`. `expire` runs from the timer interrupt on
+        // *every* processor and asks only whether the deadline has passed -- and
+        // zero always has. A processor landing in that window fired a timer that
+        // had not finished being armed, cleared the slot, and left `disarm` with
+        // nothing to find.
+        //
+        // That is the `two sources` gate's failure, about two boots in twelve
+        // hundred: `leftover [false, …]` because this loop cleared the slot, and
+        // once a wake carrying both badges because the spurious timer landed
+        // beside a real signal. It is also why shortening that test's deadline
+        // to a millisecond never reproduced it -- the bug was never that the
+        // deadline was near, but that it was momentarily *zero*.
+        //
+        // **Zero is not special and must not be made special.** The ABI calls
+        // `arg0` *"an absolute deadline on the same monotonic scale `rdtsc`
+        // reads"*, so zero is a time that has already passed and must fire at
+        // the next tick. Teaching `expire` to skip zero would close this window
+        // by turning a ring-3 program's "wake me immediately" into a wake that
+        // never comes -- a hang, traded for a flake. The claim is what has to
+        // change, not the meaning of the value.
         if slot
             .who
-            .compare_exchange(0, want, Ordering::AcqRel, Ordering::Acquire)
+            .compare_exchange(0, ARMING, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
         {
             slot.generation.store(id.generation(), Ordering::Release);
             slot.badge.store(badge, Ordering::Release);
             slot.deadline.store(deadline, Ordering::Release);
+            // Last, and with a release: everything above is visible to whoever
+            // reads this.
+            slot.who.store(want, Ordering::Release);
             return Ok(());
         }
     }
@@ -498,7 +531,8 @@ pub fn disarm(id: NotificationId) -> bool {
 pub fn expire(now: u64, mut visit: impl FnMut(NotificationId, u64)) {
     for slot in &DEADLINES {
         let who = slot.who.load(Ordering::Acquire);
-        if who == 0 || slot.deadline.load(Ordering::Acquire) > now {
+        let deadline = slot.deadline.load(Ordering::Acquire);
+        if who == 0 || who == ARMING || deadline > now {
             continue;
         }
         let generation = slot.generation.load(Ordering::Acquire);
@@ -532,7 +566,7 @@ pub fn expire(now: u64, mut visit: impl FnMut(NotificationId, u64)) {
 pub fn earliest_deadline() -> Option<u64> {
     DEADLINES
         .iter()
-        .filter(|slot| slot.who.load(Ordering::Acquire) != 0)
+        .filter(|slot| !matches!(slot.who.load(Ordering::Acquire), 0 | ARMING))
         .map(|slot| slot.deadline.load(Ordering::Acquire))
         .min()
 }
@@ -559,7 +593,7 @@ pub fn armed_deadline_owners(mut each: impl FnMut(u32, u32)) {
 pub fn armed_deadlines() -> usize {
     DEADLINES
         .iter()
-        .filter(|slot| slot.who.load(Ordering::Acquire) != 0)
+        .filter(|slot| !matches!(slot.who.load(Ordering::Acquire), 0 | ARMING))
         .count()
 }
 
@@ -930,6 +964,60 @@ mod tests {
 
         expire(500, |who, _| fired.push(who));
         assert_eq!(fired, std::vec![id]);
+        destroy(id);
+    }
+
+    /// A deadline already past fires at the next expiry, zero included.
+    ///
+    /// **This is the guard on the fix that was nearly shipped instead.** The
+    /// `two sources` flake is a slot readable as `who = want, deadline = 0`
+    /// between `arm`'s claim and its deadline store, and the one-line way to
+    /// close it is to teach `expire` to skip a zero deadline. That would have
+    /// been wrong: the ABI calls `arg0` *"an absolute deadline on the same
+    /// monotonic scale `rdtsc` reads"*, so zero is a time that has passed, and a
+    /// ring-3 program arming one is asking to be woken immediately. Skipping it
+    /// turns that wake into one that never comes -- a hang, traded for a flake,
+    /// and silent.
+    ///
+    /// So the claim changed instead and this asserts the meaning that had to
+    /// survive it. Watched red against that other fix.
+    #[test]
+    fn a_deadline_already_past_fires_and_zero_is_such_a_deadline() {
+        let _alone = alone();
+        let id = create().expect("a notification");
+        arm(id, 0, 1).expect("armed");
+
+        let mut fired = std::vec::Vec::new();
+        expire(u64::MAX, |who, _| fired.push(who));
+        assert_eq!(
+            fired,
+            std::vec![id],
+            "zero is a deadline that has passed, and a program arming one is \
+             asking to be woken now"
+        );
+        destroy(id);
+    }
+
+    /// A slot is counted as armed only once it is whole.
+    ///
+    /// `arm` claims under [`ARMING`] and publishes `who` last, so every reader
+    /// of the table must treat the marker as "not armed". This checks the two
+    /// that answer questions about it -- a leaked marker would cost a slot for
+    /// the life of the boot and read as a timer belonging to nobody.
+    #[test]
+    fn arming_leaves_no_slot_marked_as_being_armed() {
+        let _alone = alone();
+        let id = create().expect("a notification");
+        let before = armed_deadlines();
+        arm(id, 100, 1).expect("armed");
+        assert_eq!(
+            armed_deadlines(),
+            before + 1,
+            "the slot is armed and counted"
+        );
+        assert_eq!(earliest_deadline(), Some(100), "and it is the soonest");
+        assert!(disarm(id), "and disarm finds it");
+        assert_eq!(armed_deadlines(), before, "and it is given back");
         destroy(id);
     }
 
