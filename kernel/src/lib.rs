@@ -19983,6 +19983,22 @@ fn report_pci_inventory() {
     println!("    pci inventory  {found} function(s) present");
 }
 
+/// How many frames must cross before `net ring` is satisfied.
+///
+/// **More than one, and that is not fussiness.** `netd`'s step-2 self-test
+/// handled exactly one frame, so a gate satisfied by one could not tell a
+/// working receive loop from the old behaviour: a receive queue that is drained
+/// and never refilled works precisely once.
+///
+/// **Named because the wait and the gate drifted apart the moment they were two
+/// numbers.** The wait added on 2026-09-13 broke out on the first frame while
+/// the gate below required two, so the SR550 boot that verified it printed
+/// `1 frames crossed` -- the wait doing its job -- followed by
+/// `FAILED: 1 frames crossed`, the gate refusing the very number the wait had
+/// settled for. One constant makes the wait wait for exactly what the gate
+/// demands, and makes a future change to one of them a change to both.
+const NET_RING_FRAMES_REQUIRED: u64 = 2;
+
 fn report_net_ring(hhdm: u64) -> bool {
     use core::sync::atomic::Ordering;
 
@@ -20059,10 +20075,10 @@ fn report_net_ring(hhdm: u64) -> bool {
     // neighbour learned during the window is reported too, which is the other
     // number this line sits beside.
     let patience = X722_PATIENCE_MS.load(Ordering::Relaxed);
-    if patience > 0 && words[1] == 0 {
+    if patience > 0 && words[1] < NET_RING_FRAMES_REQUIRED {
         for _ in 0..(patience / 50) {
             take(&mut words);
-            if words[1] > 0 {
+            if words[1] >= NET_RING_FRAMES_REQUIRED {
                 break;
             }
             wait_millis(50);
@@ -20197,7 +20213,7 @@ fn report_net_ring(hhdm: u64) -> bool {
         return false;
     }
 
-    if frames < 2 {
+    if frames < NET_RING_FRAMES_REQUIRED {
         println!(
             "\x1b[91m    net ring       FAILED: {frames} frames crossed, which one buffer \
              would explain\x1b[0m"
