@@ -1354,6 +1354,7 @@ fn answer_from_message(request: &PersonalityCall) -> Answer {
         // could name. A relative name has nowhere to be relative to, and
         // `changeable_name` refuses it as `EROFS` along with everything else
         // outside `/tmp`.
+        FTRUNCATE => answer_ftruncate(request),
         MKDIRAT => answer_make_directory(request, request.second()),
         MKDIR => answer_make_directory(request, request.first()),
         UNLINKAT => answer_unlink(request, request.second()),
@@ -2508,6 +2509,8 @@ const FCNTL: u64 = 72;
 /// `ioctl(fd, request, argument)`.
 const IOCTL: u64 = 16;
 /// `mkdirat(dirfd, path, mode)`.
+/// `ftruncate(fd, length)`.
+const FTRUNCATE: u64 = 46;
 /// `mkdir(path, mode)` — the form without a directory descriptor.
 const MKDIR: u64 = 83;
 /// `rmdir(path)`.
@@ -3611,6 +3614,34 @@ fn open_writable(
         trace_file(-2, STAGE_SERVICE_REFUSED, outcome);
         return Answer::error(-2); // ENOENT
     }
+    // **`O_TRUNC` on a name that was already there** — RFC 0077. On the create
+    // path there is nothing to do, because a file `CREATE_AT` just made is
+    // empty; this is the other half, and it was silently ignored until now, so
+    // `echo x > file` over a longer file left the old tail and said nothing.
+    //
+    // `plan.create` is false here exactly when `OPEN_AT` was sent, which
+    // includes the `EXISTS` recursion above -- that clears `create` in the plan
+    // as well as the flags, for the reason its own comment gives.
+    if plan.truncate && !plan.create && reply.args[2] == 0 {
+        let emptied = call(
+            syscall::CALL,
+            slot,
+            bhaskix_abi::dir::TRUNCATE,
+            [0, 0, 0, 0],
+        );
+        if emptied.status != status::OK || emptied.args[0] != bhaskix_abi::dir::OK {
+            // **The open fails rather than handing back a descriptor to a file
+            // that is neither its old length nor empty.** A caller that asked
+            // for `O_TRUNC` and got a descriptor is entitled to assume it.
+            release_file_slot(slot);
+            trace_file(
+                -5,
+                STAGE_TRUNCATE_REFUSED,
+                emptied.args[0] | (emptied.status << 32),
+            );
+            return Answer::error(errno_for(emptied.args[0], REFUSED_IS_FULL));
+        }
+    }
 
     let entry = Entry {
         handle: slot,
@@ -3622,7 +3653,14 @@ fn open_writable(
         },
         close_on_exec: flags & open::CLOEXEC != 0,
         offset: 0,
-        size: reply.args[1],
+        // Zero when this open truncated it: `OPEN_AT` answered the size the
+        // file had a moment ago, and believing it would make the first `read`
+        // ask for bytes that are no longer there.
+        size: if plan.truncate && !plan.create {
+            0
+        } else {
+            reply.args[1]
+        },
         readable: plan.readable,
         writable: plan.writable,
     };
@@ -3915,6 +3953,8 @@ const STAGE_WRITE_REFUSED: i64 = -150;
 const STAGE_WRITE_SILENT: i64 = -151;
 /// The hosted process's bytes would not come out of its own memory.
 const STAGE_WRITE_NO_BYTES: i64 = -152;
+/// A truncate reached the service and it refused — RFC 0077.
+const STAGE_TRUNCATE_REFUSED: i64 = -153;
 
 /// Answers a hosted `write` to an ordinary file — RFC 0060 step 3.
 ///
@@ -4137,6 +4177,61 @@ fn errno_for(outcome: u64, refused: i64) -> i64 {
         bhaskix_abi::dir::REFUSED => refused,
         _ => -5, // EIO
     }
+}
+
+/// Answers a hosted `ftruncate(fd, length)` — RFC 0077.
+///
+/// **Only to zero.** Linux can extend a file with this, which means a sparse
+/// one, and this format has no way to represent a hole; shortening to a
+/// non-zero length is suffix arithmetic no caller here needs. A length this
+/// cannot honour is refused with `EINVAL` rather than rounded to zero, because
+/// a program that asked to keep the first `n` bytes and got an empty file is
+/// worse off than one told the call is unavailable.
+fn answer_ftruncate(request: &PersonalityCall) -> Answer {
+    use bhaskix_personality::file::Kind;
+
+    let (fd, length) = (request.first(), request.second());
+    if length != 0 {
+        return Answer::error(-22); // EINVAL
+    }
+    let Ok(descriptor) = i32::try_from(fd) else {
+        return Answer::error(-9); // EBADF
+    };
+    let Some(process) = process_for(request.domain) else {
+        return Answer::error(-11); // EAGAIN
+    };
+    let Some(entry) = process.descriptors.get(descriptor).copied() else {
+        return Answer::error(-9); // EBADF
+    };
+    // The same check `write` makes, for the same reason: a descriptor opened
+    // read-only cannot empty the file, and a file under the read-only root can
+    // never be `writable` at all.
+    if entry.kind != Kind::File || !entry.writable {
+        return Answer::error(-9); // EBADF
+    }
+    let emptied = call(
+        syscall::CALL,
+        entry.handle,
+        bhaskix_abi::dir::TRUNCATE,
+        [0, 0, 0, 0],
+    );
+    if emptied.status != status::OK {
+        trace_file(-5, STAGE_TRUNCATE_REFUSED, emptied.status);
+        return Answer::error(-5); // EIO
+    }
+    if emptied.args[0] != bhaskix_abi::dir::OK {
+        trace_file(-5, STAGE_TRUNCATE_REFUSED, emptied.args[0]);
+        return Answer::error(errno_for(emptied.args[0], REFUSED_IS_FULL));
+    }
+    if let Some(process) = process_for(request.domain)
+        && let Some(entry) = process.descriptors.get_mut(descriptor)
+    {
+        // **The offset is not moved**, which is what `ftruncate` promises and
+        // `lseek` is for. A descriptor left past the end is legal and a write
+        // there extends the file, exactly as it did before.
+        entry.size = 0;
+    }
+    Answer::ok(0)
 }
 
 /// Answers a hosted `mkdirat` under the writable directory.
