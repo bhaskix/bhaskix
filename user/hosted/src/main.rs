@@ -44,6 +44,8 @@ mod nr {
     pub const MKDIR: u64 = 83;
     /// `unlink(path)`.
     pub const UNLINK: u64 = 87;
+    /// `ftruncate(fd, length)`.
+    pub const FTRUNCATE: u64 = 46;
     /// `execve(path, argv, envp)`.
     pub const EXECVE: u64 = 59;
 }
@@ -556,6 +558,7 @@ fn write_and_read_back() {
     line.put(b"\n");
     line.flush();
 
+    truncate_over_a_longer_file();
     write_past_one_chunk();
     change_the_directory();
 }
@@ -626,6 +629,154 @@ const BULK_BYTE: u8 = 0x42;
 
 /// A buffer larger than one page, so a `write` of it cannot be one round trip.
 static BULK: [u8; 5000] = [BULK_BYTE; 5000];
+
+/// RFC 0077: `> file` over a longer file leaves nothing of the longer one.
+///
+/// **The assertion is what is *not* there.** A truncate that frees nothing
+/// looks identical from the write side -- the short body is written, the call
+/// returns the right count -- and only shows up as the old tail surviving past
+/// its end. So this writes a long body, reopens with `O_TRUNC`, writes a short
+/// one, and reads back *more* than it wrote: the bytes past the short body must
+/// be absent, not merely different.
+fn truncate_over_a_longer_file() {
+    const PATH: &[u8] = b"/tmp/trunc\0";
+    const LONG: &[u8] = b"this is the longer body that truncation has to remove completely";
+    const SHORT: &[u8] = b"short";
+
+    let mut line = Line::new();
+    line.put(b"hosted trunc ");
+
+    let fd = syscall(
+        nr::OPEN,
+        PATH.as_ptr() as u64,
+        open::WRONLY | open::CREAT,
+        0o644,
+    );
+    if (fd as i64) < 0
+        || syscall(nr::WRITE, fd, LONG.as_ptr() as u64, LONG.len() as u64) != LONG.len() as u64
+    {
+        line.put(b"could not write the long body\n");
+        line.flush();
+        return;
+    }
+    syscall(nr::CLOSE, fd, 0, 0);
+
+    let over = syscall(
+        nr::OPEN,
+        PATH.as_ptr() as u64,
+        open::WRONLY | open::TRUNC,
+        0o644,
+    );
+    if (over as i64) < 0 {
+        line.put(b"reopen with O_TRUNC refused errno ");
+        line.number(over.wrapping_neg());
+        line.put(b"\n");
+        line.flush();
+        return;
+    }
+    let wrote = syscall(nr::WRITE, over, SHORT.as_ptr() as u64, SHORT.len() as u64);
+    syscall(nr::CLOSE, over, 0, 0);
+    if wrote != SHORT.len() as u64 {
+        line.put(b"short body did not go\n");
+        line.flush();
+        return;
+    }
+
+    let back = syscall(nr::OPEN, PATH.as_ptr() as u64, open::RDONLY, 0);
+    if (back as i64) < 0 {
+        line.put(b"reopen refused errno ");
+        line.number(back.wrapping_neg());
+        line.put(b"\n");
+        line.flush();
+        return;
+    }
+    let mut buffer = [0u8; 128];
+    // Asks for far more than the short body, so a surviving tail is read
+    // rather than left outside the window.
+    let read = syscall(
+        nr::READ,
+        back,
+        buffer.as_mut_ptr() as u64,
+        buffer.len() as u64,
+    );
+    syscall(nr::CLOSE, back, 0, 0);
+    if (read as i64) != SHORT.len() as i64 {
+        line.put(b"read back ");
+        line.number(read);
+        line.put(b" bytes, wanted ");
+        line.number(SHORT.len() as u64);
+        line.put(b" -- the old body is still there\n");
+        line.flush();
+        return;
+    }
+    if &buffer[..SHORT.len()] != SHORT {
+        line.put(b"read back the wrong bytes\n");
+        line.flush();
+        return;
+    }
+    // **And the same thing through `ftruncate`, because `O_TRUNC` proving the
+    // service works does not prove the call a program actually holds does.**
+    // A shell redirects with `O_TRUNC`; anything that keeps a descriptor and
+    // empties it in place uses this one, and it is a different arm of the
+    // adapter reaching the same method.
+    let again = syscall(nr::OPEN, PATH.as_ptr() as u64, open::WRONLY, 0o644);
+    if (again as i64) < 0 {
+        line.put(b"reopen for ftruncate refused errno ");
+        line.number(again.wrapping_neg());
+        line.put(b"\n");
+        line.flush();
+        return;
+    }
+    if syscall(nr::WRITE, again, LONG.as_ptr() as u64, LONG.len() as u64) != LONG.len() as u64 {
+        line.put(b"could not write the long body again\n");
+        line.flush();
+        return;
+    }
+    // A length this system cannot honour is refused rather than rounded to
+    // zero: a program that asked to keep the first five bytes and got an empty
+    // file is worse off than one told the call is unavailable.
+    let refused = syscall(nr::FTRUNCATE, again, 5, 0);
+    if (refused as i64) != -22 {
+        line.put(b"ftruncate to a non-zero length answered ");
+        line.number(refused.wrapping_neg());
+        line.put(b", wanted EINVAL\n");
+        line.flush();
+        return;
+    }
+    if syscall(nr::FTRUNCATE, again, 0, 0) != 0 {
+        line.put(b"ftruncate to zero was refused\n");
+        line.flush();
+        return;
+    }
+    syscall(nr::CLOSE, again, 0, 0);
+
+    let after = syscall(nr::OPEN, PATH.as_ptr() as u64, open::RDONLY, 0);
+    if (after as i64) < 0 {
+        line.put(b"reopen after ftruncate refused\n");
+        line.flush();
+        return;
+    }
+    let mut empty = [0u8; 128];
+    let left = syscall(
+        nr::READ,
+        after,
+        empty.as_mut_ptr() as u64,
+        empty.len() as u64,
+    );
+    syscall(nr::CLOSE, after, 0, 0);
+    if left != 0 {
+        line.put(b"ftruncate left ");
+        line.number(left);
+        line.put(b" bytes behind\n");
+        line.flush();
+        return;
+    }
+
+    line.put(b"ok: a longer body was emptied, ");
+    line.number(read);
+    line.put(b" bytes left and nothing past them; ftruncate emptied it again\n");
+    line.flush();
+}
 
 /// RFC 0060 step 4: `mkdir` and `unlink` under the writable directory.
 ///

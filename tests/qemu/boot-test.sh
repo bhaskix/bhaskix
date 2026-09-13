@@ -3358,6 +3358,30 @@ else
     status=1
 fi
 
+# RFC 0077: `O_TRUNC` over a longer file leaves nothing of the longer one.
+#
+# **Asserted by absence, which is the only way a truncate can be.** A truncate
+# that frees nothing is invisible from the write side: the short body goes, the
+# count is right, and the only symptom is the old tail surviving past its end.
+# So the probe reads back far more than it wrote and the gate requires the read
+# to stop at the short body.
+#
+# It replaces a silent wrong answer rather than adding a feature: until RFC 0077
+# `O_TRUNC` on an existing file was ignored, so `echo x > file` over a longer
+# one left the tail and said nothing.
+if grep -qF "hosted trunc ok: a longer body was emptied, 5 bytes left and nothing past them; ftruncate emptied it again" "$LOG"; then
+    pass "a hosted O_TRUNC emptied a longer file: the old tail is gone, not overwritten"
+elif grep -qF "hosted exec    skipped" "$LOG" \
+    || grep -qF "fs domain      no block service on this machine" "$LOG"; then
+    pass "no filesystem service on this machine, so nothing was truncated"
+elif grep -qF "hosted trunc " "$LOG"; then
+    fail "the hosted truncate stopped: $(grep -aoE 'hosted trunc .{0,70}' "$LOG" | head -1)"
+    status=1
+else
+    fail "the hosted program did not say whether O_TRUNC emptied a longer file"
+    status=1
+fi
+
 # RFC 0060 step 4: `mkdir` and `unlink` under the writable directory, and
 # neither of them anywhere else.
 #
