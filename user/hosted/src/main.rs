@@ -38,24 +38,34 @@ mod nr {
     pub const OPEN: u64 = 2;
     /// `close(fd)`.
     pub const CLOSE: u64 = 3;
+    /// `read(fd, buffer, count)`.
+    pub const READ: u64 = 0;
+    /// `mkdir(path, mode)`.
+    pub const MKDIR: u64 = 83;
+    /// `unlink(path)`.
+    pub const UNLINK: u64 = 87;
     /// `execve(path, argv, envp)`.
     pub const EXECVE: u64 = 59;
 }
 
 /// `open` flags, from this machine's own headers.
 mod open {
+    /// Read only.
+    pub const RDONLY: u64 = 0o0;
     /// Write only.
     pub const WRONLY: u64 = 0o1;
     /// Create if absent.
     ///
-    /// **Not used, and kept deliberately.** Opening with it works — a hosted
-    /// program gets a real file and `fd 3` — but the journalled write that
-    /// follows reproducibly reddens the TCP inbound gate: 5 boots of 5 with
-    /// it, 3 of 3 without. It is measured in TRACKER §3 as a lever on that
-    /// defect, and this constant is what the next person flips to reproduce
-    /// it in one line.
-    #[allow(dead_code, reason = "the lever for TRACKER §3's TCP measurement")]
+    /// **Used since RFC 0060 step 3.** This constant carried a note saying it
+    /// was deliberately unused, because opening with it reddened the TCP
+    /// inbound gate 5 boots of 5 on 2026-08-31 and which half of the system
+    /// was at fault had never been established. Re-measured on 2026-09-13
+    /// against a tree thirteen days newer: 0 red of 10, with the journal
+    /// commit demonstrably happening on every one. The note is retired and
+    /// the measurement that retired it is in TRACKER §3.
     pub const CREAT: u64 = 0o100;
+    /// Truncate to nothing on open, which is what `>` means.
+    pub const TRUNC: u64 = 0o1000;
 }
 
 /// Auxiliary-vector entry types this program checks.
@@ -325,10 +335,9 @@ extern "C" fn hosted_main(stack: *const u64) -> ! {
     line.put(b"\n");
     line.flush();
 
-    // RFC 0060, step 2 in isolation: **open only, no write.** The bisect said
-    // exercising the write path breaks an unrelated socket gate, and which
-    // half does it was never established -- so this half runs alone.
-    open_only();
+    // RFC 0060: create a file, write to it, read it back, and refuse to write
+    // where nothing may be written.
+    write_and_read_back();
 
     // **RFC 0068's demonstration: run a command through somebody else's
     // shell.** Everything below this line was built for it -- RFC 0059 made
@@ -421,28 +430,256 @@ fn exec_busybox() {
 #[unsafe(no_mangle)]
 static WIDER_THAN_THE_WINDOW: [u8; 64 * 1024] = [0x5a; 64 * 1024];
 
-/// Opens a file under the writable directory and closes it. Nothing is
-/// written: this exists to say whether the *open* alone is what disturbs the
-/// machine.
-fn open_only() {
+/// The whole of RFC 0060 from a hosted program's side: create, write, close,
+/// reopen, read back — and be refused where nothing may be written.
+///
+/// **The prefix is `hosted tmp` and not `hosted write`, which is taken.**
+/// RFC 0032 step 10's hand-assembled corpus program writes the literal
+/// `hosted write ok\n` out of the adapter's console capability, and
+/// `boot-test.sh` greps for exactly that. A second producer of the same bytes
+/// would let that gate pass on the wrong program's output.
+///
+/// **The body is what proves it.** The gate matches on these exact bytes, and
+/// no other part of this machine emits them: they exist only in this program's
+/// `.rodata`, and the only way they can reach the console a second time is by
+/// having gone out to a real file on the disk and come back. A gate that
+/// asserted "the write returned a positive number" would pass on a write the
+/// filesystem discarded.
+///
+/// **The refusal is the more important half.** A machine where a hosted
+/// program can write under `/tmp` is the feature; a machine where it can write
+/// anywhere else is a broken containment claim, and RFC 0031 I3 is what would
+/// be broken. So the read-only root is attempted on every boot and the errno
+/// is printed rather than assumed.
+fn write_and_read_back() {
     const PATH: &[u8] = b"/tmp/hosted.txt\0";
+    /// A file that **exists** under the read-only root and must never become
+    /// writable.
+    ///
+    /// **The name has to be real, and an earlier draft's was not.** With a
+    /// name that is not there, the open is refused for absence and the gate
+    /// passes without ever testing writability -- which the arming caught:
+    /// removing the adapter's `EROFS` guard left the probe printing `errno 2`
+    /// and the gate saying it could not tell. `inner` is created under `sub`
+    /// by the kernel on every machine that formats this disk.
+    const SEALED: &[u8] = b"/inner\0";
+    const BODY: &[u8] = b"a hosted process wrote this through a capability";
+
+    // **The containment arm runs first, because it must not be skippable.**
+    // Every failure path below returns early, so with this at the end an
+    // unrelated short write would take the containment assertion with it and
+    // the gate would report "did not say" for the one claim that matters most.
+    // Watched: dropping the write silently made both arms red, and only one of
+    // them was about the write.
+    //
+    // `open` for writing under the read-only root must answer `EROFS`, and
+    // must do so without the filesystem service ever being asked -- the
+    // adapter holds nothing there that could carry a write.
+    let mut sealed = Line::new();
+    sealed.put(b"hosted sealed ");
+    let refused = syscall(nr::OPEN, SEALED.as_ptr() as u64, open::WRONLY, 0);
+    if (refused as i64) < 0 {
+        sealed.put(b"refused errno ");
+        sealed.number(refused.wrapping_neg());
+    } else {
+        sealed.put(b"OPENED FOR WRITING, fd ");
+        sealed.number(refused);
+        syscall(nr::CLOSE, refused, 0, 0);
+    }
+    sealed.put(b"\n");
+    sealed.flush();
 
     let mut line = Line::new();
-    line.put(b"hosted open ");
+    line.put(b"hosted tmp ");
+
     let fd = syscall(
         nr::OPEN,
         PATH.as_ptr() as u64,
-        open::WRONLY, // BISECT: no CREAT, so no journalled write
+        open::WRONLY | open::CREAT | open::TRUNC,
         0o644,
     );
     if (fd as i64) < 0 {
-        line.put(b"refused errno ");
+        line.put(b"open refused errno ");
         line.number(fd.wrapping_neg());
-    } else {
-        line.put(b"ok fd ");
-        line.number(fd);
-        syscall(nr::CLOSE, fd, 0, 0);
+        line.put(b"\n");
+        line.flush();
+        return;
     }
+    let wrote = syscall(nr::WRITE, fd, BODY.as_ptr() as u64, BODY.len() as u64);
+    syscall(nr::CLOSE, fd, 0, 0);
+    if (wrote as i64) != BODY.len() as i64 {
+        line.put(b"wrote ");
+        line.number(wrote);
+        line.put(b" of ");
+        line.number(BODY.len() as u64);
+        line.put(b"\n");
+        line.flush();
+        return;
+    }
+
+    // **Reopened rather than rewound**, because a descriptor that never left
+    // the adapter could be answered out of a record this program's own write
+    // just updated. A second `open` resolves the name again and the bytes come
+    // off the disk through the filesystem service.
+    let back = syscall(nr::OPEN, PATH.as_ptr() as u64, open::RDONLY, 0);
+    if (back as i64) < 0 {
+        line.put(b"reopen refused errno ");
+        line.number(back.wrapping_neg());
+        line.put(b"\n");
+        line.flush();
+        return;
+    }
+    let mut buffer = [0u8; 64];
+    let read = syscall(
+        nr::READ,
+        back,
+        buffer.as_mut_ptr() as u64,
+        buffer.len() as u64,
+    );
+    syscall(nr::CLOSE, back, 0, 0);
+    if (read as i64) != BODY.len() as i64 {
+        line.put(b"read back ");
+        line.number(read);
+        line.put(b" of ");
+        line.number(BODY.len() as u64);
+        line.put(b"\n");
+        line.flush();
+        return;
+    }
+    if &buffer[..BODY.len()] != BODY {
+        line.put(b"read back the wrong bytes\n");
+        line.flush();
+        return;
+    }
+    line.put(b"ok: ");
+    line.put(&buffer[..BODY.len()]);
+    line.put(b"\n");
+    line.flush();
+
+    write_past_one_chunk();
+    change_the_directory();
+}
+
+/// More than one page in a single `write`, which is what says the adapter
+/// loops.
+///
+/// **The number is the assertion.** `COPY_IN` moves at most one page and
+/// `WRITE_FROM` takes at most one page, so 5,000 bytes cannot cross in one
+/// round trip. A `write` that answers 5,000 has been through the loop at least
+/// twice; one that answers 4,096 has not, which is the short write RFC 0060
+/// decided against and which plenty of Linux software mishandles.
+fn write_past_one_chunk() {
+    const PATH: &[u8] = b"/tmp/bulk\0";
+
+    let mut line = Line::new();
+    line.put(b"hosted bulk ");
+    let fd = syscall(
+        nr::OPEN,
+        PATH.as_ptr() as u64,
+        open::WRONLY | open::CREAT | open::TRUNC,
+        0o644,
+    );
+    if (fd as i64) < 0 {
+        line.put(b"open refused errno ");
+        line.number(fd.wrapping_neg());
+        line.put(b"\n");
+        line.flush();
+        return;
+    }
+    let wrote = syscall(nr::WRITE, fd, BULK.as_ptr() as u64, BULK.len() as u64);
+    syscall(nr::CLOSE, fd, 0, 0);
+    if (wrote as i64) != BULK.len() as i64 {
+        line.put(b"wrote ");
+        line.number(wrote);
+        line.put(b" of ");
+        line.number(BULK.len() as u64);
+        line.put(b"\n");
+        line.flush();
+        return;
+    }
+    // A count is not bytes on a disk. Reading the head back says the first
+    // chunk is really there; the count says the second one went too.
+    let back = syscall(nr::OPEN, PATH.as_ptr() as u64, open::RDONLY, 0);
+    if (back as i64) < 0 {
+        line.put(b"reopen refused errno ");
+        line.number(back.wrapping_neg());
+        line.put(b"\n");
+        line.flush();
+        return;
+    }
+    let mut head = [0u8; 32];
+    let read = syscall(nr::READ, back, head.as_mut_ptr() as u64, head.len() as u64);
+    syscall(nr::CLOSE, back, 0, 0);
+    if (read as i64) != head.len() as i64 || head.iter().any(|byte| *byte != BULK_BYTE) {
+        line.put(b"read back the wrong head\n");
+        line.flush();
+        return;
+    }
+    line.put(b"ok: ");
+    line.number(wrote);
+    line.put(b" bytes in one write, past the one-page chunk\n");
+    line.flush();
+}
+
+/// The byte [`BULK`] is filled with, checked on the way back out.
+const BULK_BYTE: u8 = 0x42;
+
+/// A buffer larger than one page, so a `write` of it cannot be one round trip.
+static BULK: [u8; 5000] = [BULK_BYTE; 5000];
+
+/// RFC 0060 step 4: `mkdir` and `unlink` under the writable directory.
+///
+/// **The unlink is checked by trying to open what it removed**, not by its own
+/// return value. A `REMOVE_AT` that answered `OK` and freed nothing would look
+/// identical from here, and the file it left behind would be found by a later
+/// boot rather than by this gate.
+///
+/// `mkdir` and `unlink` are the plain forms, not the `at` ones, because a
+/// static BusyBox emits these numbers -- so this exercises the path `rm` and
+/// `mkdir` actually take rather than the one a libc wrapper might.
+fn change_the_directory() {
+    const MADE: &[u8] = b"/tmp/made\0";
+    const PATH: &[u8] = b"/tmp/hosted.txt\0";
+    /// A file under the read-only root, which `unlink` must not remove.
+    const SEALED: &[u8] = b"/inner\0";
+
+    let mut line = Line::new();
+    line.put(b"hosted change ");
+
+    let made = syscall(nr::MKDIR, MADE.as_ptr() as u64, 0o755, 0);
+    if (made as i64) < 0 {
+        line.put(b"mkdir refused errno ");
+        line.number(made.wrapping_neg());
+        line.put(b"\n");
+        line.flush();
+        return;
+    }
+    let gone = syscall(nr::UNLINK, PATH.as_ptr() as u64, 0, 0);
+    if (gone as i64) < 0 {
+        line.put(b"unlink refused errno ");
+        line.number(gone.wrapping_neg());
+        line.put(b"\n");
+        line.flush();
+        return;
+    }
+    // What says the unlink was real: the name must no longer resolve.
+    let after = syscall(nr::OPEN, PATH.as_ptr() as u64, open::RDONLY, 0);
+    if (after as i64) >= 0 {
+        syscall(nr::CLOSE, after, 0, 0);
+        line.put(b"unlinked but STILL THERE\n");
+        line.flush();
+        return;
+    }
+    // And the read-only root keeps its own: an `unlink` there must be refused
+    // for the same structural reason a write is.
+    let sealed = syscall(nr::UNLINK, SEALED.as_ptr() as u64, 0, 0);
+    if (sealed as i64) >= 0 {
+        line.put(b"REMOVED A FILE FROM THE READ-ONLY ROOT\n");
+        line.flush();
+        return;
+    }
+    line.put(b"ok: made a directory, removed a file, and the root kept its own errno ");
+    line.number(sealed.wrapping_neg());
     line.put(b"\n");
     line.flush();
 }
