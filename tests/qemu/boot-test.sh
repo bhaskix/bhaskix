@@ -1492,7 +1492,17 @@ fi
 # **Nineteen** since `bin/hosted` joined at RFC 0059 -- and it failed twice in
 # two files again, in that order, which is now twice this comment has paid for
 # itself.
-if grep -qE "vfs +[0-9]+ entries in /, 19 in /bin; bin/probe is ELF64, entry 0x10000000, 3 segments" "$LOG"; then
+# **The expected count comes from the image this booted, not a literal.** The
+# Go corpus is only in the image when `GO_CORPUS_IN_IMAGE=1` asked for it -- it
+# is 788 KiB of a four-megabyte ceiling, and leaving it out is what keeps the
+# root under that bound. Hard-coding 19 here would fail every default build;
+# loosening it to a range would give up what this check is for, which is
+# noticing when `/bin` changes at all.
+bin_expected=18
+if tar tf "$REPO_ROOT/build/initrd.tar" 2>/dev/null | grep -q 'bin/go-hello'; then
+    bin_expected=19
+fi
+if grep -qE "vfs +[0-9]+ entries in /, $bin_expected in /bin; bin/probe is ELF64, entry 0x10000000, 3 segments" "$LOG"; then
     pass "paths resolve, bad paths are refused, and bin/probe parses as ELF64"
 else
     fail "the VFS or the ELF parser did not pass"

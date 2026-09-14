@@ -5167,10 +5167,25 @@ fn corpus_self_test(hhdm_base: u64, cpus: u32, busybox: bool) -> bool {
     retire_probe(realm);
 
     if made == 0 {
-        println!(
-            "\x1b[93m    {label}      the binary made no system calls: it is absent, empty, \
-             or it faulted before its first one\x1b[0m"
-        );
+        // **A program that is not in this image is a skip, not a fault**, and
+        // saying so is the difference between a line somebody investigates and
+        // one they can read past. The Go corpus is only built in when
+        // `GO_CORPUS_IN_IMAGE=1` asks for it -- it is 788 KiB against a
+        // four-megabyte ceiling -- so on an ordinary build this path is the
+        // expected one, and it used to print a sentence listing three possible
+        // faults for a program nobody put there.
+        let named = if busybox { BUSYBOX_PROGRAM } else { GO_PROGRAM };
+        if vfs::open(named).is_err() {
+            println!(
+                "    {label}      not in this image, so nothing was asked of it \
+                 (GO_CORPUS_IN_IMAGE=1 builds it in)"
+            );
+        } else {
+            println!(
+                "\x1b[93m    {label}      the binary made no system calls: it is empty, or it \
+                 faulted before its first one\x1b[0m"
+            );
+        }
         return true;
     }
 
@@ -23885,33 +23900,48 @@ extern "C" fn user_shell_entry(hhdm_base: u64) -> ! {
     unsafe { enter_user("shell", entry, rsp, [0, 0]) }
 }
 
+/// How many entries `bin/` should hold, for the listing check above.
+///
+/// **Exact, and it stays exact.** That check has gone red on the first boot of
+/// nineteen image changes, which is its whole value -- a count that drifts is a
+/// count nobody believes. What it cannot be is a *literal*, because the Go
+/// corpus is no longer always in the image: it is 788 KiB of a four-megabyte
+/// ceiling (`MAX_ROOT_IMAGE`), and taking it out is what buys the margin back.
+///
+/// So the expectation is derived from the image rather than loosened to a
+/// range. Eighteen programs are always there; the Go corpus makes nineteen when
+/// `GO_CORPUS_IN_IMAGE=1` built it in. A missing *program* still fails, which
+/// is what the check is for.
+fn expected_bin_entries() -> usize {
+    18 + usize::from(vfs::open(GO_PROGRAM).is_ok())
+}
+
 /// Largest filesystem image this will read off a disk.
 ///
-/// **Eight megabytes, raised from four on 2026-09-14.** The image is read into
-/// the heap in one piece, so the bound is what stops a device reporting an
-/// implausible capacity from turning into an allocation the size of whatever
-/// it claimed. Eight serves that as well as four did; what four had stopped
-/// serving was the image this project actually builds.
+/// **Four megabytes, and it is not a tunable.** The image is read into the heap
+/// in *one contiguous allocation*, which goes to the buddy allocator, whose
+/// `MAX_ORDER` is 10 -- so the largest single allocation this system can make
+/// is `2^10 * 4096` bytes, four megabytes exactly. This constant is that limit
+/// written down, not a policy choice.
 ///
-/// **Raised because it was crossed, and crossing it was invisible.** The
-/// initrd reached 4,140 KiB on CI while this bound was 4,096 -- and the
-/// clamped read was silent, so the boot continued with 44 KiB missing and
-/// failed as `vfs FAILED: a leading slash is accepted and means the same
-/// thing`, an assertion about a file that lived in the dropped tail. The same
-/// source built 160 KiB smaller here and fitted, so it reproduced on no local
-/// machine. A short read says so now, which is the more important half of that
-/// fix: this number will be crossed again.
+/// **Raised to eight on 2026-09-14 and put back the same day**, which is worth
+/// recording because the mistake is easy to repeat. The initrd had crossed four
+/// megabytes on CI and the clamped read was silent, so raising this looked like
+/// the fix. It is not: at eight, `read_all` asks for the disk's true size, the
+/// allocator cannot serve an order-11 request, and the read fails outright --
+/// `the disk could not be read (OutOfMemory); using the ramdisk`. That is a
+/// better failure than a silent truncation and still a broken boot.
 ///
-/// **The margin is the point, not the number.** At 4 MiB the headroom was
-/// under 1%, which is not a bound anyone is watching -- it is a tripwire. The
-/// image is ~3,980 KiB here and ~4,140 KiB on CI, so eight leaves roughly half
-/// the bound spare and a year of ordinary growth.
+/// The bound also does the job its first version described: it stops a device
+/// reporting an implausible capacity from turning into an allocation the size
+/// of whatever it claimed.
 ///
-/// A real filesystem reads blocks as it needs them and has no such number;
-/// this one is a whole image held in memory and says so. Removing the bound
-/// entirely means demand paging the root, which is a design change and wants
-/// its own RFC rather than a constant edited under pressure.
-const MAX_ROOT_IMAGE: u64 = 8 * 1024 * 1024;
+/// **Getting past four megabytes means not holding the root in one piece** --
+/// reading it in chunks, or demand-paging it. That is a design change and wants
+/// an RFC, which is what the original comment said and what raising the number
+/// tried to avoid. Until then the image must fit, and `mount_root` says so
+/// loudly when it does not.
+const MAX_ROOT_IMAGE: u64 = 4 * 1024 * 1024;
 
 /// Chooses where the root filesystem comes from, and mounts it.
 ///
@@ -26279,7 +26309,7 @@ fn vfs_self_test(handoff: &Handoff) -> bool {
             // went red on the first boot of that change, before the change's
             // own gate had ever run.
             "a listing shows what is directly under a directory",
-            entries >= 3 && bin == 19,
+            entries >= 3 && bin == expected_bin_entries(),
         ),
         (
             "the user program is an ELF the loader accepts",

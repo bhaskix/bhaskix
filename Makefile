@@ -92,6 +92,47 @@ GO_HELLO     := build/go-hello
 # the Go corpus is.
 BUSYBOX_SRC  := $(shell for c in /bin/busybox /usr/bin/busybox; do                    if [ -x "$$c" ] && file -L "$$c" 2>/dev/null | grep -q 'statically linked';                    then echo "$$c"; break; fi; done)
 BUSYBOX      := build/busybox
+# **The Go corpus is out of the image unless asked for, and the reason is a
+# hard ceiling rather than taste.** The root filesystem is read into *one
+# contiguous allocation*, and the buddy allocator's `MAX_ORDER` of 10 caps that
+# at four megabytes exactly (`MAX_ROOT_IMAGE`). The image was 3,980 KiB here and
+# ~4,140 KiB on CI -- the same source, because the toolchains differ -- so on
+# 2026-09-13 it crossed that ceiling there, the read was clamped in silence, and
+# the lane failed as `vfs FAILED: a leading slash is accepted and means the same
+# thing` about a file that had been in the dropped 44 KiB.
+#
+# **BusyBox was the first candidate and is the wrong one.** It is larger (2,121
+# KiB against 788), but `boot-test.sh` asserts `hi from sh` on every lane with no
+# skip arm -- that is RFC 0068's L1 proof, and taking it out silently retires it.
+# The Go corpus has no gate of its own, so this is the member that can go without
+# anything ceasing to be proven.
+#
+# `make iso GO_CORPUS_IN_IMAGE=1` puts it back.
+GO_CORPUS_IN_IMAGE ?= 0
+# **A stamp, because `make` cannot see a variable.** The image's *contents* now
+# depend on `GO_CORPUS_IN_IMAGE`, and nothing in the dependency graph changes when
+# it does -- so flipping it left `initrd.tar` untouched and handed the caller
+# the previous build. The first version of this shipped that trap and the
+# BusyBox lane caught it immediately, booting an image with no BusyBox in it
+# and reporting that its shell never reached a prompt.
+#
+# The stamp records the value; the image depends on the stamp; changing the
+# value rewrites the stamp and the image rebuilds. A silently wrong image is
+# exactly what this whole change is about not doing.
+GO_CORPUS_STAMP := build/.go-corpus-in-image
+$(GO_CORPUS_STAMP): FORCE
+	@mkdir -p $(dir $@)
+	@printf '%s' '$(GO_CORPUS_IN_IMAGE)' | cmp -s - $@ 2>/dev/null || printf '%s' '$(GO_CORPUS_IN_IMAGE)' > $@
+FORCE:
+.PHONY: FORCE
+
+ifeq ($(GO_CORPUS_IN_IMAGE),1)
+GO_CORPUS_DEP   := $(GO_HELLO)
+GO_CORPUS_FILE  := --file bin/go-hello=$(GO_HELLO)
+else
+GO_CORPUS_DEP   :=
+GO_CORPUS_FILE  :=
+endif
 GREEDY_BPK   := build/greedy.bpk
 USER_SHELL   := $(SHELL_DIR)/target/$(TARGET)/release/shell
 USER_SUP     := $(SUP_DIR)/target/$(TARGET)/release/sup
@@ -295,13 +336,13 @@ FORCE:
 # and mkimage stages, hashes, verifies with the machine's own parsers, and
 # drives the same tar flags this rule always trusted. Assembled twice and
 # byte-compared every build: determinism is a gate, not a hope.
-$(INITRD): $(MKIMAGE) $(shell find $(INITRD_DIR) packages -type f 2>/dev/null | sort) $(PROBE) $(USER_SHELL) $(USER_VFSD) $(USER_CONSOLED) $(USER_BLKD) $(USER_AHCID) $(USER_NETD) $(USER_IPD) $(USER_DHCPD) $(USER_UDP6) $(USER_TCPD) $(USER_LINUXD) $(USER_TCPC) $(USER_TRACED) $(USER_FSD) $(USER_SUP) $(FS_IMAGE) $(HELLO_BPK) $(GREEDY_BPK) $(GO_HELLO) $(BUSYBOX) $(HOSTED)
+$(INITRD): $(MKIMAGE) $(shell find $(INITRD_DIR) packages -type f 2>/dev/null | sort) $(PROBE) $(USER_SHELL) $(USER_VFSD) $(USER_CONSOLED) $(USER_BLKD) $(USER_AHCID) $(USER_NETD) $(USER_IPD) $(USER_DHCPD) $(USER_UDP6) $(USER_TCPD) $(USER_LINUXD) $(USER_TCPC) $(USER_TRACED) $(USER_FSD) $(USER_SUP) $(FS_IMAGE) $(HELLO_BPK) $(GREEDY_BPK) $(BUSYBOX) $(GO_CORPUS_DEP) $(HOSTED) $(GO_CORPUS_STAMP)
 	@mkdir -p $(dir $@)
 	./$(MKIMAGE) $@ $(INITRD_ROOT) --root . --static $(INITRD_DIR) \
 	    --file fs.img=$(FS_IMAGE) \
 	    --file hello.bpk=$(HELLO_BPK) \
 	    --file greedy.bpk=$(GREEDY_BPK) \
-	    --file bin/go-hello=$(GO_HELLO) \
+	    $(GO_CORPUS_FILE) \
 	    --file bin/hosted=$(HOSTED) \
 	    --file bin/busybox=$(BUSYBOX) \
 	    \
@@ -310,7 +351,7 @@ $(INITRD): $(MKIMAGE) $(shell find $(INITRD_DIR) packages -type f 2>/dev/null | 
 	    --file fs.img=$(FS_IMAGE) \
 	    --file hello.bpk=$(HELLO_BPK) \
 	    --file greedy.bpk=$(GREEDY_BPK) \
-	    --file bin/go-hello=$(GO_HELLO) \
+	    $(GO_CORPUS_FILE) \
 	    --file bin/hosted=$(HOSTED) \
 	    --file bin/busybox=$(BUSYBOX) \
 	    $(foreach manifest,$(PACKAGES),--package $(manifest))
