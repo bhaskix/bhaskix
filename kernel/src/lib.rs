@@ -28381,9 +28381,22 @@ fn wait_queue_self_test(hhdm_base: u64) -> bool {
     // still runnable is a competitor it never accounted for.
     // The second breadcrumb. Everything below this line takes a lock -- the
     // waiters lock in `wake_all`, a runqueue lock per queue in
-    // `threads_present_exact`, and the console in any report -- and a thread
-    // switched out holding one of them never gives it back. Reaching this line
-    // and not the summary puts the hang there rather than in the window above.
+    // `threads_present_exact`, and the console in any report -- so reaching
+    // this line and not the summary puts the hang there rather than in the
+    // window above.
+    //
+    // **It is not preemption that would strand one, and this comment said it
+    // was until 2026-09-14.** It read "a thread switched out holding one of
+    // them never gives it back", which `sched::preempt_reporting` refuses to
+    // allow: *"Never take the CPU away from a thread holding a spinlock ...
+    // this is not an optimisation, it is what makes spinlocks work at all"*.
+    // The wrong half sent an afternoon after a wedged console as the
+    // explanation for specimen eighteen's silence, and a change to the
+    // bring-up watchdog was written on it before the lock rules were read.
+    //
+    // What can still strand a holder is a holder that never returns at all: a
+    // fault, a halt, or a spin on something else while holding this. Those are
+    // worth suspecting here. Being descheduled is not.
     println!(
         "    wait queues    retiring the ring: publishing the phase, then waking every station"
     );
