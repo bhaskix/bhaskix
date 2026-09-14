@@ -74,6 +74,21 @@ thread LockHeld
 error code
 selector index'
 
+# RFC 0078. Not an exception at all: a deliberate spin in the window that has no
+# watchdog *thread* in it, because one cannot be armed before
+# `sched::start_all`. What is asserted is that the machine says so -- before
+# RFC 0078 a stall there printed one line and then nothing until the harness
+# gave up, which is what specimen eighteen of the ring-station row looked like
+# and why it was read as a wedged console and then as a lost wakeup.
+#
+# The report comes from the timer interrupt after 45 seconds of quiet, so this
+# case is slower than the others by design. `stalling before the scheduler` is
+# asserted too: without it a machine that never reached the fault at all would
+# look the same as one that did.
+  [stall-early]='fault injection: stalling before the scheduler is started
+BRING-UP STALLED BEFORE THE SCHEDULER WAS WATCHING
+ran from the timer interrupt'
+
   # The odd one out, and the only one whose point is what happens *next*.
   #
   # The first six are kernel faults and every one of them ends the machine, so
@@ -99,7 +114,7 @@ Nothing left to do at this milestone'
 )
 
 FAULTS=("$@")
-[[ ${#FAULTS[@]} -eq 0 ]] && FAULTS=(de ud bp gp gp-held pf df user)
+[[ ${#FAULTS[@]} -eq 0 ]] && FAULTS=(de ud bp gp gp-held pf df user stall-early)
 
 # Anything here means the machine did not survive to report cleanly.
 FATAL_MARKERS=(

@@ -71,6 +71,19 @@ pub enum Fault {
     /// deterministic, so the report's own guarantee -- that it prints what it
     /// knows before it halts -- has something that can falsify it.
     GeneralProtectionHoldingRunqueue,
+    /// A stall in the window that has no watchdog thread yet — RFC 0078.
+    ///
+    /// Spins for ever *before* `scheduling_self_test`, which is before
+    /// `sched::start_all`, which is the earliest a watchdog thread can be
+    /// armed. Until RFC 0078 a machine that stopped there printed one line and
+    /// nothing else until the harness killed it — the shape of specimen
+    /// eighteen of `TRACKER.md`'s ring-station row, which cost an afternoon on
+    /// two wrong theories because the silence named nothing.
+    ///
+    /// It exists for `gp-held`'s reason, in `gp-held`'s words: a report whose
+    /// whole claim is that a stall will not be silent needs a stall, or the
+    /// claim has nothing that can falsify it.
+    StallEarly,
 }
 
 impl Fault {
@@ -86,6 +99,7 @@ impl Fault {
             "df" => Self::DoubleFault,
             "user" => Self::UserMode,
             "gp-held" => Self::GeneralProtectionHoldingRunqueue,
+            "stall-early" => Self::StallEarly,
             _ => return None,
         })
     }
@@ -102,6 +116,19 @@ pub fn from_cmdline(cmdline: &str) -> Option<Fault> {
         .split_ascii_whitespace()
         .find_map(|word| word.strip_prefix("bhaskix.fault="))
         .and_then(Fault::parse)
+}
+
+/// Spins for ever, where no watchdog thread can be watching — RFC 0078.
+///
+/// Announced before it stops, so a log that ends here says it was asked for
+/// rather than leaving the next reader to wonder.
+pub fn stall_early() -> ! {
+    println!();
+    println!("  fault injection: stalling before the scheduler is started");
+    println!("  (requested by bhaskix.fault=stall-early)");
+    loop {
+        core::hint::spin_loop();
+    }
 }
 
 /// Triggers `fault`.
@@ -122,6 +149,11 @@ pub fn trigger(fault: Fault) -> bool {
         Fault::InvalidOpcode => invalid_opcode(),
         Fault::Breakpoint => breakpoint(),
         Fault::GeneralProtection => general_protection(),
+        // Never reached: `stall_early` is checked far earlier than this, in
+        // `continue_on_guarded_stack`, and does not return. The arm exists
+        // because the match must be exhaustive, and saying so beats a
+        // catch-all that would silently swallow a future variant.
+        Fault::StallEarly => stall_early(),
         Fault::GeneralProtectionHoldingRunqueue => {
             crate::sched::wedge_own_runqueue();
             general_protection();

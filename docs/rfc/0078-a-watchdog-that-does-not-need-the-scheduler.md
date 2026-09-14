@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | 🔨 **Draft 2026-09-14 — steps 1 and 2 built and watched both ways.** The check runs on the timer vector and a stall before `sched::start_all` now reports instead of timing out silently; with the check removed the same stall goes back to 0 report lines and a 120 s timeout. Step 3's permanent `bhaskix.fault=stall-early` is **not** built: the arming above was done by hand, so nothing re-verifies this on its own yet. |
+| **Status** | ✅ **ACCEPTED 2026-09-15 — all four steps built, three of them gated.** A stall before `sched::start_all` reports from the timer interrupt instead of timing out in silence, and `bhaskix.fault=stall-early` keeps that falsifiable: with the check removed the gate goes red naming the two lines it did not get. Testing-plan item 3 is a measurement rather than a gate and is recorded below. |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | kernel (`trap`, `console`) |
 | **Milestone** | Phase 2 — core operating system |
@@ -115,10 +115,27 @@ mechanism a running system carries.
 ## Performance implications
 
 Two atomic loads and a comparison on the timer vector, which already does four
-atomic operations and a call. It is measurable only against a tick that does
-nothing else, and the tick never does nothing else. To be confirmed by the
-tickless numbers the boot already prints, which is a measurement this tree
-already takes every boot.
+atomic operations and a call.
+
+**Measured 2026-09-15 on a quiet machine, one boot each way, from the numbers
+the boot already prints:**
+
+| | idle cpus | busy | idle interrupts avoided |
+|---|---|---|---|
+| without the check | **0 ticks on 3** | 375 over 400 ms | 256 |
+| with it | **0 ticks on 3** | 387 over 400 ms | 281 |
+
+**The figure that matters is the zero, and it is a property rather than a
+measurement.** The check runs *on* ticks that already happen, so a CPU taking
+no ticks runs no checks — which is why `tickless_self_test` is not grading this
+watchdog the way it would grade a sleeping thread. The busy counts differ by
+about 3%, which is boot-to-boot variation on two samples and not a number to
+draw a line through: a tick that does nothing else is not a tick this kernel
+takes, so there is nothing here to measure against.
+
+**What this does not establish:** a per-tick cost. Two samples cannot see 2
+atomic loads against a path that already does four plus a call, and no attempt
+is made to claim otherwise.
 
 ## Testing plan
 

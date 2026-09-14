@@ -538,6 +538,13 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
         }
     }
 
+    // **Before the self-tests, because that is the window with no watchdog
+    // thread in it** — RFC 0078 step 3. `trigger` runs far below this, after
+    // bring-up, so a fault meant to stall the *pre-scheduler* part cannot go
+    // through it.
+    if faultinject::from_cmdline(handoff.cmdline) == Some(faultinject::Fault::StallEarly) {
+        faultinject::stall_early();
+    }
     if scheduling_self_test(handoff.hhdm_base.as_u64()) {
         println!("    scheduler      timer-driven preemption works");
     } else {
