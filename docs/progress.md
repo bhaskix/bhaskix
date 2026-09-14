@@ -11,7 +11,7 @@
 | | |
 |---|---|
 | RFCs accepted | **49** |
-| RFCs open | 27 |
+| RFCs open | 28 |
 | RFCs closed without shipping | 1 |
 | Milestone rows done | **92 of 95** |
 | Phase 2 bullets done | **12 of 13** |
@@ -78,6 +78,7 @@ gantt
     RFC 0041 A USB keyboard :done, r0041, 2026-08-22, 2026-08-23
     RFC 0043 An IOMMU on a machine with no virtio :done, r0043, 2026-08-23, 2026-08-25
     RFC 0050 a console line that arrives whole :done, r0050, 2026-08-27, 1d
+    RFC 0078 a watchdog that does not need the scheduler :active, r0078, 2026-09-14, 2026-09-14
     section Memory & scheduling
     RFC 0024 Preemption on wake :crit, r0024, 2026-08-15, 1d
     RFC 0062 a thread may not run with a TLS base it did not... :active, r0062, 2026-09-01, 2026-09-14
@@ -182,6 +183,7 @@ gantt
 | 0074 | what a network interface is | 2026-09-06 |
 | 0075 | a driver that is not in the kernel | 2026-09-07 |
 | 0076 | a bond on hardware | 2026-09-08 |
+| 0078 | a watchdog that does not need the scheduler | 2026-09-14 |
 
 ## Annexes
 
