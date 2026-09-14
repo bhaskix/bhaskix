@@ -452,6 +452,10 @@ fn handle_interrupt(frame: &mut TrapFrame) {
             {
                 count.fetch_add(1, Ordering::Relaxed);
             }
+            // **The only watchdog the pre-scheduler part of bring-up has** --
+            // RFC 0078. Two atomic loads and a comparison, and it returns
+            // immediately once bring-up is done.
+            crate::bringup_stall_check();
             // SAFETY: the APIC is initialised -- interrupts cannot be enabled
             // before `enable` succeeds -- and this acknowledges exactly the
             // interrupt currently in service.

@@ -1930,6 +1930,84 @@ const BRINGUP_WATCHDOG_MICROS: u64 = 45_000_000;
 /// See [`bringup_progress`].
 static BRINGUP_WAITS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
+/// The progress reading the timer-interrupt check last saw change — RFC 0078.
+static STALL_LAST: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// The TSC reading it changed at.
+static STALL_SINCE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Set by the first CPU to report, so a stalled machine reports once and not
+/// once per tick per CPU.
+static STALL_REPORTED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Called from the timer vector, on every CPU, while bring-up is running.
+///
+/// **A watchdog that is a thread cannot watch the part of bring-up that has no
+/// scheduler yet** — RFC 0078. [`bringup_watchdog`] is armed as early as it
+/// safely can be and that is after `sched::start_all`, so everything before it
+/// stops silently: on 2026-09-14 a CI lane printed `wait queues 4 stations
+/// spawned at 7349 ms` and then nothing for 290 seconds, and the reason was
+/// not a wedge or a lost wakeup but that no watchdog existed yet.
+///
+/// This rides ticks that already happen. It needs no thread, so `start_all`
+/// does not bound it, and it arms no timer of its own, so `tickless_self_test`
+/// is not grading it.
+///
+/// **On every CPU rather than one.** A thread stuck with interrupts disabled
+/// takes no ticks on its own CPU, so a check that ran only there would be as
+/// silent as no check. Whichever CPU is still taking interrupts reports.
+///
+/// **A machine with no calibrated clock is not watched**, rather than watched
+/// with a number that means nothing: `from_micros` answering `None` returns.
+pub(crate) fn bringup_stall_check() {
+    use core::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed};
+
+    if BRINGUP_DONE.load(Acquire) || STALL_REPORTED.load(Relaxed) {
+        return;
+    }
+    let Some(limit) = bhaskix_arch::tsc::from_micros(BRINGUP_WATCHDOG_MICROS) else {
+        return;
+    };
+    let now = bringup_progress();
+    let at = bhaskix_arch::tsc::read();
+    if now != STALL_LAST.load(Relaxed) {
+        STALL_LAST.store(now, Relaxed);
+        STALL_SINCE.store(at, Relaxed);
+        return;
+    }
+    // The first tick of the machine's life finds `STALL_SINCE` at zero, which
+    // would read as "quiet since the beginning of time" and report immediately.
+    let since = STALL_SINCE.load(Relaxed);
+    if since == 0 {
+        STALL_SINCE.store(at, Relaxed);
+        return;
+    }
+    if at.saturating_sub(since) < limit {
+        return;
+    }
+    // **The swap is the one-shot.** Two CPUs can reach this on the same tick.
+    if STALL_REPORTED.swap(true, AcqRel) {
+        return;
+    }
+    // Reported the way `panic::report` reports, and for a reason this path
+    // makes sharper than any other: a timer interrupt can land on a CPU that is
+    // *inside* a `println!` holding the console, and an interrupt handler that
+    // blocks on a lock its own CPU holds is a hang rather than a report.
+    // `enter_fatal` makes the writes wait a bounded while and then write
+    // through. A torn report on a machine that has already stopped is worth
+    // more than a clean silence.
+    console::enter_fatal();
+    println!();
+    println!("==================================================================");
+    println!("  BRING-UP STALLED BEFORE THE SCHEDULER WAS WATCHING.");
+    println!(
+        "  No print and no bounded wait has ticked for {} seconds, and this",
+        BRINGUP_WATCHDOG_MICROS / 1_000_000
+    );
+    println!("  ran from the timer interrupt because there is no watchdog thread");
+    println!("  yet -- see RFC 0078. The last line above is the last thing that");
+    println!("  completed.");
+    println!("==================================================================");
+}
+
 /// Whether bring-up is getting anywhere, as one number that only goes up.
 ///
 /// **Elapsed time was the wrong question, and it took three tries to say so.**

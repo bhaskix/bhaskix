@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Draft |
+| **Status** | 🔨 **Draft 2026-09-14 — steps 1 and 2 built and watched both ways.** The check runs on the timer vector and a stall before `sched::start_all` now reports instead of timing out silently; with the check removed the same stall goes back to 0 report lines and a 120 s timeout. Step 3's permanent `bhaskix.fault=stall-early` is **not** built: the arming above was done by hand, so nothing re-verifies this on its own yet. |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | kernel (`trap`, `console`) |
 | **Milestone** | Phase 2 — core operating system |

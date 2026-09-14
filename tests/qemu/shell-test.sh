@@ -804,7 +804,8 @@ done
 # probe reporting `linux stack FAILED` from a `#GP` at `iretq`, and they want
 # different work. Truncated, because a fault dump is long and the first line of
 # it is the part that names the fault.
-for marker in "KERNEL PANIC" "EXCEPTION" "FAILED" "unexpected interrupt on vector"; do
+for marker in "KERNEL PANIC" "EXCEPTION" "FAILED" "unexpected interrupt on vector" \
+    "BRING-UP STALLED"; do
     if grep -qF -- "$marker" "$LOG"; then
         fail "'$marker' in the log: $(grep -m1 -F -- "$marker" "$LOG" | tr -d '\r' | cut -c1-200)"
         annotate_failure_detail "$marker"

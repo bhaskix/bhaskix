@@ -67,6 +67,13 @@ EXPECT_GREETING="the light-maker"
 FAILURE_MARKERS=("KERNEL PANIC" "FATAL:" "WARNING: the memory map was truncated"
                  "unexpected interrupt on vector" "NO TICKS"
                  "LEAK:" "INVARIANT VIOLATED"
+                 # RFC 0078. Before it, a stall in the window that has no
+                 # watchdog thread yet showed up here as "the machine did not
+                 # finish booting within 120s" and nothing else -- which is what
+                 # specimen eighteen of the ring-station row looked like, and it
+                 # cost an afternoon on two wrong theories. Named, it fails on
+                 # the line that says where.
+                 "BRING-UP STALLED"
                  # A program started without an address-space slot. The boot
                  # carries on and the damage lands somewhere else entirely: the
                  # program's faults cannot be serviced, so it never runs, and
