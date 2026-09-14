@@ -3637,7 +3637,20 @@ fi
 if grep -qF "socket reclaim a domain killed while holding a bound socket gave it back" "$LOG"; then
     pass "a killed domain's socket came back when its slot was reused"
 elif grep -qF "socket reclaim skipped" "$LOG"; then
-    pass "no network this machine can drive, so there is no socket to reclaim"
+    # **The skip says why; this used to say why *for* it, and was wrong.** There
+    # are three reasons this gate can decline -- one CPU, no network, or a
+    # successor that did not reuse the leaker's slot -- and this arm answered
+    # "no network this machine can drive" to all of them. Found 2026-09-14 by
+    # arming the third: the lane went green with a sentence naming a cause it
+    # had not measured, which is the same fault this tree has now made five
+    # times in gate text.
+    #
+    # `[^\r]*` was the first try and it truncated the sentence to "the
+    # successo": inside a POSIX bracket expression `\r` is a backslash and an
+    # `r`, not a carriage return, so the match stopped at the first letter r.
+    # The CR is stripped with `tr` instead, where it means what it says.
+    pass "socket reclaim not attempted: $(grep -aoE 'socket reclaim skipped[,:]? *.*' "$LOG" \
+        | head -1 | tr -d '\r' | sed -E 's/^socket reclaim skipped[,:]? *//' | cut -c1-110)"
 else
     fail "the socket reclaim did not conclude: $(grep -aoE 'socket reclaim.*' "$LOG" | head -1)"
     status=1

@@ -9703,6 +9703,10 @@ fn killed_domain_gives_its_socket_back(hhdm_base: u64, cpus: u32) -> bool {
     // first left, which is what causes the kernel to send `FORGET`.
     let mut bound_again = false;
     let mut same_slot = false;
+    // Which slot it actually got, so a run that could not test anything can say
+    // *what* it got instead of leaving a bare `same slot false` to be read as a
+    // reclaim that failed — see the verdict below.
+    let mut taker_slot = 0u32;
     if held_it
         && reaped
         && let Ok(taker) = domain::create("taker", domain::ResourceEnvelope::new())
@@ -9710,7 +9714,8 @@ fn killed_domain_gives_its_socket_back(hhdm_base: u64, cpus: u32) -> bool {
         // The reclaim rides on the *slot* being reused, so a successor that
         // landed elsewhere would prove nothing either way. Said out loud rather
         // than folded into the pass/fail.
-        same_slot = taker.as_u32() == leaked_slot;
+        taker_slot = taker.as_u32();
+        same_slot = taker_slot == leaked_slot;
         // As the leaker above: the inner `Result` decides whether this domain
         // is a Linux one, and discarding it spawns a program that is not.
         if domain::with(taker, |owner| {
@@ -9777,6 +9782,29 @@ fn killed_domain_gives_its_socket_back(hhdm_base: u64, cpus: u32) -> bool {
         println!(
             "    socket reclaim a domain killed while holding a bound socket gave it back: the \
              next hosted program bound the same port"
+        );
+        true
+    } else if held_it && reaped && !same_slot {
+        // **A precondition that was not met is not a failure**, and saying so
+        // cost an afternoon on 2026-09-14. The reclaim rides on the successor
+        // reusing the leaker's slot -- that reuse is what makes the kernel send
+        // `FORGET` -- so a successor that lands elsewhere means this gate never
+        // ran its mechanism. It said `socket reclaim FAILED ... same slot
+        // false, bound again false (fd 3, bind -98)` instead, which reads as
+        // "the reclaim is broken" and sent somebody looking for a defect that
+        // this boot had not tested for. A red that means *could not test* is
+        // worse than no red: it spends attention and teaches people to discount
+        // the gate.
+        //
+        // **It skips loudly rather than quietly.** The line names both slots,
+        // so a reader scanning a log can see how often this gate is not
+        // testing what it exists to test -- which is the number that would
+        // matter if it ever became common. `boot-test.sh` already passes on
+        // `socket reclaim skipped`.
+        println!(
+            "\x1b[93m    socket reclaim skipped: the successor got slot {taker_slot}, not the \
+             leaker's {leaked_slot} -- the reclaim rides on slot reuse, so nothing was tested \
+             this boot\x1b[0m"
         );
         true
     } else {
