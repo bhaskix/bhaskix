@@ -1187,6 +1187,17 @@ fn dispatch_inner(frame: &mut SyscallFrame) -> Outcome {
         return match frame.method {
             method::BIND => match resolved.notification {
                 Some(notification) => {
+                    // **The same check `notify_on_end`'s `BIND` already makes,
+                    // on the path that was missing it** — RFC 0070. This badge
+                    // is `arg1`, a raw argument rather than a capability's own
+                    // badge, so RFC 0010's waiter exemption is not in play at
+                    // all: nobody binds an interrupt in order to wait. Without
+                    // it the bind answers `Ok`, the device raises its line, and
+                    // `irq.rs` discards the refusal inside the interrupt
+                    // handler, where there is no caller left to tell.
+                    if frame.arg1 == 0 {
+                        return Outcome::err(Status::WrongObject);
+                    }
                     match crate::irq::bind(resolved.handler, notification, frame.arg1) {
                         Ok(()) => Outcome::ok(0),
                         Err(_) => Outcome::err(Status::NoSuchCapability),
@@ -1331,6 +1342,11 @@ fn dispatch_inner(frame: &mut SyscallFrame) -> Outcome {
             // Every slot is armed for somebody else. A refusal rather than
             // taking one from whoever holds it.
             Err(crate::notify::NotifyError::Exhausted) => Outcome::err(Status::Congested),
+            // **The same answer `SIGNAL` gives the same mistake** — RFC 0070.
+            // Named rather than left to the catch-all below, which would have
+            // reported a badge that can never ring as a revoked notification
+            // and sent the caller looking for a capability that is fine.
+            Err(crate::notify::NotifyError::EmptyBadge) => Outcome::err(Status::WrongObject),
             Err(_) => Outcome::err(Status::Revoked),
         };
     }

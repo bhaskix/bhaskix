@@ -982,6 +982,42 @@ the distinction is in the table rather than in somebody's head.
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-09-14 (a deadline that was armed and could never ring)
+
+**[RFC 0070](docs/rfc/0070-a-badge-that-can-never-ring.md) is accepted, all four
+steps.** `notify::signal` has always refused a badge of zero — a wake that sets
+no bits is one a waiter cannot tell from never having been woken. Two operations
+*commit* the kernel to signalling later, and neither checked: arming a deadline,
+and binding an interrupt. Both answered `Ok`, and the refusal then happened
+inside a timer interrupt or an interrupt handler, where it was counted and
+dropped because there is no caller left to return it to.
+
+**That is the worst shape a missing wake can have.** The program is told its
+deadline is armed, the timer fires on schedule, and nothing happens. The kernel
+already knew: `syscall.rs` hard-codes `WAKE_BADGE = 1` for the deadlines the
+nucleus arms for itself and says why beside it.
+
+**It does not reopen RFC 0010's correction, and that RFC now links to this one.**
+Refusing at *derivation* was tried in 2026-08-13 and stops the machine booting,
+because waiters hold badge-zero capabilities legitimately. What RFC 0010 did not
+consider is the moment *between* derivation and signalling — commitment — where
+the sender/waiter distinction is real and a caller is still present.
+
+**The reproducer was watched failing first, which is what the RFC demanded of
+it.** `bin/shell`'s slot 7 is `derive(root, WRITE, 0)`: the one capability in
+the boot with a zero badge that may signal. Against the tree as it was, the
+probe printed `7  signal wr  ARMED A DEADLINE THAT RINGS NOBODY`; it prints
+`refused a deadline that could ring nobody` now, and `shell-test.sh` asserts it.
+
+**Two things the work corrected about its own instruments.** The host test
+measures everything before asserting anything, because `alone()` in `notify.rs`
+is a mutex and not a reset — a test panicking between arming and destroying
+leaves a deadline behind and reddens the *next* test, so the first arming
+produced two failures and only one meant something. And the RFC's testing plan
+implied the boot report's `wake refused` counter could witness the trap: it
+cannot, because that line is printed about a hundred lines before `bin/shell`
+runs. Both are written into the RFC rather than left as lore.
+
 ### 2026-09-14 (the same silence, three directories over)
 
 **RFC 0077 shipped an `O_TRUNC` that works in one directory and stays silent in

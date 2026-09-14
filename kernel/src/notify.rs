@@ -441,9 +441,27 @@ const ARMING: u32 = u32::MAX;
 ///
 /// # Errors
 ///
-/// [`NotifyError::Gone`] if the notification is not live, and
-/// [`NotifyError::Exhausted`] if every slot is armed for somebody else.
+/// [`NotifyError::EmptyBadge`] for a badge of zero, [`NotifyError::Gone`] if
+/// the notification is not live, and [`NotifyError::Exhausted`] if every slot
+/// is armed for somebody else.
+///
+/// **The empty badge is refused here, at the moment of commitment** — RFC
+/// 0070. [`signal`] refuses it too, and until 2026-09-14 that was the only
+/// place: arming answered `Ok`, the timer fired on schedule, and the refusal
+/// happened in [`expire`], inside the timer interrupt, where there is no
+/// caller left to return it to and the answer is counted and dropped. The
+/// program is told its deadline is armed and nothing ever wakes, which is the
+/// hardest shape a missing wake can have.
+///
+/// This does not reopen RFC 0010's correction. That rule — refuse at
+/// *derivation* — was struck through because a **waiter** holds a badge-zero
+/// capability legitimately and has no use for a badge. Arming is not waiting:
+/// a caller arming a deadline is declaring itself a sender, and unlike inside
+/// the timer interrupt there is still somebody to answer.
 pub fn arm(id: NotificationId, deadline: u64, badge: u64) -> Result<(), NotifyError> {
+    if badge == 0 {
+        return Err(NotifyError::EmptyBadge);
+    }
     if resolve(id).is_none() {
         return Err(NotifyError::Gone);
     }
@@ -1100,5 +1118,43 @@ mod tests {
         destroy(id);
         assert_eq!(arm(id, 100, 1), Err(NotifyError::Gone));
         assert_eq!(armed_deadlines(), 0);
+    }
+
+    /// A deadline that could only ever ring nobody is refused where the
+    /// caller can still be told — RFC 0070.
+    ///
+    /// **And no slot is spent.** A refusal that consumed one of the
+    /// `MAX_DEADLINES` slots would turn a caller's mistake into everybody
+    /// else's, which is why the count is asserted rather than just the error.
+    #[test]
+    fn arming_with_a_badge_that_rings_nobody_is_refused() {
+        let _alone = alone();
+        let id = create().expect("a notification");
+
+        // **Everything is measured first and asserted after the slot is
+        // given back**, because `alone()` is a mutex and not a reset: a test
+        // that panics between arming and destroying leaves a deadline behind,
+        // and the next test to read `armed_deadlines()` fails for a reason
+        // that is not its own. Watching this one fail on purpose is exactly
+        // when that happens, so the arming would arrive wearing two red tests
+        // and only one of them would mean anything.
+        let refused = arm(id, 100, 0);
+        let after_refusal = armed_deadlines();
+        let armed = arm(id, 100, 1);
+        let after_arming = armed_deadlines();
+        // **Re-arming takes the replace path**, a second store of the badge
+        // into a slot that is already live, and the other way a zero could
+        // reach one.
+        let refused_again = arm(id, 200, 0);
+        let after_replacing = armed_deadlines();
+        destroy(id);
+
+        assert_eq!(refused, Err(NotifyError::EmptyBadge));
+        assert_eq!(after_refusal, 0, "a refused arming holds no slot");
+        // The refusal is about the badge and nothing else: one bit set arms.
+        assert_eq!(armed, Ok(()));
+        assert_eq!(after_arming, 1);
+        assert_eq!(refused_again, Err(NotifyError::EmptyBadge));
+        assert_eq!(after_replacing, 1, "the good deadline is still armed");
     }
 }

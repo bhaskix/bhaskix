@@ -576,6 +576,17 @@ pub fn bind(
     badge: u64,
 ) -> Result<(), ClaimError> {
     use core::sync::atomic::Ordering;
+    // **The refusal belongs at the syscall, and this is the reminder** — RFC
+    // 0070. Every in-tree caller passes a constant, so a runtime check here
+    // could never fire and would be a check nobody can watch fail; the
+    // syscall refuses `arg1 == 0` where a caller still exists to be told. A
+    // future kernel-side caller computing a badge gets this instead of a
+    // wake that never arrives.
+    debug_assert!(
+        badge != 0,
+        "an interrupt bound with a badge of zero signals nobody: the driver \
+         would park for a device that is raising its line"
+    );
     let handlers = HANDLERS.lock();
     let handler = resolve(&handlers, id).ok_or(ClaimError::Gone)?;
     let entry = &DELIVERY[handler.vector as usize];

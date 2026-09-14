@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Draft |
+| **Status** | ✅ **ACCEPTED 2026-09-14 — all four steps built and gated.** `notify::arm` and the `BIND` syscall refuse a badge of zero where the caller can still be told; the reproducer was watched failing against the tree first, printing `ARMED A DEADLINE THAT RINGS NOBODY` from `bin/shell`'s slot-7 capability, which is `derive(root, WRITE, 0)` and the one badge-zero capability in the boot that may signal. |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | kernel (`notify`, `irq`, `syscall`) |
 | **Milestone** | Phase 2 — core operating system |
@@ -159,11 +159,39 @@ hot path; `arm` already resolves a capability and walks the deadline table.
 
 ## Unresolved questions
 
-Whether `bind` should refuse a zero badge in the kernel-internal `irq::bind`
+~~Whether `bind` should refuse a zero badge in the kernel-internal `irq::bind`
 too, or only at the syscall boundary. In-tree callers pass constants (1, 2, 4,
 1), so the check would never fire; putting it in `bind` guards a future caller,
 putting it at the syscall keeps the kernel's own paths free of a check that
-cannot fail. Proposed: the syscall, and a debug assertion in `bind`.
+cannot fail. Proposed: the syscall, and a debug assertion in `bind`.~~
+**Settled as proposed, 2026-09-14**: the syscall refuses `arg1 == 0` with
+`WrongObject`, and `irq::bind` carries a `debug_assert!` that says what a
+badge-zero binding would cost — a driver parked on a device that is raising
+its line.
+
+## What it cost, and the one thing the probe cannot show — 2026-09-14
+
+Two comparisons against zero, as predicted, and one host test armed to a single
+red rather than two: `alone()` in `notify.rs` is a mutex and not a reset, so a
+test that panics between arming and destroying leaves a deadline behind and the
+*next* test fails for a reason that is not its own. The test measures first and
+asserts after the slot is given back, which is why watching it fail shows one
+failure and not a cascade.
+
+**The boot probe cannot use the `wake refused` counter, and that was measured
+rather than assumed.** Testing plan item 3 reads as though the counter could
+witness the trap. It cannot: the boot report prints that line about a hundred
+lines before `bin/shell` runs, so it reads zero on a broken kernel and on a
+fixed one alike. What the probe asserts is the answer the caller gets — which
+is the only thing observable at the moment the mistake is made, and the whole
+point of this RFC is that afterwards there is nobody left to tell. The counter
+is still worth what step 3 of the Design says it is worth: a non-zero value now
+reports a path nobody has thought about yet.
+
+The probe's deadline is **zero**, a deadline already past, so nothing is left
+armed on either kernel — refused outright on a fixed one, expired at the next
+tick on a broken one. An earlier draft armed one far in the future and disarmed
+it afterwards; it showed only the `OK`.
 
 ## Implementation plan
 

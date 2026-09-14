@@ -155,6 +155,16 @@ the syscall answers `WrongObject`. Enforcing the sentence as written was tried
 first, and the boot hung with `consoled`, `vfsd` and the shell each blocked
 after a single run.
 
+**Followed on 2026-09-14 by [RFC 0070](0070-a-badge-that-can-never-ring.md), and
+the correction above stands.** "Derivation" and "signalling" were not the only
+two moments. Between them sits a third — when a caller *commits* the kernel to
+signalling later, by arming a deadline or binding an interrupt — and there the
+sender/waiter distinction is real in exactly the way this section describes,
+with a caller still present to be answered. Both of those paths accepted a badge
+they could never use, and the refusal then happened inside a timer interrupt or
+an interrupt handler, where it was counted and discarded. They refuse at the
+moment of commitment now.
+
 ### Signalling, including from an interrupt handler
 
 ```

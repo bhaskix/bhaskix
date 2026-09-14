@@ -588,6 +588,14 @@ else
         "a program in ring 3 is woken by a notification:6 +signal rd +woke with badge 45324"
         "a notification is a signal and not a queue:6 +signal rd +nothing left after taking it"
         "taking from a notification needs the right to:7 +signal wr +refused a take"
+        # RFC 0070. Slot 7 is `derive(root, WRITE, 0)` -- it may signal, and
+        # its badge is zero. `SIGNAL` has always refused that; `ARM` did not,
+        # so the kernel answered OK, the timer fired on time, and the refusal
+        # happened inside the timer interrupt where no caller is left to hear
+        # it. The program is told its deadline is armed and nothing ever wakes.
+        # **Watched failing first**: against the tree before the fix this line
+        # read `ARMED A DEADLINE THAT RINGS NOBODY`.
+        "a deadline that could ring nobody is refused where it is armed:7 +signal wr +refused a deadline that could ring nobody"
         # RFC 0016 step 1, from a program in ring 3. Slot 1's badge is what the
         # filesystem service uses to tell its callers apart, and until this was
         # fixed the holder could choose it. Both derivations are asked for in

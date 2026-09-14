@@ -858,6 +858,39 @@ fn signals() {
             write(b"\n");
         }
     }
+
+    // **A deadline this capability could never be woken by** — RFC 0070.
+    //
+    // Slot 7 is `derive(root, WRITE, 0)`: it may signal and its badge is
+    // zero. `SIGNAL` has always refused that, because a wake carrying no bits
+    // is one a waiter cannot tell from never having been woken — but `ARM`
+    // did not, so the kernel answered `OK`, the timer fired on schedule, and
+    // the refusal happened inside the timer interrupt with nobody left to
+    // return it to. This program is the one place in the boot holding a
+    // badge-zero capability it may write through, which is what makes it the
+    // reproducer.
+    //
+    // **The deadline is zero, which is one already past.** Nothing is left
+    // armed on either kernel -- refused outright on a fixed one, expired at
+    // the next tick on a broken one -- so there is no slot to give back and
+    // no `DISARM` here.
+    //
+    // **The boot report's `wake refused` counter cannot witness this, and
+    // that was measured rather than assumed.** It is printed about a hundred
+    // lines before this program runs, so it reads zero either way. What this
+    // probe asserts is the answer the caller gets, which is the only thing
+    // that can be observed at the moment the mistake is made -- and the whole
+    // point of RFC 0070 is that afterwards there is nobody left to tell.
+    write(b"  7  signal wr  ");
+    match syscall(syscall::INVOKE, SIGNAL_WRITE_ONLY, method::ARM, [0; 4]).status {
+        status::WRONG_OBJECT => write(b"refused a deadline that could ring nobody\n"),
+        status::OK => write(b"ARMED A DEADLINE THAT RINGS NOBODY\n"),
+        other => {
+            write(b"status ");
+            write_number(other);
+            write(b"\n");
+        }
+    }
 }
 
 fn list(path: &[u8]) {
