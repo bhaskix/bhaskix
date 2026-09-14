@@ -3451,6 +3451,14 @@ fn open_the_file(request: &PersonalityCall, path_at: u64, flags: u64) -> Answer 
     // a synthetic file generated in a crate that has never seen a capability
     // cannot leak one.
     if let Some(file) = ProcFile::from_path(&name) {
+        // A generated file cannot be emptied, and Linux says so with `EACCES`
+        // rather than by ignoring the flag -- RFC 0077.
+        if let Err(errno) = bhaskix_personality::file::plan_truncation(
+            plan,
+            bhaskix_personality::file::Target::Generated,
+        ) {
+            return Answer::error(errno);
+        }
         return open_proc(request, file, flags);
     }
     // `/tmp/<name>` resolves in the writable capability, and only there.
@@ -3469,6 +3477,14 @@ fn open_the_file(request: &PersonalityCall, path_at: u64, flags: u64) -> Answer 
         // one directory every hosted process has, was the one it could not
         // list.
         if names_own_root(&name) {
+            // `EISDIR`, as Linux answers `open("/", O_RDONLY | O_TRUNC)` --
+            // measured, not recalled. RFC 0077.
+            if let Err(errno) = bhaskix_personality::file::plan_truncation(
+                plan,
+                bhaskix_personality::file::Target::Directory,
+            ) {
+                return Answer::error(errno);
+            }
             return open_own_root(request, flags);
         }
         // **Three different refusals answered `-2` and the record could not
@@ -3490,6 +3506,19 @@ fn open_the_file(request: &PersonalityCall, path_at: u64, flags: u64) -> Answer 
             return Answer::error(errno);
         }
     };
+    // **An `O_TRUNC` through the read-only capability is refused, not
+    // dropped** -- RFC 0077. It was ignored in silence until 2026-09-14: the
+    // access-mode check above never fires for `O_RDONLY | O_TRUNC`, so the
+    // open succeeded and answered the size the file still had.
+    let target = if opened.directory {
+        bhaskix_personality::file::Target::Directory
+    } else {
+        bhaskix_personality::file::Target::File { changeable: false }
+    };
+    if let Err(errno) = bhaskix_personality::file::plan_truncation(plan, target) {
+        release_file_slot(slot);
+        return Answer::error(errno);
+    }
     let entry = Entry {
         handle: slot,
         // The filesystem's own name for what was opened, which `fstat`
@@ -3622,7 +3651,24 @@ fn open_writable(
     // `plan.create` is false here exactly when `OPEN_AT` was sent, which
     // includes the `EXISTS` recursion above -- that clears `create` in the plan
     // as well as the flags, for the reason its own comment gives.
-    if plan.truncate && !plan.create && reply.args[2] == 0 {
+    //
+    // **A directory is refused here rather than skipped** — RFC 0077's second
+    // pass. The guard used to be `reply.args[2] == 0`, which dropped the
+    // request on the floor for a directory and handed back a descriptor, which
+    // is the same silent ignore in a different place.
+    let target = if reply.args[2] != 0 {
+        bhaskix_personality::file::Target::Directory
+    } else {
+        bhaskix_personality::file::Target::File { changeable: true }
+    };
+    let empty_it = match bhaskix_personality::file::plan_truncation(plan, target) {
+        Ok(empty_it) => empty_it,
+        Err(errno) => {
+            release_file_slot(slot);
+            return Answer::error(errno);
+        }
+    };
+    if empty_it {
         let emptied = call(
             syscall::CALL,
             slot,
@@ -3656,11 +3702,7 @@ fn open_writable(
         // Zero when this open truncated it: `OPEN_AT` answered the size the
         // file had a moment ago, and believing it would make the first `read`
         // ask for bytes that are no longer there.
-        size: if plan.truncate && !plan.create {
-            0
-        } else {
-            reply.args[1]
-        },
+        size: if empty_it { 0 } else { reply.args[1] },
         readable: plan.readable,
         writable: plan.writable,
     };

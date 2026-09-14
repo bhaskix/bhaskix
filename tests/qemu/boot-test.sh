@@ -3400,6 +3400,37 @@ else
     status=1
 fi
 
+# RFC 0077, second pass: an `O_TRUNC` this system cannot honour is refused
+# rather than dropped.
+#
+# The gate above proves `O_TRUNC` works where it can. This one proves the flag
+# is never *ignored* where it cannot: a file under the read-only root, the
+# process's own root directory, and a generated `/proc` file each answered with
+# a descriptor until 2026-09-14, telling the caller its file was empty when it
+# still had every byte. `EROFS`, `EISDIR` and `EACCES` were measured on the
+# build host, not recalled.
+#
+# **The probe's own control arm is what makes the refusals mean anything**: it
+# opens all four names again without `O_TRUNC` and requires that to work, so
+# the gate cannot pass on a system that simply cannot reach them.
+#
+# The fourth is a directory inside the *writable* directory, where every other
+# part of `O_TRUNC` works: the adapter skipped the flag there because a
+# directory has no blocks to free, which is true and is not what the caller
+# asked.
+if grep -qE "hosted refuse ok: EROFS, EISDIR, EACCES and EISDIR again, [0-9]+ bytes still in the read-only file, all four open without it" "$LOG"; then
+    pass "an O_TRUNC that cannot be honoured is refused, and the file keeps its bytes"
+elif grep -qF "hosted exec    skipped" "$LOG" \
+    || grep -qF "fs domain      no block service on this machine" "$LOG"; then
+    pass "no filesystem service on this machine, so no refusal was tried"
+elif grep -qF "hosted refuse " "$LOG"; then
+    fail "the hosted truncate refusals stopped: $(grep -aoE 'hosted refuse .{0,80}' "$LOG" | head -1)"
+    status=1
+else
+    fail "the hosted program did not say whether an impossible O_TRUNC was refused"
+    status=1
+fi
+
 # RFC 0060 step 4: `mkdir` and `unlink` under the writable directory, and
 # neither of them anywhere else.
 #

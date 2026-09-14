@@ -139,6 +139,15 @@ pub mod errno {
     /// Read from `asm-generic/errno-base.h` on the build host, as [`ENOTTY`]
     /// was, rather than recalled.
     pub const EFBIG: i64 = -27;
+    /// The caller may not do this to this file. Read from the build host's
+    /// `asm-generic/errno-base.h`, as [`EFBIG`] was.
+    pub const EACCES: i64 = -13;
+    /// It is a directory, and the caller asked for something only a file can
+    /// answer.
+    pub const EISDIR: i64 = -21;
+    /// The name resolves through a capability that cannot change anything —
+    /// this system's read-only filesystem.
+    pub const EROFS: i64 = -30;
 }
 
 /// How many descriptors one hosted process may hold.
@@ -920,6 +929,77 @@ pub fn wrote(entry: &mut Entry, at: u64, written: u64) {
     entry.size = entry.size.max(end);
 }
 
+/// What an `O_TRUNC` found when the open got there.
+///
+/// The variants are one-to-one with the answers [`plan_truncation`] gives,
+/// and each of those was measured rather than recalled.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Target {
+    /// An ordinary file. `changeable` is whether it was reached through a
+    /// directory capability that may change anything at all — this system's
+    /// equivalent of a writable mount. **It is not the open's access mode**,
+    /// which `O_TRUNC` does not consult.
+    File {
+        /// Whether the directory capability this name resolved in may be
+        /// changed.
+        changeable: bool,
+    },
+    /// A directory.
+    Directory,
+    /// A file this personality generates rather than stores, such as
+    /// `/proc/self/status`.
+    Generated,
+    /// Anything else a descriptor can name: a console, a socket, a pipe.
+    Other,
+}
+
+/// Whether this open must empty what it opened, and what to refuse when it
+/// cannot.
+///
+/// **`O_TRUNC` does not ask for write access and is not refused for the lack
+/// of it.** [RFC 0077](../docs/rfc/0077-a-file-that-can-be-emptied.md) left
+/// the opposite standing as an open question — that `O_TRUNC` on a read-only
+/// open *"is `EINVAL` on Linux and would be here too, by `plan_openat`'s
+/// existing access-mode arithmetic"*. Both halves are wrong.
+/// [`plan_openat`] returns `truncate: true` beside `writable: false` without
+/// complaint, and Linux decides this by permission, not by access mode.
+///
+/// Every row below was run on the build host on 2026-09-14, as root and as an
+/// unprivileged user, rather than recalled:
+///
+/// | `open(path, O_RDONLY \| O_TRUNC)` | Linux answers |
+/// |---|---|
+/// | a file the caller may write | succeeds, and the file is empty |
+/// | a directory | `EISDIR` |
+/// | a file the caller may not write | `EACCES` |
+/// | a file on a read-only filesystem | `EROFS` |
+/// | `/proc/self/status` | `EACCES` |
+/// | `/dev/null` | succeeds, and does nothing |
+///
+/// The order is Linux's too: a directory is refused before anything asks
+/// whether it could have been written.
+///
+/// # Errors
+///
+/// [`errno::EISDIR`], [`errno::EROFS`] or [`errno::EACCES`]. **An `O_TRUNC`
+/// this system cannot honour is refused rather than dropped**, which is RFC
+/// 0077's own motivation — a caller that gets a descriptor back is entitled
+/// to believe the file is empty.
+pub fn plan_truncation(plan: OpenPlan, target: Target) -> Result<bool, i64> {
+    if !plan.truncate {
+        return Ok(false);
+    }
+    match target {
+        Target::Directory => Err(errno::EISDIR),
+        Target::Generated => Err(errno::EACCES),
+        Target::File { changeable: false } => Err(errno::EROFS),
+        // A file `O_CREAT` has just made is empty already, and asking the
+        // service to empty it again is a journal commit for nothing.
+        Target::File { changeable: true } => Ok(!plan.create),
+        Target::Other => Ok(false),
+    }
+}
+
 /// What `fstat` should answer about `entry`.
 ///
 /// The mode's type bits come from the kind, and the permission bits are
@@ -1634,6 +1714,65 @@ mod tests {
             write_dirent(&mut buffer, 1, 1, dirent_type::REG, b""),
             Err(errno::EINVAL)
         );
+    }
+
+    #[test]
+    fn a_read_only_open_still_empties_a_file_it_may_change() {
+        // Measured on the build host: `open(f, O_RDONLY | O_TRUNC)` on a file
+        // the caller may write leaves it zero bytes long. RFC 0077 recorded
+        // this as `EINVAL`, from recall, and it is not.
+        let plan = plan_openat(open::RDONLY | open::TRUNC).expect("a legal open");
+        assert!(plan.truncate && !plan.writable);
+        assert_eq!(
+            plan_truncation(plan, Target::File { changeable: true }),
+            Ok(true)
+        );
+    }
+
+    #[test]
+    fn a_file_just_created_is_not_emptied_again() {
+        let plan = plan_openat(open::WRONLY | open::CREAT | open::TRUNC).expect("a legal open");
+        // `CREATE_AT` made it, so it is already empty; a second round trip
+        // would commit a journal transaction to change nothing.
+        assert_eq!(
+            plan_truncation(plan, Target::File { changeable: true }),
+            Ok(false)
+        );
+    }
+
+    #[test]
+    fn an_o_trunc_this_system_cannot_honour_is_refused_rather_than_dropped() {
+        let plan = plan_openat(open::RDONLY | open::TRUNC).expect("a legal open");
+        // Each number was measured on the build host, and the order is
+        // Linux's: a directory is refused before anything asks whether it
+        // could have been written.
+        assert_eq!(plan_truncation(plan, Target::Directory), Err(errno::EISDIR));
+        assert_eq!(plan_truncation(plan, Target::Generated), Err(errno::EACCES));
+        assert_eq!(
+            plan_truncation(plan, Target::File { changeable: false }),
+            Err(errno::EROFS)
+        );
+    }
+
+    #[test]
+    fn an_open_that_did_not_ask_to_truncate_is_refused_nothing() {
+        // The arm that matters: listing a directory is `open(d, O_RDONLY)`,
+        // and a rule that refused `EISDIR` without reading `O_TRUNC` would
+        // take `getdents64` with it.
+        let plan = plan_openat(open::RDONLY).expect("a legal open");
+        for target in [
+            Target::Directory,
+            Target::Generated,
+            Target::File { changeable: false },
+            Target::File { changeable: true },
+            Target::Other,
+        ] {
+            assert_eq!(plan_truncation(plan, target), Ok(false));
+        }
+        // And `/dev/null` with `O_TRUNC` succeeds and does nothing, which was
+        // measured too.
+        let asked = plan_openat(open::RDONLY | open::TRUNC).expect("a legal open");
+        assert_eq!(plan_truncation(asked, Target::Other), Ok(false));
     }
 
     #[test]

@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | ✅ **ACCEPTED 2026-09-13 — all six steps built and gated.** A hosted `echo x > file` over a longer file leaves nothing of the longer one, and `ftruncate(fd, 0)` empties one in place. Five checks, each watched red. **It was parked for part of a day on a slot-accounting gate that turned out to be reading a live number mid-release**; nothing was leaking, the reading was. See *What blocked it, and what it turned out to be* |
+| **Status** | ✅ **ACCEPTED 2026-09-13 — all six steps built and gated. Second pass 2026-09-14: an `O_TRUNC` this system cannot honour is now refused rather than dropped, in the four places this RFC left it silent — see *The three places the flag was still dropped*.** A hosted `echo x > file` over a longer file leaves nothing of the longer one, and `ftruncate(fd, 0)` empties one in place. Five checks, each watched red. **It was parked for part of a day on a slot-accounting gate that turned out to be reading a live number mid-release**; nothing was leaking, the reading was. See *What blocked it, and what it turned out to be* |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | fs / libc |
 | **Milestone** | Phase 2 — Linux personality (L1) |
@@ -199,9 +199,15 @@ does, the number goes here.
    pays for allocation twice, which nothing has measured and which a page cache
    partly hides. Left open, with the trigger being a measurement rather than an
    intuition.
-3. **`O_TRUNC` on a file opened read-only** is `EINVAL` on Linux and would be
+3. ~~**`O_TRUNC` on a file opened read-only** is `EINVAL` on Linux and would be
    here too, by `plan_openat`'s existing access-mode arithmetic. Worth a host
-   test; not worth a design decision.
+   test; not worth a design decision.~~ **Wrong on both halves, and closed
+   2026-09-14 — see *The three places the flag was still dropped* below.**
+   It was written from recall. Measured on the build host, `open(f, O_RDONLY |
+   O_TRUNC)` on a file the caller may write **succeeds and empties it**; and
+   `plan_openat` has nothing to say about it either way, returning `truncate:
+   true` beside `writable: false` without complaint. What Linux actually
+   consults is permission, not access mode.
 
 ## What blocked it, and what it turned out to be — 2026-09-13
 
@@ -250,6 +256,70 @@ causes does not establish the one left standing.
 The reading that fit none of them — a long spin making the count read clean — fits perfectly
 now: the spin moved when the sample landed. It was evidence for the answer and was read as
 evidence against it.
+
+## The three places the flag was still dropped — 2026-09-14
+
+This RFC shipped an `O_TRUNC` that works inside the writable directory and left
+the same silence everywhere else. Four paths through `openat` accepted the flag,
+returned a descriptor, and emptied nothing:
+
+| what was named | what it did | what Linux does |
+|---|---|---|
+| a file under the read-only root | opened it, answered its old size | `EROFS` |
+| the process's own root, `/` or `.` | opened it | `EISDIR` |
+| `/proc/self/status`, `/proc/self/maps` | opened it | `EACCES` |
+| a **directory** inside the writable directory | opened it, skipped the method | `EISDIR` |
+
+The fourth is this RFC's own code: the guard read `reply.args[2] == 0`, so a
+directory took the `else` branch and no one was told. The first three were never
+reached at all, because the access-mode check that refuses writes outside `/tmp`
+reads the *access mode*, and `O_RDONLY | O_TRUNC` is a read.
+
+**This is the Motivation's own complaint, one directory over.** *"The shell
+reports success, the file is the length it used to be, and the difference shows
+up whenever somebody reads it back"* — the only change is that the file is one
+the caller could never have emptied.
+
+### What Linux does, measured rather than recalled
+
+Every row was run on the build host on 2026-09-14, as `root` and again as an
+unprivileged user, and the numbers read out of `asm-generic/errno-base.h` on the
+same machine:
+
+| `open(path, O_RDONLY \| O_TRUNC)` | answer |
+|---|---|
+| a file the caller may write | succeeds, and the file is empty afterwards |
+| a directory | `EISDIR` (21) |
+| a file the caller may not write | `EACCES` (13) |
+| a file on a read-only filesystem | `EROFS` (30) |
+| `/proc/self/status`, `/proc/self/maps` | `EACCES` (13) |
+| `/dev/null` | succeeds, and does nothing |
+
+The order is Linux's too: a directory is refused before anything asks whether it
+could have been written, so `EISDIR` beats `EROFS` on a read-only mount.
+
+### The shape
+
+One host-testable function, `file::plan_truncation(plan, target)`, answers both
+questions at once — whether to empty it, and what to refuse — and the adapter
+calls it at each of the four sites. The mapping from this system's authority to
+Linux's vocabulary is the only judgement in it: a name resolved through a
+capability with no `dir::WRITABLE` bit is **a read-only filesystem**, `EROFS`,
+which is the answer the adapter already gives a plain write there.
+
+### Gates
+
+Five assertions in one boot line, and the control arm is the one that matters:
+each of the four names is opened **again without `O_TRUNC`** and must succeed,
+so the gate cannot pass on a machine that simply cannot reach them — which is
+how a containment check in this same probe once passed on a file that did not
+exist. The first run caught exactly that, in reverse: the probe named `/motd`,
+which is in the *initrd* and not in the directory a hosted process holds, and
+the gate said `answered errno 2, wanted 30` rather than passing.
+
+Each refusal was then watched red on its own: removing the check at one site
+prints `O_TRUNC ON <that name> WAS ACCEPTED` and the gate fails, four for four.
+Four host tests in `bhaskix-personality` were armed the same way.
 
 ## Implementation plan
 

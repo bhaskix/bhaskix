@@ -981,6 +981,48 @@ the distinction is in the table rather than in somebody's head.
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-09-14 (the same silence, three directories over)
+
+**RFC 0077 shipped an `O_TRUNC` that works in one directory and stays silent in
+every other.** Four paths through `openat` took the flag, handed back a
+descriptor and emptied nothing: a file under the read-only root, the process's
+own root, a generated `/proc` file, and — this RFC's own code — a *directory*
+inside the writable directory, where the guard read `reply.args[2] == 0` and let
+it fall through. A caller that asks for `O_TRUNC` and is given a descriptor is
+entitled to believe the file is empty. In four cases out of five it was not.
+
+**The first three were never reached, for a reason worth writing down.** The
+check that refuses writes outside `/tmp` reads the *access mode*, and
+`O_RDONLY | O_TRUNC` is a read. So the refusal that guards the read-only root
+never saw the one request that would have changed something.
+
+**What Linux does here was measured, not recalled — and the RFC had it wrong.**
+Its unresolved question 3 said `O_TRUNC` on a read-only open *"is `EINVAL` on
+Linux and would be here too, by `plan_openat`'s existing access-mode
+arithmetic"*. Run on the build host, as root and as an unprivileged user:
+`open(f, O_RDONLY | O_TRUNC)` on a file you may write **succeeds and empties
+it**; a directory is `EISDIR`; a file you may not write is `EACCES`; a
+read-only filesystem is `EROFS`; `/dev/null` succeeds and does nothing. And
+`plan_openat` says nothing about any of it — it returns `truncate: true` beside
+`writable: false` without complaint. The question is struck through in place,
+with what is true beside it.
+
+**One rule, four call sites, five assertions in one boot line.** `plan_truncation`
+answers whether to empty it and what to refuse; the adapter calls it where it
+learns what it opened. A capability with no `dir::WRITABLE` bit is this system's
+read-only filesystem and answers `EROFS`, which is what a plain write there
+already got.
+
+**The control arm is the gate.** Each of the four names is opened again
+*without* `O_TRUNC` and must succeed — otherwise the gate would pass just as
+well on a machine that cannot reach those names at all, which is how a
+containment check in this same probe once passed on a file that did not exist.
+It earned that on the first run: the probe named `/motd`, which is in the
+initrd and *not* in the directory a hosted process holds, and the gate said
+`answered errno 2, wanted 30` instead of going green. Four arms then, one per
+site, each printing `O_TRUNC ON <that name> WAS ACCEPTED` with its check
+removed; four host tests armed the same way.
+
 ### 2026-09-14 (three red CI runs, and the cause was a size)
 
 **RFC 0060 and RFC 0077 are back on `main`, and what took them off was never in them.** Both were
