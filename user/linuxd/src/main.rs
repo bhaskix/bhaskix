@@ -1333,32 +1333,13 @@ fn answer_from_message(request: &PersonalityCall) -> Answer {
         // here and `fstat` is not.
         LSEEK => answer_lseek(request),
         FCNTL => answer_fcntl(request),
-        // **Answered under the writable directory and refused everywhere
-        // else** -- RFC 0060 step 4. This was a flat `EROFS` on the grounds
-        // that the only directory held carried no `WRITE`; step 1 granted a
-        // second one that does, so the flat refusal became a lie for exactly
-        // one path prefix.
-        //
-        // `EROFS` is still the answer outside it, and still for the reason the
-        // old comment gave: `ENOSYS` would say the call is unimplemented and
+        // **Refused, and with the errno that says why.** The directory this
+        // adapter holds carries `READ` and `DERIVE` and no `WRITE` -- RFC 0033
+        // step 6 granted it that way on purpose -- so a hosted program cannot
+        // create or remove anything, and `EROFS` is the answer that tells it
+        // the truth. `ENOSYS` would say the call is unimplemented, which would
         // send a program looking for another way to do it.
-        //
-        // **Both the `at` forms and the plain ones**, because a static
-        // BusyBox calls `unlink(2)` and `mkdir(2)` directly -- they are not
-        // deprecated numbers on `x86_64`, they are what the applet emits. The
-        // only difference is where the path sits: the `at` forms take a
-        // directory descriptor first. That descriptor is **not read**, and the
-        // reason is structural rather than lazy: this adapter resolves an
-        // absolute name against the two directory capabilities it holds, so
-        // there is no third directory an `AT_FDCWD` or an open descriptor
-        // could name. A relative name has nowhere to be relative to, and
-        // `changeable_name` refuses it as `EROFS` along with everything else
-        // outside `/tmp`.
-        FTRUNCATE => answer_ftruncate(request),
-        MKDIRAT => answer_make_directory(request, request.second()),
-        MKDIR => answer_make_directory(request, request.first()),
-        UNLINKAT => answer_unlink(request, request.second()),
-        UNLINK | RMDIR => answer_unlink(request, request.first()),
+        MKDIRAT | UNLINKAT => Answer::error(-30), // EROFS
         MADVISE => Answer::ok(memory::plan_madvise() as u64),
         // Signal masking is recorded nowhere and honoured nowhere yet. Zero
         // rather than `-ENOSYS`, because a runtime told it cannot mask signals
@@ -1439,29 +1420,11 @@ fn answer_from_message(request: &PersonalityCall) -> Answer {
                 Some((Kind::Pipe, handle)) => {
                     return write_to_pipe(request, handle as usize, buffer, count);
                 }
-                // **A file opened through the writable directory is written**
-                // — RFC 0060 step 3. This arm answered `EROFS` for every
-                // file, with a comment saying the adapter held no directory
-                // carrying `WRITE`. That stopped being true at step 1, when
-                // the kernel minted [`WRITABLE_DIR`], and the comment outlived
-                // the fact by two steps.
-                //
-                // What decides is the descriptor's own `writable`, which
-                // `open_writable` has been setting from the open's access mode
-                // all along and which nothing had ever read. A file under the
-                // read-only root is still refused, and refused *here*, before
-                // any service is called.
-                Some((Kind::File, _)) => {
-                    return answer_write_file(request, fd, buffer, count);
-                }
-                Some((Kind::Directory, _)) => {
-                    // **`EBADF`, which is what Linux answers**, and not
-                    // `EROFS`. A directory descriptor is not a read-only file;
-                    // it is a descriptor `write` does not apply to, and a
-                    // program told the filesystem is read-only would go
-                    // looking for a writable one instead of fixing its own
-                    // mistake.
-                    return Answer::error(-9); // EBADF
+                Some((Kind::File | Kind::Directory, _)) => {
+                    // The directory capability this program holds carries no
+                    // `WRITE` right, so this is a truth rather than a refusal
+                    // to try.
+                    return Answer::error(-30); // EROFS
                 }
                 _ => {}
             }
@@ -2509,14 +2472,6 @@ const FCNTL: u64 = 72;
 /// `ioctl(fd, request, argument)`.
 const IOCTL: u64 = 16;
 /// `mkdirat(dirfd, path, mode)`.
-/// `ftruncate(fd, length)`.
-const FTRUNCATE: u64 = 46;
-/// `mkdir(path, mode)` — the form without a directory descriptor.
-const MKDIR: u64 = 83;
-/// `rmdir(path)`.
-const RMDIR: u64 = 84;
-/// `unlink(path)`.
-const UNLINK: u64 = 87;
 const MKDIRAT: u64 = 258;
 /// `unlinkat(dirfd, path, flags)`.
 const UNLINKAT: u64 = 263;
@@ -3614,34 +3569,6 @@ fn open_writable(
         trace_file(-2, STAGE_SERVICE_REFUSED, outcome);
         return Answer::error(-2); // ENOENT
     }
-    // **`O_TRUNC` on a name that was already there** — RFC 0077. On the create
-    // path there is nothing to do, because a file `CREATE_AT` just made is
-    // empty; this is the other half, and it was silently ignored until now, so
-    // `echo x > file` over a longer file left the old tail and said nothing.
-    //
-    // `plan.create` is false here exactly when `OPEN_AT` was sent, which
-    // includes the `EXISTS` recursion above -- that clears `create` in the plan
-    // as well as the flags, for the reason its own comment gives.
-    if plan.truncate && !plan.create && reply.args[2] == 0 {
-        let emptied = call(
-            syscall::CALL,
-            slot,
-            bhaskix_abi::dir::TRUNCATE,
-            [0, 0, 0, 0],
-        );
-        if emptied.status != status::OK || emptied.args[0] != bhaskix_abi::dir::OK {
-            // **The open fails rather than handing back a descriptor to a file
-            // that is neither its old length nor empty.** A caller that asked
-            // for `O_TRUNC` and got a descriptor is entitled to assume it.
-            release_file_slot(slot);
-            trace_file(
-                -5,
-                STAGE_TRUNCATE_REFUSED,
-                emptied.args[0] | (emptied.status << 32),
-            );
-            return Answer::error(errno_for(emptied.args[0], REFUSED_IS_FULL));
-        }
-    }
 
     let entry = Entry {
         handle: slot,
@@ -3653,14 +3580,7 @@ fn open_writable(
         },
         close_on_exec: flags & open::CLOEXEC != 0,
         offset: 0,
-        // Zero when this open truncated it: `OPEN_AT` answered the size the
-        // file had a moment ago, and believing it would make the first `read`
-        // ask for bytes that are no longer there.
-        size: if plan.truncate && !plan.create {
-            0
-        } else {
-            reply.args[1]
-        },
+        size: reply.args[1],
         readable: plan.readable,
         writable: plan.writable,
     };
@@ -3939,372 +3859,6 @@ fn answer_read(request: &PersonalityCall) -> Answer {
     }
     trace_file(i64::from(descriptor), take as i64, entry.size);
     Answer::ok(take)
-}
-
-/// And where a `write` stopped -- RFC 0060 step 3.
-///
-/// **A range of their own, because a stage number that two calls share cannot
-/// say which call stopped**, which is the one job it has. The first draft of
-/// these reused -105, -106 and -107, already spoken for by `read`'s `EXPECT`
-/// and its two `MAP` failures; it compiled, and it would have reported a
-/// refused write as a refused lend.
-const STAGE_WRITE_REFUSED: i64 = -150;
-/// A write never reached the service at all.
-const STAGE_WRITE_SILENT: i64 = -151;
-/// The hosted process's bytes would not come out of its own memory.
-const STAGE_WRITE_NO_BYTES: i64 = -152;
-/// A truncate reached the service and it refused — RFC 0077.
-const STAGE_TRUNCATE_REFUSED: i64 = -153;
-
-/// Answers a hosted `write` to an ordinary file — RFC 0060 step 3.
-///
-/// # The bytes never enter this program's address space
-///
-/// `bin/shell` does this by mapping a transfer page and `memcpy`-ing into it,
-/// which is the obvious way and costs `unsafe`. It is not needed here.
-/// `COPY_IN` already names its destination as **an object and an offset**
-/// rather than an address — that is RFC 0032's shape, so that a supervisor
-/// "cannot ask for bytes to land anywhere it could not already write" — and
-/// `WRITE_FROM` drains the same object from offset zero. So the hosted
-/// process's bytes go from its address space into the staging object and out
-/// to the filesystem service **without this program ever holding a pointer to
-/// them**, and the largest concentration of authority in the system gains a
-/// write path for zero lines of `unsafe`.
-///
-/// # The staging object is shared with `execve`, and that is safe here
-///
-/// [`STAGING`] is RFC 0059's sixteen pages. The kernel gives a server exactly
-/// one outstanding reply, so a `write` and an `execve` cannot interleave, and
-/// nothing holds a slice of the staged bytes across a call — `staged_bytes`
-/// borrows it inside `answer_execve` and drops it there. A future change that
-/// made exec staging span calls would have to revisit this, which is why it is
-/// written down rather than left to be rediscovered.
-///
-/// # Short writes
-///
-/// The service writes at most to the end of the block the offset lands in, so
-/// a chunk at an unaligned offset comes back short and the count it reports is
-/// the truth. This advances by that count, not by what it asked for, and
-/// returns it: `write(2)` promises no more, and `answer_writev` above already
-/// loops on exactly that promise.
-fn answer_write_file(request: &PersonalityCall, fd: u64, buffer: u64, count: u64) -> Answer {
-    use bhaskix_personality::file::{Kind, plan_write, wrote};
-
-    let Ok(descriptor) = i32::try_from(fd) else {
-        return Answer::error(-9); // EBADF
-    };
-    let Some(process) = process_for(request.domain) else {
-        return Answer::error(-11); // EAGAIN
-    };
-    let Some(entry) = process.descriptors.get(descriptor).copied() else {
-        return Answer::error(-9); // EBADF
-    };
-    // **The descriptor's own answer, not the directory's.** A file opened
-    // read-only is refused before anything is staged and before the service is
-    // troubled — which is also the containment arm: a file under `ROOT_DIR`
-    // can never be `writable`, because `open_the_file` refuses a writable open
-    // there with `EROFS` and never reaches an `Entry`.
-    if entry.kind != Kind::File || !entry.writable {
-        return Answer::error(-9); // EBADF
-    }
-
-    let start = entry.offset;
-    let mut done = 0u64;
-    let mut refusal = 0i64;
-    // **The loop is here, which is RFC 0060's word and not a convenience.**
-    // `COPY_IN` moves at most `MAX_SUPERVISED_COPY` — one page, a *latency*
-    // bound rather than a performance one — and `WRITE_FROM` takes at most one
-    // page too, so a `write` of any real size is several round trips whoever
-    // makes them. Leaving them to the hosted program would mean a short write
-    // on an ordinary file, which Linux almost never produces and which plenty
-    // of software quietly mishandles.
-    //
-    // **Bounded at the staging object, deliberately.** Sixteen pages is
-    // RFC 0059's number and already the size of the object these bytes cross
-    // in, so a `write` moves at most 64 KiB and a program asking for more gets
-    // a short write it is entitled to expect at *some* size. An unbounded loop
-    // here would put a hosted `write` of a gigabyte inside one reply, which is
-    // the latency `MAX_SUPERVISED_COPY` exists to prevent, one layer up.
-    while done < count && done < STAGING_BYTES {
-        let take = match plan_write(start + done, count - done) {
-            Ok(0) => break,
-            Ok(take) => take,
-            // A refusal on the *first* chunk is the call's answer; on a later
-            // one the bytes already written are, and the errno is dropped —
-            // which is what `write(2)` says: report the short count, and let
-            // the next call produce the error again.
-            Err(errno) => {
-                refusal = errno;
-                break;
-            }
-        };
-        let staged = call(
-            syscall::INVOKE,
-            handle_of(request.domain),
-            method::COPY_IN,
-            [STAGING, 0, buffer + done, take],
-        );
-        if staged.status != status::OK {
-            refusal = -14; // EFAULT
-            trace_file(-14, STAGE_WRITE_NO_BYTES, staged.status);
-            break;
-        }
-        // **`COPY_IN` answers how many bytes it moved, and that answer is
-        // load-bearing.** It comes back short when the hosted program's buffer
-        // runs into a page it does not have mapped, and the kernel reports
-        // that rather than refusing.
-        //
-        // Writing `take` bytes after a short copy would send the staging
-        // object's *previous contents* to the file — and that object is
-        // RFC 0059's, so the tail of a hosted program's file could be the tail
-        // of the last program this adapter exec'd. It is the one place in this
-        // function where ignoring a returned count discloses somebody else's
-        // bytes rather than merely losing some of these.
-        let moved = staged.args[0].min(take);
-        if moved == 0 {
-            refusal = -14; // EFAULT: none of this chunk was readable
-            trace_file(-14, STAGE_WRITE_NO_BYTES, 0);
-            break;
-        }
-        let reply = call(
-            syscall::CALL,
-            entry.handle,
-            bhaskix_abi::dir::WRITE_FROM,
-            [STAGING, moved, start + done, 0],
-        );
-        if reply.status != status::OK {
-            refusal = -5; // EIO
-            trace_file(-5, STAGE_WRITE_SILENT, reply.status);
-            break;
-        }
-        if reply.args[0] != bhaskix_abi::dir::OK {
-            // **[`errno_for`]'s table, shared with `unlink` and `mkdir`.** A
-            // first draft wrote this refusal list out here and kept a second
-            // copy there — two copies of one mapping that must agree, which
-            // is the shape this tree has already paid for. Every outcome
-            // `WRITE_FROM` can answer is in it: `GONE` for a file removed
-            // underneath the descriptor, `BAD_NAME` for a length over one
-            // page, `READ_ONLY` for a badge that lost its writable bit, and
-            // `REFUSED`, whose meaning is the one thing that differs by call.
-            refusal = errno_for(reply.args[0], REFUSED_IS_FULL);
-            trace_file(refusal, STAGE_WRITE_REFUSED, reply.args[0]);
-            break;
-        }
-        // **What the service says went, not what was asked for.**
-        // `Volume::write` stops at the end of the block the offset lands in,
-        // so a full chunk at an unaligned offset is short by design. Clamped
-        // to `moved` as well, because a count larger than what was staged
-        // would advance this descriptor past bytes nobody wrote.
-        let written = reply.args[1].min(moved);
-        done += written;
-        if written < moved {
-            // The block boundary, or the volume filling up. Either way the
-            // next round trip starts where this one stopped, and a zero would
-            // spin here for ever.
-            if written == 0 {
-                break;
-            }
-        }
-    }
-
-    if let Some(process) = process_for(request.domain)
-        && let Some(entry) = process.descriptors.get_mut(descriptor)
-    {
-        wrote(entry, start, done);
-    }
-    trace_file(i64::from(descriptor), done as i64, start + done);
-    // **A refusal only when nothing went.** `write(2)` reports the bytes it
-    // moved if it moved any, and reports the error on the next call — a
-    // program told `ENOSPC` after a partial write cannot tell how much of its
-    // buffer reached the file.
-    if done == 0 && refusal != 0 {
-        return Answer::error(refusal);
-    }
-    Answer::ok(done)
-}
-
-/// The name a `mkdirat` or `unlinkat` names, if it is one this adapter may
-/// change — RFC 0060 step 4.
-///
-/// **One component inside the writable directory, and nothing else.** The
-/// adapter holds two directory capabilities: a read-only root, and `/tmp`.
-/// There is no capability that could name `/tmp/a/b`, so a path that goes
-/// deeper is refused for the same structural reason a path outside `/tmp` is
-/// — not by a check, but because nothing here can name it. Both come back as
-/// `EROFS`, which is the truth a program can act on.
-fn changeable_name(request: &PersonalityCall, path_at: u64) -> Result<[u64; 4], i64> {
-    let mut name = [0u8; MAX_NAME];
-    if !copy_in(request.domain, path_at, &mut name) {
-        return Err(-14); // EFAULT
-    }
-    let Some(component) = writable_component(&name) else {
-        return Err(-30); // EROFS
-    };
-    let (chunk, rest) = bhaskix_abi::Chunk::take(component);
-    if !rest.is_empty() {
-        return Err(-36); // ENAMETOOLONG
-    }
-    Ok(chunk.pack(0))
-}
-
-/// Turns a directory service outcome into the errno a hosted program sees.
-/// `dir::REFUSED` on a write path: the volume is full.
-const REFUSED_IS_FULL: i64 = -28; // ENOSPC
-/// `dir::REFUSED` on a removal: the directory still has entries.
-///
-/// **Read out of `bin/fsd` rather than guessed.** `Volume::remove` refuses a
-/// directory whose `size != 0` with `FsError::WrongKind`, and `remove_at` maps
-/// everything but `NotFound` to `REFUSED` — and a volume cannot fill up while
-/// something is being taken off it, so on this path the outcome has one
-/// meaning. `rm -r` reads this errno to tell "try the children first" from a
-/// real failure.
-const REFUSED_IS_NOT_EMPTY: i64 = -39; // ENOTEMPTY
-
-/// Turns a directory service outcome into the errno a hosted program sees.
-///
-/// **One table, and one deliberate difference.** `dir::REFUSED` is the only
-/// outcome whose meaning depends on which call produced it, so the caller
-/// supplies that one and shares the rest — rather than the two copies of the
-/// whole mapping a first draft had.
-fn errno_for(outcome: u64, refused: i64) -> i64 {
-    match outcome {
-        bhaskix_abi::dir::NO_SUCH_NAME => -2,   // ENOENT
-        bhaskix_abi::dir::BAD_NAME => -22,      // EINVAL
-        bhaskix_abi::dir::GONE => -116,         // ESTALE
-        bhaskix_abi::dir::READ_ONLY => -30,     // EROFS
-        bhaskix_abi::dir::EXISTS => -17,        // EEXIST
-        bhaskix_abi::dir::NAME_TOO_LONG => -36, // ENAMETOOLONG
-        bhaskix_abi::dir::REFUSED => refused,
-        _ => -5, // EIO
-    }
-}
-
-/// Answers a hosted `ftruncate(fd, length)` — RFC 0077.
-///
-/// **Only to zero.** Linux can extend a file with this, which means a sparse
-/// one, and this format has no way to represent a hole; shortening to a
-/// non-zero length is suffix arithmetic no caller here needs. A length this
-/// cannot honour is refused with `EINVAL` rather than rounded to zero, because
-/// a program that asked to keep the first `n` bytes and got an empty file is
-/// worse off than one told the call is unavailable.
-fn answer_ftruncate(request: &PersonalityCall) -> Answer {
-    use bhaskix_personality::file::Kind;
-
-    let (fd, length) = (request.first(), request.second());
-    if length != 0 {
-        return Answer::error(-22); // EINVAL
-    }
-    let Ok(descriptor) = i32::try_from(fd) else {
-        return Answer::error(-9); // EBADF
-    };
-    let Some(process) = process_for(request.domain) else {
-        return Answer::error(-11); // EAGAIN
-    };
-    let Some(entry) = process.descriptors.get(descriptor).copied() else {
-        return Answer::error(-9); // EBADF
-    };
-    // The same check `write` makes, for the same reason: a descriptor opened
-    // read-only cannot empty the file, and a file under the read-only root can
-    // never be `writable` at all.
-    if entry.kind != Kind::File || !entry.writable {
-        return Answer::error(-9); // EBADF
-    }
-    let emptied = call(
-        syscall::CALL,
-        entry.handle,
-        bhaskix_abi::dir::TRUNCATE,
-        [0, 0, 0, 0],
-    );
-    if emptied.status != status::OK {
-        trace_file(-5, STAGE_TRUNCATE_REFUSED, emptied.status);
-        return Answer::error(-5); // EIO
-    }
-    if emptied.args[0] != bhaskix_abi::dir::OK {
-        trace_file(-5, STAGE_TRUNCATE_REFUSED, emptied.args[0]);
-        return Answer::error(errno_for(emptied.args[0], REFUSED_IS_FULL));
-    }
-    if let Some(process) = process_for(request.domain)
-        && let Some(entry) = process.descriptors.get_mut(descriptor)
-    {
-        // **The offset is not moved**, which is what `ftruncate` promises and
-        // `lseek` is for. A descriptor left past the end is legal and a write
-        // there extends the file, exactly as it did before.
-        entry.size = 0;
-    }
-    Answer::ok(0)
-}
-
-/// Answers a hosted `mkdirat` under the writable directory.
-///
-/// **The handle it is handed is thrown away, and it has to be taken first.**
-/// `MAKE_DIRECTORY_AT` hands back a writable handle to what it made, exactly
-/// as `CREATE_AT` does, so a caller that declares no `EXPECT` slot is refused
-/// by the service rather than quietly given nothing. `mkdir` returns no
-/// descriptor, so the slot is claimed, used and released inside this call.
-fn answer_make_directory(request: &PersonalityCall, path_at: u64) -> Answer {
-    let packed = match changeable_name(request, path_at) {
-        Ok(packed) => packed,
-        Err(errno) => return Answer::error(errno),
-    };
-    let Some(slot) = claim_file_slot() else {
-        return Answer::error(-24); // EMFILE
-    };
-    if call(
-        syscall::INVOKE,
-        WRITABLE_DIR,
-        method::EXPECT,
-        [slot, 0, 0, 0],
-    )
-    .status
-        != status::OK
-    {
-        release_file_slot(slot);
-        return Answer::error(-30); // EROFS: no writable directory is held
-    }
-    let reply = call(
-        syscall::CALL,
-        WRITABLE_DIR,
-        bhaskix_abi::dir::MAKE_DIRECTORY_AT,
-        packed,
-    );
-    // Released whichever way it went: on success the handle landed in the slot
-    // and nothing will name it again, and on failure the `EXPECT` is spent.
-    let _ = call(syscall::INVOKE, slot, method::DELETE, [0; 4]);
-    release_file_slot(slot);
-    if reply.status != status::OK {
-        return Answer::error(-5); // EIO
-    }
-    if reply.args[0] != bhaskix_abi::dir::OK {
-        return Answer::error(errno_for(reply.args[0], REFUSED_IS_FULL));
-    }
-    Answer::ok(0)
-}
-
-/// Answers a hosted `unlinkat` under the writable directory.
-///
-/// `AT_REMOVEDIR` is not read, and that is deliberate: `REMOVE_AT` refuses a
-/// directory that still has entries and removes one that does not, so the flag
-/// would only let this adapter refuse something the service would have
-/// accepted. Linux uses it to stop `unlink` removing a directory by accident;
-/// here the honest narrowing is written down rather than half-enforced.
-fn answer_unlink(request: &PersonalityCall, path_at: u64) -> Answer {
-    let packed = match changeable_name(request, path_at) {
-        Ok(packed) => packed,
-        Err(errno) => return Answer::error(errno),
-    };
-    let reply = call(
-        syscall::CALL,
-        WRITABLE_DIR,
-        bhaskix_abi::dir::REMOVE_AT,
-        packed,
-    );
-    if reply.status != status::OK {
-        return Answer::error(-5); // EIO
-    }
-    if reply.args[0] != bhaskix_abi::dir::OK {
-        return Answer::error(errno_for(reply.args[0], REFUSED_IS_NOT_EMPTY));
-    }
-    Answer::ok(0)
 }
 
 /// Answers a hosted `lseek`.

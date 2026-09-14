@@ -169,15 +169,6 @@ The corollary is a refusal: **no "Bhaskix syscalls for Linux programs" escape ha
 `ioctl` gateway to the capability system, no `/dev/bhaskix`. A program that wants Bhaskix authority
 is a native program.
 
-**Two directory capabilities now, and the claim is unchanged in kind.** Since
-[RFC 0060](0060-a-writable-path-for-a-hosted-process.md) closed on 2026-09-13 the adapter holds a
-read-only root *and* a writable directory, where it held one. That widens what the adapter can do
-and not what a hosted process can *name*: its CSpace is still empty, it still reaches the second
-directory only by asking the adapter for a path under `/tmp`, and the reason it cannot write
-anywhere else is that no capability the adapter holds names anywhere else. The distinction this
-invariant draws — between what a process holds and what it can ask for — is exactly the one that
-lets the count go from one to two without the claim moving.
-
 #### I4 — A Linux domain's authority is declared, not accumulated
 
 RFC 0030's manifest already states what a package may reach. A Linux compatibility domain gets the

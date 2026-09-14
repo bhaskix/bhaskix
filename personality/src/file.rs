@@ -135,10 +135,6 @@ pub mod errno {
     /// `isatty` turns into "no", so a program redirecting its output tests
     /// for exactly this on every run.
     pub const ENOTTY: i64 = -25;
-    /// The write would end past the largest offset this system can name.
-    /// Read from `asm-generic/errno-base.h` on the build host, as [`ENOTTY`]
-    /// was, rather than recalled.
-    pub const EFBIG: i64 = -27;
 }
 
 /// How many descriptors one hosted process may hold.
@@ -867,59 +863,6 @@ pub fn plan_lseek(current: u64, size: u64, offset: i64, from: u64) -> Result<u64
     Ok(landed as u64)
 }
 
-/// How many bytes of one `write` a single `dir::WRITE_FROM` may carry.
-///
-/// The service's limit, not this crate's: `bin/fsd`'s `write_from` refuses a
-/// length above one page outright, and `Volume::write` beneath it writes only
-/// as far as the end of the block the offset lands in. So a call at an offset
-/// that is not page-aligned comes back **short by design**.
-///
-/// A caller that then advances by what it *asked for* rather than by what the
-/// service *reported* leaves a hole and loses the bytes that belonged in it —
-/// ask for 4,096 at offset 4,000, get 96, and resuming at 8,096 skips a whole
-/// block. That is why [`wrote`] takes the reported count and not the request.
-pub const WRITE_CHUNK: u64 = 4096;
-
-/// How much of a `write` the next [`WRITE_CHUNK`]-bounded call may attempt.
-///
-/// **A short write is the answer, not an error.** `write(2)` promises only
-/// that it moved some bytes, and a program that needs all of them loops —
-/// which is what `writev` here already does across its vectors. Returning
-/// `Ok(0)` for a zero-length write is the same rule: Linux does not touch the
-/// file, and neither does this.
-///
-/// # Errors
-///
-/// [`errno::EFBIG`] if the write would end past the largest offset this
-/// system can name. A descriptor may already sit anywhere [`plan_lseek`]
-/// allowed — seeking past the end is legal — so `offset` is not bounded by
-/// the file's size and the sum genuinely can overflow.
-pub fn plan_write(offset: u64, count: u64) -> Result<u64, i64> {
-    if count == 0 {
-        return Ok(0);
-    }
-    let take = count.min(WRITE_CHUNK);
-    let end = offset.checked_add(take).ok_or(errno::EFBIG)?;
-    // The same ceiling `plan_lseek` enforces from the other side. An offset
-    // it would refuse to *reach* must not be one a write can arrive at by
-    // accumulation, or the two disagree about where a file ends.
-    if end > i64::MAX as u64 {
-        return Err(errno::EFBIG);
-    }
-    Ok(take)
-}
-
-/// Records a write of `written` bytes that landed at `at`.
-///
-/// **The size is a maximum, not an assignment.** A write into the middle of a
-/// file leaves it exactly as long as it was, and a descriptor that had seeked
-/// backwards would otherwise truncate the file by writing one byte into it.
-pub fn wrote(entry: &mut Entry, at: u64, written: u64) {
-    let end = at.saturating_add(written);
-    entry.offset = end;
-    entry.size = entry.size.max(end);
-}
-
 /// What `fstat` should answer about `entry`.
 ///
 /// The mode's type bits come from the kind, and the permission bits are
@@ -1112,77 +1055,6 @@ mod tests {
         // turn that into an overwrite of the last byte.
         assert_eq!(plan_lseek(0, 10, 4096, whence::SET), Ok(4096));
         assert_eq!(plan_lseek(10, 10, 90, whence::END), Ok(100));
-    }
-
-    #[test]
-    fn a_write_is_cut_to_one_chunk_and_a_zero_length_write_touches_nothing() {
-        assert_eq!(plan_write(0, 10), Ok(10));
-        // The service refuses more than a page in one call, so asking for
-        // more here would be asking to be told `BAD_NAME` by `bin/fsd` and
-        // reporting it to the program as something it did wrong.
-        assert_eq!(plan_write(0, WRITE_CHUNK * 3), Ok(WRITE_CHUNK));
-        assert_eq!(plan_write(WRITE_CHUNK, WRITE_CHUNK), Ok(WRITE_CHUNK));
-        // `write(fd, buf, 0)` does not touch the file on Linux, and a plan
-        // that returned a chunk here would stage a page and commit a journal
-        // transaction for a program that asked for nothing.
-        assert_eq!(plan_write(0, 0), Ok(0));
-    }
-
-    #[test]
-    fn a_write_that_would_end_past_the_largest_nameable_offset_is_refused() {
-        // A descriptor gets here legitimately: seeking past the end is legal
-        // (see the seek test above), so the offset is not bounded by the size
-        // and this arithmetic is reachable rather than defensive.
-        assert_eq!(plan_write(u64::MAX, 1), Err(errno::EFBIG));
-        assert_eq!(plan_write(i64::MAX as u64, 1), Err(errno::EFBIG));
-        // Ending exactly on the ceiling is not past it.
-        assert_eq!(plan_write(i64::MAX as u64 - 1, 1), Ok(1));
-    }
-
-    #[test]
-    fn a_write_into_the_middle_of_a_file_does_not_shorten_it() {
-        let mut entry = Entry {
-            handle: 1,
-            inode: 7,
-            kind: Kind::File,
-            close_on_exec: false,
-            offset: 0,
-            size: 100,
-            readable: false,
-            writable: true,
-        };
-        // The bug this guards: assigning the size instead of taking the
-        // maximum turns one byte written at the front into a 1-byte file,
-        // and `> file` followed by a seek-and-patch would silently destroy
-        // everything after the patch.
-        wrote(&mut entry, 0, 10);
-        assert_eq!(entry.offset, 10);
-        assert_eq!(entry.size, 100);
-        // Writing past the old end does extend it.
-        wrote(&mut entry, 95, 10);
-        assert_eq!(entry.offset, 105);
-        assert_eq!(entry.size, 105);
-    }
-
-    #[test]
-    fn a_short_write_advances_by_what_went_rather_than_what_was_asked() {
-        let mut entry = Entry {
-            handle: 1,
-            inode: 7,
-            kind: Kind::File,
-            close_on_exec: false,
-            offset: 4000,
-            size: 4000,
-            readable: false,
-            writable: true,
-        };
-        // `Volume::write` stops at the end of the block the offset lands in,
-        // so a 4,096-byte chunk at offset 4,000 writes 96. Advancing by the
-        // chunk would leave the next call writing at 8,096 and the file with
-        // a hole nobody asked for.
-        wrote(&mut entry, 4000, 96);
-        assert_eq!(entry.offset, 4096);
-        assert_eq!(entry.size, 4096);
     }
 
     #[test]

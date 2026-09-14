@@ -309,29 +309,6 @@ fn refused_read_only(badge: u64) -> bool {
     true
 }
 
-/// Answers `TRUNCATE`: the file this writable handle names goes back to zero
-/// bytes — RFC 0077.
-///
-/// **No arguments to validate**, because the handle is the file. The badge is
-/// checked by the caller through `refused_read_only`, as every write-family
-/// method is, and the generation is checked here for the same reason
-/// `write_from` checks it: a handle can outlive the inode it named.
-fn truncate(cache: Cache<'static, BlockService>, badge: u64) -> Cache<'static, BlockService> {
-    let (index, generation) = dir::parts(badge);
-    let (cache, done) = writing(cache, |volume| {
-        let file = volume.inode(index).map_err(|_| dir::GONE)?;
-        if file.generation != generation || file.kind != Kind::File {
-            return Err(dir::GONE);
-        }
-        volume.truncate(index).map_err(|_| dir::REFUSED)
-    });
-    match done {
-        Ok(()) => answer(dir::OK, 0, 0),
-        Err(outcome) => answer(outcome, 0, 0),
-    }
-    cache
-}
-
 /// Answers `CREATE_AT` or `MAKE_DIRECTORY_AT`: a new name in a writable
 /// directory, and a writable handle to it handed back.
 fn create_at(
@@ -1059,13 +1036,6 @@ fn serve(mut cache: Cache<'static, BlockService>) -> ! {
                 continue;
             }
             cache = remove_at(cache, badge, &args);
-            continue;
-        }
-        if method == dir::TRUNCATE {
-            if refused_read_only(badge) {
-                continue;
-            }
-            cache = truncate(cache, badge);
             continue;
         }
         if method != dir::OPEN_AT {

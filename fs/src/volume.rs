@@ -913,37 +913,17 @@ impl<'f, S: Store> Volume<'f, S> {
                 indirect: 0,
             },
         )?;
-        self.free_contents(&victim)?;
-
-        self.commit(&[])
-    }
-
-    /// Frees every block a file holds: the direct ones, whatever the indirect
-    /// table names, and the table itself.
-    ///
-    /// **Extracted from [`Volume::remove`] by RFC 0077 rather than copied.**
-    /// A truncate frees exactly what a delete frees; writing it twice would be
-    /// two implementations of one invariant that must agree, and the invariant
-    /// here is the one RFC 0065 had to fix once already — a version that
-    /// stopped at the direct blocks leaked up to 1,025 blocks per file the
-    /// moment anything could allocate a table.
-    ///
-    /// Stages only: the caller has already called [`Volume::begin`] and is
-    /// responsible for the [`Volume::commit`].
-    ///
-    /// # Errors
-    ///
-    /// Whatever the store returns, and [`FsError::OutOfRange`] for an indirect
-    /// table shorter than the format says it is.
-    fn free_contents(&mut self, file: &Inode) -> Result<(), FsError> {
-        for block in file.direct.iter().take_while(|block| **block != 0) {
+        for block in victim.direct.iter().take_while(|block| **block != 0) {
             self.stage_bitmap(*block, false)?;
         }
         // **And whatever the indirect table named, then the table** — RFC 0065.
-        if file.indirect != 0 {
+        // This loop freed the direct blocks alone, which was complete while
+        // nothing could allocate a table; the moment a write can, a delete that
+        // stopped here would leak up to 1,025 blocks per file.
+        if victim.indirect != 0 {
             let mut numbers = [0u32; BLOCK / 4];
             {
-                let table = self.cache.edit(file.indirect)?;
+                let table = self.cache.edit(victim.indirect)?;
                 for (slot, number) in numbers.iter_mut().enumerate() {
                     let at = slot * 4;
                     let mut bytes = [0u8; 4];
@@ -954,51 +934,9 @@ impl<'f, S: Store> Volume<'f, S> {
             for number in numbers.iter().take_while(|number| **number != 0) {
                 self.stage_bitmap(*number, false)?;
             }
-            self.stage_bitmap(file.indirect, false)?;
-        }
-        Ok(())
-    }
-
-    /// Sets a file back to zero bytes, keeping the inode — RFC 0077.
-    ///
-    /// **The generation is carried forward, and that is the load-bearing
-    /// part.** It is what a stale capability is checked against, so a truncate
-    /// that bumped it would revoke every handle to a file whose *contents*
-    /// merely went away — which is the opposite of what truncation means.
-    /// `kind` and `links` are carried for the same reason: nothing about the
-    /// file's identity changed.
-    ///
-    /// **A file that is already empty costs no transaction.** That is not only
-    /// an optimisation: every `> file` on a freshly created name would
-    /// otherwise commit a journal transaction to free nothing.
-    ///
-    /// # Errors
-    ///
-    /// [`FsError::WrongKind`] if `index` is not an ordinary file — emptying a
-    /// directory is `remove`'s business, and it refuses a non-empty one — and
-    /// whatever the store returns.
-    pub fn truncate(&mut self, index: u32) -> Result<(), FsError> {
-        let file = self.inode(index)?;
-        if file.kind != Kind::File {
-            return Err(FsError::WrongKind);
-        }
-        if file.size == 0 && file.indirect == 0 && file.direct[0] == 0 {
-            return Ok(());
+            self.stage_bitmap(victim.indirect, false)?;
         }
 
-        self.begin()?;
-        self.free_contents(&file)?;
-        self.stage_inode(
-            index,
-            &Inode {
-                kind: file.kind,
-                links: file.links,
-                generation: file.generation,
-                size: 0,
-                direct: [0; 10],
-                indirect: 0,
-            },
-        )?;
         self.commit(&[])
     }
 }
@@ -1431,123 +1369,6 @@ mod tests {
         );
         assert_eq!(&contents[..read], b"eleven");
         assert_eq!(inode.size, eleventh + 6);
-    }
-
-    #[test]
-    fn a_truncate_empties_a_file_and_keeps_its_identity() {
-        // **The generation is the one that matters.** It is what a stale
-        // capability is checked against, so a truncate that bumped it would
-        // revoke every handle to a file whose *contents* merely went away --
-        // the opposite of what truncation means. `kind` and `links` go with it
-        // for the same reason: nothing about the file's identity changed.
-        let mut bytes = image(256);
-        run(&mut bytes, FRAMES, None, |volume| {
-            let root = volume.superblock().root;
-            let index = volume.create(root, b"doc", Kind::File).expect("created");
-            volume
-                .write(index, 0, b"a body that will go away")
-                .expect("written");
-            let before = volume.inode(index).expect("inode");
-            assert_ne!(before.size, 0, "there is something to remove");
-
-            volume.truncate(index).expect("emptied");
-
-            let after = volume.inode(index).expect("inode");
-            assert_eq!(after.size, 0, "no bytes left");
-            assert_eq!(after.direct[0], 0, "no block left");
-            assert_eq!(after.indirect, 0, "no table left");
-            assert_eq!(after.generation, before.generation, "the same file");
-            assert_eq!(after.kind, before.kind, "still an ordinary file");
-        });
-
-        // Read back through a reader that has never seen the cache, because
-        // the point is that the emptying reached the device.
-        let mut pages = Image::new(&bytes);
-        let mut mounted = Filesystem::mount(&mut pages).expect("mounts afterwards");
-        let root = mounted.root().unwrap();
-        let (_, inode) = mounted
-            .lookup(&root, b"doc")
-            .expect("the file is still there");
-        assert_eq!(inode.size, 0, "and it is empty on the device");
-    }
-
-    #[test]
-    fn a_truncate_gives_back_the_blocks_an_indirect_table_named() {
-        // **The leak RFC 0065 had to fix once already, in the other operation
-        // that frees a file.** A truncate that stopped at the direct blocks
-        // would strand the table and everything it named.
-        //
-        // **Counted, not inferred.** The first version of this test wrote and
-        // truncated twenty times and asserted the volume did not run dry -- and
-        // it did not catch the leak, because twenty rounds strand forty blocks
-        // and a 256-block volume absorbs that without complaint. A test that
-        // passes against the bug it names is worse than no test, and this one
-        // was rewritten when arming it proved it. It now asks the allocator for
-        // the two specific blocks back, which is what `remove`'s own test does
-        // and for the same reason.
-        let mut bytes = image(256);
-        run(&mut bytes, FRAMES, None, |volume| {
-            let root = volume.superblock().root;
-            let index = volume.create(root, b"long", Kind::File).expect("created");
-            volume
-                .write(index, 10 * BLOCK as u64, b"a")
-                .expect("eleventh");
-            let table = volume.inode(index).expect("inode").indirect;
-            assert_ne!(table, 0, "a table was allocated");
-            let data = {
-                let page = volume.cache_for_test().edit(table).expect("the table");
-                let mut number = [0u8; 4];
-                number.copy_from_slice(&page[0..4]);
-                u32::from_le_bytes(number)
-            };
-            assert_ne!(data, 0, "the eleventh block is named in the table");
-
-            volume.truncate(index).expect("emptied");
-
-            assert_eq!(volume.inode(index).expect("inode").indirect, 0, "no table");
-            // The second ask excludes the first: nothing has staged the bitmap
-            // in between, so `free_block` would otherwise hand out the same
-            // number twice -- the collision RFC 0065 had to fix in the write
-            // path, met again by the test written to check this one.
-            let first = volume.free_block_for_test().expect("a free block");
-            let second = volume
-                .free_block_excluding(first)
-                .expect("and a second one");
-            let handed = [first, second];
-            assert!(
-                handed.contains(&table) && handed.contains(&data),
-                "the table and its block came back: got {handed:?}, wanted {table} and {data}"
-            );
-        });
-    }
-
-    #[test]
-    fn truncating_an_empty_file_is_not_an_error() {
-        // `> file` on a name that was just created is the common case, and it
-        // must not be a failure -- nor a journal transaction to free nothing.
-        let mut bytes = image(256);
-        run(&mut bytes, FRAMES, None, |volume| {
-            let root = volume.superblock().root;
-            let index = volume.create(root, b"fresh", Kind::File).expect("created");
-            volume.truncate(index).expect("an empty file truncates");
-            volume.truncate(index).expect("and again");
-            assert_eq!(volume.inode(index).expect("inode").size, 0);
-        });
-    }
-
-    #[test]
-    fn a_directory_cannot_be_truncated() {
-        // Emptying a directory is `remove`'s business, and it refuses one that
-        // still has entries. A second way to empty one would be a way round
-        // that refusal.
-        let mut bytes = image(256);
-        run(&mut bytes, FRAMES, None, |volume| {
-            let root = volume.superblock().root;
-            let dir = volume
-                .create(root, b"sub", Kind::Directory)
-                .expect("created");
-            assert_eq!(volume.truncate(dir), Err(FsError::WrongKind));
-        });
     }
 
     #[test]
