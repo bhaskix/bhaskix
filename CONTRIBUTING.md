@@ -66,6 +66,10 @@ Not sure whether your idea needs an RFC? Open an issue and ask. The answer is qu
   2026-08-24 that gap let sixteen consecutive commits land on a red `main`, so it is written here
   rather than learned again. **Run `make test` before you push, and `tools/ci-status.sh` after** —
   the latter needs no token and names the failing job.
+- **Before quoting a rate for an intermittent defect, count it**: `tools/ci-count.py "<the line the
+  gate prints>"` reads every failed job's log across CI history and prices it per boot. The
+  ring-station row carried *"one in roughly 1200 boots"* for a fortnight; measured, it was **1 in
+  225**, and people had reasoned from the wrong figure about whether a fix helped.
 - Every bug fix adds a regression test. If the bug was not testable, say what you changed to make it
   testable.
 - Describe the design decision in the PR body, not the diff.

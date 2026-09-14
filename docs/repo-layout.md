@@ -67,7 +67,7 @@ bhaskix/
 ├── userspace/              init and bhaskixd-* daemons — Phase 2. Named
 │                           before `user/` existed; when the daemons arrive,
 │                           one of the two names goes.
-├── tools/                  setup-dev.sh, image builder, CI helpers
+├── tools/                  setup-dev.sh, image builder, CI helpers (ci-status, ci-count)
 │
 ├── tests/
 │   ├── unit/               host tests — allocators, page-table logic,
