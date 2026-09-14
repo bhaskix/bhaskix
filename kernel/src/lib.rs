@@ -23867,10 +23867,42 @@ fn mount_root(handoff: &Handoff) {
         match virtio::read_all(MAX_ROOT_IMAGE) {
             Ok(image) => {
                 let bytes = alloc::vec::Vec::leak(image);
-                println!(
-                    "    root           {} KiB read from the block device",
-                    bytes.len() / 1024
-                );
+                // **A short read is a failure, and it used to be silent.**
+                // `read_all` clamps to `MAX_ROOT_IMAGE` and says nothing, so a
+                // filesystem one byte over the bound lost its tail and the boot
+                // carried on with a truncated image. What that looks like is
+                // *not* a missing-image error: it is whichever file happened to
+                // live in the tail going absent, surfacing much later as an
+                // unrelated assertion about something else entirely.
+                //
+                // It cost a day on 2026-09-13. CI's image was 4,140 KiB against
+                // this 4,096 KiB bound; `hello.txt` was in the 44 KiB dropped;
+                // and the gate that failed said `vfs FAILED: a leading slash is
+                // accepted and means the same thing` -- a true statement about
+                // a VFS that had been handed most of a filesystem. The same
+                // build here was 3,980 KiB and fitted, so it reproduced nowhere
+                // local and the search went to the emulator, the CPU count and
+                // the scheduler.
+                //
+                // The device knows its own size, so the check costs one
+                // comparison: what was asked for against what is there.
+                let held = crate::virtio::capacity() * crate::virtio::SECTOR;
+                if held > bytes.len() as u64 {
+                    println!(
+                        "\x1b[91m    root           FAILED: the disk holds {} KiB and only {} KiB \
+                         was read -- MAX_ROOT_IMAGE is {} KiB, so {} KiB of the filesystem is \
+                         missing and whatever lives in it will be absent\x1b[0m",
+                        held / 1024,
+                        bytes.len() / 1024,
+                        MAX_ROOT_IMAGE / 1024,
+                        (held - bytes.len() as u64) / 1024
+                    );
+                } else {
+                    println!(
+                        "    root           {} KiB read from the block device, the whole of it",
+                        bytes.len() / 1024
+                    );
+                }
                 // SAFETY: called once, on the bootstrap CPU, before any thread
                 // that could reach the VFS exists. The slice is leaked, so it
                 // outlives everything that will borrow it.

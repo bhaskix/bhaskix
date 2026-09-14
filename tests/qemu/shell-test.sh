@@ -171,6 +171,29 @@ else
     restore_image() { :; }
 fi
 
+# **The whole filesystem, or say so.** `MAX_ROOT_IMAGE` bounds what the kernel
+# will read off the block device, and `read_all` clamps to it in silence -- so
+# an image one byte over loses its tail and the boot goes on with part of a
+# filesystem. That is not a missing-image failure; it is whichever file lived
+# in the tail going absent, and it surfaces as some later assertion about
+# something unrelated.
+#
+# It cost a day on 2026-09-13: CI's image was 4,140 KiB against a 4,096 KiB
+# bound, `hello.txt` was in the 44 KiB dropped, and this lane reported
+# `vfs FAILED: a leading slash is accepted and means the same thing`. The same
+# build here was 3,980 KiB and fitted, so it reproduced on no local machine and
+# the hunt went to the emulator, the CPU count and the scheduler in turn.
+#
+# The kernel now says when the read was short. This makes it fatal here, and
+# names the real cause instead of leaving it to be inferred from whichever file
+# went missing.
+check_root_is_whole() {
+    if grep -qa "root           FAILED: the disk holds" "$LOG"; then
+        fail "the root filesystem was truncated: $(grep -aoE 'root +FAILED:.{0,120}' "$LOG" | head -1)"
+        status=1
+    fi
+}
+
 # **Say which image this is booting, and how old it is** -- after the build
 # above, not before it, so the time is the image that will actually boot.
 #
@@ -748,6 +771,11 @@ that never replied, a full one with a marker missing is a reply that arrived tor
         github_annotation "session tail: $line"
     done < <(tail -6 "$SESSION" 2>/dev/null | tr -d '\r' | cut -c1-160)
 }
+
+# **Before the assertions, not after.** A truncated root makes some of them
+# fail for a reason that has nothing to do with what they test, so this names
+# the cause first and the symptoms read as symptoms.
+check_root_is_whole
 
 for check in "${checks[@]}"; do
     name="${check%%:*}"
