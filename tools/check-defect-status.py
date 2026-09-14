@@ -33,11 +33,22 @@ SETTLED = re.compile(r"\*\*(?:CLOSED|FIXED|RESOLVED|ROOT-CAUSED)\b|(?:CLOSED|FIX
 OPEN_CELL = re.compile(r"\|\s*🔍\s*`OPEN`\s*\|")
 
 
+# What begins a row. **`| ~~**` counts, and leaving it out was a defect in this
+# checker rather than in the table.** A row whose title is struck through --
+# which is how this file marks a defect that was withdrawn or superseded, and
+# it does that often -- did not start a row here, so it was folded into the row
+# *above* it and its body was attributed there. An `OPEN` row that happened to
+# sit above a struck-through one was then reported as contradicting itself,
+# naming a `**CLOSED` that belonged to its neighbour. Found on 2026-09-14 by
+# filing an open defect directly above one.
+ROW_START = ("| **", "| ~~**")
+
+
 def rows(text):
     """Table rows, joined across the physical lines a row is wrapped over."""
     out, current, start = [], None, 0
     for number, line in enumerate(text.split("\n"), 1):
-        if line.startswith("| **"):
+        if line.startswith(ROW_START):
             if current is not None:
                 out.append((start, "\n".join(current)))
             current, start = [line], number
