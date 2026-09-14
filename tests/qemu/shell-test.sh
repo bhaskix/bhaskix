@@ -146,11 +146,26 @@ if [[ -n "$cmdline" ]]; then
     # Its own image, keyed on the mode, so two of these can run at once and
     # neither has to put the shared one back. See `boot-test.sh`.
     ISO="$REPO_ROOT/build/iso-shell-${MODE}.iso"
+    # **An image already built is used as it is**, which is what lets
+    # `tools/boot-on-ci-emulator.sh` run the `kernel` and `disk` modes at all.
+    # Those two are the half of this job that has gone red on CI and could not
+    # be reproduced, because they rebuild the image and the container carrying
+    # CI's emulator carries no Rust toolchain.
+    #
+    # Putting one in would change the *compiler* as well as the emulator and
+    # answer a different question -- that tool's own comment says so, and it is
+    # right. So the host builds the image with the host's compiler and the
+    # container runs only the emulator, which is the whole principle of the
+    # exercise. `BHASKIX_ISO_PREBUILT` is how the caller says it has done that.
+    if [[ -n "${BHASKIX_ISO_PREBUILT:-}" && -f "$BHASKIX_ISO_PREBUILT" ]]; then
+        ISO="$BHASKIX_ISO_PREBUILT"
+    else
     make -C "$REPO_ROOT" iso CMDLINE="$cmdline" \
         ISO="$ISO" ISO_ROOT="$REPO_ROOT/build/iso_root_shell_${MODE}" >/dev/null 2>&1 || {
         fail "could not build an image with $cmdline"
         exit 1
     }
+    fi
     restore_image() { :; }
 else
     restore_image() { :; }

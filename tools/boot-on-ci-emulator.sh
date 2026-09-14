@@ -109,16 +109,45 @@ echo "${DIM}  the image was built on this machine; only the emulator is CI's${RE
 echo
 
 # **The shell lane is here because it is one of the three CI jobs that has gone
-# red**, and only two of its four modes can run: `kernel` and `disk` rebuild the
-# image with a different command line, which needs a Rust toolchain this image
-# does not carry. Adding one would change the compiler as well as the emulator
-# and answer a different question, so those two are simply not offered rather
-# than offered and quietly broken.
+# red**, and all four of its modes run now. Two of them -- `kernel` and `disk` --
+# rebuild the image with a different command line, which needs a Rust toolchain
+# this container does not carry.
+#
+# **The toolchain still does not go in, and the reason has not changed**: it
+# would make the *compiler* CI's as well as the emulator, and this tool exists
+# to vary one thing. What changed is where the build happens. The host builds
+# those two images with the host's compiler, and the container is handed them
+# through `BHASKIX_ISO_PREBUILT` and runs only the emulator.
+#
+# It was worth doing rather than leaving them "not offered": the job that went
+# red on 2026-09-13 and could not be reproduced was **`disk`**, one of the two
+# this tool could not reach, and the half it could reach was green. A
+# reproduction tool that cannot reach the failing case is a tool that says
+# "passes here" about the wrong thing -- which is the exact mistake its own
+# header describes.
 case "$LANE" in
     all)   cells=("bios max" "bios qemu64" "uefi max" "uefi qemu64") ;;
-    shell) cells=("shell user" "shell iommu") ;;
+    shell) cells=("shell user" "shell iommu" "shell kernel" "shell disk") ;;
     *)     cells=("$LANE max" "$LANE qemu64") ;;
 esac
+
+# The two images the container cannot build, built here where the compiler is.
+for mode in kernel disk; do
+    for cell in "${cells[@]}"; do
+        [[ "$cell" == "shell $mode" ]] || continue
+        case "$mode" in
+            kernel) line="shell=kernel" ;;
+            disk)   line="root=disk" ;;
+        esac
+        printf '%s  building the %s image here, where the compiler is%s\n' "$DIM" "$mode" "$RESET"
+        make -C "$REPO_ROOT" iso CMDLINE="$line" \
+            ISO="$REPO_ROOT/build/iso-shell-${mode}.iso" \
+            ISO_ROOT="$REPO_ROOT/build/iso_root_shell_${mode}" >/dev/null 2>&1 || {
+            echo "${YELLOW}ci-emulator${RESET}  could not build the $mode image" >&2
+            exit 3
+        }
+    done
+done
 
 status=0
 for cell in "${cells[@]}"; do
@@ -128,6 +157,11 @@ for cell in "${cells[@]}"; do
             script="tests/qemu/shell-test.sh $cpu"
             envs=(-e BHASKIX_SHELL_LOG=/tmp/lane.log
                   -e SHELL_TEST_TIMEOUT="${SHELL_TEST_TIMEOUT:-300}")
+            # `kernel` and `disk` boot an image this container cannot build;
+            # it was built on the host above and is handed over here.
+            if [[ "$cpu" == "kernel" || "$cpu" == "disk" ]]; then
+                envs+=(-e BHASKIX_ISO_PREBUILT="/repo/build/iso-shell-${cpu}.iso")
+            fi
         else
             script="tests/qemu/boot-test.sh $lane"
             envs=(-e BHASKIX_BOOT_LOG=/tmp/lane.log
