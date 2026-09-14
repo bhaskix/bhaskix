@@ -18,6 +18,21 @@ Both directions were real on 2026-09-05. Two of the five rows whose cell read
 
 Neither was a typo; both were rows updated in the body by whoever fixed them,
 with the cell left alone. Prose has no gate. This one does.
+
+**A second rule joined it on 2026-09-14: a struck-through title cannot be
+`OPEN`.** A row went through this check with its title struck out, a body
+announcing its own withdrawal, and a cell still reading `OPEN`. Adding
+`WITHDRAWN` to the list above was the first attempt and it was wrong -- it
+immediately flagged a legitimately open row whose body withdraws *one of its
+own findings*, `~~The loopback contributes nothing~~ **WITHDRAWN 2026-09-04**`,
+which is a row being careful rather than a row contradicting itself. The
+narrowness of that pattern is deliberate and stays.
+
+Striking out the *title* is unambiguous: it is how this file says the defect
+itself is not there. A defect that turns out not to exist is settled as firmly
+as one that was fixed -- more firmly, since nobody will ever close it later --
+and leaving it open sends the next reader after a fault measured not to be
+there.
 """
 
 import re
@@ -42,6 +57,10 @@ OPEN_CELL = re.compile(r"\|\s*🔍\s*`OPEN`\s*\|")
 # naming a `**CLOSED` that belonged to its neighbour. Found on 2026-09-14 by
 # filing an open defect directly above one.
 ROW_START = ("| **", "| ~~**")
+
+# What `bad` carries when the title, rather than the body, is the half that
+# contradicts the cell.
+STRUCK = "a struck-through title"
 
 
 def rows(text):
@@ -74,15 +93,32 @@ def main():
         if found:
             title = row[4:].split("**")[0][:72]
             bad.append((line, title, found.group(0)))
+            continue
+        # A struck-through *title* says the defect is not there at all, which
+        # no open row can also be saying. Unlike a keyword in the body, this
+        # cannot be a row striking out one of its own findings.
+        head = row[: cell.start()].lstrip("| ").lstrip("*")
+        if head.startswith("~~"):
+            title = head.lstrip("~")[:72]
+            bad.append((line, title, STRUCK))
 
     if not bad:
         print(f"  \033[1;32mok\033[0m    every OPEN defect row agrees with its body ({checked} checked)")
         return 0
 
     for line, title, marker in bad:
+        # **Which half contradicts the cell, named exactly.** Saying "its body
+        # says 'a struck-through title'" points a reader at the wrong half of
+        # the row, and a gate that names the wrong place is the fault this
+        # file exists to catch one level up.
+        where = (
+            "its title is struck through"
+            if marker == STRUCK
+            else f"its body says {marker!r}"
+        )
         print(
-            f"  \033[1;31mFAIL\033[0m  TRACKER.md:{line} says `OPEN` but its body says "
-            f"{marker!r}\n        {title}",
+            f"  \033[1;31mFAIL\033[0m  TRACKER.md:{line} says `OPEN` but {where}"
+            f"\n        {title}",
             file=sys.stderr,
         )
     print(

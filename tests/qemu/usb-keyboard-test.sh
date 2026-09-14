@@ -45,8 +45,32 @@ source "$REPO_ROOT/tests/qemu/devices.sh"
 qemu_device_list usb yes
 
 status=0
+# Set by the waiters below when QEMU is found gone. Everything after that point
+# is unobservable, and saying so is the difference between a report and a guess.
+MACHINE_GONE=0
 pass() { printf '\033[1;32mok\033[0m    %s\n' "$1"; }
 fail() { printf '\033[1;31mFAIL\033[0m  %s\n' "$1"; }
+
+# An assertion that did not pass, and *why* it did not.
+#
+# **Its claim was being contradicted two lines later.** When the machine hangs
+# and QEMU is killed at the timeout, every later wait fails and each printed a
+# sentence of its own -- so `the shell never saw the typed command` sat directly
+# above `ok the shell ran the command typed at its keyboard`, which cannot both
+# be true. Nothing was wrong with the keyboard; the run had stopped. That sent a
+# reader after input on 2026-09-14, and the comment further down records this
+# same harness costing somebody a day the same way in August.
+#
+# A truncated log cannot support a claim about what the machine did, so it does
+# not make one.
+missed() {
+    if [[ $MACHINE_GONE == 1 ]]; then
+        fail "not observed -- the run was cut short before this point: $1"
+    else
+        fail "$1"
+    fi
+    status=1
+}
 
 [[ -f $ISO ]] || { fail "no image at $ISO -- run make iso"; exit 1; }
 
@@ -80,7 +104,7 @@ trap cleanup EXIT
 await() {
     local pattern="$1" waited=0
     while ! grep -qaE -- "$pattern" "$LOG" 2>/dev/null; do
-        kill -0 "$qemu" 2>/dev/null || return 1
+        kill -0 "$qemu" 2>/dev/null || { MACHINE_GONE=1; return 1; }
         sleep 0.25
         waited=$((waited + 1))
         [[ $waited -gt $((TIMEOUT * 4)) ]] && return 1
@@ -96,13 +120,26 @@ await() {
 # itself -- is already in the log before a single key is sent. Two assertions
 # passed that way on the first run, on a machine whose monitor socket had never
 # even been opened. A marker that was already there proves nothing.
+# **A third argument bounds the wait, and the default is the whole budget.**
+#
+# Every wait here could spend `TIMEOUT` seconds, which is also QEMU's own
+# deadline -- so the *first* pattern that could not match took the machine with
+# it and left every assertion after it with nothing to read. On 2026-09-14 that
+# turned one unmatched echo into three failing assertions and a defect report
+# about a lane that "hangs one run in three". The lane was fine.
+#
+# Boot waits keep the full budget: a loaded runner really can take a minute to
+# reach a prompt. A wait for something that should follow a keystroke gets
+# `TYPED_WAIT`, so a miss costs that and the run carries on to say what else
+# worked -- which is the difference between one honest failure and three.
+TYPED_WAIT=25
 await_after() {
-    local pattern="$1" from="$2" waited=0
+    local pattern="$1" from="$2" budget="${3:-$TIMEOUT}" waited=0
     while ! tail -n "+$((from + 1))" "$LOG" 2>/dev/null | grep -qaE -- "$pattern"; do
-        kill -0 "$qemu" 2>/dev/null || return 1
+        kill -0 "$qemu" 2>/dev/null || { MACHINE_GONE=1; return 1; }
         sleep 0.25
         waited=$((waited + 1))
-        [[ $waited -gt $((TIMEOUT * 4)) ]] && return 1
+        [[ $waited -gt $((budget * 4)) ]] && return 1
     done
     return 0
 }
@@ -147,9 +184,8 @@ PY
 if await "usb keyboard   reading reports"; then
     pass "a USB keyboard was enumerated, configured, and its interrupt claimed"
 else
-    fail "no USB keyboard was reported before the timeout"
+    missed "no USB keyboard was reported before the timeout"
     grep -aE "xhci|usb keyboard" "$LOG" | sed 's/^/      /'
-    status=1
 fi
 
 # RFC 0049. Every unit the firmware named is listed, and every one of them is
@@ -160,9 +196,8 @@ fi
 if await "iommu unit 0   registers at .*claims every device"; then
     pass "every remapping unit the firmware named is listed"
 else
-    fail "the unit list did not report"
+    missed "the unit list did not report"
     grep -aE "iommu" "$LOG" | sed 's/^/      /'
-    status=1
 fi
 
 # The outcome, which is the claim that matters: not "a unit was found" but
@@ -171,9 +206,8 @@ fi
 if await "iommu          all 1 unit programmed"; then
     pass "every unit the firmware named was programmed"
 else
-    fail "the kernel did not report programming every unit"
+    missed "the kernel did not report programming every unit"
     grep -aE "iommu" "$LOG" | sed 's/^/      /'
-    status=1
 fi
 
 # The other half: a fault line every boot, saying none rather than saying
@@ -182,8 +216,7 @@ fi
 if await "iommu faults   .during bring-up. none recorded by the one programmed unit"; then
     pass "the IOMMU was asked about faults, and answered"
 else
-    fail "no fault line was printed"
-    status=1
+    missed "no fault line was printed"
 fi
 
 # The pre-OS handoff ran, and said what it found. On this emulator the answer
@@ -200,9 +233,8 @@ fi
 if await "xhci           no legacy capability"; then
     pass "the controller was asked for, and firmware had never claimed it"
 else
-    fail "the pre-OS handoff did not report"
+    missed "the pre-OS handoff did not report"
     grep -aE "xhci" "$LOG" | sed 's/^/      /'
-    status=1
 fi
 
 # Either shell will do: this is a test of the input path, not of which shell
@@ -210,8 +242,7 @@ fi
 if await 'bhaskix[>$] '; then
     pass "a shell reached its prompt"
 else
-    fail "no prompt appeared"
-    status=1
+    missed "no prompt appeared"
 fi
 
 if [[ $status -eq 0 ]]; then
@@ -236,17 +267,35 @@ if [[ $status -eq 0 ]]; then
     # The boot report contains the word `help` and the help output long before
     # anything is typed, which is why the match is anchored *after* the mark
     # rather than to the prompt.
-    if await_after '(bhaskix[>$] help|^help)' "$mark"; then
-        pass "keys typed at the USB keyboard reached the shell and were echoed"
+    # **The echo is not asserted, and that is a decision rather than a gap.**
+    #
+    # It was, twice, and produced two withdrawn defects in one day. The console
+    # is shared by every domain, and the shell echoes a *character at a time* --
+    # so another domain printing between two keystrokes splits the echo. The
+    # first version required the echo on the prompt's line and was relaxed to
+    # allow a line of its own; the case that finished it looks like this, from
+    # a kept log on 2026-09-14:
+    #
+    #     hhosted change ok: made a directory, removed a file, and ...
+    #     hosted exec busybox refused errno 2
+    #     elp
+    #
+    # The typed `h` is prefixed to a probe's line and `elp` arrives three lines
+    # later. No line-oriented pattern can match that, and because a wait runs
+    # until the machine dies, one that cannot match spends the whole timeout and
+    # takes every assertion after it down as well. That read as "the lane hangs
+    # one run in three" and was filed as a defect. Nothing was hanging.
+    #
+    # **What is asserted instead is strictly stronger.** The help text contains
+    # `print the arguments`, and it is printed only by a shell that received the
+    # keystrokes, assembled them into a line, and ran it. Interleaving cannot
+    # fake that, and no echo can satisfy it. What is given up is the claim that
+    # the *echo* works, which a shared console cannot support at this
+    # granularity from outside.
+    if await_after 'print the arguments' "$mark" "$TYPED_WAIT"; then
+        pass "keys typed at the USB keyboard reached the shell, which ran what they spelled"
     else
-        fail "the shell never saw the typed command"
-        status=1
-    fi
-    if await_after 'print the arguments' "$mark"; then
-        pass "the shell ran the command typed at its keyboard"
-    else
-        fail "the command echoed but never ran"
-        status=1
+        missed "the shell never ran the typed command"
     fi
 
     # Shift, because the modifier state is held between two scancodes and is
@@ -254,11 +303,10 @@ if [[ $status -eq 0 ]]; then
     mark=$(wc -l < "$LOG")
     monitor "sendkey e" "sendkey c" "sendkey h" "sendkey o" "sendkey spc" \
         "sendkey shift-h" "sendkey i" "sendkey ret"
-    if await_after '^Hi' "$mark"; then
+    if await_after '^Hi' "$mark" "$TYPED_WAIT"; then
         pass "a modifier is held across reports (a capital arrived over USB)"
     else
-        fail "shift did not produce a capital -- the modifier state is wrong"
-        status=1
+        missed "shift did not produce a capital -- the modifier state is wrong"
     fi
 
     # **A held key must not repeat.** This is the whole difference between a
@@ -270,7 +318,7 @@ if [[ $status -eq 0 ]]; then
     # character.
     mark=$(wc -l < "$LOG")
     monitor "sendkey a" "sendkey ret"
-    if await_after '(bhaskix[>$] a|^a)' "$mark"; then
+    if await_after '(bhaskix[>$] a|^a)' "$mark" "$TYPED_WAIT"; then
         typed=$(tail -n "+$((mark + 1))" "$LOG" | grep -aoE 'bhaskix[>$] a+' | head -1)
         if [[ "$typed" =~ a{2,} ]]; then
             fail "a held key repeated: the driver is reading state as events ($typed)"
@@ -279,8 +327,7 @@ if [[ $status -eq 0 ]]; then
             pass "a held key produces one character, not one per report"
         fi
     else
-        fail "the single keypress never arrived"
-        status=1
+        missed "the single keypress never arrived"
     fi
 fi
 
