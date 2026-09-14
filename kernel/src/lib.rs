@@ -4392,9 +4392,42 @@ fn adapter_bind_record() -> (u64, u64) {
 /// ten milliseconds, up to a second. A machine where it never settles gets the
 /// last reading and the gate's verdict on it, which is the honest outcome --
 /// this waits for a number to become meaningful and never invents one.
+///
+/// # Stability was not enough, and could not have been — 2026-09-14
+///
+/// **Thirty milliseconds of stillness cannot outlast a probe doing disk I/O**,
+/// so a program in the middle of its work reads exactly like one that has
+/// finished. RFC 0077's second pass lengthened `bin/hosted` and this gate went
+/// from failing about one boot in eight to three in eight, all of them reading
+/// `3 held, peak 3` -- which is precisely the three files that probe has open
+/// while it works. The line order proves it rather than suggests it: in a
+/// failing boot this gate's output sits *between* two of the probe's own.
+///
+/// The heuristic had already been defeated once, by RFC 0060's longer probe,
+/// and the answer then was a better heuristic. Twice is the shape of a wrong
+/// question. **This gate wants "every hosted program has finished" and was
+/// asking "has this number stopped moving".** [`domain::linux_live`] answers
+/// the first, so it is asked first and the settle is left to do what it is
+/// good for: the adapter hands descriptors back *after* a domain ends, and
+/// that release is the window stability was always right about.
+///
+/// `hosted_exec_self_test` returns while the program it exec'd is still
+/// running, which is why waiting on that function was never an option.
+///
+/// A machine where hosted processes never finish -- a lane running an
+/// interactive BusyBox, say -- spends the timeout and then reads as before.
 fn settled_process_record() -> [u64; 6] {
     const TRIES: usize = 100;
     const STABLE: u32 = 3;
+    // Two seconds, which is longer than any probe here takes to end and short
+    // enough that a lane holding a hosted shell open pays it once.
+    const FINISHING: usize = 200;
+    for _ in 0..FINISHING {
+        if domain::linux_live() == 0 {
+            break;
+        }
+        time::sleep_micros(10_000);
+    }
     let mut record = adapter_process_record();
     let mut stable = 0;
     for _ in 0..TRIES {

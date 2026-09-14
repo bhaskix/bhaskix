@@ -1445,6 +1445,27 @@ pub fn live() -> usize {
     TABLE.lock().domains.iter().filter(|d| d.live).count()
 }
 
+/// Live domains that speak Linux — that is, hosted processes still running.
+///
+/// **Added 2026-09-14 because a gate was asking the wrong question.** The
+/// adapter's file-slot check wanted to know whether every hosted program had
+/// finished, and had no way to ask, so it asked whether the slot count had
+/// stopped moving instead — which a probe in the middle of its work satisfies
+/// just as well as one that is done. See `settled_process_record`.
+///
+/// A domain gets this tag from [`Domain::set_personality`] and only the
+/// adapter's children carry it; `bin/linuxd` itself is a native service. So
+/// this is a count of hosted processes and not of anything else.
+#[must_use]
+pub fn linux_live() -> usize {
+    TABLE
+        .lock()
+        .domains
+        .iter()
+        .filter(|d| d.live && d.personality == Personality::Linux)
+        .count()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
