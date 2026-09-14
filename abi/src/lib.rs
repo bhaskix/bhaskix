@@ -993,6 +993,24 @@ pub mod dir {
     /// service answer [`NOWHERE`].
     pub const READ_INTO: u64 = 9;
 
+    /// Set the file this **writable** handle names back to zero bytes —
+    /// [RFC 0077](../../docs/rfc/0077-a-file-that-can-be-emptied.md).
+    ///
+    /// **No arguments: the handle is the file.** So there is no name to parse
+    /// and no untrusted input, which is why this method owes no fuzz target
+    /// where `CREATE_AT` and `REMOVE_AT` do. Replies with the outcome alone.
+    ///
+    /// Writable handles only. A directory is refused with `GONE` rather than
+    /// emptied — a directory's removal is `REMOVE_AT`, which refuses one that
+    /// still has entries, and giving directories a second way to be emptied
+    /// would give that refusal a way round.
+    ///
+    /// **No length**, deliberately. Linux's `ftruncate` can extend a file,
+    /// which means a sparse one, and this format cannot represent a hole.
+    /// Shortening to a non-zero length is suffix arithmetic no caller needs
+    /// yet. `ftruncate(fd, 0)` and `O_TRUNC` are what a shell wants.
+    pub const TRUNCATE: u64 = 10;
+
     /// Packs [`LIST_AT`]'s fourth reply word: the name's length in the low
     /// byte, whether the entry is a directory in bit 8, and the inode above
     /// bit 32.

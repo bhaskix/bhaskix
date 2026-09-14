@@ -4374,6 +4374,45 @@ fn adapter_bind_record() -> (u64, u64) {
     (record[0], record[1])
 }
 
+/// [`adapter_process_record`], read once its file-slot count has stopped moving.
+///
+/// **A live figure read at one instant is not a measurement, and this one was
+/// reported as a leak for a day.** `record[4]` is republished on every pass of
+/// `bin/linuxd`'s loop. The hosted probe's domain *ends* before the adapter has
+/// finished handing its descriptors back, so a single read here lands inside
+/// that window and counts slots as held that are already on their way home.
+///
+/// The gate above it asks whether the count came back **down**, so a reading
+/// taken mid-release answers a different question than the one it is asked --
+/// and answers it wrongly. It failed about one boot in eight before RFC 0060
+/// lengthened the probe and seven in eight afterwards, which is a window that
+/// was always there being widened rather than a defect being introduced.
+///
+/// Stability, not a fixed delay: three consecutive equal readings, polled at
+/// ten milliseconds, up to a second. A machine where it never settles gets the
+/// last reading and the gate's verdict on it, which is the honest outcome --
+/// this waits for a number to become meaningful and never invents one.
+fn settled_process_record() -> [u64; 6] {
+    const TRIES: usize = 100;
+    const STABLE: u32 = 3;
+    let mut record = adapter_process_record();
+    let mut stable = 0;
+    for _ in 0..TRIES {
+        time::sleep_micros(10_000);
+        let again = adapter_process_record();
+        if again[4] == record[4] {
+            stable += 1;
+            if stable >= STABLE {
+                return again;
+            }
+        } else {
+            stable = 0;
+        }
+        record = again;
+    }
+    record
+}
+
 fn adapter_process_record() -> [u64; 6] {
     let page = ADAPTER_REPORT.load(core::sync::atomic::Ordering::Acquire);
     if page == u64::MAX {
@@ -9701,7 +9740,7 @@ fn killed_domain_gives_its_socket_back(hhdm_base: u64, cpus: u32) -> bool {
     // because a number that only appears on the boot that fails has no
     // baseline to be compared against -- which is exactly how this gate came to
     // print a descriptor number for a week that nobody could read.
-    let record = adapter_process_record();
+    let record = settled_process_record();
     println!(
         "    process records {} admitted, {} found; last admitted for domain {} holding {} \
          descriptor(s)",
@@ -22963,7 +23002,7 @@ fn user_shell(handoff: &Handoff) -> Result<(), &'static str> {
         // either way, and must say so instead of reporting ABSENT and being
         // read as evidence. This verdict was three-valued for one afternoon
         // and the third value was doing exactly that.
-        let whole = crate::console::recorded_contains(b"hosted open refused errno 2\n");
+        let whole = crate::console::recorded_contains(b"hosted pid ");
         // **A short needle, because a long one has the defect it is looking
         // for.** This asked for `b"hosted open "` -- twelve bytes -- and the
         // tear it exists to detect splits the line at an arbitrary offset,
@@ -22974,7 +23013,16 @@ fn user_shell(handoff: &Handoff) -> Result<(), &'static str> {
         // correct it. Seven bytes can still be split; they are split far less
         // often, and the verdict says TORN rather than ABSENT when they
         // survive.
-        let started = crate::console::recorded_contains(b"errno 2");
+        //
+        // **And the needle must be a line the probe still prints.** It looked
+        // for `hosted open refused errno 2` until 2026-09-13, when RFC 0060
+        // gave the probe a write path and that line stopped existing -- so
+        // this instrument reported ABSENT on every boot and could no longer
+        // detect the tear it was written for. An instrument keyed to a string
+        // somebody else owns goes quiet when they rename it, and nothing
+        // fails. It now keys on the probe's *first* line, which is printed on
+        // every boot that runs it at all and does not depend on a filesystem.
+        let started = crate::console::recorded_contains(b"auxv ok");
         let (kept, refused) = crate::console::recorded();
         println!(
             "    console record  the hosted line is {} in this kernel's own record ({kept} bytes \
@@ -23839,12 +23887,31 @@ extern "C" fn user_shell_entry(hhdm_base: u64) -> ! {
 
 /// Largest filesystem image this will read off a disk.
 ///
-/// Four megabytes. The image is read into the heap in one piece, so the bound
-/// is what stops a device reporting an implausible capacity from turning into
-/// an allocation the size of whatever it claimed. A real filesystem reads
-/// blocks as it needs them and has no such number; this one is a whole image
-/// held in memory, and says so.
-const MAX_ROOT_IMAGE: u64 = 4 * 1024 * 1024;
+/// **Eight megabytes, raised from four on 2026-09-14.** The image is read into
+/// the heap in one piece, so the bound is what stops a device reporting an
+/// implausible capacity from turning into an allocation the size of whatever
+/// it claimed. Eight serves that as well as four did; what four had stopped
+/// serving was the image this project actually builds.
+///
+/// **Raised because it was crossed, and crossing it was invisible.** The
+/// initrd reached 4,140 KiB on CI while this bound was 4,096 -- and the
+/// clamped read was silent, so the boot continued with 44 KiB missing and
+/// failed as `vfs FAILED: a leading slash is accepted and means the same
+/// thing`, an assertion about a file that lived in the dropped tail. The same
+/// source built 160 KiB smaller here and fitted, so it reproduced on no local
+/// machine. A short read says so now, which is the more important half of that
+/// fix: this number will be crossed again.
+///
+/// **The margin is the point, not the number.** At 4 MiB the headroom was
+/// under 1%, which is not a bound anyone is watching -- it is a tripwire. The
+/// image is ~3,980 KiB here and ~4,140 KiB on CI, so eight leaves roughly half
+/// the bound spare and a year of ordinary growth.
+///
+/// A real filesystem reads blocks as it needs them and has no such number;
+/// this one is a whole image held in memory and says so. Removing the bound
+/// entirely means demand paging the root, which is a design change and wants
+/// its own RFC rather than a constant edited under pressure.
+const MAX_ROOT_IMAGE: u64 = 8 * 1024 * 1024;
 
 /// Chooses where the root filesystem comes from, and mounts it.
 ///

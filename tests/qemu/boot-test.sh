@@ -3198,7 +3198,15 @@ if grep -qE "adapter files   [0-9]+ of [0-9]+ slot\(s\) held now, [0-9]+ at the 
     files_now=$(echo "$files_line" | sed -E 's/adapter files   ([0-9]+) of.*/\1/')
     files_peak=$(echo "$files_line" | sed -E 's/.*, ([0-9]+) at the peak/\1/')
     if [ "$files_peak" -le "$files_now" ]; then
-        fail "the adapter's file slots never came back: $files_now held, peak $files_peak -- an execve's O_CLOEXEC descriptor kept its capability"
+        # **Says what was measured, not what probably caused it.** This named
+        # an `execve`'s `O_CLOEXEC` descriptor, which is one way to reach this
+        # number and was never the only one -- and when the number turned out
+        # to be a mid-release reading rather than a leak at all, the message
+        # sent a day of hunting into the keyboard, the controller and the
+        # IOMMU. A gate that names a cause it has not measured is the failure
+        # this tree keeps recording; the cause belongs in whatever the reader
+        # finds, not in the assertion.
+        fail "the adapter's file slots never came back: $files_now held, peak $files_peak -- one or more capabilities were not given back"
         status=1
     else
         pass "an O_CLOEXEC descriptor gave its capability back at execve (peak $files_peak, now $files_now)"
@@ -3286,29 +3294,41 @@ else
     pass "no BusyBox staged on this machine, so no hosted execve of it was tried"
 fi
 
-if grep -qE "hosted open refused errno 2(\r|\s|$)" "$LOG"; then
-    pass "a hosted program's open resolved through the writable directory (ENOENT, not EROFS)"
-elif grep -qF "hosted open refused errno 30" "$LOG"; then
+# RFC 0060 steps 3-5: a hosted program **creates a file, writes to it, closes
+# it, reopens it and reads its own bytes back off the disk** -- and is refused
+# where nothing may be written.
+#
+# **The body is the assertion, not a return value.** A `write` answering 48
+# says the adapter and the service agreed on a number; it does not say the
+# bytes reached a file. These bytes exist in exactly one place on this machine
+# -- the hosted program's own `.rodata` -- and the only way they appear a
+# second time is by having gone out through `dir::WRITE_FROM` onto a journalled
+# disk and come back through a fresh `open` and `read`. A gate on the count
+# would pass on a filesystem that discarded every write.
+#
+# The prefix is `hosted tmp` and not `hosted write`, which is taken: RFC 0032
+# step 10's hand-assembled corpus program writes the literal `hosted write ok`
+# and a gate above greps for it. Two producers of one string leave that gate
+# unable to say which program printed it.
+#
+# This replaces the step-2 gate, which asserted `ENOENT` from an open that
+# deliberately did not create -- the write path was withdrawn on 2026-08-31 for
+# reddening the TCP inbound gate 5 boots of 5. Re-measured 2026-09-13 on a tree
+# thirteen days newer: 0 red of 10, journal commit happening on every one.
+if grep -qF "hosted tmp ok: a hosted process wrote this through a capability" "$LOG"; then
+    pass "a hosted program wrote a file and read its own bytes back off the disk"
+elif grep -qF "hosted tmp open refused errno 30" "$LOG"; then
     fail "a hosted writable open was refused EROFS: the routing or the grant regressed"
     status=1
 elif grep -qF "hosted exec    skipped" "$LOG" \
     || grep -qF "fs domain      no block service on this machine" "$LOG"; then
-    pass "no filesystem service on this machine, so no hosted program opened anything"
-elif grep -qF "hosted open " "$LOG"; then
-    # **Torn, and named as such.** The line started and did not finish, so the
-    # bytes exist and something got between them. Measured at about 1 boot in
-    # 33; the kernel's own record line says whether *this kernel* printed it
-    # whole, which is the difference between a tear below this kernel and one
-    # above it.
-    fail "the hosted writable open was TORN, not refused: $(grep -aoE 'hosted open .{0,40}' "$LOG" | head -1)"
-    # **An annotation, not an `echo`, and run 484 is why.** CI produced a torn
-    # specimen that afternoon, correctly named TORN by the arm above -- and
-    # arrived without this line, because a plain `echo` to stderr reaches the
-    # job log, which needs a token to read, while `::error::` needs none. This
-    # is the one value that says whether the tear is *inside* this kernel: the
-    # recorder is filled by `write_str` before the UART, so WHOLE here with a
-    # torn log puts the tear below the kernel, and TORN here puts it above.
-    # Losing it is losing the specimen.
+    pass "no filesystem service on this machine, so no hosted program wrote anything"
+elif grep -qF "hosted tmp " "$LOG"; then
+    # The probe says where it stopped -- a refused open, a short write, a short
+    # read, or the wrong bytes back -- so this arm names the stage rather than
+    # repeating that something went wrong. A torn line lands here too, and the
+    # kernel's own record says whether the tear was above it or below it.
+    fail "the hosted write round trip stopped: $(grep -aoE 'hosted tmp .{0,60}' "$LOG" | head -1)"
     github_annotation "the kernel's own record says: $(grep -aoE 'console record .*' "$LOG" | head -1 | cut -c1-120)"
     echo "        the kernel's own record says: $(grep -aoE 'console record .*' "$LOG" | head -1 | cut -c1-90)" >&2
     status=1
@@ -3317,9 +3337,103 @@ else
     # one.** No fragment of the line reached the log at all, so this is not a
     # torn line: the probe printed nothing. Both arms said "did not conclude"
     # until 2026-08-31, and an afternoon was spent treating one as the other.
-    fail "the hosted writable open printed NOTHING: no fragment of the line reached the log"
+    fail "the hosted write round trip printed NOTHING: no fragment of the line reached the log"
     github_annotation "the kernel's own record says: $(grep -aoE 'console record .*' "$LOG" | head -1 | cut -c1-120)"
     echo "        the kernel's own record says: $(grep -aoE 'console record .*' "$LOG" | head -1 | cut -c1-90)" >&2
+    status=1
+fi
+
+# RFC 0060 step 3, the half a 48-byte line cannot reach: **a write larger than
+# one page**, which is what says the loop is in the adapter.
+#
+# `COPY_IN` moves at most `MAX_SUPERVISED_COPY` (one page, a latency bound) and
+# `WRITE_FROM` takes at most one page, so 5,000 bytes cannot cross in a single
+# round trip. A `write` answering 5,000 has been round the loop at least twice.
+# One answering 4,096 is the short write on an ordinary file that Linux almost
+# never produces and that plenty of software quietly mishandles -- so the count
+# is the assertion, and the head read back afterwards is what says the count is
+# bytes on a disk rather than arithmetic.
+if grep -qF "hosted bulk ok: 5000 bytes in one write, past the one-page chunk" "$LOG"; then
+    pass "a hosted write crossed the one-page chunk: 5000 bytes in one call, and the head read back"
+elif grep -qF "hosted exec    skipped" "$LOG" \
+    || grep -qF "fs domain      no block service on this machine" "$LOG"; then
+    pass "no filesystem service on this machine, so no bulk write was tried"
+elif grep -qF "hosted bulk " "$LOG"; then
+    fail "the hosted bulk write stopped: $(grep -aoE 'hosted bulk .{0,60}' "$LOG" | head -1)"
+    status=1
+else
+    fail "the hosted program did not say whether a write past one page worked"
+    status=1
+fi
+
+# RFC 0077: `O_TRUNC` over a longer file leaves nothing of the longer one.
+#
+# **Asserted by absence, which is the only way a truncate can be.** A truncate
+# that frees nothing is invisible from the write side: the short body goes, the
+# count is right, and the only symptom is the old tail surviving past its end.
+# So the probe reads back far more than it wrote and the gate requires the read
+# to stop at the short body.
+#
+# It replaces a silent wrong answer rather than adding a feature: until RFC 0077
+# `O_TRUNC` on an existing file was ignored, so `echo x > file` over a longer
+# one left the tail and said nothing.
+if grep -qF "hosted trunc ok: a longer body was emptied, 5 bytes left and nothing past them; ftruncate emptied it again" "$LOG"; then
+    pass "a hosted O_TRUNC emptied a longer file: the old tail is gone, not overwritten"
+elif grep -qF "hosted exec    skipped" "$LOG" \
+    || grep -qF "fs domain      no block service on this machine" "$LOG"; then
+    pass "no filesystem service on this machine, so nothing was truncated"
+elif grep -qF "hosted trunc " "$LOG"; then
+    fail "the hosted truncate stopped: $(grep -aoE 'hosted trunc .{0,70}' "$LOG" | head -1)"
+    status=1
+else
+    fail "the hosted program did not say whether O_TRUNC emptied a longer file"
+    status=1
+fi
+
+# RFC 0060 step 4: `mkdir` and `unlink` under the writable directory, and
+# neither of them anywhere else.
+#
+# **The removal is proved by absence, not by a return value.** A `REMOVE_AT`
+# that answered `OK` and freed nothing is indistinguishable from one that
+# worked, from the caller's side -- so the probe reopens the name it removed
+# and requires the open to fail. The same sentence also carries the refusal
+# from the read-only root, because an `unlink` there is the same containment
+# claim as a write and would otherwise be untested.
+if grep -qF "hosted change ok: made a directory, removed a file, and the root kept its own errno" "$LOG"; then
+    pass "a hosted program made a directory and removed a file under /tmp, and removed nothing above it"
+elif grep -qF "hosted change REMOVED A FILE FROM THE READ-ONLY ROOT" "$LOG"; then
+    fail "CONTAINMENT: a hosted program unlinked a file under the read-only root"
+    status=1
+elif grep -qF "hosted exec    skipped" "$LOG" \
+    || grep -qF "fs domain      no block service on this machine" "$LOG"; then
+    pass "no filesystem service on this machine, so nothing was made or removed"
+elif grep -qF "hosted change " "$LOG"; then
+    fail "the hosted mkdir/unlink stopped: $(grep -aoE 'hosted change .{0,60}' "$LOG" | head -1)"
+    status=1
+else
+    fail "the hosted program did not say whether it could make or remove anything"
+    status=1
+fi
+
+# **The containment arm, and it is the more important one.** RFC 0031 I3 says
+# a hosted process reaches only what it was granted. It was granted a read-only
+# root and one writable directory, so an open for writing anywhere but under
+# `/tmp` must answer `EROFS` -- structurally, because the adapter holds no
+# capability there that carries a write, and not because a check said no.
+#
+# A machine where a hosted program can write under `/tmp` is the feature. A
+# machine where it can write outside it is a broken containment claim, so this
+# is asserted on every boot rather than inferred from the arm above passing.
+if grep -qF "hosted sealed refused errno 30" "$LOG"; then
+    pass "a hosted program's write to the read-only root was refused: nothing above /tmp is writable"
+elif grep -qF "hosted sealed OPENED FOR WRITING" "$LOG"; then
+    fail "CONTAINMENT: a hosted program opened the read-only root for writing: $(grep -aoE 'hosted sealed .{0,40}' "$LOG" | head -1)"
+    status=1
+elif grep -qF "hosted exec    skipped" "$LOG" \
+    || grep -qF "fs domain      no block service on this machine" "$LOG"; then
+    pass "no filesystem service on this machine, so there was no read-only root to attempt"
+else
+    fail "the hosted program did not say whether the read-only root refused a write"
     status=1
 fi
 

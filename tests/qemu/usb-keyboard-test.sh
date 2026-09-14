@@ -224,7 +224,19 @@ if [[ $status -eq 0 ]]; then
     # The echo proves the byte reached the shell's line editor; the answer
     # proves the line was run. Both, because an echo alone would pass with a
     # shell that never executes anything.
-    if await_after 'bhaskix[>$] help' "$mark"; then
+    # **The echo need not be on the prompt's line**, and requiring it was a
+    # gate that failed for the wrong reason for a whole day. The console is
+    # shared: any other domain that prints between the shell printing
+    # `bhaskix$ ` and the shell echoing what was typed pushes the echo onto a
+    # line of its own. RFC 0060's hosted probe does exactly that, and this
+    # pattern then reported "the shell never saw the typed command" on a
+    # machine where the shell had seen it, echoed it and run it.
+    #
+    # Staleness is still handled, and by the mechanism built for it: `mark`.
+    # The boot report contains the word `help` and the help output long before
+    # anything is typed, which is why the match is anchored *after* the mark
+    # rather than to the prompt.
+    if await_after '(bhaskix[>$] help|^help)' "$mark"; then
         pass "keys typed at the USB keyboard reached the shell and were echoed"
     else
         fail "the shell never saw the typed command"
@@ -258,7 +270,7 @@ if [[ $status -eq 0 ]]; then
     # character.
     mark=$(wc -l < "$LOG")
     monitor "sendkey a" "sendkey ret"
-    if await_after 'bhaskix[>$] a' "$mark"; then
+    if await_after '(bhaskix[>$] a|^a)' "$mark"; then
         typed=$(tail -n "+$((mark + 1))" "$LOG" | grep -aoE 'bhaskix[>$] a+' | head -1)
         if [[ "$typed" =~ a{2,} ]]; then
             fail "a held key repeated: the driver is reading state as events ($typed)"
