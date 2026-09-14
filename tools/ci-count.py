@@ -28,6 +28,18 @@ error annotations carries the signature *only* in its log -- the soak run of
 2026-09-06 had exactly one annotation, `Process completed with exit code 1` --
 so this reads job logs, which cost about 2.5 s each and are cached below.
 
+# What it costs, measured rather than promised
+
+A first full-history question is about **25 minutes**; a repeat is about
+**20 seconds**. Three things are cached under `build/ci-logs/`, and each was
+added because the previous version's speed claim turned out to be false when
+somebody timed it: the job logs, the per-run boot counts (`lanes.json`), and
+the per-run failed-job listings (`failed-jobs.json`). None of the three can go
+stale -- a completed run's logs, jobs and job list never change again. Caching
+only the logs left a repeat at twenty minutes; adding the lane counts left it
+at five; the job listings took it to twenty seconds. Delete the directory to
+start over.
+
 **2. A re-run erases the evidence from the run's own conclusion.** A job that
 failed and was re-run to green leaves the run reading `success`. Two of the
 fourteen are like that. So every *attempt* is walked, not just the last.
@@ -130,8 +142,30 @@ def every_run():
     return [r for r in runs if r["conclusion"] is not None]
 
 
-def failed_jobs(run):
+JOBS = CACHE / "failed-jobs.json"
+
+
+def job_cache():
+    """Failed jobs per completed run, remembered, for `lane_cache`'s reason.
+
+    Caching the lane counts took a full-history question from twenty minutes
+    to five. The five were **this**: one request per failed run, about 258 of
+    them. A finished run's jobs do not change either, so the honest thing is
+    to remember them rather than keep writing "seconds" in the header above.
+    """
+    if JOBS.exists():
+        try:
+            return json.loads(JOBS.read_text(encoding="utf-8"))
+        except ValueError:
+            return {}
+    return {}
+
+
+def failed_jobs(run, cache):
     """Every failed job of every attempt -- see reason 2 in the module docs."""
+    key = f"{run['id']}:{run['run_attempt']}"
+    if key in cache:
+        return [tuple(entry) for entry in cache[key]]
     found = []
     for attempt in range(1, run["run_attempt"] + 1):
         out = gh(
@@ -142,6 +176,7 @@ def failed_jobs(run):
             if "\t" in line:
                 job, name = line.split("\t", 1)
                 found.append((job, name, attempt))
+    cache[key] = found
     return found
 
 
@@ -171,13 +206,39 @@ def boots_in(run, lanes):
     return lanes.get(run["run_number"], 0)
 
 
-def lane_count(run):
+LANES = CACHE / "lanes.json"
+
+
+def lane_cache():
+    """Boots per completed run, remembered. A finished run's jobs never change.
+
+    **Cached because the docs above promised something the first version did
+    not deliver.** Logs were cached and this was not, so every question
+    re-asked GitHub for the job list of all 682 runs at about two seconds
+    each -- twenty minutes before a single log was read, on a tool whose
+    header says the second question costs seconds. Found by the second
+    question taking twenty minutes.
+    """
+    if LANES.exists():
+        try:
+            return json.loads(LANES.read_text(encoding="utf-8"))
+        except ValueError:
+            return {}
+    return {}
+
+
+def lane_count(run, cache):
     """`boot (...)` jobs plus the shell job's modes, read from the run itself."""
+    key = str(run["id"])
+    if key in cache:
+        return cache[key]
     out = gh(f"/repos/{REPO}/actions/runs/{run['id']}/jobs?per_page=100", jq=".jobs[].name")
     names = (out or "").splitlines()
     lanes = sum(1 for n in names if n.startswith("boot ("))
     shells = sum(1 for n in names if n.startswith("interactive shell"))
-    return lanes + SHELL_MODES * shells
+    counted = lanes + SHELL_MODES * shells
+    cache[key] = counted
+    return counted
 
 
 def at_least_two(hits, boots, rate):
@@ -237,20 +298,26 @@ def main():
 
     hits, unreadable = set(), 0
     lanes = {}
+    by_id = lane_cache()
+    by_run = job_cache()
     for i, run in enumerate(runs, 1):
         if i % 25 == 0:
             print(f"{DIM}  ... {i}/{len(runs)}{RESET}", file=sys.stderr)
         if run["name"] != "soak":
-            lanes[run["run_number"]] = lane_count(run)
+            lanes[run["run_number"]] = lane_count(run, by_id)
         if run["conclusion"] != "failure" and run["run_attempt"] == 1:
             continue  # nothing failed in it, so nothing to read
-        for job, name, attempt in failed_jobs(run):
+        for job, name, attempt in failed_jobs(run, by_run):
             text = job_log(job)
             if text is None:
                 unreadable += 1
                 continue
             if args.signature in text:
                 hits.add((run["name"], run["run_number"], name, run["created_at"]))
+
+    CACHE.mkdir(parents=True, exist_ok=True)
+    LANES.write_text(json.dumps(by_id), encoding="utf-8")
+    JOBS.write_text(json.dumps(by_run), encoding="utf-8")
 
     edges = [when(runs[0]["created_at"]) - timedelta(seconds=1)]
     if args.detector_since:
