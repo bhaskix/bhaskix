@@ -180,6 +180,11 @@ unsafe extern "C" fn bhaskix_trap_dispatch(frame: *mut TrapFrame) {
     //
     // SAFETY: as the read above.
     let arrived = unsafe { implausible(&*frame) };
+    // A fresh dispatch starts with nothing reached yet, so a witness taken here
+    // cannot inherit the last dispatch's number.
+    if let Some(slot) = FRAME_PHASE.get(crate::percpu::cpu_id() as usize) {
+        slot.store(0, Ordering::Relaxed);
+    }
 
     // SAFETY: the stubs guarantee `frame` points to a fully initialised
     // `TrapFrame` on the current stack, valid for the duration of this call
@@ -219,8 +224,50 @@ unsafe extern "C" fn bhaskix_trap_dispatch(frame: *mut TrapFrame) {
                 slot.store(value, Ordering::Relaxed);
             }
             FRAME_ON_ENTRY.store(arrived.is_some(), Ordering::Relaxed);
+            FRAME_LAST_GOOD.store(
+                FRAME_PHASE
+                    .get(crate::percpu::cpu_id() as usize)
+                    .map_or(0, |slot| slot.load(Ordering::Relaxed)),
+                Ordering::Relaxed,
+            );
         }
     }
+}
+
+/// The last phase of a dispatch at which this CPU's frame was still plausible.
+///
+/// **Because "wrong on the way out" is a handler, and a handler is not a
+/// place.** Bracketing the dispatch says the corruption happened inside it;
+/// the timer handler alone bumps counters, acknowledges the APIC, expires
+/// timers and then **preempts** — and the preempt switch does not return until
+/// the thread is scheduled again, with this frame sitting on its kernel stack
+/// the whole time. Those are very different suspects and the bracket cannot
+/// tell them apart.
+///
+/// A caller marks a point it has reached with the frame still intact, and the
+/// witness carries the highest one. See `frame_checkpoint`.
+static FRAME_PHASE: [core::sync::atomic::AtomicU64; crate::percpu::MAX_CPUS] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; crate::percpu::MAX_CPUS];
+
+/// The phase the first implausible frame had last been good at.
+static FRAME_LAST_GOOD: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Records that the frame was still plausible at `phase`.
+///
+/// Called from the kernel's handler at points it wants bracketed. Cheap by
+/// construction: the same handful of comparisons the two ends already do, on a
+/// path that runs a few hundred times a second.
+///
+/// **Phases are numbered in execution order** so the highest is the latest, and
+/// a phase that is never reached simply never raises the number.
+pub fn frame_checkpoint(frame: &TrapFrame, phase: u64) {
+    if implausible(frame).is_some() {
+        return;
+    }
+    let Some(slot) = FRAME_PHASE.get(crate::percpu::cpu_id() as usize) else {
+        return;
+    };
+    slot.store(phase, Ordering::Relaxed);
 }
 
 /// How many frames failed [`implausible`] at either end of a dispatch.
@@ -250,6 +297,16 @@ pub fn implausible_frames() -> (u64, [u64; 6], bool) {
         witness,
         FRAME_ON_ENTRY.load(Ordering::Relaxed),
     )
+}
+
+/// The dispatch phase the first implausible frame had last been good at.
+///
+/// `0` means it had not passed a checkpoint — so either it arrived wrong, or it
+/// was corrupted before the first one. The kernel names the numbers, because
+/// the kernel is what places them.
+#[must_use]
+pub fn frame_last_good_phase() -> u64 {
+    FRAME_LAST_GOOD.load(Ordering::Relaxed)
 }
 
 /// Which field of `frame` could not be returned through, if any.

@@ -5138,10 +5138,15 @@ fn implausible_frame_report() {
     } else {
         "plausible on arrival and wrong on the way out, so it was written during the handler"
     };
+    // **And how far that dispatch got intact**, which is what separates the
+    // tick's own work from the preempt switch -- see `trap::phase`. The fault
+    // path prints the same number; a boot that records one and survives prints
+    // it here.
+    let reached = bhaskix_arch::trap::frame_last_good_phase();
     println!(
         "\x1b[91m    frame check    {count} interrupt frame(s) this machine could not return \
-         through -- the first was {when}: vector {vector:#x}, rip {rip:#018x}, cs {cs:#x}, \
-         rflags {rflags:#x}, rsp {rsp:#018x}, ss {ss:#x}\x1b[0m"
+         through -- the first was {when}, last intact at phase {reached}: vector {vector:#x}, \
+         rip {rip:#018x}, cs {cs:#x}, rflags {rflags:#x}, rsp {rsp:#018x}, ss {ss:#x}\x1b[0m"
     );
 }
 

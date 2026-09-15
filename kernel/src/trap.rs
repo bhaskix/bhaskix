@@ -148,6 +148,32 @@ pub unsafe fn enable(
     }
 }
 
+/// How far a dispatch got with its interrupt frame still intact.
+///
+/// **Named here because this file is what places them**, and numbered in
+/// execution order so the highest reached is the latest. `bhaskix_arch` keeps
+/// the highest and hands it back with the frame witness; a phase never reached
+/// simply never raises the number, and `NONE` is what a frame that arrived
+/// wrong — or was corrupted before the first checkpoint — reads as.
+///
+/// This exists because §3's frame fault reached *"wrong on the way out, so it
+/// was written during that handler"* and stopped there. The timer handler
+/// bumps counters, acknowledges the APIC, expires timers and then **preempts**,
+/// and the switch does not return until the thread is scheduled again with this
+/// frame sitting on its kernel stack throughout. Those are different bugs.
+mod phase {
+    /// No checkpoint was reached.
+    pub const NONE: u64 = 0;
+    /// The tick's own work is done and the switch has not been entered.
+    pub const BEFORE_PREEMPT: u64 = 1;
+    /// The switch returned, so the frame survived being descheduled.
+    pub const AFTER_PREEMPT: u64 = 2;
+    /// The whole interrupt handler returned.
+    pub const AFTER_INTERRUPT: u64 = 3;
+    /// The address space was checked on the way back to ring 3.
+    pub const AFTER_USER_SPACE: u64 = 4;
+}
+
 /// Handles a trap.
 ///
 /// A page fault the region map can service is serviced. Everything else is
@@ -177,11 +203,13 @@ fn handle(frame: &mut TrapFrame) {
     // fatal.
     if frame.vector >= 32 {
         handle_interrupt(frame);
+        bhaskix_arch::trap::frame_checkpoint(frame, phase::AFTER_INTERRUPT);
         // On the way back to ring 3, and only then: an interrupt that
         // preempted a thread may return to a *different* one, which is exactly
         // the moment a space could go unloaded. See `sched::check_user_space`.
         if frame.from_user_mode() {
             crate::sched::check_user_space(1);
+            bhaskix_arch::trap::frame_checkpoint(frame, phase::AFTER_USER_SPACE);
         }
         return;
     }
@@ -342,6 +370,22 @@ fn handle(frame: &mut TrapFrame) {
             "    vector {vector:#x} rip {rip:#018x} cs {cs:#x} rflags {rflags:#x} rsp \
              {rsp:#018x} ss {ss:#x}"
         );
+        // **And how far it got intact**, which is the difference between the
+        // tick's own work and the preempt switch. Printed here rather than
+        // recorded and read later, because the boot this defect produces is one
+        // that halts and never reaches a boot report -- the mistake the frame
+        // witness itself made for six sightings.
+        let reached = bhaskix_arch::trap::frame_last_good_phase();
+        println!(
+            "    last intact at {}",
+            match reached {
+                phase::NONE => "no checkpoint -- it arrived wrong, or went wrong before the first",
+                phase::BEFORE_PREEMPT => "the tick's work done, entering the switch",
+                phase::AFTER_PREEMPT => "the switch returned, so it survived being descheduled",
+                phase::AFTER_INTERRUPT => "the interrupt handler returned",
+                _ => "the address-space check on the way out",
+            }
+        );
     }
 
     println!("  Halting. A fault in the kernel is the kernel's own bug: there is");
@@ -481,7 +525,17 @@ fn handle_interrupt(frame: &mut TrapFrame) {
             // stack still holds this interrupt's frame. When the thread is
             // resumed the switch returns here, the handler unwinds normally,
             // and `iretq` returns to wherever that thread was interrupted.
+            // **Either side of the switch, which is the question.** The
+            // comment above says the outgoing stack still holds this
+            // interrupt's frame while the thread is descheduled — so a frame
+            // that was good going in and bad coming out was overwritten while
+            // this CPU was running something else, and one that was already bad
+            // going in was overwritten by the tick handling above. Those want
+            // different bugs found, and until now the witness could not tell
+            // them apart: both read "wrong on the way out".
+            bhaskix_arch::trap::frame_checkpoint(frame, phase::BEFORE_PREEMPT);
             crate::sched::preempt();
+            bhaskix_arch::trap::frame_checkpoint(frame, phase::AFTER_PREEMPT);
 
             // The second safe point. Only for a thread interrupted in *user*
             // mode: at that point it holds no kernel lock, because ring 3
