@@ -4696,13 +4696,56 @@ static WAKE_LOG: [core::sync::atomic::AtomicU64; 32] =
 /// Where the next [`WAKE_LOG`] entry goes.
 static WAKE_LOG_NEXT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
+/// The last wake that actually landed on each thread, keyed by thread.
+///
+/// **Because [`WAKE_LOG`] cannot answer this and was being asked to.** The ring
+/// holds the last thirty-two attempts *machine-wide*, and the report derived a
+/// station's `last wake` as the newest surviving entry bearing its id. Measured
+/// 2026-09-15 on three healthy boots, those thirty-two entries span **62, 61
+/// and 61 events** — so a thread whose wake is older than that has no entry at
+/// all, and the report's `last_wake` stays at its initial **zero**.
+///
+/// That zero is indistinguishable from *woken at event 0*, and it is not
+/// harmless: the decision rule this number exists for compares it against the
+/// last mark, and a false zero always reads as *mark after wake* — "it was
+/// re-blocked after being woken, find that caller, it is the bug". A specimen
+/// whose wake had merely wrapped out would be read as that.
+///
+/// So the same shape as [`LAST_MARK`]: one slot per thread with the full id
+/// stored beside it, answering `None` both when nothing was recorded and when
+/// another thread holds the slot — neither of which supports a claim. The ring
+/// stays, because the *outcome* breakdown is what it is good at.
+static LAST_WAKE: [core::sync::atomic::AtomicU64; 256] =
+    [const { core::sync::atomic::AtomicU64::new(u64::MAX) }; 256];
+
+/// The last wake that landed on `thread`, in the shared event sequence.
+///
+/// `None` when nothing was recorded *or* when the slot holds another thread.
+#[must_use]
+pub fn last_delivered_wake(thread: u32) -> Option<u64> {
+    let packed = LAST_WAKE[thread as usize % LAST_WAKE.len()].load(Ordering::Relaxed);
+    if packed == u64::MAX || u32::try_from(packed & 0xffff_ffff).ok()? != thread {
+        return None;
+    }
+    Some(packed >> 40)
+}
+
 /// Records one wake attempt. `outcome`: 0 woken, 1 not found, 2 contended.
 fn note_wake(id: u32, outcome: u64) {
+    let order = next_event();
     let slot = WAKE_LOG_NEXT.fetch_add(1, Ordering::Relaxed) as usize % WAKE_LOG.len();
     WAKE_LOG[slot].store(
-        u64::from(id) | (outcome << 32) | (next_event() << 40),
+        u64::from(id) | (outcome << 32) | (order << 40),
         Ordering::Relaxed,
     );
+    // **Only a wake that landed**, because that is the transition the rule is
+    // about: a wake that found no queue holding the thread, or one that lost a
+    // race for the lock, did not make it `Ready` and is not what "last wake"
+    // means when set against "last mark". The ring above still carries those.
+    if outcome == 0 {
+        LAST_WAKE[id as usize % LAST_WAKE.len()]
+            .store(u64::from(id) | (order << 40), Ordering::Relaxed);
+    }
 }
 
 /// Walks the recorded wake attempts for one thread, oldest slot first, as
@@ -4721,6 +4764,32 @@ pub fn for_each_wake_attempt(thread: u32, mut f: impl FnMut(u64, u64)) {
             f((packed >> 32) & 0xff, packed >> 40);
         }
     }
+}
+
+/// The span of the event sequence [`WAKE_LOG`] still covers, and how many of
+/// its slots are in use.
+///
+/// **So a report can say how far its `recent wakes` counters can see.** Those
+/// counters are derived from a thirty-two entry ring covering the whole
+/// machine, and three healthy boots measured on 2026-09-15 put its span at
+/// **62, 61 and 61 events** — so `0 not found` means *no failed attempt in the
+/// last sixty events or so*, which is a much narrower claim than *no failed
+/// attempt*. A reader cannot tell those apart without this, and a specimen has
+/// already been read against the counters.
+#[must_use]
+pub fn wake_log_span() -> (u64, u64, usize) {
+    let (mut low, mut high, mut held) = (u64::MAX, 0u64, 0usize);
+    for slot in &WAKE_LOG {
+        let packed = slot.load(Ordering::Relaxed);
+        if packed == u64::MAX {
+            continue;
+        }
+        let order = packed >> 40;
+        low = low.min(order);
+        high = high.max(order);
+        held += 1;
+    }
+    (if low == u64::MAX { 0 } else { low }, high, held)
 }
 
 fn wake_with(id: u32, from_interrupt: bool) -> WakeResult {

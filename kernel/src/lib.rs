@@ -28875,6 +28875,25 @@ fn rt_latency_self_test(hhdm_base: u64, cpus: u32) -> bool {
     true
 }
 
+/// An event number, or the fact that there is not one.
+///
+/// **So a report never prints a bare number it does not have.** The wake order
+/// was derived from a thirty-two entry ring covering the whole machine, and a
+/// station whose wake was older than that span — measured at about sixty
+/// events — simply read `#0`. Zero is a valid event number, so the reader could
+/// not tell *woken at the start* from *no record*, and the rule those numbers
+/// feed treats the two completely differently.
+struct Recorded(Option<u64>);
+
+impl core::fmt::Display for Recorded {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self.0 {
+            Some(order) => write!(f, "#{order}"),
+            None => write!(f, "nothing recorded"),
+        }
+    }
+}
+
 /// Checks that threads really sleep, and that no wakeup is ever lost.
 ///
 /// Spinning would pass a weaker version of this test, so the numbers that
@@ -29335,15 +29354,19 @@ fn wait_queue_self_test(hhdm_base: u64) -> bool {
             // was either re-blocked after being woken, or never woken at all,
             // and those want different bugs found. `WAKE_LOG` and `BLOCK_LOG`
             // share one sequence so the two can be compared.
-            let (mut last_wake, mut last_mark, mut mark_source) = (0u64, 0u64, 0u64);
-            sched::for_each_wake_attempt(spawned[id], |outcome, order| match outcome {
-                0 => {
-                    woken += 1;
-                    last_wake = last_wake.max(order);
-                }
+            let (mut last_mark, mut mark_source) = (0u64, 0u64);
+            sched::for_each_wake_attempt(spawned[id], |outcome, _order| match outcome {
+                0 => woken += 1,
                 2 => busy += 1,
                 _ => missed += 1,
             });
+            // **From the per-thread slot, not from the ring.** The ring holds
+            // the last thirty-two attempts on the whole machine — measured at a
+            // span of about sixty events — so deriving this from it printed a
+            // bare zero for any station whose wake was older, which the
+            // decision rule reads as "marked after being woken". See
+            // `sched::LAST_WAKE`.
+            let last_wake = sched::last_delivered_wake(spawned[id]);
             let mark = sched::last_block_mark(spawned[id]);
             if let Some((source, order)) = mark {
                 last_mark = order;
@@ -29353,7 +29376,7 @@ fn wait_queue_self_test(hhdm_base: u64) -> bool {
             println!(
                 "\x1b[91m                   {name} (thread {}) {state}, {} laps, last saw token \
                  {} at phase {}, {} predicate evaluations; recent wakes: {woken} landed, {missed} \
-                 not found, {busy} contended, {} migration(s); last wake #{last_wake}, last mark \
+                 not found, {busy} contended, {} migration(s); last wake {}, last mark \
                  #{last_mark} by {}\x1b[0m",
                 spawned[id],
                 LAPS[id].load(Ordering::Relaxed),
@@ -29387,6 +29410,14 @@ fn wait_queue_self_test(hhdm_base: u64) -> bool {
                 // is no longer in any queue, which is what a retired station
                 // looks like.
                 sched::migrations_of(spawned[id]).map_or(-1, |count| count as i64),
+                // **`nothing recorded`, never a bare zero.** This was derived
+                // from a thirty-two entry ring covering the whole machine, so a
+                // station whose wake was older than about sixty events had no
+                // entry and printed `#0` -- which the rule below reads as
+                // *marked after being woken*, the most incriminating of the
+                // three. It comes from a per-thread slot now and says when it
+                // does not know.
+                Recorded(last_wake),
                 // **What the two order numbers decide, written before the
                 // numbers existed so a specimen cannot be read to taste.** A
                 // mark *after* the wake means the station was re-blocked once
@@ -29408,10 +29439,19 @@ fn wait_queue_self_test(hhdm_base: u64) -> bool {
                 }
             );
         }
+        // **How far the `recent wakes` counters above can actually see.** They
+        // come from a thirty-two entry ring covering the whole machine, so
+        // `0 not found` is *no failed attempt inside this window*, not *no
+        // failed attempt*. Specimen nineteen was read against those counters
+        // without the window being stated; it happens to survive, because the
+        // retire's own wake is at the newest end of the ring, but the next
+        // reader should not have to work that out.
+        let (window_from, window_to, window_held) = sched::wake_log_span();
         println!(
             "\x1b[91m                   token {token}, phase {phase} (retire is above \
              {PHASE_WAIT}), {waiting} sleepers still queued, {overflowed} overflowed, the retire's \
-             wake found {retire_woke} entr(ies)\x1b[0m"
+             wake found {retire_woke} entr(ies); the recent-wake window is {window_held} \
+             entr(ies) spanning #{window_from}..#{window_to}\x1b[0m"
         );
         ok = false;
     }
@@ -29829,4 +29869,55 @@ fn scheduling_self_test(hhdm_base: u64) -> bool {
     });
 
     ok
+}
+
+#[cfg(test)]
+mod recorded_tests {
+    use super::Recorded;
+    use core::fmt::Write;
+
+    /// Writes into a fixed buffer, so the assertion needs no allocator.
+    struct Pad {
+        bytes: [u8; 64],
+        used: usize,
+    }
+
+    impl Write for Pad {
+        fn write_str(&mut self, s: &str) -> core::fmt::Result {
+            let end = self.used + s.len();
+            let room = self.bytes.get_mut(self.used..end).ok_or(core::fmt::Error)?;
+            room.copy_from_slice(s.as_bytes());
+            self.used = end;
+            Ok(())
+        }
+    }
+
+    fn shown(value: Recorded) -> [u8; 64] {
+        let mut pad = Pad {
+            bytes: [b' '; 64],
+            used: 0,
+        };
+        write!(pad, "{value}").expect("room");
+        pad.bytes
+    }
+
+    /// An order that exists prints as a number.
+    #[test]
+    fn an_order_prints_as_one() {
+        assert_eq!(&shown(Recorded(Some(16_077)))[..7], b"#16077 ");
+    }
+
+    /// And one that does not says so, rather than printing a zero.
+    ///
+    /// **This is the whole reason the type exists.** The number it replaced was
+    /// derived from a thirty-two entry ring spanning about sixty events, so a
+    /// station whose wake was older had no entry and printed `#0` — which the
+    /// rule reading it treats as *marked after being woken*, the most
+    /// incriminating of three outcomes.
+    #[test]
+    fn a_missing_order_is_not_a_zero() {
+        let shown = shown(Recorded(None));
+        assert_eq!(&shown[..16], b"nothing recorded");
+        assert_ne!(&shown[..2], b"#0", "never a number it does not have");
+    }
 }
