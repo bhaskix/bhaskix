@@ -28506,7 +28506,15 @@ fn wait_queue_self_test(hhdm_base: u64) -> bool {
     );
 
     PHASE.store(PHASE_WAIT + 1, Ordering::Release);
-    RING.wake_all();
+    // **How many entries the retire's wake actually found**, which the
+    // nineteenth specimen made the question. It read `ring-0 asleep, last wake
+    // #16077, last mark #16634` with `0 not found` — so the retire never
+    // *attempted* a wake on that station, which can only mean its entry was
+    // not in the queue when `wake_all` iterated. The entry and the mark are
+    // set together under the waiters lock in `enqueue_and_block`, so that
+    // should be impossible, and the count is what will say whether it happened
+    // or whether the reasoning is wrong. Discarded until now.
+    let retire_woke = RING.wake_all();
     let ring_retired = wait_until(|| sched::threads_present_exact(&spawned) == 0, 4_000);
     // **Counted here, not where it is printed.** The failure message below used
     // to call `threads_present_exact` again -- and between these two points the
@@ -28829,7 +28837,8 @@ fn wait_queue_self_test(hhdm_base: u64) -> bool {
         }
         println!(
             "\x1b[91m                   token {token}, phase {phase} (retire is above \
-             {PHASE_WAIT}), {waiting} sleepers still queued, {overflowed} overflowed\x1b[0m"
+             {PHASE_WAIT}), {waiting} sleepers still queued, {overflowed} overflowed, the retire's \
+             wake found {retire_woke} entr(ies)\x1b[0m"
         );
         ok = false;
     }
