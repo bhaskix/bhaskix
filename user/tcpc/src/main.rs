@@ -438,6 +438,24 @@ extern "C" fn tcpc_main(hertz: u64) -> ! {
             break;
         }
         bounded += 1;
+        // **The wait publishes itself, so a boot that ends here is readable.**
+        //
+        // `TRACKER.md` §3 carries five sightings of `tcp client FAILED at step
+        // 4: connected, stream still in flight`, and every one says `detail
+        // 0x0` — which is correct and useless. Step 4 reports `probe.value ^
+        // abi_tcp::OK`, so zero means the connection landed carrying exactly
+        // the value expected; the fault is downstream of it. Between that
+        // report and `report(5, STUCK)` this program used to write nothing at
+        // all, so the page could not distinguish *waiting patiently* from
+        // *wedged*, and a gate that gave up at fifteen seconds could not
+        // either.
+        //
+        // The step and outcome words are left alone on purpose: the kernel's
+        // wait loop breaks on `outcome >= 3`, so publishing a new outcome here
+        // would end that wait early and turn this into a different bug. Only
+        // the detail word moves, and it carries the iteration count above the
+        // observed state.
+        report_word(3, u64::from(bounded) << 32 | state);
         if bounded > 300 {
             report(5, outcome::STUCK, state);
             exit();

@@ -19440,6 +19440,25 @@ fn report_tcp_client(hhdm: u64) {
     }
     if outcome == 9 || outcome == 8 || outcome == 10 || outcome == 11 || outcome == 12 {
         println!("    tcp client     {said}");
+    } else if outcome == 2 && detail != 0 {
+        // **Outcome 2 with a non-zero detail is the step-5 wait talking.**
+        //
+        // `bin/tcpc` leaves step and outcome at 4/CONNECTED while it waits for
+        // `STATE_ESTABLISHED` and republishes only the detail word: the
+        // iteration count above the state it last read. Printing that raw
+        // would hand a reader `0x1200000003` and no key, so it is decoded
+        // here, beside the only message that can carry it.
+        //
+        // Five sightings of this failure all read `detail 0x0`, which is what
+        // the word means *before* the wait starts: step 4 reports
+        // `probe.value ^ abi_tcp::OK`, so zero says the connection landed with
+        // exactly the value expected. Correct, and it named nothing.
+        println!(
+            "\x1b[91m    tcp client     FAILED at step {step}: {said} — the stream wait had \
+             gone round {} time(s) and last read state {:#x}\x1b[0m",
+            detail >> 32,
+            detail & 0xffff_ffff
+        );
     } else {
         println!(
             "\x1b[91m    tcp client     FAILED at step {step}: {said} (detail {detail:#x})\
