@@ -378,6 +378,30 @@ pub struct Thread {
     /// returning to user mode, and deciding to block. See
     /// [RFC 0017](../../docs/rfc/0017-process-management.md) step 2.
     pub dying: bool,
+
+    /// This thread has left its domain's books and has not finished yet.
+    ///
+    /// **Because the two facts are ninety lines apart and both are load
+    /// bearing.** `sched::exit` calls `domain_thread_departs` — which
+    /// decrements `DOMAIN_LIVE_THREADS`, the counter `domain::create_under`
+    /// reads before handing the slot out — and sets [`State::Finished`] much
+    /// later, deliberately: `Finished` first used to strand callers, because a
+    /// `Finished` thread is never scheduled again. Between those two points the
+    /// slot may already belong to somebody new while this thread is still
+    /// queued and still not `Finished`.
+    ///
+    /// A scan for *"does this domain have a thread"* then finds a stranger's,
+    /// and refuses the newcomer. That is the second of the two windows
+    /// `sched::first_thread_in_domain` names, and this flag is what lets the
+    /// guards skip it: a thread past its departure will not run its program
+    /// again, whoever now owns the number it is carrying.
+    ///
+    /// **Read only by the guards that decide**, never by the counters that
+    /// wait. `wait_for_probe_threads` and the socket-reclaim gate wait for a
+    /// slot's threads to be *gone from the queue*, which is a different
+    /// question and still counts this one — which is why this is a flag beside
+    /// the domain rather than a clearing of it.
+    pub departing: bool,
     /// A message delivered to this thread, and who sent it.
     ///
     /// One slot, because IPC is a rendezvous: a thread has at most one
@@ -971,6 +995,7 @@ pub fn init_cpu(name: &'static str, policy: Policy) {
         call_refused: None,
         domain: u32::MAX,
         dying: false,
+        departing: false,
         answer_lost: false,
         mailbox: None,
         // The thread a CPU registers for itself is already running on the
@@ -1186,6 +1211,7 @@ pub fn spawn_on_with(
         call_refused: None,
         domain: options.domain,
         dying: false,
+        departing: false,
         answer_lost: false,
         mailbox: None,
         kernel_stack_top: guarded.top,
@@ -3408,11 +3434,21 @@ pub fn exit() -> ! {
     // the ranking exists to catch.
     let me = current_thread_id();
     let my_domain = if cpu < MAX_CPUS {
-        let queue = QUEUES[cpu].lock();
+        let mut queue = QUEUES[cpu].lock();
         let current = queue.current;
+        // **Marked as it leaves the books, not when it finishes.** The
+        // decrement below is what frees this slot for somebody else, and
+        // `State::Finished` is ninety lines further on for a reason of its own
+        // — so between here and there a scan by slot id finds this thread and
+        // refuses the newcomer. `Thread::departing` is what the two guards that
+        // *decide* read; the counters that *wait* still see it, because "gone
+        // from the queue" is a different question and they are asking that one.
         queue.threads[current]
-            .as_ref()
-            .map(|thread| thread.domain)
+            .as_mut()
+            .map(|thread| {
+                thread.departing = true;
+                thread.domain
+            })
             .filter(|domain| *domain != u32::MAX)
     } else {
         None
@@ -5201,8 +5237,9 @@ pub fn live_threads_in_domain(domain: u32) -> usize {
 
 /// Whether this thread could still run a program's code in `domain`.
 ///
-/// **One clause separates this from what [`threads_in_domain`] counts**, and it
-/// is the whole of the fix: `!dying`. A thread told to stop is still `Ready`,
+/// **Two clauses separate this from what [`threads_in_domain`] counts**, and
+/// they are the two windows in which a domain slot carries somebody else's
+/// thread: `!dying` and `!departing`. A thread told to stop is still `Ready`,
 /// `Running` or `Blocked` until it reaches a safe point, so it is present — but
 /// it will never execute another instruction of the program it belonged to, and
 /// a caller asking *may I start a program in this domain* is asking about the
@@ -5212,7 +5249,10 @@ pub fn live_threads_in_domain(domain: u32) -> usize {
 /// count, so it cannot run in a host test; this can, and it is where the
 /// meaning is.
 const fn could_still_run(thread: &Thread, domain: u32) -> bool {
-    thread.domain == domain && !matches!(thread.state, State::Finished) && !thread.dying
+    thread.domain == domain
+        && !matches!(thread.state, State::Finished)
+        && !thread.dying
+        && !thread.departing
 }
 
 /// How many of `ids` are still held by some run queue.
@@ -5629,6 +5669,7 @@ mod tests {
             woken_at: 0,
             call_refused: None,
             dying: false,
+            departing: false,
             answer_lost: false,
             domain: u32::MAX,
             mailbox: None,
@@ -5825,6 +5866,33 @@ mod tests {
             thread.state.is_schedulable(),
             "which is the point: it is still schedulable, so counting states \
              cannot tell the two apart"
+        );
+    }
+
+    /// A thread past its departure cannot run again either, and the window it
+    /// opens is the *other* one a reused slot has.
+    ///
+    /// **`sched::exit` leaves the domain's books ninety lines before it sets
+    /// `Finished`.** The decrement is what frees the slot for somebody new, so
+    /// in between, a scan by slot id finds this thread in a domain that has
+    /// never had one — which is the second of the two windows
+    /// `first_thread_in_domain` names, and the one still standing after the
+    /// dying clause was added.
+    #[test]
+    fn a_departing_thread_could_not_run_again_either() {
+        let mut thread = thread(0, State::Running, Policy::fair());
+        thread.domain = 7;
+        assert!(could_still_run(&thread, 7));
+
+        thread.departing = true;
+        assert!(
+            !could_still_run(&thread, 7),
+            "it has left the counter that frees the slot, so it is not the \
+             newcomer's thread"
+        );
+        assert!(
+            !matches!(thread.state, State::Finished),
+            "and it is not Finished yet, which is the whole of the window"
         );
     }
 
