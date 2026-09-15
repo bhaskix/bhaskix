@@ -11,7 +11,7 @@
 | | |
 |---|---|
 | RFCs accepted | **50** |
-| RFCs open | 27 |
+| RFCs open | 28 |
 | RFCs closed without shipping | 1 |
 | Milestone rows done | **92 of 95** |
 | Phase 2 bullets done | **12 of 13** |
@@ -97,6 +97,7 @@ gantt
     RFC 0060 a writable path for a hosted process :done, r0060, 2026-08-31, 2026-09-13
     RFC 0063 releasing what a reused domain left behind :active, r0063, 2026-09-01, 2026-09-15
     RFC 0064 a read that lands where the caller says :done, r0064, 2026-09-01, 1d
+    RFC 0079 a signal a process may send another :active, r0079, 2026-09-15, 2026-09-15
     section Process & tooling
     RFC 0001 License — Apache-2.0 :done, r0001, 2026-08-03, 1d
     RFC 0007 Live patching the nucleus :active, r0007, 2026-08-04, 2026-09-15
@@ -183,6 +184,7 @@ gantt
 | 0074 | what a network interface is | 2026-09-06 |
 | 0075 | a driver that is not in the kernel | 2026-09-07 |
 | 0076 | a bond on hardware | 2026-09-08 |
+| 0079 | a signal a process may send another | 2026-09-15 |
 
 ## Annexes
 
