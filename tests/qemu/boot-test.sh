@@ -1930,8 +1930,8 @@ fi
 #
 # `reason 3` is `Ending::Killed`. Asserting the number rather than just the
 # sentence is what separates "it ended" from "it was ended".
-if grep -qF "sup: a child that never exits was ended and reaped, reason 3" "$LOG"; then
-    pass "a supervisor ended a child that had no way of ending itself"
+if grep -qF "sup: a child that never exits was ended and reaped, reason 3, and ending it twice was accepted" "$LOG"; then
+    pass "a supervisor ended a child that had no way of ending itself, twice without complaint"
 else
     fail "a running child was not ended: $(grep -aoE 'sup: (a child that never|END was|a running child).{0,70}' "$LOG" | head -1)"
     status=1

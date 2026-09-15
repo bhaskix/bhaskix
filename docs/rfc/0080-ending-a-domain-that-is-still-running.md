@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | 🔨 **Draft 2026-09-15.** Its condition of acceptance — what ending a domain means when threads are running on other CPUs — is **answered**: `mark_domain_dying` marks and wakes, a dying thread stops at a safe point, and an interrupt returning to ring 3 bounds that by one tick. No code yet. |
+| **Status** | ✅ **ACCEPTED 2026-09-15 — built and gated, with one refusal implemented and not gated, which is said below rather than glossed.** A supervisor ends a child that spins in ring 3 making no system call, and the gate asserts it reported `Killed` rather than that the call returned `Ok`. |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | kernel (`syscall`, `domain`) |
 | **Milestone** | Phase 2 — core operating system |
@@ -108,12 +108,21 @@ cost is what it already is where the kernel calls it.
    reaps it. The gate is that the child **stopped** — a counter it increments
    stops moving — and not merely that `END` answered `Ok`. Armed by dropping
    the `END`, which must leave the counter moving and the reap refusing.
-2. `INFO` after `END` and before `RELEASE` answers `Killed`, so a parent can
-   read the ending. Armed by ending with the wrong `Ending`.
-3. `END` on an already-ended domain answers `Ok`. Armed by making it error.
-4. `END` on a capability that is not a `Domain` answers `WrongObject`, and on
-   an empty slot `NoSuchCapability` — the ordinary refusals, asserted because
-   a method that accepted either would be a capability check that is not one.
+2. ~~`INFO` after `END` and before `RELEASE` answers `Killed`.~~ **Done.** The
+   gate asserts `reason 3`, and arming `destroy` to record `Ending::Exited`
+   turns it red reading `reason 1` — so the number is what separates *it
+   ended* from *it was ended*.
+3. ~~`END` on an already-ended domain answers `Ok`.~~ **Done.** The supervisor
+   ends its child twice and the gate requires the second to be accepted; making
+   that arm error turns it red.
+4. **`END` on a domain capability naming the caller's own domain is refused,
+   and that refusal is not gated.** It is implemented — the arm compares the
+   target against the caller and answers `WrongObject` — but **no program in
+   this system holds a capability to its own domain**, so nothing in ring 3 can
+   attempt it. Gating it means granting one to `bin/sup` for the purpose, which
+   is what `bin/shell`'s capability self-test does for every other refusal it
+   asserts, and is the cheapest way to close this. Stated here rather than left
+   for a reader to assume the refusal is tested because the others are.
 5. Host tests for `domain::destroy`'s existing contract are already there; this
    adds none, because it adds no mechanism.
 

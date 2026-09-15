@@ -362,6 +362,23 @@ fn end_a_running_child(image_bytes: u64) -> bool {
         return false;
     }
 
+    // **Ending one that has already ended answers `Ok`** -- RFC 0080. The
+    // caller's intent is that the domain not be running, and it is not. An
+    // error here would make every caller write the same race-handling around
+    // a call whose whole purpose is idempotent.
+    //
+    // Asked *before* the reap on purpose: after `RELEASE` the slot is empty
+    // and the answer would be about a capability that is gone, which is a
+    // different question with the same shape.
+    let (again, _) = call(syscall::INVOKE, CHILD, method::END, [0; 4]);
+    if again != status::OK {
+        write(b"sup: ending an ended child was refused, status ");
+        write_number(again);
+        write(b"\n");
+        call(syscall::INVOKE, CHILD, method::RELEASE, [0; 4]);
+        return false;
+    }
+
     let (reaped, _) = call(syscall::INVOKE, CHILD, method::RELEASE, [0; 4]);
     if reaped != status::OK {
         write(b"sup: the ended child would not be reaped\n");
@@ -369,7 +386,7 @@ fn end_a_running_child(image_bytes: u64) -> bool {
     }
     write(b"sup: a child that never exits was ended and reaped, reason ");
     write_number(reason);
-    write(b"\n");
+    write(b", and ending it twice was accepted\n");
     true
 }
 
