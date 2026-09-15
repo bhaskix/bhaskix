@@ -679,6 +679,25 @@ pub mod method {
     /// short-lived program, and the kernel refuses a watch for an event that
     /// has already happened rather than accepting a wait that never ends.
     pub const BIND: u64 = 35;
+    /// End a domain that is **still running** — RFC 0080.
+    ///
+    /// [`RELEASE`] collects a domain that has already ended and refuses while
+    /// it is live; this is the other half, and until 2026-09-15 there was no
+    /// other half. A domain ended when its last thread exited and nothing in
+    /// ring 3 could stop one, which made `TRACKER.md`'s PM1 row — *"create,
+    /// grant, start, kill, reap, each an operation on a capability"* — name an
+    /// operation that did not exist.
+    ///
+    /// **The capability is the authority.** Holding one already means granting
+    /// into the domain, starting a program in it and reaping it; ending it is
+    /// not a larger power than starting it.
+    ///
+    /// Ending is not reaping: the ending stays readable through [`INFO`] until
+    /// [`RELEASE`] takes the slot, which is what a parent's `wait4` needs.
+    ///
+    /// Answers `Ok` for a domain that had already ended, because the caller's
+    /// intent is that it not be running and it is not.
+    pub const END: u64 = 74;
     /// Give back a domain that has ended, and the slot naming it.
     ///
     /// The capability goes with the slot: leaving it would let a holder ask

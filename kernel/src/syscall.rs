@@ -148,6 +148,7 @@ const _: () = {
     assert!(method::GRANT == bhaskix_abi::method::GRANT);
     assert!(method::BIND == bhaskix_abi::method::BIND);
     assert!(method::RELEASE == bhaskix_abi::method::RELEASE);
+    assert!(method::END == bhaskix_abi::method::END);
     assert!(method::SPAWN == bhaskix_abi::method::SPAWN);
     assert!(method::START == bhaskix_abi::method::START);
     assert!(crate::cap::Rights::READ.bits() as u64 == bhaskix_abi::rights::READ);
@@ -260,6 +261,9 @@ pub mod method {
     pub const ACK: u64 = 36;
     /// Give the source up: masked permanently, vector freed, claim released.
     pub const RELEASE: u64 = 37;
+    /// End a domain that is still running — RFC 0080, and see
+    /// [`bhaskix_abi::method::END`] for what it promises.
+    pub const END: u64 = 74;
     /// Wait until this notification has been signalled, then take the word.
     ///
     /// Only on a `Notification` capability. Blocks, and returns everything
@@ -1139,7 +1143,10 @@ fn dispatch_inner(frame: &mut SyscallFrame) -> Outcome {
     // on the hot path of every system call, and the machine spent its time
     // queueing for it.
     if kind == Some(Kind::Invoke)
-        && matches!(frame.method, method::BIND | method::INFO | method::RELEASE)
+        && matches!(
+            frame.method,
+            method::BIND | method::INFO | method::RELEASE | method::END
+        )
         && let Some(outcome) = domain_lifecycle(frame)
     {
         return outcome;
@@ -3972,6 +3979,37 @@ fn domain_lifecycle(frame: &SyscallFrame) -> Option<Outcome> {
             Ok(Some(reason)) => Outcome::ok(reason as u64),
             Err(()) => Outcome::err(Status::Revoked),
         },
+
+        // **End a domain that is still running** — RFC 0080. `RELEASE` below
+        // collects one that has already ended and refuses while it is live;
+        // until this arm existed there was no other half, so a domain ended
+        // only when its last thread exited and a supervisor could not stop
+        // what it had started.
+        //
+        // **A domain may not end itself**, which is RFC 0080's second open
+        // question answered the way it proposed. `Exit` is the honest way out
+        // for a program that wants to stop, and it unwinds the caller's own
+        // thread at a safe point; `END` on yourself would destroy the address
+        // space and capability arena the calling thread is standing in, from
+        // inside a system call it still has to return through. The thread is
+        // marked dying and stopped at a safe point, so the return would run
+        // on freed ground.
+        method::END => {
+            if target.as_u32() == me.as_u32() {
+                return Some(Outcome::err(Status::WrongObject));
+            }
+            // `destroy` answers whether the domain existed. A domain that had
+            // already ended is `Ok`: the caller wanted it not running, and it
+            // is not.
+            match domain::state_of(target) {
+                Ok(None) => {
+                    domain::destroy(target);
+                    Outcome::ok(0)
+                }
+                Ok(Some(_)) => Outcome::ok(0),
+                Err(()) => Outcome::err(Status::Revoked),
+            }
+        }
 
         method::RELEASE => {
             if domain::reap(target) {

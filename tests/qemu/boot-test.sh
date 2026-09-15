@@ -1916,6 +1916,27 @@ else
     status=1
 fi
 
+# RFC 0080: a domain that is still running can be ended from ring 3.
+#
+# **The child has no exit path**, which is what makes this an assertion rather
+# than a coincidence. It is started on `bin/probe`'s entry word 2 -- spin in
+# ring 3 for ever, making no system call -- so nothing it does will finish it.
+# A domain that reports `Killed` was ended by `method::END` and by nothing else.
+#
+# Entry word 2 and not 3 on purpose. A child that yields for ever ends at the
+# next return from a system call, which is the easy half of the safe-point rule;
+# one making no system calls at all can only be caught by the other half, an
+# interrupt returning to ring 3, and that is the half RFC 0080 had to argue for.
+#
+# `reason 3` is `Ending::Killed`. Asserting the number rather than just the
+# sentence is what separates "it ended" from "it was ended".
+if grep -qF "sup: a child that never exits was ended and reaped, reason 3" "$LOG"; then
+    pass "a supervisor ended a child that had no way of ending itself"
+else
+    fail "a running child was not ended: $(grep -aoE 'sup: (a child that never|END was|a running child).{0,70}' "$LOG" | head -1)"
+    status=1
+fi
+
 # And that the children *ran*, which the supervisor's own counters cannot show.
 # Each writes this line through a console capability the supervisor granted it,
 # so counting them separates "the supervisor looped" from "the children did

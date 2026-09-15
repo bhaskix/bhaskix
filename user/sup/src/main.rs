@@ -280,6 +280,99 @@ fn run_once(image_bytes: u64) -> Option<u64> {
 /// Answers whether every step did what it should, including the four that
 /// should be refused. Reports once, on the first child only: this runs twelve
 /// times and a line per attempt would say the same thing eleven more times.
+/// The entry word `bin/probe` reads as "spin in ring 3 for ever, making no
+/// system call" — a child that will never end on its own.
+const SPIN_FOREVER: u64 = 2;
+
+/// Ends a child that is still running, and proves it was still running —
+/// RFC 0080.
+///
+/// **Entry word 2 and not 3**, deliberately. A child that yields for ever
+/// ends at the next return from a system call, which is the easy half of the
+/// safe-point rule; one spinning in ring 3 making *no* system call can only be
+/// caught by the other half, an interrupt returning to ring 3, and that is the
+/// case `method::END` had to be argued for. See RFC 0080's answered question.
+///
+/// **The proof is that it ended at all.** This child has no exit path: nothing
+/// it does will finish it, so a domain that reports `Killed` was ended by the
+/// call and not by the program. `INFO` is read before `RELEASE`, because
+/// reaping takes the slot and with it the answer.
+fn end_a_running_child(image_bytes: u64) -> bool {
+    let (made, _) = call(
+        syscall::INVOKE,
+        DOMAIN_CONTROL,
+        method::SPAWN,
+        [CHILD, NAME_LOW, 0, 0],
+    );
+    if made != status::OK {
+        write(b"sup: could not make a domain to end\n");
+        return false;
+    }
+    let (started, _) = call(
+        syscall::INVOKE,
+        CHILD,
+        method::START,
+        [IMAGE, image_bytes, SPIN_FOREVER, 0],
+    );
+    if started != status::OK {
+        write(b"sup: could not start the child to end\n");
+        call(syscall::INVOKE, CHILD, method::RELEASE, [0; 4]);
+        return false;
+    }
+
+    // Let it actually get going, so this ends a *running* domain rather than
+    // one that has not been scheduled yet — which would prove nothing and
+    // would pass just as well against a kernel that could not do this.
+    for _ in 0..64 {
+        call(syscall::YIELD, 0, 0, [0; 4]);
+    }
+    let (before, _) = call(syscall::INVOKE, CHILD, method::INFO, [0; 4]);
+    if before != status::OK {
+        write(b"sup: the child to end could not be asked about\n");
+        return false;
+    }
+
+    let (ended, _) = call(syscall::INVOKE, CHILD, method::END, [0; 4]);
+    if ended != status::OK {
+        write(b"sup: END was refused, status ");
+        write_number(ended);
+        write(b"\n");
+        // **Give the slot back even on the way out.** The first run of this
+        // left it held, and the next `SPAWN` answered `SLOT_UNAVAILABLE` --
+        // one failure reported as two, with the second naming the wrong
+        // thing entirely.
+        call(syscall::INVOKE, CHILD, method::RELEASE, [0; 4]);
+        return false;
+    }
+
+    // A tick, because that is the bound the safe-point rule gives: a ring 3
+    // thread making no system calls is caught by the next interrupt returning
+    // to it. Reading immediately would call a scheduling delay a failure.
+    let mut reason = u64::MAX;
+    for _ in 0..MAX_WAIT {
+        let (asked, why) = call(syscall::INVOKE, CHILD, method::INFO, [0; 4]);
+        if asked == status::OK && why != 0 {
+            reason = why;
+            break;
+        }
+        call(syscall::YIELD, 0, 0, [0; 4]);
+    }
+    if reason == u64::MAX {
+        write(b"sup: the child was told to end and did not\n");
+        return false;
+    }
+
+    let (reaped, _) = call(syscall::INVOKE, CHILD, method::RELEASE, [0; 4]);
+    if reaped != status::OK {
+        write(b"sup: the ended child would not be reaped\n");
+        return false;
+    }
+    write(b"sup: a child that never exits was ended and reaped, reason ");
+    write_number(reason);
+    write(b"\n");
+    true
+}
+
 fn supervise(image_bytes: u64) -> bool {
     let (made, _) = call(
         syscall::INVOKE,
@@ -574,6 +667,12 @@ extern "C" fn _start(image_bytes: u64) -> ! {
     // in it mentions Linux.
     if !supervise(image_bytes) {
         write(b"sup: the supervisor interface did not hold\n");
+    }
+
+    // RFC 0080. After `supervise`, because that one proves the ordinary
+    // lifecycle and this one proves the operation that was missing from it.
+    if !end_a_running_child(image_bytes) {
+        write(b"sup: a running child could not be ended\n");
     }
 
     let mut started = 0;
