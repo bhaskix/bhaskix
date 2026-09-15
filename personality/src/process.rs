@@ -564,6 +564,31 @@ impl Processes {
         false
     }
 
+    /// The live members of a process group, written into `out`.
+    ///
+    /// **Written out rather than returned as an iterator**, because the caller
+    /// ends them: a `kill(-pgid, sig)` that walked this table while `note_exit`
+    /// changed it would be reading a list it was destroying. Gathering first
+    /// and acting afterwards is the only order that is correct, so the shape
+    /// that enforces it is the one exposed.
+    ///
+    /// Answers how many were written, which is at most `out.len()`.
+    #[must_use]
+    pub fn group_members(&self, pgid: u32, out: &mut [u32]) -> usize {
+        let mut count = 0;
+        for process in self.slots.iter().flatten() {
+            if process.state != State::Live || process.pgid != pgid {
+                continue;
+            }
+            let Some(slot) = out.get_mut(count) else {
+                break;
+            };
+            *slot = process.pid;
+            count += 1;
+        }
+        count
+    }
+
     /// As [`Self::by_pid`], for changing it.
     pub fn by_pid_mut(&mut self, pid: u32) -> Option<&mut Process> {
         self.slots.iter_mut().flatten().find(|p| p.pid == pid)
@@ -837,6 +862,51 @@ mod tests {
         table.by_pid_mut(other).expect("live").pgid = group;
         assert!(table.may_signal(shell, other), "a group member");
         assert!(table.may_signal(other, shell), "and symmetrically");
+    }
+
+    /// A group's members are gathered, and a process that has ended is not one.
+    ///
+    /// **The dead half is the half that matters.** `kill(-pgid)` ends every
+    /// member it is given, so a zombie left in the list would be ended a second
+    /// time — and by then its domain id names whoever took the slot.
+    #[test]
+    fn a_groups_members_are_its_live_ones() {
+        let mut table = Processes::new();
+        let shell = table.admit(0, 3, 1).expect("room");
+        let first = table.admit(shell, 4, 1).expect("room");
+        let second = table.admit(shell, 5, 1).expect("room");
+        let stranger = table.admit(0, 6, 1).expect("room");
+        let group = table.by_pid(shell).expect("live").pgid;
+        for pid in [first, second] {
+            table.by_pid_mut(pid).expect("live").pgid = group;
+        }
+
+        let mut out = [0u32; MAX_PROCESSES];
+        let found = table.group_members(group, &mut out);
+        assert_eq!(found, 3, "the shell and its two children");
+        assert!(!out[..found].contains(&stranger), "and not the stranger");
+
+        table.ended(first, Exit::Status(0)).expect("live");
+        let found = table.group_members(group, &mut out);
+        assert_eq!(found, 2, "a process that has ended is not a member");
+        assert!(!out[..found].contains(&first));
+    }
+
+    /// The gathering never writes past what it was given.
+    ///
+    /// A caller sizes `out` by `MAX_PROCESSES` today; one that sizes it smaller
+    /// must get a short answer rather than a panic or a stray write.
+    #[test]
+    fn gathering_a_group_stops_at_the_space_it_was_given() {
+        let mut table = Processes::new();
+        let shell = table.admit(0, 3, 1).expect("room");
+        let group = table.by_pid(shell).expect("live").pgid;
+        for domain in 4..8 {
+            let pid = table.admit(shell, domain, 1).expect("room");
+            table.by_pid_mut(pid).expect("live").pgid = group;
+        }
+        let mut out = [0u32; 2];
+        assert_eq!(table.group_members(group, &mut out), 2);
     }
 
     /// A pid this adapter does not serve is refused, from either side.

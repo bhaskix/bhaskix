@@ -1068,6 +1068,12 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
     ) {
         println!("\x1b[91m    linux wait     FAILED\x1b[0m");
     }
+    if !a_hosted_process_ends_its_child(
+        handoff.hhdm_base.as_u64(),
+        bhaskix_arch::percpu::online_count(),
+    ) {
+        println!("\x1b[91m    hosted kill    FAILED\x1b[0m");
+    }
     if !proc_self_test(
         handoff.hhdm_base.as_u64(),
         bhaskix_arch::percpu::online_count(),
@@ -7357,6 +7363,241 @@ const FORK_PROBE_CODE: [u8; 447] = [
     0x00, 0x00, 0x00, 0x0f, 0x05, 0xeb, 0xfe,
 ];
 
+/// RFC 0079's witness: a hosted process ends a child of its own with a signal.
+///
+/// Assembled from `tools/probes/linux-killer.s` by `tools/probe-bytes.sh`, so
+/// a byte and the comment beside it cannot disagree.
+///
+/// **The child runs in a page the probe mapped itself.** A fork copies the
+/// regions the *personality* recorded — what `mmap` answered, and not an
+/// `execve`'s own segments — so the handful of instructions the child executes
+/// after `fork` must live in one of them. The parent keeps its whole address
+/// space and needs no such care, which is why the routine is *called* rather
+/// than jumped into: the parent returns out of it to the code page it came
+/// from, and the child never leaves it.
+#[rustfmt::skip]
+const KILL_PROBE_CODE: [u8; 604] = [
+    0x49, 0x89, 0xfc,                         // mov %rdi,%r12
+    0xb8, 0x27, 0x00, 0x00, 0x00,             // mov $0x27,%eax
+    0x0f, 0x05,                               // syscall
+    0x49, 0x89, 0x04, 0x24,                   // mov %rax,(%r12)
+    0x49, 0x89, 0xc6,                         // mov %rax,%r14
+    0x49, 0xc7, 0x44, 0x24, 0x78, 0x01, 0x00, 0x00, 0x00, // movq $0x1,0x78(%r12)
+    0xbf, 0x00, 0x00, 0x00, 0x40,             // mov $0x40000000,%edi
+    0xbe, 0x00, 0x10, 0x00, 0x00,             // mov $0x1000,%esi
+    0xba, 0x03, 0x00, 0x00, 0x00,             // mov $0x3,%edx
+    0x41, 0xba, 0x32, 0x00, 0x00, 0x00,       // mov $0x32,%r10d
+    0x49, 0xc7, 0xc0, 0xff, 0xff, 0xff, 0xff, // mov $0xffffffffffffffff,%r8
+    0x45, 0x31, 0xc9,                         // xor %r9d,%r9d
+    0xb8, 0x09, 0x00, 0x00, 0x00,             // mov $0x9,%eax
+    0x0f, 0x05,                               // syscall
+    0x49, 0x89, 0x44, 0x24, 0x60,             // mov %rax,0x60(%r12)
+    0x49, 0xc7, 0x44, 0x24, 0x78, 0x02, 0x00, 0x00, 0x00, // movq $0x2,0x78(%r12)
+    0x48, 0x3d, 0x00, 0x00, 0x00, 0x40,       // cmp $0x40000000,%rax
+    0x0f, 0x85, 0xcb, 0x01, 0x00, 0x00,       // jne 225 <done>
+    0x48, 0xc7, 0x04, 0x25, 0x00, 0x00, 0x00, 0x40, 0xe8, 0x03, 0x00, 0x00, // movq $0x3e8,0x40000000
+    0x48, 0xc7, 0x04, 0x25, 0x08, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00, 0x00, // movq $0x0,0x40000008
+    0xbf, 0x00, 0x00, 0x01, 0x40,             // mov $0x40010000,%edi
+    0xbe, 0x00, 0x10, 0x00, 0x00,             // mov $0x1000,%esi
+    0xba, 0x03, 0x00, 0x00, 0x00,             // mov $0x3,%edx
+    0x41, 0xba, 0x32, 0x00, 0x00, 0x00,       // mov $0x32,%r10d
+    0x49, 0xc7, 0xc0, 0xff, 0xff, 0xff, 0xff, // mov $0xffffffffffffffff,%r8
+    0x45, 0x31, 0xc9,                         // xor %r9d,%r9d
+    0xb8, 0x09, 0x00, 0x00, 0x00,             // mov $0x9,%eax
+    0x0f, 0x05,                               // syscall
+    0x49, 0x89, 0x44, 0x24, 0x68,             // mov %rax,0x68(%r12)
+    0x49, 0xc7, 0x44, 0x24, 0x78, 0x03, 0x00, 0x00, 0x00, // movq $0x3,0x78(%r12)
+    0x48, 0x3d, 0x00, 0x00, 0x01, 0x40,       // cmp $0x40010000,%rax
+    0x0f, 0x85, 0x73, 0x01, 0x00, 0x00,       // jne 225 <done>
+    0x49, 0x89, 0xc7,                         // mov %rax,%r15
+    0x48, 0x8d, 0x35, 0x74, 0x01, 0x00, 0x00, // lea 0x174(%rip),%rsi # 230 <inner>
+    0x4c, 0x89, 0xff,                         // mov %r15,%rdi
+    0xb9, 0x2c, 0x00, 0x00, 0x00,             // mov $0x2c,%ecx
+    0xf3, 0xa4,                               // rep movsb %ds:(%rsi),%es:(%rdi)
+    0x4c, 0x89, 0xff,                         // mov %r15,%rdi
+    0xbe, 0x00, 0x10, 0x00, 0x00,             // mov $0x1000,%esi
+    0xba, 0x05, 0x00, 0x00, 0x00,             // mov $0x5,%edx
+    0xb8, 0x0a, 0x00, 0x00, 0x00,             // mov $0xa,%eax
+    0x0f, 0x05,                               // syscall
+    0x49, 0x89, 0x44, 0x24, 0x70,             // mov %rax,0x70(%r12)
+    0x49, 0xc7, 0x44, 0x24, 0x78, 0x04, 0x00, 0x00, 0x00, // movq $0x4,0x78(%r12)
+    0x48, 0x85, 0xc0,                         // test %rax,%rax
+    0x0f, 0x88, 0x34, 0x01, 0x00, 0x00,       // js 225 <done>
+    0x41, 0xff, 0xd7,                         // callq *%r15
+    0x49, 0x89, 0x44, 0x24, 0x08,             // mov %rax,0x8(%r12)
+    0x49, 0xc7, 0x44, 0x24, 0x78, 0x05, 0x00, 0x00, 0x00, // movq $0x5,0x78(%r12)
+    0x49, 0x89, 0xc5,                         // mov %rax,%r13
+    0x48, 0x85, 0xc0,                         // test %rax,%rax
+    0x0f, 0x8e, 0x17, 0x01, 0x00, 0x00,       // jle 225 <done>
+    0x4c, 0x89, 0xef,                         // mov %r13,%rdi
+    0xbe, 0x0f, 0x00, 0x00, 0x00,             // mov $0xf,%esi
+    0xb8, 0x3e, 0x00, 0x00, 0x00,             // mov $0x3e,%eax
+    0x0f, 0x05,                               // syscall
+    0x49, 0x89, 0x44, 0x24, 0x10,             // mov %rax,0x10(%r12)
+    0x49, 0xc7, 0x44, 0x24, 0x78, 0x06, 0x00, 0x00, 0x00, // movq $0x6,0x78(%r12)
+    0x4c, 0x89, 0xef,                         // mov %r13,%rdi
+    0x49, 0x8d, 0x74, 0x24, 0x20,             // lea 0x20(%r12),%rsi
+    0x31, 0xd2,                               // xor %edx,%edx
+    0x45, 0x31, 0xd2,                         // xor %r10d,%r10d
+    0xb8, 0x3d, 0x00, 0x00, 0x00,             // mov $0x3d,%eax
+    0x0f, 0x05,                               // syscall
+    0x49, 0x89, 0x44, 0x24, 0x18,             // mov %rax,0x18(%r12)
+    0x49, 0xc7, 0x44, 0x24, 0x78, 0x07, 0x00, 0x00, 0x00, // movq $0x7,0x78(%r12)
+    0x49, 0x8d, 0x87, 0x0f, 0x00, 0x00, 0x00, // lea 0xf(%r15),%rax
+    0xff, 0xd0,                               // callq *%rax
+    0x49, 0x89, 0x44, 0x24, 0x28,             // mov %rax,0x28(%r12)
+    0x49, 0xc7, 0x44, 0x24, 0x78, 0x08, 0x00, 0x00, 0x00, // movq $0x8,0x78(%r12)
+    0x49, 0x89, 0xc5,                         // mov %rax,%r13
+    0x48, 0x85, 0xc0,                         // test %rax,%rax
+    0x0f, 0x8e, 0xb5, 0x00, 0x00, 0x00,       // jle 225 <done>
+    0x4c, 0x89, 0xef,                         // mov %r13,%rdi
+    0xbe, 0x09, 0x00, 0x00, 0x00,             // mov $0x9,%esi
+    0xb8, 0x3e, 0x00, 0x00, 0x00,             // mov $0x3e,%eax
+    0x0f, 0x05,                               // syscall
+    0x49, 0x89, 0x44, 0x24, 0x30,             // mov %rax,0x30(%r12)
+    0x49, 0xc7, 0x44, 0x24, 0x78, 0x09, 0x00, 0x00, 0x00, // movq $0x9,0x78(%r12)
+    0x4c, 0x89, 0xef,                         // mov %r13,%rdi
+    0x49, 0x8d, 0x74, 0x24, 0x40,             // lea 0x40(%r12),%rsi
+    0x31, 0xd2,                               // xor %edx,%edx
+    0x45, 0x31, 0xd2,                         // xor %r10d,%r10d
+    0xb8, 0x3d, 0x00, 0x00, 0x00,             // mov $0x3d,%eax
+    0x0f, 0x05,                               // syscall
+    0x49, 0x89, 0x44, 0x24, 0x38,             // mov %rax,0x38(%r12)
+    0x49, 0xc7, 0x44, 0x24, 0x78, 0x0a, 0x00, 0x00, 0x00, // movq $0xa,0x78(%r12)
+    0x31, 0xdb,                               // xor %ebx,%ebx
+    0x41, 0xbd, 0x01, 0x00, 0x00, 0x00,       // mov $0x1,%r13d
+    0x4c, 0x89, 0xef,                         // mov %r13,%rdi
+    0x31, 0xf6,                               // xor %esi,%esi
+    0xb8, 0x3e, 0x00, 0x00, 0x00,             // mov $0x3e,%eax
+    0x0f, 0x05,                               // syscall
+    0x48, 0x85, 0xc0,                         // test %rax,%rax
+    0x75, 0x02,                               // jne 1ca <sweep+0x13>
+    0xff, 0xc3,                               // inc %ebx
+    0x41, 0xff, 0xc5,                         // inc %r13d
+    0x41, 0x83, 0xfd, 0x28,                   // cmp $0x28,%r13d
+    0x7e, 0xe4,                               // jle 1b7 <sweep>
+    0x49, 0x89, 0x5c, 0x24, 0x48,             // mov %rbx,0x48(%r12)
+    0x49, 0xc7, 0x44, 0x24, 0x78, 0x0b, 0x00, 0x00, 0x00, // movq $0xb,0x78(%r12)
+    0x31, 0xdb,                               // xor %ebx,%ebx
+    0x41, 0xbd, 0x01, 0x00, 0x00, 0x00,       // mov $0x1,%r13d
+    0x4d, 0x39, 0xf5,                         // cmp %r14,%r13
+    0x74, 0x17,                               // je 205 <strangers+0x1c>
+    0x4c, 0x89, 0xef,                         // mov %r13,%rdi
+    0xbe, 0x09, 0x00, 0x00, 0x00,             // mov $0x9,%esi
+    0xb8, 0x3e, 0x00, 0x00, 0x00,             // mov $0x3e,%eax
+    0x0f, 0x05,                               // syscall
+    0x48, 0x83, 0xf8, 0xfd,                   // cmp $0xfffffffffffffffd,%rax
+    0x74, 0x02,                               // je 205 <strangers+0x1c>
+    0xff, 0xc3,                               // inc %ebx
+    0x41, 0xff, 0xc5,                         // inc %r13d
+    0x41, 0x83, 0xfd, 0x28,                   // cmp $0x28,%r13d
+    0x7e, 0xdb,                               // jle 1e9 <strangers>
+    0x49, 0x89, 0x5c, 0x24, 0x50,             // mov %rbx,0x50(%r12)
+    0x49, 0xc7, 0x44, 0x24, 0x78, 0x0c, 0x00, 0x00, 0x00, // movq $0xc,0x78(%r12)
+    0x49, 0xc7, 0x44, 0x24, 0x58, 0xee, 0xff, 0xc0, 0x00, // movq $0xc0ffee,0x58(%r12)
+    0x31, 0xff,                               // xor %edi,%edi
+    0xb8, 0xe7, 0x00, 0x00, 0x00,             // mov $0xe7,%eax
+    0x0f, 0x05,                               // syscall
+    0xeb, 0xfe,                               // jmp 22e <done+0x9>
+    0xb8, 0x39, 0x00, 0x00, 0x00,             // mov $0x39,%eax
+    0x0f, 0x05,                               // syscall
+    0x48, 0x85, 0xc0,                         // test %rax,%rax
+    0x74, 0x01,                               // je 23d <inner+0xd>
+    0xc3,                                     // retq
+    0xeb, 0xfe,                               // jmp 23d <inner+0xd>
+    0xb8, 0x39, 0x00, 0x00, 0x00,             // mov $0x39,%eax
+    0x0f, 0x05,                               // syscall
+    0x48, 0x85, 0xc0,                         // test %rax,%rax
+    0x74, 0x01,                               // je 24c <park+0xd>
+    0xc3,                                     // retq
+    0xbf, 0x00, 0x00, 0x00, 0x40,             // mov $0x40000000,%edi
+    0x31, 0xf6,                               // xor %esi,%esi
+    0xb8, 0x23, 0x00, 0x00, 0x00,             // mov $0x23,%eax
+    0x0f, 0x05,                               // syscall
+    0xeb, 0xfe,                               // jmp 25a <park+0x1b>
+];
+
+/// A hosted process in nobody's tree, so the containment gate has a target.
+///
+/// Assembled from `tools/probes/linux-bystander.s`.
+///
+/// **Without it the containment gate would pass on absence.** Every other
+/// hosted process alive while the killer probe runs is the killer or one of
+/// its children, so "every stranger refused" would be a claim about an empty
+/// set. This one reports that it is running, waits for a word the kernel writes
+/// into its page, and reports again — and the second report is the half that
+/// matters, because it says the process was still there after the killer had
+/// tried to end it.
+#[rustfmt::skip]
+const BYSTANDER_CODE: [u8; 250] = [
+    0x49, 0x89, 0xfc,                         // mov %rdi,%r12
+    0xb8, 0x27, 0x00, 0x00, 0x00,             // mov $0x27,%eax
+    0x0f, 0x05,                               // syscall
+    0x49, 0x89, 0x44, 0x24, 0x08,             // mov %rax,0x8(%r12)
+    0x31, 0xff,                               // xor %edi,%edi
+    0xbe, 0x00, 0x10, 0x00, 0x00,             // mov $0x1000,%esi
+    0xba, 0x03, 0x00, 0x00, 0x00,             // mov $0x3,%edx
+    0x41, 0xba, 0x22, 0x00, 0x00, 0x00,       // mov $0x22,%r10d
+    0x49, 0xc7, 0xc0, 0xff, 0xff, 0xff, 0xff, // mov $0xffffffffffffffff,%r8
+    0x45, 0x31, 0xc9,                         // xor %r9d,%r9d
+    0xb8, 0x09, 0x00, 0x00, 0x00,             // mov $0x9,%eax
+    0x0f, 0x05,                               // syscall
+    0x48, 0x85, 0xc0,                         // test %rax,%rax
+    0x0f, 0x88, 0xa5, 0x00, 0x00, 0x00,       // js e0 <done>
+    0x49, 0x89, 0xc7,                         // mov %rax,%r15
+    0x48, 0x8d, 0x35, 0xa6, 0x00, 0x00, 0x00, // lea 0xa6(%rip),%rsi # eb <inner>
+    0x4c, 0x89, 0xff,                         // mov %r15,%rdi
+    0xb9, 0x0f, 0x00, 0x00, 0x00,             // mov $0xf,%ecx
+    0xf3, 0xa4,                               // rep movsb %ds:(%rsi),%es:(%rdi)
+    0x4c, 0x89, 0xff,                         // mov %r15,%rdi
+    0xbe, 0x00, 0x10, 0x00, 0x00,             // mov $0x1000,%esi
+    0xba, 0x05, 0x00, 0x00, 0x00,             // mov $0x5,%edx
+    0xb8, 0x0a, 0x00, 0x00, 0x00,             // mov $0xa,%eax
+    0x0f, 0x05,                               // syscall
+    0x48, 0x85, 0xc0,                         // test %rax,%rax
+    0x78, 0x78,                               // js e0 <done>
+    0x41, 0xff, 0xd7,                         // callq *%r15
+    0x49, 0x89, 0x44, 0x24, 0x18,             // mov %rax,0x18(%r12)
+    0x49, 0x89, 0xc5,                         // mov %rax,%r13
+    0x48, 0x85, 0xc0,                         // test %rax,%rax
+    0x7e, 0x68,                               // jle e0 <done>
+    0x49, 0xc7, 0x04, 0x24, 0x01, 0x00, 0x00, 0x00, // movq $0x1,(%r12)
+    0xb8, 0x18, 0x00, 0x00, 0x00,             // mov $0x18,%eax
+    0x0f, 0x05,                               // syscall
+    0x49, 0x8b, 0x44, 0x24, 0x10,             // mov 0x10(%r12),%rax
+    0x48, 0x85, 0xc0,                         // test %rax,%rax
+    0x74, 0xef,                               // je 80 <_start+0x80>
+    0x49, 0xc7, 0x04, 0x24, 0x03, 0x00, 0x00, 0x00, // movq $0x3,(%r12)
+    0x4c, 0x89, 0xef,                         // mov %r13,%rdi
+    0x49, 0x8d, 0x74, 0x24, 0x28,             // lea 0x28(%r12),%rsi
+    0xba, 0x01, 0x00, 0x00, 0x00,             // mov $0x1,%edx
+    0x45, 0x31, 0xd2,                         // xor %r10d,%r10d
+    0xb8, 0x3d, 0x00, 0x00, 0x00,             // mov $0x3d,%eax
+    0x0f, 0x05,                               // syscall
+    0x49, 0x89, 0x44, 0x24, 0x20,             // mov %rax,0x20(%r12)
+    0x4c, 0x89, 0xef,                         // mov %r13,%rdi
+    0xbe, 0x09, 0x00, 0x00, 0x00,             // mov $0x9,%esi
+    0xb8, 0x3e, 0x00, 0x00, 0x00,             // mov $0x3e,%eax
+    0x0f, 0x05,                               // syscall
+    0x4c, 0x89, 0xef,                         // mov %r13,%rdi
+    0x49, 0x8d, 0x74, 0x24, 0x30,             // lea 0x30(%r12),%rsi
+    0x31, 0xd2,                               // xor %edx,%edx
+    0x45, 0x31, 0xd2,                         // xor %r10d,%r10d
+    0xb8, 0x3d, 0x00, 0x00, 0x00,             // mov $0x3d,%eax
+    0x0f, 0x05,                               // syscall
+    0x49, 0xc7, 0x04, 0x24, 0x02, 0x00, 0x00, 0x00, // movq $0x2,(%r12)
+    0x31, 0xff,                               // xor %edi,%edi
+    0xb8, 0xe7, 0x00, 0x00, 0x00,             // mov $0xe7,%eax
+    0x0f, 0x05,                               // syscall
+    0xeb, 0xfe,                               // jmp e9 <done+0x9>
+    0xb8, 0x39, 0x00, 0x00, 0x00,             // mov $0x39,%eax
+    0x0f, 0x05,                               // syscall
+    0x48, 0x85, 0xc0,                         // test %rax,%rax
+    0x74, 0x01,                               // je f8 <inner+0xd>
+    0xc3,                                     // retq
+    0xeb, 0xfe,                               // jmp f8 <inner+0xd>
+];
+
 /// What the parent writes before forking, and the child must print.
 ///
 /// **Deliberately not named in the report line.** The gate looks for these
@@ -8775,6 +9016,147 @@ fn fork_self_test(hhdm_base: u64, cpus: u32) -> bool {
     right
 }
 
+/// RFC 0079's witness: a hosted process ends a child of its own, and is
+/// refused every process outside its own tree.
+///
+/// # What it asserts, and why each half is here
+///
+/// **That a signal ended a child, rather than that `kill` answered `OK`.** The
+/// gate reads the `wait4` status word: `15` for `SIGTERM` and `9` for
+/// `SIGKILL`, which is `WIFSIGNALED` with the number. A `kill` that recorded an
+/// exit and woke the parent while the target kept running would answer `OK`
+/// just the same, and that is the failure this RFC exists to refuse.
+///
+/// **That everything else is refused, against a target that is really there.**
+/// The probe asks `kill(pid, 0)` of forty pids and must reach exactly one —
+/// itself — and then aims `SIGKILL` at every other pid and must be told `ESRCH`
+/// every time. A bystander runs alongside it in nobody's tree for the duration,
+/// so "every stranger refused" is a claim about a set with something in it, and
+/// the bystander reports that it was still running afterwards.
+///
+/// **`ESRCH` rather than `EPERM`** is the answer for a process outside the
+/// tree, so a hosted process cannot learn that a pid it may not touch exists.
+fn a_hosted_process_ends_its_child(hhdm_base: u64, cpus: u32) -> bool {
+    use core::sync::atomic::Ordering;
+
+    if cpus < 2 {
+        println!("\x1b[93m    hosted kill    skipped, needs a second cpu\x1b[0m");
+        return true;
+    }
+    const BYSTANDER_CPU: u32 = 2;
+    const KILLER_CPU: u32 = 3;
+    const DONE: u64 = 0xC0_FFEE;
+
+    KILLER_PA.store(0, Ordering::Release);
+    BYSTANDER_PA.store(0, Ordering::Release);
+
+    let start = |name: &'static str, entry: extern "C" fn(u64) -> !, cpu: u32| {
+        let realm = domain::create(name, domain::ResourceEnvelope::new()).ok()?;
+        if domain::with(realm, |owner| {
+            owner.set_personality(domain::Personality::Linux)
+        }) != Some(Ok(()))
+        {
+            return None;
+        }
+        let options = sched::SpawnOptions::new()
+            .pinned()
+            .in_domain(realm.as_u32());
+        sched::spawn_on_with(cpu, name, entry, hhdm_base, hhdm_base, options).ok()?;
+        Some(realm)
+    };
+    // Reads a word out of a probe's report page. `None` until the page exists.
+    let word = |pa: &core::sync::atomic::AtomicU64, at: u64| -> Option<u64> {
+        let page = pa.load(Ordering::Acquire);
+        if page == 0 {
+            return None;
+        }
+        // SAFETY: a frame the probe's own space owns, reached through the
+        // direct map, as every other probe here reads its report.
+        Some(unsafe { core::ptr::read_volatile((hhdm_base + page + at) as *const u64) })
+    };
+
+    let Some(bystander) = start("bystander", ring3_bystander, BYSTANDER_CPU) else {
+        println!("\x1b[91m    hosted kill    FAILED: the bystander would not start\x1b[0m");
+        return false;
+    };
+    // **Running before the killer starts, not merely spawned.** A bystander
+    // that had not reached its first instruction would be a stranger that does
+    // not exist yet, and the containment half would pass on absence again.
+    let standing = wait_until(|| word(&BYSTANDER_PA, 0) == Some(1), 20_000);
+    let bystander_pid = word(&BYSTANDER_PA, 8).unwrap_or(0);
+
+    let Some(killer) = start("killer", ring3_killer, KILLER_CPU) else {
+        retire_probe(bystander);
+        println!("\x1b[91m    hosted kill    FAILED: the probe would not start\x1b[0m");
+        return false;
+    };
+    let finished = wait_until(|| word(&KILLER_PA, 88) == Some(DONE), 30_000);
+
+    // Tell the bystander to stop, and read whether it was alive to be told.
+    if let Some(page) = Some(BYSTANDER_PA.load(Ordering::Acquire)).filter(|page| *page != 0) {
+        // SAFETY: as the read above.
+        unsafe { core::ptr::write_volatile((hhdm_base + page + 16) as *mut u64, 1) };
+    }
+    let survived = wait_until(|| word(&BYSTANDER_PA, 0) == Some(2), 20_000);
+    // **What the bystander's own child was doing afterwards**, which is the
+    // half that makes the containment gate armable: `wait4(child, WNOHANG)`
+    // answering zero means there was nothing to collect, so the child was
+    // still running. Its pid and a status of 9 would mean the killer took it.
+    let bystander_child = word(&BYSTANDER_PA, 24).unwrap_or(0);
+    let bystander_state = word(&BYSTANDER_PA, 0).unwrap_or(0);
+    let child_taken = word(&BYSTANDER_PA, 32).unwrap_or(0);
+
+    let read = |at: u64| word(&KILLER_PA, at).unwrap_or(0);
+    let (pid, term_status, kill_status) = (read(0), read(32), read(64));
+    let (reachable, strangers) = (read(72), read(80));
+    let ended_them = read(16) == 0 && read(48) == 0;
+    // What the probe's own setup answered, so a run that never reached a kill
+    // says which call stopped it rather than leaving every number at zero.
+    let (data_page, code_page, protected) = (read(96), read(104), read(112));
+    let reached = read(120);
+    let (first_child, second_child) = (read(8) as i64, read(40) as i64);
+
+    retire_probe(killer);
+    retire_probe(bystander);
+
+    let right = standing
+        && finished
+        && survived
+        && ended_them
+        && term_status == 15
+        && kill_status == 9
+        && reachable == 1
+        && strangers == 0
+        && bystander_child > 0
+        && child_taken == 0;
+    if right {
+        println!(
+            "    hosted kill    pid {pid} ended a child with SIGTERM and one with SIGKILL, and \
+             wait4 reported the signal rather than an exit (status {term_status} and \
+             {kill_status})"
+        );
+        println!(
+            "    hosted kill    and it reached {reachable} of 40 pids -- itself -- while \
+             SIGKILL at the other 39 ended {strangers} of them: pid {bystander_pid} was \
+             still running afterwards and still had its own child {bystander_child}"
+        );
+    } else {
+        // Says what was measured. A gate that names a cause it has not measured
+        // is the failure this tree keeps recording.
+        println!(
+            "\x1b[91m    hosted kill    FAILED: standing {standing}, finished {finished}, \
+             survived {survived}, kill accepted {ended_them}, status {term_status} and \
+             {kill_status}, reachable {reachable} of 40, strangers reached {strangers}, \
+             bystander's child {bystander_child} and wait4 on it answered \
+             {child_taken}, bystander stopped at state {bystander_state}; the probe's \
+             pages answered {data_page:#x} and {code_page:#x}, mprotect \
+             {protected:#x}, and it got as far as step {reached} of 12; its forks \
+             answered {first_child} and {second_child}\x1b[0m"
+        );
+    }
+    right
+}
+
 /// What the adapter's last `wait4` answered: the child collected, and the
 /// status word. Negative firsts are refusals — see `bin/linuxd`'s `trace_wait`.
 fn adapter_wait_record() -> (i64, u64) {
@@ -9444,6 +9826,10 @@ static LEAKER_PA: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64:
 static TAKER_PA: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 const LEAKER_AT: u64 = 0x0000_0000_2100_0000;
 const TAKER_AT: u64 = 0x0000_0000_2300_0000;
+const KILLER_AT: u64 = 0x0000_0000_2500_0000;
+const BYSTANDER_AT: u64 = 0x0000_0000_2700_0000;
+static KILLER_PA: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static BYSTANDER_PA: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// Binds a socket, **polls it with no timeout**, and reports what arrived.
 ///
@@ -9586,7 +9972,10 @@ fn run_bell_program(
     code: &[u8],
     code_at: u64,
     report_pa: &core::sync::atomic::AtomicU64,
-    own_port: u16,
+    // **`Option`, because not every probe binds a socket** -- RFC 0079's does
+    // not, and its code is longer than `SOCKET_PROBE_ADDRESS_AT`, so writing an
+    // address beside the code would write it *into* the code.
+    own_port: Option<u16>,
     peer_port: Option<u16>,
 ) -> ! {
     use bhaskix_boot::VirtAddr;
@@ -9621,12 +10010,18 @@ fn run_bell_program(
     // map; the executable mapping is never writable.
     unsafe {
         core::ptr::copy_nonoverlapping(code.as_ptr(), (hhdm_base + code_pa) as *mut u8, code.len());
-        let own = loopback6_at(own_port);
-        core::ptr::copy_nonoverlapping(
-            own.as_ptr(),
-            (hhdm_base + code_pa + SOCKET_PROBE_ADDRESS_AT) as *mut u8,
-            own.len(),
-        );
+        if let Some(port) = own_port {
+            assert!(
+                code.len() < SOCKET_PROBE_ADDRESS_AT as usize,
+                "this probe's code has grown into the address beside it"
+            );
+            let own = loopback6_at(port);
+            core::ptr::copy_nonoverlapping(
+                own.as_ptr(),
+                (hhdm_base + code_pa + SOCKET_PROBE_ADDRESS_AT) as *mut u8,
+                own.len(),
+            );
+        }
         if let Some(peer) = peer_port {
             let peer = loopback6_at(peer);
             core::ptr::copy_nonoverlapping(
@@ -9659,7 +10054,7 @@ extern "C" fn ring3_socket_leaker(hhdm_base: u64) -> ! {
         &BELL_LEAKER_CODE,
         LEAKER_AT,
         &LEAKER_PA,
-        LEAKED_PORT,
+        Some(LEAKED_PORT),
         None,
     )
 }
@@ -9670,7 +10065,29 @@ extern "C" fn ring3_socket_taker(hhdm_base: u64) -> ! {
         &BELL_LEAKER_CODE,
         TAKER_AT,
         &TAKER_PA,
-        LEAKED_PORT,
+        Some(LEAKED_PORT),
+        None,
+    )
+}
+
+extern "C" fn ring3_killer(hhdm_base: u64) -> ! {
+    run_bell_program(
+        hhdm_base,
+        &KILL_PROBE_CODE,
+        KILLER_AT,
+        &KILLER_PA,
+        None,
+        None,
+    )
+}
+
+extern "C" fn ring3_bystander(hhdm_base: u64) -> ! {
+    run_bell_program(
+        hhdm_base,
+        &BYSTANDER_CODE,
+        BYSTANDER_AT,
+        &BYSTANDER_PA,
+        None,
         None,
     )
 }
@@ -9681,7 +10098,7 @@ extern "C" fn ring3_bell_waiter(hhdm_base: u64) -> ! {
         &BELL_WAITER_CODE,
         BELL_WAITER_AT,
         &BELL_WAITER_PA,
-        BELL_WAITER_PORT,
+        Some(BELL_WAITER_PORT),
         None,
     )
 }
@@ -9692,7 +10109,7 @@ extern "C" fn ring3_bell_sender(hhdm_base: u64) -> ! {
         &BELL_SENDER_CODE,
         BELL_SENDER_AT,
         &BELL_SENDER_PA,
-        BELL_SENDER_PORT,
+        Some(BELL_SENDER_PORT),
         Some(BELL_WAITER_PORT),
     )
 }

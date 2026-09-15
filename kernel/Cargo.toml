@@ -854,7 +854,14 @@ asm_budget = 10
 # until it gave up. Volatile, once per word, and the two lines buy a gate that
 # stops calling a working receive path FAILED in the same report that shows
 # thirty-two frames crossing.
-unsafe_budget = 2054
+# 2062 for RFC 0079's two hosted probes: eight lines, all of them reading or
+# writing a word of a probe's own report page through the direct map, which is
+# how every probe in this file has reported since the first one. The kill probe
+# is read at eleven offsets and the bystander at four, and the kernel writes one
+# word back to tell the bystander the killer has finished -- a channel that
+# needs no socket, no service and no second mechanism, because the kernel
+# already holds the page's physical address.
+unsafe_budget = 2062
 # Up thirty-one for RFC 0005 step 9's socket probe -- `ring3_socketeer`, which
 # is `ring3_lister` with a `sockaddr_in6` copied in beside its code instead of
 # two filenames. The same two blocks every hosted probe has: one

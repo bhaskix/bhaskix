@@ -998,6 +998,73 @@ the distinction is in the table rather than in somebody's head.
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-09-15 (a hosted process can end another, and only the ones it may)
+
+**[RFC 0079](docs/rfc/0079-a-signal-a-process-may-send-another.md) is accepted.**
+`kill(pid, sig)` exists in `bin/linuxd` for `SIGKILL`, `SIGTERM` and the `sig ==
+0` probe, plus `kill(-pgid, sig)` over a group. The rule for who may signal whom
+is the **process tree** — the caller, its descendants, its own process group —
+because Linux answers that question with uids and RFC 0031 is explicit that
+Linux UID 0 is not Bhaskix authority. Anything outside is `ESRCH`, never
+`EPERM`, so a hosted process cannot learn that a pid it may not touch exists.
+
+**The RFC assumed the adapter already held the authority, and it did not.** That
+was the largest thing the draft found: `adapter::CHILD` is one slot and
+`answer_fork` deleted it as soon as the child was built, so `bin/linuxd` named
+no running hosted process's domain and could not have ended one. A `kill`
+written against that would have recorded an exit and woken the parent's `wait4`
+while the target kept running. The adapter now derives and keeps a capability
+per forked process, from a pool of thirty-two allocated upward from
+`DOMAIN_FLOOR` — away from the file slots, which grow downward from the top —
+and gives it back when the process ends. It needed the nucleus to grow `END`
+first, which is [RFC 0080](docs/rfc/0080-ending-a-domain-that-is-still-running.md).
+
+**Two boot gates, both armed.** The signal gate reads `wait4`'s **status word**
+— 15 and 9 — because a `kill` that recorded an exit while the target kept
+running would answer `OK` just the same; its `SIGKILL` target is a child asleep
+**inside the adapter** in `nanosleep`, which is the case a `^C` at a shell meets
+and the one a spinning child never tests. The containment gate needed a
+**bystander** before it meant anything: every other hosted process alive while
+the probe runs is the probe or one of its children, so "every stranger refused"
+would have been a claim about an empty set. A bystander runs in nobody's tree
+holding a forked child a `kill` from outside could really end; the probe reaches
+exactly one pid of forty and ends none of the other thirty-nine. Armed by
+removing the tree check: `reached 40 of 40 pids`, six strangers answered, and
+the bystander could no longer finish.
+
+**Three things the building found that the design did not show.**
+`claim_domain_slot().filter(..)` leaves a slot held when the derive fails, so a
+failed fork cost a slot for the rest of the boot — found by arming the gate,
+which printed `2 held, peak 2` where it should have shown nothing kept. A hosted
+thread calling plain `exit(2)` reaches neither `note_exit` nor `FORGET` in time,
+and the adapter cannot answer that call by recording a process exit because
+`clone` exists and the thread ending need not be the last one — so it **asks
+instead of being told**: `INFO` on the kept capability answers `0` while the
+domain lives and its `Ending` afterwards. And the kernel's reader truncated the
+process record to six words while the record had grown to eight, so the two new
+numbers arrived in the page and were dropped; the report read `0 at the peak`
+for a slot demonstrably held, and the adapter was suspected first because it was
+the end that had changed.
+
+**One limitation found and recorded rather than fixed**: a hosted process that
+maps `0x30000000` cannot `fork`. `bin/linuxd` puts a fork's trampoline at that
+fixed address, so `map_at_eager` cannot place it and `fork` answers `ENOMEM` for
+a reason no caller can act on. Found because this RFC's probe picked the same
+address and read `ENOMEM` for three boots.
+
+**And one case named as untested rather than glossed**: a process killed by
+somebody other than its parent — a sibling in its own group, which the rule
+permits — and what the parent's `wait4` then does. Nothing tests it; arming the
+containment gate produced one observation suggesting the parent's `wait4` may
+not return, from a deliberately broken adapter killing six processes at once, so
+it is a hint rather than a finding. It is RFC 0079's third unresolved question.
+
+**`security.md` T11 prices the widening plainly**: a compromised `bin/linuxd`
+can end every hosted process, at any moment, where before it could refuse them
+service but not stop one that was running. `bin/linuxd`'s exact `unsafe` budget
+goes 117 to 118 — one accessor for the slot table; the capabilities themselves
+cost none.
+
 ### 2026-09-14 (two instruments that reported the wrong thing, one of them mine)
 
 **The socket-reclaim gate calls an unmet precondition a failure, and it now says so instead.** The reclaim rides on the successor domain reusing the leaker's slot — that reuse is what makes the kernel send `FORGET` — so a successor that lands elsewhere means the mechanism was never exercised. The gate printed `socket reclaim FAILED: ... same slot false, bound again false (fd 3, bind -98)`, which reads as *the reclaim is broken*. It is now `socket reclaim skipped: the successor got slot N, not the leaker's M -- the reclaim rides on slot reuse, so nothing was tested this boot`. **A red that means "could not test" is worse than no red**: it spends an afternoon and teaches people to discount the gate. Watched both ways — armed at the allocation rather than at the comparison, so the two slot numbers in the message are the ones actually read.

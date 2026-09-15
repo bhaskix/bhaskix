@@ -3256,6 +3256,42 @@ else
     status=1
 fi
 
+# **A hosted process may end a child of its own, and nothing else** — RFC 0079.
+#
+# Two assertions, and the second is the one that matters. The first is that a
+# signal *ended* a child: the gate reads `wait4`'s status word, 15 for SIGTERM
+# and 9 for SIGKILL, because a `kill` that recorded an exit and woke the parent
+# while the target kept running would answer `OK` exactly the same way.
+#
+# The second is containment, asserted against a target that is really there: a
+# bystander process in nobody's tree runs for the duration, the probe reaches
+# exactly one pid of forty with `kill(pid, 0)` — itself — and `SIGKILL` at the
+# other thirty-nine ends none of them. A containment test that passes on
+# absence tests nothing, which is why the bystander exists and why it reports
+# that it was still running afterwards.
+if grep -qE "hosted kill    pid [0-9]+ ended a child with SIGTERM" "$LOG"; then
+    kill_line=$(grep -oE "status [0-9]+ and [0-9]+\)" "$LOG" | head -1)
+    if [ "$kill_line" = "status 15 and 9)" ]; then
+        pass "a hosted process ended its children with SIGTERM and SIGKILL, and wait4 reported the signal ($kill_line"
+    else
+        fail "a hosted kill did not report the signal that ended the child: $kill_line"
+        status=1
+    fi
+    reach_line=$(grep -oE "reached [0-9]+ of 40 pids -- itself -- while SIGKILL at the other 39 ended [0-9]+ of them" "$LOG" | head -1)
+    if [ "$reach_line" = "reached 1 of 40 pids -- itself -- while SIGKILL at the other 39 ended 0 of them" ] \
+        && grep -qE "still running afterwards and still had its own child [0-9]+" "$LOG"; then
+        pass "a hosted process could reach no pid outside its own tree, and the child it was refused was still there"
+    else
+        fail "CONTAINMENT: a hosted process reached outside its own tree -- $reach_line"
+        status=1
+    fi
+elif grep -qF "hosted kill    skipped" "$LOG"; then
+    pass "one cpu on this machine, so nothing could be killed while something else ran"
+else
+    fail "no hosted process tried to end a child of its own"
+    status=1
+fi
+
 # **A hosted process's domain capability is kept, and it is given back** — RFC
 # 0079 step 2. The adapter keeps a capability naming each forked process's
 # domain, because without one it cannot end a process and a `kill(2)` written

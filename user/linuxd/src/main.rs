@@ -979,6 +979,165 @@ fn answer_tgkill(request: &PersonalityCall) -> (u64, Answer) {
     (REPLY_VALUE, bhaskix_personality::call::ENOSYS)
 }
 
+/// `kill(pid, signal)` — RFC 0079.
+///
+/// **The authority question is the whole of this, and the answer is the
+/// process tree.** Linux answers "may A signal B?" with real and effective
+/// uids; RFC 0031 is explicit that Linux UID 0 is not Bhaskix authority, so a
+/// rule phrased in uids would either lie about what it checks or invent an
+/// authority this system does not have. `Processes::may_signal` is the rule —
+/// the caller, its descendants, and its own process group — and it is a
+/// property of a tree this program already maintains rather than a new table
+/// to keep in step.
+///
+/// **`ESRCH` rather than `EPERM` for a process outside that tree**, because
+/// `EPERM` tells a caller that a process it may not touch exists, and
+/// `kill(pid, 0)` is how that is usually discovered.
+///
+/// **What it can actually do.** `SIGKILL` and `SIGTERM` end the target's
+/// domain through the capability this program kept at its fork, and `0` is the
+/// existence-and-permission probe that changes nothing. `SIGTERM` is fatal
+/// here and that is a limitation rather than a decision: this program records
+/// handlers and does not deliver them, so a `SIGTERM` that claimed to be
+/// catchable would be a lie, and ending on it is what a default-disposition
+/// process does. Any other signal is `ENOSYS` — refusing to carry one is
+/// honest, and reporting success for a signal nothing delivers is not.
+fn answer_kill(request: &PersonalityCall) -> (u64, Answer) {
+    const SIGKILL: u64 = 9;
+    const SIGTERM: u64 = 15;
+    let (raw, signal) = (request.first() as i64, request.second());
+
+    // Who is asking. A caller this table cannot name may signal nothing; there
+    // is no "unknown caller" worth being generous about, because every hosted
+    // call arrives with a domain the table can name.
+    let Some(caller) = process_for(request.domain).map(|process| process.pid) else {
+        return (REPLY_VALUE, Answer::error(memory::errno::ESRCH));
+    };
+
+    // **Not `kill(-1, sig)`.** "Every process you may signal" is exactly the
+    // breadth the authority rule refuses, and no shell needs it to run a job.
+    if raw == -1 {
+        return (REPLY_VALUE, Answer::error(memory::errno::ESRCH));
+    }
+    if signal != 0 && signal != SIGKILL && signal != SIGTERM {
+        return (REPLY_VALUE, Answer::error(memory::errno::ENOSYS));
+    }
+
+    // A negative pid names a process group. Gathered before anything is ended,
+    // because ending one changes the table this is walking.
+    let mut targets = [0u32; bhaskix_personality::process::MAX_PROCESSES];
+    let mut count = 0;
+    {
+        // SAFETY: single-threaded by construction, as elsewhere here.
+        let processes = processes();
+        if raw < 0 {
+            let group = raw.unsigned_abs() as u32;
+            let mut members = [0u32; bhaskix_personality::process::MAX_PROCESSES];
+            let found = processes.group_members(group, &mut members);
+            // **Filtered by the rule, not trusted to be the caller's own
+            // group.** A negative pid is usually the caller's group and this
+            // does not assume it: a member the rule refuses is skipped rather
+            // than refusing the whole call, because a group signal that killed
+            // nothing it may kill should still reach what it may.
+            for member in &members[..found] {
+                if processes.may_signal(caller, *member) && count < targets.len() {
+                    targets[count] = *member;
+                    count += 1;
+                }
+            }
+        } else {
+            let target = raw as u32;
+            if !processes.may_signal(caller, target) {
+                return (REPLY_VALUE, Answer::error(memory::errno::ESRCH));
+            }
+            targets[0] = target;
+            count = 1;
+        }
+    }
+    if count == 0 {
+        return (REPLY_VALUE, Answer::error(memory::errno::ESRCH));
+    }
+    // The probe: permission was checked above and nothing is delivered.
+    if signal == 0 {
+        return (REPLY_VALUE, Answer::ok(0));
+    }
+
+    let (mut ended, mut refused, mut itself) = (0, 0, false);
+    for target in &targets[..count] {
+        // **The caller is left until last**, because ending it is the one thing
+        // this loop cannot do and then carry on: a `kill(-pgid, SIGKILL)` sent
+        // by a member of that group ends every member, and stopping at the
+        // sender would leave the rest of its group running.
+        if *target == caller {
+            itself = true;
+            continue;
+        }
+        // SAFETY: single-threaded by construction, as elsewhere here; the
+        // values are copied out because `note_exit` walks the same table.
+        let processes = processes();
+        let Some((slot, domain)) = processes
+            .by_pid(*target)
+            .map(|process| (process.domain_slot, process.domain))
+        else {
+            continue;
+        };
+        // **A process this program did not fork, it cannot end.** The capability
+        // is kept at `fork`; a process the kernel started has none, and no
+        // amount of permission conjures one. Counted rather than returned on, so
+        // one unkillable member of a group does not stop the rest.
+        if slot == 0 {
+            refused += 1;
+            continue;
+        }
+        if call(syscall::INVOKE, slot, method::END, [0; 4]).status != status::OK {
+            continue;
+        }
+        // **Recorded after the domain is gone, not before.** `END`'s contract
+        // is that the revocation completes before it returns — `security.md`
+        // §2 rule 3 — so a parent woken by this cannot then find the child
+        // still running. `note_exit` gives the slot back, releases the sockets
+        // and wakes whoever is in `wait4`.
+        note_exit(
+            domain,
+            Exit::Signalled {
+                signal: signal as u8,
+                core: false,
+            },
+        );
+        ended += 1;
+    }
+
+    // **The caller's own death is the one this program cannot carry out.**
+    // Ending the domain a call arrived from would destroy the address space the
+    // reply is going back to, which is why the nucleus refuses `END` on a
+    // capability naming the caller's own domain. `REPLY_END_DOMAIN` is how that
+    // is said instead, and `exit_group` beside it says it the same way.
+    if itself {
+        note_exit(
+            request.domain,
+            Exit::Signalled {
+                signal: signal as u8,
+                core: false,
+            },
+        );
+        return (REPLY_END_DOMAIN, Answer::ok(0));
+    }
+    if ended == 0 {
+        // `EPERM` when something was found and could not be ended, `ESRCH` when
+        // nothing was found at all — the second must not become the first, or a
+        // caller learns that a process it may not touch is there.
+        return (
+            REPLY_VALUE,
+            Answer::error(if refused > 0 {
+                bhaskix_personality::process::errno::EPERM
+            } else {
+                memory::errno::ESRCH
+            }),
+        );
+    }
+    (REPLY_VALUE, Answer::ok(0))
+}
+
 /// Maps `pages` lazily at `address` in a hosted domain.
 ///
 /// Lazily, because a hosted `mmap` is a *reservation*: a runtime that asks for
@@ -1141,6 +1300,10 @@ fn answer(request: &PersonalityCall) -> (u64, Answer) {
         CLOCK_NANOSLEEP => return answer_nanosleep(request),
         NANOSLEEP => return answer_nanosleep_relative(request, request.first()),
         TGKILL => return answer_tgkill(request),
+        // **In this dispatcher and not the one below**, for the reason
+        // `exit_group` is: a caller may name itself, and only this one can
+        // answer `REPLY_END_DOMAIN`.
+        KILL => return answer_kill(request),
         // `wait4(pid, status, options, rusage)`.
         WAIT4 => return answer_wait(request),
         _ => {}
@@ -2492,6 +2655,9 @@ const ACCESS: u64 = 21;
 const WRITEV: u64 = 20;
 /// `tgkill(tgid, tid, signal)` — how a libc raises a signal at itself.
 const TGKILL: u64 = 234;
+/// `kill(pid, signal)` — RFC 0079, and the first signal a process may send
+/// somebody other than itself.
+const KILL: u64 = 62;
 /// `getcwd(buffer, size)`.
 const GETCWD: u64 = 79;
 /// How much address space a `brk` heap is reserved, lazily.

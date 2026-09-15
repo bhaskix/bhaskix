@@ -51,6 +51,13 @@ pub mod errno {
     pub const ENOSYS: i64 = -38;
     /// Permission denied.
     pub const EACCES: i64 = -13;
+    /// No such process.
+    ///
+    /// **The answer for a process the caller may not signal, as well as for
+    /// one that does not exist** — RFC 0079. `EPERM` would tell a caller that
+    /// a process it may not touch is there, and `kill(pid, 0)` is the usual
+    /// way that is discovered.
+    pub const ESRCH: i64 = -3;
 }
 
 /// What the personality should do with an `mmap` request.

@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | 🔨 **Draft — steps 1 and 2's prerequisite built 2026-09-15; the syscall itself is next.** `may_signal` is in `bhaskix-personality` with three armed tests. The block is gone: [RFC 0080](0080-ending-a-domain-that-is-still-running.md) gave the nucleus `END`, and the adapter now **keeps a domain capability per forked process and gives it back**, gated both ways. What is left is `kill(2)` calling the two. See *What retaining a capability actually took*. |
+| **Status** | ✅ **ACCEPTED 2026-09-15 — built and gated, with one case named below that is not tested rather than glossed.** A hosted process ends a child with `SIGTERM` and another with `SIGKILL` while that one is asleep inside the adapter, `wait4` reports the signal rather than an exit, and the process can reach no pid outside its own tree — asserted against a bystander that is really there and keeps its own child through it. |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | libc (`bin/linuxd`) |
 | **Milestone** | Phase 2 — Linux personality (L1) |
@@ -212,17 +212,52 @@ containment test that passes on absence tests nothing.
 A pid lookup in the process table on a path that is not hot, and a domain
 ending that already exists. Nothing to measure.
 
+## What building the syscall found
+
+**A hosted process that maps `0x30000000` cannot fork**, and nothing said so.
+`bin/linuxd` places a fork's trampoline at `FORK_TRAMPOLINE_AT` — that address,
+fixed — so `map_at_eager` cannot place it if the caller is already there, and
+`fork` answers `ENOMEM` for a reason no caller can act on. Found because this
+RFC's probe picked the same address for its own page and read `ENOMEM` for
+three boots. Recorded here rather than fixed: the fix is for the trampoline to
+be placed where the caller is not, which is RFC 0033's `fork` to change and
+wants its own measurement of where a hosted address space is free.
+
+**Killing a process that is asleep *inside the adapter* is the case worth
+gating, and it is not the one a spinning child tests.** RFC 0080 bounds a
+thread that makes no system call: it is caught at the next tick. A thread
+parked in a call is the other half, and it is the half a `^C` at a shell meets.
+The gate's `SIGKILL` target is a child parked in `nanosleep` for a thousand
+seconds; the `SIGTERM` target spins. Both end, and the adapter keeps serving
+every other hosted process afterwards, which is the part that would fail if a
+reply to a destroyed thread blocked its single thread.
+
+**A report word that is zero cannot say whether it was written.** The probe
+carries a step counter for that reason: three separate diagnoses here turned on
+telling *"the call answered zero"* from *"the call was never reached"*, and the
+same confusion cost a day one file up, where the kernel's truncated reader made
+`0 at the peak` mean both.
+
 ## Testing plan
 
-1. A hosted probe forks a child, kills it with `SIGTERM`, and `wait4` reports
-   `Signalled` with the right number. Armed by dropping the signal.
-2. The same with `SIGKILL`.
-3. **Containment, and it is the gate that matters**: a hosted process attempts
-   `kill` on a pid outside its tree — the pid of another probe — and must get
-   `ESRCH`, with the target still alive afterwards. Armed by removing the tree
-   check, which must turn it red and leave the target dead.
-4. `kill(pid, 0)` answers `OK` for a pid in the tree and `ESRCH` for one
-   outside, changing nothing either way.
+1. ~~A hosted probe forks a child, kills it with `SIGTERM`, and `wait4` reports
+   `Signalled` with the right number.~~ **Done.** The gate reads the status
+   word — `15`, and `9` for the second — because a `kill` that recorded an exit
+   while the target kept running would answer `OK` just the same.
+2. ~~The same with `SIGKILL`.~~ **Done**, and against a child **asleep inside
+   the adapter** rather than spinning, which is the harder of the two cases.
+3. ~~**Containment, and it is the gate that matters**~~ **Done, and it needed a
+   bystander before it meant anything.** Every other hosted process alive while
+   the probe runs is the probe or one of its children, so "every stranger
+   refused" would have been a claim about an empty set. A bystander runs in
+   nobody's tree, holding a forked child of its own that a `kill` from outside
+   *could* really end. The probe reaches exactly one pid of forty with
+   `kill(pid, 0)` — itself — and `SIGKILL` at the other thirty-nine ends none.
+   Armed by removing the tree check: `reached 40 of 40 pids`, six strangers
+   answered, and the bystander could no longer finish.
+4. ~~`kill(pid, 0)` answers `OK` for a pid in the tree and `ESRCH` for one
+   outside, changing nothing either way.~~ **Done**, and it is how the sweep
+   above is counted.
 5. ~~Host tests in `bhaskix-personality` for the rule itself — caller,
    descendant, group member, stranger — armed one at a time.~~ **Done.**
 6. ~~A capability is kept while a hosted process lives and given back after.~~
@@ -241,7 +276,17 @@ ending that already exists. Nothing to measure.
    become general. Separate RFC.
 2. **`SIGSTOP`/`SIGCONT`.** A shell's job control wants them; a domain has no
    stopped state today, so they would be invented rather than translated.
-3. **Whether a descendant's descendant counts.** The rule says "descendant",
+3. **A process killed by somebody other than its parent, and what the parent's
+   `wait4` then does.** The rule permits it — a process may signal any member of
+   its own group, which a sibling is — and **nothing tests it**. What is known
+   is one observation from arming the containment gate, where the tree check was
+   off and the killer ended a bystander's child: the bystander's
+   `wait4(child, WNOHANG)` did not return. That was a deliberately broken
+   adapter killing six processes at once, so it is a hint rather than a finding,
+   and it is written down rather than left out because the in-tree case it
+   points at is reachable and untested. Testing it wants three hosted processes
+   with real code, which this probe's hand-assembly cannot carry.
+4. **Whether a descendant's descendant counts.** The rule says "descendant",
    and the record has `ppid`, so the walk is upward and bounded by the tree's
    depth. Proposed: yes, and bounded by a depth limit so a cycle — which the
    record should make impossible and which nothing currently asserts — cannot
@@ -256,9 +301,13 @@ ending that already exists. Nothing to measure.
    back.~~ **Done 2026-09-15** — see *What retaining a capability actually
    took*. One boot gate, both halves armed: forcing the derive to fail reads
    `peak 0`, and removing the releases reads `2 held, peak 2`.
-3. `kill(2)` in `bin/linuxd`, calling `may_signal` and then `method::END` on the
-   kept capability, for `SIGKILL`, `SIGTERM` and `0`.
-4. The probe and the three boot gates, each watched red.
+3. ~~`kill(2)` in `bin/linuxd`, calling `may_signal` and then `method::END` on
+   the kept capability, for `SIGKILL`, `SIGTERM` and `0`.~~ **Done 2026-09-15**,
+   with `kill(-pgid, sig)` over the group and `kill(-1, sig)` refused.
+4. ~~The probe and the three boot gates, each watched red.~~ **Done** — two
+   gates, both armed: removing the tree check reads `reached 40 of 40 pids` and
+   leaves the bystander unable to finish, and the signal half reads the status
+   word rather than `kill`'s return.
 5. ~~`security.md` T11~~ **done 2026-09-15** — the note prices the widening at
    "a compromised adapter can end every hosted process". `roadmap.md` L1 and
    `TRACKER.md` §7 when the syscall lands.
