@@ -28748,16 +28748,32 @@ fn wait_queue_self_test(hhdm_base: u64) -> bool {
             // from the recorded attempts rather than inferred by elimination,
             // which is what `run-1007` left this report doing.
             let (mut woken, mut missed, mut busy) = (0u32, 0u32, 0u32);
-            sched::for_each_wake_attempt(spawned[id], |outcome| match outcome {
-                0 => woken += 1,
+            // **The order of the last wake and the last mark, which is the
+            // question the counters cannot answer.** A station that is
+            // `asleep` with its queue entry gone and no wake reported missing
+            // was either re-blocked after being woken, or never woken at all,
+            // and those want different bugs found. `WAKE_LOG` and `BLOCK_LOG`
+            // share one sequence so the two can be compared.
+            let (mut last_wake, mut last_mark, mut mark_source) = (0u64, 0u64, 0u64);
+            sched::for_each_wake_attempt(spawned[id], |outcome, order| match outcome {
+                0 => {
+                    woken += 1;
+                    last_wake = last_wake.max(order);
+                }
                 2 => busy += 1,
                 _ => missed += 1,
             });
+            let mark = sched::last_block_mark(spawned[id]);
+            if let Some((source, order)) = mark {
+                last_mark = order;
+                mark_source = source;
+            }
             let seen_phase = SEEN_PHASE[id].load(Ordering::Relaxed);
             println!(
                 "\x1b[91m                   {name} (thread {}) {state}, {} laps, last saw token \
                  {} at phase {}, {} predicate evaluations; recent wakes: {woken} landed, {missed} \
-                 not found, {busy} contended, {} migration(s)\x1b[0m",
+                 not found, {busy} contended, {} migration(s); last wake #{last_wake}, last mark \
+                 #{last_mark} by {}\x1b[0m",
                 spawned[id],
                 LAPS[id].load(Ordering::Relaxed),
                 if seen == u64::MAX { -1 } else { seen as i64 },
@@ -28767,6 +28783,16 @@ fn wait_queue_self_test(hhdm_base: u64) -> bool {
                     seen_phase as i64
                 },
                 PREDICATE_EVALS[id].load(Ordering::Relaxed),
+                // **What the two order numbers decide, written before the
+                // numbers existed so a specimen cannot be read to taste.** A
+                // mark *after* the wake means it was re-blocked once awake,
+                // and the source names the path that did it. A wake after the
+                // mark means it was left runnable and something else is
+                // reading `asleep`. No mark at all means the `Blocked` it ends
+                // in is the one it entered before the retire -- so the wake
+                // that cleared its queue entry never reached the thread it
+                // named, and `wake_with` reported `Woken` for a thread it did
+                // not leave runnable.
                 // **Whether this station ever moved between queues.**
                 //
                 // Two specimens name the stuck station as the caller whose
@@ -28779,7 +28805,26 @@ fn wait_queue_self_test(hhdm_base: u64) -> bool {
                 // another instrument being added first. `-1` means the thread
                 // is no longer in any queue, which is what a retired station
                 // looks like.
-                sched::migrations_of(spawned[id]).map_or(-1, |count| count as i64)
+                sched::migrations_of(spawned[id]).map_or(-1, |count| count as i64),
+                // **What the two order numbers decide, written before the
+                // numbers existed so a specimen cannot be read to taste.** A
+                // mark *after* the wake means the station was re-blocked once
+                // awake, and this names the path that did it. A wake after the
+                // mark means it was left runnable and something else is
+                // reading `asleep`. No mark at all means the `Blocked` it ends
+                // in is the one it entered before the retire -- so the wake
+                // that cleared its queue entry never reached the thread it
+                // named, and `wake_with` reported `Woken` for a thread it did
+                // not leave runnable.
+                match (mark, mark_source) {
+                    // **Not the same as "no mark".** `last_block_mark` answers
+                    // `None` both when nothing was recorded and when the slot
+                    // holds another thread, and neither supports a claim about
+                    // this one.
+                    (None, _) => "nothing recorded",
+                    (Some(_), 0) => "itself",
+                    (Some(_), _) => "a completed mark",
+                }
             );
         }
         println!(

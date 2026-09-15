@@ -3942,6 +3942,7 @@ pub fn mark_blocked(id: u32) {
     }
     if !thread.dying {
         thread.state = State::Blocked;
+        note_block(id, 0);
     }
 }
 
@@ -3956,6 +3957,7 @@ fn mark_blocked_anywhere(thread: u32) {
         if let Some(found) = queue.threads.iter_mut().flatten().find(|t| t.id == thread) {
             if !found.dying {
                 found.state = State::Blocked;
+                note_block(thread, 1);
             }
             MARKED_ELSEWHERE.fetch_add(1, Ordering::Relaxed);
             return;
@@ -4613,6 +4615,68 @@ static DEFERRED_WAKES: [core::sync::atomic::AtomicU32; MAX_CPUS * MAX_THREADS_PE
     [const { core::sync::atomic::AtomicU32::new(NO_THREAD) }; MAX_CPUS * MAX_THREADS_PER_CPU];
 static DEFERRED_LOST: AtomicU64 = AtomicU64::new(0);
 
+/// Orders the two logs below against each other.
+///
+/// **`WAKE_LOG` records what happened to a sleeper and nothing records when.**
+/// That was enough while the question was *did the wake land*; it is not
+/// enough now the question is *which came last*. `run-1007` and the specimens
+/// after it leave a station `Ready` by one record and `Blocked` by another,
+/// and only an order can say whether it was re-blocked after being woken or
+/// never woken at all.
+static EVENT_SEQ: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// The next order number, for either log.
+fn next_event() -> u64 {
+    EVENT_SEQ.fetch_add(1, Ordering::Relaxed) & 0xff_ffff
+}
+
+/// The last mark that put each thread `Blocked`: which path, and when.
+///
+/// The other half of [`WAKE_LOG`]. `source` is 0 for a thread marking itself
+/// through `mark_blocked` and 1 for `mark_blocked_anywhere` completing a
+/// refused mark, so a specimen can say not only that a block came after a wake
+/// but which code path delivered it.
+///
+/// # Why this is keyed by thread and [`WAKE_LOG`] is a ring
+///
+/// **A shared ring cannot answer the question this was built for.** The first
+/// version was thirty-two slots like `WAKE_LOG`, and a mark happens every time
+/// any thread blocks -- thousands a boot. The stuck station's last mark would
+/// be wrapped out long before the report read it, and the report would say *no
+/// mark at all*, which the decision rule in `TRACKER.md` reads as "the wake
+/// never reached the thread it named". That is the wrong conclusion drawn
+/// confidently from an instrument that had merely forgotten, which is the
+/// failure this tree spent two days removing from other gates.
+///
+/// Keyed by `id % LEN` with the full id stored beside the entry, so a reader
+/// that finds a different id there reports **unknown** rather than another
+/// thread's mark. It can say "I do not know"; it cannot say something false.
+static LAST_MARK: [core::sync::atomic::AtomicU64; 256] =
+    [const { core::sync::atomic::AtomicU64::new(u64::MAX) }; 256];
+
+/// Records one mark. `source`: 0 marked itself, 1 completed elsewhere.
+fn note_block(id: u32, source: u64) {
+    let slot = id as usize % LAST_MARK.len();
+    LAST_MARK[slot].store(
+        u64::from(id) | (source << 32) | (next_event() << 40),
+        Ordering::Relaxed,
+    );
+}
+
+/// The last mark recorded for `thread`, as `(source, order)`.
+///
+/// `None` when nothing was recorded *or* when the slot holds another thread --
+/// the two are deliberately the same answer, because neither supports a claim
+/// about this thread.
+#[must_use]
+pub fn last_block_mark(thread: u32) -> Option<(u64, u64)> {
+    let packed = LAST_MARK[thread as usize % LAST_MARK.len()].load(Ordering::Relaxed);
+    if packed == u64::MAX || u32::try_from(packed & 0xffff_ffff).ok()? != thread {
+        return None;
+    }
+    Some(((packed >> 32) & 0xff, packed >> 40))
+}
+
 /// The last wake attempts made on this machine: which thread, and what came of
 /// it.
 ///
@@ -4635,7 +4699,10 @@ static WAKE_LOG_NEXT: core::sync::atomic::AtomicU64 = core::sync::atomic::Atomic
 /// Records one wake attempt. `outcome`: 0 woken, 1 not found, 2 contended.
 fn note_wake(id: u32, outcome: u64) {
     let slot = WAKE_LOG_NEXT.fetch_add(1, Ordering::Relaxed) as usize % WAKE_LOG.len();
-    WAKE_LOG[slot].store(u64::from(id) | (outcome << 32), Ordering::Relaxed);
+    WAKE_LOG[slot].store(
+        u64::from(id) | (outcome << 32) | (next_event() << 40),
+        Ordering::Relaxed,
+    );
 }
 
 /// Walks the recorded wake attempts for one thread, oldest slot first, as
@@ -4644,14 +4711,14 @@ fn note_wake(id: u32, outcome: u64) {
 /// Reading by thread rather than dumping all thirty-two: the question is always
 /// "what happened to *this* sleeper", and a report that prints every wake on the
 /// machine is one nobody reads.
-pub fn for_each_wake_attempt(thread: u32, mut f: impl FnMut(u64)) {
+pub fn for_each_wake_attempt(thread: u32, mut f: impl FnMut(u64, u64)) {
     for slot in &WAKE_LOG {
         let packed = slot.load(Ordering::Relaxed);
         if packed == u64::MAX {
             continue;
         }
         if u32::try_from(packed & 0xffff_ffff).unwrap_or(u32::MAX) == thread {
-            f(packed >> 32);
+            f((packed >> 32) & 0xff, packed >> 40);
         }
     }
 }
