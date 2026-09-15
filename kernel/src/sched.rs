@@ -5160,18 +5160,31 @@ pub fn threads_in_domain(domain: u32) -> usize {
 /// It is safe to ignore a dying thread of the domain *itself*, rather than of
 /// its predecessor, because `domain::record_pending_start` refuses a domain
 /// that is not live and a domain whose threads are dying is on its way there.
+///
+/// # Why this blocks for each queue
+///
+/// **It asks once and decides, which is the caller [`threads_in_domain_exact`]
+/// exists for.** That function's own note draws the line: `threads_in_domain`
+/// counts a queue it cannot take as *empty*, tolerable *"because every caller
+/// polls in a loop, so a blinded pass is corrected by the next"* — and a caller
+/// that asks once and acts on the answer is not that caller.
+///
+/// `START` is one. A blinded scan reads as "no threads" and lets a program be
+/// started in a domain that already has one, which is two programs sharing an
+/// address space. `Domain::set_personality` had exactly this defect, measured
+/// on 2026-08-26 at about **one attempt in twenty** and retryable, so a caller
+/// in a loop defeated the rule at will; it was moved to the blocking scan for
+/// that reason and this is the same move for the same reason.
+///
+/// **Lock order**: this is called from `start_program` holding no domain-table
+/// lock — the `domain::with` that resolved the capability has returned — so it
+/// takes `Rank::SchedRunqueue` alone, which is sound from anywhere.
 #[must_use]
 pub fn live_threads_in_domain(domain: u32) -> usize {
     let online = percpu::online_count() as usize;
     let mut total = 0;
     for queue in QUEUES.iter().take(online.min(MAX_CPUS)) {
-        // As [`threads_in_domain`]: a queue this cannot take reads as empty,
-        // which under-counts. That is the safe direction for a refusal —
-        // refusing wrongly is the failure this function exists to remove.
-        let Some(queue) = queue.try_lock() else {
-            DOMAIN_SCAN_SKIPS.fetch_add(1, Ordering::Relaxed);
-            continue;
-        };
+        let queue = queue.lock();
         total += queue
             .threads
             .iter()

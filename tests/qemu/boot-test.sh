@@ -1909,7 +1909,7 @@ fi
 # domain" arm was aimed at the console, whose object id names no live domain,
 # so deleting the kind check entirely left the gate green; it is aimed at
 # `DomainControl` now, whose id is zero, and domain zero is real.
-if grep -qE "sup: supervised a running child -- mapped a page into it, wrote a word across, read it back, and was refused an unmapped address, a domain it does not hold, an oversized copy, a capability that is not a domain, a protection that does not exist, and a thread that is not its own" "$LOG"; then
+if grep -qE "sup: supervised a running child -- mapped a page into it, wrote a word across, read it back, and was refused an unmapped address, a domain it does not hold, an oversized copy, a capability that is not a domain, a protection that does not exist, a thread that is not its own, and a second program in a domain that already has one" "$LOG"; then
     pass "a supervisor reached into a child it holds, and was refused everything it should be"
 else
     fail "the supervisor interface did not hold"

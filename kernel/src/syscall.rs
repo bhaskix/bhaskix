@@ -4239,6 +4239,12 @@ fn start_program(frame: &SyscallFrame) -> Outcome {
     // check never fired. Found while building step 6, which needed the same
     // question answered properly.
     //
+    // **Blocking for each queue, not skipping one it cannot take.** This asks
+    // once and decides, and `threads_in_domain` counts a queue it could not
+    // lock as empty — so a contended scan here would read "no threads" and let
+    // a program start in a domain that already has one. `set_personality` had
+    // that defect, measured at about one attempt in twenty and retryable.
+    //
     // **And dying threads do not count**, which is the difference between
     // asking *does this slot hold a thread* and *may I start a program in this
     // domain*. A domain slot is reused before the last thread of its previous

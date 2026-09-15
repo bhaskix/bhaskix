@@ -473,7 +473,7 @@ fn supervise(image_bytes: u64) -> bool {
         return false;
     }
 
-    let held = supervise_child();
+    let held = supervise_child(image_bytes);
 
     // The child ends by itself -- that is what mode 8 is for -- so this waits
     // rather than killing, and reaps when it has. A supervisor cannot kill a
@@ -501,7 +501,12 @@ fn supervise(image_bytes: u64) -> bool {
 const TLS_BASE: u64 = 0x0000_7000_0000_0000;
 
 /// The methods, against a child that is running.
-fn supervise_child() -> bool {
+///
+/// `image_bytes` is here for one refusal: a second `START` on the running child
+/// must be refused, and `START` checks the image length *before* it checks
+/// whether the domain already has a thread — so a zero length would be turned
+/// away by the wrong rule and prove nothing.
+fn supervise_child(image_bytes: u64) -> bool {
     if !attach_scratch() {
         write(b"sup: could not map its own scratch page\n");
         return false;
@@ -643,12 +648,29 @@ fn supervise_child() -> bool {
     // is refused by the ownership check or not at all, which is why it is
     // aimed at a thread that is certainly there.
     let (not_its_thread, _) = call(syscall::INVOKE, CHILD, method::SET_TLS, [1, TLS_BASE, 0, 0]);
+    // **A domain that already has a program does not get a second one.** The
+    // child started above is running, so this is the rule being asked while it
+    // is true rather than in the abstract: two programs started in one domain
+    // would share an address space, which is the isolation the domain *is*.
+    //
+    // It had no gate at all until 2026-09-15, and the nucleus checks it by
+    // counting the domain's threads — a count that read a run queue it could
+    // not lock as *empty* until the same day, so a contended attempt could
+    // have been let through. `Domain::set_personality` had that exact defect
+    // and it was measured at about one attempt in twenty.
+    let (started_twice, _) = call(
+        syscall::INVOKE,
+        CHILD,
+        method::START,
+        [IMAGE, image_bytes, SAY_AND_EXIT, 0],
+    );
     let refused = unmapped_read != status::OK
         && not_held != status::OK
         && too_long != status::OK
         && not_a_domain == status::NO_SUCH_METHOD
         && no_such_protection != status::OK
-        && not_its_thread == status::NO_SUCH_CAPABILITY;
+        && not_its_thread == status::NO_SUCH_CAPABILITY
+        && started_twice == status::SLOT_UNAVAILABLE;
     if !refused {
         // **Which one, and what it answered.** A line saying only that
         // something was allowed sends the next reader back to the source to
@@ -666,6 +688,11 @@ fn supervise_child() -> bool {
         write_number(status::NO_SUCH_METHOD);
         write(b"), protection ");
         write_number(no_such_protection);
+        write(b", started-twice ");
+        write_number(started_twice);
+        write(b" (wanted ");
+        write_number(status::SLOT_UNAVAILABLE);
+        write(b")");
         write(b", not-its-thread ");
         write_number(not_its_thread);
         write(b" (wanted ");
@@ -690,7 +717,8 @@ fn supervise_child() -> bool {
         b"sup: supervised a running child -- mapped a page into it, wrote a word across, \
 read it back, and was refused an unmapped address, a domain it \
 does not hold, an oversized copy, a capability that is not a domain, a protection that \
-does not exist, and a thread that is not its own\n",
+does not exist, a thread that is not its own, and a second program in a domain that \
+already has one\n",
     );
     true
 }

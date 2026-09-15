@@ -998,6 +998,41 @@ the distinction is in the table rather than in somebody's head.
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-09-15 (and a second program could be started in a domain that had one)
+
+**The other half of the same check, found by reading what it was asking.**
+`start_program` refuses a domain that already has threads — two programs in one
+domain share an address space, which is the isolation a domain *is* — and it
+counted those threads with `sched::threads_in_domain`, which takes each run
+queue with `try_lock` and **counts one it cannot take as empty**.
+
+That counter's own note draws the line this crossed: skipping is tolerable
+*"because every caller polls in a loop, so a blinded pass is corrected by the
+next"*, and **a caller that asks once and decides is not that caller**. `START`
+asks once. A contended scan there reads "no threads" and lets the second
+program through. `Domain::set_personality` had exactly this defect, measured on
+2026-08-26 at about **one attempt in twenty** and retryable, and was moved to
+the blocking scan for it; this is the same move for the same reason, with the
+dying-thread exclusion added the same day.
+
+**Lock order checked rather than asserted**: `start_program` holds no
+domain-table lock at that point — the `domain::with` that resolved the
+capability has returned — so it takes `Rank::SchedRunqueue` alone. The boot
+reports `lock order clean through bring-up too (188557 acquisitions checked)`,
+0 violations.
+
+**And the rule had no gate at all.** `bin/sup` asserted six refusals against a
+running child; starting it a second time was not among them. It is the seventh
+now, asked while the child is genuinely running rather than in the abstract.
+Armed by removing the check: `started-twice 0 (wanted 11)` — which is the
+failure message naming *which* refusal failed and what it answered, a shape
+that paid for itself immediately.
+
+**What is not claimed**: that the gate arms the *contention*. It asks once,
+uncontended, and would pass against the skipping counter too. It gates the
+rule, which nothing did; the exactness rests on the documented precedent and
+the lock-order gate above.
+
 ### 2026-09-15 (a program could not start in a domain that was empty)
 
 **`START` refused a fresh, empty domain because the slot's *last* occupant
