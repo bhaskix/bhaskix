@@ -3256,6 +3256,43 @@ else
     status=1
 fi
 
+# **A hosted process's domain capability is kept, and it is given back** — RFC
+# 0079 step 2. The adapter keeps a capability naming each forked process's
+# domain, because without one it cannot end a process and a `kill(2)` written
+# against it would record an exit and wake the parent's `wait4` while the
+# target kept running.
+#
+# Two halves, and neither proves the other. `at the peak` non-zero says a
+# capability was really derived and held while a process lived -- `0 of 32 kept
+# now` on its own cannot tell "released properly" from "never kept", which is
+# how this was first read while the kernel was silently truncating the record
+# to six words and the number was always zero. `kept now` back at zero says
+# every one was given back.
+if grep -qE "adapter domains [0-9]+ of [0-9]+ kept now, [0-9]+ at the peak" "$LOG"; then
+    domains_line=$(grep -oE "adapter domains [0-9]+ of [0-9]+ kept now, [0-9]+ at the peak" "$LOG" | head -1)
+    domains_now=$(echo "$domains_line" | sed -E 's/adapter domains ([0-9]+) of.*/\1/')
+    domains_peak=$(echo "$domains_line" | sed -E 's/.*, ([0-9]+) at the peak/\1/')
+    if [ "$domains_peak" -eq 0 ]; then
+        fail "the adapter kept no domain capability for any hosted process, so it could not end one (peak $domains_peak)"
+        status=1
+    elif [ "$domains_now" -ne 0 ]; then
+        fail "the adapter's domain slots never came back: $domains_now held, peak $domains_peak"
+        status=1
+    else
+        pass "a hosted process's domain capability was kept while it lived and given back after (peak $domains_peak, now $domains_now)"
+    fi
+elif grep -qF "hosted exec    skipped" "$LOG"; then
+    # **The same escape as the file gate above, and for the same reason**: the
+    # whole process-record block is printed only where there is a filesystem
+    # service to exec from, so on a machine without one these numbers are not
+    # absent -- they are unasked. The fork itself still happens here and the
+    # capability is still kept; nothing reports it, so nothing can assert it.
+    pass "no filesystem service on this machine, so the adapter's record was never read"
+else
+    fail "the boot report did not say how many adapter domain slots were held"
+    status=1
+fi
+
 # **No syscall may answer what its own contract forbids.**
 #
 # `mmap` answers a mapping or a negative errno; `bind` answers zero or one. Two

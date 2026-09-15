@@ -67,6 +67,13 @@ pub mod errno {
 /// `EAGAIN`, which is what Linux answers a `fork` it cannot serve.
 pub const MAX_PROCESSES: usize = 32;
 
+// **The adapter keeps one domain capability per process** — RFC 0079 — and the
+// slots for them are declared in the ABI as `adapter::DOMAIN_COUNT`. This
+// crate does not depend on the ABI and mirrors its constants by hand, as
+// `socket.rs` does; the kernel sees both and asserts they agree, so a change
+// to either is a build failure rather than a process admitted with nowhere to
+// keep the capability that can end it.
+
 /// The first pid this personality hands out.
 ///
 /// **Not 1, and not zero.** Zero is `wait`'s "any process in my group" and a
@@ -113,6 +120,16 @@ pub struct Process {
     pub sid: u32,
     /// The Bhaskix domain this process *is*.
     pub domain: u32,
+    /// The adapter slot holding a capability to that domain, or zero — RFC
+    /// 0079.
+    ///
+    /// **Kept for one reason: so the process can be ended.** Before RFC 0079
+    /// the adapter deleted each child's domain capability as soon as the child
+    /// was built, so it named no running hosted process and could not have
+    /// stopped one. Zero means none was kept, which a caller must treat as
+    /// "cannot be signalled" rather than as slot zero — that slot is the
+    /// console.
+    pub domain_slot: u64,
     /// That domain's generation when it was bound.
     ///
     /// **A domain id is reused.** Without the generation, a record outliving
@@ -236,6 +253,8 @@ impl Process {
         Self {
             pid,
             ppid,
+            // Filled in by whoever kept the capability, if anyone did.
+            domain_slot: 0,
             // Its own group and session until something says otherwise,
             // which is what a process started by nobody in particular is.
             pgid: pid,
@@ -396,6 +415,12 @@ impl Process {
         Self {
             pid,
             ppid: self.pid,
+            // **Not inherited.** The parent's slot holds a capability to the
+            // *parent's* domain; the child's is a different domain and its
+            // slot is filled in by whoever kept a capability to it. Copying
+            // this would give a child the power to end its parent, and the
+            // authority rule in `may_signal` says descendants only.
+            domain_slot: 0,
             pgid: self.pgid,
             sid: self.sid,
             // **The child inherits the parent's layout, deliberately.** `fork`

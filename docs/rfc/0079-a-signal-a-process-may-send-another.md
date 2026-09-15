@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | 🔨 **Draft — step 1 built 2026-09-15; step 2 blocked on a decision this RFC has to make.** `may_signal` is in `bhaskix-personality` with three armed tests. The syscall cannot follow until **the nucleus grows a way to end a live domain**, which no ring-3 method does today — retaining a capability was chosen and is necessary without being sufficient. See *Security implications*. |
+| **Status** | 🔨 **Draft — steps 1 and 2's prerequisite built 2026-09-15; the syscall itself is next.** `may_signal` is in `bhaskix-personality` with three armed tests. The block is gone: [RFC 0080](0080-ending-a-domain-that-is-still-running.md) gave the nucleus `END`, and the adapter now **keeps a domain capability per forked process and gives it back**, gated both ways. What is left is `kill(2)` calling the two. See *What retaining a capability actually took*. |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | libc (`bin/linuxd`) |
 | **Milestone** | Phase 2 — Linux personality (L1) |
@@ -151,6 +151,58 @@ compromised *adapter* can end hosted processes — which a compromise of the
 adapter arguably implies anyway, and which T11 should say out loud rather than
 leave to a reader.
 
+## What retaining a capability actually took
+
+Built 2026-09-15, and written here because three of the four things it took
+were not visible from the design.
+
+**A pool, allocated the other way from the files.** `adapter::DOMAIN_FLOOR` is
+`FILE_TOP + 1` and `DOMAIN_COUNT` is 32, allocated **upward** where the file
+slots are allocated downward from the top, so the two pools grow apart rather
+than into each other. 32 is `MAX_PROCESSES`, asserted in the nucleus beside the
+ABI assertions rather than left as two numbers that happen to match.
+
+**Derived, not moved, and the difference is the whole of it.** `answer_fork`
+builds the child in `adapter::CHILD`, which is one slot reused by the next
+fork. The capability that survives is a `DERIVE` of it carrying every right the
+parent holds — a derived capability may not gain what its parent lacks, and
+`rights` has no `ALL`, so they are named. `DELETE` on `CHILD` afterwards empties
+that slot and leaves the derived one alone; the cascading destruction is
+`REVOKE`, a different method.
+
+**A failed derive must give the slot back, and `filter` does not.** The first
+version read `claim_domain_slot().filter(|slot| derive_succeeded)`, which drops
+the `Some` and leaves the slot marked held with nothing in it — a fork whose
+derive failed would cost a slot for the rest of the boot. **Found by arming the
+gate rather than by review**: forcing the derive to fail printed `2 held, peak
+2` where it should have shown nothing kept. It is `and_then` with an explicit
+release now, and the peak is counted where a capability is really held rather
+than where a slot is reserved, so the arming reads `peak 0` as it should.
+
+**And a process can end without the adapter being told.** `note_exit` releases
+the slot for a process that calls `exit_group` or takes a fatal fault, and the
+`FORGET` message catches one killed from outside — but `FORGET` arrives when the
+domain slot is *reused*, which may be never. A hosted thread calling plain
+`exit(2)` reaches neither, and the fork probe's child does exactly that: the
+tail of `FORK_PROBE_CODE` is `mov eax, 60; syscall`. The adapter cannot answer
+that call by recording a process exit, because `clone` exists and the thread
+ending need not be the last one — recording an exit there would wake a parent's
+`wait4` for a process still running, which is the lie this RFC exists to refuse.
+
+**So it asks instead of being told.** The kept capability names the domain, and
+`INFO` on a domain answers `0` while it lives and its `Ending` afterwards, so
+`reclaim_domain_slots` sweeps every held slot and releases the ones whose
+process has gone. It runs before each claim, which means no fork can ever fail
+for want of a slot belonging to a process that has ended. A slot is therefore
+returned **at once** for a process that exits the ways the adapter sees, and **by
+the next fork** otherwise — the same shape of bound RFC 0058 states for sockets,
+and stated here rather than rounded to "released".
+
+**Cost**: one `unsafe` line, the accessor for the slot table, taking
+`bin/linuxd`'s exact budget from 117 to 118. The capabilities themselves cost
+none — they are derived, held and deleted through invocations, and nothing is
+dereferenced.
+
 **Containment must be asserted, not assumed.** Two boot gates below assert a
 refusal rather than a permission, for the reason RFC 0060's write path does: a
 containment test that passes on absence tests nothing.
@@ -171,8 +223,14 @@ ending that already exists. Nothing to measure.
    check, which must turn it red and leave the target dead.
 4. `kill(pid, 0)` answers `OK` for a pid in the tree and `ESRCH` for one
    outside, changing nothing either way.
-5. Host tests in `bhaskix-personality` for the rule itself — caller,
-   descendant, group member, stranger — armed one at a time.
+5. ~~Host tests in `bhaskix-personality` for the rule itself — caller,
+   descendant, group member, stranger — armed one at a time.~~ **Done.**
+6. ~~A capability is kept while a hosted process lives and given back after.~~
+   **Done.** The boot report carries both numbers, because neither proves the
+   other: `0 of 32 kept now` alone cannot tell *released properly* from *never
+   kept*, which is how it was first read while the kernel's reader was
+   truncating the record to six words and the count was always zero whatever
+   the adapter wrote.
 
 ## Unresolved questions
 
@@ -191,8 +249,16 @@ ending that already exists. Nothing to measure.
 
 ## Implementation plan
 
-1. The rule, in `bhaskix-personality`, as a pure function over the process
-   table: `may_signal(caller, target) -> bool`. Host tests, armed.
-2. `kill(2)` in `bin/linuxd` using it, for `SIGKILL`, `SIGTERM` and `0`.
-3. The probe and the three boot gates, each watched red.
-4. `roadmap.md` L1, `security.md` T11, `TRACKER.md` §7.
+1. ~~The rule, in `bhaskix-personality`, as a pure function over the process
+   table: `may_signal(caller, target) -> bool`. Host tests, armed.~~ **Done
+   2026-09-15**, three tests, each armed.
+2. ~~The adapter retains a domain capability per hosted process, and gives it
+   back.~~ **Done 2026-09-15** — see *What retaining a capability actually
+   took*. One boot gate, both halves armed: forcing the derive to fail reads
+   `peak 0`, and removing the releases reads `2 held, peak 2`.
+3. `kill(2)` in `bin/linuxd`, calling `may_signal` and then `method::END` on the
+   kept capability, for `SIGKILL`, `SIGTERM` and `0`.
+4. The probe and the three boot gates, each watched red.
+5. ~~`security.md` T11~~ **done 2026-09-15** — the note prices the widening at
+   "a compromised adapter can end every hosted process". `roadmap.md` L1 and
+   `TRACKER.md` §7 when the syscall lands.

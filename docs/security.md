@@ -208,6 +208,32 @@ We will not pretend to cover these. Each has a note on whether it becomes in-sco
 > is RFC 0060's own unresolved question 1, said there as it is said here: a shared scratch directory
 > between mutually distrusting processes is a real weakness and not a simplification.
 
+> **[RFC 0079](rfc/0079-a-signal-a-process-may-send-another.md) added the power to *end* a hosted
+> process, on 2026-09-15, and it is the largest single widening in this list.** Everything above
+> reads, writes, waits or builds. This destroys: the adapter now keeps, for each process it forks,
+> a capability naming that process's domain, and [RFC 0080](rfc/0080-ending-a-domain-that-is-still-running.md)'s
+> `END` on such a capability ends a domain that is still running.
+>
+> So the price, stated as plainly as the rest: **a compromised `bin/linuxd` can end every hosted
+> process, at any moment, with no warning to any of them.** Before this it could refuse them
+> service, which a hosted process could at least observe; it could not stop one that was running.
+> A pool of thirty-two slots bounds how many it holds at once and nothing bounds which.
+>
+> **What it still cannot do, and why the widening is this size and no larger.** Each capability
+> names one domain the adapter itself created, so this reaches no Bhaskix service, no other
+> supervisor's children, and not the domain the adapter runs in — `END` on a capability naming the
+> caller's own domain is refused in the nucleus. And the boundary between *hosted* processes is not
+> the capability: RFC 0079's rule is the process tree, checked by `may_signal` in the adapter, so a
+> hosted process that asks it to kill a stranger is refused. That check is in the compromised
+> component, which is exactly why this note prices the compromise at "every hosted process" rather
+> than at what the rule allows.
+>
+> This was chosen over the two alternatives rather than slipped in. Cooperative delivery — the
+> target notices a pending signal at its next syscall — costs the adapter nothing and cannot
+> implement `SIGKILL`, because a process spinning without syscalls would ignore it for ever; and
+> letting the nucleus end a domain for its creator without a capability is ambient authority by
+> another name, refused on the same grounds RFC 0031 refuses Linux UID 0.
+
 > "Every boot today" stopped being true on 2026-08-28: a boot with `busybox=sh` grants the console
 > to the BusyBox domain, and it is the only one. Every other boot grants nothing and reaches no
 > keystroke at all. It is not

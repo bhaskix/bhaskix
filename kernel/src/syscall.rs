@@ -149,6 +149,11 @@ const _: () = {
     assert!(method::BIND == bhaskix_abi::method::BIND);
     assert!(method::RELEASE == bhaskix_abi::method::RELEASE);
     assert!(method::END == bhaskix_abi::method::END);
+    // **The adapter's domain slots and the process table it indexes them by**
+    // — RFC 0079. `bhaskix-personality` mirrors ABI constants by hand and
+    // does not depend on the ABI, so this crate, which sees both, is where
+    // they are held together.
+    assert!(bhaskix_abi::adapter::DOMAIN_COUNT == bhaskix_personality::process::MAX_PROCESSES);
     assert!(method::SPAWN == bhaskix_abi::method::SPAWN);
     assert!(method::START == bhaskix_abi::method::START);
     assert!(crate::cap::Rights::READ.bits() as u64 == bhaskix_abi::rights::READ);

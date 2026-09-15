@@ -243,7 +243,13 @@ asm_budget = 3
 # and the outcome on both paths, so a domain absent from that record never
 # reached the function. That is the one distinction three days of instruments
 # have not been able to draw.
-unsafe_budget = 117
+# 118 on 2026-09-15, one line, for RFC 0079: the table of domain slots this
+# program keeps a hosted process's capability in. One accessor -- the shape
+# `handles` and `incarnation` already use -- rather than a block in each of the
+# four places that borrows it, which is the difference between one line and
+# four. The capabilities themselves cost nothing: they are derived, held and
+# deleted through invocations, and none of it dereferences anything.
+unsafe_budget = 118
 # Up five for RFC 0005 step 9's datagram page: the volatile writes that stage
 # a payload into it, the volatile reads that take one back out, and the static
 # that remembers whether it has been mapped.

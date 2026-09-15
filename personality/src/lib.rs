@@ -122,6 +122,18 @@ pub mod report {
     /// came back.
     pub const PROCESS_AT: usize = SOCKET_AT + 16;
 
+    /// How many words [`PROCESS_AT`] holds.
+    ///
+    /// **Eight since 2026-09-15**, the last two being the domain capabilities
+    /// the adapter keeps so it can end a hosted process — RFC 0079 — as a
+    /// count and a peak. The peak is not decoration: a count that ends at zero
+    /// cannot distinguish "every one was released" from "none was ever kept",
+    /// which is the same reason the file slots carry one. Named rather than
+    /// written as a literal on both sides, because the writer and the reader
+    /// disagreeing about the length is a silent wrong number rather than a
+    /// build failure.
+    pub const PROCESS_WORDS: usize = 8;
+
     /// The bind record: which domain asked, and what it was told.
     ///
     /// **The question the socket-reclaim hunt cannot currently answer.** Its

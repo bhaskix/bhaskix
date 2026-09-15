@@ -245,12 +245,40 @@ pub mod adapter {
         PAYLOAD,
     ];
 
+    /// The first slot holding a hosted process's own domain — RFC 0079.
+    ///
+    /// **One per hosted process, kept for its whole life, and held for one
+    /// reason: to be able to end it.** Until 2026-09-15 the adapter deleted
+    /// the domain capability as soon as the child was built — `CHILD` is a
+    /// single slot, "where an `execve` holds the domain it is building, one at
+    /// a time" — so it held nothing naming a running hosted process and could
+    /// not have stopped one. A `kill(2)` written against that would have
+    /// recorded an exit and woken the parent's `wait4` while the target kept
+    /// running, which is not a signal but a lie told to the parent.
+    ///
+    /// **What this costs is worth saying where the slots are declared.** The
+    /// adapter now holds the power to end every hosted process for as long as
+    /// each lives, so a compromise of it gains that too. `docs/security.md`
+    /// T11 prices what a compromise of the adapter costs and says so.
+    pub const DOMAIN_FLOOR: usize = FILE_TOP + 1;
+    /// One per entry in the process table, which is what bounds them.
+    ///
+    /// **Thirty-two, and it must equal `bhaskix_personality::process::
+    /// MAX_PROCESSES`.** It cannot be written as that constant: the table
+    /// lives in the personality crate and the personality crate depends on
+    /// this one, not the other way about. The agreement is asserted where both
+    /// are visible, in `process.rs`, so a change to either is a build failure
+    /// rather than a process that is admitted and has nowhere to keep its
+    /// domain.
+    pub const DOMAIN_COUNT: usize = 32;
+
     /// Whether `slot` is one a pool allocates from.
     const fn in_a_pool(slot: usize) -> bool {
         (slot >= WAKES && slot < WAKES + WAKE_COUNT)
             || (slot >= HANDLE_FLOOR && slot < NETWORK)
             || (slot >= SOCKETS && slot < SOCKETS + SOCKET_COUNT)
             || (slot >= FILE_FLOOR && slot <= FILE_TOP)
+            || (slot >= DOMAIN_FLOOR && slot < DOMAIN_FLOOR + DOMAIN_COUNT)
             || slot == DATAGRAM_BELL
     }
 
@@ -287,6 +315,9 @@ pub mod adapter {
         assert!(SOCKETS + SOCKET_COUNT <= DATAGRAM_BELL);
         assert!(DATAGRAM_BELL < FILE_FLOOR);
         assert!(FILE_TOP < crate::limits::CSPACE_SLOTS);
+        // The domain slots sit above the files and inside the CSpace.
+        assert!(DOMAIN_FLOOR > FILE_TOP);
+        assert!(DOMAIN_FLOOR + DOMAIN_COUNT <= crate::limits::CSPACE_SLOTS);
     };
 }
 

@@ -2792,6 +2792,26 @@ const FILE_SLOTS: usize = bhaskix_abi::adapter::FILE_COUNT;
 /// Which file slots are taken.
 static mut FILE_HELD: [bool; FILE_SLOTS] = [false; FILE_SLOTS];
 
+/// The first slot holding a hosted process's own domain — RFC 0079.
+const DOMAIN_SLOT_FLOOR: u64 = bhaskix_abi::adapter::DOMAIN_FLOOR as u64;
+/// One per entry in the process table; the ABI and the table are held equal
+/// by an assertion in the kernel, which is the one crate that sees both.
+const DOMAIN_SLOTS: usize = bhaskix_abi::adapter::DOMAIN_COUNT;
+
+/// Which domain slots are taken.
+///
+/// **Held for one reason: to be able to end the process.** Before RFC 0079 the
+/// adapter deleted each child's domain capability as soon as it was built, so
+/// it named no running hosted process and could not have stopped one.
+static mut DOMAIN_HELD: [bool; DOMAIN_SLOTS] = [false; DOMAIN_SLOTS];
+
+/// The most ever held at once.
+///
+/// **A count that ends at zero cannot tell "all released" from "none ever
+/// kept".** The file slots carry a peak for the same reason, and its comment
+/// says so: the number that matters is whether the count came back *down*.
+static DOMAIN_PEAK: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 /// Whether the staging object has been attached yet — RFC 0059.
 ///
 /// `ATTACH` refuses an address that is already mapped, with the same
@@ -2832,6 +2852,92 @@ fn exec_image_page() -> &'static mut [u8; bhaskix_personality::exec::IMAGE_BYTES
 }
 
 /// Takes a free slot for an open file, or `None` when there are none left.
+/// Takes a slot to keep a hosted process's domain capability in.
+///
+/// Allocated **upward** from the floor, where files are allocated downward
+/// from the top, so the two pools grow apart rather than toward each other.
+fn claim_domain_slot() -> Option<u64> {
+    // **Stale slots first, or a fork fails for a process that has ended.** A
+    // hosted process that ends through a path this program is not told about
+    // leaves its slot held -- see `reclaim_domain_slots`, which explains which
+    // paths those are. Sweeping here rather than only on exhaustion keeps the
+    // count in the boot report meaning what it says.
+    reclaim_domain_slots();
+    let held = domain_held();
+    let index = held.iter().position(|taken| !*taken)?;
+    held[index] = true;
+    Some(DOMAIN_SLOT_FLOOR + index as u64)
+}
+
+/// Gives one back, deleting the capability with it.
+///
+/// **The capability goes when the slot does.** A domain slot still holding a
+/// capability to a reaped domain would let this program end whatever took the
+/// domain's place, which is the shape of every reused-handle bug this tree has
+/// filed.
+fn release_domain_slot(slot: u64) {
+    if slot < DOMAIN_SLOT_FLOOR {
+        return;
+    }
+    let index = (slot - DOMAIN_SLOT_FLOOR) as usize;
+    let held = domain_held();
+    let Some(taken) = held.get_mut(index) else {
+        return;
+    };
+    let _ = call(syscall::INVOKE, slot, method::DELETE, [0; 4]);
+    *taken = false;
+}
+
+/// How many domain slots are held, for the boot report.
+fn domain_slots_held() -> usize {
+    domain_held().iter().filter(|taken| **taken).count()
+}
+
+/// The domain slots this program is holding a capability in.
+///
+/// One accessor rather than an `unsafe` block in each of the four places that
+/// wants it, which is the shape `handles` and `incarnation` already use here.
+fn domain_held() -> &'static mut [bool; DOMAIN_SLOTS] {
+    // SAFETY: single-threaded by construction, as the note above.
+    unsafe { &mut *core::ptr::addr_of_mut!(DOMAIN_HELD) }
+}
+
+/// Gives back every slot whose domain has ended.
+///
+/// **Because a process can end without this program being told.** `note_exit`
+/// releases the slot for one that calls `exit_group` or takes a fatal fault,
+/// and the `FORGET` message catches one killed from outside -- but `FORGET`
+/// arrives when the domain slot is *reused*, which may be never, and a hosted
+/// thread calling plain `exit(2)` reaches neither. The fork probe's child does
+/// exactly that: it is the second half of `FORK_PROBE_CODE`, ending with
+/// `mov eax, 60; syscall`. This program cannot answer that call by recording a
+/// process exit, because `clone` exists and the thread ending need not be the
+/// last one -- recording an exit there would wake a parent's `wait4` for a
+/// process still running, which is the lie this whole design refuses.
+///
+/// **So it asks instead of being told.** The kept capability names the domain,
+/// and `INFO` on a domain answers `0` while it lives and its `Ending`
+/// afterwards. That is the one question this program can always ask and always
+/// get a true answer to, and it needs no new mechanism to ask it.
+fn reclaim_domain_slots() {
+    for index in 0..DOMAIN_SLOTS {
+        if !domain_held()[index] {
+            continue;
+        }
+        let slot = DOMAIN_SLOT_FLOOR + index as u64;
+        let answer = call(syscall::INVOKE, slot, method::INFO, [0; 4]);
+        let ending = answer.args[0];
+        // Still running, so the capability is still wanted. A refusal is left
+        // alone too: a slot this program cannot ask about is not one it should
+        // silently drop, and `release_domain_slot` would delete a capability
+        // whose state it never learned.
+        if answer.status != status::OK || ending == 0 {
+            continue;
+        }
+        release_domain_slot(slot);
+    }
+}
+
 fn claim_file_slot() -> Option<u64> {
     // SAFETY: single-threaded by construction, as `dispositions_of`.
     let held = file_held();
@@ -3013,6 +3119,11 @@ fn trace_process() {
         LAST_ADMITTED_HELD.load(Relaxed),
         held_now,
         peak,
+        // The domain capabilities kept so a hosted process can be ended —
+        // RFC 0079. A number that only goes up is a leak: each is released
+        // when its process ends.
+        domain_slots_held() as u64,
+        DOMAIN_PEAK.load(Relaxed),
     ];
     // A loop rather than four statements, because each one would be a line of
     // `unsafe` against this program's budget and they say the same thing.
@@ -5449,6 +5560,14 @@ fn note_exit(domain: u32, exit: Exit) {
         return;
     };
     let (pid, parent) = (process.pid, process.ppid);
+    // **The kept capability goes when the process does** — RFC 0079. It exists
+    // to end a *running* process; one that has ended cannot be ended again,
+    // and a slot left holding a capability to a dead domain is thirty-two
+    // forks away from a fork that fails for want of one.
+    let slot = process.domain_slot;
+    if slot != 0 {
+        release_domain_slot(slot);
+    }
 
     // **A dead process's sockets come back, and nothing else would bring
     // them.** `bin/ipd` holds four; a hosted program that exits without
@@ -5652,7 +5771,71 @@ fn answer_fork(request: &PersonalityCall, image: &[u64; FAULT_REGISTERS]) -> Ans
     }
     let child_domain = made.args[0] as u32;
     let outcome = build_fork_child(request, rip, rsp);
+    // **Keep a capability to the child before letting go of the build slot** —
+    // RFC 0079. `CHILD` is one slot, reused by the next fork, and until now it
+    // was simply deleted here: this program then named no running hosted
+    // process and could not have ended one, so a `kill(2)` written against it
+    // would have recorded an exit and woken the parent's `wait4` while the
+    // target kept running.
+    //
+    // Derived rather than moved, because there is no move. `DELETE` empties a
+    // slot — the "destroy everything derived from it" contract belongs to
+    // `REVOKE`, which is a different method — so the derived capability
+    // outlives the build slot it came from.
+    //
+    // **`and_then`, not `filter`, and the difference is a leak.** `filter`
+    // drops the `Some` and leaves the slot marked held with nothing in it, so
+    // a fork whose derive failed would cost a slot for the rest of the boot.
+    // Found by arming this gate: forcing the derive to fail printed `2 held,
+    // peak 2` where it should have printed a peak of nothing kept.
+    let kept = claim_domain_slot().and_then(|slot| {
+        let derived = call(
+            syscall::INVOKE,
+            CHILD,
+            method::DERIVE,
+            // Every right the parent has, because this capability exists to
+            // end the domain and a derived one may not gain what its parent
+            // lacks. `rights` has no `ALL`; naming them is the honest spelling.
+            [
+                bhaskix_abi::rights::READ
+                    | bhaskix_abi::rights::WRITE
+                    | bhaskix_abi::rights::EXECUTE
+                    | bhaskix_abi::rights::GRANT
+                    | bhaskix_abi::rights::REVOKE
+                    | bhaskix_abi::rights::DERIVE,
+                0,
+                slot,
+                0,
+            ],
+        )
+        .status
+            == status::OK;
+        if !derived {
+            release_domain_slot(slot);
+            return None;
+        }
+        // **The peak is counted here, where a capability is really held** --
+        // not in `claim_domain_slot`, which also runs for the claim just
+        // released above. A peak that counted reservations would say a
+        // capability was kept on exactly the boot where none was.
+        DOMAIN_PEAK.fetch_max(
+            domain_slots_held() as u64,
+            core::sync::atomic::Ordering::Relaxed,
+        );
+        Some(slot)
+    });
+    if kept.is_none() {
+        // **Ended here, while `CHILD` still names it.** Nowhere to keep the
+        // capability means nothing could ever stop this child, and a hosted
+        // process this program cannot end is worse than one it never started.
+        // After the `DELETE` below there would be no way to say so.
+        let _ = call(syscall::INVOKE, CHILD, method::END, [0; 4]);
+    }
     let _ = call(syscall::INVOKE, CHILD, method::DELETE, [0; 4]);
+    let Some(kept) = kept else {
+        return Answer::error(-11); // EAGAIN
+    };
+    let _ = kept;
     let Some(copied) = outcome else {
         return Answer::error(-12); // ENOMEM
     };
@@ -5673,6 +5856,9 @@ fn answer_fork(request: &PersonalityCall, image: &[u64; FAULT_REGISTERS]) -> Ans
             let identity = (child.pid, child.ppid, child.domain, child.generation);
             *child = parent.fork_into(identity.0, identity.2, identity.3);
             child.ppid = identity.1;
+            // The capability kept above, recorded where the process is — RFC
+            // 0079. `fork_into` deliberately does not carry the parent's.
+            child.domain_slot = kept;
         }
         pid
     };
@@ -6804,6 +6990,19 @@ extern "C" fn linuxd_main(hertz: u64) -> ! {
             // a socket held by a domain killed and not replaced stays held.
             // That bound is stated in RFC 0058 rather than rounded to "fixed".
             release_sockets_of(received.badge as u32);
+            // **And its kept domain capability** -- RFC 0079, and the same
+            // shape as the sockets above. `note_exit` releases it for a
+            // process that exits; one killed from outside, or one that calls
+            // plain `exit` rather than `exit_group`, reaches neither, so this
+            // message is again the only thing that learns of it. The leak was
+            // not deduced: the report read `1 of 32 kept now, 2 at the peak`
+            // on a boot where every hosted domain had already ended, which is
+            // a slot that was claimed and never given back.
+            if let Some(process) = process_for(received.badge as u32)
+                && process.domain_slot != 0
+            {
+                release_domain_slot(process.domain_slot);
+            }
             *dispositions_of(received.badge as u32) = Dispositions::new();
             // And whatever it left asleep. A sleeper keyed by a domain id
             // that now names somebody else would let a `WAKE` from the new

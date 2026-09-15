@@ -4501,7 +4501,7 @@ fn adapter_bind_record() -> (u64, u64) {
 ///
 /// A machine where hosted processes never finish -- a lane running an
 /// interactive BusyBox, say -- spends the timeout and then reads as before.
-fn settled_process_record() -> [u64; 6] {
+fn settled_process_record() -> [u64; bhaskix_personality::report::PROCESS_WORDS] {
     const TRIES: usize = 100;
     const STABLE: u32 = 3;
     // Two seconds, which is longer than any probe here takes to end and short
@@ -4531,31 +4531,40 @@ fn settled_process_record() -> [u64; 6] {
     record
 }
 
-fn adapter_process_record() -> [u64; 6] {
+fn adapter_process_record() -> [u64; bhaskix_personality::report::PROCESS_WORDS] {
     let page = ADAPTER_REPORT.load(core::sync::atomic::Ordering::Acquire);
     if page == u64::MAX {
-        return [0; 6];
+        return [0; bhaskix_personality::report::PROCESS_WORDS];
     }
     const FIRST_WORD: usize = bhaskix_personality::report::PROCESS_AT / 8;
     let object = shared::MemoryId::from_u64(page);
-    let mut record = [0u64; 6];
+    let mut record = [0u64; bhaskix_personality::report::PROCESS_WORDS];
     let mut at = 0usize;
-    let taken = shared::drain_into(object, (FIRST_WORD + 6) * 8, &mut |chunk: &[u8]| {
-        for word in chunk.as_chunks::<8>().0 {
-            if at >= FIRST_WORD + 6 {
-                break;
+    let taken = shared::drain_into(
+        object,
+        (FIRST_WORD + bhaskix_personality::report::PROCESS_WORDS) * 8,
+        &mut |chunk: &[u8]| {
+            for word in chunk.as_chunks::<8>().0 {
+                // `PROCESS_WORDS`, not a literal. This read `+ 6` while the record
+                // had grown to eight, so the two words RFC 0079 added arrived in
+                // the page and were dropped here -- the report then said `0 at the
+                // peak` for a slot that was demonstrably held, and the adapter got
+                // suspected first because it was the end that had changed.
+                if at >= FIRST_WORD + bhaskix_personality::report::PROCESS_WORDS {
+                    break;
+                }
+                if at >= FIRST_WORD {
+                    let mut eight = [0u8; 8];
+                    eight.copy_from_slice(word);
+                    record[at - FIRST_WORD] = u64::from_le_bytes(eight);
+                }
+                at += 1;
             }
-            if at >= FIRST_WORD {
-                let mut eight = [0u8; 8];
-                eight.copy_from_slice(word);
-                record[at - FIRST_WORD] = u64::from_le_bytes(eight);
-            }
-            at += 1;
-        }
-        chunk.len()
-    });
+            chunk.len()
+        },
+    );
     if taken.is_none() {
-        return [0; 6];
+        return [0; bhaskix_personality::report::PROCESS_WORDS];
     }
     record
 }
@@ -9895,6 +9904,19 @@ fn killed_domain_gives_its_socket_back(hhdm_base: u64, cpus: u32) -> bool {
         record[4],
         bhaskix_abi::adapter::FILE_COUNT,
         record[5]
+    );
+    // **The domain capabilities the adapter keeps so it can end a hosted
+    // process** — RFC 0079. Before it, the adapter deleted each child's
+    // capability as soon as the child was built and so could not have stopped
+    // one; now it holds one per live process, and this is where a leak would
+    // show: the number must come back down as processes end, because thirty-two
+    // that never came back is a fork that fails for want of a slot.
+    println!(
+        "    adapter domains {} of {} kept now, {} at the peak, so a hosted \
+         process can be ended",
+        record[6],
+        bhaskix_abi::adapter::DOMAIN_COUNT,
+        record[7]
     );
     if held_it && reaped && same_slot && bound_again {
         println!(
