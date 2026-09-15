@@ -11,7 +11,7 @@
 | | |
 |---|---|
 | RFCs accepted | **52** |
-| RFCs open | 27 |
+| RFCs open | 28 |
 | RFCs closed without shipping | 1 |
 | Milestone rows done | **92 of 95** |
 | Phase 2 bullets done | **12 of 13** |
@@ -56,6 +56,7 @@ gantt
     RFC 0053 input a domain was given :done, r0053, 2026-08-27, 1d
     RFC 0070 a badge that can never ring is refused where it... :done, r0070, 2026-09-05, 2026-09-14
     RFC 0080 ending a domain that is still running :done, r0080, 2026-09-15, 1d
+    RFC 0081 a thread belongs to an incarnation not a slot :active, r0081, 2026-09-15, 2026-09-15
     section Networking
     RFC 0018 A network stack outside the kernel and a socket... :done, r0018, 2026-08-12, 2026-08-13
     RFC 0020 TCP as a state machine that can be tested... :done, r0020, 2026-08-14, 2026-08-16
@@ -185,6 +186,7 @@ gantt
 | 0074 | what a network interface is | 2026-09-06 |
 | 0075 | a driver that is not in the kernel | 2026-09-07 |
 | 0076 | a bond on hardware | 2026-09-08 |
+| 0081 | a thread belongs to an incarnation not a slot | 2026-09-15 |
 
 ## Annexes
 
