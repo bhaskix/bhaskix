@@ -191,6 +191,54 @@ strangers:
         mov     %rbx, 80(%r12)          # word 10
         movq    $12, 120(%r12)          # how far this got
 
+        # ---- a sibling ends a sibling, and the parent collects it ----
+        #
+        # **RFC 0079's third unresolved question, which nothing tested.** The
+        # rule permits this: a process may signal any member of its own process
+        # group, and two children of one parent are in one group. What was not
+        # known is what the *parent* then sees -- a `kill` carried out by
+        # somebody other than the parent still has to leave a status the parent
+        # can collect, or the signal is a lie told to whoever is waiting.
+        #
+        # B spins; its pid goes in the data page, which a fork copies, so the
+        # sibling forked next can name it without being handed a register.
+        call    *%r15
+        mov     %rax, 128(%r12)         # word 16: the one that will be ended
+        movq    $13, 120(%r12)
+        mov     %rax, %r13
+        test    %rax, %rax
+        jle     done
+        mov     %r13, 0x40000010
+
+        lea     (sibling - inner)(%r15), %rax
+        call    *%rax
+        mov     %rax, 136(%r12)         # word 17: the one that ends it
+        mov     %rax, %rbx
+        test    %rax, %rax
+        jle     done
+
+        # The sibling exits with what its `kill` answered, negated, so zero is
+        # acceptance -- the only way it can report anything, since its copy of
+        # the data page is its own and nothing it writes comes back here.
+        mov     %rbx, %rdi
+        lea     152(%r12), %rsi
+        xor     %edx, %edx
+        xor     %r10d, %r10d
+        mov     $61, %eax
+        syscall
+        mov     %rax, 144(%r12)         # word 18, and word 19 is its status
+
+        # **And the question itself**: does this return? The parent did not send
+        # the signal and was not told it was coming.
+        mov     %r13, %rdi
+        lea     168(%r12), %rsi
+        xor     %edx, %edx
+        xor     %r10d, %r10d
+        mov     $61, %eax
+        syscall
+        mov     %rax, 160(%r12)         # word 20, and word 21 is the status
+        movq    $14, 120(%r12)
+
         movq    $0xC0FFEE, 88(%r12)     # word 11: every step above ran
 done:
         xor     %edi, %edi
@@ -222,6 +270,26 @@ park:
 4:      mov     $0x40000000, %edi       # nanosleep(&{1000, 0}, NULL)
         xor     %esi, %esi
         mov     $35, %eax
+        syscall
+        jmp     .
+
+        # The same fork, except that the child ends a *sibling* -- a process it
+        # did not create and is not descended from, reachable only because the
+        # two share a process group. Its pid is read out of the data page,
+        # which is where its parent left it before this fork copied the page.
+sibling:
+        mov     $57, %eax               # fork
+        syscall
+        test    %rax, %rax
+        jz      5f
+        ret
+5:      mov     0x40000010, %edi        # the sibling to end
+        mov     $9, %esi                # SIGKILL
+        mov     $62, %eax
+        syscall
+        mov     %rax, %rdi              # exit_group(-answer): 0 is acceptance
+        neg     %rdi
+        mov     $231, %eax
         syscall
         jmp     .
 inner_end:

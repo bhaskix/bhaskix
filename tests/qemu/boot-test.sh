@@ -3304,6 +3304,13 @@ if grep -qE "hosted kill    pid [0-9]+ ended a child with SIGTERM" "$LOG"; then
         fail "CONTAINMENT: a hosted process reached outside its own tree -- $reach_line"
         status=1
     fi
+    sibling_line=$(grep -oE "ended its sibling [0-9]+, which it may only reach through their shared process group, and their parent collected it with status [0-9]+" "$LOG" | head -1)
+    if [ -n "$sibling_line" ] && [ "${sibling_line##*status }" = "9" ]; then
+        pass "a process ended a sibling it could reach only through their shared group, and their parent collected the signal"
+    else
+        fail "a sibling kill was not collected by the parent: $sibling_line"
+        status=1
+    fi
 elif grep -qF "hosted kill    skipped" "$LOG"; then
     pass "one cpu on this machine, so nothing could be killed while something else ran"
 else

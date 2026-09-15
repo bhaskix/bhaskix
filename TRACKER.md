@@ -998,6 +998,30 @@ the distinction is in the table rather than in somebody's head.
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-09-15 (a sibling ends a sibling, and the answer was not the one guessed)
+
+**[RFC 0079](docs/rfc/0079-a-signal-a-process-may-send-another.md)'s third
+unresolved question is answered by measurement: it works.** A hosted process
+ends a sibling it can reach only through their shared process group — it is
+neither the target's parent nor its ancestor — and their parent, which sent no
+signal and was told nothing was coming, collects it with status 9. That is the
+rule's group half doing something no other gate exercised.
+
+**Two things that question said are corrected rather than deleted.** It
+recorded a hint that the parent's `wait4` might not return, from arming the
+containment gate; that was collateral from a deliberately broken adapter
+killing six processes at once, and tested directly the `wait4` returns. And it
+said the test *"wants three hosted processes with real code, which this probe's
+hand-assembly cannot carry"*. It can: what made three look impossible was a
+forked child arriving with no registers to be handed a pid in, and the data page
+the parked child already needed solves it — a fork copies the regions the
+personality recorded, so the parent writes the pid to be ended into that page
+before forking the process that will end it.
+
+Armed by dropping the group half of `may_signal`: the sibling's `kill` comes
+back `ESRCH` (its exit status reads 768, which is 3 << 8) and the parent blocks
+for ever on a child nothing ended.
+
 ### 2026-09-15 (the refusal that was implemented and could not be attempted)
 
 **[RFC 0080](docs/rfc/0080-ending-a-domain-that-is-still-running.md)'s fourth

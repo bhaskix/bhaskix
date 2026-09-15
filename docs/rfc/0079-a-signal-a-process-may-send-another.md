@@ -260,7 +260,11 @@ same confusion cost a day one file up, where the kernel's truncated reader made
    above is counted.
 5. ~~Host tests in `bhaskix-personality` for the rule itself — caller,
    descendant, group member, stranger — armed one at a time.~~ **Done.**
-6. ~~A capability is kept while a hosted process lives and given back after.~~
+6. **A sibling ends a sibling and the parent collects it**, which is the rule's
+   group half doing something no other gate exercises: the killer is neither the
+   target's parent nor its ancestor, and reaches it only because two children of
+   one parent share a process group.
+7. ~~A capability is kept while a hosted process lives and given back after.~~
    **Done.** The boot report carries both numbers, because neither proves the
    other: `0 of 32 kept now` alone cannot tell *released properly* from *never
    kept*, which is how it was first read while the kernel's reader was
@@ -276,16 +280,27 @@ same confusion cost a day one file up, where the kernel's truncated reader made
    become general. Separate RFC.
 2. **`SIGSTOP`/`SIGCONT`.** A shell's job control wants them; a domain has no
    stopped state today, so they would be invented rather than translated.
-3. **A process killed by somebody other than its parent, and what the parent's
-   `wait4` then does.** The rule permits it — a process may signal any member of
-   its own group, which a sibling is — and **nothing tests it**. What is known
-   is one observation from arming the containment gate, where the tree check was
-   off and the killer ended a bystander's child: the bystander's
-   `wait4(child, WNOHANG)` did not return. That was a deliberately broken
-   adapter killing six processes at once, so it is a hint rather than a finding,
-   and it is written down rather than left out because the in-tree case it
-   points at is reachable and untested. Testing it wants three hosted processes
-   with real code, which this probe's hand-assembly cannot carry.
+3. ~~**A process killed by somebody other than its parent, and what the
+   parent's `wait4` then does.**~~ **Answered and gated 2026-09-15: it works.**
+   A hosted process ends a sibling it can reach only through their shared
+   process group, and their parent — which sent no signal and was told nothing
+   was coming — collects it with status 9.
+
+   **The hint this question recorded was wrong, and is corrected here rather
+   than deleted.** It said the bystander's `wait4` did not return when the
+   containment gate was armed, and that was collateral from a deliberately
+   broken adapter killing six processes at once, not the sibling case. Tested
+   directly, the parent's `wait4` returns.
+
+   **And "this probe's hand-assembly cannot carry it" was wrong too.** It needs
+   three hosted processes, and what made that look impossible was a forked child
+   arriving with no registers to be handed a pid in. The data page the parked
+   child already needed solves it: a fork copies the regions the personality
+   recorded, so the parent writes the pid of the process to be ended into that
+   page *before* forking the one that will end it, and the child reads it from a
+   fixed address. Armed by dropping the group half of `may_signal`, which reads
+   `sibling ... status 768` — 3 << 8, the sibling's `kill` refused with `ESRCH` —
+   and leaves the parent blocked for ever on a child nothing ended.
 4. **Whether a descendant's descendant counts.** The rule says "descendant",
    and the record has `ppid`, so the walk is upward and bounded by the tree's
    depth. Proposed: yes, and bounded by a depth limit so a cycle — which the
