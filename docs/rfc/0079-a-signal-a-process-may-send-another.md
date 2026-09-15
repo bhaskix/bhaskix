@@ -214,14 +214,27 @@ ending that already exists. Nothing to measure.
 
 ## What building the syscall found
 
-**A hosted process that maps `0x30000000` cannot fork**, and nothing said so.
-`bin/linuxd` places a fork's trampoline at `FORK_TRAMPOLINE_AT` — that address,
-fixed — so `map_at_eager` cannot place it if the caller is already there, and
-`fork` answers `ENOMEM` for a reason no caller can act on. Found because this
-RFC's probe picked the same address for its own page and read `ENOMEM` for
-three boots. Recorded here rather than fixed: the fix is for the trampoline to
-be placed where the caller is not, which is RFC 0033's `fork` to change and
-wants its own measurement of where a hosted address space is free.
+~~**A hosted process that maps `0x30000000` cannot fork**, and nothing said
+so.~~ **Fixed and gated 2026-09-15.** `bin/linuxd` placed a fork's trampoline at
+`FORK_TRAMPOLINE_AT` — that address, fixed — so `map_at_eager` could not place
+it if the caller was already there, and `fork` answered `ENOMEM` for a reason no
+caller could act on. Found because this RFC's probe picked the same address for
+its own page and read `ENOMEM` for three boots.
+
+The comment beside that constant argued the address could not collide, because
+`mmap` hands out addresses from `0x7000_0000_0000` and a program's image sits
+far below it. That is true of an `mmap` asked for a *hint* and says nothing
+whatever about `MAP_FIXED`, where the caller names the address it wants — the
+comment has been corrected in place rather than deleted.
+
+`Process::free_page` clears the child's own regions and answers the first page
+none of them covers, and that is what `SPAWN_THREAD` is given; nothing outside
+the fork needs to know where the trampoline went, because the child jumps out of
+it and never returns. Four host tests, three of them armed — the first two
+armings written for it changed no behaviour and were replaced, which is the
+whole reason to watch a test fail before believing it. The boot gate has the
+probe map that exact page and fork from it; armed by restoring the constant,
+which reads `holding 0x30000000 it forked -12`.
 
 **Killing a process that is asleep *inside the adapter* is the case worth
 gating, and it is not the one a spinning child tests.** RFC 0080 bounds a

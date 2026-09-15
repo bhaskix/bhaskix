@@ -5068,6 +5068,67 @@ pub fn threads_in_domain(domain: u32) -> usize {
     total
 }
 
+/// How many threads in this domain could still run — **dying ones excluded**.
+///
+/// **The difference matters because a domain slot is reused.** A thread told to
+/// stop is still `Ready`, `Running` or `Blocked` until it reaches a safe point,
+/// so [`threads_in_domain`] counts it; and by then the domain it belonged to
+/// may be gone and its slot handed to somebody else. The newcomer is a live
+/// domain with a dead one's thread counted against it.
+///
+/// `START` asks this question — *may I start a program in this domain* — and a
+/// dying thread is not an answer to it. A freshly created live domain has never
+/// had a thread of its own, so a dying thread in its slot is always the last
+/// occupant's.
+///
+/// **Measured, not reasoned about.** Adding RFC 0079's kill probe shifted which
+/// slot `bin/sup`'s child landed on and `START` began refusing it with
+/// `SlotUnavailable` one boot in five — a signature with no sighting in 4,585
+/// boots of CI before it. A print at the refusal read `domain 14 has 0
+/// thread(s)`: the count that refused it was already back to zero by the time
+/// the next instruction asked again.
+///
+/// It is safe to ignore a dying thread of the domain *itself*, rather than of
+/// its predecessor, because `domain::record_pending_start` refuses a domain
+/// that is not live and a domain whose threads are dying is on its way there.
+#[must_use]
+pub fn live_threads_in_domain(domain: u32) -> usize {
+    let online = percpu::online_count() as usize;
+    let mut total = 0;
+    for queue in QUEUES.iter().take(online.min(MAX_CPUS)) {
+        // As [`threads_in_domain`]: a queue this cannot take reads as empty,
+        // which under-counts. That is the safe direction for a refusal —
+        // refusing wrongly is the failure this function exists to remove.
+        let Some(queue) = queue.try_lock() else {
+            DOMAIN_SCAN_SKIPS.fetch_add(1, Ordering::Relaxed);
+            continue;
+        };
+        total += queue
+            .threads
+            .iter()
+            .flatten()
+            .filter(|thread| could_still_run(thread, domain))
+            .count();
+    }
+    total
+}
+
+/// Whether this thread could still run a program's code in `domain`.
+///
+/// **One clause separates this from what [`threads_in_domain`] counts**, and it
+/// is the whole of the fix: `!dying`. A thread told to stop is still `Ready`,
+/// `Running` or `Blocked` until it reaches a safe point, so it is present — but
+/// it will never execute another instruction of the program it belonged to, and
+/// a caller asking *may I start a program in this domain* is asking about the
+/// future rather than the present.
+///
+/// Its own function because the live counter reads global queues and a per-CPU
+/// count, so it cannot run in a host test; this can, and it is where the
+/// meaning is.
+const fn could_still_run(thread: &Thread, domain: u32) -> bool {
+    thread.domain == domain && !matches!(thread.state, State::Finished) && !thread.dying
+}
+
 /// How many of `ids` are still held by some run queue.
 ///
 /// **Blocks for each queue rather than skipping one it cannot take**, for the
@@ -5651,6 +5712,46 @@ mod tests {
              stopped counting it would decline to preempt for it"
         );
         assert!(queue.threads[1].as_ref().unwrap().state.is_schedulable());
+    }
+
+    /// A dying thread is present and cannot run again, and the difference is
+    /// what a reused domain slot turns on.
+    ///
+    /// **`bin/sup` could not start a program in a fresh, empty domain** because
+    /// the slot's last occupant still had a thread on a runqueue, marked dying.
+    /// One boot in five, once RFC 0079's kill probe shifted which slot the
+    /// child landed on; no sighting in the 4,585 boots of CI before that.
+    #[test]
+    fn a_dying_thread_could_not_run_again_however_present_it_is() {
+        let mut thread = thread(0, State::Ready, Policy::fair());
+        thread.domain = 7;
+        assert!(
+            could_still_run(&thread, 7),
+            "a ready thread of this domain is one that could run"
+        );
+
+        thread.dying = true;
+        assert!(
+            !could_still_run(&thread, 7),
+            "and once it is told to stop it is not, however schedulable it looks"
+        );
+        assert!(
+            thread.state.is_schedulable(),
+            "which is the point: it is still schedulable, so counting states \
+             cannot tell the two apart"
+        );
+    }
+
+    /// The other two clauses still hold, so the fix narrowed nothing else.
+    #[test]
+    fn a_finished_thread_and_another_domains_thread_still_do_not_count() {
+        let mut finished = thread(0, State::Finished, Policy::fair());
+        finished.domain = 7;
+        assert!(!could_still_run(&finished, 7));
+
+        let mut elsewhere = thread(0, State::Ready, Policy::fair());
+        elsewhere.domain = 8;
+        assert!(!could_still_run(&elsewhere, 7));
     }
 
     /// The order the delivery decision asks its questions in.

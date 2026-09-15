@@ -2493,12 +2493,22 @@ const WAIT4: u64 = 61;
 const FORK: u64 = 57;
 /// The name a forked child's domain is created under.
 const FORK_NAME_LOW: u64 = u64::from_le_bytes(*b"forked\0\0");
-/// Where the child's trampoline is written, in its own space.
+/// Where the child's trampoline goes, **unless the child is already there**.
 ///
-/// Above everything a hosted program maps for itself: `mmap` hands out
-/// addresses from `0x7000_0000_0000` and a program's own image sits far below
-/// this. A collision would be a region copied over the trampoline, which is
-/// why the address is out of both ranges rather than merely unlikely.
+/// This is where the search starts, not where the trampoline lands:
+/// `Process::free_page` clears any region the child has at this address, and
+/// the answer is what `SPAWN_THREAD` is given. Nothing outside this function
+/// needs to know where it went — the child jumps out of it immediately and
+/// never comes back.
+///
+/// **The comment here used to argue the address could not collide**, on the
+/// grounds that `mmap` hands out addresses from `0x7000_0000_0000` and a
+/// program's image sits far below this. That is true of an `mmap` asked for a
+/// *hint* and says nothing whatever about `MAP_FIXED`, where the caller names
+/// the address it wants. A hosted process that mapped this one page could not
+/// fork, and the `ENOMEM` it got back named nothing it could act on. Found by
+/// a probe that picked the same address and read `ENOMEM` for three boots —
+/// [RFC 0079](../../../docs/rfc/0079-a-signal-a-process-may-send-another.md).
 const FORK_TRAMPOLINE_AT: u64 = 0x0000_0000_3000_0000;
 
 /// `execve(path, argv, envp)`.
@@ -6087,8 +6097,12 @@ fn build_fork_child(request: &PersonalityCall, rip: u64, rsp: u64) -> Option<u64
     code[4..12].copy_from_slice(&rip.to_le_bytes());
     code[12] = 0xff;
     code[13] = 0xe1; // jmp rcx
-    if !map_at_eager(CHILD, FORK_TRAMPOLINE_AT, 1, PROT_READ_EXECUTE)
-        || !copy_out_through(CHILD, FORK_TRAMPOLINE_AT, &code)
+    // Somewhere the child does not already have. The regions are the parent's,
+    // which is exactly right: the child's space holds copies of those and the
+    // trampoline, and nothing else.
+    let trampoline = process_for(request.domain)?.free_page(FORK_TRAMPOLINE_AT)?;
+    if !map_at_eager(CHILD, trampoline, 1, PROT_READ_EXECUTE)
+        || !copy_out_through(CHILD, trampoline, &code)
     {
         return None;
     }
@@ -6096,7 +6110,7 @@ fn build_fork_child(request: &PersonalityCall, rip: u64, rsp: u64) -> Option<u64
         syscall::INVOKE,
         CHILD,
         method::SPAWN_THREAD,
-        [FORK_TRAMPOLINE_AT, rsp, 0, 0],
+        [trampoline, rsp, 0, 0],
     );
     if started.status != status::OK {
         return None;

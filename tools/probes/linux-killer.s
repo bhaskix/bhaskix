@@ -239,6 +239,47 @@ strangers:
         mov     %rax, 160(%r12)         # word 20, and word 21 is the status
         movq    $14, 120(%r12)
 
+        # ---- and a fork from a process sitting on the trampoline's address ----
+        #
+        # **The one page a fork used to need for itself.** `bin/linuxd` wrote a
+        # forked child's trampoline at a constant and the comment beside it
+        # argued the address was out of the ranges `mmap` hands out -- true of a
+        # hint and false of `MAP_FIXED`, where the caller names the address. A
+        # hosted process that mapped this page could not fork at all, and the
+        # `ENOMEM` it got back named nothing it could act on. This probe read
+        # exactly that for three boots, from picking the same address by
+        # accident.
+        mov     $0x30000000, %edi
+        mov     $4096, %esi
+        mov     $3, %edx
+        mov     $0x32, %r10d
+        mov     $-1, %r8
+        xor     %r9d, %r9d
+        mov     $9, %eax
+        syscall
+        mov     %rax, 176(%r12)         # word 22: the trampoline's own address
+        cmp     $0x30000000, %rax
+        jne     done
+
+        call    *%r15                   # and now fork, standing on it
+        mov     %rax, 184(%r12)         # word 23: a pid, or the refusal
+        mov     %rax, %r13
+        test    %rax, %rax
+        jle     done
+
+        mov     %r13, %rdi              # tidy it away again
+        mov     $9, %esi
+        mov     $62, %eax
+        syscall
+        mov     %r13, %rdi
+        lea     200(%r12), %rsi
+        xor     %edx, %edx
+        xor     %r10d, %r10d
+        mov     $61, %eax
+        syscall
+        mov     %rax, 192(%r12)         # word 24
+        movq    $15, 120(%r12)
+
         movq    $0xC0FFEE, 88(%r12)     # word 11: every step above ran
 done:
         xor     %edi, %edi

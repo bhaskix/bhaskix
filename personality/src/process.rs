@@ -95,6 +95,9 @@ pub const FIRST_PID: u32 = 2;
 /// make.
 pub const MAX_REGIONS: usize = 16;
 
+/// A page, which this module needs only to reason about where a region ends.
+const PAGE: u64 = crate::memory::PAGE;
+
 /// One mapped range of a hosted process's memory.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Region {
@@ -297,6 +300,44 @@ impl Process {
             .ok_or(crate::memory::errno::ENOMEM)?;
         self.regions[free] = Some(region);
         Ok(())
+    }
+
+    /// A page this process has **not** mapped, at or above `from`.
+    ///
+    /// **Because a fork needs somewhere in the child to put its trampoline**,
+    /// and a fixed address is only free until a program maps it. `bin/linuxd`
+    /// used a constant and the comment beside it argued the address was out of
+    /// the ranges `mmap` hands out — which is true of an `mmap` that asks for a
+    /// *hint* and says nothing at all about `MAP_FIXED`, where the caller names
+    /// the address. A hosted process that mapped that one page could not fork,
+    /// and the `ENOMEM` it got back named nothing it could act on.
+    ///
+    /// Answers `None` when everything from `from` upward is taken, which cannot
+    /// happen with sixteen regions and a 64-bit space but is not asserted away.
+    ///
+    /// **The regions are not sorted**, so this cannot walk them once. Each pass
+    /// moves past the furthest end among those overlapping the candidate, which
+    /// strictly increases the candidate and can therefore happen at most once
+    /// per region.
+    #[must_use]
+    pub fn free_page(&self, from: u64) -> Option<u64> {
+        let mut at = from;
+        for _ in 0..=MAX_REGIONS {
+            let mut moved = at;
+            for region in self.regions.iter().flatten() {
+                let end = region.at.checked_add(region.pages.checked_mul(PAGE)?)?;
+                // Overlap against one page at `at`, which is all a trampoline
+                // needs and all this promises.
+                if region.at < at.checked_add(PAGE)? && at < end {
+                    moved = moved.max(end);
+                }
+            }
+            if moved == at {
+                return Some(at);
+            }
+            at = moved;
+        }
+        None
     }
 
     /// Forgets a mapping, by its start address.
@@ -862,6 +903,81 @@ mod tests {
         table.by_pid_mut(other).expect("live").pgid = group;
         assert!(table.may_signal(shell, other), "a group member");
         assert!(table.may_signal(other, shell), "and symmetrically");
+    }
+
+    /// A page nobody has mapped is the one asked for.
+    #[test]
+    fn a_free_page_is_the_one_asked_for_when_nothing_is_there() {
+        let table = Processes::new();
+        let _ = table;
+        let process = Process::new(1, 0, 3, 1);
+        assert_eq!(process.free_page(0x3000_0000), Some(0x3000_0000));
+    }
+
+    /// A page somebody *has* mapped is not, and the answer clears the mapping
+    /// rather than landing inside it.
+    ///
+    /// **This is the case that could not fork.** `bin/linuxd` put a fork's
+    /// trampoline at a constant, a hosted program mapped that page with
+    /// `MAP_FIXED`, and the fork answered `ENOMEM` for a reason no caller could
+    /// act on.
+    #[test]
+    fn a_mapped_page_is_not_free_and_the_answer_clears_it() {
+        let mut process = Process::new(1, 0, 3, 1);
+        process
+            .mapped(Region {
+                at: 0x3000_0000,
+                pages: 4,
+                protection: 0,
+            })
+            .expect("room");
+        assert_eq!(process.free_page(0x3000_0000), Some(0x3000_4000));
+    }
+
+    /// Regions are not sorted, so **one pass is not enough**: clearing the
+    /// region that covers the candidate can land inside a region the pass had
+    /// already looked at. What guards this is the outer loop, not the order.
+    ///
+    /// Armed by doing a single pass, which answers `0x3000_1000` — the middle
+    /// of three mapped pages.
+    #[test]
+    fn a_free_page_clears_every_region_not_just_the_first() {
+        let mut process = Process::new(1, 0, 3, 1);
+        // Deliberately out of order: the second one is what a single pass over
+        // the first would land inside.
+        for (at, pages) in [(0x3000_1000, 1), (0x3000_0000, 1), (0x3000_2000, 1)] {
+            process
+                .mapped(Region {
+                    at,
+                    pages,
+                    protection: 0,
+                })
+                .expect("room");
+        }
+        let found = process.free_page(0x3000_0000).expect("somewhere is free");
+        assert_eq!(found, 0x3000_3000);
+        assert!(
+            !process
+                .regions
+                .iter()
+                .flatten()
+                .any(|region| region.at == found),
+            "and it is not the start of one either"
+        );
+    }
+
+    /// A region that ends at the candidate does not cover it.
+    #[test]
+    fn a_region_that_ends_where_the_search_starts_is_not_in_the_way() {
+        let mut process = Process::new(1, 0, 3, 1);
+        process
+            .mapped(Region {
+                at: 0x2FFF_F000,
+                pages: 1,
+                protection: 0,
+            })
+            .expect("room");
+        assert_eq!(process.free_page(0x3000_0000), Some(0x3000_0000));
     }
 
     /// A group's members are gathered, and a process that has ended is not one.

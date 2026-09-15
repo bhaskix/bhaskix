@@ -3318,6 +3318,28 @@ else
     status=1
 fi
 
+# **A fork by a process standing on the page a fork wants for itself.**
+#
+# `bin/linuxd` wrote a forked child's trampoline at a constant, and the comment
+# beside it argued the address was out of the ranges `mmap` hands out -- true of
+# a hint, and false of `MAP_FIXED`, where the caller names the address. A hosted
+# process that mapped that page could not fork at all, and the `ENOMEM` it got
+# named nothing it could act on. The trampoline goes on a free page now, found
+# by clearing the child's own regions.
+#
+# **Its own block, not nested inside the kill gate above.** It was written
+# inside it first, and arming it proved the mistake: the kernel prints one
+# `FAILED` line for the whole probe, the kill gate took its else branch, and
+# this assertion never ran at all -- a gate that cannot report its own failure.
+if grep -qE "hosted fork    a process holding 0x30000000 .* forked anyway, into pid [1-9][0-9]*" "$LOG"; then
+    pass "a hosted process holding the trampoline's own page could still fork"
+elif grep -qF "hosted kill    skipped" "$LOG"; then
+    pass "one cpu on this machine, so no hosted process forked from that page"
+else
+    fail "a process holding the trampoline's page could not fork: $(grep -aoE 'holding 0x[0-9a-f]+ it forked -?[0-9]+' "$LOG" | head -1)"
+    status=1
+fi
+
 # **A hosted process's domain capability is kept, and it is given back** — RFC
 # 0079 step 2. The adapter keeps a capability naming each forked process's
 # domain, because without one it cannot end a process and a `kill(2)` written

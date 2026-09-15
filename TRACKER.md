@@ -998,6 +998,77 @@ the distinction is in the table rather than in somebody's head.
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-09-15 (a program could not start in a domain that was empty)
+
+**`START` refused a fresh, empty domain because the slot's *last* occupant
+still had a thread on a runqueue.** `start_program` asked
+`sched::threads_in_domain` by slot id, and a thread told to stop is still
+`Ready`, `Running` or `Blocked` until it reaches a safe point — so a domain
+slot handed out in that window arrives with somebody else's thread counted
+against it. It asks `sched::live_threads_in_domain` now, which excludes dying
+threads: a freshly created live domain has never had a thread of its own, so a
+dying thread in its slot is always the last occupant's.
+
+**Found as a regression and traced to a defect older than the change that
+exposed it.** RFC 0079's kill probe forks five hosted domains; that shifted
+which slot `bin/sup`'s child landed on, and sup began failing to start it one
+boot in five. `tools/ci-count.py` put the signature at **no sighting in 4,585
+boots** since 20 August, and HEAD without the probe measured 8 of 8 clean — so
+the alignment was new and the race was not. With the fix: 8 of 8.
+
+**A print at the refusal is what settled it**, rather than argument: `domain 14
+has 0 thread(s)` — the count that refused the start was already back to zero by
+the time the next instruction asked again, which is a thread on its way out and
+not a domain in use.
+
+**Two things were built on the way and thrown away, which is the part worth
+recording.** The first was a wrong theory: that the probe left domains draining
+behind it, fixed by having the test wait for them. It was built, measured, and
+made things *worse* — and the wait never once timed out, which said plainly that
+the probe was leaving nothing behind. The second was a supervisor step that
+started a child immediately after ending one, meant to gate the window; it
+passed with the broken check in place four boots out of four, because
+`end_a_running_child` waits for `INFO` before reaping and the thread is long
+gone by then. **A test that cannot be made to fail proves nothing**, so it was
+removed rather than kept as decoration.
+
+What is gated instead is the clause itself. The live counter reads global queues
+and a per-CPU count and cannot run in a host test; the predicate it filters with
+can, and two host tests now hold it — a dying thread that is still schedulable
+must not count, and the other two clauses must still refuse. Armed by dropping
+`!dying`.
+
+### 2026-09-15 (the one page a fork needed, and a comment that argued it was safe)
+
+**A hosted process that mapped `0x30000000` could not `fork`, and it can now.**
+`bin/linuxd` wrote a forked child's trampoline at that fixed address, so
+`map_at_eager` could not place it when the caller was already there and `fork`
+answered `ENOMEM` for a reason no caller could act on. `Process::free_page`
+clears the child's own regions and answers the first page none of them covers;
+`SPAWN_THREAD` is given that. Nothing outside the fork needs to know where the
+trampoline went, because the child jumps out of it and never returns.
+
+**The comment beside the constant argued the collision was impossible**, on the
+grounds that `mmap` hands out addresses from `0x7000_0000_0000` and a program's
+image sits far below. True of an `mmap` asked for a *hint*, and silent about
+`MAP_FIXED`, where the caller names the address. Corrected in place.
+
+**Found by accident, which is worth recording**: RFC 0079's probe picked that
+same address for a page of its own and read `ENOMEM` for three boots before the
+fault address in the boot report named it.
+
+**Two armings that changed no behaviour, caught and replaced.** The first pair
+written for the new host tests both left every test green — one because the
+outer loop rescued the mutation, one because the mutated branch returned the
+same answer anyway. A test that cannot be made to fail proves nothing, and the
+reason one of them could not be armed was that the claim in its own doc comment
+was wrong; the claim was corrected rather than the test deleted.
+
+**And a gate nested where it could not report.** The boot gate was written
+inside the `hosted kill` block; arming it showed the kernel prints one `FAILED`
+line for the whole probe, that block took its else branch, and the assertion
+never ran. It has its own block now, and prints what it measured.
+
 ### 2026-09-15 (a sibling ends a sibling, and the answer was not the one guessed)
 
 **[RFC 0079](docs/rfc/0079-a-signal-a-process-may-send-another.md)'s third

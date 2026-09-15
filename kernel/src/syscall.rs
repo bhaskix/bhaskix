@@ -4238,7 +4238,14 @@ fn start_program(frame: &SyscallFrame) -> Outcome {
     // self-test ever increments, so it reads zero for every domain and this
     // check never fired. Found while building step 6, which needed the same
     // question answered properly.
-    if crate::sched::threads_in_domain(target.as_u32()) != 0 {
+    //
+    // **And dying threads do not count**, which is the difference between
+    // asking *does this slot hold a thread* and *may I start a program in this
+    // domain*. A domain slot is reused before the last thread of its previous
+    // occupant has reached a safe point, and counting that thread refused a
+    // program in a domain that was fresh and empty -- `bin/sup` one boot in
+    // five, once RFC 0079's probe shifted which slot its child landed on.
+    if crate::sched::live_threads_in_domain(target.as_u32()) != 0 {
         return Outcome::err(Status::SlotUnavailable);
     }
 

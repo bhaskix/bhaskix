@@ -364,7 +364,17 @@ fn end_a_running_child(image_bytes: u64) -> bool {
         [IMAGE, image_bytes, SPIN_FOREVER, 0],
     );
     if started != status::OK {
-        write(b"sup: could not start the child to end\n");
+        // **The status, because a failure that names no number is a failure
+        // nobody can act on.** This said only that the start did not happen.
+        write(b"sup: could not start the child to end, status ");
+        write_number(started);
+        write(b"\n");
+        // **`END` before `RELEASE`, or the slot stays held.** `RELEASE` is
+        // `reap` and refuses a domain that is still live -- and a domain that
+        // was created and never started is live. Releasing alone left the slot
+        // occupied and the next `SPAWN` answered `SLOT_UNAVAILABLE`, which is
+        // one failure reported as two with the second naming the wrong thing.
+        call(syscall::INVOKE, CHILD, method::END, [0; 4]);
         call(syscall::INVOKE, CHILD, method::RELEASE, [0; 4]);
         return false;
     }
@@ -436,6 +446,7 @@ fn end_a_running_child(image_bytes: u64) -> bool {
     write(b"sup: a child that never exits was ended and reaped, reason ");
     write_number(reason);
     write(b", and ending it twice was accepted\n");
+
     true
 }
 
