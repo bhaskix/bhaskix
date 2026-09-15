@@ -1324,7 +1324,28 @@ impl Domain {
         // 0017 `START`ed programs, a counter `syscall.rs` records as reading
         // "zero for every domain" outside one self-test -- so the scan is not
         // a second opinion, it is the only one.
-        self.threads > 0 || crate::sched::threads_in_domain_exact(self.id) > 0
+        //
+        // **And dying threads are not counted, as of 2026-09-15.** A domain
+        // slot is reused before the last thread of its previous occupant has
+        // reached a safe point, and a thread is identified with a domain by
+        // *slot id* -- so a freshly created domain inherits the predecessor's
+        // dying thread and this said `HasThreads` about a domain that has had
+        // none of its own. `TRACKER.md` §3 carries two specimens of exactly
+        // that, and the message one of them prints already named the mechanism
+        // as the thing to look at.
+        //
+        // **Safe, and for a narrower reason than it looks.** The rule exists so
+        // that no program is "half-run under one ABI and finished under
+        // another". A dying thread's domain has been destroyed, and
+        // `domain::destroy` completes the revocation before it returns -- so
+        // that thread holds nothing, will execute no more of its program, and
+        // is not a program this tag could finish differently.
+        //
+        // **This does not close those rows.** The same message names a second
+        // window: a thread on its way out that is not `Finished` yet is neither
+        // dying nor uncounted, and nothing here changes that. What it removes
+        // is the mechanism `START` was measured suffering from one door over.
+        self.threads > 0 || crate::sched::live_threads_in_domain(self.id) > 0
     }
 
     /// Sets the dialect — refused once the domain has a thread, because a

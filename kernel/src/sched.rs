@@ -5176,9 +5176,13 @@ pub fn threads_in_domain(domain: u32) -> usize {
 /// in a loop defeated the rule at will; it was moved to the blocking scan for
 /// that reason and this is the same move for the same reason.
 ///
-/// **Lock order**: this is called from `start_program` holding no domain-table
-/// lock — the `domain::with` that resolved the capability has returned — so it
-/// takes `Rank::SchedRunqueue` alone, which is sound from anywhere.
+/// **Lock order**, for both callers. `start_program` holds no domain-table lock
+/// at that point — the `domain::with` that resolved the capability has returned
+/// — so it takes `Rank::SchedRunqueue` alone. `Domain::has_threads` is called
+/// with the domain table held, `Rank::Domains` being **6** against the
+/// runqueue's **10**, which is the sanctioned direction and the one
+/// [`threads_in_domain_exact`] already blocks in. It would not be sound the
+/// other way round, and the rank detector is what proves it stays this way.
 #[must_use]
 pub fn live_threads_in_domain(domain: u32) -> usize {
     let online = percpu::online_count() as usize;

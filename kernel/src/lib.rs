@@ -9155,6 +9155,22 @@ fn a_hosted_process_ends_its_child(hhdm_base: u64, cpus: u32) -> bool {
     let standing = wait_until(|| word(&BYSTANDER_PA, 0) == Some(1), 20_000);
     let bystander_pid = word(&BYSTANDER_PA, 8).unwrap_or(0);
 
+    // **A domain with a thread still refuses a personality change**, asserted
+    // here because this is the one place in the boot with a domain that is
+    // certainly running: the bystander has just reported itself alive.
+    //
+    // `Domain::has_threads` stopped counting *dying* threads on 2026-09-15 —
+    // a reused slot handed a fresh domain its predecessor's dying thread, and
+    // the tag was refused for a domain that had never had one. Nothing
+    // asserted the rule the guard is *for*, so narrowing it could have removed
+    // it altogether and no gate would have noticed. This is that assertion: a
+    // live thread must still refuse, and the reason the rule exists is that a
+    // program half-run under one ABI and finished under another is not a state
+    // anyone can reason about.
+    let tag_refused = domain::with(bystander, |owner| {
+        owner.set_personality(domain::Personality::Linux)
+    }) == Some(Err(domain::DomainError::HasThreads));
+
     let Some(killer) = start("killer", ring3_killer, KILLER_CPU) else {
         retire_probe(bystander);
         println!("\x1b[91m    hosted kill    FAILED: the probe would not start\x1b[0m");
@@ -9201,6 +9217,7 @@ fn a_hosted_process_ends_its_child(hhdm_base: u64, cpus: u32) -> bool {
     retire_probe(bystander);
 
     let right = standing
+        && tag_refused
         && finished
         && survived
         && ended_them
@@ -9243,7 +9260,8 @@ fn a_hosted_process_ends_its_child(hhdm_base: u64, cpus: u32) -> bool {
         // Says what was measured. A gate that names a cause it has not measured
         // is the failure this tree keeps recording.
         println!(
-            "\x1b[91m    hosted kill    FAILED: standing {standing}, finished {finished}, \
+            "\x1b[91m    hosted kill    FAILED: standing {standing}, tag refused \
+             {tag_refused}, finished {finished}, \
              survived {survived}, kill accepted {ended_them}, status {term_status} and \
              {kill_status}, reachable {reachable} of 40, strangers reached {strangers}, \
              bystander's child {bystander_child} and wait4 on it answered \
