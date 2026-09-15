@@ -1937,6 +1937,25 @@ else
     status=1
 fi
 
+# RFC 0080 item 4: a domain may not end **itself** through a capability to it.
+#
+# That RFC recorded this refusal as implemented and **not gated**, and said so
+# rather than letting a reader assume it was tested because the others were:
+# no program in this system held a capability to its own domain, so nothing in
+# ring 3 could attempt it. `bin/sup` holds one now, in slot 6, for this.
+#
+# **The line existing at all is half the assertion.** A kernel that carried the
+# call out would take the supervisor's domain down inside the invocation, so
+# there would be no line to find and every supervisor gate after this one would
+# go with it. The other half is the status: `WRONG_OBJECT`, not `OK`, because a
+# kernel that accepted the call and did nothing would also leave it running.
+if grep -qF "sup: ending its own domain was refused and it kept running" "$LOG"; then
+    pass "a domain was refused the end of itself, and Exit remains the honest way out"
+else
+    fail "ending a domain's own domain was not refused: $(grep -aoE 'sup: (ending its own|after the refusal).{0,70}' "$LOG" | head -1)"
+    status=1
+fi
+
 # And that the children *ran*, which the supervisor's own counters cannot show.
 # Each writes this line through a console capability the supervisor granted it,
 # so counting them separates "the supervisor looped" from "the children did

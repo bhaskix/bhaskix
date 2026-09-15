@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | ✅ **ACCEPTED 2026-09-15 — built and gated, with one refusal implemented and not gated, which is said below rather than glossed.** A supervisor ends a child that spins in ring 3 making no system call, and the gate asserts it reported `Killed` rather than that the call returned `Ok`. |
+| **Status** | ✅ **ACCEPTED 2026-09-15 — built and gated, all four refusals included.** A supervisor ends a child that spins in ring 3 making no system call, and the gate asserts it reported `Killed` rather than that the call returned `Ok`. The self-`END` refusal was implemented and ungated when this was accepted; it is gated as of the same day — see testing plan item 4. |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | kernel (`syscall`, `domain`) |
 | **Milestone** | Phase 2 — core operating system |
@@ -115,14 +115,25 @@ cost is what it already is where the kernel calls it.
 3. ~~`END` on an already-ended domain answers `Ok`.~~ **Done.** The supervisor
    ends its child twice and the gate requires the second to be accepted; making
    that arm error turns it red.
-4. **`END` on a domain capability naming the caller's own domain is refused,
-   and that refusal is not gated.** It is implemented — the arm compares the
-   target against the caller and answers `WrongObject` — but **no program in
-   this system holds a capability to its own domain**, so nothing in ring 3 can
-   attempt it. Gating it means granting one to `bin/sup` for the purpose, which
-   is what `bin/shell`'s capability self-test does for every other refusal it
-   asserts, and is the cheapest way to close this. Stated here rather than left
-   for a reader to assume the refusal is tested because the others are.
+4. ~~**`END` on a domain capability naming the caller's own domain is refused,
+   and that refusal is not gated.**~~ **Gated 2026-09-15**, the way this item
+   proposed: `bin/sup` holds a capability to its own domain in slot 6, invokes
+   `END` on it, and requires `WRONG_OBJECT`.
+
+   **Two halves, because either alone would pass against a broken kernel.** The
+   line existing at all is the first: a kernel that carried the call out would
+   take the supervisor's domain down *inside* the invocation, so there would be
+   no line to find. Arming it — removing the comparison — produces exactly
+   that, and takes `the supervisor did not complete its restarts` with it. The
+   status is the second: a kernel that answered `OK` and did nothing would
+   leave the supervisor running just the same.
+
+   **What slot 6 grants beside the refusal**, said rather than waved at: on its
+   own domain the other methods are already refused or already pointless.
+   `RELEASE` is `reap` and refuses while the domain is live, `START` refuses a
+   domain that has threads and this one is running, and `GRANT` to itself
+   copies a capability it already holds. What it adds is the ability to *ask* —
+   and to be told no.
 5. Host tests for `domain::destroy`'s existing contract are already there; this
    adds none, because it adds no mechanism.
 
@@ -155,9 +166,10 @@ cost is what it already is where the kernel calls it.
    the one it started with — and it means the gate in the testing plan should
    allow a tick before asserting the counter has stopped, rather than reading
    it immediately and calling a scheduling delay a failure.
-2. **Whether a domain may end itself** by invoking `END` on a capability to
-   itself. `Exit` already exists for that and is the honest way; this should
-   probably refuse, and the refusal wants a test.
+2. ~~**Whether a domain may end itself** by invoking `END` on a capability to
+   itself.~~ **Answered and tested.** It refuses, `Exit` remains the honest way
+   out, and the test the last clause of this question asked for is testing plan
+   item 4 above.
 3. **What a hosted process's `wait4` reports** when the adapter ends a domain
    this way is RFC 0079's question, not this one, but the two want reading
    together.

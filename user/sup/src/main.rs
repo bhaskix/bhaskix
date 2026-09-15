@@ -56,6 +56,20 @@ const CHILD: u64 = 4;
 /// anywhere it could not already write.
 const SCRATCH: u64 = 5;
 
+/// A `Domain` capability naming **this program's own domain** — RFC 0080.
+///
+/// It is here for one refusal. `END` on a capability naming the caller's own
+/// domain is refused in the nucleus, and until this slot existed no program in
+/// this system held a capability to its own domain, so nothing in ring 3 could
+/// attempt it: the refusal was implemented and ungated, which that RFC said
+/// out loud rather than leaving a reader to assume it was tested because the
+/// others were.
+///
+/// **`Exit` is the honest way for a program to stop**, and it unwinds the
+/// caller's own thread at a safe point. `END` on yourself would destroy the
+/// address space the reply is going back to.
+const ITSELF: u64 = 6;
+
 /// Where the child's memory is reached, and with what.
 ///
 /// Chosen to be somewhere the child has **not** mapped, so `MAP_AT` is what
@@ -283,6 +297,41 @@ fn run_once(image_bytes: u64) -> Option<u64> {
 /// The entry word `bin/probe` reads as "spin in ring 3 for ever, making no
 /// system call" — a child that will never end on its own.
 const SPIN_FOREVER: u64 = 2;
+
+/// Asks the nucleus to end **this program's own domain**, and requires a
+/// refusal — RFC 0080's testing plan item 4.
+///
+/// **Why a refusal is the right answer rather than a convenience.** `END` is
+/// carried out on the domain the *caller* is in: it would destroy the address
+/// space the reply is going back to, and free the stack the calling thread is
+/// standing on. `Exit` already exists for a program that wants to stop, and it
+/// unwinds the caller's own thread at a safe point, which is the difference.
+///
+/// **The proof is that this function returns.** A kernel that carried the call
+/// out would take the domain down inside the invocation, so there would be no
+/// line printed and no `true` to return — which is exactly what arming it
+/// produces. Asserting the status as well as the survival, because a kernel
+/// that answered `OK` and did nothing would also return.
+fn ending_itself_is_refused() -> bool {
+    let (refused, _) = call(syscall::INVOKE, ITSELF, method::END, [0; 4]);
+    if refused != status::WRONG_OBJECT {
+        write(b"sup: ending its own domain answered ");
+        write_number(refused);
+        write(b", wanted ");
+        write_number(status::WRONG_OBJECT);
+        write(b"\n");
+        return false;
+    }
+    // Still here, and still able to use the capability it was refused with:
+    // the refusal cost it nothing.
+    let (asked, reason) = call(syscall::INVOKE, ITSELF, method::INFO, [0; 4]);
+    if asked != status::OK || reason != 0 {
+        write(b"sup: after the refusal its own domain read as ended\n");
+        return false;
+    }
+    write(b"sup: ending its own domain was refused and it kept running\n");
+    true
+}
 
 /// Ends a child that is still running, and proves it was still running —
 /// RFC 0080.
@@ -690,6 +739,12 @@ extern "C" fn _start(image_bytes: u64) -> ! {
     // lifecycle and this one proves the operation that was missing from it.
     if !end_a_running_child(image_bytes) {
         write(b"sup: a running child could not be ended\n");
+    }
+
+    // RFC 0080's fourth testing-plan item, which that RFC recorded as
+    // implemented and **not** gated. It is gated now.
+    if !ending_itself_is_refused() {
+        write(b"sup: ending its own domain was not refused\n");
     }
 
     let mut started = 0;

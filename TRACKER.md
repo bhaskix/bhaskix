@@ -998,6 +998,30 @@ the distinction is in the table rather than in somebody's head.
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-09-15 (the refusal that was implemented and could not be attempted)
+
+**[RFC 0080](docs/rfc/0080-ending-a-domain-that-is-still-running.md)'s fourth
+testing-plan item is closed.** `END` on a capability naming the caller's own
+domain has been refused in the nucleus since the day that RFC landed, and
+nothing could attempt it: **no program in this system held a capability to its
+own domain**. The RFC recorded that plainly rather than letting a reader assume
+the refusal was tested because the other three were. `bin/sup` holds one now,
+in slot 6, and the boot asserts the refusal.
+
+**Two halves, because either alone passes against a broken kernel.** The line
+existing at all is the first — a kernel that carried the call out would take the
+supervisor's domain down *inside* the invocation, so there would be no line to
+find. Armed by removing the comparison: no line, and `the supervisor did not
+complete its restarts` went red beside it. The status is the second: a kernel
+that answered `OK` and did nothing would leave the supervisor running too, so
+the gate reads `WRONG_OBJECT` rather than "it survived".
+
+**What slot 6 grants beside the refusal, stated rather than waved at.** On its
+own domain the other methods are already refused or already pointless:
+`RELEASE` is `reap` and refuses while the domain is live, `START` refuses a
+domain that has threads and this one is running, and `GRANT` to itself copies a
+capability it already holds. What it adds is the ability to ask, and be told no.
+
 ### 2026-09-15 (a hosted process can end another, and only the ones it may)
 
 **[RFC 0079](docs/rfc/0079-a-signal-a-process-may-send-another.md) is accepted.**

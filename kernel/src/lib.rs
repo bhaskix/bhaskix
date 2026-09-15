@@ -21917,6 +21917,36 @@ fn start_supervisor(cpu: u32, hhdm_base: u64) -> Result<(), &'static str> {
         .map_err(|_| "the supervisor's scratch page would not be created")?;
     let scratch_cap = shared::name(scratch).map_err(|_| "the scratch page would not be named")?;
 
+    // Slot 6: a `Domain` capability naming **the supervisor's own domain**, and
+    // it exists for one refusal — RFC 0080's testing plan item 4.
+    //
+    // `END` on a capability naming the caller's own domain is refused in the
+    // nucleus, and until this slot existed **no program in this system held a
+    // capability to its own domain**, so nothing in ring 3 could attempt it and
+    // the refusal was implemented and ungated. That RFC said so rather than
+    // letting a reader assume the refusal was tested because the others were;
+    // this is the cheapest way to close it, and it is what `bin/shell`'s
+    // capability self-test does for every other refusal it asserts.
+    //
+    // **What it grants beside the refusal, said rather than waved at.** The
+    // other domain methods are `BIND`, `INFO`, `GRANT`, `START`, `SPAWN` and
+    // `RELEASE`. On its own domain they are already refused or already
+    // pointless: `RELEASE` is `reap` and refuses while the domain is live,
+    // `START` refuses a domain that has threads and this one is running, and
+    // `GRANT` to itself copies a capability it already holds. The one thing
+    // this adds is the ability to *ask* — and to be told no.
+    let own = cap::with_arena(|arena| {
+        let root = arena
+            .insert_root(
+                cap::ObjectRef::new(cap::ObjectKind::Domain, u64::from(realm.as_u32())),
+                cap::Rights::ALL,
+                0,
+            )
+            .ok()?;
+        arena.derive(root, cap::Rights::ALL, 0).ok()
+    })
+    .ok_or("the supervisor's own-domain capability would not be created")?;
+
     // Slot 4 is left empty: it is where each child's `Domain` capability lands
     // and is given back from.
     if domain::with(realm, |owner| {
@@ -21925,6 +21955,7 @@ fn start_supervisor(cpu: u32, hhdm_base: u64) -> Result<(), &'static str> {
             && owner.cspace.install_at(2, staged).is_ok()
             && owner.cspace.install_at(3, signal).is_ok()
             && owner.cspace.install_at(5, scratch_cap).is_ok()
+            && owner.cspace.install_at(6, own).is_ok()
     }) != Some(true)
     {
         return Err("the supervisor's capabilities would not install");
