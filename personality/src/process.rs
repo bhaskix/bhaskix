@@ -492,6 +492,53 @@ impl Processes {
         self.slots.iter().flatten().find(|p| p.pid == pid)
     }
 
+    /// Whether `caller` may send a signal to `target` — RFC 0079.
+    ///
+    /// **The rule is the process tree, because uids are not available and
+    /// inventing them is refused.** Linux answers this with real and effective
+    /// uids; [RFC 0031](../docs/rfc/0031-linux-compatibility-as-an-adapter.md)
+    /// is explicit that Linux UID 0 is not Bhaskix authority, so a rule phrased
+    /// in uids would either lie about what it checks or invent an authority
+    /// this system does not have.
+    ///
+    /// A caller may signal itself, any descendant of itself, and any member of
+    /// its own process group. That is what job control needs and no more, and
+    /// it is a property of a tree this adapter already maintains rather than a
+    /// new table to keep in step.
+    ///
+    /// **A caller that is not a process this adapter serves may signal
+    /// nothing.** There is no "unknown caller" case worth being generous
+    /// about: every hosted syscall arrives with a domain this table can name.
+    ///
+    /// The walk upward is depth-limited. `ppid` is set at fork and cleared to
+    /// zero when a parent goes, so a cycle should be impossible — and nothing
+    /// asserts that, so a bound is cheaper than trusting it. A tree deeper than
+    /// the table can hold cannot exist, so the limit costs nothing real.
+    #[must_use]
+    pub fn may_signal(&self, caller: u32, target: u32) -> bool {
+        let (Some(from), Some(to)) = (self.by_pid(caller), self.by_pid(target)) else {
+            return false;
+        };
+        if from.pid == to.pid || from.pgid == to.pgid {
+            return true;
+        }
+        // Upward from the target: is the caller one of its ancestors?
+        let mut at = to.ppid;
+        for _ in 0..self.slots.len() {
+            if at == 0 {
+                return false;
+            }
+            if at == caller {
+                return true;
+            }
+            let Some(parent) = self.by_pid(at) else {
+                return false;
+            };
+            at = parent.ppid;
+        }
+        false
+    }
+
     /// As [`Self::by_pid`], for changing it.
     pub fn by_pid_mut(&mut self, pid: u32) -> Option<&mut Process> {
         self.slots.iter_mut().flatten().find(|p| p.pid == pid)
@@ -721,6 +768,69 @@ mod tests {
             )
             .expect("a fresh table has room");
         table
+    }
+
+    /// RFC 0079's rule, one clause at a time.
+    ///
+    /// The asymmetry is the part worth asserting: a parent may signal a child
+    /// and a child may **not** signal its parent. A rule that walked the tree
+    /// in either direction would read as "the same family" and would hand a
+    /// compromised child the authority to end the shell that started it.
+    #[test]
+    fn a_process_may_signal_its_own_tree_and_nothing_else() {
+        let mut table = Processes::new();
+        let parent = table.admit(0, 3, 1).expect("room");
+        let child = table.admit(parent, 4, 1).expect("room");
+        let grandchild = table.admit(child, 5, 1).expect("room");
+        let stranger = table.admit(0, 6, 1).expect("room");
+
+        assert!(table.may_signal(parent, parent), "itself");
+        assert!(table.may_signal(parent, child), "its child");
+        assert!(table.may_signal(parent, grandchild), "its grandchild");
+
+        // Upward is refused, which is the whole point of naming the rule
+        // "descendants" rather than "relatives".
+        assert!(!table.may_signal(child, parent), "its parent");
+        assert!(!table.may_signal(grandchild, parent), "its grandparent");
+
+        // Sideways is refused too: a stranger shares no ancestor and no group.
+        assert!(!table.may_signal(stranger, parent));
+        assert!(!table.may_signal(parent, stranger));
+    }
+
+    /// A group member that is not a descendant is still signallable, because
+    /// that is what `kill(-pgid)` and job control are for.
+    #[test]
+    fn a_process_may_signal_its_own_group() {
+        let mut table = Processes::new();
+        let shell = table.admit(0, 3, 1).expect("room");
+        let other = table.admit(0, 4, 1).expect("room");
+        // Unrelated by descent: `admit` gives each its own group.
+        assert!(!table.may_signal(shell, other));
+        // Put them in one group, as `setpgid` would.
+        let group = table.by_pid(shell).expect("live").pgid;
+        table.by_pid_mut(other).expect("live").pgid = group;
+        assert!(table.may_signal(shell, other), "a group member");
+        assert!(table.may_signal(other, shell), "and symmetrically");
+    }
+
+    /// A pid this adapter does not serve is refused, from either side.
+    ///
+    /// **Refused rather than trusted**: `may_signal` is the only thing between
+    /// a hosted process and another's domain, so an unknown pid must not fall
+    /// through to a permissive default.
+    #[test]
+    fn an_unknown_pid_may_neither_signal_nor_be_signalled() {
+        let mut table = Processes::new();
+        let live = table.admit(0, 3, 1).expect("room");
+        let absent = 9999;
+        assert!(
+            table.by_pid(absent).is_none(),
+            "the fixture means what it says"
+        );
+        assert!(!table.may_signal(live, absent));
+        assert!(!table.may_signal(absent, live));
+        assert!(!table.may_signal(absent, absent));
     }
 
     #[test]
