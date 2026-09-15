@@ -142,7 +142,7 @@ whose threads are running on other CPUs, and whether a caller holding the
 capability is sufficient or a further check belongs there.
 
 Until that exists, `may_signal` is a rule with nothing to enforce it, and step 2
-cannot be written honestly.
+cannot be written honestly. Specified as [RFC 0080](0080-ending-a-domain-that-is-still-running.md), which carries the argument for exposing `domain::destroy` and the three questions it opens — chiefly what ending a domain means when its threads are running on other CPUs, which `spawn`'s failure path never has to face.
 
 **What does not change.** The boundary is still the process tree, checked in
 the adapter by `may_signal`, and a hosted process still cannot reach another's
