@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Draft |
+| **Status** | 🔨 **Draft — step 1 built 2026-09-15; step 2 blocked on a decision this RFC has to make.** `may_signal` is in `bhaskix-personality` with three armed tests. The syscall cannot follow until the adapter has a way to end a hosted domain, which it does not have today — see *Security implications*. |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | libc (`bin/linuxd`) |
 | **Milestone** | Phase 2 — Linux personality (L1) |
@@ -77,7 +77,7 @@ the authority rule refuses, and no shell needs it to run a job.
 
 | | |
 |---|---|
-| **Give the adapter a capability per hosted domain and check that** | It already holds one; the check would be `true` for every pair and would document a boundary that does not exist. |
+| **Give the adapter a capability per hosted domain and check *that* instead of the tree** | Written here first as *"it already holds one"*, which is false — see *Security implications*. It holds none, and it will have to hold one for `kill` to work at all. But holding one is not a rule: the adapter would hold a capability to **every** hosted domain, so a check against it is `true` for every pair and documents a boundary that does not exist. The tree is still the rule; the capability is only the means. |
 | **Map Linux uids onto something** | RFC 0031 refuses this, and rightly: it would be the first thing in the adapter that invented authority rather than translating it. |
 | **`EPERM` for a pid outside the rule** | Tells a caller that a process it may not signal exists. `ESRCH` is both the safer answer and the one Linux gives for a pid that is gone. |
 
@@ -92,13 +92,40 @@ the authority rule refuses, and no shell needs it to run a job.
 
 ## Security implications
 
-**The boundary is the process tree, and it is checked in the adapter.** A
-hosted process cannot reach another's domain directly — it has no capability
-naming it — so this is the adapter exercising authority it already holds on a
-caller's behalf, which is what every other hosted syscall does. The new
-exposure is that a compromised hosted process can end its own descendants and
-group members, which is strictly less than a compromise of the adapter already
-implies.
+**The adapter does not hold the authority this RFC assumed it held**, and that
+is the largest thing found while drafting it. The first version of this section
+said `kill` would be "the adapter exercising authority it already holds on a
+caller's behalf, which is what every other hosted syscall does". It is not.
+
+`adapter::CHILD` is **one slot**, documented as *"where an `execve` holds the
+domain it is building, one at a time"*, and `answer_fork` does
+`method::DELETE` on it as soon as the child is built. The adapter therefore
+holds **no capability naming a running hosted process's domain**, and in a
+system whose whole claim is that there is no ambient authority, that means it
+cannot end one. A `kill` implemented today could record an exit and wake the
+parent's `wait4` while the target kept running — which is not a signal, it is
+a lie told to the parent.
+
+**So step 2 is blocked on a decision this RFC has to make rather than assume.**
+Three ways out, none free:
+
+| | |
+|---|---|
+| **The adapter retains a domain capability per hosted process** | Honest and simple, and it widens what `security.md` T11 prices: a compromise of the adapter would gain the power to end every hosted process, where today it gains their files and descriptors. It also costs a capability slot per process, against a fixed table. |
+| **Cooperative delivery: the target notices a pending signal at its next syscall** | Costs the adapter nothing and cannot implement `SIGKILL`, which must be immediate and uncatchable. A process spinning without syscalls would ignore it for ever, which is a worse lie than not having `kill`. |
+| **The nucleus lets a domain's creator end it without holding a capability** | Ambient authority by another name, and refused on the same grounds RFC 0031 refuses Linux UID 0. |
+
+**The first is the only honest one**, and it should be argued for what it costs
+rather than slipped in: the adapter would keep, for each hosted process, a
+capability it needs only to kill. Whether that is worth `kill(2)` is the
+decision, and it belongs in this RFC before any code.
+
+**What does not change.** The boundary is still the process tree, checked in
+the adapter by `may_signal`, and a hosted process still cannot reach another's
+domain directly. The new exposure, if the first option is taken, is that a
+compromised *adapter* can end hosted processes — which a compromise of the
+adapter arguably implies anyway, and which T11 should say out loud rather than
+leave to a reader.
 
 **Containment must be asserted, not assumed.** Two boot gates below assert a
 refusal rather than a permission, for the reason RFC 0060's write path does: a
