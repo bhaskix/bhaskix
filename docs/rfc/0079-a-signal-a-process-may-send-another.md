@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | 🔨 **Draft — step 1 built 2026-09-15; step 2 blocked on a decision this RFC has to make.** `may_signal` is in `bhaskix-personality` with three armed tests. The syscall cannot follow until the adapter has a way to end a hosted domain, which it does not have today — see *Security implications*. |
+| **Status** | 🔨 **Draft — step 1 built 2026-09-15; step 2 blocked on a decision this RFC has to make.** `may_signal` is in `bhaskix-personality` with three armed tests. The syscall cannot follow until **the nucleus grows a way to end a live domain**, which no ring-3 method does today — retaining a capability was chosen and is necessary without being sufficient. See *Security implications*. |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | libc (`bin/linuxd`) |
 | **Milestone** | Phase 2 — Linux personality (L1) |
@@ -117,8 +117,32 @@ Three ways out, none free:
 
 **The first is the only honest one**, and it should be argued for what it costs
 rather than slipped in: the adapter would keep, for each hosted process, a
-capability it needs only to kill. Whether that is worth `kill(2)` is the
-decision, and it belongs in this RFC before any code.
+capability it needs only to kill. **Chosen 2026-09-15.**
+
+### And a capability is necessary without being sufficient
+
+Retaining one gives the adapter something to name. It does not give it anything
+to *do*, and that was found only by going to build it.
+
+**Ring 3 cannot end a running domain.** The whole domain method set the syscall
+layer accepts is `BIND`, `INFO` and `RELEASE`. `RELEASE` is `domain::reap`,
+which refuses while `domain.live` — it collects a domain that has already
+ended. `DELETE` empties a capability slot and leaves the object alone;
+`cap::remove` is `self.slots.get_mut(index)?.take()`. `domain::destroy` exists
+and is what would be wanted, and its only callers are kernel-internal — in
+`spawn`, as the cleanup path when creation fails.
+
+So step 2 needs a **new nucleus operation**: a method on a `Domain` capability
+that ends a live domain. `domain::destroy` already promises what makes that
+safe — *"the revocation completes before this returns … a destroyed domain's
+grants are dead everywhere, not scheduled for cleanup"* — so this is exposing
+an existing, careful primitive rather than writing a new one. It is still a new
+authority in the nucleus and wants its own argument: what it means for a domain
+whose threads are running on other CPUs, and whether a caller holding the
+capability is sufficient or a further check belongs there.
+
+Until that exists, `may_signal` is a rule with nothing to enforce it, and step 2
+cannot be written honestly.
 
 **What does not change.** The boundary is still the process tree, checked in
 the adapter by `may_signal`, and a hosted process still cannot reach another's
