@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Draft |
+| **Status** | 🔨 **Draft 2026-09-15.** Its condition of acceptance — what ending a domain means when threads are running on other CPUs — is **answered**: `mark_domain_dying` marks and wakes, a dying thread stops at a safe point, and an interrupt returning to ring 3 bounds that by one tick. No code yet. |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | kernel (`syscall`, `domain`) |
 | **Milestone** | Phase 2 — core operating system |
@@ -119,12 +119,33 @@ cost is what it already is where the kernel calls it.
 
 ## Unresolved questions
 
-1. **A domain whose threads hold kernel locks.** `destroy` is called today only
-   from `spawn`'s failure path, where the domain has no threads yet. Ending one
-   with threads running on other CPUs is the case this opens, and the rule that
-   makes it safe — that a lock holder is never descheduled, so a thread either
-   holds no lock or is running — should be checked rather than assumed before
-   this is accepted.
+1. ~~**A domain whose threads hold kernel locks.**~~ **Answered from the source,
+   2026-09-15, and the design is already there.** `domain::end` calls
+   `sched::mark_domain_dying`, which takes every runqueue lock in turn —
+   blocking rather than `try_lock`, because *"skipping a contended queue loses
+   a thread, and a lost thread is a domain that reports itself destroyed while
+   part of it is still running"* — marks each of the domain's threads `dying`,
+   and wakes the blocked ones so they can notice.
+
+   A thread is then stopped at a **safe point**, not where it stands.
+   `syscall.rs` states why: killing it the moment its domain died *"would
+   instead catch it mid-derivation or half-way through a rendezvous, and free
+   the stack it was standing on"*. The two safe points are the return from a
+   system call and an interrupt returning to ring 3, and the second bounds the
+   first: a ring 3 thread that is not making system calls *"is caught within a
+   tick"*.
+
+   And a dying thread may not sleep. `sched` asserts it: *"a thread told to
+   stop must not go to sleep: sleeping is the one state with no next safe
+   point"*.
+
+   **So the answer this RFC needed is that ending a domain with threads on
+   other CPUs is bounded by one timer tick**, and the invariant that makes it
+   safe is already written and already tested. What this RFC exposes is a
+   caller for a mechanism that is finished, which is a much smaller claim than
+   the one it started with — and it means the gate in the testing plan should
+   allow a tick before asserting the counter has stopped, rather than reading
+   it immediately and calling a scheduling delay a failure.
 2. **Whether a domain may end itself** by invoking `END` on a capability to
    itself. `Exit` already exists for that and is the honest way; this should
    probably refuse, and the refusal wants a test.
@@ -139,5 +160,5 @@ cost is what it already is where the kernel calls it.
 2. The supervisor gate: spawn a looping child, end it, assert it stopped.
    Watched red by dropping the `END`.
 3. `INFO`-after-`END` and the already-ended case, each armed.
-4. Question 1 answered in writing before this is accepted, not after.
+4. ~~Question 1 answered in writing before this is accepted, not after.~~ Done before any code, and it removed the RFC's largest unknown rather than confirming it.
 5. `TRACKER.md` PM1 and §7, `docs/rfc/0017`, `docs/security.md` T11.
