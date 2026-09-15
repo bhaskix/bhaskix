@@ -147,3 +147,21 @@ IPI is an inference from that rate, not a direct measurement of one.
 per-CPU pending-base slot the interrupt-return path can consume without taking the runqueue — would
 close the remaining 4%. That is a design change rather than a constant, and it is named here so it
 is a known cost rather than a surprise.
+
+### Two facts that step needs, established 2026-09-15
+
+**"Interrupt-return path" is load-bearing and not a synonym for "handler".** The handler can land
+part-way through a context switch: a `SpinLock` in this kernel leaves interrupts enabled while it is
+held — `claim_uninterrupted` covers two bookkeeping stores and nothing else — so an IPI can arrive
+while the switch code holds the runqueue lock and `queue.current` is between two values. That is
+exactly what `refresh_fs_base_here`'s `try_lock` refuses to read, and the 3.9% above is the price of
+refusing it. A pending slot consumed *in the handler* would buy speed by reading the thing the
+`try_lock` exists to avoid.
+
+**The slot cannot be a bare base.** It has to carry the thread id and be checked against whoever is
+actually about to run, or a thread that migrated between the send and the interrupt gets another
+thread's TLS base — a thread reading another's thread-local storage, which is worse than the window
+this RFC closes. And the obvious check is not free: `current_thread_id()` takes the runqueue lock
+too, so the step needs a lock-free per-CPU record of who is running, which is a **second source of
+truth for a fact the runqueue already owns**. That is the real cost of this step, and it is a design
+question rather than an implementation detail.
