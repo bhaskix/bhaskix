@@ -999,6 +999,33 @@ the distinction is in the table rather than in somebody's head.
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-09-16 (per-CPU state read after a switch — the whole tree, once)
+
+**One lens, applied everywhere it could apply, and recorded so it is not
+applied again.** Building the frame checkpoint produced the fault twice: state
+kept per CPU, written before `sched::preempt` and read after it, when a
+preempted thread can be stolen and resume elsewhere. Every other place the
+kernel indexes something by `percpu::cpu_id()` was then read with that question.
+
+| site | verdict |
+|---|---|
+| `time::arm_for` / `cancel_for` | **A real window, fixed.** The timer went in the arming CPU's list and the cancel looked only where the thread woke up. See the entry above |
+| `frames::with_reserve` | Safe, and its own comment says why: interrupts are masked across the whole closure, so nothing can switch inside it and the reserve is never carried across one |
+| `telemetry::note_domain` / `domain_hint` | Safe by intent — it is a fact about the *CPU* ("the domain now running here"), not about a thread, so reading it after a migration is correct rather than stale |
+| `telemetry`'s ring producers | Safe: each reads the index and uses it immediately, with no blocking call in between; a migration mid-sequence costs a misfiled telemetry event and nothing else |
+| `vm.rs`'s `SPACES.owner() == cpu_id()` | Safe: *does this CPU hold the lock right now*, which is a current-CPU question by construction |
+
+**The verdicts are as much the point as the finding.** Four of the five are
+safe, and three of those are safe *for a reason worth knowing* — masked
+interrupts, a fact about the CPU rather than the thread, and no blocking call in
+the window. A future reader who has this list does not have to re-derive them,
+and a future *writer* has three worked examples of what makes per-CPU state
+sound.
+
+**What this sweep is not**: a gate. Nothing stops the next per-CPU index from
+being added on either side of a block, and a static check for it would have to
+know which calls can block, which is the whole difficulty.
+
 ### 2026-09-15 (the other half of the window, ninety lines apart)
 
 **A thread that has left its domain's books but has not finished yet no longer
