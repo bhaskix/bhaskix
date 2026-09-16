@@ -5143,9 +5143,11 @@ fn implausible_frame_report() {
     // path prints the same number; a boot that records one and survives prints
     // it here.
     let reached = bhaskix_arch::trap::frame_last_good_phase();
+    let entry_vector = bhaskix_arch::trap::frame_entry_vector();
     println!(
         "\x1b[91m    frame check    {count} interrupt frame(s) this machine could not return \
-         through -- the first was {when}, last intact at phase {reached}: vector {vector:#x}, \
+         through -- the first was {when}, last intact at phase {reached} of a dispatch that \
+         arrived on vector {entry_vector}: vector {vector:#x}, \
          rip {rip:#018x}, cs {cs:#x}, rflags {rflags:#x}, rsp {rsp:#018x}, ss {ss:#x}\x1b[0m"
     );
 }

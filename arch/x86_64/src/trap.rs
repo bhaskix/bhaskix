@@ -182,9 +182,12 @@ unsafe extern "C" fn bhaskix_trap_dispatch(frame: *mut TrapFrame) {
     let arrived = unsafe { implausible(&*frame) };
     // A fresh dispatch starts with nothing reached yet, so a witness taken here
     // cannot inherit the last dispatch's number.
-    if let Some(slot) = FRAME_PHASE.get(crate::percpu::cpu_id() as usize) {
-        slot.store(0, Ordering::Relaxed);
-    }
+    // SAFETY: as the read above -- the stubs guarantee a valid frame.
+    let entry_vector = unsafe { (*frame).vector };
+    let address = frame as u64;
+    let slot = phase_slot(address);
+    PHASE_KEY[slot].store(address, Ordering::Relaxed);
+    PHASE_VALUE[slot].store(entry_vector << 32, Ordering::Relaxed);
 
     // SAFETY: the stubs guarantee `frame` points to a fully initialised
     // `TrapFrame` on the current stack, valid for the duration of this call
@@ -224,33 +227,73 @@ unsafe extern "C" fn bhaskix_trap_dispatch(frame: *mut TrapFrame) {
                 slot.store(value, Ordering::Relaxed);
             }
             FRAME_ON_ENTRY.store(arrived.is_some(), Ordering::Relaxed);
-            FRAME_LAST_GOOD.store(
-                FRAME_PHASE
-                    .get(crate::percpu::cpu_id() as usize)
-                    .map_or(0, |slot| slot.load(Ordering::Relaxed)),
-                Ordering::Relaxed,
-            );
+            let (phase, vector) = phase_of(address).unwrap_or((0, u64::MAX));
+            FRAME_LAST_GOOD.store(phase, Ordering::Relaxed);
+            FRAME_WITNESS_VECTOR.store(vector, Ordering::Relaxed);
         }
     }
 }
 
-/// The last phase of a dispatch at which this CPU's frame was still plausible.
+/// Where a dispatch has got to with its frame still plausible, keyed by frame.
 ///
-/// **Because "wrong on the way out" is a handler, and a handler is not a
-/// place.** Bracketing the dispatch says the corruption happened inside it;
-/// the timer handler alone bumps counters, acknowledges the APIC, expires
-/// timers and then **preempts** — and the preempt switch does not return until
-/// the thread is scheduled again, with this frame sitting on its kernel stack
-/// the whole time. Those are very different suspects and the bracket cannot
-/// tell them apart.
+/// **Not keyed by CPU, and that was the first attempt.** `sched::preempt` does
+/// not return until the thread is scheduled again — and a preempted thread can
+/// be *stolen*, so the switch returns on a **different CPU** from the one the
+/// interrupt arrived on. A per-CPU slot then has a checkpoint written to one
+/// CPU's entry and read from another's, which reports a phase and a vector
+/// belonging to some other dispatch. Caught by arming the reschedule arm and
+/// watching it say `dispatched from the timer`.
 ///
-/// A caller marks a point it has reached with the frame still intact, and the
-/// witness carries the highest one. See `frame_checkpoint`.
-static FRAME_PHASE: [core::sync::atomic::AtomicU64; crate::percpu::MAX_CPUS] =
-    [const { core::sync::atomic::AtomicU64::new(0) }; crate::percpu::MAX_CPUS];
+/// The frame's address is unique among dispatches in flight — it is a position
+/// on a kernel stack that is in use — so it is the identity this wants. The
+/// full address is stored beside the value, so a slot collision reads as *not
+/// mine* rather than as somebody else's number: the same discipline
+/// `sched::LAST_MARK` is written to, and for the same reason.
+static PHASE_KEY: [core::sync::atomic::AtomicU64; PHASE_SLOTS] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; PHASE_SLOTS];
+
+/// `phase | entry vector << 32` for the frame in [`PHASE_KEY`]'s matching slot.
+static PHASE_VALUE: [core::sync::atomic::AtomicU64; PHASE_SLOTS] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; PHASE_SLOTS];
+
+/// Enough for every CPU to have a dispatch and a nested one in flight.
+const PHASE_SLOTS: usize = 256;
+
+/// Which slot a frame's address lands in.
+///
+/// **Two ranges of bits, because either alone collides on purpose.** Kernel
+/// stacks are 64 KiB apart, so frames on *different* stacks at the same depth
+/// share every bit below 16 — a hash of the low bits alone puts every CPU's
+/// in-flight frame in one slot, which is exactly the set that must not
+/// collide. It was written that way first and the arming caught it: a
+/// deliberately corrupted frame read back as `no checkpoint` because a
+/// concurrent dispatch had claimed the slot. The high bits alone have the
+/// mirror fault, aliasing a dispatch with one nested inside it on the same
+/// stack.
+const fn phase_slot(frame: u64) -> usize {
+    (((frame >> 4) ^ (frame >> 16)) as usize) % PHASE_SLOTS
+}
+
+/// The phase and entry vector recorded for this frame, if the slot is still its.
+fn phase_of(frame: u64) -> Option<(u64, u64)> {
+    let slot = phase_slot(frame);
+    if PHASE_KEY[slot].load(Ordering::Relaxed) != frame {
+        return None;
+    }
+    let packed = PHASE_VALUE[slot].load(Ordering::Relaxed);
+    Some((packed & 0xffff_ffff, packed >> 32))
+}
 
 /// The phase the first implausible frame had last been good at.
 static FRAME_LAST_GOOD: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// The vector the first implausible frame's dispatch arrived on.
+///
+/// **The frame's own `vector` field cannot answer this**: in every specimen of
+/// the defect this exists for, that field is part of what was overwritten. This
+/// is the copy read on entry.
+static FRAME_WITNESS_VECTOR: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(u64::MAX);
 
 /// Records that the frame was still plausible at `phase`.
 ///
@@ -264,13 +307,18 @@ pub fn frame_checkpoint(frame: &TrapFrame, phase: u64) {
     if implausible(frame).is_some() {
         return;
     }
-    let Some(slot) = FRAME_PHASE.get(crate::percpu::cpu_id() as usize) else {
+    let address = core::ptr::from_ref(frame) as u64;
+    let slot = phase_slot(address);
+    if PHASE_KEY[slot].load(Ordering::Relaxed) != address {
+        // Somebody else's slot. Recording here would overwrite a dispatch that
+        // is still in flight, and reading it later would answer for this one.
         return;
-    };
-    slot.store(phase, Ordering::Relaxed);
+    }
+    let vector = PHASE_VALUE[slot].load(Ordering::Relaxed) >> 32;
+    PHASE_VALUE[slot].store(phase | (vector << 32), Ordering::Relaxed);
 }
 
-/// How many frames failed [`implausible`] at either end of a dispatch.
+/// How many frames failed [`implausible`] at either end of a dispatch./// How many frames failed [`implausible`] at either end of a dispatch.
 pub static FRAME_IMPLAUSIBLE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// The first such frame: vector, rip, cs, rflags, rsp, ss.
@@ -307,6 +355,16 @@ pub fn implausible_frames() -> (u64, [u64; 6], bool) {
 #[must_use]
 pub fn frame_last_good_phase() -> u64 {
     FRAME_LAST_GOOD.load(Ordering::Relaxed)
+}
+
+/// The vector the first implausible frame's dispatch arrived on.
+///
+/// `u64::MAX` when no dispatch has been recorded. This is the vector read on
+/// *entry*, which is the only trustworthy copy: the frame's own field is part
+/// of what these specimens overwrite.
+#[must_use]
+pub fn frame_entry_vector() -> u64 {
+    FRAME_WITNESS_VECTOR.load(Ordering::Relaxed)
 }
 
 /// Which field of `frame` could not be returned through, if any.

@@ -146,7 +146,12 @@ asm_budget = 37
 # fields out when they disagree. Each is the same `&*frame` the dispatch
 # already performs to reach the handler, and none of them can be safe: the
 # frame is a raw pointer to the stack the processor wrote.
-unsafe_budget = 1165
+# 1166 for the dispatch's entry vector, read from that same frame before the
+# handler runs -- the fourth read of it, and the one that survives what these
+# specimens overwrite. The frame's own `vector` field is part of the damage in
+# every sighting of §3's frame fault, so the copy taken on the way in is what
+# says which arm a phase belongs to.
+unsafe_budget = 1166
 # Raised from 1070 for ECAM -- one volatile read of configuration space as
 # memory -- and for counting the bytes the transmitter gives up on. The second
 # is two lines and bought a silent data loss becoming a visible number.

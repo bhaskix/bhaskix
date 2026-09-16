@@ -376,8 +376,14 @@ fn handle(frame: &mut TrapFrame) {
         // that halts and never reaches a boot report -- the mistake the frame
         // witness itself made for six sightings.
         let reached = bhaskix_arch::trap::frame_last_good_phase();
+        let arm = match bhaskix_arch::trap::frame_entry_vector() {
+            v if v == u64::from(bhaskix_arch::apic::TIMER_VECTOR) => "the timer",
+            v if v == u64::from(crate::sched::RESCHEDULE_VECTOR) => "a reschedule IPI",
+            u64::MAX => "an unrecorded dispatch",
+            _ => "another vector",
+        };
         println!(
-            "    last intact at {}",
+            "    last intact at {}, dispatched from {arm}",
             match reached {
                 phase::NONE => "no checkpoint -- it arrived wrong, or went wrong before the first",
                 phase::BEFORE_PREEMPT => "the tick's work done, entering the switch",
@@ -578,7 +584,16 @@ fn handle_interrupt(frame: &mut TrapFrame) {
             // intermittent this closes.
             crate::sched::refresh_fs_base_here();
 
+            // **The same two points as the timer's arm**, because this arm
+            // switches too and the frame sits on the outgoing stack just the
+            // same. Without them a frame corrupted across *this* switch reads
+            // `no checkpoint`, which the legend says means it arrived wrong or
+            // went wrong before the first -- a false reading of exactly the
+            // kind this instrument exists to remove. The vector recorded on
+            // entry is what says which of the two arms a phase belongs to.
+            bhaskix_arch::trap::frame_checkpoint(frame, phase::BEFORE_PREEMPT);
             crate::sched::preempt();
+            bhaskix_arch::trap::frame_checkpoint(frame, phase::AFTER_PREEMPT);
         }
 
         // TLB shootdown from another CPU. Acknowledged like any delivered
