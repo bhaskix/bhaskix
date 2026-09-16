@@ -114,6 +114,13 @@ impl Timers {
         }
     }
 
+    /// Whether this list holds a timer for `thread`.
+    fn holds(&self, thread: u32) -> bool {
+        self.entries
+            .iter()
+            .any(|entry| entry.is_some_and(|timer| timer.thread == thread))
+    }
+
     /// Soonest deadline outstanding, if any.
     fn earliest(&self) -> Option<u64> {
         self.entries
@@ -310,13 +317,63 @@ pub fn cancel_wake() {
     }
 }
 
-/// Cancels any timer for `thread` on this CPU.
+/// Cancels any timer for `thread`, **on whichever CPU armed it**.
+///
+/// # Why this is not "on this CPU"
+///
+/// It was, and the two halves did not agree. `arm_for` inserts into the list of
+/// the CPU the caller is running on; its one caller then **blocks** —
+/// `notify::wait_once` — and a thread woken from a block can be stolen, so it
+/// resumes on a different CPU and cancelled there. The timer then stayed armed
+/// on the CPU that took it, fired later, and woke a thread that had stopped
+/// waiting for it. If that thread had since exited and its id been reused, it
+/// woke a different thread entirely.
+///
+/// **The scan is the same answer `sched::mark_blocked_anywhere` gives to the
+/// identical problem** one subsystem over: the thread's identity was never in
+/// doubt, only which queue holds it, so look. Four lock acquisitions instead of
+/// one, on a path taken once per blocking device wait.
+///
+/// **And it counts the case rather than assuming it**, because whether a thread
+/// really migrates between the arm and the cancel is a question about this
+/// machine that nothing had asked. The boot report prints the number.
 fn cancel_for(thread: u32) {
-    let cpu = percpu::cpu_id() as usize;
-    if cpu < MAX_CPUS {
-        TIMERS[cpu].lock().remove(thread);
+    let here = percpu::cpu_id() as usize;
+    for (cpu, timers) in TIMERS
+        .iter()
+        .take((percpu::online_count() as usize).min(MAX_CPUS))
+        .enumerate()
+    {
+        let mut timers = timers.lock();
+        if !timers.holds(thread) {
+            continue;
+        }
+        timers.remove(thread);
+        CANCELLED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        if cpu != here {
+            CANCELLED_ELSEWHERE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        }
     }
 }
+
+/// Timers cancelled on a CPU other than the one that armed them.
+///
+/// **Zero would mean the migration this scan exists for does not happen here**,
+/// which is worth knowing and was never measured; anything else means it does.
+/// Printed on every boot rather than only when non-zero, because a number that
+/// appears only on the boot that goes wrong has no baseline to be read against.
+pub static CANCELLED_ELSEWHERE: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+/// Timers found still armed when their thread cancelled, on any CPU.
+///
+/// **The denominator, without which the other number means two things.** A
+/// reading of zero elsewhere could be *no thread ever migrated across that
+/// window*, or it could be *no cancel ever found a timer to remove* — because
+/// the deadline had already fired every time, which would make the scan
+/// insurance on a path that never runs. Those are very different facts and one
+/// number cannot carry both.
+pub static CANCELLED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// Blocks the calling thread for at least `duration_us` microseconds.
 ///

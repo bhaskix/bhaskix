@@ -27316,8 +27316,22 @@ fn tickless_report() {
         );
     }
 
+    // **Whether a thread really moves between arming a timer and cancelling
+    // it**, which nothing had measured. `arm_for` puts the timer in the list of
+    // the CPU the caller is on; its caller then blocks, and a thread woken from
+    // a block can be stolen. Cancelling only on the CPU it woke up on left the
+    // timer armed where it was put, to fire at a thread that had stopped
+    // waiting for it — or, after an id was reused, at a different thread.
+    //
+    // Zero says this machine does not migrate across that window and the scan
+    // is insurance; anything else says it does. Printed either way, because a
+    // number that appears only on the boot that goes wrong has no baseline.
+    let elsewhere = time::CANCELLED_ELSEWHERE.load(core::sync::atomic::Ordering::Relaxed);
+    let cancelled = time::CANCELLED.load(core::sync::atomic::Ordering::Relaxed);
     println!(
-        "    tickless       {idles} idle interrupts avoided, {armed} armed on demand, {ipis} reschedule ipis"
+        "    tickless       {idles} idle interrupts avoided, {armed} armed on demand, {ipis} \
+         reschedule ipis, {cancelled} timer(s) cancelled before firing, {elsewhere} of them on \
+         another cpu"
     );
 }
 
