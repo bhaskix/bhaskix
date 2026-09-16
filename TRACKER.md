@@ -999,6 +999,51 @@ the distinction is in the table rather than in somebody's head.
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-09-16 (the SR550 found a record overlapping another, on its first boot)
+
+**The process record grew onto the bind record, and only real hardware showed
+it.** `report::PROCESS_WORDS` went from six to eight on 2026-09-15 for RFC
+0079's domain-slot count and peak. `BIND_AT` was written as `PROCESS_AT + 48` —
+six words — so the two new words landed exactly on the sixteen bytes the bind
+record occupies. Nothing asserted the records did not overlap, so it built and
+passed every lane.
+
+**Both directions were corrupted**, which is worse than a wrong report.
+`bin/linuxd` writes the bind record on every `bind`, and writes the process
+trace on every process lookup — 249 of them in the boot that found this. So the
+process trace clobbered the bind record, *and* the bind record clobbered the
+domain-slot numbers the kernel read back. The bind record exists for the
+socket-reclaim hunt in §3, whose whole difficulty is that its record *"does not
+say whose bind it was"* — any specimen of it taken since 2026-09-15 was reading
+a process trace.
+
+**QEMU could not show it.** The lane the change was developed on binds no
+socket, so the two words were zero and the count read correctly. The SR550 has
+four network ports; its boot report read `adapter domains 12884901909 of 32
+kept now, 1125900416778240 at the peak`. `12884901909` is `0x3_0000_0015` —
+the bind record's own halves, a domain of 21 and an outcome of 3, which the
+line beside it prints as `last admitted for domain 21 holding 3 descriptor(s)`.
+
+**`BIND_AT` is derived from `PROCESS_WORDS` now**, so the next word added moves
+it rather than landing on it, and two const assertions hold the layout: the
+process record must fit before the bind record, and the bind record before the
+scratch. The second one **fired immediately** — the records ended exactly at
+512 and there was no room — so `SCRATCH_AT` moved to 576, costing the scratch
+64 of 3,584 bytes, which is a chunk size and not a capacity.
+
+**And the numbers it was hiding were wrong in QEMU too.** With the layout
+fixed, the iommu lane reads `0 of 32 kept now, 3 at the peak` where it read
+`0, 1` before — 3 being what RFC 0079's probe actually forks concurrently. The
+gate had been passing on partly-clobbered words.
+
+**This is what the hardware instruction is for**, and it is the second time it
+has paid: the first physical boot of the project falsified an assumption every
+gate had passed, and this one found a silent overlap eleven commits deep.
+Booted twice on host3 — 16 CPUs against QEMU's 4 — once to find it and once to
+confirm the repair. The machine's four failures both times are its own:
+`net ring`, `dhcp client` and `tcp client` step 5, all of them nothing
+answering on those links.
+
 ### 2026-09-16 (per-CPU state read after a switch — the whole tree, once)
 
 **One lens, applied everywhere it could apply, and recorded so it is not

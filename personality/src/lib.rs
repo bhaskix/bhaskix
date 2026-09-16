@@ -151,13 +151,32 @@ pub mod report {
     /// low sixteen bits, the port above them, and the service's refusal word
     /// above that. Written on both paths, so "no record for this domain" means
     /// the call did not arrive.
-    pub const BIND_AT: usize = PROCESS_AT + 48;
+    /// **Derived from [`PROCESS_WORDS`], not written as 48.** It *was* 48 — six
+    /// words — and on 2026-09-15 the process record grew to eight without this
+    /// moving, so its last two words landed on top of this one. The adapter
+    /// was overwriting the bind record on every process trace, and the kernel
+    /// read this record's contents back as a domain-slot count.
+    ///
+    /// **QEMU could not show it and the SR550 did on the first boot.** The lane
+    /// the change was developed on binds no socket, so the two words it
+    /// clobbered were zero and the count read correctly; a machine with four
+    /// network ports writes them, and the boot report read `adapter domains
+    /// 12884901909 of 32 kept now`. That number is `0x3_0000_0015` — this
+    /// record's own two halves, a domain of 21 and an outcome of 3.
+    pub const BIND_AT: usize = PROCESS_AT + PROCESS_WORDS * 8;
 
     /// Where bulk staging begins.
     ///
-    /// Rounded up to 512 from the end of the records, so the boundary is
-    /// legible in a hex dump rather than merely correct.
-    pub const SCRATCH_AT: usize = 512;
+    /// Rounded up from the end of the records, so the boundary is legible in a
+    /// hex dump rather than merely correct.
+    ///
+    /// **576 since 2026-09-16, and it was 512.** The records ended exactly at
+    /// 512 while the process record held six words; widening it to eight took
+    /// the sixteen bytes [`BIND_AT`] occupied, silently, because nothing
+    /// asserted the two did not overlap. Moving the boundary out is what gives
+    /// the bind record its own bytes back — and it costs the scratch 64 of the
+    /// 3,584 it had, which is a chunk size and not a capacity.
+    pub const SCRATCH_AT: usize = 576;
 
     /// How much of the page bulk staging may use.
     ///
@@ -174,6 +193,12 @@ pub mod report {
     pub const PAGE: usize = 4096;
 
     /// Every record ends before the scratch begins.
+    /// **The process record must fit before the record after it.** Nothing
+    /// asserted this, which is why widening `PROCESS_WORDS` silently moved two
+    /// words on top of [`BIND_AT`] rather than failing to build. It is
+    /// redundant now that `BIND_AT` is derived — and it is kept precisely
+    /// because the next person to write a literal there will be caught by it.
+    const _: () = assert!(PROCESS_AT + PROCESS_WORDS * 8 <= BIND_AT);
     const _: () = assert!(BIND_AT + 16 <= SCRATCH_AT);
     /// And the scratch ends inside the page.
     const _: () = assert!(SCRATCH_AT + SCRATCH_BYTES == PAGE);
