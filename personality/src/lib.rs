@@ -56,17 +56,35 @@ pub mod report {
     /// Eight `mmap` trace records, thirty-two bytes each.
     pub const TRACES_AT: usize = 0;
     /// Where the fault log begins: four sixteen-byte entries.
-    pub const FAULT_LOG_AT: usize = 8 * 32;
+    pub const FAULT_LOG_AT: usize = TRACES_AT + TRACES_WORDS * 8;
+
+    /// How many words [`TRACES_AT`] holds.
+    pub const TRACES_WORDS: usize = 32;
     /// The exec record: pid, from, to.
-    pub const EXEC_AT: usize = FAULT_LOG_AT + 4 * 16;
+    pub const EXEC_AT: usize = FAULT_LOG_AT + FAULT_LOG_WORDS * 8;
+
+    /// How many words [`FAULT_LOG_AT`] holds — four entries of two.
+    pub const FAULT_LOG_WORDS: usize = 8;
     /// The file record: outcome, stage, bytes.
-    pub const FILE_AT: usize = EXEC_AT + 24;
+    pub const FILE_AT: usize = EXEC_AT + EXEC_WORDS * 8;
+
+    /// How many words [`EXEC_AT`] holds.
+    pub const EXEC_WORDS: usize = 3;
     /// The fork record: child pid, bytes copied.
-    pub const FORK_AT: usize = FILE_AT + 24;
+    pub const FORK_AT: usize = FILE_AT + FILE_WORDS * 8;
+
+    /// How many words [`FILE_AT`] holds.
+    pub const FILE_WORDS: usize = 3;
     /// The wait record: collected, status.
-    pub const WAIT_AT: usize = FORK_AT + 16;
+    pub const WAIT_AT: usize = FORK_AT + FORK_WORDS * 8;
+
+    /// How many words [`FORK_AT`] holds.
+    pub const FORK_WORDS: usize = 2;
     /// The supervised-copy measurement: cold cycles, warm cycles.
-    pub const COPY_AT: usize = WAIT_AT + 16;
+    pub const COPY_AT: usize = WAIT_AT + WAIT_WORDS * 8;
+
+    /// How many words [`WAIT_AT`] holds.
+    pub const WAIT_WORDS: usize = 2;
     /// Giving a lent page back: cold cycles, warm cycles.
     ///
     /// [RFC 0044](../../docs/rfc/0044-revocation-that-reaches-the-mapping.md)
@@ -76,7 +94,10 @@ pub mod report {
     /// halves for the reason [`COPY_AT`]'s comment gives at length: a single
     /// figure here would be the first execution of the path rather than the
     /// cost of using it.
-    pub const LEND_AT: usize = COPY_AT + 16;
+    pub const LEND_AT: usize = COPY_AT + COPY_WORDS * 8;
+
+    /// How many words [`COPY_AT`] holds.
+    pub const COPY_WORDS: usize = 2;
 
     /// The socket record: closes `bin/ipd` refused, and how many attempts the
     /// last successful close needed.
@@ -92,7 +113,11 @@ pub mod report {
     /// The second word is there because a retry that succeeds on its last
     /// attempt and one that succeeds on its first are the same "no failure" to
     /// every gate, and the difference is the whole margin.
-    pub const SOCKET_AT: usize = LEND_AT + 16;
+    pub const SOCKET_AT: usize = LEND_AT + LEND_WORDS * 8;
+
+    /// How many words [`LEND_AT`] holds, and how many slots
+    /// `record_release` fills.
+    pub const LEND_WORDS: usize = 2;
 
     /// The process record: records admitted, records found, the last domain a
     /// record was admitted for, and how many descriptors that record held.
@@ -120,7 +145,10 @@ pub mod report {
     /// this tree** — nothing set `O_CLOEXEC` and then exec'd. The exec probe
     /// does now, and these two words are what let a gate see whether the slot
     /// came back.
-    pub const PROCESS_AT: usize = SOCKET_AT + 16;
+    pub const PROCESS_AT: usize = SOCKET_AT + SOCKET_WORDS * 8;
+
+    /// How many words [`SOCKET_AT`] holds.
+    pub const SOCKET_WORDS: usize = 2;
 
     /// How many words [`PROCESS_AT`] holds.
     ///
@@ -165,6 +193,10 @@ pub mod report {
     /// record's own two halves, a domain of 21 and an outcome of 3.
     pub const BIND_AT: usize = PROCESS_AT + PROCESS_WORDS * 8;
 
+    /// How many words [`BIND_AT`] holds: the domain that asked, and its
+    /// outcome.
+    pub const BIND_WORDS: usize = 2;
+
     /// Where bulk staging begins.
     ///
     /// Rounded up from the end of the records, so the boundary is legible in a
@@ -199,7 +231,45 @@ pub mod report {
     /// redundant now that `BIND_AT` is derived — and it is kept precisely
     /// because the next person to write a literal there will be caught by it.
     const _: () = assert!(PROCESS_AT + PROCESS_WORDS * 8 <= BIND_AT);
-    const _: () = assert!(BIND_AT + 16 <= SCRATCH_AT);
+    const _: () = assert!(BIND_AT + BIND_WORDS * 8 <= SCRATCH_AT);
+
+    /// **Every record ends before the next one begins.**
+    ///
+    /// Each offset is derived from the one before it *and that record's own
+    /// length*, so a record that grows moves the rest rather than landing on
+    /// them. This says it out loud as well, because a derivation is the kind of
+    /// thing a later edit replaces with a literal — which is exactly what
+    /// `BIND_AT` was, and what let the process record grow onto it unnoticed
+    /// until a machine with four network ports read the collision back as a
+    /// domain-slot count.
+    const _: () = {
+        assert!(TRACES_AT + TRACES_WORDS * 8 <= FAULT_LOG_AT);
+        assert!(FAULT_LOG_AT + FAULT_LOG_WORDS * 8 <= EXEC_AT);
+        assert!(EXEC_AT + EXEC_WORDS * 8 <= FILE_AT);
+        assert!(FILE_AT + FILE_WORDS * 8 <= FORK_AT);
+        assert!(FORK_AT + FORK_WORDS * 8 <= WAIT_AT);
+        assert!(WAIT_AT + WAIT_WORDS * 8 <= COPY_AT);
+        assert!(COPY_AT + COPY_WORDS * 8 <= LEND_AT);
+        assert!(LEND_AT + LEND_WORDS * 8 <= SOCKET_AT);
+        assert!(SOCKET_AT + SOCKET_WORDS * 8 <= PROCESS_AT);
+    };
+
+    /// **And the offsets did not move when they became derived.** The refactor
+    /// is only worth having if it describes the layout that already exists;
+    /// these are the numbers from before it.
+    const _: () = {
+        assert!(TRACES_AT == 0);
+        assert!(FAULT_LOG_AT == 256);
+        assert!(EXEC_AT == 320);
+        assert!(FILE_AT == 344);
+        assert!(FORK_AT == 368);
+        assert!(WAIT_AT == 384);
+        assert!(COPY_AT == 400);
+        assert!(LEND_AT == 416);
+        assert!(SOCKET_AT == 432);
+        assert!(PROCESS_AT == 448);
+        assert!(BIND_AT == 512);
+    };
     /// And the scratch ends inside the page.
     const _: () = assert!(SCRATCH_AT + SCRATCH_BYTES == PAGE);
     /// The fault log is past the traces, which is what it used to claim and

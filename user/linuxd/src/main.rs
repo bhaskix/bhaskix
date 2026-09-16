@@ -4913,7 +4913,12 @@ fn answer_getdents64(request: &PersonalityCall) -> Answer {
 /// A zero slot means "not taken yet", which is safe because a call that took
 /// no cycles did not happen.
 fn record_release(cycles: u64) {
-    for slot in 0..2u64 {
+    // **The record's own length, not a literal two.** The layout gives each
+    // record a `_WORDS` beside its offset and derives the next one from both,
+    // so a writer that counts for itself is the remaining way to write past
+    // the end — which is how the process record came to sit on the bind
+    // record.
+    for slot in 0..report::LEND_WORDS as u64 {
         let at = LEND_RECORD_AT + slot * 8;
         // SAFETY: inside the page `ATTACH` mapped from this program's own
         // object, at an offset the crate asserts is before the scratch area.
