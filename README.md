@@ -41,7 +41,17 @@ The `-ix` is the Unix lineage, the same suffix Minix and Linux carry.
 > An IOMMU giving a device its own translations. A journalled, writable filesystem with a page
 > cache. Process management that is capability-shaped rather than POSIX-shaped: no `fork`, no pid,
 > no signals — a **supervisor in ring 3** creates a domain, grants it authority one piece at a time,
-> starts a program in it, and reaps it. And a **user-mode shell** that reaches all of it through
+> starts a program in it, **ends it if it will not end itself**, and reaps it. Ending a running
+> domain landed on 2026-09-15 ([RFC 0080](docs/rfc/0080-ending-a-domain-that-is-still-running.md));
+> until then this sentence read "starts a program in it, and reaps it", and a supervisor that could
+> not stop what it started was the gap.
+>
+> **And the POSIX shapes exist above that, not inside it** — which is the claim, not an exception to
+> it. A hosted Linux process has a pid, can `fork`, and since 2026-09-15 can `kill`
+> ([RFC 0079](docs/rfc/0079-a-signal-a-process-may-send-another.md)): all of it invented in ring 3
+> by `bin/linuxd`, which decides who may signal whom from the **process tree** it maintains, because
+> Linux uids are not authority here and a rule phrased in them would be a lie. The nucleus still has
+> no pid and no signal. And a **user-mode shell** that reaches all of it through
 > capabilities it holds and nothing else — the block driver, the console, and the filesystem each
 > run as services in their own domains, outside the kernel.
 >
