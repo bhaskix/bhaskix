@@ -999,6 +999,28 @@ the distinction is in the table rather than in somebody's head.
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-09-17 (the day's changes, counted forward)
+
+**Ten boots, ten clean**, after a day that touched the scheduler's guards, the
+interrupt dispatch, a record layout shared between two rings, and `bin/netd`'s
+report writers — each of which had been verified by a single suite run. Six on
+the `iommu` lane and four on `bios`, on the tree as pushed.
+
+**And the numbers the day's work produces are stable**: `adapter domains 0 of 32
+kept now, 3 at the peak` on every boot. That reading is worth stating because it
+moved twice. It was `0, 1` while the process record was being clobbered by the
+bind record and nobody knew; it was `12884901909 of 32` on the SR550, which is
+what a collision looks like when something actually writes the other record; and
+it is `0, 3` now, 3 being what RFC 0079's probe forks concurrently. A number that
+is the same on every boot is not proof it is right — but one that varies is
+proof something is wrong, and this one stopped varying when the layout was
+fixed.
+
+**What this does not cover**: the two lanes that need hardware or a second
+machine, and the rates in §3, which are all far rarer than ten boots can speak
+to. It is a check against *new* flakiness from a day of changes, and that is all
+it is.
+
 ### 2026-09-17 (correcting yesterday's entry: the positional coupling is real, the words named were the wrong ones)
 
 **The entry below is wrong in its specifics and the correction is worth more
