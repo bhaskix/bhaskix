@@ -241,6 +241,33 @@ def lane_count(run, cache):
     return counted
 
 
+def matched_line(text, signature):
+    """The first line the signature was found on, cleaned for printing.
+
+    **Because a count cannot say what it counted.** This tool answered "3 in
+    4,639 boots" for `EXCEPTION: general protection fault` on 2026-09-17, and
+    one of the three was the fault-injection lane asserting a `#GP` it had
+    raised **on purpose** -- the line reads `gp   ok    EXCEPTION: general
+    protection fault (#GP)`. A signature that matches a passing test's own
+    output is not a signature, and nothing in the output said so: the reader had
+    to go and read the cached logs to find out, which is the step this tool
+    exists to remove.
+
+    So every sighting now shows the line it was found on. The judgement stays
+    with the reader -- an `ok` in the line is a strong hint and not a rule, and a
+    tool that silently dropped such matches would be deciding something it
+    cannot know.
+    """
+    for line in text.splitlines():
+        if signature not in line:
+            continue
+        # Job logs carry an ISO timestamp and sometimes ANSI colour.
+        cleaned = re.sub(r"^\S*Z\s*", "", line)
+        cleaned = re.sub(r"\x1b\[[0-9;]*m", "", cleaned).strip()
+        return cleaned[:96]
+    return ""
+
+
 def at_least_two(hits, boots, rate):
     """P(this many or more), at `rate`. Poisson, which is the right shape for
     a rare independent event and does not need a boot-by-boot model."""
@@ -313,7 +340,15 @@ def main():
                 unreadable += 1
                 continue
             if args.signature in text:
-                hits.add((run["name"], run["run_number"], name, run["created_at"]))
+                hits.add(
+                    (
+                        run["name"],
+                        run["run_number"],
+                        name,
+                        run["created_at"],
+                        matched_line(text, args.signature),
+                    )
+                )
 
     CACHE.mkdir(parents=True, exist_ok=True)
     LANES.write_text(json.dumps(by_id), encoding="utf-8")
@@ -362,8 +397,10 @@ def main():
     print()
     print(f"  {BOLD}{args.signature}{RESET}")
     print()
-    for name, number, job, stamp in sorted(hits, key=lambda h: h[3]):
+    for name, number, job, stamp, line in sorted(hits, key=lambda h: h[3]):
         print(f"    {stamp[:10]}  {name:5s} run {number:<5d} {job}")
+        if line:
+            print(f"      {DIM}{line}{RESET}")
     if not hits:
         print(f"    {DIM}no sighting in any job log read{RESET}")
     print()
