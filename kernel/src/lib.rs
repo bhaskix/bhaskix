@@ -20017,6 +20017,23 @@ fn report_tcp_client(hhdm: u64) {
     }
     if outcome == 9 || outcome == 8 || outcome == 10 || outcome == 11 || outcome == 12 {
         println!("    tcp client     {said}");
+    } else if outcome == 2 && detail == bhaskix_abi::tcp::WAIT_ENTERED {
+        // **It reached the wait and the first question did not come back.**
+        // `bin/tcpc` publishes this before asking the service anything, so the
+        // program is inside `stream_state` rather than short of it.
+        println!(
+            "\x1b[91m    tcp client     FAILED at step {step}: {said} — it entered the stream \
+             wait and the first state read has not returned\x1b[0m"
+        );
+    } else if outcome == 2 && detail == 0 {
+        // **And a zero is no longer the step 4 XOR meaning nothing.** Since the
+        // line above is published on entry, zero says the program never reached
+        // the wait at all — it stopped between `report(4, CONNECTED)` and that
+        // publish.
+        println!(
+            "\x1b[91m    tcp client     FAILED at step {step}: {said} — it never reached the \
+             stream wait\x1b[0m"
+        );
     } else if outcome == 2 && detail != 0 {
         // **Outcome 2 with a non-zero detail is the step-5 wait talking.**
         //

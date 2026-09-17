@@ -1303,6 +1303,23 @@ pub mod socket {
 /// numbers here start at 58 because [`method::DISARM`] is 57 and is the highest
 /// allocated; there is no gap this time.
 pub mod tcp {
+    /// What `bin/tcpc` puts in its detail word on reaching the stream wait,
+    /// before it has asked the service anything.
+    ///
+    /// **Because a zero there meant two things and now means one.** That
+    /// program leaves step and outcome at 4/`CONNECTED` while it waits for
+    /// `STATE_ESTABLISHED`, republishing only the detail word as
+    /// `count << 32 | state` — and the count is incremented *before* the
+    /// publish, so no completed pass can write zero. Six sightings of §3's
+    /// step-4 row all read `detail 0x0`, which said the loop had published
+    /// nothing; what it could not say was whether the program had reached the
+    /// loop at all or was stuck inside its first call.
+    ///
+    /// Published immediately before that first call, this separates them: a
+    /// zero means it never got there, this value means it got there and the
+    /// call did not come back, and anything else is a completed pass.
+    pub const WAIT_ENTERED: u64 = u64::MAX;
+
     /// Open a connection.
     ///
     /// Invoked on a capability to the TCP service's endpoint. `arg0` is the

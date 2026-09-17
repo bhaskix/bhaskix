@@ -431,6 +431,13 @@ extern "C" fn tcpc_main(hertz: u64) -> ! {
     // the kernel owns the conversion to time.
     let mut state;
     let mut bounded = 0u32;
+    // **Published before the first question is asked**, so that a boot which
+    // ends here says which side of it stopped. A detail of zero is now "never
+    // reached this line"; this value is "reached it, and the first
+    // `stream_state` did not return"; anything else is a completed pass. §3's
+    // sixth sighting could tell the first from a completed pass and not the
+    // second — see `bhaskix_abi::tcp::WAIT_ENTERED`.
+    report_word(3, abi_tcp::WAIT_ENTERED);
     loop {
         let (s, _) = stream_state(5);
         state = s;
