@@ -353,8 +353,22 @@ mod queue {
     pub const TRANSMIT: u16 = 1;
 }
 
-/// Offsets into the rings object. Eight pages, and every ring on its own page
-/// so that alignment is true by construction rather than by arithmetic.
+/// Offsets into the rings object.
+///
+/// **Eight pages, and the rings two kilobytes apart** — not "every ring on its
+/// own page", which this said until 2026-09-17 and was never true: the offsets
+/// below step by `0x800`. Two kilobytes is ample for what a four-entry virtio
+/// queue needs (sixty-four bytes of descriptors, fourteen of available ring,
+/// thirty-eight of used) and the alignment virtio requires is satisfied many
+/// times over, so the layout was right and only its description was wrong.
+///
+/// **The assertions at the end are the point.** Every offset here is a literal
+/// and every size is implicit in the next offset, which is exactly the shape
+/// that let `bhaskix_personality::report`'s process record grow onto its bind
+/// record — invisible in QEMU, found on the first boot of a machine with four
+/// network ports. Nothing here overlaps today; the assertions are what make
+/// that survive the next edit, and `QUEUE_ENTRIES` is the number most likely
+/// to change.
 mod ring {
     /// Receive queue: descriptors, available, used.
     pub const RX_DESCRIPTORS: u64 = 0x0000;
@@ -391,6 +405,38 @@ mod ring {
     // already enforces and which the specification requires anyway.
     /// Where this program leaves its findings for the kernel.
     pub const REPORT: u64 = 0x7000;
+
+    /// How many pages the kernel makes this object.
+    ///
+    /// Stated here because every offset above has to fit inside it, and it is
+    /// the kernel that chooses it — `shared::create(keeper, 8 * FRAME_SIZE)`,
+    /// in two places. A third statement of one number is not an improvement in
+    /// itself; what it buys is that the offsets are checked against *something*
+    /// rather than against nothing, and a reader who changes the kernel's size
+    /// has a constant here to find.
+    pub const PAGES: u64 = 8;
+
+    /// What a virtio queue of `QUEUE_ENTRIES` needs of each of its three parts.
+    const DESCRIPTOR_BYTES: u64 = super::QUEUE_ENTRIES as u64 * 16;
+    const AVAILABLE_BYTES: u64 = 6 + super::QUEUE_ENTRIES as u64 * 2;
+    const USED_BYTES: u64 = 6 + super::QUEUE_ENTRIES as u64 * 8;
+
+    /// **No part of this layout may run into the next.**
+    const _: () = {
+        assert!(RX_DESCRIPTORS + DESCRIPTOR_BYTES <= RX_AVAILABLE);
+        assert!(RX_AVAILABLE + AVAILABLE_BYTES <= RX_USED);
+        assert!(RX_USED + USED_BYTES <= TX_DESCRIPTORS);
+        assert!(TX_DESCRIPTORS + DESCRIPTOR_BYTES <= TX_AVAILABLE);
+        assert!(TX_AVAILABLE + AVAILABLE_BYTES <= TX_USED);
+        assert!(TX_USED + USED_BYTES <= RX_BUFFERS);
+        // The receive buffers are one per descriptor, and this is the pair most
+        // likely to collide: four of them fill `0x3000..0x5000` exactly, so a
+        // queue of eight would run straight over the frame being transmitted.
+        assert!(RX_BUFFERS + super::QUEUE_ENTRIES as u64 * RX_BUFFER <= TX_BUFFER);
+        // One frame, which is at most what a receive buffer holds.
+        assert!(TX_BUFFER + RX_BUFFER <= REPORT);
+        assert!(REPORT < PAGES * 4096);
+    };
 
     /// Word in the report page the **kernel writes and this program reads**.
     ///
