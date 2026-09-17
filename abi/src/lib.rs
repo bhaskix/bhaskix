@@ -1499,6 +1499,57 @@ pub mod net_ring {
     /// the whole reason this module exists.
     pub const REPORT_PAGE: usize = (REPORT / 4096) as usize;
 
+    /// The words of that report the **kernel reads by position**.
+    ///
+    /// **Established by measurement, after reading it twice produced two
+    /// different wrong answers.** The report page was dumped on a boot and the
+    /// values matched against `bin/netd`'s own array literal: word 0 held
+    /// `"NETDRPT1"`, word 1 a MAC, words 6 and 7 held 0 and 1 — which are
+    /// `queue::RECEIVE` and `queue::TRANSMIT`, a fingerprint no other pair of
+    /// fields could produce — and word 9 a frame counter the kernel already
+    /// calls `handed`. `TRACKER.md`'s entry of 2026-09-17 records both wrong
+    /// answers and why reading could not settle it.
+    ///
+    /// **These nine are a beginning, not the set.** The kernel reads this page
+    /// in **five** functions — `report_net_domain`, `report_bond`,
+    /// `report_x722`, `report_net_ring` and `report_net_after_exchange` —
+    /// between them indexing roughly twenty-five positions. Nine were named
+    /// here because those are the ones whose meaning was *verified*, by dumping
+    /// the page on a boot and matching the values; naming the rest from a
+    /// reading would repeat the mistake that made this module necessary.
+    ///
+    /// **What is already fixed is the dangerous half.** `bin/netd` no longer
+    /// writes any of them by position in a list: every field is assigned at an
+    /// index, so inserting one cannot silently move the others. What remains is
+    /// a number stated twice — the ordinary kind of duplication, which is
+    /// visible and fails loudly when it is wrong.
+    pub mod word {
+        /// `"NETDRPT1"`, written last so a partial report has no marker.
+        pub const MARKER: usize = 0;
+        /// The station address the driver settled on.
+        pub const MAC: usize = 1;
+        /// Which virtqueue receives — `queue::RECEIVE`.
+        pub const RECEIVE_QUEUE: usize = 6;
+        /// Which virtqueue transmits — `queue::TRANSMIT`.
+        pub const TRANSMIT_QUEUE: usize = 7;
+        /// Frames handed up to `bin/ipd`. The kernel watches this one move.
+        pub const HANDED: usize = 9;
+        /// How many ports the bond has.
+        pub const BOND_MEMBERS: usize = 17;
+        /// Which member is active.
+        pub const BOND_ACTIVE: usize = 18;
+        /// One bit per member that is up.
+        pub const BOND_LINKS: usize = 19;
+        /// How many times it has failed over.
+        pub const BOND_FAILOVERS: usize = 20;
+
+        /// The bond's words follow the first report's, and neither runs past
+        /// the page. `bin/netd` writes its bond words at a base of
+        /// [`BOND_MEMBERS`], so this is the same fact its loop depends on.
+        const _: () = assert!(HANDED < BOND_MEMBERS);
+        const _: () = assert!(BOND_FAILOVERS * 8 < 4096);
+    }
+
     /// The report begins on a page boundary — the kernel indexes by page, so a
     /// report that began part-way into one could not be reached that way at
     /// all.

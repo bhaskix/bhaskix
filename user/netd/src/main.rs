@@ -4055,13 +4055,21 @@ fn bond_report(
         x722,
         firmware,
     ];
-    // SAFETY: the report page this program mapped writable, at the five words
-    // that follow the seventeen `report` writes. The marker is not touched:
-    // this is an addition to a report that is already published, and a reader
-    // that stops at seventeen words is unaffected.
+    // **Seven words, not five** — this said five and wrote seven, which is the
+    // kind of drift that made the positions in this page unreadable from the
+    // source. The base is named now: the kernel reads the first four of these
+    // by position, and `bhaskix_abi::net_ring::word` is where those positions
+    // are written down.
+    //
+    // Hoisted out of the block below so naming the base costs no `unsafe` line.
+    let base = bhaskix_abi::net_ring::word::BOND_MEMBERS as u64;
+    // SAFETY: the report page this program mapped writable, at the words that
+    // follow `report`'s. The marker is not touched: this is an addition to a
+    // report that is already published, and a reader that stops before these is
+    // unaffected.
     unsafe {
         for (index, word) in words.iter().enumerate() {
-            core::ptr::write_volatile((at + (17 + index as u64) * 8) as *mut u64, *word);
+            core::ptr::write_volatile((at + (base + index as u64) * 8) as *mut u64, *word);
         }
     }
 }
@@ -4070,6 +4078,13 @@ fn bond_report(
 const fn ring_buffer_of(index: u16) -> u64 {
     ring::RX_BUFFERS + (index as u64) * ring::RX_BUFFER
 }
+
+/// How many words the first report holds, before the bond's own.
+const REPORT_HEAD_WORDS: usize = 16;
+
+/// It must end before the bond's words begin, which is the one place the two
+/// writers into this page could collide.
+const _: () = assert!(REPORT_HEAD_WORDS <= bhaskix_abi::net_ring::word::BOND_MEMBERS);
 
 /// Leaves the findings where the kernel granted memory for them.
 ///
@@ -4090,35 +4105,42 @@ fn report(
     took_length: u64,
 ) {
     let at = RINGS_AT + ring::REPORT;
-    let words = [
-        MARKER,
-        mac,
-        sent,
-        received,
-        source,
-        header,
-        u64::from(queue::RECEIVE),
-        u64::from(queue::TRANSMIT),
-        // What the receive ring itself says the device has done. Reported
-        // because "nothing was received" has two very different causes -- the
-        // device wrote nothing, or it wrote and this driver misread the ring --
-        // and a count distinguishes them where a boolean cannot.
-        rx_seen,
-        // How many frames this program put into the ring to `ipd`. Reported
-        // because "nothing crossed" has two causes -- a producer that never
-        // handed anything over, and a consumer that never read it -- and they
-        // are indistinguishable from the far end.
-        handed,
-        // Frames taken out of the return ring and put on the wire. Counted
-        // separately from `handed` because "nothing came out" has an end at
-        // each side of a ring, and one number cannot say which.
-        sent_for_ipd,
-        took,
-        took_length,
-        WIDEST.load(core::sync::atomic::Ordering::Relaxed),
-        OUTSTANDING.load(core::sync::atomic::Ordering::Relaxed),
-        COPIES.load(core::sync::atomic::Ordering::Relaxed),
-    ];
+    // **Assigned by index, not by position in a list.** The four slots the
+    // kernel reads are named; the rest are numbered here rather than implied
+    // by where they sit. Inserting a field used to move every field after it
+    // while the kernel went on reading the old numbers, with nothing failing
+    // to build — and `TRACKER.md`'s entry of 2026-09-17 records that reading
+    // the source twice could not even settle which fields those were. The
+    // mapping below was established by dumping the page on a boot.
+    use bhaskix_abi::net_ring::word;
+    let mut words = [0u64; REPORT_HEAD_WORDS];
+    words[word::MARKER] = MARKER;
+    words[word::MAC] = mac;
+    words[2] = sent;
+    words[3] = received;
+    words[4] = source;
+    words[5] = header;
+    words[word::RECEIVE_QUEUE] = u64::from(queue::RECEIVE);
+    words[word::TRANSMIT_QUEUE] = u64::from(queue::TRANSMIT);
+    // What the receive ring itself says the device has done. Reported
+    // because "nothing was received" has two very different causes -- the
+    // device wrote nothing, or it wrote and this driver misread the ring --
+    // and a count distinguishes them where a boolean cannot.
+    words[8] = rx_seen;
+    // How many frames this program put into the ring to `ipd`. Reported
+    // because "nothing crossed" has two causes -- a producer that never
+    // handed anything over, and a consumer that never read it -- and they
+    // are indistinguishable from the far end.
+    words[word::HANDED] = handed;
+    // Frames taken out of the return ring and put on the wire. Counted
+    // separately from `handed` because "nothing came out" has an end at
+    // each side of a ring, and one number cannot say which.
+    words[10] = sent_for_ipd;
+    words[11] = took;
+    words[12] = took_length;
+    words[13] = WIDEST.load(core::sync::atomic::Ordering::Relaxed);
+    words[14] = OUTSTANDING.load(core::sync::atomic::Ordering::Relaxed);
+    words[15] = COPIES.load(core::sync::atomic::Ordering::Relaxed);
     // SAFETY: the last page of the rings this program mapped writable, which no
     // ring and no buffer reaches. The marker is written *last*, so a kernel
     // that reads a partial report sees no marker rather than half the fields.

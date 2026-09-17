@@ -18157,7 +18157,11 @@ fn report_x722(words: &[u64; 29]) {
 fn report_bond(words: &mut [u64; 29], take: impl Fn(&mut [u64; 29])) {
     /// Which member the bond is on, and what each member's link says.
     fn members(words: &[u64; 29]) -> (u64, u64, u64) {
-        (words[17], words[18], words[19])
+        (
+            words[bhaskix_abi::net_ring::word::BOND_MEMBERS],
+            words[bhaskix_abi::net_ring::word::BOND_ACTIVE],
+            words[bhaskix_abi::net_ring::word::BOND_LINKS],
+        )
     }
 
     let (count, active, links) = members(words);
@@ -18182,19 +18186,19 @@ fn report_bond(words: &mut [u64; 29], take: impl Fn(&mut [u64; 29])) {
     if patience == 0 {
         return;
     }
-    let handed = words[9];
+    let handed = words[bhaskix_abi::net_ring::word::HANDED];
     let mut failed_over = false;
     let mut carried = false;
     for _ in 0..(patience / 50) {
         take(words);
-        failed_over = words[20] != 0;
+        failed_over = words[bhaskix_abi::net_ring::word::BOND_FAILOVERS] != 0;
         // **Word 26 is the driver's own count from the instant it failed
         // over**, and it is the one that answers the question. This compared
         // against a baseline taken when *this* window opened, which is later --
         // sometimes a minute later, because the wait for a first frame runs
         // first -- so a member that had been carrying since the change looked
         // like one that had carried nothing.
-        carried = words[9] > handed;
+        carried = words[bhaskix_abi::net_ring::word::HANDED] > handed;
         if failed_over && carried {
             break;
         }
@@ -18472,7 +18476,7 @@ fn report_net_after_exchange(hhdm: u64) {
         }
     };
     take(&mut words);
-    if words[0] != NETD_MARKER {
+    if words[bhaskix_abi::net_ring::word::MARKER] != NETD_MARKER {
         return;
     }
     // **Ask for the failover, where this boot said to** -- RFC 0076 step 3.
@@ -20617,12 +20621,12 @@ fn report_net_domain(hhdm: u64) -> bool {
         buffer.copy_from_slice(&raw[index * 8..index * 8 + 8]);
         *word = u64::from_le_bytes(buffer);
     }
-    if words[0] != NETD_MARKER {
+    if words[bhaskix_abi::net_ring::word::MARKER] != NETD_MARKER {
         println!("\x1b[91m    net domain     FAILED: the driver left no report\x1b[0m");
         return false;
     }
 
-    let mac = words[1];
+    let mac = words[bhaskix_abi::net_ring::word::MAC];
     let octets = |value: u64| {
         [
             (value >> 40) as u8,
