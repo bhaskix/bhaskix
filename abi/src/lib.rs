@@ -1436,6 +1436,52 @@ pub mod tcp {
     }
 }
 
+/// Where `bin/netd`'s rings object begins and ends.
+///
+/// **In the ABI for the reason [`block_ring`] is, and the same two statements
+/// were already drifting apart in units.** The kernel had
+/// `NETD_REPORT_PAGE: usize = 7` and the driver had `REPORT: u64 = 0x7000` —
+/// one fact, written as a page index on one side and a byte offset on the
+/// other, with nothing making them agree. That is the exact shape `block_ring`
+/// records ending: *"the kernel expressed the same offset as `frames[3] +
+/// 0x800` — two independent statements of one layout, in two rings, with
+/// nothing checking that they agreed."*
+///
+/// **What is deliberately still not here**, so the next reader is not misled
+/// into thinking this module is complete: the eighteen *word offsets inside*
+/// the report page. The kernel names them (`NETD_TRANSMITTED`,
+/// `NETD_MEMBER_QUEUES`, and sixteen more) and `bin/netd` writes most of them
+/// as bare literals — `ring::REPORT + 27 * 8` — so each is still a number
+/// stated twice. Moving them is a thirty-seven site mechanical edit whose one
+/// failure mode is a mis-transcription, which is precisely the disagreement it
+/// exists to prevent; it wants its own change, done when somebody can watch the
+/// bond tests afterwards rather than at the end of a long day.
+pub mod net_ring {
+    /// How many pages the rings object holds.
+    ///
+    /// The kernel creates it — `shared::create(keeper, PAGES * FRAME_SIZE)`, in
+    /// two places, one per bond member — and the driver's offsets all have to
+    /// fit inside it.
+    pub const PAGES: u64 = 8;
+
+    /// Where the driver leaves its findings, as a byte offset.
+    pub const REPORT: u64 = 0x7000;
+
+    /// The same place as a page index, which is how the kernel reaches it.
+    ///
+    /// Derived rather than written, because the two spellings drifting apart is
+    /// the whole reason this module exists.
+    pub const REPORT_PAGE: usize = (REPORT / 4096) as usize;
+
+    /// The report begins on a page boundary — the kernel indexes by page, so a
+    /// report that began part-way into one could not be reached that way at
+    /// all.
+    const _: () = assert!(REPORT.is_multiple_of(4096));
+
+    /// And it is inside the object.
+    const _: () = assert!(REPORT < PAGES * 4096);
+}
+
 /// Where each structure sits inside the block service's ring pages.
 ///
 /// **In the ABI because both rings read it, and they were deriving it

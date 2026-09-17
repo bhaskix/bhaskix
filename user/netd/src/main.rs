@@ -404,17 +404,19 @@ mod ring {
     // One buffer means one transmit outstanding at a time, which this loop
     // already enforces and which the specification requires anyway.
     /// Where this program leaves its findings for the kernel.
-    pub const REPORT: u64 = 0x7000;
+    ///
+    /// From the ABI, because the kernel reaches the same page by *index* —
+    /// `net_ring::REPORT_PAGE` — and one fact written as a byte offset here and
+    /// a page number there is two statements that nothing made agree.
+    pub const REPORT: u64 = bhaskix_abi::net_ring::REPORT;
 
     /// How many pages the kernel makes this object.
     ///
-    /// Stated here because every offset above has to fit inside it, and it is
-    /// the kernel that chooses it — `shared::create(keeper, 8 * FRAME_SIZE)`,
-    /// in two places. A third statement of one number is not an improvement in
-    /// itself; what it buys is that the offsets are checked against *something*
-    /// rather than against nothing, and a reader who changes the kernel's size
-    /// has a constant here to find.
-    pub const PAGES: u64 = 8;
+    /// From the ABI, which is the one place it is now written: the kernel
+    /// sizes the object with the same constant. This said "a third statement of
+    /// one number is not an improvement in itself" when it was a literal eight,
+    /// and that was true — so it stopped being one.
+    pub const PAGES: u64 = bhaskix_abi::net_ring::PAGES;
 
     /// What a virtio queue of `QUEUE_ENTRIES` needs of each of its three parts.
     const DESCRIPTOR_BYTES: u64 = super::QUEUE_ENTRIES as u64 * 16;

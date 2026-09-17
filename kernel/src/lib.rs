@@ -14205,8 +14205,11 @@ pub fn start_net_domain(
         keeper.as_u32().saturating_add(1),
         core::sync::atomic::Ordering::Release,
     );
-    let rings = shared::create(keeper, 8 * bhaskix_mm::FRAME_SIZE)
-        .map_err(|_| "the net domain's rings would not be created")?;
+    let rings = shared::create(
+        keeper,
+        bhaskix_abi::net_ring::PAGES * bhaskix_mm::FRAME_SIZE,
+    )
+    .map_err(|_| "the net domain's rings would not be created")?;
     let named = shared::name(rings).map_err(|_| "the rings would not be named")?;
     if domain::with(realm, |owner| owner.cspace.install_at(3, named).is_ok()) != Some(true) {
         return Err("the rings capability would not install");
@@ -14449,8 +14452,11 @@ fn delegate_second_port(
     // Rings of its own, the same eight pages the first port has and for the
     // same arithmetic. Shared rings would be two devices writing one descriptor
     // table, which is not a bond but a fault.
-    let rings = shared::create(keeper, 8 * bhaskix_mm::FRAME_SIZE)
-        .map_err(|_| "the second port's rings would not be created")?;
+    let rings = shared::create(
+        keeper,
+        bhaskix_abi::net_ring::PAGES * bhaskix_mm::FRAME_SIZE,
+    )
+    .map_err(|_| "the second port's rings would not be created")?;
     let named = shared::name(rings).map_err(|_| "the second port's rings would not be named")?;
     if domain::with(realm, |owner| owner.cspace.install_at(13, named).is_ok()) != Some(true) {
         return Err("the second port's rings capability would not install");
@@ -17538,7 +17544,7 @@ const NETD_MARKER: u64 = 0x3154_5052_4454_454e;
 /// *device* reads and writes, and a report living in any of them would be a
 /// report the device could overwrite -- which is the same reason the block
 /// driver's report sits in its last page.
-const NETD_REPORT_PAGE: usize = 7;
+const NETD_REPORT_PAGE: usize = bhaskix_abi::net_ring::REPORT_PAGE;
 
 /// The MAC `bin/netd` reported, if it has reported one.
 ///
