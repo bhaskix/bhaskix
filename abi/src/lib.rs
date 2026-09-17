@@ -1518,6 +1518,34 @@ pub mod net_ring {
     /// the page on a boot and matching the values; naming the rest from a
     /// reading would repeat the mistake that made this module necessary.
     ///
+    /// **The rest of the mapping, verified but not yet named.** Written down so
+    /// the next attempt starts from facts rather than from a reading. Every one
+    /// of these was confirmed against a boot dump and the driver's own
+    /// literals:
+    ///
+    /// | word | field | | word | field |
+    /// |---|---|---|---|---|
+    /// | 2 | frames sent | | 12 | its length |
+    /// | 3 | frames received | | 13 | widest frame seen |
+    /// | 4 | last source address | | 14 | requests outstanding |
+    /// | 5 | its virtio header | | 15 | copies made |
+    /// | 8 | frames seen on the ring | | 17–21 | the bond's five |
+    /// | 10 | frames sent for `bin/ipd` | | 22 | the X722's state |
+    /// | 11 | the last frame taken | | 23 | its firmware |
+    ///
+    /// **Word 16 is a gap** — `report()` fills 0 to 15 and the bond's words
+    /// begin at 17 — and **words 22 and 23 are not bond fields**, which is the
+    /// trap in naming them: `bond_report` and `no_virtio_report_with` both
+    /// write them, from the virtio path and the hardware path, and they agree.
+    /// A name like `BOND_X722` would have been wrong, and was nearly added.
+    ///
+    /// **And there is a third writer.** `no_virtio_report_with` fills words 0,
+    /// 1, 8, 9, 10, 22, 23, 24 and 25 for a machine with no virtio device,
+    /// agreeing with the others on every position it shares. An edit that
+    /// rewrites "the report writer" without knowing there are three will land
+    /// in the wrong one — which is how this note came to be written rather than
+    /// the naming finished.
+    ///
     /// **What is already fixed is the dangerous half.** `bin/netd` no longer
     /// writes any of them by position in a list: every field is assigned at an
     /// index, so inserting one cannot silently move the others. What remains is
