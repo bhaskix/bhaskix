@@ -5248,6 +5248,33 @@ pub fn live_threads_in_domain(domain: u32) -> usize {
 /// Its own function because the live counter reads global queues and a per-CPU
 /// count, so it cannot run in a host test; this can, and it is where the
 /// meaning is.
+///
+/// # Why two clauses are enough, and not an enumeration
+///
+/// **This was written as one flag, then two, and it looked like a list with no
+/// end.** [RFC 0081](../../docs/rfc/0081-a-thread-belongs-to-an-incarnation-not-a-slot.md)
+/// was drafted to replace them with a domain *generation* on the grounds that
+/// nothing bounded how many windows there were, and was rejected when the bound
+/// turned out to be provable in three steps:
+///
+/// 1. [`crate::domain::end`] is the **only** routine that frees a slot — the
+///    single place `live` is cleared and the generation bumped — and both ways
+///    a domain can end go through it.
+/// 2. It calls [`mark_domain_dying`], whose loop marks *every* thread of that
+///    slot not already dying. Nothing is left unmarked.
+/// 3. The thread whose exit triggers the end sets `departing` under the queue
+///    lock **before** `domain_thread_departs`, which is the decrement
+///    `domain::create_under` waits on — so the window between the slot becoming
+///    free and `end` running is covered too.
+///
+/// So a thread carrying a previous incarnation's slot number is `dying` or
+/// `departing`, and there is no third case.
+///
+/// **If you are adding a path that frees a domain slot, this is what you must
+/// keep true**: free it through `end`, or mark the threads that still carry its
+/// number. Break either and these two clauses stop covering the cases, silently
+/// — which is what the rejected RFC would have made impossible, at the price of
+/// a field on every thread.
 const fn could_still_run(thread: &Thread, domain: u32) -> bool {
     thread.domain == domain
         && !matches!(thread.state, State::Finished)

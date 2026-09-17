@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | 🔨 **Draft 2026-09-15.** Written after the same defect was fixed three times in one day at three different doors, each fix correct and none of them the cause. |
+| **Status** | ❌ **REJECTED 2026-09-17, on its own central claim being false.** It argued the two flags were an enumeration with no known end — *"a third window needs a third flag, and nothing says how many there are"*. There are two, and it is provable from the source in three steps. The proof is below and is now written where the flags are maintained, which is what this RFC should have been. Kept whole, because a rejected alternative recorded is worth more than the chosen one explained. |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | kernel (`sched`, `domain`) |
 | **Depends on** | [RFC 0017](0017-process-management.md) (the domain lifecycle), and it is the general form of the repairs made under [RFC 0079](0079-a-signal-a-process-may-send-another.md) |
@@ -50,6 +50,42 @@ asks the question by slot id gets the same wrong answer, and is repaired
 separately. Two flags now cover the two windows anybody has looked at. A third
 window needs a third flag, and nothing says how many there are — which is the
 shape of a fix that is not one.
+
+## Why this was rejected — the count is two, and provable
+
+**Checked before building it, which is the only reason this document is not
+code.** The motivation above rests on the windows being open-ended. They are
+not, and three facts from the source close them:
+
+1. **`domain::end` is the only routine that frees a slot.** It is the single
+   place `domain.live = false` and `generation += 1` happen, and both entries to
+   it — `destroy` for a domain ended from outside, and `ended_by_last_thread`
+   for one whose last thread went — go through it.
+2. **`end` marks *every* remaining thread of that slot dying.** It calls
+   `sched::mark_domain_dying`, whose loop skips a thread only when it is already
+   dying. Nothing is left unmarked.
+3. **The thread whose exit triggers the end is `departing` before the slot can
+   be handed out.** `sched::exit` sets the flag under the queue lock, and only
+   then calls `domain_thread_departs`, which is the decrement `create_under`
+   waits on. So the window between the slot becoming free and `end` running is
+   covered by the flag, and everything after it by the marking.
+
+**So any thread carrying a previous incarnation's slot number is `dying` or
+`departing`, and there is no third case to find.** The guards are correct, and
+correct for a reason rather than by having suffered two bugs.
+
+**What this RFC would still have bought**, stated so the rejection is not
+overclaimed: independence from that argument. The flags are right because `end`
+behaves as it does; a generation would be right whatever `end` did. That is
+worth something and it is not worth a field on every thread plus a comparison in
+every scan — the argument is three steps long and now lives in
+`could_still_run`'s own documentation, where the next person to add a
+slot-releasing path will be reading.
+
+**What would reopen it**: a second routine that frees a slot, or one that frees
+it without marking the threads that carry its number. Either breaks step 1 or
+step 2, and at that point the enumeration really is open and the generation is
+the answer.
 
 ## Design
 
