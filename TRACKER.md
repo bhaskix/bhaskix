@@ -999,6 +999,45 @@ the distinction is in the table rather than in somebody's head.
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-09-17 (a report whose field positions are a list's order)
+
+**Found while scoping a refactor, and it is a latent hazard rather than a
+tidiness complaint.** `bin/netd` publishes its report by building
+`let words = [a, b, c, …]` and writing the whole array from `ring::REPORT` —
+three functions do it — so **a field's word number is its position in a
+literal**. The kernel reads those fields by number: `NETD_TRANSMITTED` at word
+27, `NETD_MEMBER_QUEUES` at 39, eighteen in all.
+
+**Insert a field in the middle of that list and every field after it moves**,
+while the kernel goes on reading the old numbers. Nothing fails to build,
+nothing fails a gate, and the report simply starts answering the wrong
+questions. That is the same shape as the record overlap the SR550 found the day
+before — a position that is implicit rather than stated — and it is the more
+dangerous version, because the overlap at least corrupted something a boot
+printed.
+
+**It is not broken today**: the positions agree, which is why the bond tests
+pass. What is missing is anything that would keep them agreeing.
+
+**The fix is not the one first written down.** `abi::net_ring`'s note said the
+words were "bare literals" and wanted a thirty-seven site mechanical move. There
+are two shapes, and only one of them is literals: seventeen inline
+`ring::REPORT + N * 8` sites, and the positional arrays above. Naming eighteen
+constants would fix the literals and leave the arrays exactly as dangerous. The
+change wanted is **to stop the positions being implicit** — the words the kernel
+reads assigned by name, with the names in the ABI beside `REPORT` and `PAGES`,
+which already live there.
+
+Two details for whoever takes it: netd writes word 26 (`carried_since_report`)
+which the kernel never reads and so needs no shared name; and
+`NETD_SENT_FRAME` (48) and `NETD_HEARD_FRAME` (64) are *ranges* inside those
+arrays rather than single fields.
+
+**Recorded rather than done, deliberately.** The investigation is the part that
+was worth doing tonight; the edit touches three report writers and eighteen
+kernel constants, and its one failure mode — a position transcribed wrongly — is
+precisely the fault it exists to prevent.
+
 ### 2026-09-16 (the SR550 found a record overlapping another, on its first boot)
 
 **The process record grew onto the bind record, and only real hardware showed

@@ -1447,15 +1447,33 @@ pub mod tcp {
 /// 0x800` — two independent statements of one layout, in two rings, with
 /// nothing checking that they agreed."*
 ///
-/// **What is deliberately still not here**, so the next reader is not misled
-/// into thinking this module is complete: the eighteen *word offsets inside*
-/// the report page. The kernel names them (`NETD_TRANSMITTED`,
-/// `NETD_MEMBER_QUEUES`, and sixteen more) and `bin/netd` writes most of them
-/// as bare literals — `ring::REPORT + 27 * 8` — so each is still a number
-/// stated twice. Moving them is a thirty-seven site mechanical edit whose one
-/// failure mode is a mis-transcription, which is precisely the disagreement it
-/// exists to prevent; it wants its own change, done when somebody can watch the
-/// bond tests afterwards rather than at the end of a long day.
+/// **What is deliberately still not here, and it is worse than it first looked.**
+/// The eighteen *word offsets inside* the report page are not here. The kernel
+/// names them — `NETD_TRANSMITTED` at word 27, `NETD_MEMBER_QUEUES` at 39, and
+/// sixteen more — and `bin/netd` states the same positions in **two different
+/// shapes**, which is why this is not the mechanical edit it was first written
+/// up as:
+///
+/// * **Inline offsets**, `ring::REPORT + 26 * 8` and sixteen like it. A number
+///   stated twice, and the ordinary kind of duplication.
+/// * **Positional array literals**, which are the dangerous kind. Three
+///   functions build `let words = [a, b, c, …]` and write the whole thing from
+///   `ring::REPORT`, so a field's word number is its *position in a list* — and
+///   inserting one in the middle silently moves every field after it, while the
+///   kernel goes on reading the old numbers. Nothing would fail to build and
+///   nothing would fail a gate; the report would simply start answering the
+///   wrong questions.
+///
+/// **So the fix is not "name eighteen constants", it is "stop the positions
+/// being implicit"**: the words the kernel reads should be assigned by name
+/// rather than by position, and the names should live here. That is a real
+/// change with a real argument, and it is a different change from the one this
+/// note described before it was investigated.
+///
+/// Two further details for whoever does it: `bin/netd` writes word 26
+/// (`carried_since_report`) which the kernel never reads, so it needs no name
+/// here; and the kernel's `NETD_SENT_FRAME` (48) and `NETD_HEARD_FRAME` (64)
+/// are ranges inside those positional arrays rather than single fields.
 pub mod net_ring {
     /// How many pages the rings object holds.
     ///
