@@ -1456,13 +1456,21 @@ pub mod tcp {
 ///
 /// * **Inline offsets**, `ring::REPORT + 26 * 8` and sixteen like it. A number
 ///   stated twice, and the ordinary kind of duplication.
-/// * **Positional array literals**, which are the dangerous kind. Three
-///   functions build `let words = [a, b, c, …]` and write the whole thing from
-///   `ring::REPORT`, so a field's word number is its *position in a list* — and
-///   inserting one in the middle silently moves every field after it, while the
-///   kernel goes on reading the old numbers. Nothing would fail to build and
-///   nothing would fail a gate; the report would simply start answering the
-///   wrong questions.
+/// * **Positional array literals**, which are the dangerous kind — and which
+///   hold *different* words from the eighteen above. `report()` builds one from
+///   word 0 and `bond_report()` writes seven words at an explicit base of 17,
+///   and the kernel reads nine of those positions directly: `words[0]`, `[1]`,
+///   `[6]`, `[7]` in `report_net_domain`, and `[9]`, `[17]`, `[18]`, `[19]`,
+///   `[20]` in `report_bond`. Inserting a field into either array shifts what
+///   the kernel reads, with nothing failing to build.
+///
+/// **And the layout cannot be checked by reading**, which is the strongest
+/// argument for changing it. Four writers reach this page and they interleave,
+/// and `bond_report`'s own comment says it writes *"the five words that follow
+/// the seventeen `report` writes"* while its array holds seven. Two attempts to
+/// describe this layout from the source produced two different wrong answers
+/// before this one; see `TRACKER.md`'s entry of 2026-09-17 and the correction
+/// above it.
 ///
 /// **So the fix is not "name eighteen constants", it is "stop the positions
 /// being implicit"**: the words the kernel reads should be assigned by name

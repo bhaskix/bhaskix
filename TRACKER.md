@@ -999,6 +999,42 @@ the distinction is in the table rather than in somebody's head.
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-09-17 (correcting yesterday's entry: the positional coupling is real, the words named were the wrong ones)
+
+**The entry below is wrong in its specifics and the correction is worth more
+than the entry.** It said the kernel reads the positional fields "by number:
+`NETD_TRANSMITTED` at word 27, `NETD_MEMBER_QUEUES` at 39, eighteen in all".
+Those eighteen are **not** the positional ones: they are written by explicit
+offset in `bin/netd` — `ring::REPORT + 27 * 8` and sixteen like it — and read by
+explicit offset in the kernel. They are a number stated twice, which is ordinary
+duplication and not a silent-shift hazard.
+
+**The positional coupling is real, and it is these nine indices.** The kernel
+reads `words[0]`, `[1]`, `[6]` and `[7]` in `report_net_domain`, and `words[9]`,
+`[17]`, `[18]`, `[19]` and `[20]` in `report_bond`. `bin/netd` writes them from
+two positional arrays: `report()` builds one from word 0, and `bond_report()`
+writes seven words at an explicit base of 17. Inserting a field into either
+shifts what the kernel reads, with nothing failing to build.
+
+**And the part that matters most was found by getting it wrong twice:** the
+mapping from a position to the field it holds **cannot be established by
+reading**. There are four writers into that page — `report()`, `bond_report()`,
+an indexed builder, and seventeen inline offset sites — they interleave, and at
+least one comment is already stale: `bond_report`'s says it writes *"the five
+words that follow the seventeen `report` writes"* while its array holds
+**seven**. Two attempts to describe this layout from the source produced two
+different wrong answers, which is the strongest argument available that the
+positions should not be implicit.
+
+**So what is established is narrower than the entry below claimed, and the case
+for the change is stronger.** Nine indices, coupled by position, in a layout
+whose own comments no longer describe it. What is *not* established is which
+netd expression lands on which index — and that is exactly what a reader would
+have to know to change this safely today.
+
+**Not attempted tonight.** A fix built on a mapping I could not verify would be
+the third wrong description, and this one would compile.
+
 ### 2026-09-17 (a report whose field positions are a list's order)
 
 **Found while scoping a refactor, and it is a latent hazard rather than a
