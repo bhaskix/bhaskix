@@ -12923,6 +12923,17 @@ const TCPC_RING_BYTES: u64 = 4 * bhaskix_mm::FRAME_SIZE;
 /// The badge the client's capability to the TCP service carries.
 const TCPC_BADGE: u64 = 0x7C_C1;
 static TCPC_REPORT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// Which domain `bin/tcpc` runs in, so its failure report can ask about it.
+///
+/// **Because the client cannot describe the call it is stuck inside.** §3's
+/// step-4 row reached, on its seventh sighting, *"it entered the stream wait
+/// and the first state read has not returned"* — which is as far as a word that
+/// program writes can go, since it writes nothing while blocked. Whether it is
+/// **parked in the rendezvous**, waiting for a reply `bin/tcpd` never sent, or
+/// **running** somewhere else entirely is a question only the scheduler can
+/// answer, and answering it needs the domain to ask about.
+static TCPC_DOMAIN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(u32::MAX);
 /// The TCP service's endpoint, for minting client capabilities to it.
 static TCP_ENDPOINT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
 
@@ -19502,6 +19513,7 @@ fn start_tcp_client_domain(
 
     let realm = domain::create("tcpc", domain::ResourceEnvelope::new())
         .map_err(|_| "the tcp client domain would not be created")?;
+    TCPC_DOMAIN.store(realm.as_u32(), core::sync::atomic::Ordering::Release);
 
     // The client's capability to the service: badged, so the service can key
     // the handover by who is calling, and carrying no GRANT — holding a
@@ -20018,6 +20030,25 @@ fn report_tcp_client(hhdm: u64) {
     if outcome == 9 || outcome == 8 || outcome == 10 || outcome == 11 || outcome == 12 {
         println!("    tcp client     {said}");
     } else if outcome == 2 && detail == bhaskix_abi::tcp::WAIT_ENTERED {
+        // **And what the scheduler says that thread is doing**, which the
+        // program itself cannot: it writes nothing while it is inside the call.
+        // `Blocked` is a thread parked in the rendezvous, waiting for a reply
+        // `bin/tcpd` has not sent — the fault is then on the service's side of
+        // one named call. Anything else is a thread that is running and not
+        // returning, which is a different search entirely.
+        let doing = match sched::first_thread_in_domain(
+            TCPC_DOMAIN.load(core::sync::atomic::Ordering::Acquire),
+        ) {
+            Some((thread, state)) => {
+                println!(
+                    "\x1b[91m    tcp client     and the scheduler has thread {thread} \
+                     {state:?}\x1b[0m"
+                );
+                true
+            }
+            None => false,
+        };
+        let _ = doing;
         // **It reached the wait and the first question did not come back.**
         // `bin/tcpc` publishes this before asking the service anything, so the
         // program is inside `stream_state` rather than short of it.
