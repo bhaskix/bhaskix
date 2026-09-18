@@ -4666,6 +4666,23 @@ fn next_event() -> u64 {
     EVENT_SEQ.fetch_add(1, Ordering::Relaxed) & 0xff_ffff
 }
 
+/// Takes an order number for something that is neither a wake nor a mark.
+///
+/// **Because the retire's own wake had no place in the sequence, and that was
+/// the one number specimen twenty needed.** That specimen reads `last wake
+/// #5405, last mark #5407 by a completed mark` on a station that ended asleep,
+/// with the retire finding three entries rather than four — and whether the
+/// retire's `wake_all` ran *before* #5407 or *after* it decides between a lost
+/// wakeup and a re-block, which are different bugs. Both readings were
+/// available and neither was decidable.
+///
+/// It consumes a number like any other event, so bracketing a call with two of
+/// these places that call in the same order as every wake and mark around it.
+#[must_use]
+pub fn event_mark() -> u64 {
+    next_event()
+}
+
 /// The last mark that put each thread `Blocked`: which path, and when.
 ///
 /// The other half of [`WAKE_LOG`]. `source` is 0 for a thread marking itself

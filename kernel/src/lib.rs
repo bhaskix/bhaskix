@@ -29172,7 +29172,13 @@ fn wait_queue_self_test(hhdm_base: u64) -> bool {
     // set together under the waiters lock in `enqueue_and_block`, so that
     // should be impossible, and the count is what will say whether it happened
     // or whether the reasoning is wrong. Discarded until now.
+    // **Bracketed in the same sequence the wakes and marks use**, because
+    // specimen twenty could not say whether the retire's wake ran before or
+    // after the stuck station's mark — and that decides between a lost wakeup
+    // and a re-block. See `sched::event_mark`.
+    let wake_from = sched::event_mark();
     let retire_woke = RING.wake_all();
+    let wake_to = sched::event_mark();
     let ring_retired = wait_until(|| sched::threads_present_exact(&spawned) == 0, 4_000);
     // **Counted here, not where it is printed.** The failure message below used
     // to call `threads_present_exact` again -- and between these two points the
@@ -29516,8 +29522,9 @@ fn wait_queue_self_test(hhdm_base: u64) -> bool {
         println!(
             "\x1b[91m                   token {token}, phase {phase} (retire is above \
              {PHASE_WAIT}), {waiting} sleepers still queued, {overflowed} overflowed, the retire's \
-             wake found {retire_woke} entr(ies); the recent-wake window is {window_held} \
-             entr(ies) spanning #{window_from}..#{window_to}\x1b[0m"
+             wake found {retire_woke} entr(ies) between #{wake_from} and #{wake_to}; the \
+             recent-wake window is {window_held} entr(ies) spanning #{window_from}..\
+             #{window_to}\x1b[0m"
         );
         ok = false;
     }
