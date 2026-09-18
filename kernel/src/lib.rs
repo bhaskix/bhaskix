@@ -15622,10 +15622,17 @@ const NET_CONFIG_MARKER: u64 = 0x3146_4e43_5049_5f4e;
 
 /// Byte offset in `bin/netd`'s report page of the failover request.
 ///
-/// **The one word this kernel writes into that page**, and the driver's
-/// `ring::FAILOVER_REQUEST` is the same number from the other side. Forty words
-/// in, well clear of the twenty-six the report itself uses.
-const NETD_FAILOVER_REQUEST: u64 = 40 * 8;
+/// **The first of the two words this kernel writes into that page**, and the
+/// number is now stated once, in `bhaskix_abi::net_ring::word`, rather than
+/// here and in the driver's `ring::FAILOVER_REQUEST` separately.
+///
+/// This said it was *"well clear of the twenty-six the report itself uses"*,
+/// and that was wrong in a way worth recording: the report is 83 words wide and
+/// word 40 sits **between** the X722's sections, after `MEMBER_QUEUES` at 39
+/// and before `MEMBER_OWNERS` at 42. What keeps it clear of them is not being
+/// past the end; it is that the ABI asserts the neighbours, which is a check
+/// rather than a belief.
+const NETD_FAILOVER_REQUEST: u64 = bhaskix_abi::net_ring::word::FAILOVER_REQUEST as u64 * 8;
 
 /// Byte offset in that page of the bond's mode: non-zero for 802.3ad.
 ///
@@ -15633,12 +15640,13 @@ const NETD_FAILOVER_REQUEST: u64 = 40 * 8;
 /// know whose received frames to hand up -- every member's in an aggregation,
 /// the carrier's alone in active-backup -- and the mode is a configuration
 /// fact, so the driver may hold it without reading a frame.
-const NETD_BOND_IS_LACP: u64 = 41 * 8;
+const NETD_BOND_IS_LACP: u64 = bhaskix_abi::net_ring::word::BOND_IS_LACP as u64 * 8;
 
 /// Byte offset in that page of the members' own station addresses.
 ///
-/// Read, not written: `bin/netd`'s `ring::MEMBER_ADDRESSES` is the same number
-/// from the other side. The word at this offset is a sentinel saying the block
+/// Read, not written, and the offset comes from `bhaskix_abi::net_ring::word`
+/// -- `bin/netd`'s `ring::MEMBER_ADDRESSES` is derived from the same constant
+/// rather than repeating it. The word at this offset is a sentinel saying the block
 /// behind it has been filled in, and [`NETD_MEMBER_COUNT`] addresses follow it,
 /// zero where there is no member.
 ///
@@ -15648,7 +15656,7 @@ const NETD_BOND_IS_LACP: u64 = 41 * 8;
 /// would read as three members with no address, which is a thing that can also
 /// be true. The driver writes this block once, after every port has been tried,
 /// and the sentinel last.
-const NETD_MEMBER_ADDRESSES: u64 = 32 * 8;
+const NETD_MEMBER_ADDRESSES: u64 = bhaskix_abi::net_ring::word::MEMBER_ADDRESSES as u64 * 8;
 
 /// Byte offset in that page of what the device says it transmitted: the VSI's
 /// multicast count packed with its flags, and the port's beside it.
@@ -15656,7 +15664,7 @@ const NETD_MEMBER_ADDRESSES: u64 = 32 * 8;
 /// The same words `report_x722` prints from, read again later by
 /// [`net_domain_transmitted`] so that a comparison against `bin/ipd`'s count is
 /// a comparison of one instant.
-const NETD_TRANSMITTED: u64 = 27 * 8;
+const NETD_TRANSMITTED: u64 = bhaskix_abi::net_ring::word::TRANSMITTED as u64 * 8;
 
 /// Byte offset in that page of the VSI's switching section as `bin/netd` read
 /// it **back** from the device, with bit 16 saying it was read at all.
@@ -15665,7 +15673,7 @@ const NETD_TRANSMITTED: u64 = 27 * 8;
 /// is whether the bit stuck. Without it a switch control tag is *"not
 /// permitted"*, and an accepted command whose bit did not stick reads exactly
 /// like a working one.
-const NETD_VSI_SWITCHING: u64 = 37 * 8;
+const NETD_VSI_SWITCHING: u64 = bhaskix_abi::net_ring::word::VSI_SWITCHING as u64 * 8;
 
 /// Byte offset in that page of the device's malicious-driver transmit record
 /// and the members' transmit queue enables, with bit 40 saying it was read.
@@ -15674,7 +15682,7 @@ const NETD_VSI_SWITCHING: u64 = 37 * 8;
 /// 38.31.1: *"Packets outside this range are considered malicious. The
 /// respective queue is stopped and an interrupt is issued to the PF."* A driver
 /// whose descriptors are consumed and then are not has exactly this to ask.
-const NETD_MALICIOUS: u64 = 38 * 8;
+const NETD_MALICIOUS: u64 = bhaskix_abi::net_ring::word::MALICIOUS as u64 * 8;
 
 /// Byte offset of each member's transmit queue and each member's **own**
 /// malicious-driver flag, with bit 63 saying it was written.
@@ -15688,7 +15696,7 @@ const NETD_MALICIOUS: u64 = 38 * 8;
 /// The flags matter separately: `GL_MDET_TX` is one register for the card, but
 /// `PF_MDET_TX` is one per port, and `bin/netd` read it from port 0 alone while
 /// calling the whole record global.
-const NETD_MEMBER_QUEUES: u64 = 39 * 8;
+const NETD_MEMBER_QUEUES: u64 = bhaskix_abi::net_ring::word::MEMBER_QUEUES as u64 * 8;
 
 /// Byte offset of each member's function number and its queue's `QTX_CTL`
 /// read-back, with bit 63 saying it was written.
@@ -15699,7 +15707,7 @@ const NETD_MEMBER_QUEUES: u64 = 39 * 8;
 /// reading it back. Its `PF_INDX` comes from `PF_FUNC_RID`, so both are here:
 /// four bits of `FUNCTION_NUMBER`, then `PFVF_Q` and `PF_INDX`, ten bits per
 /// member. Words 40 and 41 are this kernel's own, so this is word 42.
-const NETD_MEMBER_OWNERS: u64 = 42 * 8;
+const NETD_MEMBER_OWNERS: u64 = bhaskix_abi::net_ring::word::MEMBER_OWNERS as u64 * 8;
 /// Bits each member takes there.
 const NETD_MEMBER_OWNER_BITS: u32 = 10;
 /// Bit 63 of it: the word was written.
@@ -15721,13 +15729,13 @@ const _: () = assert!(NETD_MEMBER_OWNER_BITS as usize * NETD_MEMBER_COUNT < 63);
 /// scheduled"*, so a queue in an arbitration set that is not the function's is
 /// never scheduled, its context is never fetched, and its descriptors sit in
 /// the ring. Ten bits per member, the same stride as [`NETD_MEMBER_OWNERS`].
-const NETD_MEMBER_QUEUE_SETS: u64 = 43 * 8;
+const NETD_MEMBER_QUEUE_SETS: u64 = bhaskix_abi::net_ring::word::MEMBER_QUEUE_SETS as u64 * 8;
 /// Bit 63 of it: the word was written.
 const NETD_MEMBER_QUEUE_SETS_WRITTEN: u64 = 1 << 63;
 
 /// Byte offset of each member's PVID -- twelve bits each, the VLAN section's
 /// valid bit at 48:51 -- with bit 63 saying it was written.
-const NETD_MEMBER_PVIDS: u64 = 44 * 8;
+const NETD_MEMBER_PVIDS: u64 = bhaskix_abi::net_ring::word::MEMBER_PVIDS as u64 * 8;
 /// And of the VLAN handling flags beside it: `Insert PVID`, valid, insertion
 /// mode and expose mode, seven bits at an eight-bit stride.
 ///
@@ -15737,7 +15745,7 @@ const NETD_MEMBER_PVIDS: u64 = 44 * 8;
 /// out of the MAC and the switch simply never hands it to LACP. A partner in
 /// that state reports `Defaulted` and records its own defaults -- key 0, port 0
 /// -- as its partner, which is what the SR550's switch says on all four links.
-const NETD_MEMBER_VLAN_FLAGS: u64 = 45 * 8;
+const NETD_MEMBER_VLAN_FLAGS: u64 = bhaskix_abi::net_ring::word::MEMBER_VLAN_FLAGS as u64 * 8;
 /// Bit 63 of either: the word was written.
 const NETD_MEMBER_VLAN_WRITTEN: u64 = 1 << 63;
 
@@ -15750,9 +15758,9 @@ const NETD_MEMBER_VLAN_WRITTEN: u64 = 1 << 63;
 /// what a `SWTCH` uplink resolving to one switch element's uplink looks like,
 /// and it would leave three of the four switch ports having heard no LACPDU at
 /// all -- `Defaulted` on three links, for a reason nothing here could name.
-const NETD_MEMBER_VSI_OUT: u64 = 46 * 8;
+const NETD_MEMBER_VSI_OUT: u64 = bhaskix_abi::net_ring::word::MEMBER_VSI_OUT as u64 * 8;
 /// And the same frames one boundary further out, at the MAC port.
-const NETD_MEMBER_PORT_OUT: u64 = 47 * 8;
+const NETD_MEMBER_PORT_OUT: u64 = bhaskix_abi::net_ring::word::MEMBER_PORT_OUT as u64 * 8;
 /// Bit 63 of either: the word was written.
 const NETD_MEMBER_OUT_WRITTEN: u64 = 1 << 63;
 /// Bits each member's count takes in those two words.
@@ -15772,19 +15780,19 @@ const NETD_MEMBER_OUT_BITS: u32 = 13;
 /// for field, against the switch's own frame. The partner TLV at offset 36, the
 /// collector at 56 and the terminator at 72 were left unread -- and a receiver
 /// validates all three before it will accept an LACPDU.
-const NETD_SENT_FRAME: u64 = 48 * 8;
+const NETD_SENT_FRAME: u64 = bhaskix_abi::net_ring::word::SENT_FRAME as u64 * 8;
 /// Both frames' lengths, sent at 15:0 and heard at 31:16, bit 63 set when taken.
 ///
 /// **The length is the one thing code review cannot check.** A frame truncated
 /// anywhere between `frame()` and the descriptor's `BSIZE` reaches the switch
 /// short and is discarded, and every counter in this report still reads exactly
 /// as it does now.
-const NETD_FRAME_LENGTHS: u64 = 80 * 8;
+const NETD_FRAME_LENGTHS: u64 = bhaskix_abi::net_ring::word::FRAME_LENGTHS as u64 * 8;
 /// And the last slow-protocol frame the switch sent us -- the one LACPDU on
 /// this wire known to be acceptable to something.
-const NETD_HEARD_FRAME: u64 = 64 * 8;
+const NETD_HEARD_FRAME: u64 = bhaskix_abi::net_ring::word::HEARD_FRAME as u64 * 8;
 /// Words each dump takes.
-const NETD_FRAME_WORDS: usize = 16;
+const NETD_FRAME_WORDS: usize = bhaskix_abi::net_ring::FRAME_WORDS;
 /// An LACPDU's frame length: a 14-byte Ethernet header and 110 bytes of PDU.
 const NETD_LACPDU_FRAME: u64 = 124;
 /// Bit 63 of [`NETD_FRAME_LENGTHS`]: both were taken.
@@ -15797,19 +15805,19 @@ const NETD_FRAMES_WRITTEN: u64 = 1 << 63;
 /// of the switch's report: if frames arrive here intact while ours arrive there
 /// broken, the corruption is one-way and belongs to this side's transmit rather
 /// than to the cable between them.
-const NETD_MEMBER_CRC: u64 = 81 * 8;
+const NETD_MEMBER_CRC: u64 = bhaskix_abi::net_ring::word::MEMBER_CRC as u64 * 8;
 /// And each member's negotiated speed at 31:0, its `Set MAC Config` outcome at
 /// 47:32, with bit 63 saying both were taken.
 ///
 /// The speed is here because four 10G ports negotiating 1 Gb/s is worth seeing
 /// without asking the BMC -- `bin/netd` has published it since links were read
 /// and this kernel has never printed it.
-const NETD_MEMBER_SPEED: u64 = 82 * 8;
+const NETD_MEMBER_SPEED: u64 = bhaskix_abi::net_ring::word::MEMBER_SPEED as u64 * 8;
 /// Bit 63 of that word.
 const NETD_MEMBER_LINK_WRITTEN: u64 = 1 << 63;
 
 /// The sentinel `bin/netd` writes there.
-const NETD_MEMBER_ADDRESSES_WRITTEN: u64 = 0x5352_4444_414d_454d;
+const NETD_MEMBER_ADDRESSES_WRITTEN: u64 = bhaskix_abi::net_ring::MEMBER_ADDRESSES_WRITTEN;
 
 /// How many addresses follow it.
 ///
@@ -15817,7 +15825,7 @@ const NETD_MEMBER_ADDRESSES_WRITTEN: u64 = 0x5352_4444_414d_454d;
 /// `bin/netd`'s `ring::MEMBER_ADDRESS_COUNT` and `bin/ipd`'s `LACP_MACHINES`
 /// are the same four, and the assertion below ties it to the ports this kernel
 /// actually delegates so the two cannot drift apart in silence.
-const NETD_MEMBER_COUNT: usize = 4;
+const NETD_MEMBER_COUNT: usize = bhaskix_abi::net_ring::MEMBER_COUNT;
 
 const _: () = assert!(X722_MEMBERS as usize <= NETD_MEMBER_COUNT);
 
@@ -17547,7 +17555,7 @@ fn report_ahci_domain(hhdm: u64) -> bool {
 }
 
 /// The marker `bin/netd` writes before its report.
-const NETD_MARKER: u64 = 0x3154_5052_4454_454e;
+const NETD_MARKER: u64 = bhaskix_abi::net_ring::MARKER;
 
 /// Where in the rings the network driver leaves its report.
 ///
@@ -18009,6 +18017,7 @@ fn time_the_burst(hhdm: u64) {
 /// about this kernel rather than about the machine, and leaving it unsaid is
 /// how a delegation that quietly stopped working would go unnoticed.
 fn report_x722(words: &[u64; 29]) {
+    use bhaskix_abi::net_ring::word;
     /// Word 22's low four bits: delegated, reset, queues enabled, link up.
     const DELEGATED: u64 = 1;
     const RESET: u64 = 1 << 1;
@@ -18018,7 +18027,7 @@ fn report_x722(words: &[u64; 29]) {
     /// the admin queues that carry commands.
     const CARRYING: u64 = 1 << 4;
 
-    let state = words[22];
+    let state = words[word::X722_STATE];
     if state & DELEGATED == 0 {
         if find_foreign_nic().is_some() {
             println!(
@@ -18031,8 +18040,8 @@ fn report_x722(words: &[u64; 29]) {
     println!(
         "    net x722       bin/netd holds it: firmware {}.{}, link {}, {} switch element(s); \
          reset {}, admin queues {}",
-        words[23] & 0xffff,
-        words[23] >> 16 & 0xffff,
+        words[word::X722_FIRMWARE] & 0xffff,
+        words[word::X722_FIRMWARE] >> 16 & 0xffff,
         if state & LINK_UP != 0 { "UP" } else { "down" },
         state >> 16 & 0xffff,
         if state & RESET != 0 {
@@ -18062,14 +18071,14 @@ fn report_x722(words: &[u64; 29]) {
     // that separates a frame that reached the wire from one the device
     // swallowed. Both were consistent with "44 sent, none received" and neither
     // could tell them apart.
-    let out = words[27] & 0xffff_ffff;
-    let override_ok = words[27] >> 32 & 1 != 0;
+    let out = words[word::TRANSMITTED] & 0xffff_ffff;
+    let override_ok = words[word::TRANSMITTED] >> 32 & 1 != 0;
     // **Bit 33 says the port's count behind word 28 was measured.** Zero is
     // what a port that sent nothing and a word nobody wrote both look like, and
     // reading the second as the first is the mistake this report has made three
     // times. The driver sets it in the same store that publishes the rest.
-    let measured = words[27] >> 33 & 1 != 0;
-    let wire = words[28] & 0xffff_ffff;
+    let measured = words[word::TRANSMITTED] >> 33 & 1 != 0;
+    let wire = words[word::PORT_MULTICAST] & 0xffff_ffff;
     // **What firmware said to `Stop LLDP Agent`**, at bits 34 onward.
     //
     // 38.28 assigns the MAC's control VSI to the EMP at initialisation and says
@@ -18082,8 +18091,8 @@ fn report_x722(words: &[u64; 29]) {
     // Three outcomes and not two: the datasheet says the command is *"silently
     // dropped"* when the agent is already off, so a refusal may mean the port
     // was already ours and may mean firmware would not give it up.
-    let lldp = words[27] >> 34 & 0xf;
-    let lldp_code = words[27] >> 38 & 0xffff;
+    let lldp = words[word::TRANSMITTED] >> 34 & 0xf;
+    let lldp_code = words[word::TRANSMITTED] >> 38 & 0xffff;
     if lldp == 3 {
         // `0xD` is `EEXIST` in Table 38-350, which for this command is the
         // agent having already been off -- the port was already this driver's,
@@ -18166,12 +18175,13 @@ fn report_x722(words: &[u64; 29]) {
 /// a failover with no traffic after it is a bond that failed over into silence,
 /// and it must not print as a pass.
 fn report_bond(words: &mut [u64; 29], take: impl Fn(&mut [u64; 29])) {
+    use bhaskix_abi::net_ring::word;
     /// Which member the bond is on, and what each member's link says.
     fn members(words: &[u64; 29]) -> (u64, u64, u64) {
         (
-            words[bhaskix_abi::net_ring::word::BOND_MEMBERS],
-            words[bhaskix_abi::net_ring::word::BOND_ACTIVE],
-            words[bhaskix_abi::net_ring::word::BOND_LINKS],
+            words[word::BOND_MEMBERS],
+            words[word::BOND_ACTIVE],
+            words[word::BOND_LINKS],
         )
     }
 
@@ -18197,19 +18207,19 @@ fn report_bond(words: &mut [u64; 29], take: impl Fn(&mut [u64; 29])) {
     if patience == 0 {
         return;
     }
-    let handed = words[bhaskix_abi::net_ring::word::HANDED];
+    let handed = words[word::HANDED];
     let mut failed_over = false;
     let mut carried = false;
     for _ in 0..(patience / 50) {
         take(words);
-        failed_over = words[bhaskix_abi::net_ring::word::BOND_FAILOVERS] != 0;
+        failed_over = words[word::BOND_FAILOVERS] != 0;
         // **Word 26 is the driver's own count from the instant it failed
         // over**, and it is the one that answers the question. This compared
         // against a baseline taken when *this* window opened, which is later --
         // sometimes a minute later, because the wait for a first frame runs
         // first -- so a member that had been carrying since the change looked
         // like one that had carried nothing.
-        carried = words[bhaskix_abi::net_ring::word::HANDED] > handed;
+        carried = words[word::HANDED] > handed;
         if failed_over && carried {
             break;
         }
@@ -18220,8 +18230,8 @@ fn report_bond(words: &mut [u64; 29], take: impl Fn(&mut [u64; 29])) {
         println!(
             "    net bond       \x1b[92mfailed over {} time(s): traffic on port {active} now, \
              and {} frame(s) have crossed since\x1b[0m",
-            words[20],
-            words[9] - handed
+            words[word::BOND_FAILOVERS],
+            words[word::HANDED] - handed
         );
     } else if failed_over {
         // **What "nothing crossed" could mean, said rather than left to be
@@ -18236,7 +18246,8 @@ fn report_bond(words: &mut [u64; 29], take: impl Fn(&mut [u64; 29])) {
             "\x1b[91m    net bond       failed over to port {active} and nothing has crossed \
              since: {} sent from it, {} frame(s) had reached the backup before the \
              change\x1b[0m",
-            words[10], words[21]
+            words[word::SENT_FOR_IPD],
+            words[word::BOND_OFF_MEMBER]
         );
     } else {
         println!(
@@ -18442,6 +18453,7 @@ impl core::fmt::Display for LinkStates {
 }
 
 fn report_net_after_exchange(hhdm: u64) {
+    use bhaskix_abi::net_ring::word;
     use core::sync::atomic::Ordering;
 
     let raw = NET_RINGS.load(Ordering::Acquire);
@@ -18487,7 +18499,7 @@ fn report_net_after_exchange(hhdm: u64) {
         }
     };
     take(&mut words);
-    if words[bhaskix_abi::net_ring::word::MARKER] != NETD_MARKER {
+    if words[word::MARKER] != NETD_MARKER {
         return;
     }
     // **Ask for the failover, where this boot said to** -- RFC 0076 step 3.
@@ -18513,10 +18525,10 @@ fn report_net_after_exchange(hhdm: u64) {
     // an X722 the wire carries a frame about every thirty seconds. A glance
     // during bring-up reports the silence rather than the receive path.
     let patience = X722_PATIENCE_MS.load(Ordering::Relaxed);
-    if patience > 0 && words[9] == 0 {
+    if patience > 0 && words[word::HANDED] == 0 {
         for _ in 0..(patience / 50) {
             take(&mut words);
-            if words[9] > 0 {
+            if words[word::HANDED] > 0 {
                 break;
             }
             wait_millis(50);
@@ -18525,7 +18537,11 @@ fn report_net_after_exchange(hhdm: u64) {
     println!(
         "    net after      {} completions seen, {} handed across, {} sent back; widest frame \
          the device wrote {} bytes, {} buffers left with it",
-        words[8], words[9], words[10], words[13], words[14]
+        words[word::RING_SEEN],
+        words[word::HANDED],
+        words[word::SENT_FOR_IPD],
+        words[word::WIDEST_FRAME],
+        words[word::OUTSTANDING]
     );
     report_bond(&mut words, take);
     report_x722(&words);
@@ -19466,8 +19482,8 @@ fn report_net_after_exchange(hhdm: u64) {
     // a ring copy, and every ring copy exists only because the driver and the
     // protocol code are in different domains — so this total divided by the
     // packets that crossed *is* the claim, checked.
-    let packets = words[9].saturating_add(words[10]);
-    let copies = words[15].saturating_add(ipd[13]);
+    let packets = words[word::HANDED].saturating_add(words[word::SENT_FOR_IPD]);
+    let copies = words[word::COPIES].saturating_add(ipd[13]);
     if let Some(whole) = copies.checked_div(packets)
         && let Some(hundredths) = copies.saturating_mul(100).checked_div(packets)
     {
@@ -19475,7 +19491,7 @@ fn report_net_after_exchange(hhdm: u64) {
             "    boundary       {copies} ring copies over {packets} packets = {whole}.{:02} per \
              packet ({} by the driver, {} by the service)",
             hundredths % 100,
-            words[15],
+            words[word::COPIES],
             ipd[13]
         );
     }
@@ -20643,6 +20659,7 @@ fn measure_deadlines(handoff: &Handoff, when: &str) -> bool {
 /// driver that transmits into a void and never checks would pass a single gate
 /// covering both; it cannot pass two.
 fn report_net_domain(hhdm: u64) -> bool {
+    use bhaskix_abi::net_ring::word;
     use core::sync::atomic::Ordering;
 
     let raw = NET_RINGS.load(Ordering::Acquire);
@@ -20669,12 +20686,12 @@ fn report_net_domain(hhdm: u64) -> bool {
         buffer.copy_from_slice(&raw[index * 8..index * 8 + 8]);
         *word = u64::from_le_bytes(buffer);
     }
-    if words[bhaskix_abi::net_ring::word::MARKER] != NETD_MARKER {
+    if words[word::MARKER] != NETD_MARKER {
         println!("\x1b[91m    net domain     FAILED: the driver left no report\x1b[0m");
         return false;
     }
 
-    let mac = words[bhaskix_abi::net_ring::word::MAC];
+    let mac = words[word::MAC];
     let octets = |value: u64| {
         [
             (value >> 40) as u8,
@@ -20721,10 +20738,11 @@ fn report_net_domain(hhdm: u64) -> bool {
     println!(
         "    net domain     up: mac {a:02x}:{b:02x}:{c:02x}:{d:02x}:{e:02x}:{f:02x}, \
          rx queue {}, tx queue {}",
-        words[6], words[7]
+        words[word::RECEIVE_QUEUE],
+        words[word::TRANSMIT_QUEUE]
     );
 
-    let transmitted = words[2];
+    let transmitted = words[word::SENT];
     if transmitted == 0 {
         println!("\x1b[91m    net domain     FAILED: nothing was transmitted\x1b[0m");
         return false;
@@ -20733,20 +20751,25 @@ fn report_net_domain(hhdm: u64) -> bool {
 
     // The receive half, gated separately. A length of zero means nothing came
     // back, which on a network that answers is a failure and not an absence.
-    let length = words[3];
+    let length = words[word::RECEIVED];
     if length == 0 {
         println!(
             "\x1b[91m    net domain     FAILED: nothing was received (the receive ring has \
              seen {} completions)\x1b[0m",
-            words[8]
+            words[word::RING_SEEN]
         );
         return false;
     }
-    let [p, q, r, s, t, u] = octets(words[4]);
+    let [p, q, r, s, t, u] = octets(words[word::LAST_SOURCE]);
     println!(
         "    net frame      received {length} bytes from {p:02x}:{q:02x}:{r:02x}:{s:02x}:{t:02x}:{u:02x}, \
          virtio header {} bytes; {} of {} seen handed to the ring, {} sent back for ipd (took {} bytes starting {:#014x})",
-        words[5], words[9], words[8], words[10], words[12], words[11]
+        words[word::LAST_HEADER],
+        words[word::HANDED],
+        words[word::RING_SEEN],
+        words[word::SENT_FOR_IPD],
+        words[word::LAST_FRAME_LENGTH],
+        words[word::LAST_FRAME]
     );
     true
 }

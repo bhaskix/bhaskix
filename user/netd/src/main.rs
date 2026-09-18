@@ -449,7 +449,8 @@ mod ring {
     /// monitor to ask through. It is one word, well clear of the report's
     /// twenty-six, and non-zero means *take the active member's link down once
     /// traffic has proven it works*.
-    pub const FAILOVER_REQUEST: u64 = REPORT + 40 * 8;
+    pub const FAILOVER_REQUEST: u64 =
+        REPORT + bhaskix_abi::net_ring::word::FAILOVER_REQUEST as u64 * 8;
 
     /// The second such word: non-zero when the bond is **802.3ad**.
     ///
@@ -458,7 +459,7 @@ mod ring {
     /// aggregation every member carries, so every member's frames are handed
     /// across; in active-backup only the one carrying does, and a backup's
     /// frames would arrive twice.
-    pub const BOND_IS_LACP: u64 = REPORT + 41 * 8;
+    pub const BOND_IS_LACP: u64 = REPORT + bhaskix_abi::net_ring::word::BOND_IS_LACP as u64 * 8;
 
     /// **Each member's own station address**, one word each, at word 32.
     ///
@@ -475,17 +476,18 @@ mod ring {
     /// `bin/ipd` what the interface is, and without it a bring-up that reports
     /// after every port would be read one port in, with three addresses that
     /// had not been asked for yet published as zeros.
-    pub const MEMBER_ADDRESSES: u64 = REPORT + 32 * 8;
+    pub const MEMBER_ADDRESSES: u64 =
+        REPORT + bhaskix_abi::net_ring::word::MEMBER_ADDRESSES as u64 * 8;
 
     /// Written at [`MEMBER_ADDRESSES`], after the addresses behind it.
-    pub const MEMBER_ADDRESSES_WRITTEN: u64 = 0x5352_4444_414d_454d;
+    pub const MEMBER_ADDRESSES_WRITTEN: u64 = bhaskix_abi::net_ring::MEMBER_ADDRESSES_WRITTEN;
 
     /// How many addresses follow the sentinel.
     ///
     /// The same four `X722_MEMBERS` is and `bin/ipd`'s `LACP_MACHINES` is: this
     /// is the width of the interface between them, so all three are one number
     /// or two of them are wrong.
-    pub const MEMBER_ADDRESS_COUNT: usize = 4;
+    pub const MEMBER_ADDRESS_COUNT: usize = bhaskix_abi::net_ring::MEMBER_COUNT;
 }
 
 /// Offsets into the common configuration structure, from the specification.
@@ -583,7 +585,7 @@ mod feature {
 const VIRTIO_NET_HEADER: u64 = 12;
 
 /// The marker the kernel looks for before believing the report.
-const MARKER: u64 = 0x3154_5052_4454_454e;
+const MARKER: u64 = bhaskix_abi::net_ring::MARKER;
 
 /// There is nothing to unwind and nowhere to print to.
 #[panic_handler]
@@ -1241,7 +1243,7 @@ const SLOW_PROTOCOLS: u16 = 0x8809;
 
 /// Words each frame dump takes: sixteen, so 128 bytes, which covers an LACPDU's
 /// 124 with the slack rounded up to a whole word.
-const FRAME_WORDS: usize = 16;
+const FRAME_WORDS: usize = bhaskix_abi::net_ring::FRAME_WORDS;
 /// An LACPDU's frame length: a 14-byte Ethernet header and 110 bytes of PDU.
 const LACPDU_FRAME: u64 = 124;
 const _: () = assert!(FRAME_WORDS * 8 >= LACPDU_FRAME as usize);
@@ -2050,13 +2052,20 @@ fn receive_seen(ports: &[Option<Port>; 2]) -> u16 {
     ports[0].as_ref().map_or(0, |port| port.receive.seen())
 }
 
-/// Words in the report this program writes.
+/// Words in the array [`no_virtio_report_with`] builds.
 ///
-/// Seventeen are the driver's own, five the bond's and two the X722's, and the
-/// kernel reads exactly this many. Named because three places write it and a
-/// length spelled three times is wrong in at least one of them -- which this
-/// file has recorded happening twice.
+/// **Not the width of the report, and this said it was -- corrected
+/// 2026-09-18.** It read *"seventeen are the driver's own, five the bond's and
+/// two the X722's, and the kernel reads exactly this many"*, which counts to
+/// twenty-four rather than twenty-eight and describes a page that stops at word
+/// 25. The report is `bhaskix_abi::net_ring::WORDS` wide, seven functions here
+/// write into it and the kernel writes two words of it back; this number is one
+/// array's length, and the highest word that array fills is
+/// [`bhaskix_abi::net_ring::word::SECOND_ADDRESS`].
 const REPORT_WORDS: usize = 28;
+
+/// And the array is long enough for the highest word it assigns.
+const _: () = assert!(bhaskix_abi::net_ring::word::SECOND_ADDRESS < REPORT_WORDS);
 
 /// Everything the X722 needs to carry a frame, once it is up.
 ///
@@ -3301,24 +3310,25 @@ fn no_virtio_report_with(
     seen: u64,
     second: (u64, u64),
 ) {
+    use bhaskix_abi::net_ring::word;
     let mut words = [0u64; REPORT_WORDS];
-    words[0] = MARKER;
+    words[word::MARKER] = MARKER;
     // **Word 1 is the station address**, which is where the kernel reads it to
     // tell `bin/ipd` what interface it is on. On a machine with a virtio device
     // that is the virtio port's; here it is the X722's, and without it the
     // service above holds an unspecified address for the life of the boot.
-    words[1] = address;
-    words[8] = seen;
-    words[9] = handed;
-    words[10] = sent;
-    words[22] = state;
-    words[23] = firmware;
+    words[word::MAC] = address;
+    words[word::RING_SEEN] = seen;
+    words[word::HANDED] = handed;
+    words[word::SENT_FOR_IPD] = sent;
+    words[word::X722_STATE] = state;
+    words[word::X722_FIRMWARE] = firmware;
     // **The second port, words 24 and 25.** Its own state word and its own
     // station address -- and the address is the half that matters, because two
     // ports reporting the same one would be one device counted twice, which is
     // exactly what step 1's gate exists to rule out.
-    words[24] = second.0;
-    words[25] = second.1;
+    words[word::SECOND_STATE] = second.0;
+    words[word::SECOND_ADDRESS] = second.1;
     let at = RINGS_AT + ring::REPORT;
     // SAFETY: the last page of the rings this program mapped writable, which no
     // ring and no buffer reaches. The marker is written last, so a kernel that
@@ -3327,7 +3337,7 @@ fn no_virtio_report_with(
         for (index, word) in words.iter().enumerate().skip(1) {
             core::ptr::write_volatile((at + index as u64 * 8) as *mut u64, *word);
         }
-        core::ptr::write_volatile(at as *mut u64, words[0]);
+        core::ptr::write_volatile(at as *mut u64, words[word::MARKER]);
     }
 }
 
@@ -3780,7 +3790,7 @@ fn x722_transmit_report(report: TransmitReport) {
         heard_frame,
         heard_length,
     } = report;
-    let at = RINGS_AT + ring::REPORT + 27 * 8;
+    use bhaskix_abi::net_ring::word;
     // **Word 29: what this program did with the frames it was given.** The
     // uplink-tagged posts in the low half, the refusals in the high.
     //
@@ -3816,22 +3826,22 @@ fn x722_transmit_report(report: TransmitReport) {
     // transmit counts and short of the members' addresses at 32.
     unsafe {
         core::ptr::write_volatile(
-            (at + 16) as *mut u64,
+            word_at(word::POSTED) as *mut u64,
             (posted.0 & 0xffff_ffff) | (posted.1 & 0xffff_ffff) << 32,
         );
         core::ptr::write_volatile(
-            (at + 24) as *mut u64,
+            word_at(word::UNFINISHED) as *mut u64,
             (unfinished.0 & 0xffff_ffff) | (unfinished.1 & 0xffff_ffff) << 32,
         );
         core::ptr::write_volatile(
-            (at + 32) as *mut u64,
+            word_at(word::CURSORS) as *mut u64,
             (cursors.0 & 0xffff_ffff) | (cursors.1 & 0xffff_ffff) << 32,
         );
         // **Word 37: the VSI's switching section as read back**, with bit 16
         // saying it was read at all -- zero is a legitimate section and is also
         // what an unwritten word looks like.
         core::ptr::write_volatile(
-            (RINGS_AT + ring::REPORT + 37 * 8) as *mut u64,
+            word_at(word::VSI_SWITCHING) as *mut u64,
             switching.packed() | 1 << 16,
         );
         // **Word 38: the malicious-driver record and the queue enables.** A
@@ -3839,7 +3849,7 @@ fn x722_transmit_report(report: TransmitReport) {
         // separates a device that will not take descriptors from one that has
         // been told to stop taking them. Bit 40 says it was read at all.
         core::ptr::write_volatile(
-            (RINGS_AT + ring::REPORT + 38 * 8) as *mut u64,
+            word_at(word::MALICIOUS) as *mut u64,
             malicious.packed() | (queues_up & 0xf) << 32 | 1 << 40,
         );
         // **Word 39: what the record can now be compared against.** Each
@@ -3848,7 +3858,7 @@ fn x722_transmit_report(report: TransmitReport) {
         // it was written, because a member on queue 0 with nothing flagged is
         // all zeroes and so is a word nobody wrote.
         core::ptr::write_volatile(
-            (RINGS_AT + ring::REPORT + 39 * 8) as *mut u64,
+            word_at(word::MEMBER_QUEUES) as *mut u64,
             member_queues | (flagged_members & 0xf) << 52 | 1 << 63,
         );
         // **Word 42: what each member says it is, and who the device says owns
@@ -3858,7 +3868,7 @@ fn x722_transmit_report(report: TransmitReport) {
         // written, since function 0 owning queue 0 is a legitimate reading and
         // so is a word nobody wrote.
         core::ptr::write_volatile(
-            (RINGS_AT + ring::REPORT + 42 * 8) as *mut u64,
+            word_at(word::MEMBER_OWNERS) as *mut u64,
             member_owners | 1 << 63,
         );
         // **Word 43: the arbitration queue set each transmit context was given.**
@@ -3868,7 +3878,7 @@ fn x722_transmit_report(report: TransmitReport) {
         // off the device and written straight back is exactly the kind nobody
         // checks. Bit 63 says it was written, since zero is PF0's real answer.
         core::ptr::write_volatile(
-            (RINGS_AT + ring::REPORT + 43 * 8) as *mut u64,
+            word_at(word::MEMBER_QUEUE_SETS) as *mut u64,
             member_queue_sets | 1 << 63,
         );
         // **Words 44 and 45: the VSI's VLAN handling section per member.**
@@ -3879,11 +3889,11 @@ fn x722_transmit_report(report: TransmitReport) {
         // 63 on each says it was written, because an all-clear section is a
         // legitimate reading.
         core::ptr::write_volatile(
-            (RINGS_AT + ring::REPORT + 44 * 8) as *mut u64,
+            word_at(word::MEMBER_PVIDS) as *mut u64,
             member_pvids | 1 << 63,
         );
         core::ptr::write_volatile(
-            (RINGS_AT + ring::REPORT + 45 * 8) as *mut u64,
+            word_at(word::MEMBER_VLAN_FLAGS) as *mut u64,
             member_vlan_flags | 1 << 63,
         );
         // **Words 46 and 47: the two transmit counts per member.** Thirteen
@@ -3891,20 +3901,20 @@ fn x722_transmit_report(report: TransmitReport) {
         // 59:52. Bit 63 says written, because a member that sent nothing is a
         // real reading.
         core::ptr::write_volatile(
-            (RINGS_AT + ring::REPORT + 46 * 8) as *mut u64,
+            word_at(word::MEMBER_VSI_OUT) as *mut u64,
             member_vsi_out | 1 << 63,
         );
         core::ptr::write_volatile(
-            (RINGS_AT + ring::REPORT + 47 * 8) as *mut u64,
+            word_at(word::MEMBER_PORT_OUT) as *mut u64,
             member_port_out | 1 << 63,
         );
         // **Words 81 and 82: this side's receive CRC errors and link speeds.**
         // Sixteen bits of error count each, eight bits of speed each. Word 82
         // also carries each member's `Set MAC Config` outcome at 32:47, four
         // bits apiece, and bit 63 says the three were taken.
-        core::ptr::write_volatile((RINGS_AT + ring::REPORT + 81 * 8) as *mut u64, member_crc);
+        core::ptr::write_volatile(word_at(word::MEMBER_CRC) as *mut u64, member_crc);
         core::ptr::write_volatile(
-            (RINGS_AT + ring::REPORT + 82 * 8) as *mut u64,
+            word_at(word::MEMBER_SPEED) as *mut u64,
             member_speed | member_mac_config << 32 | 1 << 63,
         );
         // **Words 48-63 and 64-79: the two frames whole, 128 bytes each.**
@@ -3914,19 +3924,13 @@ fn x722_transmit_report(report: TransmitReport) {
         // reaches the switch short and is discarded, and every counter here
         // still reads exactly as it does now.
         for (index, word) in sent_frame.iter().enumerate() {
-            core::ptr::write_volatile(
-                (RINGS_AT + ring::REPORT + (48 + index as u64) * 8) as *mut u64,
-                *word,
-            );
+            core::ptr::write_volatile(word_at(word::SENT_FRAME + index) as *mut u64, *word);
         }
         for (index, word) in heard_frame.iter().enumerate() {
-            core::ptr::write_volatile(
-                (RINGS_AT + ring::REPORT + (64 + index as u64) * 8) as *mut u64,
-                *word,
-            );
+            core::ptr::write_volatile(word_at(word::HEARD_FRAME + index) as *mut u64, *word);
         }
         core::ptr::write_volatile(
-            (RINGS_AT + ring::REPORT + 80 * 8) as *mut u64,
+            word_at(word::FRAME_LENGTHS) as *mut u64,
             (sent_length & 0xffff) | (heard_length & 0xffff) << 16 | 1 << 63,
         );
     }
@@ -3936,9 +3940,9 @@ fn x722_transmit_report(report: TransmitReport) {
     // is there goes second, so a reader that catches this half-written finds
     // the bit clear rather than a number nobody wrote.
     unsafe {
-        core::ptr::write_volatile((at + 8) as *mut u64, port_multicast);
+        core::ptr::write_volatile(word_at(word::PORT_MULTICAST) as *mut u64, port_multicast);
         core::ptr::write_volatile(
-            at as *mut u64,
+            word_at(word::TRANSMITTED) as *mut u64,
             multicast | u64::from(override_ok) << 32 | 1 << 33 | lldp.packed() << 34,
         );
     }
@@ -3982,11 +3986,16 @@ unsafe fn station_address(device_at: u64) -> u64 {
     value
 }
 
-/// Publishes how much the bond has carried since it failed over -- word 26.
+/// Publishes how much the bond has carried since it failed over.
+///
+/// **Nothing reads it.** `bhaskix_abi::net_ring::word` says so beside the name:
+/// the kernel has never looked at this word. It is published and named anyway,
+/// because a word with no name is the one a future writer lands on.
 fn carried_since_report(frames: u64) {
-    let at = RINGS_AT + ring::REPORT + 26 * 8;
+    let at = word_at(bhaskix_abi::net_ring::word::CARRIED_SINCE);
     // SAFETY: the report page this program mapped writable, one word past the
-    // bond's five and far short of the failover request.
+    // second port's and far short of the failover request -- and the ABI
+    // asserts both of those, so this comment is checked rather than believed.
     unsafe { core::ptr::write_volatile(at as *mut u64, frames) };
 }
 
@@ -4010,21 +4019,32 @@ fn bond_is_lacp() -> bool {
 /// differs is only where the numbers come from: that one reads them off virtio
 /// `Port`s, and this is handed them.
 fn x722_bond_report(members: u64, active: u64, links: u64, failovers: u64, off_member: u64) {
+    use bhaskix_abi::net_ring::word;
     let at = RINGS_AT + ring::REPORT;
-    let words = [members, active, links, failovers, off_member];
-    // SAFETY: the report page this program mapped writable, at the five words
-    // that follow the seventeen `report` writes -- the same ones `bond_report`
-    // writes, and not the marker.
+    // **Each word carries its own position**, the way [`report`]'s do. This
+    // wrote them at a literal base of 17 while `bond_report` wrote the same
+    // five at a named one, so the two would have parted company the first time
+    // the base moved -- and the comment here said they followed "the seventeen
+    // `report` writes", which is sixteen words and a gap.
+    let words = [
+        (word::BOND_MEMBERS, members),
+        (word::BOND_ACTIVE, active),
+        (word::BOND_LINKS, links),
+        (word::BOND_FAILOVERS, failovers),
+        (word::BOND_OFF_MEMBER, off_member),
+    ];
+    // SAFETY: the report page this program mapped writable, at the bond's own
+    // words -- the same ones `bond_report` writes, and not the marker.
     unsafe {
-        for (index, word) in words.iter().enumerate() {
-            core::ptr::write_volatile((at + (17 + index as u64) * 8) as *mut u64, *word);
+        for (index, value) in words {
+            core::ptr::write_volatile((at + index as u64 * 8) as *mut u64, value);
         }
     }
 }
 
 /// Leaves the bond's own state where the kernel reads the rest of the report.
 ///
-/// Words 17 to 22, appended rather than folded into [`report`]'s arguments:
+/// Words 17 to 23, appended rather than folded into [`report`]'s arguments:
 /// that function already takes ten and clippy's limit is not the only reason to
 /// stop -- a caller passing four more positional numbers is a caller that will
 /// pass them in the wrong order.
@@ -4035,6 +4055,7 @@ fn bond_report(
     off_member: u64,
     x722: X722,
 ) {
+    use bhaskix_abi::net_ring::word;
     let at = RINGS_AT + ring::REPORT;
     let members = ports.iter().flatten().count() as u64;
     // One bit per member, so "the bond is up on one leg" and "both are up" are
@@ -4046,32 +4067,40 @@ fn bond_report(
         }
     }
     let (x722, firmware) = x722.words();
+    // **Seven words, and the last two are not the bond's.** This said five and
+    // wrote seven, which is the kind of drift that made the positions in this
+    // page unreadable from the source; naming each one ends the argument about
+    // how many there are. `X722_STATE` and `X722_FIRMWARE` sit among the
+    // bond's words and belong to the card -- `bhaskix_abi::net_ring::word`
+    // says so beside them, because a name like `BOND_X722` was nearly added.
     let words = [
-        members,
-        active as u64,
-        links,
-        failovers,
-        off_member,
-        x722,
-        firmware,
+        (word::BOND_MEMBERS, members),
+        (word::BOND_ACTIVE, active as u64),
+        (word::BOND_LINKS, links),
+        (word::BOND_FAILOVERS, failovers),
+        (word::BOND_OFF_MEMBER, off_member),
+        (word::X722_STATE, x722),
+        (word::X722_FIRMWARE, firmware),
     ];
-    // **Seven words, not five** — this said five and wrote seven, which is the
-    // kind of drift that made the positions in this page unreadable from the
-    // source. The base is named now: the kernel reads the first four of these
-    // by position, and `bhaskix_abi::net_ring::word` is where those positions
-    // are written down.
-    //
-    // Hoisted out of the block below so naming the base costs no `unsafe` line.
-    let base = bhaskix_abi::net_ring::word::BOND_MEMBERS as u64;
     // SAFETY: the report page this program mapped writable, at the words that
     // follow `report`'s. The marker is not touched: this is an addition to a
     // report that is already published, and a reader that stops before these is
     // unaffected.
     unsafe {
-        for (index, word) in words.iter().enumerate() {
-            core::ptr::write_volatile((at + (base + index as u64) * 8) as *mut u64, *word);
+        for (index, value) in words {
+            core::ptr::write_volatile((at + index as u64 * 8) as *mut u64, value);
         }
     }
+}
+
+/// Where report word `index` sits, in this program's address space.
+///
+/// **So that a word is named where it is written.** Every writer into this page
+/// used to spell the arithmetic out, and sixteen of them spelled it with a bare
+/// number -- which is how `bhaskix_abi::net_ring::word` came to exist and why
+/// the literals are gone from here.
+const fn word_at(index: usize) -> u64 {
+    RINGS_AT + ring::REPORT + index as u64 * 8
 }
 
 /// Where receive buffer `index` starts, within the rings object.
@@ -4116,17 +4145,17 @@ fn report(
     let mut words = [0u64; REPORT_HEAD_WORDS];
     words[word::MARKER] = MARKER;
     words[word::MAC] = mac;
-    words[2] = sent;
-    words[3] = received;
-    words[4] = source;
-    words[5] = header;
+    words[word::SENT] = sent;
+    words[word::RECEIVED] = received;
+    words[word::LAST_SOURCE] = source;
+    words[word::LAST_HEADER] = header;
     words[word::RECEIVE_QUEUE] = u64::from(queue::RECEIVE);
     words[word::TRANSMIT_QUEUE] = u64::from(queue::TRANSMIT);
     // What the receive ring itself says the device has done. Reported
     // because "nothing was received" has two very different causes -- the
     // device wrote nothing, or it wrote and this driver misread the ring --
     // and a count distinguishes them where a boolean cannot.
-    words[8] = rx_seen;
+    words[word::RING_SEEN] = rx_seen;
     // How many frames this program put into the ring to `ipd`. Reported
     // because "nothing crossed" has two causes -- a producer that never
     // handed anything over, and a consumer that never read it -- and they
@@ -4135,12 +4164,12 @@ fn report(
     // Frames taken out of the return ring and put on the wire. Counted
     // separately from `handed` because "nothing came out" has an end at
     // each side of a ring, and one number cannot say which.
-    words[10] = sent_for_ipd;
-    words[11] = took;
-    words[12] = took_length;
-    words[13] = WIDEST.load(core::sync::atomic::Ordering::Relaxed);
-    words[14] = OUTSTANDING.load(core::sync::atomic::Ordering::Relaxed);
-    words[15] = COPIES.load(core::sync::atomic::Ordering::Relaxed);
+    words[word::SENT_FOR_IPD] = sent_for_ipd;
+    words[word::LAST_FRAME] = took;
+    words[word::LAST_FRAME_LENGTH] = took_length;
+    words[word::WIDEST_FRAME] = WIDEST.load(core::sync::atomic::Ordering::Relaxed);
+    words[word::OUTSTANDING] = OUTSTANDING.load(core::sync::atomic::Ordering::Relaxed);
+    words[word::COPIES] = COPIES.load(core::sync::atomic::Ordering::Relaxed);
     // SAFETY: the last page of the rings this program mapped writable, which no
     // ring and no buffer reaches. The marker is written *last*, so a kernel
     // that reads a partial report sees no marker rather than half the fields.
@@ -4148,7 +4177,7 @@ fn report(
         for (index, word) in words.iter().enumerate().skip(1) {
             core::ptr::write_volatile((at + index as u64 * 8) as *mut u64, *word);
         }
-        core::ptr::write_volatile(at as *mut u64, words[0]);
+        core::ptr::write_volatile(at as *mut u64, words[word::MARKER]);
     }
 }
 

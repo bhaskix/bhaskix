@@ -1453,7 +1453,8 @@ pub mod tcp {
     }
 }
 
-/// Where `bin/netd`'s rings object begins and ends.
+/// Where `bin/netd`'s rings object begins and ends, and what its report page
+/// holds.
 ///
 /// **In the ABI for the reason [`block_ring`] is, and the same two statements
 /// were already drifting apart in units.** The kernel had
@@ -1464,41 +1465,42 @@ pub mod tcp {
 /// 0x800` — two independent statements of one layout, in two rings, with
 /// nothing checking that they agreed."*
 ///
-/// **What is deliberately still not here, and it is worse than it first looked.**
-/// The eighteen *word offsets inside* the report page are not here. The kernel
-/// names them — `NETD_TRANSMITTED` at word 27, `NETD_MEMBER_QUEUES` at 39, and
-/// sixteen more — and `bin/netd` states the same positions in **two different
-/// shapes**, which is why this is not the mechanical edit it was first written
-/// up as:
+/// **The words inside the page are here now too — 2026-09-18.** This module
+/// used to carry a note saying they were deliberately absent and what it would
+/// take to bring them in. It took a census, and the census is why the note was
+/// wrong about the size of the job in both directions: the page is
+/// [`WORDS`] words wide rather than the twenty-six the note's table reached,
+/// and **eight** pieces of code touch it rather than the "four writers" one
+/// paragraph claimed and the "third writer" another did.
 ///
-/// * **Inline offsets**, `ring::REPORT + 26 * 8` and sixteen like it. A number
-///   stated twice, and the ordinary kind of duplication.
-/// * **Positional array literals**, which are the dangerous kind — and which
-///   hold *different* words from the eighteen above. `report()` builds one from
-///   word 0 and `bond_report()` writes seven words at an explicit base of 17,
-///   and the kernel reads nine of those positions directly: `words[0]`, `[1]`,
-///   `[6]`, `[7]` in `report_net_domain`, and `[9]`, `[17]`, `[18]`, `[19]`,
-///   `[20]` in `report_bond`. Inserting a field into either array shifts what
-///   the kernel reads, with nothing failing to build.
+/// Seven of the eight are in `bin/netd` — `report` (words 0 to 15),
+/// `bond_report` (17 to 23), `x722_bond_report` (17 to 21),
+/// `no_virtio_report_with` (0, 1, 8, 9, 10, and 22 to 25),
+/// `member_address_report` (32 to 36), `carried_since_report` (26) and
+/// `x722_transmit_report` (27 to 31, 37 to 39, and 42 to 82). The eighth is
+/// **the kernel**, which writes [`word::FAILOVER_REQUEST`] and
+/// [`word::BOND_IS_LACP`] for the driver to read — the two words that go the
+/// other way, and the ones no count of "writers" had ever included.
 ///
-/// **And the layout cannot be checked by reading**, which is the strongest
-/// argument for changing it. Four writers reach this page and they interleave,
-/// and `bond_report`'s own comment says it writes *"the five words that follow
-/// the seventeen `report` writes"* while its array holds seven. Two attempts to
-/// describe this layout from the source produced two different wrong answers
-/// before this one; see `TRACKER.md`'s entry of 2026-09-17 and the correction
-/// above it.
+/// **Nothing moved to get here.** Every number below was already in the tree,
+/// on both sides, and every pair agreed; this states each of them once. Four
+/// were named on both sides and derived on neither — the `NETDRPT1` marker,
+/// the member-address sentinel, the member count and the frame width — and
+/// sixteen more were a named constant in the kernel against a bare literal in
+/// `x722_transmit_report`.
 ///
-/// **So the fix is not "name eighteen constants", it is "stop the positions
-/// being implicit"**: the words the kernel reads should be assigned by name
-/// rather than by position, and the names should live here. That is a real
-/// change with a real argument, and it is a different change from the one this
-/// note described before it was investigated.
+/// **The marker is the one with teeth.** If the two copies of it had ever
+/// disagreed nothing would have failed: the kernel would have read no marker
+/// and reported that there is no driver.
 ///
-/// Two further details for whoever does it: `bin/netd` writes word 26
-/// (`carried_since_report`) which the kernel never reads, so it needs no name
-/// here; and the kernel's `NETD_SENT_FRAME` (48) and `NETD_HEARD_FRAME` (64)
-/// are ranges inside those positional arrays rather than single fields.
+/// **And `report_net_ring` is not one of the readers**, though this module said
+/// it was. Four kernel functions read this page — `report_net_domain`,
+/// `report_bond`, `report_x722` and `report_net_after_exchange`. The fifth
+/// reads `bin/ipd`'s report, which is a different object with a different
+/// layout: its word 21 is a v6 prefix where this one's is a bond count, and its
+/// word 50 holds ARP stall counts where this one's is half of a frame. Putting
+/// these names on those words would be exactly the mistake the module exists to
+/// prevent, which is why the wrong claim is corrected here rather than deleted.
 pub mod net_ring {
     /// How many pages the rings object holds.
     ///
@@ -1516,69 +1518,92 @@ pub mod net_ring {
     /// the whole reason this module exists.
     pub const REPORT_PAGE: usize = (REPORT / 4096) as usize;
 
-    /// The words of that report the **kernel reads by position**.
+    /// `"NETDRPT1"`, the word `bin/netd` writes **last** so that a kernel
+    /// reading a half-written report finds no marker rather than half the
+    /// fields.
+    pub const MARKER: u64 = 0x3154_5052_4454_454e;
+
+    /// The sentinel at [`word::MEMBER_ADDRESSES`], written after the addresses
+    /// behind it.
+    ///
+    /// **Why a sentinel and not just the addresses.** `bin/netd` publishes its
+    /// report after every port it brings up, so a report read one port in is a
+    /// perfectly good report — and addresses that had not been asked for yet
+    /// would read as members with no address, which is a thing that can also be
+    /// true.
+    pub const MEMBER_ADDRESSES_WRITTEN: u64 = 0x5352_4444_414d_454d;
+
+    /// How many bond members the report has room for.
+    pub const MEMBER_COUNT: usize = 4;
+
+    /// How many words each of the two whole frames takes — 128 bytes, which
+    /// holds an LACPDU's 124 with room to see that it is 124.
+    pub const FRAME_WORDS: usize = 16;
+
+    /// How wide the report is, in words.
+    pub const WORDS: usize = 83;
+
+    /// The words of that report, by name.
     ///
     /// **Established by measurement, after reading it twice produced two
-    /// different wrong answers.** The report page was dumped on a boot and the
-    /// values matched against `bin/netd`'s own array literal: word 0 held
+    /// different wrong answers.** The page was dumped on a boot and the values
+    /// matched against `bin/netd`'s own array literal: word 0 held
     /// `"NETDRPT1"`, word 1 a MAC, words 6 and 7 held 0 and 1 — which are
     /// `queue::RECEIVE` and `queue::TRANSMIT`, a fingerprint no other pair of
     /// fields could produce — and word 9 a frame counter the kernel already
     /// calls `handed`. `TRACKER.md`'s entry of 2026-09-17 records both wrong
-    /// answers and why reading could not settle it.
+    /// answers and why reading could not settle it. The rest were taken from
+    /// the writers' own parameter names and the kernel's own constants, which
+    /// is a different kind of evidence and a good one: both sides had already
+    /// named them, separately.
     ///
-    /// **These nine are a beginning, not the set.** The kernel reads this page
-    /// in **five** functions — `report_net_domain`, `report_bond`,
-    /// `report_x722`, `report_net_ring` and `report_net_after_exchange` —
-    /// between them indexing roughly twenty-five positions. Nine were named
-    /// here because those are the ones whose meaning was *verified*, by dumping
-    /// the page on a boot and matching the values; naming the rest from a
-    /// reading would repeat the mistake that made this module necessary.
+    /// **Two traps, kept in writing because each was nearly walked into.**
+    /// Words 22 and 23 sit among the bond's and are **not** bond fields —
+    /// `bond_report` writes them from the virtio path and
+    /// `no_virtio_report_with` from the hardware path, and a name like
+    /// `BOND_X722` would have been wrong. And word 16 is a gap: `report` fills
+    /// 0 to 15 and the bond's words begin at 17.
     ///
-    /// **The rest of the mapping, verified but not yet named.** Written down so
-    /// the next attempt starts from facts rather than from a reading. Every one
-    /// of these was confirmed against a boot dump and the driver's own
-    /// literals:
-    ///
-    /// | word | field | | word | field |
-    /// |---|---|---|---|---|
-    /// | 2 | frames sent | | 12 | its length |
-    /// | 3 | frames received | | 13 | widest frame seen |
-    /// | 4 | last source address | | 14 | requests outstanding |
-    /// | 5 | its virtio header | | 15 | copies made |
-    /// | 8 | frames seen on the ring | | 17–21 | the bond's five |
-    /// | 10 | frames sent for `bin/ipd` | | 22 | the X722's state |
-    /// | 11 | the last frame taken | | 23 | its firmware |
-    ///
-    /// **Word 16 is a gap** — `report()` fills 0 to 15 and the bond's words
-    /// begin at 17 — and **words 22 and 23 are not bond fields**, which is the
-    /// trap in naming them: `bond_report` and `no_virtio_report_with` both
-    /// write them, from the virtio path and the hardware path, and they agree.
-    /// A name like `BOND_X722` would have been wrong, and was nearly added.
-    ///
-    /// **And there is a third writer.** `no_virtio_report_with` fills words 0,
-    /// 1, 8, 9, 10, 22, 23, 24 and 25 for a machine with no virtio device,
-    /// agreeing with the others on every position it shares. An edit that
-    /// rewrites "the report writer" without knowing there are three will land
-    /// in the wrong one — which is how this note came to be written rather than
-    /// the naming finished.
-    ///
-    /// **What is already fixed is the dangerous half.** `bin/netd` no longer
-    /// writes any of them by position in a list: every field is assigned at an
-    /// index, so inserting one cannot silently move the others. What remains is
-    /// a number stated twice — the ordinary kind of duplication, which is
-    /// visible and fails loudly when it is wrong.
+    /// **[`CARRIED_SINCE`] is written and never read.** `bin/netd` publishes
+    /// it and nothing in the kernel looks at it. It is named anyway, because a
+    /// word with no name is the one a future writer lands on.
     pub mod word {
-        /// `"NETDRPT1"`, written last so a partial report has no marker.
+        /// `"NETDRPT1"` — the value is [`super::MARKER`].
         pub const MARKER: usize = 0;
         /// The station address the driver settled on.
         pub const MAC: usize = 1;
+        /// Frames this driver put on the wire, and frames it took off it.
+        pub const SENT: usize = 2;
+        /// See [`SENT`].
+        pub const RECEIVED: usize = 3;
+        /// The last frame's source address, and the virtio header in front of
+        /// it — both kept because *nothing arrived* and *something arrived and
+        /// was misread* look the same in a count.
+        pub const LAST_SOURCE: usize = 4;
+        /// See [`LAST_SOURCE`].
+        pub const LAST_HEADER: usize = 5;
         /// Which virtqueue receives — `queue::RECEIVE`.
         pub const RECEIVE_QUEUE: usize = 6;
         /// Which virtqueue transmits — `queue::TRANSMIT`.
         pub const TRANSMIT_QUEUE: usize = 7;
+        /// What the receive ring itself says the device has done, which is not
+        /// the same question as how many frames were handed up.
+        pub const RING_SEEN: usize = 8;
         /// Frames handed up to `bin/ipd`. The kernel watches this one move.
         pub const HANDED: usize = 9;
+        /// Frames taken back out of `bin/ipd`'s ring and transmitted.
+        pub const SENT_FOR_IPD: usize = 10;
+        /// The last frame taken out of that ring, and its length.
+        pub const LAST_FRAME: usize = 11;
+        /// See [`LAST_FRAME`].
+        pub const LAST_FRAME_LENGTH: usize = 12;
+        /// The widest frame the device has written.
+        pub const WIDEST_FRAME: usize = 13;
+        /// Buffers left with the device, and copies this driver made.
+        pub const OUTSTANDING: usize = 14;
+        /// See [`OUTSTANDING`].
+        pub const COPIES: usize = 15;
+
         /// How many ports the bond has.
         pub const BOND_MEMBERS: usize = 17;
         /// Which member is active.
@@ -1587,12 +1612,100 @@ pub mod net_ring {
         pub const BOND_LINKS: usize = 19;
         /// How many times it has failed over.
         pub const BOND_FAILOVERS: usize = 20;
+        /// Frames that arrived on a member that was **not** the active one —
+        /// what the backup had been receiving all along. The kernel prints it
+        /// beside [`SENT_FOR_IPD`] to tell a switch refusing a moved address
+        /// from a driver that sent nothing.
+        pub const BOND_OFF_MEMBER: usize = 21;
+        /// The X722's state word — **not a bond field**, though it sits among
+        /// them; see this module's note.
+        pub const X722_STATE: usize = 22;
+        /// Its firmware version, major and minor.
+        pub const X722_FIRMWARE: usize = 23;
+        /// The second port's own state word and its own station address. The
+        /// address is the half that matters: two ports reporting the same one
+        /// would be one device counted twice.
+        pub const SECOND_STATE: usize = 24;
+        /// See [`SECOND_STATE`].
+        pub const SECOND_ADDRESS: usize = 25;
+        /// How much the bond has carried since it failed over.
+        pub const CARRIED_SINCE: usize = 26;
 
-        /// The bond's words follow the first report's, and neither runs past
-        /// the page. `bin/netd` writes its bond words at a base of
-        /// [`BOND_MEMBERS`], so this is the same fact its loop depends on.
-        const _: () = assert!(HANDED < BOND_MEMBERS);
-        const _: () = assert!(BOND_FAILOVERS * 8 < 4096);
+        /// What the device says it transmitted: the VSI's multicast count
+        /// packed with its flags, and the port's beside it.
+        pub const TRANSMITTED: usize = 27;
+        /// See [`TRANSMITTED`].
+        pub const PORT_MULTICAST: usize = 28;
+        /// Uplink-tagged posts in the low half, refusals in the high.
+        pub const POSTED: usize = 29;
+        /// Posts the device never wrote back.
+        pub const UNFINISHED: usize = 30;
+        /// Descriptors the device has not consumed.
+        pub const CURSORS: usize = 31;
+        /// [`super::MEMBER_ADDRESSES_WRITTEN`], with
+        /// [`super::MEMBER_COUNT`] station addresses following it.
+        pub const MEMBER_ADDRESSES: usize = 32;
+        /// The VSI's switching section as read back, bit 16 saying it was read
+        /// at all — zero is a legitimate section and is also what an unwritten
+        /// word looks like.
+        pub const VSI_SWITCHING: usize = 37;
+        /// The malicious-driver record and the queue enables, bit 40 saying it
+        /// was read.
+        pub const MALICIOUS: usize = 38;
+        /// Each member's transmit queue and its own `PF_MDET_TX` flag.
+        pub const MEMBER_QUEUES: usize = 39;
+        /// **Written by the kernel and read by the driver** — one of the two
+        /// words that go the other way. A boot asks for a failover here before
+        /// `bin/netd` has anything to report.
+        pub const FAILOVER_REQUEST: usize = 40;
+        /// The other one: whether the bond is 802.3ad.
+        pub const BOND_IS_LACP: usize = 41;
+        /// Each member's function number and its queue's `QTX_CTL` read-back.
+        pub const MEMBER_OWNERS: usize = 42;
+        /// The arbitration queue set each transmit context was given.
+        pub const MEMBER_QUEUE_SETS: usize = 43;
+        /// The VSI's VLAN handling per member: the PVIDs, then the flags.
+        pub const MEMBER_PVIDS: usize = 44;
+        /// See [`MEMBER_PVIDS`].
+        pub const MEMBER_VLAN_FLAGS: usize = 45;
+        /// The two transmit counts per member, and each member's MAC port.
+        pub const MEMBER_VSI_OUT: usize = 46;
+        /// See [`MEMBER_VSI_OUT`].
+        pub const MEMBER_PORT_OUT: usize = 47;
+        /// The last uplink-tagged frame sent, [`super::FRAME_WORDS`] long.
+        pub const SENT_FRAME: usize = 48;
+        /// The last slow-protocol frame heard, the same length — the one
+        /// LACPDU on this wire known to be acceptable to something.
+        pub const HEARD_FRAME: usize = 64;
+        /// Both frames' lengths, and the bit that says they were taken.
+        pub const FRAME_LENGTHS: usize = 80;
+        /// This side's receive CRC errors, sixteen bits per member.
+        pub const MEMBER_CRC: usize = 81;
+        /// The members' link speeds, and what `Set MAC Config` answered.
+        pub const MEMBER_SPEED: usize = 82;
+
+        /// **The blocks do not overlap, in the order they are written.** Each
+        /// of these is a collision a future insertion could cause, stated where
+        /// the numbers are rather than left to a boot to find: `report`'s head
+        /// ends before the bond's words, the bond's before the second port's,
+        /// the transmit counts before the members' addresses, the addresses
+        /// before the X722's sections, and the two frames before each other and
+        /// before the lengths that describe them.
+        const _: () = assert!(COPIES < BOND_MEMBERS);
+        const _: () = assert!(BOND_OFF_MEMBER < X722_STATE);
+        const _: () = assert!(SECOND_ADDRESS < CARRIED_SINCE);
+        const _: () = assert!(CARRIED_SINCE < TRANSMITTED);
+        const _: () = assert!(CURSORS < MEMBER_ADDRESSES);
+        const _: () = assert!(MEMBER_ADDRESSES + super::MEMBER_COUNT < VSI_SWITCHING);
+        const _: () = assert!(MEMBER_QUEUES < FAILOVER_REQUEST);
+        const _: () = assert!(BOND_IS_LACP < MEMBER_OWNERS);
+        const _: () = assert!(MEMBER_PORT_OUT < SENT_FRAME);
+        const _: () = assert!(SENT_FRAME + super::FRAME_WORDS <= HEARD_FRAME);
+        const _: () = assert!(HEARD_FRAME + super::FRAME_WORDS <= FRAME_LENGTHS);
+        const _: () = assert!(FRAME_LENGTHS < MEMBER_CRC);
+
+        /// And the whole report fits the page it is published in.
+        const _: () = assert!(MEMBER_SPEED < super::WORDS);
     }
 
     /// The report begins on a page boundary — the kernel indexes by page, so a
@@ -1602,6 +1715,10 @@ pub mod net_ring {
 
     /// And it is inside the object.
     const _: () = assert!(REPORT < PAGES * 4096);
+
+    /// The report fits in the page it starts on, which is what lets the kernel
+    /// map one page and read all of it.
+    const _: () = assert!(WORDS * 8 <= 4096);
 }
 
 /// Where each structure sits inside the block service's ring pages.
