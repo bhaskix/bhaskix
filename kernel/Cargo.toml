@@ -861,7 +861,16 @@ asm_budget = 10
 # word back to tell the bystander the killer has finished -- a channel that
 # needs no socket, no service and no second mechanism, because the kernel
 # already holds the page's physical address.
-unsafe_budget = 2062
+# 2050 for RFC 0082, and **down twelve rather than up**, which is the first
+# time this number has fallen. The change needed to count page-table frames
+# from inside three allocator closures, and those closures sat lexically
+# inside the `unsafe` blocks that call `map_page` and `create_address_space`
+# -- so counting a frame, which is safe code, was costing `unsafe` budget. The
+# closures are bound outside the blocks now and only the calls remain in them.
+# Nothing about the machine got safer; what changed is that the number stopped
+# counting arithmetic. Lowered rather than left slack, because a budget with
+# room in it stops being the thing that makes growth visible.
+unsafe_budget = 2050
 # Up thirty-one for RFC 0005 step 9's socket probe -- `ring3_socketeer`, which
 # is `ring3_lister` with a `sockaddr_in6` copied in beside its code instead of
 # two filenames. The same two blocks every hosted probe has: one

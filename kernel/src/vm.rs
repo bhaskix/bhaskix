@@ -52,6 +52,14 @@ pub enum VmError {
     /// mapping that is *nearly* what was asked for is one the caller will use
     /// as though it were exactly that.
     Refused,
+    /// The owning domain's [`crate::domain::ResourceEnvelope`] will not cover
+    /// it — [RFC 0082](../../docs/rfc/0082-a-domains-own-memory-is-its-own.md).
+    ///
+    /// Distinct from [`Self::OutOfMemory`] on purpose: the machine has frames
+    /// and this domain may not have them. Reporting the two as one would make
+    /// a correctly-enforced limit read as an exhausted machine, which is the
+    /// diagnosis pointing at the wrong half of the system.
+    MemoryEnvelopeExceeded,
 }
 
 impl From<RangeMapError> for VmError {
@@ -74,6 +82,22 @@ pub struct AddressSpace {
     regions: RangeMap,
     /// Direct map base, for reaching page tables and frames.
     hhdm_base: u64,
+    /// Whose frames this space spends —
+    /// [RFC 0082](../../docs/rfc/0082-a-domains-own-memory-is-its-own.md).
+    ///
+    /// **`None` is the kernel's own**, and is charged nothing: the self-tests
+    /// below build spaces no domain owns, and it is the same `None` that
+    /// `sched::domain_of` answers for a kernel thread.
+    owner: Option<crate::domain::DomainId>,
+    /// Frames this space holds, whoever is paying for them.
+    ///
+    /// Kept beside [`Self::owner`] rather than derived from it, because a
+    /// space is **mapped before it is owned**: `started_program` builds the
+    /// stack and loads the ELF and only then calls [`install`], which is where
+    /// the domain becomes known. Without this, every frame of a program's
+    /// initial image was charged to nobody — which was true of this change for
+    /// an afternoon, and is what [`AddressSpace::own`] transfers.
+    charged: u64,
 }
 
 impl AddressSpace {
@@ -87,17 +111,23 @@ impl AddressSpace {
         // this closure allocates through the global allocator.
         let root = heap::with(|heap| {
             let pmm = heap.pmm_mut();
+            // Hoisted out of the `unsafe` block below, and not for style: the
+            // block's line count is the `unsafe` budget, and none of this is
+            // an unsafe operation. A safe closure counted against that budget
+            // makes the number mean less every time somebody adds bookkeeping.
+            let mut level = || {
+                pmm.allocate(0, Zone::Normal).ok().map(|pfn| {
+                    note_page_table_frame();
+                    u64::from(pfn) * FRAME_SIZE
+                })
+            };
             // SAFETY: the currently loaded page table is by definition a valid
             // PML4 whose higher half maps the kernel, which is exactly the
             // template needed. Nothing else is modifying page tables: there is
             // one CPU and interrupts do not map memory.
             unsafe {
                 let template = paging::active_page_table();
-                paging::create_address_space(template, hhdm_base, &mut || {
-                    pmm.allocate(0, Zone::Normal)
-                        .ok()
-                        .map(|pfn| u64::from(pfn) * FRAME_SIZE)
-                })
+                paging::create_address_space(template, hhdm_base, &mut level)
             }
         })
         .ok_or(VmError::NoAllocator)??;
@@ -106,6 +136,8 @@ impl AddressSpace {
             root,
             regions: RangeMap::new(),
             hhdm_base,
+            owner: None,
+            charged: 0,
         })
     }
 
@@ -113,6 +145,73 @@ impl AddressSpace {
     #[must_use]
     pub const fn root(&self) -> u64 {
         self.root
+    }
+
+    /// Records which domain's envelope this space's frames are charged to.
+    ///
+    /// **Called only where a space is bound to a domain** — [`register_for`]
+    /// and [`install`], which are the two places that can honestly say whose
+    /// it is — and by the self-tests below, which create a domain of their
+    /// own to be the owner. A space that is never bound stays the kernel's
+    /// and is charged nothing.
+    ///
+    /// Not a way for a domain to change who pays: nothing in ring 3 reaches
+    /// this, and the two callers take the owner from the thread or from the
+    /// capability the caller already held.
+    ///
+    /// **The frames already mapped go with it.** A space is built before it is
+    /// owned — `started_program` maps a stack and loads an ELF, and only then
+    /// installs — so an owner that took over an empty ledger would leave a
+    /// program's whole initial image charged to nobody. The transfer is
+    /// unconditional on the receiving side: those frames exist, they are this
+    /// domain's, and declining to count them because they overflow the cap
+    /// would be the hole this accounting was written to close. A domain that
+    /// lands over its cap this way is refused its *next* allocation, which is
+    /// the enforcement working rather than failing.
+    pub fn own(&mut self, owner: crate::domain::DomainId) {
+        if self.owner == Some(owner) {
+            return;
+        }
+        if let Some(previous) = self.owner {
+            crate::domain::release_frames(previous, self.charged);
+        }
+        self.owner = Some(owner);
+        crate::domain::adopt_frames(owner, self.charged);
+    }
+
+    /// Charges `frames` to whoever owns this space.
+    ///
+    /// `Ok(())` for a space no domain owns — the kernel's own, which no
+    /// envelope bounds. Otherwise the owner's budget decides, without taking
+    /// a lock: see `domain::FrameBudget`.
+    ///
+    /// The space's own count moves either way, because it is what
+    /// [`Self::own`] hands over and it has to be right before anybody owns it.
+    ///
+    /// # Errors
+    ///
+    /// Whatever `domain::charge_frames` answers, which for a space whose
+    /// domain has ended is [`crate::domain::DomainError::NoSuchDomain`].
+    fn charge(&mut self, frames: u64) -> Result<(), crate::domain::DomainError> {
+        if let Some(owner) = self.owner {
+            crate::domain::charge_frames(owner, frames)?;
+        }
+        self.charged = self.charged.saturating_add(frames);
+        Ok(())
+    }
+
+    /// Returns `frames` to whoever owns this space. Nothing, if nobody does.
+    fn release(&mut self, frames: u64) {
+        self.charged = self.charged.saturating_sub(frames);
+        if let Some(owner) = self.owner {
+            crate::domain::release_frames(owner, frames);
+        }
+    }
+
+    /// Frames this space holds, whoever is paying. For the self-test.
+    #[must_use]
+    pub const fn charged(&self) -> u64 {
+        self.charged
     }
 
     /// The regions mapped here.
@@ -161,8 +260,18 @@ impl AddressSpace {
         if !protection.present() {
             // A guard page: reserved in the map, deliberately absent from the
             // page table, so touching it faults and the handler can say the
-            // region exists but permits nothing.
+            // region exists but permits nothing. No frames, so no charge.
             return Ok(());
+        }
+
+        // **The owner pays for the whole range before any of it is taken**
+        // (RFC 0082). Charged up front rather than per page, because a
+        // partial mapping is undone below and a charge that had already been
+        // spent page by page would have to be unwound in step with it — two
+        // counters to keep in agreement where one will do.
+        if self.charge(range.pages()).is_err() {
+            self.regions.remove(range.start).ok();
+            return Err(VmError::MemoryEnvelopeExceeded);
         }
 
         let root = self.root;
@@ -193,15 +302,19 @@ impl AddressSpace {
                 }
 
                 let entry = Self::entry_flags(protection, page.as_u64());
+                // Outside the block, as in `new`: safe bookkeeping does not
+                // belong in the `unsafe` budget.
+                let mut level = || {
+                    pmm.allocate(0, Zone::Normal).ok().map(|pfn| {
+                        note_page_table_frame();
+                        u64::from(pfn) * FRAME_SIZE
+                    })
+                };
                 // SAFETY: `root` is this space's PML4, `hhdm` the direct map
                 // base, and there is one CPU with nothing else touching these
                 // tables.
                 let outcome = unsafe {
-                    paging::map_page(root, page.as_u64(), physical, entry, hhdm, &mut || {
-                        pmm.allocate(0, Zone::Normal)
-                            .ok()
-                            .map(|pfn| u64::from(pfn) * FRAME_SIZE)
-                    })
+                    paging::map_page(root, page.as_u64(), physical, entry, hhdm, &mut level)
                 };
                 if let Err(error) = outcome {
                     let _ = pmm.free(pfn, 0);
@@ -216,7 +329,11 @@ impl AddressSpace {
             // Undo the pages that did map, so a failed call leaves no trace.
             // A partial mapping is worse than a failure: it is memory the
             // region map does not know about.
-            self.unmap_pages(range, mapped);
+            //
+            // `unmap_pages` releases what it frees, so the charge still owed
+            // is the rest of the range — the pages this call never mapped.
+            let freed = self.unmap_pages(range, mapped);
+            self.release(range.pages().saturating_sub(freed));
             self.regions.remove(range.start).ok();
             return Err(error);
         }
@@ -243,7 +360,12 @@ impl AddressSpace {
     }
 
     /// Unmaps and frees the first `count` pages of `range`.
-    fn unmap_pages(&mut self, range: VirtRange, count: u64) {
+    ///
+    /// Answers how many frames it actually freed, **and releases them from
+    /// the owner's envelope** (RFC 0082). The number is not always `count`: a
+    /// page the region map covers may have no frame behind it, which is the
+    /// ordinary state of a lazy mapping nothing has touched.
+    fn unmap_pages(&mut self, range: VirtRange, count: u64) -> u64 {
         let root = self.root;
         let hhdm = self.hhdm_base;
         let active = self.is_active();
@@ -264,8 +386,9 @@ impl AddressSpace {
             );
         }
 
-        heap::with(|heap| {
+        let freed = heap::with(|heap| {
             let pmm = heap.pmm_mut();
+            let mut freed = 0;
             for page in range.pages_iter().take(count as usize) {
                 // SAFETY: `root` is this space's PML4.
                 if let Ok(physical) = unsafe { paging::unmap_page(root, page.as_u64(), hhdm) } {
@@ -277,9 +400,18 @@ impl AddressSpace {
                         crate::tlb::shootdown(page.as_u64());
                     }
                     let _ = pmm.free((physical / FRAME_SIZE) as u32, 0);
+                    freed += 1;
                 }
             }
-        });
+            freed
+        })
+        .unwrap_or(0);
+
+        // Outside the heap closure: `release` is lock-free, but keeping it
+        // out keeps this module's rule — nothing but frame work inside that
+        // guard — simple to follow.
+        self.release(freed);
+        freed
     }
 
     /// Removes the region starting at `start`, freeing anything it owned.
@@ -335,15 +467,19 @@ impl AddressSpace {
             for (index, page) in range.pages_iter().enumerate() {
                 let physical = frames[index];
                 let entry = Self::entry_flags(protection, page.as_u64());
+                // Outside the block, as in `new`: safe bookkeeping does not
+                // belong in the `unsafe` budget.
+                let mut level = || {
+                    pmm.allocate(0, Zone::Normal).ok().map(|pfn| {
+                        note_page_table_frame();
+                        u64::from(pfn) * FRAME_SIZE
+                    })
+                };
                 // SAFETY: `root` is this space's PML4, `hhdm` the direct map
                 // base, and `physical` is a frame the object owns and keeps
                 // owning -- this only builds a second name for it.
                 let outcome = unsafe {
-                    paging::map_page(root, page.as_u64(), physical, entry, hhdm, &mut || {
-                        pmm.allocate(0, Zone::Normal)
-                            .ok()
-                            .map(|pfn| u64::from(pfn) * FRAME_SIZE)
-                    })
+                    paging::map_page(root, page.as_u64(), physical, entry, hhdm, &mut level)
                 };
                 if let Err(error) = outcome {
                     return Err((VmError::Paging(error), index as u64));
@@ -451,6 +587,8 @@ impl AddressSpace {
     pub fn unmap(&mut self, start: VirtAddr) -> Result<(), VmError> {
         let region = self.regions.remove(start)?;
         if region.backing == Backing::Anonymous && region.protection.present() {
+            // Releases the owner's charge for whatever it frees; see
+            // `unmap_pages`.
             self.unmap_pages(region.range, region.range.pages());
         }
         Ok(())
@@ -476,8 +614,9 @@ impl AddressSpace {
         let root = self.root;
         let hhdm = self.hhdm_base;
 
-        heap::with(|heap| {
+        let freed = heap::with(|heap| {
             let pmm = heap.pmm_mut();
+            let mut freed = 0u64;
 
             // Leaf frames first, and only the ones this space owns. Device
             // mappings and reserved ranges are not ours to free.
@@ -492,6 +631,7 @@ impl AddressSpace {
                     // a cached translation for it, so no shootdown is needed.
                     if let Ok(physical) = unsafe { paging::unmap_page(root, page.as_u64(), hhdm) } {
                         let _ = pmm.free((physical / FRAME_SIZE) as u32, 0);
+                        freed += 1;
                     }
                 }
             }
@@ -501,12 +641,24 @@ impl AddressSpace {
             // would unmap the kernel out from under the machine.
             // SAFETY: as above, and nothing references `root` afterwards --
             // `self` is consumed.
-            unsafe {
+            let tables = unsafe {
                 paging::destroy_address_space(root, hhdm, &mut |frame| {
                     let _ = pmm.free((frame / FRAME_SIZE) as u32, 0);
-                });
-            }
-        });
+                })
+            };
+            // The page-table gauge goes down by exactly what this returned,
+            // which is what makes it a statement about memory held rather
+            // than about memory ever allocated.
+            note_page_table_frames_freed(tables);
+            freed
+        })
+        .unwrap_or(0);
+
+        // The leaf frames go back to the owner's envelope. The page tables
+        // freed just above do not, because they were never charged — RFC
+        // 0082's first named gap, counted rather than hidden by
+        // `page_table_frames()`.
+        self.release(freed);
     }
 }
 
@@ -595,6 +747,82 @@ pub const MAX_SPACES: usize = 32;
 /// rather than by thread or domain, because the root is what `CR3` holds: the
 /// fault happened in whatever space is loaded, and asking the hardware which
 /// one that is cannot disagree with the hardware.
+/// Frames **currently held** by page tables for address spaces, machine-wide.
+///
+/// [RFC 0082](../../docs/rfc/0082-a-domains-own-memory-is-its-own.md)'s first
+/// named gap, kept as a number rather than as a sentence. Every frame counted
+/// here is real memory spent on a domain's behalf and charged to nobody: the
+/// PML4 [`AddressSpace::new`] allocates, and every intermediate level a
+/// mapping needs.
+///
+/// **A gauge and not a tally, and the difference was worth a measurement.**
+/// It counted allocations only at first, and read **9,368** on a boot whose
+/// domains had 182 leaf frames between them — which looks like page tables
+/// costing fifty times the memory they map, and is not what it is. The
+/// frame-leak gate builds and tears down a thousand address spaces, and every
+/// one of them was still in that figure. [`AddressSpace::destroy`] gives its
+/// page-table frames back here now, and the number is what the machine is
+/// holding when it is read.
+///
+/// **Counted and not charged, deliberately.** Charging them means unwinding a
+/// partially built page table on a refusal, which is its own piece of work and
+/// a bad one to do inside a fault handler. This is what will say whether it is
+/// worth doing: a count that stays small beside a domain's leaf pages is a gap
+/// worth leaving, and one that does not is a gap worth closing.
+static PAGE_TABLE_FRAMES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// How many frames page tables are holding, uncharged to anybody.
+#[must_use]
+pub fn page_table_frames() -> u64 {
+    PAGE_TABLE_FRAMES.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Page-table frames ever taken, and ever given back.
+///
+/// Both, because the gauge above is their difference and a difference cannot
+/// say which half is surprising. It was read once as "page tables cost fifty
+/// times the memory they map", which was a reading of the tally before there
+/// was a gauge; this is what stops the next such reading needing a rebuild.
+#[must_use]
+pub fn page_table_frame_traffic() -> (u64, u64) {
+    (
+        PAGE_TABLE_TAKEN.load(core::sync::atomic::Ordering::Relaxed),
+        PAGE_TABLE_GIVEN.load(core::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+/// Page-table frames ever taken. See [`page_table_frame_traffic`].
+static PAGE_TABLE_TAKEN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Page-table frames ever given back. See [`page_table_frame_traffic`].
+static PAGE_TABLE_GIVEN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Records one frame spent on a page table. See [`PAGE_TABLE_FRAMES`].
+fn note_page_table_frame() {
+    PAGE_TABLE_FRAMES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    PAGE_TABLE_TAKEN.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Records `frames` page-table frames given back.
+///
+/// Saturating for the reason every counter here is: a gauge that wrapped
+/// would read as an enormous allocation, which is worse than reading zero.
+fn note_page_table_frames_freed(frames: u64) {
+    PAGE_TABLE_GIVEN.fetch_add(frames, core::sync::atomic::Ordering::Relaxed);
+    let mut held = PAGE_TABLE_FRAMES.load(core::sync::atomic::Ordering::Relaxed);
+    loop {
+        let left = held.saturating_sub(frames);
+        match PAGE_TABLE_FRAMES.compare_exchange_weak(
+            held,
+            left,
+            core::sync::atomic::Ordering::Relaxed,
+            core::sync::atomic::Ordering::Relaxed,
+        ) {
+            Ok(_) => return,
+            Err(now) => held = now,
+        }
+    }
+}
+
 static SPACES: SpinLock<[Option<AddressSpace>; MAX_SPACES]> =
     SpinLock::new(Rank::AddressSpace, [const { None }; MAX_SPACES]);
 
@@ -821,8 +1049,18 @@ impl AddressSpace {
 /// stack, and the descriptor tables — which holds for anything built by
 /// [`AddressSpace::new`] *after* those mappings existed in the template, since
 /// creation copies the higher half rather than sharing a live view of it.
-pub unsafe fn install(space: AddressSpace) {
+pub unsafe fn install(mut space: AddressSpace) {
     let root = space.root();
+    // Whose space this is, decided **before** the table is taken. The same
+    // lookup happens again at the bottom of this function for
+    // `record_space_root`; doing it here as well keeps the two facts together
+    // and, more to the point, takes `sched::domain_of`'s runqueue locks with
+    // nothing else held. Taking them inside the `SPACES` guard below would
+    // order `Rank::SchedRunqueue` inside `Rank::AddressSpace`, which nothing
+    // else in the tree does.
+    if let Some(owner) = crate::sched::current_thread_id().and_then(crate::sched::domain_of) {
+        space.own(owner);
+    }
     {
         let mut spaces = SPACES.lock();
         // Replace an entry with the same root before taking a new slot: a
@@ -911,8 +1149,11 @@ pub unsafe fn install(space: AddressSpace) {
 /// loads it on the switch into that thread, which is the ordinary path.
 ///
 /// Answers the root, or `None` if the table is full.
-pub fn register_for(domain: crate::domain::DomainId, space: AddressSpace) -> Option<u64> {
+pub fn register_for(domain: crate::domain::DomainId, mut space: AddressSpace) -> Option<u64> {
     let root = space.root();
+    // RFC 0082: the caller named the domain, so this is the one place that
+    // needs no lookup to know whose frames the space will spend.
+    space.own(domain);
     {
         let mut spaces = SPACES.lock();
         let slot = spaces
@@ -1132,6 +1373,46 @@ fn service_fault(space: &mut AddressSpace, address: u64, write: bool) -> FaultOu
     // SAFETY: reads page table entries only.
     let existing = unsafe { paging::translate(root, page.as_u64(), hhdm) };
 
+    // **The owner pays for this page, before a frame is taken for it**
+    // (RFC 0082). Both arms below that reach a frame add exactly one to the
+    // space: demand paging maps a new one, and copy-on-write maps a copy
+    // while deliberately not freeing the original. The third arm — present,
+    // and not a copy-on-write write — creates nothing, so it is charged
+    // nothing and returns `NotOurs` below.
+    //
+    // Charging here rather than inside each arm is what makes the release on
+    // the two failure paths a single decision: everything below this point
+    // that does not map gives the charge back beside the frame.
+    //
+    // **No lock is taken**, which is the constraint this whole design is
+    // shaped by — see `domain::FrameBudget`.
+    let copying = write && region.flags.copy_on_write;
+    let charged = existing.is_none() || copying;
+    if charged && let Err(why) = space.charge(1) {
+        // **Two errors, two messages.** A full envelope and a space whose
+        // domain has ended are different diagnoses pointing at different
+        // halves of the system, and reporting the second as the first is the
+        // mistake this file records costing a day more than once — a gate
+        // naming a cause it had not measured. The second ought to be
+        // unreachable, because `domain::end` calls `forget` and a space that
+        // is not in the table never reaches here; "ought to be unreachable"
+        // is the reason to name it rather than the reason not to.
+        return FaultOutcome::Refused(match why {
+            crate::domain::DomainError::NoSuchDomain => {
+                "the domain that owns this address space has ended"
+            }
+            _ => "the domain's memory envelope is full",
+        });
+    }
+    // Gives back the page's charge on any path that does not end up mapping
+    // it. A closure rather than four copies of one line, because the one that
+    // gets forgotten is the bug.
+    let refund = |space: &mut AddressSpace| {
+        if charged {
+            space.release(1);
+        }
+    };
+
     // Frames come from this CPU's reserve, not from the allocator.
     //
     // The allocator's lock is the one thing a fault handler must never wait
@@ -1141,11 +1422,12 @@ fn service_fault(space: &mut AddressSpace, address: u64, write: bool) -> FaultOu
     // -- if the reserve is dry the fault is refused, which is the same
     // outcome as before but now the rare case rather than the common one.
     let Some(fresh) = frames::take() else {
+        refund(space);
         return FaultOutcome::Unserviceable("no frame in this cpu's reserve");
     };
 
     // Page-table levels come from the same place, for the same reason.
-    let mut reserve_frame = || frames::take();
+    let mut reserve_frame = || frames::take().inspect(|_| note_page_table_frame());
 
     match existing {
         // Copy-on-write: the page is present but write-protected, and the
@@ -1173,6 +1455,7 @@ fn service_fault(space: &mut AddressSpace, address: u64, write: bool) -> FaultOu
             };
             if replaced.is_err() {
                 frames::give(fresh);
+                refund(space);
                 return FaultOutcome::Unserviceable("could not remap the copied page");
             }
 
@@ -1192,6 +1475,11 @@ fn service_fault(space: &mut AddressSpace, address: u64, write: bool) -> FaultOu
         // is exactly what makes it look serviceable.
         Some(_) => {
             frames::give(fresh);
+            // Nothing was charged for this arm -- it creates no page -- so
+            // `refund` is a no-op here. Called anyway, so that the rule is
+            // "every path out of the match refunds" rather than "every path
+            // except the one that happens not to need it".
+            refund(space);
             FaultOutcome::NotOurs
         }
 
@@ -1214,6 +1502,7 @@ fn service_fault(space: &mut AddressSpace, address: u64, write: bool) -> FaultOu
             };
             if mapped.is_err() {
                 frames::give(fresh);
+                refund(space);
                 return FaultOutcome::Unserviceable("could not map the demanded page");
             }
             FaultOutcome::Handled
@@ -1245,18 +1534,32 @@ fn service_fault(space: &mut AddressSpace, address: u64, write: bool) -> FaultOu
 pub fn supervisor_write_self_test(hhdm_base: u64) -> bool {
     // Far from anything bring-up maps, and page-aligned.
     const LAZY: u64 = 0x0000_0000_5000_0000;
-    // A domain id nothing owns. `register_for` records it and no operation
-    // here resolves it, which is exactly what `DomainId::from_u32` documents.
-    const NOBODY: u32 = 0xffff_fffe;
 
     let baseline = heap::available_frames();
 
+    // **A real domain, since 2026-09-19, and the previous comment is worth
+    // keeping to say why.** This registered the space for `NOBODY`
+    // (`0xffff_fffe`) — "a domain id nothing owns; `register_for` records it
+    // and no operation here resolves it, which is exactly what
+    // `DomainId::from_u32` documents". That stopped being true the moment
+    // RFC 0082 made the fault path charge the owner: the commit below would
+    // resolve the owner, find no such domain, and be refused. The alternative
+    // was to let an unresolvable owner mean *uncharged*, which is the hole
+    // this project just closed, reopened as a special case for a test.
+    let Ok(owner) = crate::domain::create("supwrite", crate::domain::ResourceEnvelope::new())
+    else {
+        crate::println!("    supervisor write  FAILED: no domain to own the space");
+        return false;
+    };
+
     let Ok(mut space) = AddressSpace::new(hhdm_base) else {
         crate::println!("    supervisor write  FAILED to create an address space");
+        crate::domain::destroy(owner);
         return false;
     };
     let Some(range) = VirtRange::from_pages(VirtAddr(LAZY), 1) else {
         space.destroy();
+        crate::domain::destroy(owner);
         return false;
     };
     if space
@@ -1265,12 +1568,14 @@ pub fn supervisor_write_self_test(hhdm_base: u64) -> bool {
     {
         crate::println!("    supervisor write  FAILED to register a lazy region");
         space.destroy();
+        crate::domain::destroy(owner);
         return false;
     }
 
     let root = space.root();
-    if register_for(crate::domain::DomainId::from_u32(NOBODY), space).is_none() {
+    if register_for(owner, space).is_none() {
         crate::println!("    supervisor write  FAILED to register the space");
+        crate::domain::destroy(owner);
         return false;
     }
 
@@ -1304,10 +1609,27 @@ pub fn supervisor_write_self_test(hhdm_base: u64) -> bool {
         wrong = Some("a write committed a page in no region at all");
     }
 
+    // What the commit cost the owner, read before the domain is ended — the
+    // slot's accounting goes back with it.
+    let charged = crate::domain::frames_charged(owner).map_or(0, |(charged, _)| charged);
+
     forget(root);
+    crate::domain::destroy(owner);
 
     if let Some(what) = wrong {
         crate::println!("    supervisor write  FAILED: {what}");
+        return false;
+    }
+
+    // RFC 0082: the one page the write committed was charged to the domain
+    // that owns the space, and the read before it was not. This is the
+    // *supervisor* half of that property — a page committed on behalf of a
+    // domain by somebody else is still the domain's memory.
+    if charged != 1 {
+        crate::println!(
+            "    supervisor write  FAILED: the committed page was charged {charged} time(s) to \
+             the owning domain, not once"
+        );
         return false;
     }
 
@@ -1318,6 +1640,289 @@ pub fn supervisor_write_self_test(hhdm_base: u64) -> bool {
     let after = heap::available_frames();
     crate::println!(
         "    supervisor write  a write commits, a read does not; {} frames spent",
+        baseline.saturating_sub(after)
+    );
+    true
+}
+
+/// Proves that a domain's **own memory** is charged to its envelope, and that
+/// the envelope refuses — [RFC 0082](../../docs/rfc/0082-a-domains-own-memory-is-its-own.md).
+///
+/// # Why this exists beside a gate that looked like it already did
+///
+/// `docs/security.md` T10's note says it plainly: the gate in
+/// `domain_self_test` calls `domain::charge_frames` **directly**, so it tests
+/// the accounting function and not the claim above it — that a domain's
+/// allocations are charged. It was green for a year while every allocation
+/// path but one charged nothing. *A gate that exercises the mechanism rather
+/// than the property will pass while the property is absent.*
+///
+/// So this one allocates. It maps, it faults, it copies on write, and it
+/// requires the refusal to arrive from the real path rather than from a call
+/// to the counter.
+///
+/// # What each arm is for
+///
+/// 1. **The eager path.** `map_anonymous` past the cap is refused, nothing is
+///    mapped, and no frame leaves the allocator.
+/// 2. **The fault path.** A lazy region larger than the envelope commits
+///    exactly as many pages as the cap allows and then refuses — through
+///    `service_fault`, which is the function a real page fault reaches.
+/// 3. **Copy-on-write.** A copy is a *new* frame and must be charged as one;
+///    at the cap it is refused rather than served for free.
+/// 4. **Release.** Tearing the space down gives every frame back, so the cap
+///    bounds what a domain holds rather than what it has ever touched.
+///
+/// Returns whether every property held.
+pub fn envelope_self_test(hhdm_base: u64) -> bool {
+    use crate::domain::{self, ResourceEnvelope};
+
+    // Deliberately tiny, and far from anything bring-up maps.
+    const CAP: u64 = 4;
+    const EAGER: u64 = 0x0000_0000_6000_0000;
+    const OVER: u64 = 0x0000_0000_6080_0000;
+    const LAZY: u64 = 0x0000_0000_6100_0000;
+    const COW: u64 = 0x0000_0000_6200_0000;
+
+    let baseline = heap::available_frames();
+
+    let Ok(owner) = domain::create("envelope", ResourceEnvelope::new().memory_frames(CAP)) else {
+        crate::println!("\x1b[91m    envelope       FAILED: no domain to own a space\x1b[0m");
+        return false;
+    };
+    let Ok(mut space) = AddressSpace::new(hhdm_base) else {
+        crate::println!("\x1b[91m    envelope       FAILED to create an address space\x1b[0m");
+        domain::destroy(owner);
+        return false;
+    };
+    space.own(owner);
+
+    let mut wrong: Option<&str> = None;
+
+    // --- 1. the eager path charges, and refuses past the cap --------------
+    // **One that fits, first**, so the arm below is a cap and not a wall --
+    // and for a second reason found by getting the order wrong: `RangeMap`
+    // holds a `Vec`, so the *first* region inserted into a fresh space grows
+    // the kernel heap by a frame the PMM never gets back. Measuring the
+    // refusal's cost across that growth reported "a refused eager mapping
+    // still took frames" for a frame the mapping never asked for. Warming the
+    // map here is what lets the check below mean what it says.
+    if let Some(range) = VirtRange::from_pages(VirtAddr(EAGER), 1) {
+        if space.map_anonymous(range, Protection::ReadWrite).is_err() {
+            wrong = Some("an eager mapping within the cap was refused");
+        } else if domain::frames_charged(owner) != Some((1, CAP)) {
+            wrong = Some("an eager mapping within the cap was not charged");
+        }
+    } else {
+        wrong = Some("could not describe the eager range");
+    }
+
+    // One page more than the envelope has left. The refusal must be the
+    // envelope's and not the allocator's, and it must cost nothing.
+    let before_eager = heap::available_frames();
+    if wrong.is_none()
+        && let Some(range) = VirtRange::from_pages(VirtAddr(OVER), CAP)
+    {
+        match space.map_anonymous(range, Protection::ReadWrite) {
+            Err(VmError::MemoryEnvelopeExceeded) => {}
+            Err(_) => {
+                wrong = Some("an eager mapping past the cap was refused for the wrong reason")
+            }
+            Ok(()) => wrong = Some("an eager mapping past the cap was allowed"),
+        }
+    }
+    let after_eager = heap::available_frames();
+    if wrong.is_none() && after_eager != before_eager {
+        crate::println!(
+            "    envelope       DETAIL: {before_eager} frames before the refused mapping, \
+             {after_eager} after"
+        );
+        wrong = Some("a refused eager mapping still took frames");
+    }
+    if wrong.is_none() && space.translate(VirtAddr(OVER)).is_some() {
+        wrong = Some("a refused eager mapping left a page mapped");
+    }
+    if wrong.is_none() && domain::frames_charged(owner) != Some((1, CAP)) {
+        wrong = Some("a refused eager mapping left a charge behind");
+    }
+
+    // --- 2. the fault path charges, and refuses at the cap ----------------
+    // A lazy region of six pages against three frames of headroom. Committing
+    // is what a page fault does; `service_fault` is the function it reaches,
+    // and calling it directly is the same servicing without needing a program
+    // in ring 3 to touch the pages.
+    if wrong.is_none()
+        && let Some(range) = VirtRange::from_pages(VirtAddr(LAZY), 6)
+    {
+        if space
+            .map_anonymous_lazy(range, Protection::ReadWrite)
+            .is_err()
+        {
+            wrong = Some("could not reserve a lazy region");
+        } else {
+            let mut committed = 0;
+            let mut refused_for_the_envelope = false;
+            for page in 0..6u64 {
+                match service_fault(&mut space, LAZY + page * PAGE_SIZE, true) {
+                    FaultOutcome::Handled => committed += 1,
+                    FaultOutcome::Refused("the domain's memory envelope is full") => {
+                        refused_for_the_envelope = true;
+                        break;
+                    }
+                    _ => break,
+                }
+            }
+            // Three, because the eager page above took the fourth.
+            if committed != CAP - 1 {
+                wrong = Some("the fault path committed a number of pages the envelope did not fit");
+            } else if !refused_for_the_envelope {
+                wrong = Some("the fault path did not refuse at the cap");
+            } else if domain::frames_charged(owner) != Some((CAP, CAP)) {
+                wrong = Some("the fault path's pages were not charged");
+            }
+        }
+    }
+
+    // --- 3. a copy-on-write copy is a frame, and is charged as one --------
+    // At the cap already, so the copy must be refused. Then one frame is
+    // released and the same fault must succeed, which is what distinguishes
+    // "refused because full" from "refused because copy-on-write is broken".
+    if wrong.is_none() {
+        let mapped = VirtRange::from_pages(VirtAddr(COW), 1).is_some_and(|range| {
+            // Released first: the page itself needs a frame before it can be
+            // copied, and the domain is at its cap.
+            domain::release_frames(owner, 1);
+            space.map_anonymous(range, Protection::ReadWrite).is_ok()
+        });
+        if !mapped {
+            wrong = Some("could not map the page a copy-on-write fault needs");
+        } else if space.make_copy_on_write(VirtAddr(COW)).is_err() {
+            wrong = Some("could not mark a region copy-on-write");
+        } else if !matches!(
+            service_fault(&mut space, COW, true),
+            FaultOutcome::Refused("the domain's memory envelope is full")
+        ) {
+            wrong = Some("a copy-on-write copy at the cap was not refused");
+        } else {
+            domain::release_frames(owner, 1);
+            if !matches!(service_fault(&mut space, COW, true), FaultOutcome::Handled) {
+                wrong = Some("a copy-on-write copy with room was refused");
+            }
+        }
+    }
+
+    // --- 4. teardown gives every frame back --------------------------------
+    space.destroy();
+    let left = domain::frames_charged(owner).map_or(u64::MAX, |(charged, _)| charged);
+    domain::destroy(owner);
+
+    if wrong.is_none() && left != 0 {
+        wrong = Some("destroying the space did not return the domain's frames");
+    }
+
+    // --- 5. a space mapped before it was owned is charged when it is -------
+    // **The case that was wrong for an afternoon.** `started_program` maps a
+    // stack and loads an ELF into a space and only *then* installs it, which
+    // is where the domain becomes known — so an owner that took over an empty
+    // ledger would leave a program's entire initial image charged to nobody.
+    // The frames are counted while the space is unowned and handed over by
+    // `own`.
+    let mut adopted_ok = false;
+    if wrong.is_none() {
+        let Ok(late) = domain::create("adopted", ResourceEnvelope::new().memory_frames(CAP)) else {
+            crate::println!("\x1b[91m    envelope       FAILED: no domain to adopt a space\x1b[0m");
+            return false;
+        };
+        match AddressSpace::new(hhdm_base) {
+            Ok(mut orphan) => {
+                let mapped = VirtRange::from_pages(VirtAddr(EAGER), 2).is_some_and(|range| {
+                    // Unowned: charged to nobody, and counted by the space.
+                    orphan.map_anonymous(range, Protection::ReadWrite).is_ok()
+                });
+                if !mapped {
+                    wrong = Some("could not map into a space before it had an owner");
+                } else if orphan.charged() != 2 {
+                    wrong = Some("a space did not count the frames it mapped while unowned");
+                } else if domain::frames_charged(late) != Some((0, CAP)) {
+                    wrong = Some("an unowned space charged somebody anyway");
+                } else {
+                    orphan.own(late);
+                    if domain::frames_charged(late) != Some((2, CAP)) {
+                        wrong = Some("taking ownership of a space did not take over its frames");
+                    } else {
+                        orphan.destroy();
+                        adopted_ok = domain::frames_charged(late) == Some((0, CAP));
+                        if !adopted_ok {
+                            wrong = Some("an adopted space did not give its frames back");
+                        }
+                    }
+                }
+            }
+            Err(_) => wrong = Some("could not create a space to adopt"),
+        }
+        domain::destroy(late);
+    }
+    let _ = adopted_ok;
+
+    // --- 6. a fault in a space whose domain has gone says so --------------
+    // **The other thing a charge can answer, and it must not be reported as a
+    // full envelope.** Two different diagnoses pointing at two different
+    // halves of the system; naming one as the other is the mistake this file
+    // records costing a day more than once. It *ought* to be unreachable —
+    // `domain::end` calls `forget`, and a space that is not in the table
+    // never reaches the fault handler — so this arm reaches it the only way
+    // left: a space the test holds directly, owned by a domain it then ends.
+    if wrong.is_none() {
+        let orphaned = domain::create("orphaned", ResourceEnvelope::new())
+            .ok()
+            .and_then(|dead| {
+                let mut space = AddressSpace::new(hhdm_base).ok()?;
+                space.own(dead);
+                let range = VirtRange::from_pages(VirtAddr(LAZY), 1)?;
+                space
+                    .map_anonymous_lazy(range, Protection::ReadWrite)
+                    .ok()?;
+                domain::destroy(dead);
+                let outcome = service_fault(&mut space, LAZY, true);
+                space.destroy();
+                Some(outcome)
+            });
+        match orphaned {
+            Some(FaultOutcome::Refused("the domain that owns this address space has ended")) => {}
+            Some(FaultOutcome::Refused(other)) => {
+                crate::println!(
+                    "\x1b[91m    envelope       DETAIL: a fault in an ownerless space said \
+                     {other:?}\x1b[0m"
+                );
+                wrong = Some(
+                    "a fault in a space whose domain has ended was refused for the \
+                              wrong stated reason",
+                );
+            }
+            Some(_) => wrong = Some("a fault in a space whose domain has ended was serviced"),
+            None => wrong = Some("could not build a space whose domain has ended"),
+        }
+    }
+
+    let table_frames = page_table_frames();
+
+    if let Some(what) = wrong {
+        crate::println!("\x1b[91m    envelope       FAILED: {what}\x1b[0m");
+        return false;
+    }
+
+    // **Every frame the *domain* held is back** — that is the assertion above,
+    // and it is the one that matters. The allocator is a frame down all the
+    // same, and it is not a leak in this path: `RangeMap` holds a `Vec`, so
+    // the first region inserted into a fresh space grows the kernel heap, and
+    // the heap does not return frames to the PMM. Reported rather than
+    // asserted, because asserting it would be asserting something about the
+    // heap's growth policy under the name of the envelope.
+    let after = heap::available_frames();
+    crate::println!(
+        "    envelope       a domain's own memory is charged: eager, fault and copy-on-write all \
+         refused at a cap of {CAP}; the domain got every frame back; {} to the kernel heap; \
+         {table_frames} in page tables, uncharged",
         baseline.saturating_sub(after)
     );
     true

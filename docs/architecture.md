@@ -424,7 +424,7 @@ flowchart TB
 
         subgraph ACCT["accounting — ResourceEnvelope"]
             E1["cpu_shares — divided among its threads,<br/>so the total is constant however many it spawns"]
-            E2["memory_frames — a hard cap; allocation past it fails"]
+            E2["memory_frames — a hard cap on the frames a domain holds:<br/>its address space and its shared objects.<br/>Page tables are not charged to it"]
             E3["max_child_domains — zero by default"]
             E4["io_weight — recorded, nothing enforces it yet"]
             E5["latency_class"]

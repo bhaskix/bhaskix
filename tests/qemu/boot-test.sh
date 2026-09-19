@@ -3978,19 +3978,79 @@ fi
 # prove: the self-test puts one thread and three threads on the same CPU and
 # checks the shares hold, which is the property and not merely the arithmetic.
 #
-# **The memory half is weaker than it reads, and saying so here is the point.**
-# `docs/security.md` T10 said the envelope is enforced at allocation time, and
-# the kernel line below is produced by calling `domain::charge_frames`
-# *directly* -- eight frames against a cap of eight, then a ninth, and the
-# refusal is required. That tests the accounting function. It does not test that
-# anything allocating memory calls it, and as of 2026-08-26 almost nothing does:
-# `shared::create` is the only real caller, so a domain's own address space is
-# uncharged. This gate was green throughout. A gate that exercises the mechanism
-# rather than the property will pass while the property is absent.
+# **The memory half of this line is the accounting function and nothing more,
+# and saying so here is the point.** The kernel line below is produced by
+# calling `domain::charge_frames` *directly* -- eight frames against a cap of
+# eight, then a ninth, and the refusal is required. That is a true test of the
+# arithmetic. It does not test that anything allocating memory calls it, and
+# between 2026-08-26 and 2026-09-19 almost nothing did: `shared::create` was the
+# only real caller, so a domain's own address space was uncharged and this gate
+# was green throughout. A gate that exercises the mechanism rather than the
+# property will pass while the property is absent.
+#
+# **The property has its own gate now** -- the `envelope` row below, RFC 0082.
+# This one is kept as the unit check it honestly is: the arithmetic is worth
+# asserting, and asserting it here is cheaper than reaching it through a
+# mapping.
 if grep -qE "domains +[0-9]+ created; envelope refuses past its cap; shares divided" "$LOG"; then
     pass "domains: envelope enforced, CPU share independent of thread count"
 else
     fail "domain self test did not pass"
+    status=1
+fi
+
+# **RFC 0082: a domain's own memory is charged to its envelope, and the
+# envelope refuses.** The property the row above cannot see. Three allocation
+# paths, each driven for real rather than through the counter: an eager
+# `map_anonymous` past the cap, a lazy region committed page by page through
+# `service_fault` -- the function a page fault reaches -- and a copy-on-write
+# copy, which is a new frame and must be charged as one. Each is required to be
+# refused at the cap, and the space's teardown is required to give every frame
+# back, so the envelope bounds what a domain *holds* rather than what it has
+# ever touched.
+#
+# Six assertions, each watched red before it was believed: the three charges
+# above, the release, the hand-over of a space's frames to an owner it acquires
+# late -- `started_program` maps a stack and loads an ELF *before* `install`,
+# so an owner taking over an empty ledger left a program's whole initial image
+# charged to nobody -- and that a fault in a space whose domain has *ended*
+# says so rather than reporting a full envelope. See TRACKER.md.
+if grep -qE "envelope +a domain's own memory is charged" "$LOG"; then
+    pass "RFC 0082: a domain's own memory is charged, and refused past its cap"
+else
+    fail "the envelope did not bound a domain's own memory: a mapping, a fault or a copy went uncharged"
+    status=1
+fi
+
+# And the figure it produces on the machine as booted, which is what says
+# whether any real domain is near its envelope. Not an assertion about the
+# number -- there is no right value yet -- but an assertion that the boot
+# *states* it, because the failure this accounting introduces is an envelope
+# too tight for the program inside it, and that is only visible if somebody
+# prints it.
+if grep -qE "envelope +[0-9]+ frame\(s\) charged across [0-9]+ live domain\(s\)" "$LOG"; then
+    pass "the boot says what each domain's own memory costs it"
+else
+    fail "the boot said nothing about what domains have charged"
+    status=1
+fi
+
+# **And no live domain has an address space it was charged nothing for.** This
+# one *is* an assertion about a number, and it is the detector for the bug RFC
+# 0082 shipped with for an afternoon: the owner was being set at `install`,
+# which happens *after* `started_program` maps a stack and loads an ELF, so a
+# program's entire initial image was charged to nobody -- 936 frames a boot,
+# with every other gate green because every gate used a space that was owned
+# before it was used. A program with a space has memory in it; zero is not a
+# plausible reading of one.
+silent=$(grep -aoE "[0-9]+ with a space and nothing charged" "$LOG" | head -1 | grep -oE "^[0-9]+")
+if [ "${silent:-x}" = "0" ]; then
+    pass "every domain with an address space was charged for it"
+elif [ -z "$silent" ]; then
+    fail "the boot did not say how many domains have a space and no charge"
+    status=1
+else
+    fail "$silent domain(s) hold an address space charged to nobody -- a space's frames are not reaching its owner"
     status=1
 fi
 

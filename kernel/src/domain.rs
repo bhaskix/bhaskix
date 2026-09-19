@@ -338,6 +338,187 @@ pub enum Personality {
     Linux,
 }
 
+/// One domain's frame accounting, readable and writable without a lock.
+///
+/// # Why this is not a field in [`Domain`]
+///
+/// [RFC 0082](../../docs/rfc/0082-a-domains-own-memory-is-its-own.md). The
+/// page-fault handler charges a frame, and **the page-fault handler may not
+/// take a lock**: `vm::service_fault` takes its frame from this CPU's reserve
+/// rather than from the allocator precisely because "the allocator's lock is
+/// the one thing a fault handler must never wait for", and `vm::SPACES` is
+/// `try_lock`ed for the same reason. A charge that went through
+/// [`TABLE`] at [`Rank::Domains`] would put back exactly the wait those two
+/// were written to remove.
+///
+/// So the counter and the cap live here, one per slot, and the table lock is
+/// needed only to *publish* them — which happens at creation, before any
+/// thread of that domain exists.
+///
+/// # The pure logic is here, and it is what the host tests exercise
+///
+/// Everything that can be got wrong about a cap — a charge that would pass
+/// it, a request near [`u64::MAX`] that must not wrap, a release of more than
+/// was charged — is in [`FrameBudget::charge`] and [`FrameBudget::release`],
+/// which need no table, no domain and no lock to test.
+pub struct FrameBudget {
+    /// Frames currently charged.
+    charged: core::sync::atomic::AtomicU64,
+    /// The cap they are charged against. One writer, at creation.
+    cap: core::sync::atomic::AtomicU64,
+    /// Whether a live domain holds this slot.
+    ///
+    /// Without it a charge could not tell an empty slot from a domain with a
+    /// cap of zero, and [`charge_frames`]'s two errors would collapse into
+    /// one.
+    live: core::sync::atomic::AtomicBool,
+}
+
+impl FrameBudget {
+    /// An unoccupied slot: no cap, no charge, nobody there.
+    const fn empty() -> Self {
+        Self {
+            charged: core::sync::atomic::AtomicU64::new(0),
+            cap: core::sync::atomic::AtomicU64::new(0),
+            live: core::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// Opens the slot with `cap`, starting from nothing charged.
+    ///
+    /// The charge is cleared here as well as at [`Self::close`], because a
+    /// slot is reused and a domain that inherited its predecessor's charge
+    /// would be refused memory it never took — the hazard RFC 0081 was
+    /// rejected over, one field along.
+    fn open(&self, cap: u64) {
+        self.charged.store(0, core::sync::atomic::Ordering::Relaxed);
+        self.cap.store(cap, core::sync::atomic::Ordering::Relaxed);
+        self.live.store(true, core::sync::atomic::Ordering::Release);
+    }
+
+    /// Closes the slot, returning everything charged against it.
+    fn close(&self) {
+        self.live
+            .store(false, core::sync::atomic::Ordering::Release);
+        self.charged.store(0, core::sync::atomic::Ordering::Relaxed);
+        self.cap.store(0, core::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether a live domain holds this slot.
+    fn occupied(&self) -> bool {
+        self.live.load(core::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Charges `frames`, refusing rather than exceeding.
+    ///
+    /// **All or nothing.** The compare-exchange retries on contention and
+    /// never publishes a partial charge, so a refusal leaves the count where
+    /// it was — which is what makes the error safe to report to a caller that
+    /// will try again with less.
+    ///
+    /// # Errors
+    ///
+    /// [`DomainError::MemoryEnvelopeExceeded`] if the total would pass the cap.
+    fn charge(&self, frames: u64) -> Result<(), DomainError> {
+        let cap = self.cap.load(core::sync::atomic::Ordering::Relaxed);
+        let mut charged = self.charged.load(core::sync::atomic::Ordering::Relaxed);
+        loop {
+            // Saturating, so a request near `u64::MAX` is refused rather than
+            // wrapping to a total that fits.
+            let total = charged.saturating_add(frames);
+            if total > cap {
+                return Err(DomainError::MemoryEnvelopeExceeded {
+                    charged,
+                    requested: frames,
+                    limit: cap,
+                });
+            }
+            match self.charged.compare_exchange_weak(
+                charged,
+                total,
+                core::sync::atomic::Ordering::Relaxed,
+                core::sync::atomic::Ordering::Relaxed,
+            ) {
+                Ok(_) => return Ok(()),
+                // Somebody else charged in between. Re-read and decide again
+                // against the total they left, which is the whole reason two
+                // CPUs faulting at once cannot both be allowed past the cap.
+                Err(now) => charged = now,
+            }
+        }
+    }
+
+    /// Returns `frames` to the budget.
+    ///
+    /// Saturating: releasing more than was charged is a bug, and reporting
+    /// zero is better than wrapping to a number that reads as an enormous
+    /// allocation.
+    fn release(&self, frames: u64) {
+        let mut charged = self.charged.load(core::sync::atomic::Ordering::Relaxed);
+        loop {
+            let left = charged.saturating_sub(frames);
+            match self.charged.compare_exchange_weak(
+                charged,
+                left,
+                core::sync::atomic::Ordering::Relaxed,
+                core::sync::atomic::Ordering::Relaxed,
+            ) {
+                Ok(_) => return,
+                Err(now) => charged = now,
+            }
+        }
+    }
+
+    /// Adds `frames` **without consulting the cap**.
+    ///
+    /// For one caller: `vm::AddressSpace::own`, handing over frames a space
+    /// already holds. They exist, they are this domain's, and declining to
+    /// count them because they overflow the cap would leave real memory
+    /// charged to nobody — which is the hole this whole budget was written to
+    /// close. A domain that lands over its cap is refused its next ordinary
+    /// [`Self::charge`], which is the enforcement working.
+    fn adopt(&self, frames: u64) {
+        let mut charged = self.charged.load(core::sync::atomic::Ordering::Relaxed);
+        loop {
+            let total = charged.saturating_add(frames);
+            match self.charged.compare_exchange_weak(
+                charged,
+                total,
+                core::sync::atomic::Ordering::Relaxed,
+                core::sync::atomic::Ordering::Relaxed,
+            ) {
+                Ok(_) => return,
+                Err(now) => charged = now,
+            }
+        }
+    }
+
+    /// Frames currently charged.
+    fn charged(&self) -> u64 {
+        self.charged.load(core::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The cap they are charged against.
+    fn cap(&self) -> u64 {
+        self.cap.load(core::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+/// One budget per domain slot, indexed by [`DomainId`]'s raw index.
+///
+/// Parallel to [`TABLE`] rather than inside it, for the reason
+/// [`FrameBudget`] gives: the fault path reads and writes this and may not
+/// wait for a lock.
+static BUDGETS: [FrameBudget; MAX_DOMAINS] = [const { FrameBudget::empty() }; MAX_DOMAINS];
+
+/// The budget for a raw slot index, or `None` for an index no slot has.
+///
+/// `DomainId::from_u32` documents that it does not check the domain exists, so
+/// an out-of-range index reaches here and must answer rather than panic.
+fn budget_of(id: DomainId) -> Option<&'static FrameBudget> {
+    BUDGETS.get(id.as_u32() as usize)
+}
+
 /// Which domain slots are Linux-tagged, as a bitmask over the whole table.
 ///
 /// The syscall entry reads this once per call with a relaxed load -- the
@@ -504,8 +685,6 @@ pub struct Domain {
     pub cspace: CSpace,
     /// What it may consume.
     pub envelope: ResourceEnvelope,
-    /// Frames currently charged against the envelope.
-    charged_frames: u64,
     /// Capabilities currently charged against the envelope.
     held_capabilities: u32,
     /// Threads belonging to this domain.
@@ -543,7 +722,6 @@ impl Domain {
             pending_clone: None,
             cspace: CSpace::new(),
             envelope: ResourceEnvelope::new(),
-            charged_frames: 0,
             held_capabilities: 0,
             threads: 0,
             personality: Personality::Native,
@@ -554,9 +732,12 @@ impl Domain {
     }
 
     /// Frames charged against this domain's envelope.
+    ///
+    /// Read out of [`BUDGETS`] rather than out of this struct, because the
+    /// fault path charges without the table lock — see [`FrameBudget`].
     #[must_use]
-    pub const fn charged_frames(&self) -> u64 {
-        self.charged_frames
+    pub fn charged_frames(&self) -> u64 {
+        budget_of(DomainId(self.id)).map_or(0, FrameBudget::charged)
     }
 
     /// Capabilities charged against this domain's envelope.
@@ -627,31 +808,6 @@ impl Domain {
         // count gets the floor, which is the honest failure -- it asked for
         // less CPU than it has threads to spend it.
         if weight == 0 { 1 } else { weight }
-    }
-
-    /// Charges `frames` against the envelope, refusing rather than exceeding.
-    ///
-    /// # Errors
-    ///
-    /// [`DomainError::MemoryEnvelopeExceeded`] if the total would pass the cap.
-    pub fn charge_frames(&mut self, frames: u64) -> Result<(), DomainError> {
-        let total = self.charged_frames.saturating_add(frames);
-        if total > self.envelope.memory_frames {
-            return Err(DomainError::MemoryEnvelopeExceeded {
-                charged: self.charged_frames,
-                requested: frames,
-                limit: self.envelope.memory_frames,
-            });
-        }
-        self.charged_frames = total;
-        Ok(())
-    }
-
-    /// Returns `frames` to the envelope. Saturating: releasing more than was
-    /// charged is a bug, and reporting zero is better than wrapping to a
-    /// number that reads as an enormous allocation.
-    pub fn release_frames(&mut self, frames: u64) {
-        self.charged_frames = self.charged_frames.saturating_sub(frames);
     }
 
     /// Charges one capability against the envelope.
@@ -1073,7 +1229,6 @@ pub fn create_under(
         pending_clone: None,
         cspace: CSpace::new(),
         envelope,
-        charged_frames: 0,
         held_capabilities: 0,
         threads: 0,
         personality: Personality::Native,
@@ -1081,6 +1236,13 @@ pub fn create_under(
         space_root: 0,
         live: true,
     };
+    // The frame cap, published where the fault path can read it without the
+    // lock this call holds. Here and nowhere else: a cap that could be raised
+    // after a domain had threads would be a domain raising its own limit if it
+    // ever reached a capability that did it.
+    if let Some(budget) = budget_of(DomainId(id)) {
+        budget.open(envelope.memory_frames);
+    }
     table.created += 1;
 
     // After the child exists, so a failure above leaves nothing charged. The
@@ -1212,7 +1374,13 @@ pub fn end(id: DomainId, reason: Ending) -> bool {
         domain.parent = u32::MAX;
         domain.live = false;
         domain.generation = domain.generation.wrapping_add(1);
-        domain.charged_frames = 0;
+        // The frames go back with the slot. Nothing is freed here -- the
+        // address space's page tables are deliberately left mapped, see below
+        // -- but the *accounting* must not outlive the domain, or a reused
+        // slot starts life already charged for memory it never took.
+        if let Some(budget) = budget_of(id) {
+            budget.close();
+        }
         domain.held_capabilities = 0;
         domain.threads = 0;
         domain.cspace = CSpace::new();
@@ -1404,16 +1572,51 @@ pub fn from_capability(slot: SlotRef) -> Option<DomainId> {
 
 /// Charges frames against a domain's envelope.
 ///
+/// **Takes no lock**, which is the whole point of
+/// [RFC 0082](../../docs/rfc/0082-a-domains-own-memory-is-its-own.md): the
+/// page-fault handler calls this, and it may not wait for one. See
+/// [`FrameBudget`].
+///
+/// A domain ending concurrently with a charge can leave a frame charged
+/// against a slot that is closing. [`FrameBudget::close`] clears the count, so
+/// the race costs nothing and the successor starts at zero.
+///
 /// # Errors
 ///
 /// [`DomainError::NoSuchDomain`] or [`DomainError::MemoryEnvelopeExceeded`].
 pub fn charge_frames(id: DomainId, frames: u64) -> Result<(), DomainError> {
-    with(id, |domain| domain.charge_frames(frames)).unwrap_or(Err(DomainError::NoSuchDomain))
+    let Some(budget) = budget_of(id).filter(|budget| budget.occupied()) else {
+        return Err(DomainError::NoSuchDomain);
+    };
+    budget.charge(frames)
 }
 
-/// Releases frames back to a domain's envelope.
+/// Takes over `frames` a domain already holds, past its cap if need be.
+///
+/// For `vm::AddressSpace::own` alone — see [`FrameBudget::adopt`] for why it
+/// does not refuse.
+pub fn adopt_frames(id: DomainId, frames: u64) {
+    if let Some(budget) = budget_of(id).filter(|budget| budget.occupied()) {
+        budget.adopt(frames);
+    }
+}
+
+/// Releases frames back to a domain's envelope. Takes no lock, as above.
 pub fn release_frames(id: DomainId, frames: u64) {
-    let _ = with(id, |domain| domain.release_frames(frames));
+    if let Some(budget) = budget_of(id) {
+        budget.release(frames);
+    }
+}
+
+/// What a domain has charged, and against what cap.
+///
+/// For the boot report: a cap is only meaningful beside the number being
+/// charged against it, and an envelope that is too tight for the program it
+/// holds should be visible before it is load-bearing rather than after.
+#[must_use]
+pub fn frames_charged(id: DomainId) -> Option<(u64, u64)> {
+    let budget = budget_of(id).filter(|budget| budget.occupied())?;
+    Some((budget.charged(), budget.cap()))
 }
 
 /// Records that a domain gained a thread, and re-divides its CPU share.
@@ -1466,6 +1669,72 @@ pub fn live() -> usize {
     TABLE.lock().domains.iter().filter(|d| d.live).count()
 }
 
+/// What the live domains have charged: the total, and the fullest one.
+///
+/// `(total, fullest_name, fullest_charged, fullest_cap, silent)` —
+/// [RFC 0082](../../docs/rfc/0082-a-domains-own-memory-is-its-own.md)'s
+/// report. **The fullest is the number worth a line**, because the failure
+/// this change introduces is an envelope too tight for the program inside it,
+/// and a total hides exactly that: sixteen domains at a tenth of their caps
+/// and one at the brim sum to a comfortable figure.
+///
+/// **`silent` is the detector for the bug that cost this RFC a sixfold
+/// undercount**: domains that have an address space and have been charged
+/// *nothing*. A program with a space has a stack and an image in it, so zero
+/// is not a plausible reading — it means the space's frames never reached
+/// whoever owns it. That is precisely what happened while the owner was set
+/// at `install` and took over an empty ledger, and nothing in the report
+/// would have said so. It reads zero on a healthy boot.
+///
+/// Takes the table lock, which is why this is a reporting call and not
+/// something the fault path can use.
+#[must_use]
+pub fn frames_charged_summary() -> (u64, Name, u64, u64, usize) {
+    let table = TABLE.lock();
+    let mut total: u64 = 0;
+    let mut silent = 0usize;
+    let mut fullest: Option<(Name, u64, u64)> = None;
+    for domain in table.domains.iter().filter(|domain| domain.live) {
+        let Some(budget) = budget_of(DomainId(domain.id)) else {
+            continue;
+        };
+        let (charged, cap) = (budget.charged(), budget.cap());
+        total = total.saturating_add(charged);
+        if domain.space_root != 0 && charged == 0 {
+            silent += 1;
+        }
+        // Compared as a fraction rather than as a count, because the tight
+        // envelope is the one nearest its *own* cap and not the one holding
+        // the most frames. Cross-multiplied so there is no division and no
+        // zero denominator to guard: `a/b > c/d` is `a*d > c*b` while `b` and
+        // `d` are positive, and a cap of zero loses every comparison, which
+        // is right — a domain that may hold nothing is not the one to warn
+        // about.
+        let beats = fullest.is_none_or(|(_, best_charged, best_cap)| {
+            charged.saturating_mul(best_cap) > best_charged.saturating_mul(cap)
+        });
+        if beats {
+            fullest = Some((
+                Name {
+                    bytes: domain.name,
+                    len: domain.name_len,
+                },
+                charged,
+                cap,
+            ));
+        }
+    }
+    let (name, charged, cap) = fullest.unwrap_or((
+        Name {
+            bytes: [0; MAX_NAME],
+            len: 0,
+        },
+        0,
+        0,
+    ));
+    (total, name, charged, cap, silent)
+}
+
 /// Live domains that speak Linux — that is, hosted processes still running.
 ///
 /// **Added 2026-09-14 because a gate was asking the wrong question.** The
@@ -1513,18 +1782,27 @@ mod tests {
         domain
     }
 
+    /// A budget of `cap`, open and charged nothing — the four tests below
+    /// were written against a `Domain` and are against the budget now, for
+    /// the reason [`FrameBudget`] gives. They assert the same things.
+    fn budget(cap: u64) -> FrameBudget {
+        let budget = FrameBudget::empty();
+        budget.open(cap);
+        budget
+    }
+
     #[test]
     fn the_memory_envelope_refuses_rather_than_exceeding() {
         // `docs/security.md` T10: enforced at allocation time, not by best
         // effort. Refusing is the only behaviour that means anything to the
         // *other* domains.
-        let mut domain = domain(ResourceEnvelope::new().memory_frames(10));
-        assert_eq!(domain.charge_frames(6), Ok(()));
-        assert_eq!(domain.charge_frames(4), Ok(()));
-        assert_eq!(domain.charged_frames(), 10);
+        let budget = budget(10);
+        assert_eq!(budget.charge(6), Ok(()));
+        assert_eq!(budget.charge(4), Ok(()));
+        assert_eq!(budget.charged(), 10);
 
         assert_eq!(
-            domain.charge_frames(1),
+            budget.charge(1),
             Err(DomainError::MemoryEnvelopeExceeded {
                 charged: 10,
                 requested: 1,
@@ -1532,7 +1810,7 @@ mod tests {
             })
         );
         assert_eq!(
-            domain.charged_frames(),
+            budget.charged(),
             10,
             "a refused charge must not be partially applied"
         );
@@ -1542,28 +1820,89 @@ mod tests {
     fn a_refused_charge_leaves_room_for_a_smaller_one() {
         // The failure must be about this request, not a latch that puts the
         // domain into a permanently-failing state.
-        let mut domain = domain(ResourceEnvelope::new().memory_frames(10));
-        domain.charge_frames(8).unwrap();
-        assert!(domain.charge_frames(5).is_err());
-        assert_eq!(domain.charge_frames(2), Ok(()));
+        let budget = budget(10);
+        budget.charge(8).unwrap();
+        assert!(budget.charge(5).is_err());
+        assert_eq!(budget.charge(2), Ok(()));
     }
 
     #[test]
     fn a_huge_request_cannot_wrap_past_the_limit() {
         // Saturating arithmetic, so a request near `u64::MAX` is refused
         // rather than wrapping to a small total that fits.
-        let mut domain = domain(ResourceEnvelope::new().memory_frames(10));
-        domain.charge_frames(5).unwrap();
-        assert!(domain.charge_frames(u64::MAX).is_err());
-        assert_eq!(domain.charged_frames(), 5);
+        let budget = budget(10);
+        budget.charge(5).unwrap();
+        assert!(budget.charge(u64::MAX).is_err());
+        assert_eq!(budget.charged(), 5);
     }
 
     #[test]
     fn releasing_more_than_was_charged_reports_zero_rather_than_wrapping() {
-        let mut domain = domain(ResourceEnvelope::new().memory_frames(10));
-        domain.charge_frames(3).unwrap();
-        domain.release_frames(100);
-        assert_eq!(domain.charged_frames(), 0);
+        let budget = budget(10);
+        budget.charge(3).unwrap();
+        budget.release(100);
+        assert_eq!(budget.charged(), 0);
+    }
+
+    #[test]
+    fn a_reused_slot_does_not_inherit_its_predecessors_charge() {
+        // The whole reason `open` clears the count as well as `close`. A
+        // domain that started life already charged would be refused memory it
+        // never took, and the refusal would be unattributable.
+        let budget = budget(10);
+        budget.charge(7).unwrap();
+        budget.close();
+        assert!(!budget.occupied());
+        budget.open(10);
+        assert_eq!(budget.charged(), 0);
+        assert_eq!(budget.charge(10), Ok(()));
+    }
+
+    #[test]
+    fn two_charges_racing_one_cap_cannot_both_win() {
+        // **The property the compare-exchange exists for**, and the reason
+        // the accounting is not a read-then-write: two CPUs faulting in the
+        // same domain at the same moment must not both be allowed past the
+        // cap. A `charged + n > cap` check followed by a store would let
+        // them, and on the fault path there is no lock to stop it.
+        //
+        // Sixteen threads each charging one frame against a cap of eight:
+        // exactly eight may succeed, whichever eight they are.
+        const THREADS: usize = 16;
+        const CAP: u64 = 8;
+
+        // Repeated, because a race that is lost by scheduling on one run
+        // proves nothing. Any single interleaving that broke the invariant
+        // would fail the assertion, and this gives it many.
+        for _ in 0..200 {
+            let budget = std::sync::Arc::new(budget(CAP));
+            let granted = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let start = std::sync::Arc::new(std::sync::Barrier::new(THREADS));
+
+            let runners: Vec<_> = (0..THREADS)
+                .map(|_| {
+                    let budget = std::sync::Arc::clone(&budget);
+                    let granted = std::sync::Arc::clone(&granted);
+                    let start = std::sync::Arc::clone(&start);
+                    std::thread::spawn(move || {
+                        start.wait();
+                        if budget.charge(1).is_ok() {
+                            granted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    })
+                })
+                .collect();
+            for runner in runners {
+                runner.join().unwrap_or(());
+            }
+
+            assert_eq!(
+                granted.load(std::sync::atomic::Ordering::Relaxed),
+                CAP,
+                "exactly the cap may be granted, however the charges interleave"
+            );
+            assert_eq!(budget.charged(), CAP, "and the count must agree with them");
+        }
     }
 
     #[test]

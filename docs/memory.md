@@ -131,16 +131,46 @@ as consequences of it, in the present tense, and they are corrected here because
 that field has never been written**: nothing calls `FrameDb::set_owner`, nothing reads `Frame::owner`,
 and it holds `NO_OWNER` for every frame in the machine.
 
-- ~~Per-domain memory limits enforced at allocation time (the `ResourceEnvelope`).~~ **Partly true,
-  by a different mechanism, and the part that is missing is the important one.** `domain::charge_frames`
-  charges the envelope and refuses rather than exceeding — and it has exactly one real caller,
-  `shared::create`. So the envelope bounds **shared objects** and does not bound a domain's own
-  memory: `AddressSpace::map_anonymous` charges nothing, and the demand-paging fault path that
-  commits a lazy reservation charges nothing. A domain's address space is bounded per *call*
-  (`MAX_SUPERVISED_PAGES`, and only on the eager path) and is not bounded in aggregate at all. A
-  domain can therefore hold more physical memory than `memory_frames` allows. Whether to fix that by
-  charging every allocation — and what should happen to a domain that hits the limit, given reclaim
-  is deferred — is a design question and not a missing line of code.
+- ~~Per-domain memory limits enforced at allocation time (the `ResourceEnvelope`).~~ ~~**Partly
+  true, by a different mechanism, and the part that is missing is the important one.**~~ **True as
+  of 2026-09-19, for leaf pages, by a mechanism that is not this field** —
+  [RFC 0082](rfc/0082-a-domains-own-memory-is-its-own.md). The paragraph that was here said
+  `domain::charge_frames` had exactly one real caller, `shared::create`, so the envelope bounded
+  shared objects and not a domain's own memory: `AddressSpace::map_anonymous` charged nothing and
+  the demand-paging fault path charged nothing. All of that was true and none of it is now. The
+  invariant is below.
+
+  The two questions it left open are answered. *Whether to charge every allocation*: yes, at the
+  point a frame enters an address space. *What happens to a domain that hits the limit, given
+  reclaim is deferred*: it is refused — an eager mapping with `VmError::MemoryEnvelopeExceeded`, a
+  fault with `FaultOutcome::Refused`, which ends the program the way an access to a guard page
+  does. Refusing rather than reclaiming is the same answer `domain::charge_frames` has always
+  given, for the reason `domain.rs`'s header states: a limit that reclaims instead of refusing
+  does not answer T10, it describes it.
+
+  **What is still not charged: page-table frames.** The PML4 an address space is created with and
+  every intermediate level a mapping needs are real memory spent on a domain's behalf, and nothing
+  bills them. Measured rather than waved at — on the boot that accepted RFC 0082, **306 frames in
+  page tables against 1,118 charged**, which is 0.27× the memory the envelope bounds — small enough
+  to leave, with a written trigger for revisiting it: if the ratio passes 0.5, charge them. `vm`'s
+  `page_table_frames()` is that gauge and the boot prints it.
+
+> ### The invariant, since 2026-09-19
+>
+> **A domain is charged for every frame its address space holds, and for exactly those.**
+>
+> Which decides where the code goes without further argument: charge where a frame *enters* a
+> space, release where one *leaves*. `map_anonymous` charges its whole range before allocating;
+> `map_anonymous_lazy` charges nothing because it maps nothing; the fault path charges one frame in
+> each of the two arms that create one; `unmap`, `unmap_pages` and `destroy` release exactly what
+> they free, which is not always what they were asked for. `map_shared` charges nothing — those
+> frames belong to a `Memory` object and were charged to its owner at `shared::create`, and
+> charging them twice would make the cap mean half of what it says. `map_device` charges nothing,
+> because MMIO is not frames.
+>
+> A space that no domain owns is the kernel's own and is charged nothing. That is the same `None`
+> that `sched::domain_of` answers for a kernel thread, and it is why the self-tests in `vm` can
+> build address spaces without an envelope to put them in.
 - ~~Exact accounting for the telemetry plane — no sampling, no estimation.~~ **Not available from
   the frame database**, which cannot attribute a single frame to a domain.
 - ~~Correct cleanup on domain teardown: walk the frame database, free everything owned.~~ **The

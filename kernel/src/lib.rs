@@ -381,6 +381,15 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
         println!("\x1b[91m    supervisor write  FAILED\x1b[0m");
     }
 
+    // **And whether any of it is charged to anybody** — RFC 0082. Directly
+    // after the two tests above because it uses the same mechanisms: a
+    // mapping, a fault serviced against a region map, and a copy-on-write
+    // copy. What it adds is the question neither of them asks — whose memory
+    // that was, and what happens at the limit.
+    if !vm::envelope_self_test(handoff.hhdm_base.as_u64()) {
+        println!("\x1b[91m    envelope       FAILED\x1b[0m");
+    }
+
     // **The disclosure staged, on every boot.** `shared::create` allocated
     // frames without zeroing them until 2026-08-26, so an object handed to a
     // ring 3 service carried whatever its frames held before. This writes a
@@ -23441,6 +23450,39 @@ fn user_shell(handoff: &Handoff) -> Result<(), &'static str> {
         "    domains        {} of {} slots occupied at once (a slot is held until reaped)",
         domain::peak_occupied(),
         domain::MAX_DOMAINS
+    );
+    // **What a domain's own memory costs it, and how close the tightest one
+    // is to its limit** — RFC 0082. The fullest domain rather than the sum,
+    // because the failure this accounting introduces is an envelope too tight
+    // for the program inside it, and a total hides exactly that. The
+    // page-table figure beside it is the frames spent on address spaces that
+    // *nothing* is charged for, which is the gap that RFC names and does not
+    // close.
+    //
+    // **Taken and given back are printed beside the figure they make**,
+    // because the difference alone was misread the day it was written: the
+    // tally read 9,368 against 182 charged, which looks like page tables
+    // costing fifty times the memory they map. It is a boot's whole traffic,
+    // and the frame-leak gate builds and destroys a thousand address spaces
+    // inside it. What is *held* is 306. A number that can be read two ways
+    // prints both.
+    //
+    // **`silent` is the detector for the bug this accounting shipped with for
+    // an afternoon**: domains that have an address space and have been charged
+    // nothing. A program with a space has a stack and an image in it, so zero
+    // is not a plausible reading — it means the space's frames never reached
+    // its owner. That is exactly what happened while the owner was set at
+    // `install` and took over an empty ledger, and none of the numbers on this
+    // line would have said so. It reads zero on a healthy boot.
+    let (charged_total, fullest, fullest_charged, fullest_cap, silent) =
+        domain::frames_charged_summary();
+    let (taken, given) = vm::page_table_frame_traffic();
+    println!(
+        "    envelope       {charged_total} frame(s) charged across {} live domain(s); fullest \
+         {fullest} at {fullest_charged} of {fullest_cap}; {silent} with a space and nothing \
+         charged; page tables hold {} more, uncharged ({taken} taken, {given} given back)",
+        domain::live(),
+        vm::page_table_frames()
     );
     println!(
         "    memory objects {} of {} live at once",
