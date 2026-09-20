@@ -1010,6 +1010,95 @@ the distinction is in the table rather than in somebody's head.
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-09-21 (the LACP lane failed once, and it is a lane CI never runs)
+
+**One failure, on the full suite, at `test-lacp`:** `net domain FAILED:
+nothing was received (the receive ring has seen 0 completions)`, `net reply
+FAILED: the service built nothing to send`, and `net ring 0 frames crossed to
+ipd`. The wire between the two guests never carried anything.
+
+**Two clean re-runs of that lane immediately after**, on the same tree.
+
+**It has no sighting history, because nothing has ever been able to give it
+one.** `test-lacp` is not in the CI workflow — like `test-busybox`, it runs
+only when somebody runs the whole suite locally, so `tools/ci-count.py` over
+CI history answers zero for every signature it can produce and that zero means
+"never looked", not "never happened". The BusyBox keystroke row already carries
+this warning in its own words; this is the second lane it applies to, and the
+pair of them is worth knowing about before anyone reads a CI zero as a rate.
+
+**Not attributed to the change it appeared on**, which was signal masking in
+`bin/linuxd`: the lane boots two guests and exercises `bin/netd`'s receive
+ring, and nothing in that change is on a network path. Recorded with its date
+rather than asserted either way.
+
+### 2026-09-21 (ring specimen twenty-one: the station read the retire's phase and slept anyway)
+
+**Caught locally on the `iommu` lane while verifying an unrelated change, and
+it is a sharper contradiction than the row's own.** Two stations did not
+retire:
+
+```
+ring-0 (thread 12) retired,  1477 laps, token 1 at phase 3,   3,405 evaluations; last wake #15242, last mark #15238 by itself
+ring-1 (thread 13) runnable, 1476 laps, token 1 at phase 2,   3,186 evaluations; last wake #15219, last mark #15216 by itself
+ring-2 (thread 14) asleep,   1476 laps, token 1 at phase 3, 273,294 evaluations; last wake #15237, last mark #15239 by itself
+ring-3 (thread 15) retired,  1476 laps, token 1 at phase 3,   3,326 evaluations; last wake #15243, last mark #15240 by itself
+token 1, phase 3, 0 sleepers still queued, 0 overflowed; the retire's wake
+found 2 entr(ies) between #15241 and #15244; window spans #15179..#15243
+```
+
+**The contradiction, stated exactly.** The station's predicate is
+`token == id || phase > PHASE_WAIT`, and `PHASE_WAIT` is 2. `SEEN_PHASE` is
+stored *inside* that closure, under the queue's own lock, from the same local
+the decision uses. ring-2's last evaluation therefore read phase **3**, which
+makes the predicate **true** — so `wait_until` returned and the station should
+have reached `sched::exit()`. It is `Blocked` instead, and `asleep` is
+`threads_present_exact > 0 && is_blocked == Some(true)`, so it is a live thread
+in the blocked state rather than a retired one mislabelled. The scheduler's own
+dump agrees: `cpu 2 thread 14 ring-2 fair Blocked 3227 runs (migrated)`.
+
+**Specimen twenty had `SEEN_PHASE` = 2** — evaluated *before* the retire
+published — and that row's open question is whether the retire's wake ran
+between the evaluation and the enqueue. Twenty-one is the other side of that:
+the evaluation happened *after* the phase was published and the station slept
+anyway, which the code as written does not allow.
+
+**And its entry was gone.** The retire's `wake_all` found 2 entries and ring-0
+and ring-3 took wakes at #15242 and #15243 — those are the 2. ring-2's last
+delivered wake is #15237, before the window, with `0 not found, 0 contended`,
+so nothing aimed at it and missed. It was marked blocked at #15239 and was not
+in the queue two events later, with nothing recorded as removing it.
+
+**273,294 predicate evaluations against about 3,300 for each of its
+siblings** — eighty times. §3 already prices that shape: a refused mark costs a
+lap through the scheduler, the mark is dropped, `block_self` finds the thread
+unblocked and returns, and `wait_until` goes round again. No specimen has shown
+it at this scale.
+
+**What reading eliminated, so the next person does not re-walk it:**
+
+- *`wait_until` does not skip its re-enqueue after a spurious wake.* It calls
+  `waiters.remove(me)` and then `enqueue_and_block(me)` on **every** pass, so a
+  woken-and-re-blocked station is re-queued rather than left out.
+- *`enqueue_and_block` cannot mark without enqueueing.* It takes a free slot
+  first and marks second, both under the queue lock, and returns `false`
+  without marking when the queue is full — and `overflowed` reads 0.
+- *The predicate does include the phase.* It is not a `TOKEN == id` wait that
+  misses the retire; the phase is the second half of the disjunction.
+- *`asleep` is not a mislabelled retirement.* The classification was corrected
+  once for exactly that and now uses `threads_present_exact`.
+
+**So the numbers are not explainable by reading, and the next step is an
+instrument rather than a fifth theory** — this file records three theories
+dying this month by being settled before the evidence was complete. The
+instrument is narrow: record **which queue** a station is blocked in, and the
+predicate's **return value** beside `SEEN_PHASE`. That separates *blocked in
+`RING` having decided false* — which would mean `SEEN_PHASE` does not belong to
+the deciding evaluation — from *blocked somewhere that is not `RING`*, which
+would be a different defect wearing this one's clothes.
+
+The log is kept.
+
 ### 2026-09-21 (a signal raised and not delivered, once, and a shared slot removed rather than a cause proven)
 
 **Seen once, on the full suite's `test-boot-iommu-off` lane**, on the tree that
