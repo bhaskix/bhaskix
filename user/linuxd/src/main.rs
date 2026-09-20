@@ -429,6 +429,13 @@ fn deliver_signal(domain: u32, slot: u64, signal: u64, address: u64, handler: Ha
     {
         return FAULT_END;
     }
+    // **The set in force before this delivery, into the frame's own
+    // `uc_sigmask`** — RFC 0083 step 7, and the block that stops this handler
+    // being entered on top of itself. Written *after* the sigcontext because
+    // it sits past it, and taken before the block so the frame carries what
+    // `rt_sigreturn` must put back rather than what this delivery imposed.
+    let previous = dispositions_of(domain).block_for_delivery(signal, handler.mask);
+    frame[8 + SIGINFO_BYTES + UCONTEXT_SIGMASK..][..8].copy_from_slice(&previous.to_le_bytes());
     // Into the hosted process's own stack. A process whose stack is unmapped
     // gets an ending rather than a delivery, which is what the kernel did.
     if !copy_out(domain, frame_at, &frame) {
@@ -503,25 +510,41 @@ fn deliver_signal_after_call(
 /// be repeated — and `EINTR` and `SA_RESTART`, which this adapter would then
 /// owe, are a much larger piece of work than the one this RFC is.
 ///
-/// One entry is enough and the key is checked anyway. This program answers one
-/// call at a time and the kernel re-presents immediately, so nothing can
-/// interleave; the key is what turns "cannot happen" into "did not happen".
+/// **One entry per domain, and it was one entry for the whole machine until
+/// 2026-09-21.** The first version reasoned that this program answers one call
+/// at a time and the kernel re-presents a `NEED_FRAME` immediately, so nothing
+/// could interleave. That is true of this program's *thread* and not of the
+/// conversation: between replying `NEED_FRAME` to one domain and receiving
+/// that domain's frame message, this loop can take and answer a message from
+/// **another** domain — and if that one also has a signal pending it stashes
+/// too, over the top. The first domain's frame then arrives with no stash,
+/// falls through to the argument path, and its call is dispatched a second
+/// time while its signal stays pending for ever.
+///
+/// **Whether that produced `raised 4, delivered 3` on one `iommu-off` boot is
+/// not established** — it did not reproduce in eight runs of that lane and is
+/// not explained by reading. What is established is that a single shared slot
+/// in a server answering many domains is a class of fault, and this removes
+/// the class rather than an instance. Keyed the way `DISPOSITIONS` and
+/// `PARKED_ON` already are.
 ///
 /// **Atomics rather than a `static mut`, and not for thread safety** — this
 /// program is single-threaded and the rest of its state is `static mut` behind
 /// `// SAFETY:` comments. It is because `bin/linuxd`'s `unsafe` budget is
 /// *exact*: it holds the largest concentration of authority in the system, and
 /// the build fails if the number moves in either direction without somebody
-/// editing it. Three lines of `unsafe` to stash two words is a poor thing to
-/// spend that budget on when a load and a store will do.
-static AWAITING_DOMAIN: core::sync::atomic::AtomicU32 =
-    core::sync::atomic::AtomicU32::new(NO_DOMAIN_AWAITING);
-/// The value the stashed call produced. Meaningful only while
-/// [`AWAITING_DOMAIN`] names a domain.
-static AWAITING_VALUE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-/// No call is waiting for its frame. A real domain id can never be this: the
-/// domain table is [`limits::MAX_DOMAINS`] long.
-const NO_DOMAIN_AWAITING: u32 = u32::MAX;
+/// editing it. Lines of `unsafe` to stash a word are a poor thing to spend
+/// that budget on when a load and a store will do.
+static AWAITING: [core::sync::atomic::AtomicU64; limits::MAX_DOMAINS] =
+    [const { core::sync::atomic::AtomicU64::new(NOTHING_AWAITING) }; limits::MAX_DOMAINS];
+
+/// No call in this slot is waiting for its frame.
+///
+/// `u64::MAX` rather than zero: zero is a perfectly ordinary answer for a
+/// system call — a `read` at end of file, a `write` of nothing — and a
+/// sentinel a real value collides with is a stash that silently stops working
+/// for exactly the calls that answer it.
+const NOTHING_AWAITING: u64 = u64::MAX;
 
 /// Where the signal record sits — [RFC 0083](../../docs/rfc/0083-a-signal-a-process-can-catch.md).
 const SIGNAL_RECORD_AT: u64 = REPORT_AT + report::SIGNAL_AT as u64;
@@ -533,6 +556,18 @@ static SIGNALS_DELIVERED: core::sync::atomic::AtomicU64 = core::sync::atomic::At
 /// Deliveries that could not be built — an unmapped stack, or a register frame
 /// that would not read back.
 static SIGNALS_UNBUILT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Raises that landed on a signal the target already had **blocked**.
+///
+/// Such a signal stays pending and is delivered when the mask lifts, which is
+/// correct — and a count that is not zero says a mask is being held longer
+/// than a handler runs, which is the failure mode this design can have.
+static SIGNALS_RAISED_BLOCKED: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+/// `rt_sigreturn`s that could not read their own frame's `uc_sigmask`.
+///
+/// Each one latches a mask on for ever, so a non-zero here is a process that
+/// can no longer receive a signal it has a handler for.
+static SIGNALS_UNRESTORED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// Publishes the three signal counters where the boot report can read them.
 ///
@@ -546,6 +581,8 @@ fn publish_signals() {
         SIGNALS_RAISED.load(core::sync::atomic::Ordering::Relaxed),
         SIGNALS_DELIVERED.load(core::sync::atomic::Ordering::Relaxed),
         SIGNALS_UNBUILT.load(core::sync::atomic::Ordering::Relaxed),
+        SIGNALS_RAISED_BLOCKED.load(core::sync::atomic::Ordering::Relaxed),
+        SIGNALS_UNRESTORED.load(core::sync::atomic::Ordering::Relaxed),
     ];
     for (index, count) in counts.iter().enumerate() {
         // SAFETY: inside the page `ATTACH` mapped from this program's own
@@ -597,18 +634,17 @@ fn wake_parked(domain: u32) {
 /// Records that a call in `domain` has been answered with `value` and needs
 /// its frame so a pending signal can be delivered.
 fn await_frame_for_signal(domain: u32, value: u64) {
-    AWAITING_VALUE.store(value, core::sync::atomic::Ordering::Relaxed);
-    AWAITING_DOMAIN.store(domain, core::sync::atomic::Ordering::Relaxed);
+    if let Some(slot) = AWAITING.get((domain as usize) % limits::MAX_DOMAINS) {
+        slot.store(value, core::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// Takes the stashed answer for `domain`, if this frame was asked for to
 /// deliver a signal rather than to read a call's arguments.
 fn take_awaited_frame(domain: u32) -> Option<u64> {
-    if AWAITING_DOMAIN.load(core::sync::atomic::Ordering::Relaxed) != domain {
-        return None;
-    }
-    AWAITING_DOMAIN.store(NO_DOMAIN_AWAITING, core::sync::atomic::Ordering::Relaxed);
-    Some(AWAITING_VALUE.load(core::sync::atomic::Ordering::Relaxed))
+    let slot = AWAITING.get((domain as usize) % limits::MAX_DOMAINS)?;
+    let value = slot.swap(NOTHING_AWAITING, core::sync::atomic::Ordering::Relaxed);
+    (value != NOTHING_AWAITING).then_some(value)
 }
 
 /// Answers a call whose arguments did not fit in a message.
@@ -717,6 +753,25 @@ fn answer_with_frame(domain: u32, slot: u64, number: u64) -> (u64, Answer) {
             let Ok(registers) = Registers::read_sigcontext(&bytes) else {
                 return (REPLY_VALUE, Answer::error(memory::errno::EINVAL));
             };
+            // **The blocked set this frame was built with, put back** — RFC
+            // 0083 step 7. Read out of the frame rather than from a stack this
+            // program keeps, so nesting of any depth unwinds by construction
+            // and a handler that edited `uc_sigmask` is obeyed.
+            let mut saved = [0u8; 8];
+            if copy_in(
+                domain,
+                base + 8 + SIGINFO_BYTES as u64 + UCONTEXT_SIGMASK as u64,
+                &mut saved,
+            ) {
+                dispositions_of(domain).set_blocked(u64::from_le_bytes(saved));
+            } else {
+                // **Counted, because the alternative is silence.** A restore
+                // that does not happen leaves the mask this delivery imposed
+                // in force for ever, and the process stops receiving a signal
+                // it has a handler for.
+                SIGNALS_UNRESTORED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                publish_signals();
+            }
             let mut edited = image;
             edited[0] = registers.rax;
             edited[3] = registers.rdx;
@@ -1302,6 +1357,9 @@ fn answer_kill(request: &PersonalityCall) -> (u64, Answer) {
         // The wake is what makes it reach a process that is *blocked*: it is
         // parked on a notification this program named, re-enters on the wake,
         // and its call is interrupted with `EINTR` after the handler runs.
+        if dispositions_of(domain).blocked() & (1u64 << (signal & 63)) != 0 {
+            SIGNALS_RAISED_BLOCKED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        }
         if dispositions_of(domain).raise(signal) {
             SIGNALS_RAISED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             publish_signals();
@@ -1345,6 +1403,9 @@ fn answer_kill(request: &PersonalityCall) -> (u64, Answer) {
         // is how a program asks for its own handler to run, and it is the one
         // delivery that needs no wake: the caller is right here, mid-call, and
         // the main loop redirects it on the way out of this very `kill`.
+        if dispositions_of(request.domain).blocked() & (1u64 << (signal & 63)) != 0 {
+            SIGNALS_RAISED_BLOCKED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        }
         if dispositions_of(request.domain).raise(signal) {
             SIGNALS_RAISED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             publish_signals();
@@ -7156,11 +7217,24 @@ const FRAME_BYTES: usize = 8 + SIGINFO_BYTES + UCONTEXT_BYTES;
 const SIGINFO_BYTES: usize = 128;
 /// Where `si_addr` sits within it.
 const SIGINFO_ADDR: usize = 16;
-/// The part of a `ucontext_t` this builds, up to and including the
-/// `sigcontext` a handler reads and edits.
-const UCONTEXT_BYTES: usize = UCONTEXT_MCONTEXT + signal::sigcontext::SIZE;
+/// The part of a `ucontext_t` this builds: up to and including the
+/// `sigcontext` a handler reads and edits, and then `uc_sigmask`.
+const UCONTEXT_BYTES: usize = UCONTEXT_SIGMASK + 8;
 /// Where the `mcontext` starts inside the `ucontext`.
 const UCONTEXT_MCONTEXT: usize = 40;
+/// Where `uc_sigmask` sits inside the `ucontext` — immediately after the
+/// `mcontext`, which is Linux's own layout.
+///
+/// **It is where this frame used to end**, so carrying it costs eight bytes
+/// and no arithmetic anybody has to check: the offset falls out of the two
+/// constants above rather than being written down a second time.
+///
+/// [RFC 0083](../../docs/rfc/0083-a-signal-a-process-can-catch.md) step 7.
+/// The set that was in force when a delivery was built travels in its own
+/// frame, so nesting unwinds without this program keeping a stack of masks —
+/// and a handler that edits `uc_sigmask`, which real runtimes do, gets what it
+/// asked for.
+const UCONTEXT_SIGMASK: usize = UCONTEXT_MCONTEXT + signal::sigcontext::SIZE;
 
 /// How many processors a hosted program is told it has.
 ///

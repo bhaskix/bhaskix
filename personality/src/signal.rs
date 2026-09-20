@@ -98,6 +98,19 @@ pub struct Dispositions {
     /// than an event with a count. A queue would promise an arrival count
     /// nothing here can keep.
     pending: u64,
+    /// Signals this process may not be delivered right now — one bit per
+    /// number, [RFC 0083](../../docs/rfc/0083-a-signal-a-process-can-catch.md)
+    /// step 7.
+    ///
+    /// **A handler runs with its own signal blocked**, which is what stops it
+    /// being entered on top of itself. Delivery here happens on the way out of
+    /// a call, so a handler that makes *any* call while another signal is
+    /// raised would otherwise be re-entered, and each nesting costs a frame on
+    /// the target's own stack.
+    ///
+    /// Blocked is not lost: [`Self::take_pending`] skips these and leaves them
+    /// pending, so the signal arrives once the set is restored.
+    blocked: u64,
 }
 
 impl Default for Dispositions {
@@ -123,7 +136,46 @@ impl Dispositions {
                 flags: 0,
             },
             pending: 0,
+            blocked: 0,
         }
+    }
+
+    /// Which signals are blocked from delivery right now.
+    ///
+    /// Written into a delivery's `uc_sigmask` so that `rt_sigreturn` can put
+    /// it back — which is how nesting unwinds without a stack of its own here:
+    /// each frame carries the set that was in force when it was built.
+    #[must_use]
+    pub const fn blocked(&self) -> u64 {
+        self.blocked
+    }
+
+    /// Replaces the blocked set, answering what it was.
+    ///
+    /// **`SIGKILL` is masked out on the way in**, for the reason it cannot be
+    /// caught: a handler whose `sa_mask` named it would be asking not to be
+    /// ended, and who may end a hosted process is RFC 0079's subject rather
+    /// than the process's own.
+    pub fn set_blocked(&mut self, blocked: u64) -> u64 {
+        let kept = self.blocked;
+        self.blocked = blocked & !(1 << number::SIGKILL);
+        kept
+    }
+
+    /// Blocks `signal` and everything its handler's `sa_mask` names, answering
+    /// the set that was in force before.
+    ///
+    /// What a delivery does on the way in; the answer is what its frame
+    /// carries so that `rt_sigreturn` can restore it.
+    pub fn block_for_delivery(&mut self, signal: u64, mask: u64) -> u64 {
+        let previous = self.blocked;
+        let bit = if signal < number::MAX as u64 {
+            1u64 << signal
+        } else {
+            0
+        };
+        self.set_blocked(previous | bit | mask);
+        previous
     }
 
     /// Marks `signal` pending, if it is one this process can catch.
@@ -168,7 +220,10 @@ impl Dispositions {
     /// and then restores the default has asked for the default. Delivering to
     /// an entry point of zero would be a jump to zero.
     pub fn take_pending(&mut self) -> Option<(u64, Handler)> {
-        let mut left = self.pending;
+        // **Blocked signals are skipped and left pending**, not taken and
+        // dropped. A handler that blocks a signal has asked for it later, not
+        // for it never.
+        let mut left = self.pending & !self.blocked;
         while left != 0 {
             let index = left.trailing_zeros() as u64;
             let bit = 1u64 << index;
@@ -195,6 +250,10 @@ impl Dispositions {
         self.handlers = parent.handlers;
         self.alt = parent.alt;
         self.pending = 0;
+        // **The blocked set *is* inherited**, which Linux also does: a child
+        // forked from inside a handler starts with that handler's mask, and
+        // its own `rt_sigreturn` is what lifts it.
+        self.blocked = parent.blocked;
     }
 
     /// Whether anything is waiting to be delivered.
@@ -203,7 +262,7 @@ impl Dispositions {
     /// a load and a comparison and nothing else.
     #[must_use]
     pub const fn has_pending(&self) -> bool {
-        self.pending != 0
+        self.pending & !self.blocked != 0
     }
 
     /// Installs `handler` for `signal`, returning what was there before.
@@ -750,5 +809,125 @@ mod tests {
             dispositions.take_pending().map(|(s, _)| s),
             Some(number::SIGURG)
         );
+    }
+
+    #[test]
+    fn a_blocked_signal_stays_pending_rather_than_being_dropped() {
+        // **The half that would be easy to get wrong.** Skipping a blocked
+        // signal by *taking* it would lose it: the handler asked for it later,
+        // not for it never.
+        let mut dispositions = caught(number::SIGTERM);
+        assert!(dispositions.raise(number::SIGTERM));
+        dispositions.set_blocked(1 << number::SIGTERM);
+
+        assert!(!dispositions.has_pending(), "blocked is not deliverable");
+        assert_eq!(dispositions.take_pending(), None);
+
+        dispositions.set_blocked(0);
+        assert!(dispositions.has_pending(), "and it was kept, not dropped");
+        assert_eq!(
+            dispositions.take_pending().map(|(s, _)| s),
+            Some(number::SIGTERM)
+        );
+    }
+
+    #[test]
+    fn a_delivery_blocks_its_own_signal_and_its_mask() {
+        // What stops a handler being entered on top of itself: delivery here
+        // happens on the way out of a call, so a handler that makes any call
+        // while the same signal is raised would otherwise nest.
+        let mut dispositions = Dispositions::new();
+        dispositions
+            .install(
+                number::SIGTERM,
+                Handler {
+                    entry: 0x4000,
+                    flags: 0,
+                    mask: 1 << number::SIGURG,
+                    restorer: 0,
+                },
+            )
+            .unwrap();
+        let previous = dispositions.block_for_delivery(number::SIGTERM, 1 << number::SIGURG);
+        assert_eq!(previous, 0, "it answers what was in force before");
+        assert_eq!(
+            dispositions.blocked(),
+            (1 << number::SIGTERM) | (1 << number::SIGURG),
+            "the signal itself and everything its sa_mask names"
+        );
+
+        // Raised again mid-handler: pending, and not deliverable.
+        assert!(dispositions.raise(number::SIGTERM));
+        assert!(!dispositions.has_pending());
+
+        // And `rt_sigreturn` putting the old set back makes it deliverable.
+        dispositions.set_blocked(previous);
+        assert_eq!(
+            dispositions.take_pending().map(|(s, _)| s),
+            Some(number::SIGTERM)
+        );
+    }
+
+    #[test]
+    fn sigkill_cannot_be_blocked_however_a_mask_is_written() {
+        // The same rule as `raise`, at the other door. A handler whose
+        // `sa_mask` names SIGKILL would be asking not to be ended.
+        let mut dispositions = caught(number::SIGTERM);
+        dispositions.set_blocked(u64::MAX);
+        assert_eq!(
+            dispositions.blocked() & (1 << number::SIGKILL),
+            0,
+            "SIGKILL is masked out of any set, whatever was asked for"
+        );
+        let previous = dispositions.block_for_delivery(number::SIGTERM, u64::MAX);
+        let _ = previous;
+        assert_eq!(dispositions.blocked() & (1 << number::SIGKILL), 0);
+    }
+
+    #[test]
+    fn nesting_unwinds_through_the_sets_each_delivery_carries() {
+        // Two deliveries deep, each restoring what it found. No stack of its
+        // own: every frame carries the set that was in force when it was
+        // built, which is what `uc_sigmask` is for.
+        let mut dispositions = caught(number::SIGTERM);
+        dispositions
+            .install(
+                number::SIGURG,
+                Handler {
+                    entry: 0x5000,
+                    flags: 0,
+                    mask: 0,
+                    restorer: 0,
+                },
+            )
+            .unwrap();
+
+        let outer = dispositions.block_for_delivery(number::SIGTERM, 0);
+        let inner = dispositions.block_for_delivery(number::SIGURG, 0);
+        assert_eq!(
+            dispositions.blocked(),
+            (1 << number::SIGTERM) | (1 << number::SIGURG)
+        );
+
+        dispositions.set_blocked(inner);
+        assert_eq!(dispositions.blocked(), 1 << number::SIGTERM);
+        dispositions.set_blocked(outer);
+        assert_eq!(dispositions.blocked(), 0);
+    }
+
+    #[test]
+    fn a_forked_child_inherits_the_blocked_set_and_not_the_pending_one() {
+        let mut parent = caught(number::SIGTERM);
+        parent.raise(number::SIGTERM);
+        parent.set_blocked(1 << number::SIGURG);
+
+        let mut child = Dispositions::new();
+        child.inherit(&parent);
+        assert_eq!(child.blocked(), 1 << number::SIGURG, "the mask crosses");
+        assert!(
+            !child.has_pending(),
+            "a signal waiting for the parent was sent to the parent"
+        );
+        assert!(child.handler(number::SIGTERM).is_some(), "handlers cross");
     }
 }

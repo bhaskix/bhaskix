@@ -7392,7 +7392,7 @@ const FORK_PROBE_CODE: [u8; 447] = [
 /// than jumped into: the parent returns out of it to the code page it came
 /// from, and the child never leaves it.
 #[rustfmt::skip]
-const KILL_PROBE_CODE: [u8; 1603] = [
+const KILL_PROBE_CODE: [u8; 1680] = [
     0x49, 0x89, 0xfc,                         // mov %rdi,%r12
     0xb8, 0x27, 0x00, 0x00, 0x00,             // mov $0x27,%eax
     0x0f, 0x05,                               // syscall
@@ -7426,7 +7426,7 @@ const KILL_PROBE_CODE: [u8; 1603] = [
     0x48, 0x3d, 0x00, 0x00, 0x01, 0x40,       // cmp $0x40010000,%rax
     0x0f, 0x85, 0x94, 0x04, 0x00, 0x00,       // jne 546 <done>
     0x49, 0x89, 0xc7,                         // mov %rax,%r15
-    0x48, 0x8d, 0x35, 0xbb, 0x04, 0x00, 0x00, // lea 0x4bb(%rip),%rsi # 577 <inner>
+    0x48, 0x8d, 0x35, 0x08, 0x05, 0x00, 0x00, // lea 0x508(%rip),%rsi # 5c4 <inner>
     0x4c, 0x89, 0xff,                         // mov %r15,%rdi
     0xb9, 0xcc, 0x00, 0x00, 0x00,             // mov $0xcc,%ecx
     0xf3, 0xa4,                               // rep movsb %ds:(%rsi),%es:(%rdi)
@@ -7569,7 +7569,7 @@ const KILL_PROBE_CODE: [u8; 1603] = [
     0x48, 0x8d, 0x05, 0x1a, 0x02, 0x00, 0x00, // lea 0x21a(%rip),%rax # 551 <caught>
     0x48, 0x89, 0x04, 0x25, 0x40, 0x00, 0x00, 0x40, // mov %rax,0x40000040
     0x48, 0xc7, 0x04, 0x25, 0x48, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00, 0x04, // movq $0x4000000,0x40000048
-    0x48, 0x8d, 0x05, 0x1c, 0x02, 0x00, 0x00, // lea 0x21c(%rip),%rax # 56e <restorer>
+    0x48, 0x8d, 0x05, 0x69, 0x02, 0x00, 0x00, // lea 0x269(%rip),%rax # 5bb <restorer>
     0x48, 0x89, 0x04, 0x25, 0x50, 0x00, 0x00, 0x40, // mov %rax,0x40000050
     0x48, 0xc7, 0x04, 0x25, 0x58, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00, 0x00, // movq $0x0,0x40000058
     0xbf, 0x0f, 0x00, 0x00, 0x00,             // mov $0xf,%edi
@@ -7669,30 +7669,43 @@ const KILL_PROBE_CODE: [u8; 1603] = [
     0x49, 0xc7, 0x84, 0x24, 0x00, 0x01, 0x00, 0x00, 0xa7, 0x0c, 0x00, 0x00, // movq $0xca7,0x100(%r12)
     0x49, 0x89, 0xbc, 0x24, 0x08, 0x01, 0x00, 0x00, // mov %rdi,0x108(%r12)
     0x49, 0xff, 0x84, 0x24, 0x10, 0x01, 0x00, 0x00, // incq 0x110(%r12)
+    0x49, 0xff, 0x84, 0x24, 0x40, 0x01, 0x00, 0x00, // incq 0x140(%r12)
+    0x49, 0x8b, 0x84, 0x24, 0x40, 0x01, 0x00, 0x00, // mov 0x140(%r12),%rax
+    0x49, 0x3b, 0x84, 0x24, 0x48, 0x01, 0x00, 0x00, // cmp 0x148(%r12),%rax
+    0x7e, 0x08,                               // jle 58f <caught+0x3e>
+    0x49, 0x89, 0x84, 0x24, 0x48, 0x01, 0x00, 0x00, // mov %rax,0x148(%r12)
+    0x49, 0x83, 0xbc, 0x24, 0x10, 0x01, 0x00, 0x00, 0x01, // cmpq $0x1,0x110(%r12)
+    0x75, 0x18,                               // jne 5b2 <caught+0x61>
+    0x49, 0x8b, 0x3c, 0x24,                   // mov (%r12),%rdi
+    0xbe, 0x0f, 0x00, 0x00, 0x00,             // mov $0xf,%esi
+    0xb8, 0x3e, 0x00, 0x00, 0x00,             // mov $0x3e,%eax
+    0x0f, 0x05,                               // syscall
+    0x49, 0x89, 0x84, 0x24, 0x50, 0x01, 0x00, 0x00, // mov %rax,0x150(%r12)
+    0x49, 0xff, 0x8c, 0x24, 0x40, 0x01, 0x00, 0x00, // decq 0x140(%r12)
     0xc3,                                     // retq
     0xb8, 0x0f, 0x00, 0x00, 0x00,             // mov $0xf,%eax
     0x0f, 0x05,                               // syscall
-    0xeb, 0xfe,                               // jmp 575 <restorer+0x7>
+    0xeb, 0xfe,                               // jmp 5c2 <restorer+0x7>
     0xb8, 0x39, 0x00, 0x00, 0x00,             // mov $0x39,%eax
     0x0f, 0x05,                               // syscall
     0x48, 0x85, 0xc0,                         // test %rax,%rax
-    0x74, 0x01,                               // je 584 <inner+0xd>
+    0x74, 0x01,                               // je 5d1 <inner+0xd>
     0xc3,                                     // retq
-    0xeb, 0xfe,                               // jmp 584 <inner+0xd>
+    0xeb, 0xfe,                               // jmp 5d1 <inner+0xd>
     0xb8, 0x39, 0x00, 0x00, 0x00,             // mov $0x39,%eax
     0x0f, 0x05,                               // syscall
     0x48, 0x85, 0xc0,                         // test %rax,%rax
-    0x74, 0x01,                               // je 593 <park+0xd>
+    0x74, 0x01,                               // je 5e0 <park+0xd>
     0xc3,                                     // retq
     0xbf, 0x00, 0x00, 0x00, 0x40,             // mov $0x40000000,%edi
     0x31, 0xf6,                               // xor %esi,%esi
     0xb8, 0x23, 0x00, 0x00, 0x00,             // mov $0x23,%eax
     0x0f, 0x05,                               // syscall
-    0xeb, 0xfe,                               // jmp 5a1 <park+0x1b>
+    0xeb, 0xfe,                               // jmp 5ee <park+0x1b>
     0xb8, 0x39, 0x00, 0x00, 0x00,             // mov $0x39,%eax
     0x0f, 0x05,                               // syscall
     0x48, 0x85, 0xc0,                         // test %rax,%rax
-    0x74, 0x01,                               // je 5b0 <sibling+0xd>
+    0x74, 0x01,                               // je 5fd <sibling+0xd>
     0xc3,                                     // retq
     0x8b, 0x3c, 0x25, 0x10, 0x00, 0x00, 0x40, // mov 0x40000010,%edi
     0xbe, 0x09, 0x00, 0x00, 0x00,             // mov $0x9,%esi
@@ -7702,11 +7715,11 @@ const KILL_PROBE_CODE: [u8; 1603] = [
     0x48, 0xf7, 0xdf,                         // neg %rdi
     0xb8, 0xe7, 0x00, 0x00, 0x00,             // mov $0xe7,%eax
     0x0f, 0x05,                               // syscall
-    0xeb, 0xfe,                               // jmp 5d0 <sibling+0x2d>
+    0xeb, 0xfe,                               // jmp 61d <sibling+0x2d>
     0xb8, 0x39, 0x00, 0x00, 0x00,             // mov $0x39,%eax
     0x0f, 0x05,                               // syscall
     0x48, 0x85, 0xc0,                         // test %rax,%rax
-    0x74, 0x01,                               // je 5df <catch_park+0xd>
+    0x74, 0x01,                               // je 62c <catch_park+0xd>
     0xc3,                                     // retq
     0xbc, 0xf0, 0x0f, 0x02, 0x40,             // mov $0x40020ff0,%esp
     0xbf, 0x00, 0x00, 0x00, 0x40,             // mov $0x40000000,%edi
@@ -7716,11 +7729,11 @@ const KILL_PROBE_CODE: [u8; 1603] = [
     0xbf, 0x63, 0x00, 0x00, 0x00,             // mov $0x63,%edi
     0xb8, 0xe7, 0x00, 0x00, 0x00,             // mov $0xe7,%eax
     0x0f, 0x05,                               // syscall
-    0xeb, 0xfe,                               // jmp 5fe <catch_park+0x2c>
+    0xeb, 0xfe,                               // jmp 64b <catch_park+0x2c>
     0xb8, 0x39, 0x00, 0x00, 0x00,             // mov $0x39,%eax
     0x0f, 0x05,                               // syscall
     0x48, 0x85, 0xc0,                         // test %rax,%rax
-    0x74, 0x01,                               // je 60d <pipe_park+0xd>
+    0x74, 0x01,                               // je 65a <pipe_park+0xd>
     0xc3,                                     // retq
     0xbc, 0xf0, 0x0f, 0x02, 0x40,             // mov $0x40020ff0,%esp
     0x8b, 0x3c, 0x25, 0x60, 0x00, 0x00, 0x40, // mov 0x40000060,%edi
@@ -7731,11 +7744,11 @@ const KILL_PROBE_CODE: [u8; 1603] = [
     0xbf, 0x61, 0x00, 0x00, 0x00,             // mov $0x61,%edi
     0xb8, 0xe7, 0x00, 0x00, 0x00,             // mov $0xe7,%eax
     0x0f, 0x05,                               // syscall
-    0xeb, 0xfe,                               // jmp 633 <pipe_park+0x33>
+    0xeb, 0xfe,                               // jmp 680 <pipe_park+0x33>
     0xbf, 0x58, 0x00, 0x00, 0x00,             // mov $0x58,%edi
     0xb8, 0xe7, 0x00, 0x00, 0x00,             // mov $0xe7,%eax
     0x0f, 0x05,                               // syscall
-    0xeb, 0xfe,                               // jmp 641 <child_handler+0xc>
+    0xeb, 0xfe,                               // jmp 68e <child_handler+0xc>
 ];
 
 /// A hosted process in nobody's tree, so the containment gate has a target.
@@ -9378,6 +9391,11 @@ fn a_hosted_process_ends_its_child(hhdm_base: u64, cpus: u32) -> bool {
     // **re-parks** when it is woken and so is delivered to by the other arm.
     let (pipe_made, pipe_child) = (read(280) as i64, read(288));
     let (pipe_kill, pipe_collected, pipe_status) = (read(296) as i64, read(304) as i64, read(312));
+    // **RFC 0083 step 7: how deep the handler ever got.** It signals itself on
+    // its first entry, so without a blocked set it is entered again on the way
+    // out of that `kill` — on top of itself. `handler_runs` is 2 either way
+    // and only this number tells the two apart.
+    let (handler_depth, handler_self_kill) = (read(328), read(336) as i64);
 
     retire_probe(killer);
     retire_probe(bystander);
@@ -9404,13 +9422,19 @@ fn a_hosted_process_ends_its_child(hhdm_base: u64, cpus: u32) -> bool {
         && forked_anyway > 0
         // RFC 0083, and every clause is a separate thing that can be wrong.
         // The handler ran, exactly once, and was handed the number that was
-        // sent -- a delivery that ran twice or delivered `SIGSEGV` would pass
-        // a check that only asked "did anything happen".
+        // sent -- a delivery that delivered `SIGSEGV` would pass a check that
+        // only asked "did anything happen".
+        //
+        // **This asserted `handler_runs == 1` until step 7**, which was right
+        // while the handler only ran once: it signals itself now, so the count
+        // is two and the assertion that carries the weight is the *depth*
+        // below. Left as a contradiction with the new clause for one boot,
+        // which the gate caught by being unsatisfiable rather than by being
+        // wrong.
         && installed == 0
         && self_kill == 0
         && handler_marker == 0xCA7
         && handler_signal == 15
-        && handler_runs == 1
         // And the parked child: collected as an ordinary *exit* with the code
         // its handler chose. Without delivery this reads 15 -- a death by
         // signal -- which is what it read before this change.
@@ -9432,7 +9456,13 @@ fn a_hosted_process_ends_its_child(hhdm_base: u64, cpus: u32) -> bool {
         && pipe_child > 0
         && pipe_kill == 0
         && pipe_collected == pipe_child as i64
-        && pipe_status == CAUGHT_EXIT << 8;
+        && pipe_status == CAUGHT_EXIT << 8
+        // RFC 0083 step 7. Two runs, never nested, and the handler's own
+        // `kill` accepted — a refusal there would make the depth trivially 1
+        // and the assertion vacuous.
+        && handler_runs == 2
+        && handler_depth == 1
+        && handler_self_kill == 0;
     if right {
         println!(
             "    hosted kill    pid {pid} ended a child with SIGTERM and one with SIGKILL, and \
@@ -9463,7 +9493,9 @@ fn a_hosted_process_ends_its_child(hhdm_base: u64, cpus: u32) -> bool {
              and its `kill` answered {self_kill}; child {caught_child} was parked in a call, \
              was woken by the signal, and its handler exited it {} where no handler \
              would have made it a death by 15; child {pipe_child} was parked on a pipe \
-             nobody writes to, whose read re-parks when woken, and its handler exited it {}",
+             nobody writes to, whose read re-parks when woken, and its handler exited it {}; \
+             the handler signalled itself and ran twice without ever being entered on top of \
+             itself",
             caught_status >> 8,
             pipe_status >> 8
         );
@@ -9487,10 +9519,12 @@ fn a_hosted_process_ends_its_child(hhdm_base: u64, cpus: u32) -> bool {
         );
         // RFC 0083's half, separately, because a line nobody can read to the
         // end is a line that gets skimmed.
-        let (raised, delivered, unbuilt) = adapter_signal_record();
+        let (raised, delivered, unbuilt, raised_blocked, unrestored) = adapter_signal_record();
         println!(
             "\x1b[91m    hosted catch   DETAIL: the adapter raised {raised} signal(s), \
-             delivered {delivered}, and could not build {unbuilt} frame(s)\x1b[0m"
+             delivered {delivered}, could not build {unbuilt} frame(s); {raised_blocked} \
+             raise(s) landed on a signal already blocked and {unrestored} sigreturn(s) could \
+             not read their own uc_sigmask\x1b[0m"
         );
         println!(
             "\x1b[91m    hosted catch   FAILED: sigaction answered {installed}, the self-kill \
@@ -9499,7 +9533,9 @@ fn a_hosted_process_ends_its_child(hhdm_base: u64, cpus: u32) -> bool {
              was killed with {caught_kill}, collected {caught_collected} and its status is \
              {caught_status} ({} is the handler's own exit, 15 is a death by signal); the \
              pipe-parked child {pipe_child} answered pipe2 {pipe_made}, kill {pipe_kill}, \
-             collected {pipe_collected} status {pipe_status}\x1b[0m",
+             collected {pipe_collected} status {pipe_status}; the handler reached depth \
+             {handler_depth} over {handler_runs} run(s) and its own kill answered \
+             {handler_self_kill}\x1b[0m",
             CAUGHT_EXIT << 8
         );
     }
@@ -9545,10 +9581,10 @@ fn adapter_wait_record() -> (i64, u64) {
 /// makes no calls has its signal raised and never receives it. Linux delivers
 /// at any kernel entry, including a timer tick. Printing `raised` alone would
 /// hide that, and printing `delivered` alone would hide it twice.
-fn adapter_signal_record() -> (u64, u64, u64) {
+fn adapter_signal_record() -> (u64, u64, u64, u64, u64) {
     let page = ADAPTER_REPORT.load(core::sync::atomic::Ordering::Acquire);
     if page == u64::MAX {
-        return (0, 0, 0);
+        return (0, 0, 0, 0, 0);
     }
     const FIRST_WORD: usize = bhaskix_personality::report::SIGNAL_AT / 8;
     const WORDS: usize = bhaskix_personality::report::SIGNAL_WORDS;
@@ -9570,9 +9606,9 @@ fn adapter_signal_record() -> (u64, u64, u64) {
         chunk.len()
     });
     if taken.is_none() {
-        return (0, 0, 0);
+        return (0, 0, 0, 0, 0);
     }
-    (record[0], record[1], record[2])
+    (record[0], record[1], record[2], record[3], record[4])
 }
 
 /// What the adapter's last `fork` did: the child's pid and the bytes copied.

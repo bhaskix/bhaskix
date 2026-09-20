@@ -212,7 +212,16 @@ pub mod report {
     pub const SIGNAL_AT: usize = BIND_AT + BIND_WORDS * 8;
 
     /// How many words [`SIGNAL_AT`] holds.
-    pub const SIGNAL_WORDS: usize = 3;
+    ///
+    /// **Five since 2026-09-21.** The first three could not tell a raise that
+    /// was never delivered from one that was delivered late: a boot read
+    /// `raised 4, delivered 3, unbuilt 0` and the difference had two possible
+    /// causes with nothing between them. The fourth counts raises landing on a
+    /// signal the target already had **blocked**, and the fifth counts
+    /// `rt_sigreturn`s that could not read their own frame's `uc_sigmask` —
+    /// which would latch a mask on for ever and is the one failure this
+    /// design can have that nothing else would show.
+    pub const SIGNAL_WORDS: usize = 5;
 
     /// Where bulk staging begins.
     ///

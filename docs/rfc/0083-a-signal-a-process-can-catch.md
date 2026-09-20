@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | 🔨 **Draft 2026-09-19 — built and gated.** A hosted process catches `SIGTERM`: one it sends itself, one sent to a child parked in a sleep, and one sent to a child parked on a pipe. Three assertions, each armed red. The limit this design has is named below and printed on every boot. |
+| **Status** | 🔨 **Draft 2026-09-19 — built and gated.** A hosted process catches `SIGTERM`: one it sends itself, one sent to a child parked in a sleep, and one sent to a child parked on a pipe. Three assertions, each armed red. **Step 7 (2026-09-21) closes question 2**: a handler runs with its own signal blocked and is not entered on top of itself. The limit this design has is named below and printed on every boot. |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | userspace (`bin/linuxd`), `bhaskix-personality` |
 | **Milestone** | Phase 2 — the Linux personality |
@@ -213,14 +213,39 @@ predicts.
 
 1. **`SIGSTOP`/`SIGCONT`.** RFC 0079's question 2, untouched: a domain has no
    stopped state, so they would be invented rather than translated.
-2. **`sa_mask` during delivery.** Recorded and returned; not enforced. A
+2. ~~**`sa_mask` during delivery.** Recorded and returned; not enforced. A
    handler that is signalled again while it runs will be re-entered, where
-   Linux would have blocked the signal.
+   Linux would have blocked the signal.~~ **Answered by step 7, 2026-09-21.**
+   A handler runs with its own signal and everything its `sa_mask` names
+   blocked, and `rt_sigreturn` puts the previous set back. The set travels in
+   the frame's own `uc_sigmask`, at the offset Linux puts it — which is where
+   this frame already ended, so it cost eight bytes and no second arithmetic.
+   Nesting therefore unwinds by construction, and a handler that edits
+   `uc_sigmask` is obeyed. `SIGKILL` is masked out of any blocked set, for the
+   reason it cannot be caught.
 3. **`SA_RESTART`.** Accepted and recorded; nothing restarts. A call
    interrupted by a delivery answers `EINTR` whatever the flag says, which is
    correct for a flag that is not implemented and wrong for one that claims to
    be.
-4. **A forked child's stack**, above. It belongs to `fork`.
+4. **A forked child's stack**, above. It belongs to `fork`, and it is larger
+   than the note above suggests — established 2026-09-21 rather than assumed:
+
+   - `execve` maps the program's segments *and* its stack with `map_at_eager`
+     and never calls `remember_mapping`, so `fork` does not copy either.
+   - A **kernel-started** hosted program's whole layout — code, buffer and
+     stack — is mapped by `run_bell_program` in the kernel, which `bin/linuxd`
+     never sees at all.
+
+   So `fork` copies what the adapter *remembers*, which is only what `mmap`
+   answered. That is why a forked child cannot run its parent's code and why
+   the probe's children are given a page to stand on.
+
+   **Recording `execve`'s regions would fix half of it and cost more than it
+   is worth in that half**: every BusyBox `fork` would copy 2.1 MB for a path
+   that `execve`s immediately and throws it away, and there is no cross-domain
+   copy-on-write here. The principled fix is a supervisor method that copies
+   the address space the **kernel** actually has — a nucleus change, and its
+   own RFC. Both halves are written down so the next person starts from them.
 
 ## Implementation plan
 
@@ -232,3 +257,19 @@ predicts.
 4. ✅ **`kill` routes** and wakes a parked target; a forked child inherits.
 5. ✅ **The counters, the gate and the arming.**
 6. ✅ **The documents.**
+7. ✅ **A handler that is not re-entered** (2026-09-21) — the blocked set, the
+   frame's `uc_sigmask`, and `rt_sigreturn` restoring it. Closes question 2.
+
+   **The gate turns on one number, and it is not the obvious one.** The
+   probe's handler signals *itself* on its first entry. Without a blocked set
+   the delivery for that signal lands on the way out of the `kill` and the
+   handler is entered on top of itself; with one, the `kill` returns, the run
+   finishes, and the still-pending signal is delivered on the way out of
+   `rt_sigreturn`. **Both give two runs** — only the *depth* differs, 2
+   against 1, and a gate that counted runs would have passed on both. Armed,
+   and the armed run reads depth 2.
+
+   It also caught a mistake of its own making: the step-6 assertion
+   `handler_runs == 1` was left in place beside the new `== 2`, so the
+   condition was unsatisfiable for one boot. A contradiction is a better
+   failure than a wrong pass, and it is why the two clauses are now one.

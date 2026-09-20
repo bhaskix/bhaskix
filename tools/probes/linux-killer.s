@@ -462,6 +462,31 @@ caught:
         movq    $0xCA7, 256(%r12)       # word 32: the handler ran
         mov     %rdi, 264(%r12)         # word 33: the signal it was handed
         incq    272(%r12)               # word 34: and how many times
+
+        # **How deep it ever got, which is the number that discriminates** --
+        # RFC 0083 step 7. On its first entry this handler signals *itself*,
+        # and the delivery for that signal happens on the way out of the
+        # `kill`. Without a blocked set it is entered again there, on top of
+        # itself: two runs, nested. With one, the `kill` returns, this run
+        # finishes, `rt_sigreturn` restores the set, and the still-pending
+        # signal is delivered on the way out of `rt_sigreturn` -- two runs,
+        # side by side.
+        #
+        # So `runs` is 2 either way and only the **depth** tells them apart. A
+        # gate that counted runs alone would pass on both.
+        incq    320(%r12)               # word 40: depth in
+        mov     320(%r12), %rax
+        cmp     328(%r12), %rax         # word 41: the deepest it has been
+        jle     8f
+        mov     %rax, 328(%r12)
+8:      cmpq    $1, 272(%r12)           # only the first run signals itself
+        jne     9f
+        mov     (%r12), %rdi
+        mov     $15, %esi
+        mov     $62, %eax
+        syscall
+        mov     %rax, 336(%r12)         # word 42: what that kill answered
+9:      decq    320(%r12)
         ret                             # to the restorer the frame put here
 
         # What a handler returns through. `rt_sigreturn` takes no arguments and
