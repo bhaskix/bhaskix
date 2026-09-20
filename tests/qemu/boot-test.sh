@@ -3973,6 +3973,30 @@ else
     status=1
 fi
 
+# **RFC 0083: a signal a hosted process catches.** Two acts, and the second is
+# the one that needed the mechanism rather than the arithmetic.
+#
+# *A signal it sent itself*, handled on the way out of the very `kill` that
+# raised it -- no wake, no park, because the target is inside the adapter
+# making the call.
+#
+# *A child parked in a call*, which is where a shell waiting for a key is. It
+# is woken by the `kill`, re-enters the adapter, and its `nanosleep` is
+# interrupted so the handler can run. The handler exits 88, so the parent
+# collects an ordinary **exit** where a child with no handler shows a death by
+# signal 15 -- and that difference is the assertion. Before this change the
+# same probe read 15.
+#
+# The child's handler is **inherited across the fork**, as Linux does it, which
+# is also what removes a race the first version of this probe had: a child that
+# installed its own handler after forking could be killed before it got there.
+if grep -qE "hosted catch +pid [0-9]+ caught signal 15 it sent itself, once" "$LOG"; then
+    pass "RFC 0083: a hosted process caught a signal it sent itself, and a parked child caught one too"
+else
+    fail "a hosted process did not catch a signal: the handler never ran, or the parked child was ended instead of delivered to"
+    status=1
+fi
+
 # Domains and the resource envelope. §3 says a domain's CPU share holds
 # regardless of how many threads it spawns, and that half this gate really does
 # prove: the self-test puts one thread and three threads on the same CPU and

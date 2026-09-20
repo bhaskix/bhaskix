@@ -280,10 +280,194 @@ strangers:
         mov     %rax, 192(%r12)         # word 24
         movq    $15, 120(%r12)
 
+        # ---- a signal this process sends itself, and catches ----
+        #
+        # **RFC 0083.** Every act above ends a process; this one does not. The
+        # handler runs on the way out of the very `kill` that raised it --
+        # there is no wake and no park, because the target is this process and
+        # it is already inside the adapter making the call.
+        #
+        # `SA_RESTORER`, and the restorer is not optional: the frame this
+        # personality builds puts the restorer's address where a `ret` will
+        # find it, so a handler that returns lands there and the restorer's
+        # `rt_sigreturn` is what puts the interrupted registers back.
+        lea     caught(%rip), %rax
+        mov     %rax, 0x40000040
+        movq    $0x04000000, 0x40000048         # SA_RESTORER
+        lea     restorer(%rip), %rax
+        mov     %rax, 0x40000050
+        movq    $0, 0x40000058
+
+        mov     $15, %edi                       # rt_sigaction(SIGTERM, &act, 0, 8)
+        mov     $0x40000040, %esi
+        xor     %edx, %edx
+        mov     $8, %r10d
+        mov     $13, %eax
+        syscall
+        mov     %rax, 208(%r12)         # word 26
+        movq    $16, 120(%r12)
+        test    %rax, %rax
+        jnz     done
+
+        mov     (%r12), %rdi                    # kill(self, SIGTERM)
+        mov     $15, %esi
+        mov     $62, %eax
+        syscall
+        mov     %rax, 216(%r12)         # word 27: what the kill answered
+        movq    $17, 120(%r12)
+
+        # ---- a child parked in a call, woken to catch it ----
+        #
+        # The half a self-signal cannot reach: the target is asleep *inside* a
+        # system call, which is where a shell waiting for a key is. It is woken
+        # by the `kill`, re-enters the adapter, and its `nanosleep` is
+        # interrupted -- the handler runs and exits 88, so its parent collects
+        # an ordinary exit rather than a death by signal. That difference is
+        # the whole assertion: without delivery this child would be status 15.
+        # **A stack for the child, because a signal frame is built on one.**
+        #
+        # A forked child is started on its *parent's* `rsp`, and a fork copies
+        # the regions the personality recorded -- what `mmap` answered. The
+        # program's original stack is not one of those, so the child's `rsp`
+        # points at memory its own address space does not have. It can run
+        # (`nanosleep` touches no stack) and it cannot be *signalled*: the
+        # delivery writes a `siginfo` and a `ucontext` below `rsp`, and the
+        # copy fails. The adapter counted exactly that -- one frame it could
+        # not build -- which is how this was found rather than guessed.
+        #
+        # So the child stands on a page that was mapped before the fork and
+        # therefore exists on both sides of it.
+        mov     $0x40020000, %edi
+        mov     $4096, %esi
+        mov     $3, %edx
+        mov     $0x32, %r10d
+        mov     $-1, %r8
+        xor     %r9d, %r9d
+        mov     $9, %eax
+        syscall
+        cmp     $0x40020000, %rax
+        jne     done
+
+        # **The handler the child will have, installed before the fork.**
+        #
+        # A child inherits its parent's dispositions -- RFC 0083 made that true
+        # here, as it is on Linux -- so installing it now is what removes a race
+        # this probe found the hard way: a child that installed its own handler
+        # after `fork` could be killed before it got there, and the run then
+        # showed a death by signal 15 on one boot and an uncaught return on the
+        # next. Installed before the fork there is no window at all.
+        #
+        # It points into the *copied* page, because a child's instruction
+        # pointer has to land somewhere the fork carried over.
+        lea     (child_handler - inner)(%r15), %rax
+        mov     %rax, 0x40000040
+        movq    $0, 0x40000048          # flags: it never returns, so no restorer
+        movq    $0, 0x40000050
+        movq    $0, 0x40000058
+
+        mov     $15, %edi               # rt_sigaction(SIGTERM, &act, 0, 8)
+        mov     $0x40000040, %esi
+        xor     %edx, %edx
+        mov     $8, %r10d
+        mov     $13, %eax
+        syscall
+        test    %rax, %rax
+        jnz     done
+
+        lea     (catch_park - inner)(%r15), %rax
+        call    *%rax
+        mov     %rax, 224(%r12)         # word 28: the child's pid
+        mov     %rax, %r13
+        movq    $18, 120(%r12)
+        test    %rax, %rax
+        jle     done
+
+        mov     %r13, %rdi                      # kill(child, SIGTERM)
+        mov     $15, %esi
+        mov     $62, %eax
+        syscall
+        mov     %rax, 232(%r12)         # word 29
+        movq    $19, 120(%r12)
+
+        mov     %r13, %rdi                      # wait4(child, &status, 0, 0)
+        lea     248(%r12), %rsi
+        xor     %edx, %edx
+        xor     %r10d, %r10d
+        mov     $61, %eax
+        syscall
+        mov     %rax, 240(%r12)         # word 30, and word 31 is the status
+        movq    $20, 120(%r12)
+
+        # ---- a child parked on a pipe that will never be written ----
+        #
+        # **The act that reaches the other delivery path.** A woken
+        # `nanosleep` *completes* -- the adapter sees the deadline was taken
+        # and answers it -- so the act above is delivered on a finished call.
+        # A `read` on an empty pipe does not: woken, re-asked, still empty, it
+        # parks again. Without an arm that interrupts a call which is about to
+        # park, this child would be woken and re-parked for ever with its
+        # signal still pending, and the wake would be burned. That is the shape
+        # a shell blocked on a key is in.
+        #
+        # pipe2(&fds, 0): the read end lands at 0x40000060, the write end four
+        # bytes after it, and the fork copies both.
+        mov     $0x40000060, %edi
+        xor     %esi, %esi
+        mov     $293, %eax
+        syscall
+        mov     %rax, 280(%r12)         # word 35
+        movq    $21, 120(%r12)
+        test    %rax, %rax
+        jnz     done
+
+        lea     (pipe_park - inner)(%r15), %rax
+        call    *%rax
+        mov     %rax, 288(%r12)         # word 36: the child's pid
+        mov     %rax, %r13
+        movq    $22, 120(%r12)
+        test    %rax, %rax
+        jle     done
+
+        mov     %r13, %rdi              # kill(child, SIGTERM)
+        mov     $15, %esi
+        mov     $62, %eax
+        syscall
+        mov     %rax, 296(%r12)         # word 37
+        movq    $23, 120(%r12)
+
+        mov     %r13, %rdi              # wait4(child, &status, 0, 0)
+        lea     312(%r12), %rsi
+        xor     %edx, %edx
+        xor     %r10d, %r10d
+        mov     $61, %eax
+        syscall
+        mov     %rax, 304(%r12)         # word 38, and word 39 is the status
+        movq    $24, 120(%r12)
+
         movq    $0xC0FFEE, 88(%r12)     # word 11: every step above ran
 done:
         xor     %edi, %edi
         mov     $231, %eax              # exit_group
+        syscall
+        jmp     .
+
+        # **The handler itself** -- RFC 0083. It runs in the parent, which
+        # keeps its whole address space across a fork, so unlike everything
+        # below it needs no copied page.
+        #
+        # `%r12` is still the report page: a delivery edits `rdi`, `rsi`, `rdx`,
+        # `rip` and `rsp` and leaves every other register alone, which is what
+        # lets a handler write where the rest of the program writes.
+caught:
+        movq    $0xCA7, 256(%r12)       # word 32: the handler ran
+        mov     %rdi, 264(%r12)         # word 33: the signal it was handed
+        incq    272(%r12)               # word 34: and how many times
+        ret                             # to the restorer the frame put here
+
+        # What a handler returns through. `rt_sigreturn` takes no arguments and
+        # never comes back.
+restorer:
+        mov     $15, %eax
         syscall
         jmp     .
 
@@ -331,6 +515,62 @@ sibling:
         mov     %rax, %rdi              # exit_group(-answer): 0 is acceptance
         neg     %rdi
         mov     $231, %eax
+        syscall
+        jmp     .
+        # A child that parks in a call with a handler it inherited -- RFC 0083.
+        #
+        # **It installs nothing**, and that is the assertion underneath this
+        # act: the handler is its parent's, carried across the `fork` the way
+        # Linux carries one. It parks, is woken by a `SIGTERM` it never asked
+        # for, and its inherited handler ends it with a code of its own.
+catch_park:
+        mov     $57, %eax               # fork
+        syscall
+        test    %rax, %rax
+        jz      6f
+        ret
+6:      mov     $0x40020ff0, %esp       # a stack this address space actually has
+        mov     $0x40000000, %edi       # nanosleep(&{1000, 0}, NULL)
+        xor     %esi, %esi
+        mov     $35, %eax
+        syscall
+        # Reached only if the sleep returned without the handler ending this
+        # process -- so the exit code says "the call came back and nothing
+        # caught the signal", which the parent can tell from 88.
+        mov     $99, %edi
+        mov     $231, %eax
+        syscall
+        jmp     .
+
+        # A child that parks on a pipe nobody will write to. Unlike the sleeper
+        # above, its call **re-parks** when it is woken, so it is delivered to
+        # by the arm that interrupts a call about to block rather than by the
+        # one that rides out on a finished call.
+pipe_park:
+        mov     $57, %eax               # fork
+        syscall
+        test    %rax, %rax
+        jz      7f
+        ret
+7:      mov     $0x40020ff0, %esp       # a stack this address space has
+        mov     0x40000060, %edi        # the read end its parent made
+        mov     $0x40000080, %esi       # somewhere to put a byte
+        mov     $1, %edx
+        xor     %eax, %eax              # read
+        syscall
+        # Reached only if the read returned without the handler ending this
+        # process, which the parent tells from 88.
+        mov     $97, %edi
+        mov     $231, %eax
+        syscall
+        jmp     .
+
+        # The child's handler, which does not return: it ends the process with
+        # a code of its own, so the parent's `wait4` sees an *exit* where a
+        # child with no handler would have shown a death by signal 15.
+child_handler:
+        mov     $88, %edi
+        mov     $231, %eax              # exit_group(88)
         syscall
         jmp     .
 inner_end:

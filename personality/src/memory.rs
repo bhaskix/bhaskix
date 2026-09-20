@@ -43,6 +43,14 @@ pub mod flags {
 
 /// Linux `errno` values this translation returns, negated at the register.
 pub mod errno {
+    /// A call was interrupted by a signal that was delivered to a handler —
+    /// [RFC 0083](../../docs/rfc/0083-a-signal-a-process-can-catch.md).
+    ///
+    /// What a blocking call answers when a signal arrives while it is parked.
+    /// The program sees it *after* its handler returns, which is the order
+    /// Linux gives it and the reason a shell's `read` comes back rather than
+    /// waiting for a key that is never coming.
+    pub const EINTR: i64 = -4;
     /// Invalid argument.
     pub const EINVAL: i64 = -22;
     /// Out of memory.

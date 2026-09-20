@@ -249,7 +249,22 @@ asm_budget = 3
 # four places that borrows it, which is the difference between one line and
 # four. The capabilities themselves cost nothing: they are derived, held and
 # deleted through invocations, and none of it dereferences anything.
-unsafe_budget = 118
+# 121 on 2026-09-19, three lines, for RFC 0083's signal record: three counters
+# published into the report page, written the way every other record here is
+# written -- one volatile store per word, inside the page `ATTACH` mapped from
+# this program's own object, at offsets the `report` module asserts at compile
+# time do not overlap the record before them or run into the scratch.
+#
+# **Raised deliberately, and the counters are the reason the RFC can be
+# honest.** It delivers a signal at a call or a fault and nowhere else, so a
+# process that makes no calls never receives one -- a real divergence from
+# Linux, which delivers at any kernel entry. `raised` minus `delivered` is
+# exactly that number, and without it the limit would be a sentence in a
+# document rather than a figure on every boot. The rest of the change spends
+# no budget at all: the pending set is arithmetic in `bhaskix-personality`,
+# which forbids `unsafe` outright, and the stash and the parked-slot table are
+# atomics chosen over a `static mut` for precisely this reason.
+unsafe_budget = 121
 # Up five for RFC 0005 step 9's datagram page: the volatile writes that stage
 # a payload into it, the volatile reads that take one back out, and the static
 # that remembers whether it has been mapped.

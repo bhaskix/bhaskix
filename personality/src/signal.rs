@@ -27,6 +27,12 @@ pub mod number {
     pub const SIGSEGV: u64 = 11;
     /// Go's asynchronous preemption signal (Go 1.14 and later).
     pub const SIGURG: u64 = 23;
+    /// Ends a process and can never be caught — POSIX, and the reason
+    /// [`super::Dispositions::raise`] refuses to make it pending.
+    pub const SIGKILL: u64 = 9;
+    /// Asks a process to end, and *can* be caught, which is the whole point
+    /// of [RFC 0083](../../docs/rfc/0083-a-signal-a-process-can-catch.md).
+    pub const SIGTERM: u64 = 15;
     /// The highest signal number this personality knows.
     pub const MAX: usize = 64;
 }
@@ -74,9 +80,24 @@ pub struct AltStack {
 ///
 /// A fixed table, because this crate does not allocate and because sixty-four
 /// signals is the whole of the space Linux defines.
+///
+/// `Clone` because a `fork` gives its child the parent's dispositions, which
+/// is what Linux does and what [RFC 0083](../../docs/rfc/0083-a-signal-a-process-can-catch.md)
+/// needed: handlers live per *domain* here and a fork makes a new one, so
+/// without this a forked child woke with none.
+#[derive(Clone)]
 pub struct Dispositions {
     handlers: [Handler; number::MAX],
     alt: AltStack,
+    /// Signals raised at this process and not yet delivered — one bit per
+    /// number, [RFC 0083](../../docs/rfc/0083-a-signal-a-process-can-catch.md).
+    ///
+    /// **A bitmask and not a queue, which is Linux's own answer for these
+    /// signals.** Two `SIGTERM`s before the process next enters the adapter
+    /// are one delivery, because a standard signal is a *condition* rather
+    /// than an event with a count. A queue would promise an arrival count
+    /// nothing here can keep.
+    pending: u64,
 }
 
 impl Default for Dispositions {
@@ -101,7 +122,88 @@ impl Dispositions {
                 size: 0,
                 flags: 0,
             },
+            pending: 0,
         }
+    }
+
+    /// Marks `signal` pending, if it is one this process can catch.
+    ///
+    /// Answers whether it was taken. **`false` is not a failure** — it is the
+    /// caller's instruction to fall back to the default disposition, which
+    /// for every signal that reaches here means ending the process. Two
+    /// reasons it can be `false`, and both are deliberate:
+    ///
+    /// - **`SIGKILL` is never catchable.** A process that could install a
+    ///   handler for it could refuse to be ended, and the authority to end a
+    ///   hosted process is RFC 0079's whole subject.
+    /// - **No handler is installed.** The default disposition for these
+    ///   signals is to end, so making them pending would turn a signal that
+    ///   *does* something today into one that is remembered and never acted
+    ///   on. That is the direction this change must not move: it may make a
+    ///   fatal signal catchable, never a fatal signal silent.
+    pub fn raise(&mut self, signal: u64) -> bool {
+        if signal == number::SIGKILL {
+            return false;
+        }
+        let Some(index) = usize::try_from(signal).ok().filter(|index| {
+            // Zero is `kill`'s permission probe and names no signal.
+            *index != 0 && *index < number::MAX
+        }) else {
+            return false;
+        };
+        if self.handler(signal).is_none() {
+            return false;
+        }
+        self.pending |= 1 << index;
+        true
+    }
+
+    /// Takes the lowest-numbered pending signal that still has a handler.
+    ///
+    /// **Lowest first**, which is what Linux does and what makes the order a
+    /// fact rather than an accident of iteration.
+    ///
+    /// **Re-checks the handler**, because one can be removed between the
+    /// raise and the delivery: a process that installs a handler, is signalled
+    /// and then restores the default has asked for the default. Delivering to
+    /// an entry point of zero would be a jump to zero.
+    pub fn take_pending(&mut self) -> Option<(u64, Handler)> {
+        let mut left = self.pending;
+        while left != 0 {
+            let index = left.trailing_zeros() as u64;
+            let bit = 1u64 << index;
+            left &= !bit;
+            self.pending &= !bit;
+            if let Some(handler) = self.handler(index) {
+                return Some((index, handler));
+            }
+            // No handler any more: the bit is cleared above and the loop goes
+            // on, so a stale entry cannot block the ones behind it.
+        }
+        None
+    }
+
+    /// Takes the parent's dispositions for a freshly forked child.
+    ///
+    /// **Handlers are inherited and pending signals are not**, which is what
+    /// Linux does and is the part that would be easy to get wrong by copying
+    /// the whole structure: a child is born with an empty pending set, because
+    /// the signal that was waiting for its parent was sent to its parent. A
+    /// child that inherited it would run a handler for a signal nobody sent
+    /// it.
+    pub fn inherit(&mut self, parent: &Self) {
+        self.handlers = parent.handlers;
+        self.alt = parent.alt;
+        self.pending = 0;
+    }
+
+    /// Whether anything is waiting to be delivered.
+    ///
+    /// The hot check — it runs on the way out of every hosted call, so it is
+    /// a load and a comparison and nothing else.
+    #[must_use]
+    pub const fn has_pending(&self) -> bool {
+        self.pending != 0
     }
 
     /// Installs `handler` for `signal`, returning what was there before.
@@ -492,5 +594,161 @@ mod tests {
             )
             .unwrap();
         assert_eq!(dispositions.delivery_stack(number::SIGURG, 0x7000), 0x7000);
+    }
+
+    /// A handler for `signal`, at a distinguishable entry point.
+    fn caught(signal: u64) -> Dispositions {
+        let mut dispositions = Dispositions::new();
+        dispositions
+            .install(
+                signal,
+                Handler {
+                    entry: 0x4000 + signal,
+                    flags: 0,
+                    mask: 0,
+                    restorer: 0,
+                },
+            )
+            .unwrap();
+        dispositions
+    }
+
+    #[test]
+    fn a_signal_with_a_handler_becomes_pending_and_comes_back_once() {
+        let mut dispositions = caught(number::SIGTERM);
+        assert!(!dispositions.has_pending());
+        assert!(dispositions.raise(number::SIGTERM));
+        assert!(dispositions.has_pending());
+
+        let (signal, handler) = dispositions.take_pending().expect("one is pending");
+        assert_eq!(signal, number::SIGTERM);
+        assert_eq!(handler.entry, 0x4000 + number::SIGTERM);
+
+        // Taken means taken: a second delivery would run the handler twice
+        // for one signal.
+        assert!(!dispositions.has_pending());
+        assert_eq!(dispositions.take_pending(), None);
+    }
+
+    #[test]
+    fn sigkill_is_never_pending_however_it_is_installed() {
+        // **The authority rule, as arithmetic.** A process that could catch
+        // `SIGKILL` could refuse to be ended, and RFC 0079 gave that
+        // authority to the process tree rather than to the target.
+        let mut dispositions = caught(number::SIGKILL);
+        assert!(!dispositions.raise(number::SIGKILL));
+        assert!(!dispositions.has_pending());
+        assert_eq!(dispositions.take_pending(), None);
+    }
+
+    #[test]
+    fn a_signal_with_no_handler_is_refused_rather_than_remembered() {
+        // `false` tells the caller to fall back to the default disposition,
+        // which ends the process. Making it pending instead would turn a
+        // signal that ends a process today into one that is remembered and
+        // never acted on -- silence where there was an ending.
+        let mut dispositions = Dispositions::new();
+        assert!(!dispositions.raise(number::SIGTERM));
+        assert!(!dispositions.has_pending());
+    }
+
+    #[test]
+    fn signal_zero_names_nothing_and_is_not_a_signal() {
+        // `kill(pid, 0)` is the permission probe. It must never deliver.
+        let mut dispositions = caught(number::SIGTERM);
+        assert!(!dispositions.raise(0));
+        assert!(!dispositions.has_pending());
+    }
+
+    #[test]
+    fn a_signal_past_the_table_is_refused_rather_than_wrapped() {
+        let mut dispositions = caught(number::SIGTERM);
+        assert!(!dispositions.raise(number::MAX as u64));
+        assert!(!dispositions.raise(u64::MAX));
+        assert!(
+            !dispositions.has_pending(),
+            "a signal number outside the table must not alias one inside it"
+        );
+    }
+
+    #[test]
+    fn twice_before_a_delivery_is_one_delivery() {
+        // A standard signal is a condition, not a counter. Two `SIGTERM`s
+        // before the process next enters the adapter are one delivery, which
+        // is what Linux does and what a bitmask can honestly promise.
+        let mut dispositions = caught(number::SIGTERM);
+        assert!(dispositions.raise(number::SIGTERM));
+        assert!(dispositions.raise(number::SIGTERM));
+        assert!(dispositions.take_pending().is_some());
+        assert_eq!(dispositions.take_pending(), None);
+    }
+
+    #[test]
+    fn the_lowest_numbered_pending_signal_is_delivered_first() {
+        let mut dispositions = caught(number::SIGTERM);
+        dispositions
+            .install(
+                number::SIGURG,
+                Handler {
+                    entry: 0x4000 + number::SIGURG,
+                    flags: 0,
+                    mask: 0,
+                    restorer: 0,
+                },
+            )
+            .unwrap();
+        assert!(dispositions.raise(number::SIGURG));
+        assert!(dispositions.raise(number::SIGTERM));
+        // 15 before 23, whichever order they were raised in.
+        assert_eq!(
+            dispositions.take_pending().map(|(s, _)| s),
+            Some(number::SIGTERM)
+        );
+        assert_eq!(
+            dispositions.take_pending().map(|(s, _)| s),
+            Some(number::SIGURG)
+        );
+    }
+
+    #[test]
+    fn a_handler_removed_after_the_raise_is_not_delivered_to() {
+        // A process that installs a handler, is signalled, and then restores
+        // the default has asked for the default. The entry point would be
+        // zero, and delivering would be a jump to zero.
+        let mut dispositions = caught(number::SIGTERM);
+        assert!(dispositions.raise(number::SIGTERM));
+        dispositions
+            .install(number::SIGTERM, Handler::default())
+            .unwrap();
+        assert_eq!(dispositions.take_pending(), None);
+        assert!(!dispositions.has_pending(), "and the stale bit is cleared");
+    }
+
+    #[test]
+    fn a_stale_signal_does_not_block_the_one_behind_it() {
+        // The lowest-numbered bit has no handler any more; the next one does
+        // and must still arrive. A `return None` on the first miss would have
+        // hidden it.
+        let mut dispositions = caught(number::SIGTERM);
+        dispositions
+            .install(
+                number::SIGURG,
+                Handler {
+                    entry: 0x4000 + number::SIGURG,
+                    flags: 0,
+                    mask: 0,
+                    restorer: 0,
+                },
+            )
+            .unwrap();
+        assert!(dispositions.raise(number::SIGTERM));
+        assert!(dispositions.raise(number::SIGURG));
+        dispositions
+            .install(number::SIGTERM, Handler::default())
+            .unwrap();
+        assert_eq!(
+            dispositions.take_pending().map(|(s, _)| s),
+            Some(number::SIGURG)
+        );
     }
 }

@@ -197,6 +197,23 @@ pub mod report {
     /// outcome.
     pub const BIND_WORDS: usize = 2;
 
+    /// The signal record — [RFC 0083](../../docs/rfc/0083-a-signal-a-process-can-catch.md):
+    /// signals raised, signals delivered to a handler, and deliveries that
+    /// could not be built.
+    ///
+    /// **Three words because two of them are only meaningful as a
+    /// difference.** A raise that never becomes a delivery is the failure this
+    /// record exists to make visible, and it is invisible in either count
+    /// alone: a boot with one raise and one delivery and a boot with one raise
+    /// and none both have "a raise". The third separates the two ways a
+    /// delivery can not happen — a frame that could not be built, which is
+    /// this adapter's fault, from a signal still pending, which is a process
+    /// that has not made a call yet and is the limit this RFC names.
+    pub const SIGNAL_AT: usize = BIND_AT + BIND_WORDS * 8;
+
+    /// How many words [`SIGNAL_AT`] holds.
+    pub const SIGNAL_WORDS: usize = 3;
+
     /// Where bulk staging begins.
     ///
     /// Rounded up from the end of the records, so the boundary is legible in a
@@ -231,7 +248,8 @@ pub mod report {
     /// redundant now that `BIND_AT` is derived — and it is kept precisely
     /// because the next person to write a literal there will be caught by it.
     const _: () = assert!(PROCESS_AT + PROCESS_WORDS * 8 <= BIND_AT);
-    const _: () = assert!(BIND_AT + BIND_WORDS * 8 <= SCRATCH_AT);
+    const _: () = assert!(BIND_AT + BIND_WORDS * 8 <= SIGNAL_AT);
+    const _: () = assert!(SIGNAL_AT + SIGNAL_WORDS * 8 <= SCRATCH_AT);
 
     /// **Every record ends before the next one begins.**
     ///

@@ -47,7 +47,7 @@ use bhaskix_personality::proc::File as ProcFile;
 use bhaskix_personality::process::layout;
 use bhaskix_personality::process::{Exit, Process, Processes, Region};
 use bhaskix_personality::report;
-use bhaskix_personality::signal::{self, Dispositions, Registers, number::SIGSEGV};
+use bhaskix_personality::signal::{self, Dispositions, Handler, Registers, number::SIGSEGV};
 use bhaskix_personality::thread::{self, ClonePlan};
 
 /// One page to report through, written by this program and read by the
@@ -339,6 +339,10 @@ fn trace_exec(pid: u32, from: u32, to: u32) {
 /// now — the dispositions this program keeps, the frame layout
 /// `bhaskix_personality::signal` has always owned, and two capability
 /// invocations to reach the faulting process's memory and registers.
+///
+/// The fault's own arm. [`deliver_signal`] is the general one underneath it,
+/// which [RFC 0083](../../docs/rfc/0083-a-signal-a-process-can-catch.md)
+/// needed for signals that arrive from a `kill` rather than from a fault.
 fn deliver(domain: u32, slot: u64, address: u64) -> u64 {
     let Some(handler) = dispositions_of(domain).handler(SIGSEGV) else {
         // Nothing wanted it. Ending is the honest answer, and the kernel says
@@ -359,12 +363,30 @@ fn deliver(domain: u32, slot: u64, address: u64) -> u64 {
         return FAULT_END;
     };
 
+    deliver_signal(domain, slot, SIGSEGV, address, handler)
+}
+
+/// Builds a signal frame on `domain`'s own stack and redirects it into
+/// `handler`, answering [`FAULT_RESUME`] or [`FAULT_END`].
+///
+/// **The general form of what the fault path has done since 2026-08-20**, and
+/// the whole of [RFC 0083](../../docs/rfc/0083-a-signal-a-process-can-catch.md)'s
+/// mechanism: a signal that arrives from a `kill` is delivered by exactly the
+/// steps a fault's is, differing only in the number and in what `si_addr`
+/// holds. It was `SIGSEGV`-shaped with one caller, and generalising it is a
+/// change of arguments rather than of method — which is the reason RFC 0079
+/// could say this was "a separate RFC's worth of work" and be describing
+/// plumbing rather than a design.
+///
+/// `slot` names the register image to read and write back; for a fault the
+/// kernel provides it, and for a call [`REPLY_NEED_FRAME`] asks for it.
+fn deliver_signal(domain: u32, slot: u64, signal: u64, address: u64, handler: Handler) -> u64 {
     let mut image = [0u64; FAULT_REGISTERS];
     if !read_slot(slot, &mut image) {
         note_exit(
             domain,
             Exit::Signalled {
-                signal: SIGSEGV as u8,
+                signal: signal as u8,
                 core: false,
             },
         );
@@ -395,7 +417,7 @@ fn deliver(domain: u32, slot: u64, address: u64) -> u64 {
     // Below the delivery stack's top, sixteen-aligned as the ABI requires --
     // and the return address then leaves `rsp % 16 == 8` at the handler's
     // first instruction, exactly as a `call` would.
-    let top = dispositions_of(domain).delivery_stack(SIGSEGV, registers.rsp);
+    let top = dispositions_of(domain).delivery_stack(signal, registers.rsp);
     let frame_at = (top - FRAME_BYTES as u64) & !15;
 
     let mut frame = [0u8; FRAME_BYTES];
@@ -418,7 +440,7 @@ fn deliver(domain: u32, slot: u64, address: u64) -> u64 {
     // instruction pointer and stack and nothing else -- the kernel refuses
     // `cs`, `ss` and the interrupt flag whatever is written here.
     let mut edited = image;
-    edited[5] = SIGSEGV;
+    edited[5] = signal;
     edited[4] = frame_at + 8;
     edited[3] = frame_at + 8 + SIGINFO_BYTES as u64;
     edited[15] = handler.entry;
@@ -429,12 +451,200 @@ fn deliver(domain: u32, slot: u64, address: u64) -> u64 {
     FAULT_RESUME
 }
 
+/// Delivers `signal` to a process whose system call has just completed.
+///
+/// [RFC 0083](../../docs/rfc/0083-a-signal-a-process-can-catch.md). The same
+/// frame [`deliver_signal`] builds, with one difference that is the whole
+/// point: the call's own result, `value`, is written into the **saved** `rax`
+/// inside the signal frame, so `rt_sigreturn` resumes the program with the
+/// answer its call produced rather than with whatever the handler left.
+///
+/// `si_addr` is zero. For a fault it is the address that faulted; for a
+/// `kill` there is no such address, and Linux fills `si_pid`/`si_uid` instead
+/// — fields this adapter does not yet write, and an invented address would be
+/// worse than a zero a handler can see is empty.
+///
+/// `Some(())` when the process has been redirected, `None` when the frame
+/// could not be built.
+fn deliver_signal_after_call(
+    domain: u32,
+    slot: u64,
+    signal: u64,
+    handler: Handler,
+    value: u64,
+) -> Option<()> {
+    let mut image = [0u64; FAULT_REGISTERS];
+    if !read_slot(slot, &mut image) {
+        return None;
+    }
+    // The call's answer, into the register the program will find it in once
+    // the handler returns. Written into the *image* before the frame is built
+    // from it, so the saved context carries it.
+    image[0] = value;
+    if !write_slot(slot, &image) {
+        return None;
+    }
+    match deliver_signal(domain, slot, signal, 0, handler) {
+        FAULT_RESUME => Some(()),
+        _ => None,
+    }
+}
+
+/// A call that has been answered and is waiting for its register frame so a
+/// signal can be delivered on the way out —
+/// [RFC 0083](../../docs/rfc/0083-a-signal-a-process-can-catch.md).
+///
+/// `(domain, thread, value)`. **The value is the whole reason this exists.**
+/// The call is *completed* before the signal is delivered, so its result has
+/// already been computed when the frame is asked for; it is written into the
+/// saved `rax` so that the handler's `rt_sigreturn` resumes the program with
+/// the answer its system call really produced. Delivering *before* the call
+/// would mean re-running it afterwards, which is only safe for calls that can
+/// be repeated — and `EINTR` and `SA_RESTART`, which this adapter would then
+/// owe, are a much larger piece of work than the one this RFC is.
+///
+/// One entry is enough and the key is checked anyway. This program answers one
+/// call at a time and the kernel re-presents immediately, so nothing can
+/// interleave; the key is what turns "cannot happen" into "did not happen".
+///
+/// **Atomics rather than a `static mut`, and not for thread safety** — this
+/// program is single-threaded and the rest of its state is `static mut` behind
+/// `// SAFETY:` comments. It is because `bin/linuxd`'s `unsafe` budget is
+/// *exact*: it holds the largest concentration of authority in the system, and
+/// the build fails if the number moves in either direction without somebody
+/// editing it. Three lines of `unsafe` to stash two words is a poor thing to
+/// spend that budget on when a load and a store will do.
+static AWAITING_DOMAIN: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(NO_DOMAIN_AWAITING);
+/// The value the stashed call produced. Meaningful only while
+/// [`AWAITING_DOMAIN`] names a domain.
+static AWAITING_VALUE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// No call is waiting for its frame. A real domain id can never be this: the
+/// domain table is [`limits::MAX_DOMAINS`] long.
+const NO_DOMAIN_AWAITING: u32 = u32::MAX;
+
+/// Where the signal record sits — [RFC 0083](../../docs/rfc/0083-a-signal-a-process-can-catch.md).
+const SIGNAL_RECORD_AT: u64 = REPORT_AT + report::SIGNAL_AT as u64;
+
+/// Signals raised at a process that had a handler for them.
+static SIGNALS_RAISED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Signals actually delivered to a handler.
+static SIGNALS_DELIVERED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Deliveries that could not be built — an unmapped stack, or a register frame
+/// that would not read back.
+static SIGNALS_UNBUILT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Publishes the three signal counters where the boot report can read them.
+///
+/// **`raised` minus `delivered` is the number this RFC exists to be honest
+/// about.** A signal that is raised and never delivered is a process that has
+/// not entered the adapter since — the limit named in RFC 0083, which no
+/// design can remove without a nucleus change — and it is invisible in either
+/// count on its own.
+fn publish_signals() {
+    let counts = [
+        SIGNALS_RAISED.load(core::sync::atomic::Ordering::Relaxed),
+        SIGNALS_DELIVERED.load(core::sync::atomic::Ordering::Relaxed),
+        SIGNALS_UNBUILT.load(core::sync::atomic::Ordering::Relaxed),
+    ];
+    for (index, count) in counts.iter().enumerate() {
+        // SAFETY: inside the page `ATTACH` mapped from this program's own
+        // object, at an offset `report` asserts at compile time is before the
+        // scratch area and does not overlap the record before it.
+        unsafe {
+            core::ptr::write_volatile((SIGNAL_RECORD_AT + index as u64 * 8) as *mut u64, *count);
+        }
+    }
+}
+
+/// What each domain is parked on, by adapter capability slot, or zero.
+///
+/// [RFC 0083](../../docs/rfc/0083-a-signal-a-process-can-catch.md). A process
+/// blocked in `read` or `wait4` is parked on a notification **this program
+/// named** when it answered `REPLY_BLOCK_ON*`, so this program is the only
+/// thing that knows which one, and a `kill` that could not wake it would
+/// leave a shell waiting for a key that is never coming.
+///
+/// Zero is "not parked", which is the same sentinel `Process::domain_slot`
+/// uses and for the same reason: slot zero is the console and no park is ever
+/// on it.
+static PARKED_ON: [core::sync::atomic::AtomicU64; limits::MAX_DOMAINS] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; limits::MAX_DOMAINS];
+
+/// Records what `domain` has just parked on, or clears it.
+fn parked_on(domain: u32, slot: u64) {
+    if let Some(cell) = PARKED_ON.get((domain as usize) % limits::MAX_DOMAINS) {
+        cell.store(slot, core::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Wakes `domain` if it is parked, so it re-enters this program and finds
+/// whatever is pending for it.
+///
+/// Signalling a notification nobody is waiting on is harmless — it sets a word
+/// that the next wait consumes — so this does not have to know whether the
+/// park is still current, only that it was the last one named.
+fn wake_parked(domain: u32) {
+    let Some(cell) = PARKED_ON.get((domain as usize) % limits::MAX_DOMAINS) else {
+        return;
+    };
+    let slot = cell.load(core::sync::atomic::Ordering::Relaxed);
+    if slot != 0 {
+        let _ = call(syscall::INVOKE, slot, method::SIGNAL, [0; 4]);
+    }
+}
+
+/// Records that a call in `domain` has been answered with `value` and needs
+/// its frame so a pending signal can be delivered.
+fn await_frame_for_signal(domain: u32, value: u64) {
+    AWAITING_VALUE.store(value, core::sync::atomic::Ordering::Relaxed);
+    AWAITING_DOMAIN.store(domain, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Takes the stashed answer for `domain`, if this frame was asked for to
+/// deliver a signal rather than to read a call's arguments.
+fn take_awaited_frame(domain: u32) -> Option<u64> {
+    if AWAITING_DOMAIN.load(core::sync::atomic::Ordering::Relaxed) != domain {
+        return None;
+    }
+    AWAITING_DOMAIN.store(NO_DOMAIN_AWAITING, core::sync::atomic::Ordering::Relaxed);
+    Some(AWAITING_VALUE.load(core::sync::atomic::Ordering::Relaxed))
+}
+
 /// Answers a call whose arguments did not fit in a message.
 ///
 /// The register file is in `slot`, in the kernel's order — which is the one
 /// place both sides must agree and the reason that order is written down on
 /// each of them.
 fn answer_with_frame(domain: u32, slot: u64, number: u64) -> (u64, Answer) {
+    // **A signal on the way out of a completed call**, RFC 0083. This frame
+    // was asked for by the main loop rather than by a call that needs six
+    // arguments, so it is answered here before `number` is looked at: the
+    // number is the call that has *already happened*, and dispatching it again
+    // would run it twice.
+    if let Some(value) = take_awaited_frame(domain) {
+        if let Some((signal, handler)) = dispositions_of(domain).take_pending() {
+            let verdict = deliver_signal_after_call(domain, slot, signal, handler, value);
+            match verdict {
+                Some(()) => SIGNALS_DELIVERED.fetch_add(1, core::sync::atomic::Ordering::Relaxed),
+                None => SIGNALS_UNBUILT.fetch_add(1, core::sync::atomic::Ordering::Relaxed),
+            };
+            publish_signals();
+            return match verdict {
+                Some(()) => (REPLY_RESTORE, Answer::ok(slot)),
+                // The frame could not be built -- an unmapped stack, say. The
+                // call still happened, so its value is still owed, and the
+                // process is left running rather than ended: it has a handler
+                // it never reached, which is a worse outcome to invent than
+                // simply not delivering.
+                None => (REPLY_VALUE, Answer::ok(value)),
+            };
+        }
+        // Nothing pending after all -- a handler removed between the check and
+        // here. The call's own answer is still owed.
+        return (REPLY_VALUE, Answer::ok(value));
+    }
+
     let mut image = [0u64; FAULT_REGISTERS];
     if !read_slot(slot, &mut image) {
         return (REPLY_VALUE, Answer::error(memory::errno::EINVAL));
@@ -1063,6 +1273,7 @@ fn answer_kill(request: &PersonalityCall) -> (u64, Answer) {
     }
 
     let (mut ended, mut refused, mut itself) = (0, 0, false);
+    let mut caught = 0;
     for target in &targets[..count] {
         // **The caller is left until last**, because ending it is the one thing
         // this loop cannot do and then carry on: a `kill(-pgid, SIGKILL)` sent
@@ -1081,6 +1292,23 @@ fn answer_kill(request: &PersonalityCall) -> (u64, Answer) {
         else {
             continue;
         };
+        // **Caught, if the target asked to catch it** — RFC 0083, and the one
+        // behavioural change in this function. `raise` answers `false` for
+        // `SIGKILL`, which is never catchable, and for a target with no
+        // handler, whose default disposition is to end — so everything that
+        // ended before this line still ends, and RFC 0079's gates are
+        // untouched.
+        //
+        // The wake is what makes it reach a process that is *blocked*: it is
+        // parked on a notification this program named, re-enters on the wake,
+        // and its call is interrupted with `EINTR` after the handler runs.
+        if dispositions_of(domain).raise(signal) {
+            SIGNALS_RAISED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            publish_signals();
+            wake_parked(domain);
+            caught += 1;
+            continue;
+        }
         // **A process this program did not fork, it cannot end.** The capability
         // is kept at `fork`; a process the kernel started has none, and no
         // amount of permission conjures one. Counted rather than returned on, so
@@ -1113,14 +1341,30 @@ fn answer_kill(request: &PersonalityCall) -> (u64, Answer) {
     // capability naming the caller's own domain. `REPLY_END_DOMAIN` is how that
     // is said instead, and `exit_group` beside it says it the same way.
     if itself {
-        note_exit(
-            request.domain,
-            Exit::Signalled {
-                signal: signal as u8,
-                core: false,
-            },
-        );
-        return (REPLY_END_DOMAIN, Answer::ok(0));
+        // **Unless it asked to catch it** — RFC 0083. `kill(getpid(), SIGTERM)`
+        // is how a program asks for its own handler to run, and it is the one
+        // delivery that needs no wake: the caller is right here, mid-call, and
+        // the main loop redirects it on the way out of this very `kill`.
+        if dispositions_of(request.domain).raise(signal) {
+            SIGNALS_RAISED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            publish_signals();
+            caught += 1;
+        } else {
+            note_exit(
+                request.domain,
+                Exit::Signalled {
+                    signal: signal as u8,
+                    core: false,
+                },
+            );
+            return (REPLY_END_DOMAIN, Answer::ok(0));
+        }
+    }
+    // **A signal that was caught is a signal that was delivered**, so it
+    // answers success. Counting it as nothing would make `kill` report `ESRCH`
+    // for a process that is there and has just been told.
+    if ended == 0 && caught > 0 {
+        return (REPLY_VALUE, Answer::ok(0));
     }
     if ended == 0 {
         // `EPERM` when something was found and could not be ended, `ESRCH` when
@@ -5951,6 +6195,17 @@ fn answer_fork(request: &PersonalityCall, image: &[u64; FAULT_REGISTERS]) -> Ans
         return Answer::error(-11); // EAGAIN
     }
     let child_domain = made.args[0] as u32;
+    // **The child inherits its parent's handlers** — RFC 0083, and Linux's own
+    // behaviour. Dispositions are kept per *domain* here and a fork makes a
+    // new one, so without this a forked child woke with none: a shell that
+    // installs a `SIGTERM` handler and forks would have had a child that could
+    // not catch what the parent could.
+    //
+    // **Pending signals are not inherited**, which is the half that would be
+    // wrong if the whole structure were copied: a signal waiting for the
+    // parent was sent to the parent.
+    let inherited = dispositions_of(request.domain).clone();
+    dispositions_of(child_domain).inherit(&inherited);
     let outcome = build_fork_child(request, rip, rsp);
     // **Keep a capability to the child before letting go of the build slot** —
     // RFC 0079. `CHILD` is one slot, reused by the next fork, and until now it
@@ -7268,6 +7523,64 @@ extern "C" fn linuxd_main(hertz: u64) -> ! {
             received.badge as u32,
         );
         let (how, reply) = answer(&request);
+        // **A signal waiting for this process, delivered on the way out** —
+        // RFC 0083. Only a call that is *finished* is interrupted: `how` of
+        // `REPLY_VALUE` is the one shape that means "here is your answer, you
+        // are about to run again", and it is the only point at which a
+        // redirect costs nothing and needs no `EINTR`. A park, a yield or an
+        // ending is left alone -- a parked process is woken by the `kill`
+        // itself and delivers when it comes back round.
+        //
+        // The check is a load and a compare on the hot path; the frame is
+        // asked for only when something is actually pending.
+        let (how, reply) = if dispositions_of(request.domain).has_pending() {
+            match how {
+                // A finished call: the program is about to run again, so the
+                // redirect costs nothing and its answer is carried through the
+                // frame.
+                REPLY_VALUE => {
+                    await_frame_for_signal(request.domain, reply.value);
+                    (REPLY_NEED_FRAME, Answer::ok(0))
+                }
+                // **A call that is about to park, interrupted instead** —
+                // which is what `EINTR` *is*. Without this arm a process
+                // blocked in `read` could never be signalled: the `kill` wakes
+                // it, the nucleus re-asks the same call, nothing has arrived,
+                // and it parks again with the signal still pending. It would
+                // be woken and re-parked for ever, which is worse than not
+                // delivering at all because it also burns the wake.
+                //
+                // The deadline is dropped on the floor deliberately -- it was
+                // taken by `deadline_word` for a park that is no longer
+                // happening, and a timer armed for a call that is not waiting
+                // would ring at a process that has moved on.
+                REPLY_BLOCK_ON | REPLY_BLOCK_ON_RETRY | REPLY_BLOCK_ON_UNTIL => {
+                    let _ = deadline_word();
+                    await_frame_for_signal(request.domain, memory::errno::EINTR as u64);
+                    (REPLY_NEED_FRAME, Answer::ok(0))
+                }
+                // A yield, an ending, or a frame already being asked for. None
+                // of these is a point at which a redirect is safe or needed:
+                // an ending has no program to return to, and a call that is
+                // fetching its own arguments has not happened yet.
+                _ => (how, reply),
+            }
+        } else {
+            (how, reply)
+        };
+        // **What this process is parked on, recorded where every reply passes**
+        // — RFC 0083. One site rather than the dozen that answer a park, for
+        // the reason the net report's field positions were moved off a
+        // literal's order: a second place to remember is a second place to
+        // forget. Cleared on any reply that is not a park, so a stale slot
+        // cannot make `kill` signal a notification this process left behind.
+        parked_on(
+            request.domain,
+            match how {
+                REPLY_BLOCK_ON | REPLY_BLOCK_ON_RETRY | REPLY_BLOCK_ON_UNTIL => reply.value,
+                _ => 0,
+            },
+        );
         // The second word is the deadline a `BLOCK_ON_UNTIL` names, and zero
         // for every other shape -- see [`REPLY_BLOCK_ON_UNTIL`].
         let _ = call(syscall::REPLY, 0, how, [reply.value, deadline_word(), 0, 0]);
