@@ -20347,19 +20347,6 @@ fn report_tcp_client(hhdm: u64) {
         // `bin/tcpd` has not sent — the fault is then on the service's side of
         // one named call. Anything else is a thread that is running and not
         // returning, which is a different search entirely.
-        let doing = match sched::first_thread_in_domain(
-            TCPC_DOMAIN.load(core::sync::atomic::Ordering::Acquire),
-        ) {
-            Some((thread, state)) => {
-                println!(
-                    "\x1b[91m    tcp client     and the scheduler has thread {thread} \
-                     {state:?}\x1b[0m"
-                );
-                true
-            }
-            None => false,
-        };
-        let _ = doing;
         // **It reached the wait and the first question did not come back.**
         // `bin/tcpc` publishes this before asking the service anything, so the
         // program is inside `stream_state` rather than short of it.
@@ -20367,6 +20354,35 @@ fn report_tcp_client(hhdm: u64) {
             "\x1b[91m    tcp client     FAILED at step {step}: {said} — it entered the stream \
              wait and the first state read has not returned\x1b[0m"
         );
+        // **And what the scheduler says that thread is doing**, which the
+        // program itself cannot: it writes nothing while it is inside the call.
+        // `Blocked` is a thread parked in the rendezvous, waiting for a reply
+        // `bin/tcpd` has not sent — the fault is then on the service's side of
+        // one named call. Anything else is a thread that is running and not
+        // returning, which is a different search entirely.
+        //
+        // **Printed after the marker and indented past column fifteen, which
+        // is the only way it reaches CI.** `annotate_failure_detail` skips the
+        // marker line and then takes following lines whose first non-blank is
+        // beyond column 15, stopping at the first that is not. This line used
+        // to be printed *above* the marker at an indent of four, so it failed
+        // both tests — and this row has eight sightings, every one of them on
+        // CI, with the field that separates its two candidate causes never
+        // once visible. The same shape as the ring report's truncation, found
+        // the same day.
+        match sched::first_thread_in_domain(TCPC_DOMAIN.load(core::sync::atomic::Ordering::Acquire))
+        {
+            Some((thread, state)) => println!(
+                "\x1b[91m                   the scheduler has thread {thread} {state:?}\x1b[0m"
+            ),
+            // Saying so, rather than printing nothing: a silent line is read
+            // as "the instrument did not run", which is a third possibility
+            // nobody can tell from the other two.
+            None => println!(
+                "\x1b[91m                   the scheduler has no thread in bin/tcpc's \
+                 domain\x1b[0m"
+            ),
+        }
     } else if outcome == 2 && detail == 0 {
         // **And a zero is no longer the step 4 XOR meaning nothing.** Since the
         // line above is published on entry, zero says the program never reached
