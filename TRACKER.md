@@ -727,6 +727,7 @@ do is listed under "What M7 did not do" below — it is short, and none of it is
 
 | Defect | Evidence | Owner |
 |---|---|---|
+| **A signal is raised at a hosted process and never delivered (filed 2026-09-21, two sightings).** `the adapter raised N signal(s), delivered N-1` — and the target, a child parked in `nanosleep` with an inherited `SIGTERM` handler, is collected at the probe's *"the sleep returned and nothing caught it"* exit rather than at its handler's. Introduced with [RFC 0083](docs/rfc/0083-a-signal-a-process-can-catch.md); it is **this row's own change that is at fault**, not an older path. <br><br>**First seen** on `test-boot-iommu-off` in a full suite, **second** on `test-shell`. Both times the *pipe*-parked child in the same boot was delivered to correctly, and the parent's own handler ran twice at depth 1 — so the mechanism works and one delivery in four goes missing. It did not reproduce in eleven runs of the first lane. <br><br>**Three of the four candidate causes are eliminated by the counters added for exactly this**, on the second sighting: `could not build 0 frame(s)` — the frame was always constructible; `0 sigreturn(s) could not read their own uc_sigmask` — no mask was latched on; and the single `raise landed on a signal already blocked` is the handler's own self-kill, which is *expected* and correct, not the missing one. So the child's signal was raised, was not blocked, could have been built, and was never taken. <br><br>**What that leaves** is that the domain never re-entered the adapter through an arm that delivers — or that the raise and the later call disagree about which domain slot they mean. `answer_kill` raises against `process.domain` from the process table while a call arrives with `request.domain`; `dispositions_of` masks both by `MAX_DOMAINS`. Nothing yet distinguishes those. <br><br>**A single global stash was removed on the first sighting** — the slot carrying a completed call's result across the `REPLY_NEED_FRAME` round trip, which another domain's call could overwrite — and it is **per-domain since**. The symptom survived it, so that was a class of fault removed rather than this instance, exactly as the commit said it might be. <br><br>**The decisive instrument is named and not yet built:** whether any domain still holds a pending signal when the boot reports, and which. A domain still pending says the raise landed correctly and delivery never came; none pending says the raise went somewhere the target never reads. | 🔍 `OPEN` | 2026-09-21 |
 | **~~The USB keyboard lane hangs after running the first typed command, about one run in three~~ — WITHDRAWN the same day: the machine never hung. The echo assertion cannot match an echo split between characters, and a missed wait then spends the whole timeout (filed and withdrawn 2026-09-14).** The shell reaches its prompt, **runs** the command typed at its USB keyboard — that assertion passes — and then nothing more reaches the serial log until the harness kills QEMU at its timeout. **That reading was wrong, and the kept log says so in four characters.** | ✅ **WITHDRAWN 2026-09-14** | 2026-09-14  <br><br>**4 failures in 13 runs, on both trees, and the interleaving is why that is trustworthy.** The first six runs read 3 of 5 failing with an uncommitted kernel change and 0 of 4 without it, which is exactly how a change gets blamed: the baselines had run last, on a box the background work had stopped loading. Interleaved with/base pairs immediately produced a **baseline failure**, so the change — whose new arm cannot fire on this lane at all — is excluded. <br><br>**The gate text blames the wrong thing.** A truncated log makes three assertions fail: `the shell never saw the typed command`, `shift did not produce a capital -- the modifier state is wrong`, `the single keypress never arrived`. The first is contradicted two lines later by `ok the shell ran the command typed at its keyboard`, which cannot be true if the shell never saw it. **The harness says the run was cut short before it says anything about input, as of 2026-09-14.** Both waiters already knew — they return the same `1` whether the pattern never appeared or QEMU was gone — so they now record which, and the ten assertions that rest on a wait report through `missed`, which prefixes *not observed -- the run was cut short before this point*. Armed deterministically with `TIMEOUT=25`, and then seen on two real hangs: the line above `ok the shell ran the command typed at its keyboard` no longer contradicts it. **And the assertion that produced both false defects is gone, 2026-09-14.** A console every domain shares cannot carry a character-level claim from outside, so the echo is no longer asserted. What replaces it is strictly stronger: the help text's `print the arguments` is printed only by a shell that received the keystrokes, assembled them into a line and ran it, which no interleaving can fake and no echo can satisfy. **12 of 12 runs pass**, against about one in three failing before. <br><br>**The waits after a keystroke are bounded too, and that is what made the diagnosis hard.** Every wait could spend the whole `TIMEOUT`, which is also QEMU's deadline — so the first pattern that could not match took the machine with it and left every later assertion with nothing to read. Armed by not typing the first command: before, three failures all reading *not observed*; now **one** failure naming the right thing, the two later assertions still running and passing, and the run over in 59s instead of 180. <br><br>**WITHDRAWN 2026-09-14, and the evidence is the echo itself.** The harness keeps its log on failure, and both kept logs read identically:
 
 ```
@@ -1009,6 +1010,87 @@ the distinction is in the table rather than in somebody's head.
 ## 7. Changelog
 
 Newest first. One entry per meaningful change of project state.
+
+### 2026-09-21 (a second sighting of the undelivered signal, and the counters earned their keep)
+
+**§3 has a new `OPEN` row, and it is this week's own work that is at fault.**
+A signal raised at a hosted process is, about one delivery in four on a boot
+that shows it, never delivered: `raised 4, delivered 3`, with the child parked
+in `nanosleep` collected at the probe's *"the sleep returned and nothing caught
+it"* exit instead of its handler's.
+
+**Second sighting — `test-shell` this time, `test-boot-iommu-off` the first.**
+In both, the *pipe*-parked child of the same boot was delivered to correctly
+and the parent's own handler ran twice at depth 1, so the mechanism works and
+one delivery goes missing.
+
+**The counters added on the first sighting eliminated three of the four
+candidates on the second**, which is the whole reason they were added rather
+than a fix being guessed at:
+
+- `could not build 0 frame(s)` — the frame was always constructible.
+- `0 sigreturn(s) could not read their own uc_sigmask` — nothing latched a
+  mask on, which was the one failure the step-7 design could have had.
+- `1 raise(s) landed on a signal already blocked` — and that one is the
+  *handler's own self-kill*, which is blocked by design while the handler
+  runs. Expected, correct, and **not** the missing delivery.
+
+So the child's signal was raised, was not blocked, could have been built, and
+was never taken.
+
+**And the per-domain stash did not fix it**, which the commit that made that
+change said in as many words: *"whether that produced the boot above is not
+established"*. It removed a class of fault. This is a different instance or a
+different cause, and the honest reading is that the change bought clarity
+rather than a repair.
+
+**The next instrument is named rather than a fifth theory:** whether any domain
+still holds a *pending* signal when the boot reports, and which one. A domain
+still pending says the raise landed correctly and delivery never came; none
+pending says the raise went somewhere the target never reads — and
+`answer_kill` raises against `process.domain` from the process table while a
+call arrives carrying `request.domain`.
+
+### 2026-09-21 (the tcp step-4 row's decisive field has never once reached CI — eighth sighting)
+
+**CI run 714, `interactive shell`**, on the commit that recorded specimen
+twenty-two. *"`tcp client FAILED at step 4: connected, stream still in flight
+— it entered the stream wait and the first state read has not returned`"* —
+the seventh sighting's reading, and the eighth occurrence.
+
+**The field that was supposed to answer it was not there.** That row's own note
+says the next specimen would say *"the scheduler has thread N `<state>`"*, with
+`Blocked` meaning a thread parked in the rendezvous — the fault on
+`bin/tcpd`'s side of one named call — and anything else meaning a thread
+running and not returning, *"a different search entirely"*. Both readings were
+built and watched red on 2026-09-18.
+
+**It could never have reached CI.** `annotate_failure_detail` skips the marker
+line and then takes following lines whose first non-blank character is beyond
+**column 15**, stopping at the first that is not. The scheduler line was
+printed *above* the marker, at an indent of four. It failed both tests.
+
+Run through the harness's own awk, the two layouts give:
+
+```
+old (above the marker, indent 4):  (nothing)
+new (below it, indent 19):         the scheduler has thread 91 Blocked
+```
+
+**So eight sightings, every one on CI, and the one field that separates the two
+candidate causes has been invisible for all of them.** The instrument was
+built, armed and correct; it was printed where nothing would carry it.
+
+**Fixed by moving it below the marker and indenting it as a continuation**, and
+the absent case now prints too — a silent line reads as "the instrument did not
+run", which is a third possibility nobody can tell from the other two.
+
+**This is the second instrument in one day found to be correct and unreachable**
+— the ring report's fields were behind `ci-status.sh`'s own 150-character cut.
+Both were written, armed, and believed to be working. The general lesson is
+worth more than either fix: **an instrument is not working until its output has
+been seen through the path that will actually carry it**, and on this project
+that path is a CI annotation, not a local terminal.
 
 ### 2026-09-21 (`block_self` is told who is calling it — a fourth door gets a rule the other three have)
 
