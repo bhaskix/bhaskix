@@ -256,6 +256,18 @@ impl Dispositions {
         self.blocked = parent.blocked;
     }
 
+    /// Every signal raised at this process and not yet taken, **blocked or
+    /// not**.
+    ///
+    /// [`Self::has_pending`] answers the *deliverable* question and masks the
+    /// blocked ones out, which is right for the hot path and wrong for a
+    /// report: a signal held back by a mask is still owed, and a boot that
+    /// ends with one outstanding is the open defect this exists to see.
+    #[must_use]
+    pub const fn pending(&self) -> u64 {
+        self.pending
+    }
+
     /// Whether anything is waiting to be delivered.
     ///
     /// The hot check — it runs on the way out of every hosted call, so it is

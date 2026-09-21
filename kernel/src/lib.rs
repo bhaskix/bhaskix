@@ -9519,13 +9519,30 @@ fn a_hosted_process_ends_its_child(hhdm_base: u64, cpus: u32) -> bool {
         );
         // RFC 0083's half, separately, because a line nobody can read to the
         // end is a line that gets skimmed.
-        let (raised, delivered, unbuilt, raised_blocked, unrestored) = adapter_signal_record();
+        let (raised, delivered, unbuilt, raised_blocked, unrestored, owed, first_owed) =
+            adapter_signal_record();
         println!(
             "\x1b[91m    hosted catch   DETAIL: the adapter raised {raised} signal(s), \
              delivered {delivered}, could not build {unbuilt} frame(s); {raised_blocked} \
              raise(s) landed on a signal already blocked and {unrestored} sigreturn(s) could \
              not read their own uc_sigmask\x1b[0m"
         );
+        // **Which of the two open readings this boot is.** A domain still
+        // holding the signal says the raise landed where it should and the
+        // delivery never came; none holding it says the raise went somewhere
+        // the target never reads. `raised` minus `delivered` cannot tell them
+        // apart, and they are different bugs.
+        if first_owed == u64::MAX {
+            println!(
+                "\x1b[91m                   {owed} domain(s) still hold a signal nobody took, \
+                 so the raise reached a domain that never read it\x1b[0m"
+            );
+        } else {
+            println!(
+                "\x1b[91m                   {owed} domain(s) still hold a signal nobody took, \
+                 the first being domain {first_owed}\x1b[0m"
+            );
+        }
         println!(
             "\x1b[91m    hosted catch   FAILED: sigaction answered {installed}, the self-kill \
              {self_kill}; the handler marker is {handler_marker:#x} for signal \
@@ -9581,10 +9598,10 @@ fn adapter_wait_record() -> (i64, u64) {
 /// makes no calls has its signal raised and never receives it. Linux delivers
 /// at any kernel entry, including a timer tick. Printing `raised` alone would
 /// hide that, and printing `delivered` alone would hide it twice.
-fn adapter_signal_record() -> (u64, u64, u64, u64, u64) {
+fn adapter_signal_record() -> (u64, u64, u64, u64, u64, u64, u64) {
     let page = ADAPTER_REPORT.load(core::sync::atomic::Ordering::Acquire);
     if page == u64::MAX {
-        return (0, 0, 0, 0, 0);
+        return (0, 0, 0, 0, 0, 0, u64::MAX);
     }
     const FIRST_WORD: usize = bhaskix_personality::report::SIGNAL_AT / 8;
     const WORDS: usize = bhaskix_personality::report::SIGNAL_WORDS;
@@ -9606,9 +9623,11 @@ fn adapter_signal_record() -> (u64, u64, u64, u64, u64) {
         chunk.len()
     });
     if taken.is_none() {
-        return (0, 0, 0, 0, 0);
+        return (0, 0, 0, 0, 0, 0, u64::MAX);
     }
-    (record[0], record[1], record[2], record[3], record[4])
+    (
+        record[0], record[1], record[2], record[3], record[4], record[5], record[6],
+    )
 }
 
 /// What the adapter's last `fork` did: the child's pid and the bytes copied.

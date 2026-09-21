@@ -577,12 +577,36 @@ static SIGNALS_UNRESTORED: core::sync::atomic::AtomicU64 = core::sync::atomic::A
 /// design can remove without a nucleus change — and it is invisible in either
 /// count on its own.
 fn publish_signals() {
+    // **Who still holds one.** `raised` minus `delivered` says a signal is
+    // owed; only this says whether the *target* still has it. A domain still
+    // holding one means the raise landed where it should and the delivery
+    // never came; none holding one means the raise went somewhere the target
+    // never reads — and `answer_kill` raises against `process.domain` from the
+    // process table while a call arrives carrying `request.domain`. Those are
+    // different bugs and nothing else separates them.
+    //
+    // A scan of the table on a path that runs only when a signal is raised or
+    // delivered, which is rare; the hot check stays `has_pending` on one
+    // domain.
+    let (mut owed, mut first_owed) = (0u64, u64::MAX);
+    for domain in 0..limits::MAX_DOMAINS {
+        // Pending *at all*, blocked or not: a signal held back by a mask is
+        // still owed, and a boot that ends with one outstanding is the defect.
+        if dispositions_of(domain as u32).pending() != 0 {
+            owed += 1;
+            if first_owed == u64::MAX {
+                first_owed = domain as u64;
+            }
+        }
+    }
     let counts = [
         SIGNALS_RAISED.load(core::sync::atomic::Ordering::Relaxed),
         SIGNALS_DELIVERED.load(core::sync::atomic::Ordering::Relaxed),
         SIGNALS_UNBUILT.load(core::sync::atomic::Ordering::Relaxed),
         SIGNALS_RAISED_BLOCKED.load(core::sync::atomic::Ordering::Relaxed),
         SIGNALS_UNRESTORED.load(core::sync::atomic::Ordering::Relaxed),
+        owed,
+        first_owed,
     ];
     for (index, count) in counts.iter().enumerate() {
         // SAFETY: inside the page `ATTACH` mapped from this program's own

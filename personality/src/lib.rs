@@ -221,20 +221,34 @@ pub mod report {
     /// `rt_sigreturn`s that could not read their own frame's `uc_sigmask` —
     /// which would latch a mask on for ever and is the one failure this
     /// design can have that nothing else would show.
-    pub const SIGNAL_WORDS: usize = 5;
+    ///
+    /// **Seven since 2026-09-21.** The sixth and seventh are how many domains
+    /// still hold a signal that was raised and never taken, and the first such
+    /// domain. `raised` minus `delivered` says one is owed; only this says
+    /// *whether the target still has it*. A domain still holding it means the
+    /// raise landed where it should and delivery never came; none holding it
+    /// means the raise went somewhere the target never reads, and those are
+    /// different bugs.
+    pub const SIGNAL_WORDS: usize = 7;
 
     /// Where bulk staging begins.
     ///
     /// Rounded up from the end of the records, so the boundary is legible in a
     /// hex dump rather than merely correct.
     ///
-    /// **576 since 2026-09-16, and it was 512.** The records ended exactly at
-    /// 512 while the process record held six words; widening it to eight took
-    /// the sixteen bytes [`BIND_AT`] occupied, silently, because nothing
-    /// asserted the two did not overlap. Moving the boundary out is what gives
-    /// the bind record its own bytes back — and it costs the scratch 64 of the
-    /// 3,584 it had, which is a chunk size and not a capacity.
-    pub const SCRATCH_AT: usize = 576;
+    /// **640 since 2026-09-21; 576 before that, and 512 before that.** The
+    /// records ended exactly at 512 while the process record held six words;
+    /// widening it to eight took the sixteen bytes [`BIND_AT`] occupied,
+    /// silently, because nothing asserted the two did not overlap. That is why
+    /// the assertions below exist — and they earned it again on 2026-09-21,
+    /// when the signal record grew from five words to seven and ended at 584
+    /// against a boundary of 576. **It failed to build instead of overwriting
+    /// the scratch**, which is the whole difference between this and the bug it
+    /// was written for.
+    ///
+    /// Each move costs the scratch 64 bytes of the 3,584 it started with,
+    /// which is a chunk size rather than a capacity.
+    pub const SCRATCH_AT: usize = 640;
 
     /// How much of the page bulk staging may use.
     ///
