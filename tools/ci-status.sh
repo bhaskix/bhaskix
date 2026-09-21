@@ -157,8 +157,24 @@ for a in anns:
         continue
     for line in msg.split("\n"):
         line = line.strip()
-        if line:
-            print("      " + line[:150])
+        if not line:
+            continue
+        # **Wrapped, not cut.** This printed line[:150] and the annotation
+        # itself is not limited -- so the truncation belonged to this tool, and
+        # it landed on exactly the fields a specimen is read from. The ring
+        # report station line is 194 characters and its last two fields are the
+        # order of the wake and of the mark, which is the whole of what
+        # specimens nineteen through twenty-one were argued from.
+        #
+        # Found by adding two more fields, watching them vanish on CI, and
+        # nearly rewriting the instrument to fit a limit that does not exist.
+        while len(line) > 150:
+            cut = line.rfind(" ", 0, 150)
+            if cut <= 0:
+                cut = 150
+            print("      " + line[:cut])
+            line = "        " + line[cut:].lstrip()
+        print("      " + line)
 '
     done
     exit 0

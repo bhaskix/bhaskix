@@ -1010,6 +1010,57 @@ the distinction is in the table rather than in somebody's head.
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-09-21 (specimen twenty-two, and it was under a truncation this repository owned)
+
+**The instrument added hours earlier fired on its first CI run, and
+`ci-status.sh` cut the answer off.** Run 713, `interactive shell`. The station
+line is 194 characters; the tool printed `line[:150]`. The two new fields sit
+at the end, so they vanished — and so, it turns out, had `last wake` and `last
+mark` on every CI specimen before them, which is what specimens nineteen
+through twenty-one were argued from.
+
+**The limit was this tool's, not GitHub's.** That was nearly diagnosed the
+other way: the instrument was already being rewritten to fit a shorter line
+when the `[:150]` turned up in `tools/ci-status.sh`. It wraps now.
+
+**What the annotation had said all along:**
+
+```
+ring-3 (thread 15) retired, token 2 at phase 3 ... last decided ready at #5175, no entry in the ring; last wake #5172, last mark #5168 by itself
+ring-2 (thread 14) asleep,  token 2 at phase 2 ... last decided ready at #5146, no entry in the ring; last wake #5139, last mark #5145 by a completed mark
+ring-1 (thread 13) retired, token 2 at phase 3 ... last decided ready at #5173, no entry in the ring; last wake #5170, last mark #5164 by itself
+ring-0 (thread 12) retired, token 2 at phase 3 ... last decided ready at #5174, no entry in the ring; last wake #5171, last mark #5166 by itself
+```
+
+**The stuck station decided to leave.** `last decided ready` — its predicate
+returned true, so `wait_until` returned and it should have reached
+`sched::exit()`. It is a live `Blocked` thread holding no queue entry.
+
+**And the one thing that separates it from its three siblings is not the
+ordering — it is who marked it.** All four show a mark before their last
+decision, which is the ordinary shape of being woken and re-evaluating. All
+four decided `ready`. All four hold no entry. **ring-2 is the only one whose
+mark reads `by a completed mark` rather than `by itself`** — it was marked
+`Blocked` by another thread's refusal-completion path, the mechanism §3
+introduced when a refused mark began scanning the queues for its target.
+
+That is the first fact in twenty-two specimens that tells the stuck station
+from the others by *mechanism* rather than by outcome, and it agrees with the
+same boot's own counters: `1 block(s) refused for a caller that was not the
+thread being marked`, `1 of them were completed by finding the caller on
+another queue`.
+
+**The question it puts, and it is a narrow one:** does the completion path
+mark a thread that is no longer about to block? A thread marked `Blocked`
+after it has decided to leave runs on to its next scheduling point, returns
+from `wait_until`, and is then never scheduled again — which is exactly a
+station that decided `ready`, holds no entry, and sleeps for ever.
+
+**Not called a diagnosis.** It is one specimen, the reading is hours old, and
+this file records three theories this month that were settled before their
+evidence was complete. What is established is the discriminator; what is not
+is that the completion path is wrong.
+
 ### 2026-09-21 (the instrument specimen twenty-one asked for, built and armed)
 
 **The next step that entry named, rather than a fifth theory.** Specimen
