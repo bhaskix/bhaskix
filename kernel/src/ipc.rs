@@ -553,7 +553,7 @@ pub fn call(id: EndpointId, badge: u64, method: u64, args: [u64; 4]) -> Result<M
             // The server's receive path could not complete this thread's
             // staged gift; the message was never delivered. RFC 0022 step 2.
             sched::Delivery::Refused(status) => return Err(IpcError::Refused(status)),
-            sched::Delivery::Blocked => sched::block_self(),
+            sched::Delivery::Blocked => sched::block_self(me),
         }
     }
 }
@@ -723,7 +723,7 @@ pub fn recv_either(id: EndpointId) -> Result<Received, IpcError> {
                             return Ok(Received::Notified(bits));
                         }
                         RECV_EMPTY.fetch_add(1, Ordering::Relaxed);
-                        sched::block_self();
+                        sched::block_self(me);
                     }
                 }
             },

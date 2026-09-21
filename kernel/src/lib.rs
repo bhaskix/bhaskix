@@ -24306,6 +24306,22 @@ fn user_shell(handoff: &Handoff) -> Result<(), &'static str> {
                  accounting had been handed to the incoming thread\x1b[0m"
             );
         }
+        // **The window specimen twenty-two points at, on every boot rather
+        // than only on a failing one.** A migration seen inside `block_self`
+        // is a caller that was not `current` on the CPU it had just read --
+        // which until 2026-09-21 was counted as a wake race and *returned*,
+        // leaving the caller marked `Blocked` and still running, which is the
+        // defect's terminal state. Printed only when non-zero, because the
+        // interesting fact is that it happens at all; "gave up" should never
+        // be anything but zero, since a running thread finds itself on the
+        // next pass.
+        let (migrated, gave_up) = sched::block_self_migrations();
+        if migrated > 0 || gave_up > 0 {
+            println!(
+                "    block migrate  {migrated} caller(s) had migrated when block_self took \
+                 their CPU's queue, {gave_up} of them past the retry bound"
+            );
+        }
         let mismarked_unless = sched::mismarked_unless();
         let mismarked_total = sched::mismarked_blocks();
         if mismarked_total > 0 {
@@ -29741,6 +29757,7 @@ fn wait_queue_self_test(hhdm_base: u64) -> bool {
         // count **per station**, which this counter cannot give -- the stuck
         // station's own recheck firing is the interesting event, and it is
         // summed here with three healthy stations'.
+        //
         println!(
             "                   {races} block/wake races caught by the recheck, {blocks} blocks \
              and {wakeups} wakeups in this phase"

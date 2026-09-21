@@ -751,7 +751,7 @@ pub fn wait(id: NotificationId) -> Result<u64, NotifyError> {
         if crate::sched::should_die() {
             break Err(NotifyError::Gone);
         }
-        crate::sched::block_self();
+        crate::sched::block_self(me);
     };
 
     // Released whichever way this ended, or the next waiter is refused for
@@ -806,7 +806,7 @@ pub fn wait_once(id: NotificationId) -> Result<u64, NotifyError> {
         slot.waiter.store(0, Ordering::Release);
         return Ok(word);
     }
-    crate::sched::block_self();
+    crate::sched::block_self(me);
 
     let word = slot.pending.swap(0, Ordering::AcqRel);
     slot.waiter.store(0, Ordering::Release);

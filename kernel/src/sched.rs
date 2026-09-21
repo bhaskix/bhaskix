@@ -4001,6 +4001,30 @@ fn mark_blocked_anywhere(thread: u32) {
     }
 }
 
+/// Times `block_self` found a thread that was not its caller as `current`.
+///
+/// The caller migrated between reading its CPU and taking that CPU's queue.
+/// Non-zero says the window specimen twenty-two points at is entered at all;
+/// zero across many boots would say the window is real and not the one behind
+/// the defect, which is worth knowing either way.
+static BLOCK_SELF_MIGRATED: AtomicU64 = AtomicU64::new(0);
+
+/// Times that retry reached its bound and returned without blocking.
+///
+/// **Today's behaviour, counted.** Any non-zero here is a caller left marked
+/// `Blocked` and running -- the defect's own terminal state -- and it should
+/// be zero, because a running thread finds itself on the next pass.
+static BLOCK_SELF_GAVE_UP: AtomicU64 = AtomicU64::new(0);
+
+/// `(migrations seen, retries that gave up)` inside `block_self`.
+#[must_use]
+pub fn block_self_migrations() -> (u64, u64) {
+    (
+        BLOCK_SELF_MIGRATED.load(Ordering::Relaxed),
+        BLOCK_SELF_GAVE_UP.load(Ordering::Relaxed),
+    )
+}
+
 /// Marks that were completed by finding the caller on another queue.
 ///
 /// Zero means no caller migrated inside `mark_blocked` on this boot. Non-zero
@@ -4141,11 +4165,23 @@ pub fn cancel_block() {
 /// else runnable on its CPU has no exit from the loop and spins here forever,
 /// which is a hang rather than a slowdown.
 #[track_caller]
-pub fn block_self() {
-    let cpu = percpu::cpu_id() as usize;
-    if cpu >= MAX_CPUS {
+pub fn block_self(who: u32) {
+    if percpu::cpu_id() as usize >= MAX_CPUS {
         return;
     }
+    // **How many passes the migration retry gets before it gives up.**
+    //
+    // An unbounded spin in the blocking path is a hang, which is a worse
+    // failure than the lost wakeup this guard exists to prevent -- so the
+    // retry is bounded and giving up is *counted*, rather than the bound being
+    // a silent behaviour change nobody can see.
+    //
+    // Four, because a caller only fails the identity check by migrating
+    // between reading its CPU and taking that CPU's queue, and it is running:
+    // the next pass reads the CPU it is actually on. Needing more than one
+    // would itself be the finding.
+    const MIGRATION_PASSES: u32 = 4;
+    let mut passes = 0u32;
 
     // INSTRUMENTATION. Reports, and does not refuse.
     //
@@ -4199,6 +4235,18 @@ pub fn block_self() {
     }
 
     loop {
+        // **Re-read on every pass, which is the whole point of the retry.**
+        // The identity check below fires when this thread has migrated between
+        // reading its CPU and taking that CPU's queue; retrying against a CPU
+        // captured once, before the loop, would ask the same wrong queue again
+        // for ever. This is the line that lets the next pass find the caller
+        // where it actually is -- the same reasoning `mark_blocked_anywhere`
+        // uses when it scans rather than guessing.
+        let cpu = percpu::cpu_id() as usize;
+        if cpu >= MAX_CPUS {
+            restore_interrupts(interrupts_were_enabled);
+            return;
+        }
         let switch = {
             // `try_lock`, exactly as `preempt` does, and for a second reason
             // beyond avoiding a deadlock against an interrupt: a blocking
@@ -4212,10 +4260,50 @@ pub fn block_self() {
             };
             let current = queue.current;
 
+            // **The caller says who it is, and this is checked rather than
+            // assumed** -- the same rule `mark_blocked` states at length and
+            // `block_unless` was given afterwards. Its correction note says
+            // the guard "went on one door of three"; this is a fourth door,
+            // and it did not have the rule until 2026-09-21.
+            //
+            // `cpu_id()`, the lock, and this read are three separate instants.
+            // A caller preempted and resumed on another CPU in between finds
+            // somebody else as `current` here -- and that thread is not
+            // `Blocked`, so the arm below used to count a race and **return**,
+            // leaving the caller marked `Blocked` by whoever completed its
+            // mark and still running. `wait_until` then removes its own queue
+            // entry, decides its predicate, and returns from the wait
+            // `Blocked` with nothing left to wake it. That is specimen
+            // twenty-two's terminal state exactly.
+            //
+            // Retrying is what makes this a fix rather than a rename: the
+            // caller asked to block and has not blocked, it is running, and
+            // the next pass reads the CPU it is actually on.
+            match queue.threads[current].as_ref().map(|thread| thread.id) {
+                Some(id) if id != who => {
+                    BLOCK_SELF_MIGRATED.fetch_add(1, Ordering::Relaxed);
+                    drop(queue);
+                    passes += 1;
+                    if passes >= MIGRATION_PASSES {
+                        // Giving up is today's behaviour, and it is counted so
+                        // that a bound being reached is visible rather than a
+                        // silent return to the defect.
+                        BLOCK_SELF_GAVE_UP.fetch_add(1, Ordering::Relaxed);
+                        restore_interrupts(interrupts_were_enabled);
+                        return;
+                    }
+                    core::hint::spin_loop();
+                    continue;
+                }
+                _ => {}
+            }
+
             match queue.threads[current].as_ref().map(|thread| thread.state) {
                 Some(State::Blocked) => {}
                 // Woken in the window, or never really blocked. Either way
-                // there is nothing to do.
+                // there is nothing to do. **This arm is now only reached for
+                // the caller itself**, which is what makes it a wake race
+                // rather than two different things sharing a counter.
                 _ => {
                     RACES.fetch_add(1, Ordering::Relaxed);
                     restore_interrupts(interrupts_were_enabled);

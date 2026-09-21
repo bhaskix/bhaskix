@@ -275,7 +275,7 @@ impl WaitQueue {
             // Lock released -- it has to be, before switching. Anything a
             // waker does from here on is caught by the recheck inside
             // `block_self`.
-            sched::block_self();
+            sched::block_self(me.id);
         }
     }
 

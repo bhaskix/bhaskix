@@ -410,7 +410,7 @@ pub fn sleep_micros(duration_us: u64) {
 
     while now() < deadline {
         crate::sched::mark_blocked(thread);
-        crate::sched::block_self();
+        crate::sched::block_self(thread);
     }
     cancel_for(thread);
 }

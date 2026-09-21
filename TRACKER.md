@@ -1010,6 +1010,53 @@ the distinction is in the table rather than in somebody's head.
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-09-21 (`block_self` is told who is calling it — a fourth door gets a rule the other three have)
+
+**Specimen twenty-two pointed at one function and it had a readable hole.**
+`sched::block_self` read `percpu::cpu_id()`, took that CPU's runqueue, and
+inspected **`queue.current`** — assuming it was the caller. `mark_blocked`
+carries forty lines about exactly that assumption being wrong: *"those are
+three separate instants … waved through, migrated, and resumed elsewhere, this
+function would lock the old CPU's queue and mark whatever thread is running
+there."* It was fixed by being told who is calling. `block_unless` was given
+the identical check, and that comment's own correction says the guard *"went on
+one door of three"*. **`block_self` was a fourth door and never got it.**
+
+**What the missing rule did.** A caller that migrates between reading its CPU
+and taking the lock finds another thread as `current`. That thread is not
+`Blocked`, so the arm read it as a wake race and **returned without blocking**
+— leaving the caller marked `Blocked` by whoever completed its mark, and still
+running. `wait_until` then removes its own queue entry, decides its predicate,
+and returns from the wait `Blocked` with nothing left to wake it. That is
+specimen twenty-two's terminal state, down to the completion-path mark one
+event before the decision, `ready`, no entry, one recheck race, and a lap count
+one short of its siblings.
+
+**The two cases are separated now, and only one of them returns.** The caller
+not being `current` is counted as a migration and **retried** — it is running,
+so the next pass re-reads the CPU it is actually on, which is the same
+reasoning `mark_blocked_anywhere` uses when it scans rather than guesses. The
+retry is **bounded at four passes** and giving up is counted separately,
+because an unbounded spin in the blocking path is a hang, which is worse than
+the lost wakeup this closes.
+
+**Armed, and the arming is the whole assurance.** Forcing every `block_self`
+to see one bogus migration produced **7,705** of them, **0 past the retry
+bound**, and the ring gate still read `threads sleep and are woken, no lost
+wakeups`. So the counter fires, the retry recovers, and a thread that sees a
+mismatch blocks on the next pass instead of returning unblocked.
+
+**And the number is the deliverable rather than the fix.** On three ordinary
+boots the window is **not entered at all** — the line does not print. That is
+consistent with a row that runs at 1 in 225 and it is the honest position:
+**the window is closed and the next specimen says whether it was the one.**
+A failing ring boot that also prints `block migrate` confirms the mechanism; a
+failing ring boot that prints nothing says this hole was real and not the one
+behind the defect, which is worth as much.
+
+**Not called fixed.** Twenty-two specimens, one of which fits this; no gate
+can assert the absence of a 1-in-225 event, and the row stays `OPEN`.
+
 ### 2026-09-21 (specimen twenty-two, and it was under a truncation this repository owned)
 
 **The instrument added hours earlier fired on its first CI run, and
