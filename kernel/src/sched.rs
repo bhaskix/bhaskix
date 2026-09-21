@@ -4661,6 +4661,20 @@ static DEFERRED_LOST: AtomicU64 = AtomicU64::new(0);
 /// never woken at all.
 static EVENT_SEQ: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
+/// Takes the next order number, so an instrument **outside** this module can
+/// put its own event into the same sequence as the marks and the wakes.
+///
+/// Added for the ring self-test's predicate stamp. Specimen twenty-one's
+/// contradiction is entirely a question of *which came last*: a station whose
+/// recorded phase implies its predicate returned true is a station that should
+/// have left the wait, and nothing can say whether that evaluation happened
+/// before or after the mark unless the two share a sequence. A second counter
+/// would have answered a different question.
+#[must_use]
+pub fn next_order() -> u64 {
+    next_event()
+}
+
 /// The next order number, for either log.
 fn next_event() -> u64 {
     EVENT_SEQ.fetch_add(1, Ordering::Relaxed) & 0xff_ffff

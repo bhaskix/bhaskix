@@ -28524,6 +28524,17 @@ static TOKEN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new
 /// The queue they all sleep on.
 static RING: wait::WaitQueue = wait::WaitQueue::new();
 
+/// The last predicate decision each station took, and when.
+///
+/// `order << 1 | ready`, one word so the two halves cannot come from
+/// different evaluations. `u64::MAX` means nothing has been recorded.
+static PREDICATE_VERDICT: [core::sync::atomic::AtomicU64; RING_SIZE as usize] = [
+    core::sync::atomic::AtomicU64::new(u64::MAX),
+    core::sync::atomic::AtomicU64::new(u64::MAX),
+    core::sync::atomic::AtomicU64::new(u64::MAX),
+    core::sync::atomic::AtomicU64::new(u64::MAX),
+];
+
 /// Times each ring thread has taken its turn.
 static LAPS: [core::sync::atomic::AtomicU64; 4] = [
     core::sync::atomic::AtomicU64::new(0),
@@ -28608,7 +28619,24 @@ extern "C" fn ring_station(id: u64) -> ! {
             if let Some(slot) = PREDICATE_EVALS.get(id as usize) {
                 slot.fetch_add(1, Ordering::Relaxed);
             }
-            token == id || phase > PHASE_WAIT
+            let ready = token == id || phase > PHASE_WAIT;
+            // **The decision and when it was taken, in one word** — specimen
+            // twenty-one. Its contradiction is that `SEEN_PHASE` said 3, which
+            // makes this expression *true*, while the station stayed blocked;
+            // and nothing could say whether that evaluation came before or
+            // after the mark, because the two were not in the same sequence.
+            //
+            // Packed rather than stored as a pair, so a reader can never see
+            // one from a later evaluation and the other from an earlier one —
+            // which is the class of mistake this whole hunt has been paying
+            // for in instruments that disagreed with each other.
+            if let Some(slot) = PREDICATE_VERDICT.get(id as usize) {
+                slot.store(
+                    (sched::next_order() << 1) | u64::from(ready),
+                    Ordering::Relaxed,
+                );
+            }
+            ready
         });
 
         if PHASE.load(Ordering::Acquire) > PHASE_WAIT {
@@ -29827,10 +29855,24 @@ fn wait_queue_self_test(hhdm_base: u64) -> bool {
                 mark_source = source;
             }
             let seen_phase = SEEN_PHASE[id].load(Ordering::Relaxed);
+            // **The two facts specimen twenty-one could not supply.** What the
+            // predicate last *decided* and when, against the mark's own order;
+            // and whether the ring is actually holding this station's entry,
+            // which is a different claim from the count the retire saw.
+            let verdict = PREDICATE_VERDICT[id].load(Ordering::Relaxed);
+            let (decided, decided_at) = if verdict == u64::MAX {
+                ("none", 0)
+            } else if verdict & 1 == 1 {
+                ("ready", verdict >> 1)
+            } else {
+                ("waiting", verdict >> 1)
+            };
+            let queued = RING.holds(spawned[id]);
             println!(
                 "\x1b[91m                   {name} (thread {}) {state}, {} laps, last saw token \
                  {} at phase {}, {} predicate evaluations; recent wakes: {woken} landed, {missed} \
-                 not found, {busy} contended, {} migration(s); last wake {}, last mark \
+                 not found, {busy} contended, {} migration(s); last decided {decided} at \
+                 #{decided_at}, {} in the ring; last wake {}, last mark \
                  #{last_mark} by {}\x1b[0m",
                 spawned[id],
                 LAPS[id].load(Ordering::Relaxed),
@@ -29864,6 +29906,11 @@ fn wait_queue_self_test(hhdm_base: u64) -> bool {
                 // is no longer in any queue, which is what a retired station
                 // looks like.
                 sched::migrations_of(spawned[id]).map_or(-1, |count| count as i64),
+                // **Whether the ring is holding *this* station's entry**, which
+                // is not what the retire's count says. Specimen twenty-one had
+                // `wake_all` find two entries and a third station blocked, and
+                // nothing could name which of those facts to doubt.
+                if queued { "entry held" } else { "no entry" },
                 // **`nothing recorded`, never a bare zero.** This was derived
                 // from a thirty-two entry ring covering the whole machine, so a
                 // station whose wake was older than about sixty events had no

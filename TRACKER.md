@@ -1010,6 +1010,42 @@ the distinction is in the table rather than in somebody's head.
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-09-21 (the instrument specimen twenty-one asked for, built and armed)
+
+**The next step that entry named, rather than a fifth theory.** Specimen
+twenty-one's contradiction is that `SEEN_PHASE` read 3, which makes the
+station's predicate `token == id || phase > PHASE_WAIT` **true** — so
+`wait_until` returned and the station should have reached `sched::exit()` —
+while the station was a live `Blocked` thread whose queue entry the retire's
+`wake_all` did not find. Nothing could say which of those numbers to doubt.
+
+**Two facts were missing and are now printed per station.**
+
+*What the predicate last decided, and when.* The decision is stamped with
+`sched::next_order()` — the **same** sequence the marks and wakes already use,
+because the whole question is which came last and a second counter would have
+answered a different one. Packed into one word as `order << 1 | ready`, so a
+reader can never take the verdict from one evaluation and the order from
+another; instruments disagreeing with each other is what this hunt has been
+paying for.
+
+*Whether the ring is holding that station's entry.* `WaitQueue::holds` — which
+is not the fact the retire's count gives. "The retire found two entries" and
+"this station's entry is absent" are different claims, and twenty-one needed
+the second.
+
+**Armed by making one station's predicate permanently false**, which caught it
+asleep and read: `last decided waiting at #20, entry held in the ring; last
+wake #16, last mark #21 by itself`. Decision before the mark, entry present —
+the coherent picture, against which an incoherent one can now be recognised.
+
+**What the next specimen must say.** Either `last decided ready` with `no
+entry`, which proves the station decided to leave and is blocked anyway and
+sends the hunt to `exit` and the scheduler; or `last decided waiting` beside a
+`SEEN_PHASE` of 3, which proves `SEEN_PHASE` does not belong to the deciding
+evaluation and sends it to the store ordering in the closure. Those are
+different bugs, and until now nothing separated them.
+
 ### 2026-09-21 (the LACP lane failed once, and it is a lane CI never runs)
 
 **One failure, on the full suite, at `test-lacp`:** `net domain FAILED:

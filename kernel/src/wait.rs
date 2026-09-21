@@ -279,6 +279,27 @@ impl WaitQueue {
         }
     }
 
+    /// Whether this queue currently holds an entry for `thread`.
+    ///
+    /// **A question no instrument could ask until 2026-09-21.** Specimen
+    /// twenty-one showed a station `Blocked` whose entry the retire's
+    /// `wake_all` did not find, and the report could say the *count* of
+    /// entries the retire saw but not whether a particular station was among
+    /// them. Those are different facts: a queue holding two entries and a
+    /// queue holding this station's are not the same claim.
+    ///
+    /// Takes the lock, so it is a reporting call rather than something a hot
+    /// path may use.
+    #[must_use]
+    pub fn holds(&self, thread: u32) -> bool {
+        let waiters = self.waiters.lock();
+        waiters
+            .entries
+            .iter()
+            .flatten()
+            .any(|entry| entry.id == thread)
+    }
+
     /// Wakes every sleeper. Returns how many were actually blocked.
     ///
     /// The caller must have published whatever the waiters test *before*
