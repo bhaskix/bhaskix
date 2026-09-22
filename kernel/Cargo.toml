@@ -870,7 +870,15 @@ asm_budget = 10
 # Nothing about the machine got safer; what changed is that the number stopped
 # counting arithmetic. Lowered rather than left slack, because a budget with
 # room in it stops being the thing that makes growth visible.
-unsafe_budget = 2050
+# 2060 for RFC 0084, and every one of the ten is a frame reached through the
+# direct map. Six copy a page from one domain's frame into another's, which is
+# the whole mechanism -- the alternative is the `COPY_IN`/`COPY_OUT` pair it
+# replaces, at 213,404 cycles a page against 140. Two map a single page into a
+# region already in the map, which is the same `map_page` call every other
+# mapping path here makes. Two are the boot self-test writing a pattern into
+# the source's page and reading it back out of the child's, which is the
+# property being proved and cannot be proved without touching both frames.
+unsafe_budget = 2060
 # Up thirty-one for RFC 0005 step 9's socket probe -- `ring3_socketeer`, which
 # is `ring3_lister` with a `sockaddr_in6` copied in beside its code instead of
 # two filenames. The same two blocks every hosted probe has: one

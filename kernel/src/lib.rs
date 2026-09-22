@@ -390,6 +390,15 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
         println!("\x1b[91m    envelope       FAILED\x1b[0m");
     }
 
+    // **And whether a domain can be given a copy of another's memory** — RFC
+    // 0084. Next, because it is built on both of the above: the region map is
+    // what it walks, and the envelope is what charges the receiver. The
+    // property it proves is the one a hosted `fork` could not have — a page
+    // the parent mapped, present in a child that never asked for it.
+    if !vm::copy_space_self_test(handoff.hhdm_base.as_u64()) {
+        println!("\x1b[91m    copy space     FAILED\x1b[0m");
+    }
+
     // **The disclosure staged, on every boot.** `shared::create` allocated
     // frames without zeroing them until 2026-08-26, so an object handed to a
     // ring 3 service carried whatever its frames held before. This writes a
@@ -7280,37 +7289,45 @@ const FORK_PROBE_CODE_AT: u64 = 0x0000_0000_1500_0000;
 /// page, writes eight bytes into it, forks, and yields; the child prints what
 /// is at that address in **its own** address space.
 ///
-/// The `mmap` is not decoration: a fork copies the regions the *personality*
-/// knows about, and the personality knows about a region because it answered
-/// the `mmap` that made it. This probe's code and stack were mapped by the
-/// kernel before it ran, so they are invisible to the adapter and are not
-/// copied — which is exactly right for a program the kernel starts by hand,
-/// and would be wrong for one an `execve` built. Stated here because the first
-/// version of this probe wrote its marker into a kernel-mapped page and the
-/// record honestly said `0 bytes copied`. A fork that made a domain and
-/// started a thread but copied nothing would print eight zeros; one that
-/// shared the page rather than copying it would be a different bug with the
-/// same output, which is why the child writes and the parent does not.
+/// A fork that made a domain and started a thread but copied nothing would
+/// print eight zeros; one that shared the page rather than copying it would be
+/// a different bug with the same output, which is why the child writes and the
+/// parent does not.
+///
+/// **This doc block said the opposite until 2026-09-23, and the opposite was
+/// true when it was written.** It said the `mmap` was not decoration, because
+/// a fork copied the regions the *personality* knew about and the personality
+/// knew a region because it answered the `mmap` that made it — so this probe's
+/// kernel-mapped code and stack were invisible to the adapter and were *not*
+/// copied, "which is exactly right for a program the kernel starts by hand".
+/// It was not right. It was the defect
+/// [RFC 0084](../../docs/rfc/0084-a-fork-the-kernel-copies.md) removes: the
+/// kernel copies the address space, so the child gets its parent's code and
+/// stack whoever mapped them. The `mmap` is now decoration in the sense that
+/// the marker page need not be one — it is kept because the marker has to be
+/// somewhere and this is where the probe already writes it.
 ///
 /// The child is entered through a trampoline `bin/linuxd` writes, so `rax` is
 /// zero there and the parent sees the child's pid — the one branch this blob
 /// takes.
 ///
-/// **The probe forks from memory it mapped itself, and that is the whole
-/// shape of what a fork can copy.** A fork copies the regions the
-/// *personality* knows about, and the personality knows a region because it
-/// answered the `mmap` that made it. This probe's own code and stack were
-/// mapped by the kernel before it ran, so they are invisible to the adapter —
-/// and a child whose `rip` pointed into them would jump into memory its space
-/// does not have. So the probe maps a page, **writes the forking routine into
-/// it eight bytes at a time**, makes it executable, maps a second page for the
-/// data, and jumps in. Everything the child needs is then a region the adapter
-/// recorded.
+/// **The probe maps a page, writes the forking routine into it eight bytes at a
+/// time, makes it executable, maps a second page for the data, and jumps in.**
+/// That contortion exists because of the defect RFC 0084 removed: until
+/// 2026-09-23 a child whose `rip` pointed into kernel-mapped code jumped into
+/// memory its space did not have, so everything the child needed had to be a
+/// region the adapter had recorded. Two earlier versions failed exactly there:
+/// the first wrote its marker into a kernel-mapped page and the record
+/// honestly said `0 bytes copied`; the second copied the page but left the
+/// child jumping into code its space did not contain, and the fault counter
+/// went up by one.
 ///
-/// Two earlier versions of this probe failed exactly there: the first wrote
-/// its marker into a kernel-mapped page and the record honestly said `0 bytes
-/// copied`; the second copied the page but left the child jumping into code
-/// its space did not contain, and the fault counter went up by one.
+/// **It is kept, and deliberately.** A probe that runs from a page it mapped
+/// itself still proves what it proved, and it is now the *harder* case rather
+/// than the only one — the child inherits both this page and the kernel-mapped
+/// code it does not use, and the gate counts both. Rewriting 447 bytes of
+/// hand-assembled machine code to prove the easier case would trade a working
+/// witness for a simpler story.
 ///
 /// **Both addresses are constants**, because a child arrives with `rax`, its
 /// stack pointer and its instruction pointer and *nothing else* — the parent's
@@ -9224,7 +9241,14 @@ fn fork_self_test(hhdm_base: u64, cpus: u32) -> bool {
         return false;
     }
     let mut ended = false;
+    // **The most the parent's own space ever held, sampled while it runs.**
+    // Read once at the end it would be zero: the probe's last thread exiting
+    // ends the domain, which takes its ledger with it. What the copy is
+    // measured against is what the parent had *while it had it*.
+    let mut parent_frames = 0;
     for _ in 0..400 {
+        parent_frames =
+            parent_frames.max(domain::frames_charged(realm).map_or(0, |(held, _)| held));
         if sched::threads_counted_in(realm.as_u32()) == 0 {
             ended = true;
             break;
@@ -9234,17 +9258,28 @@ fn fork_self_test(hhdm_base: u64, cpus: u32) -> bool {
     retire_probe(realm);
 
     let (pid, copied) = adapter_fork_record();
-    let right = ended && pid > 0 && copied > 0;
+    // **Four pages, not two** — RFC 0084, and the number is the property. Two
+    // of them are the pages this probe `mmap`'d, which is all a fork could
+    // copy before: the adapter copied the regions *it* remembered, and it
+    // remembers a region because it answered the `mmap` that made it. The
+    // other two are the probe's code and its stack, mapped by the kernel
+    // before it ran and invisible to the adapter for ever. The child now has
+    // them because the kernel copies the space rather than the supervisor
+    // copying its own notes about it. This read 8,192 until 2026-09-23.
+    const INHERITED: u64 = 4 * 4096;
+    let right = ended && pid > 0 && copied >= INHERITED;
     if right {
         println!(
             "    linux fork     a Linux program forked: the child is pid {pid}, {copied} bytes of \
-             its parent's memory were copied into it a kilobyte at a time, and the child printed \
-             what its parent had written there"
+             its parent's memory came with it -- including the code and stack the kernel mapped, \
+             which no supervisor ever saw -- out of the {parent_frames} frame(s) the parent held, \
+             and the child printed what its parent had written there"
         );
     } else {
         println!(
             "\x1b[91m    linux fork     FAILED: ended {ended}, child pid {pid}, {copied} bytes \
-             copied\x1b[0m"
+             copied of the {parent_frames} frame(s) the parent held, wanted at least \
+             {INHERITED}\x1b[0m"
         );
     }
     right

@@ -2840,6 +2840,20 @@ const FORK_NAME_LOW: u64 = u64::from_le_bytes(*b"forked\0\0");
 /// [RFC 0079](../../../docs/rfc/0079-a-signal-a-process-may-send-another.md).
 const FORK_TRAMPOLINE_AT: u64 = 0x0000_0000_3000_0000;
 
+/// How far the trampoline may be moved when the child already has that page.
+///
+/// A stride rather than a page, because what is in the way is a *region* —
+/// after [RFC 0084](../../../docs/rfc/0084-a-fork-the-kernel-copies.md) the
+/// child holds everything its parent did, and stepping a page at a time
+/// through a megabyte of inherited program image would be a thousand refused
+/// invocations to discover something the first one already implied. Two
+/// megabytes for thirty-two tries covers the 64 MiB above
+/// [`FORK_TRAMPOLINE_AT`], which is entirely below the `mmap` window and above
+/// every fixed address this program maps into a hosted domain.
+const FORK_TRAMPOLINE_STRIDE: u64 = 0x20_0000;
+/// How many strides are tried before a fork gives up and says `ENOMEM`.
+const FORK_TRAMPOLINE_TRIES: u32 = 32;
+
 /// `execve(path, argv, envp)`.
 const EXECVE: u64 = 59;
 /// The authority to create a domain, granted at boot — RFC 0033 step 5.
@@ -6395,40 +6409,41 @@ fn build_fork_child(request: &PersonalityCall, rip: u64, rsp: u64) -> Option<u64
     if call(syscall::INVOKE, CHILD, method::PERSONALITY, [1, 0, 0, 0]).status != status::OK {
         return None;
     }
-    if call(syscall::INVOKE, CHILD, method::MAKE_SPACE, [0; 4]).status != status::OK {
+
+    // **The kernel copies the space** — RFC 0084. `MAKE_SPACE` and the region
+    // walk that followed it are gone, and with them the defect that walk had:
+    // it copied the regions *this program remembers*, which is only what it
+    // answered `mmap` for. `execve` maps a program's segments and its stack
+    // with `map_at_eager` and records neither, and a hosted program the kernel
+    // started has its whole layout mapped where this program never sees it. So
+    // a child was forked without its code and without its stack, which is why
+    // every hosted probe here has had to `mmap` a page for its child to run
+    // out of.
+    //
+    // The kernel has the source's region map and reaches both sets of frames
+    // through the direct map: 140 cycles a page against 213,404 through the
+    // `COPY_IN`/`COPY_OUT` pair this replaces, measured on this boot before a
+    // line of it was written.
+    let parent = handle_of(request.domain);
+    if parent == NO_HANDLE {
         return None;
     }
-
-    let mut copied = 0u64;
-    let process = process_for(request.domain)?;
-    let regions = process.regions;
-    let parent = request.domain;
-    for region in regions.iter().flatten() {
-        if !map_at_eager(CHILD, region.at, region.pages, region.protection) {
-            return None;
-        }
-        // A kilobyte at a time, because that is what the scratch object holds
-        // and what one `COPY_IN` may move. Two invocations per kilobyte is the
-        // price stage two exists to argue with.
-        let bytes = region.pages * 4096;
-        let mut moved = 0;
-        while moved < bytes {
-            let take = (bytes - moved).min(SCRATCH_BYTES) as usize;
-            let mut chunk = [0u8; SCRATCH_BYTES as usize];
-            if !copy_in(parent, region.at + moved, &mut chunk[..take]) {
-                // A region with a hole in it -- a lazily mapped page nothing
-                // has touched -- is not an error: there is nothing there to
-                // copy, and the child's own page is already zero.
-                moved += take as u64;
-                continue;
-            }
-            if !copy_out_through(CHILD, region.at + moved, &chunk[..take]) {
-                return None;
-            }
-            moved += take as u64;
-            copied += take as u64;
-        }
+    let done = call(
+        syscall::INVOKE,
+        CHILD,
+        method::COPY_SPACE,
+        [parent, 0, 0, 0],
+    );
+    if done.status != status::OK {
+        return None;
     }
+    // Frames in the low thirty-two, regions above them, skipped at the top.
+    // The bytes are what step 8 asks for and the only one of the three this
+    // program has a word to report — `report::FORK_WORDS` is 2, and widening
+    // it moves every record after it. The regions and the skips are gated in
+    // the kernel, on the boot's own `copy space` self-test, which is where the
+    // policy they describe lives.
+    let copied = (done.args[0] & 0xffff_ffff) * 4096;
 
     // The trampoline: `xor eax, eax; movabs rcx, rip; jmp rcx`, in a page of
     // the child's own memory. Three instructions rather than a kernel method
@@ -6442,13 +6457,24 @@ fn build_fork_child(request: &PersonalityCall, rip: u64, rsp: u64) -> Option<u64
     code[4..12].copy_from_slice(&rip.to_le_bytes());
     code[12] = 0xff;
     code[13] = 0xe1; // jmp rcx
-    // Somewhere the child does not already have. The regions are the parent's,
-    // which is exactly right: the child's space holds copies of those and the
-    // trampoline, and nothing else.
-    let trampoline = process_for(request.domain)?.free_page(FORK_TRAMPOLINE_AT)?;
-    if !map_at_eager(CHILD, trampoline, 1, PROT_READ_EXECUTE)
-        || !copy_out_through(CHILD, trampoline, &code)
-    {
+    // Somewhere the child does not already have — and after RFC 0084 the child
+    // has **everything its parent had**, including the regions this program
+    // never recorded. `free_page` consults the regions this program remembers
+    // and is therefore a starting point rather than an answer; the kernel's
+    // refusal is the authority, and a refused address is stepped over rather
+    // than turned into an `ENOMEM` naming nothing the caller can act on. That
+    // failure has happened once here already, when this address was a constant
+    // a hosted `MAP_FIXED` could take.
+    let mut trampoline = process_for(request.domain)?.free_page(FORK_TRAMPOLINE_AT)?;
+    let mut placed = false;
+    for _ in 0..FORK_TRAMPOLINE_TRIES {
+        if map_at_eager(CHILD, trampoline, 1, PROT_READ_EXECUTE) {
+            placed = true;
+            break;
+        }
+        trampoline = trampoline.checked_add(FORK_TRAMPOLINE_STRIDE)?;
+    }
+    if !placed || !copy_out_through(CHILD, trampoline, &code) {
         return None;
     }
     let started = call(

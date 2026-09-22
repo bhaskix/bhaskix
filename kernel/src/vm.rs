@@ -950,6 +950,71 @@ impl AddressSpace {
         Ok(())
     }
 
+    /// Puts one frame behind one page of a region already in the map.
+    ///
+    /// For [`copy_space`], which registers each region lazily and then
+    /// materialises only the pages the source actually has. The alternative —
+    /// mapping every region eagerly — charges a child for every page its
+    /// parent reserved and never touched, which for a program that reserves a
+    /// heap and uses a corner of it is most of them.
+    ///
+    /// **The frame is not zeroed**, and that is a contract rather than an
+    /// optimisation: the only caller overwrites all 4,096 bytes of it
+    /// immediately. Any second caller must do the same or zero it, because a
+    /// frame reaching another domain with somebody's bytes still in it is a
+    /// disclosure, and `docs/memory.md` §2 puts zeroing on allocation for
+    /// exactly that reason.
+    ///
+    /// # Errors
+    ///
+    /// [`VmError::MemoryEnvelopeExceeded`] if the owner cannot pay for the
+    /// page, [`VmError::OutOfMemory`] if no frame can be had, and
+    /// [`VmError::Paging`] if the page table will not hold it. Every failing
+    /// path gives the charge back and leaves nothing mapped.
+    fn populate_page(&mut self, page: VirtAddr, protection: Protection) -> Result<u64, VmError> {
+        // Charged before the frame is taken, as everywhere else (RFC 0082).
+        if self.charge(1).is_err() {
+            return Err(VmError::MemoryEnvelopeExceeded);
+        }
+        let root = self.root;
+        let hhdm = self.hhdm_base;
+
+        let outcome = heap::with(|heap| {
+            let pmm = heap.pmm_mut();
+            let Ok(pfn) = pmm.allocate(0, Zone::Normal) else {
+                return Err(VmError::OutOfMemory);
+            };
+            let physical = u64::from(pfn) * FRAME_SIZE;
+            let entry = Self::entry_flags(protection, page.as_u64());
+            // Outside the block, as `map_anonymous` does it: safe bookkeeping
+            // does not belong in the `unsafe` budget.
+            let mut level = || {
+                pmm.allocate(0, Zone::Normal).ok().map(|pfn| {
+                    note_page_table_frame();
+                    u64::from(pfn) * FRAME_SIZE
+                })
+            };
+            // SAFETY: `root` is this space's PML4, `hhdm` the direct map base,
+            // and the space is not installed on any CPU — it is being built
+            // for a domain that has no threads.
+            let mapped =
+                unsafe { paging::map_page(root, page.as_u64(), physical, entry, hhdm, &mut level) };
+            match mapped {
+                Ok(_) => Ok(physical),
+                Err(error) => {
+                    let _ = pmm.free(pfn, 0);
+                    Err(VmError::Paging(error))
+                }
+            }
+        })
+        .unwrap_or(Err(VmError::NoAllocator));
+
+        if outcome.is_err() {
+            self.release(1);
+        }
+        outcome
+    }
+
     /// Changes the protection of the region containing `start` — Linux's
     /// `mprotect`, RFC 0005 step 8's first call.
     ///
@@ -1131,6 +1196,172 @@ pub unsafe fn install(mut space: AddressSpace) {
             crate::domain::record_space_root(domain, root);
         }
     }
+}
+
+/// What copying one address space into another did.
+///
+/// [RFC 0084](../../docs/rfc/0084-a-fork-the-kernel-copies.md). Three numbers
+/// rather than a bare success, because *"the child has a copy"* and *"the
+/// child has a copy of everything that could be copied"* are different claims
+/// and a fork whose child quietly lacks a mapping is the failure this exists
+/// to remove.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Copied {
+    /// Regions reproduced with their contents.
+    pub regions: u64,
+    /// Frames whose bytes were moved through the direct map.
+    pub frames: u64,
+    /// Regions deliberately not reproduced: those whose pages belong to
+    /// somebody else. See [`copy_space`].
+    pub skipped: u64,
+}
+
+/// Copies every region of the space rooted at `from` into a new space for
+/// `to`, and registers it.
+///
+/// [RFC 0084](../../docs/rfc/0084-a-fork-the-kernel-copies.md). **The pages
+/// move through the direct map, which is the whole point**: a page costs 140
+/// cycles here against 213,404 through `COPY_OUT`, so an adapter copying an
+/// address space a kilobyte at a time was paying a factor of 1,524 for the
+/// crossing rather than for the bytes.
+///
+/// # What is copied, and what is deliberately not
+///
+/// - [`Backing::Anonymous`] is reproduced and its bytes copied.
+/// - [`Backing::Reserved`] is reproduced with nothing behind it, because a
+///   guard page that is not there is not a guard.
+/// - [`Backing::Shared`] is **skipped**. Those frames belong to a `Memory`
+///   object, and the target holds no capability naming it; reproducing the
+///   mapping would hand it memory nobody granted, which is manufacturing
+///   authority rather than copying an address space.
+/// - [`Backing::Direct`] is **skipped**, for the same reason one step along:
+///   device registers are not the target's to have.
+///
+/// Both skips are counted and reported rather than silent.
+///
+/// # Errors
+///
+/// [`VmError`] as [`AddressSpace::map_anonymous`] gives it — including
+/// [`VmError::MemoryEnvelopeExceeded`], because the target is charged for what
+/// it receives (RFC 0082) and a copy it cannot afford is refused rather than
+/// half-made.
+pub fn copy_space(
+    from: u64,
+    to: crate::domain::DomainId,
+    hhdm_base: u64,
+) -> Result<Copied, VmError> {
+    // The source's regions, taken out before anything else is touched: the
+    // space table's lock may not be held while the target's space is built,
+    // and a borrow of the source would hold it.
+    let Some(plan) = with_space(from, |space| {
+        space
+            .regions()
+            .iter()
+            .copied()
+            .collect::<alloc::vec::Vec<_>>()
+    }) else {
+        return Err(VmError::Region(RangeMapError::NotFound));
+    };
+
+    let mut space = AddressSpace::new(hhdm_base)?;
+    // Owned **before** anything is mapped, so every frame below is charged to
+    // the target rather than to nobody. Getting this order wrong is what RFC
+    // 0082 records costing 936 uncharged frames a boot.
+    space.own(to);
+
+    // The walk is its own function so that **a failure half way through tears
+    // the space down**. `map_anonymous` unwinds its own call, which is not the
+    // same thing: a copy refused on its third region has two mapped, and an
+    // `AddressSpace` has no `Drop` — dropping one leaks every frame in it and
+    // leaves the target charged for memory it does not have.
+    let done = match copy_regions(from, &plan, &mut space, hhdm_base) {
+        Ok(done) => done,
+        Err(error) => {
+            space.destroy();
+            return Err(error);
+        }
+    };
+
+    if register_for(to, space).is_none() {
+        return Err(VmError::OutOfMemory);
+    }
+    Ok(done)
+}
+
+/// The region walk of [`copy_space`], separated so its caller can tear down a
+/// half-built space. See there for what is copied and what is refused.
+fn copy_regions(
+    from: u64,
+    plan: &[VmRegion],
+    space: &mut AddressSpace,
+    hhdm_base: u64,
+) -> Result<Copied, VmError> {
+    let mut done = Copied::default();
+
+    for region in plan {
+        match region.backing {
+            Backing::Shared { .. } | Backing::Direct { .. } => {
+                done.skipped += 1;
+                continue;
+            }
+            Backing::Reserved => {
+                // Reproduced exactly, with nothing behind it. Not through
+                // `map_anonymous`, which would record it as anonymous: a
+                // guard that reads back as ordinary memory is a guard the
+                // next reader of this map cannot tell from a mapping.
+                space
+                    .regions
+                    .insert(VmRegion::new(
+                        region.range,
+                        region.protection,
+                        Backing::Reserved,
+                    ))
+                    .map_err(VmError::Region)?;
+                done.regions += 1;
+                continue;
+            }
+            Backing::Anonymous => {}
+        }
+
+        // **Lazily, then page by page for what the source actually holds.**
+        // The region map is the authority, and a region records a range the
+        // source *may* touch; mapping all of it would charge the target for
+        // every page its parent reserved and never used.
+        space.map_anonymous_lazy(region.range, region.protection)?;
+        done.regions += 1;
+        if !region.protection.present() {
+            // A guard the source built through `map_anonymous`: recorded
+            // anonymous, present in neither page table. Nothing to copy.
+            continue;
+        }
+
+        for page in region.range.pages_iter() {
+            // No frame in the source means the source has never touched the
+            // page, and a page the target has not been given reads as the
+            // same zero when it first faults. Skipping is not an
+            // optimisation: there is nothing there to copy.
+            let Some(source_frame) = with_space(from, |s| s.translate(page)).flatten() else {
+                continue;
+            };
+            let target_frame = space.populate_page(page, region.protection)?;
+            // SAFETY: both frames are page-aligned and reachable through the
+            // direct map. They are distinct: the target's came from the
+            // allocator a moment ago with nothing else referring to it, and
+            // the source's belongs to a space this call only reads. Exactly
+            // one page is written, which is also why `populate_page` may hand
+            // back a frame it did not zero.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    (hhdm_base + source_frame) as *const u8,
+                    (hhdm_base + target_frame) as *mut u8,
+                    PAGE_SIZE as usize,
+                );
+            }
+            done.frames += 1;
+        }
+    }
+
+    Ok(done)
 }
 
 /// Puts a space in the table for a domain that is **not** the caller's, and
@@ -1645,6 +1876,215 @@ pub fn supervisor_write_self_test(hhdm_base: u64) -> bool {
     true
 }
 
+/// Proves that copying an address space reproduces what the target never
+/// mapped, and refuses what is not the target's to have.
+///
+/// [RFC 0084](../../docs/rfc/0084-a-fork-the-kernel-copies.md). The property
+/// is the one a `fork` could not have before: a page the **source** mapped,
+/// with the source's own bytes in it, present in a space the target never
+/// asked for. Everything else here is the refusals.
+///
+/// Returns whether every property held.
+pub fn copy_space_self_test(hhdm_base: u64) -> bool {
+    use crate::domain::{self, ResourceEnvelope};
+
+    // Deliberately far from anything bring-up maps.
+    const AT: u64 = 0x0000_0000_7000_0000;
+    const GUARD: u64 = 0x0000_0000_7010_0000;
+    const SHARED: u64 = 0x0000_0000_7020_0000;
+    const LAZY: u64 = 0x0000_0000_7030_0000;
+    const LAZY_PAGES: u64 = 4;
+    const PATTERN: u64 = 0x5061_6765_5f63_6f70; // "Page_cop"
+
+    let baseline = heap::available_frames();
+
+    let (Ok(parent), Ok(child), Ok(pauper)) = (
+        domain::create("copyfrom", ResourceEnvelope::new()),
+        domain::create("copyto", ResourceEnvelope::new()),
+        // One frame short of the one page the source holds, so the refusal
+        // below is the envelope's and not the allocator's.
+        domain::create("copypoor", ResourceEnvelope::new().memory_frames(0)),
+    ) else {
+        crate::println!("\x1b[91m    copy space     FAILED: no domains\x1b[0m");
+        return false;
+    };
+    let mut wrong: Option<&str> = None;
+
+    // The source, built the way a program's own space is: one written page,
+    // one guard, one region whose frames belong to somebody else, and one
+    // region reserved and never touched.
+    let built = (|| -> Option<()> {
+        let mut space = AddressSpace::new(hhdm_base).ok()?;
+        space.own(parent);
+
+        space
+            .map_anonymous(
+                VirtRange::from_pages(VirtAddr(AT), 1)?,
+                Protection::ReadWrite,
+            )
+            .ok()?;
+        space
+            .map_anonymous(VirtRange::from_pages(VirtAddr(GUARD), 1)?, Protection::None)
+            .ok()?;
+        let frame = space.translate(VirtAddr(AT))?;
+        // SAFETY: the frame was just mapped into a space nothing else holds,
+        // and is reachable through the direct map.
+        unsafe { core::ptr::write_volatile((hhdm_base + frame) as *mut u64, PATTERN) };
+
+        // Pointed at the page above rather than at a frame of its own. That
+        // makes the mapping real without a `Memory` object, and nothing is
+        // freed twice: `AddressSpace::destroy` frees leaf frames for
+        // anonymous regions only, which is the same rule this copy follows.
+        space
+            .map_shared(
+                VirtRange::from_pages(VirtAddr(SHARED), 1)?,
+                0xffff_ffff,
+                &[frame],
+                Protection::ReadWrite,
+            )
+            .ok()?;
+
+        space
+            .map_anonymous_lazy(
+                VirtRange::from_pages(VirtAddr(LAZY), LAZY_PAGES)?,
+                Protection::ReadWrite,
+            )
+            .ok()?;
+
+        register_for(parent, space)?;
+        Some(())
+    })();
+    let Some(()) = built else {
+        crate::println!("\x1b[91m    copy space     FAILED to build the source\x1b[0m");
+        domain::destroy(parent);
+        domain::destroy(child);
+        domain::destroy(pauper);
+        return false;
+    };
+
+    let from = domain::space_root_of(parent).unwrap_or(0);
+
+    // --- the refusal first, because it must leave nothing behind ----------
+    let before_refusal = heap::available_frames();
+    match copy_space(from, pauper, hhdm_base) {
+        Err(VmError::MemoryEnvelopeExceeded) => {}
+        Err(_) => {
+            wrong = Some("a copy past the target's envelope was refused for the wrong reason")
+        }
+        Ok(_) => wrong = Some("a copy past the target's envelope was allowed"),
+    }
+    if wrong.is_none() {
+        if domain::frames_charged(pauper).is_some_and(|(held, _)| held != 0) {
+            wrong = Some("a refused copy left the target charged");
+        } else if heap::available_frames() != before_refusal {
+            wrong = Some("a refused copy left frames taken");
+        } else if domain::space_root_of(pauper).is_some() {
+            wrong = Some("a refused copy left the target holding a space");
+        }
+    }
+
+    // --- then the copy that is meant to work ------------------------------
+    let done = if wrong.is_some() {
+        Copied::default()
+    } else {
+        match copy_space(from, child, hhdm_base) {
+            Ok(done) => done,
+            Err(_) => {
+                wrong = Some("the copy was refused");
+                Copied::default()
+            }
+        }
+    };
+
+    let root = domain::space_root_of(child).unwrap_or(0);
+    let at = with_space(root, |space| space.translate(VirtAddr(AT))).flatten();
+
+    // **The property**: the child holds a page its parent mapped, with its
+    // parent's bytes in it, having never asked for anything.
+    if wrong.is_none() {
+        match at {
+            None => wrong = Some("the child did not receive a page its parent mapped"),
+            Some(frame) => {
+                // SAFETY: a frame the copy mapped into the child's space a
+                // moment ago, reachable through the direct map.
+                let value = unsafe { core::ptr::read_volatile((hhdm_base + frame) as *const u64) };
+                if value != PATTERN {
+                    wrong = Some("the child received the page without its parent's bytes");
+                }
+            }
+        }
+    }
+
+    // A copy, not the same frame: writing through the child must not be
+    // visible to the parent, which is what makes this a `fork` rather than a
+    // share.
+    if wrong.is_none()
+        && let Some(frame) = at
+        && with_space(from, |space| space.translate(VirtAddr(AT)))
+            .flatten()
+            .is_some_and(|source| source == frame)
+    {
+        wrong = Some("the child was given the parent's own frame rather than a copy");
+    }
+
+    // The refusals, each read off the child's space.
+    let holds = |address: u64| {
+        with_space(root, |space| space.translate(VirtAddr(address)))
+            .flatten()
+            .is_some()
+    };
+    if wrong.is_none() && holds(GUARD) {
+        wrong = Some("a guard page was reproduced with a frame behind it");
+    }
+    if wrong.is_none() && holds(SHARED) {
+        wrong = Some("a region belonging to a memory object was reproduced");
+    }
+    if wrong.is_none() && holds(LAZY) {
+        wrong = Some("a page the source had reserved and never touched was materialised");
+    }
+    if wrong.is_none()
+        && with_space(root, |space| space.regions().find(VirtAddr(LAZY)).is_none()).unwrap_or(true)
+    {
+        wrong = Some("a region the source had reserved was not reproduced at all");
+    }
+
+    // And the counts say so rather than the copy being quietly short.
+    if wrong.is_none() && (done.frames, done.regions, done.skipped) != (1, 3, 1) {
+        wrong = Some("the copy reported a shape the source did not have");
+    }
+
+    // Charged to the child, by RFC 0082, for exactly the frame it received.
+    if wrong.is_none() && domain::frames_charged(child).is_some_and(|(held, _)| held == 0) {
+        wrong = Some("the child was not charged for the frame it received");
+    }
+
+    // --- and it is put down the way a domain's space is ------------------
+    // `forget` and not `destroy`, because that is what `domain::end` does and
+    // for the reason it states: the frames are **not** freed, since destroying
+    // a space needs every CPU moved off its root first. So the cost is
+    // reported below rather than asserted back to baseline — the same claim
+    // `supervisor_write_self_test` makes, and the only honest one here.
+    for (domain, its_root) in [(parent, from), (child, root)] {
+        if its_root != 0 {
+            forget(its_root);
+        }
+        domain::destroy(domain);
+    }
+    domain::destroy(pauper);
+
+    if let Some(what) = wrong {
+        crate::println!("\x1b[91m    copy space     FAILED: {what}\x1b[0m");
+        return false;
+    }
+    let (regions, frames, skipped) = (done.regions, done.frames, done.skipped);
+    let spent = baseline.saturating_sub(heap::available_frames());
+    crate::println!(
+        "    copy space     a domain received {regions} region(s) and {frames} frame(s) it never \
+         mapped, its parent's bytes intact, the guard still a guard, {skipped} region(s) skipped \
+         as somebody else's, an envelope of nothing refused; {spent} frames spent"
+    );
+    true
+}
 /// Proves that a domain's **own memory** is charged to its envelope, and that
 /// the envelope refuses — [RFC 0082](../../docs/rfc/0082-a-domains-own-memory-is-its-own.md).
 ///

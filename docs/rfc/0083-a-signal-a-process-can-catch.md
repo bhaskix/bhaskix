@@ -271,6 +271,16 @@ predicts.
    got right is that recording `execve`'s regions and copying them through the
    adapter is not the way; what it got wrong is the reason.
 
+   **Answered on 2026-09-23 by
+   [RFC 0084](0084-a-fork-the-kernel-copies.md)**, which is where this entry
+   now continues. `COPY_SPACE` on a `Domain` capability copies the address
+   space in the kernel, `bin/linuxd`'s `fork` calls it, and the hosted fork
+   gate's byte count went from 8,192 to 16,384 — the four frames the probe's
+   parent held, two of which the adapter has never seen. A forked child gets
+   its parent's code and its parent's stack. The page a probe's child is
+   handed to stand on is no longer necessary, and the probes that hand one are
+   kept because they still prove what they proved.
+
 ## Implementation plan
 
 1. ✅ **The pending set** — `personality::signal`, host-tested, inert.

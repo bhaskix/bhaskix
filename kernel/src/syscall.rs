@@ -145,6 +145,7 @@ const _: () = {
     assert!(method::SPAWN_THREAD == bhaskix_abi::method::SPAWN_THREAD);
     assert!(method::SET_TLS == bhaskix_abi::method::SET_TLS);
     assert!(method::MAKE_SPACE == bhaskix_abi::method::MAKE_SPACE);
+    assert!(method::COPY_SPACE == bhaskix_abi::method::COPY_SPACE);
     assert!(method::GRANT == bhaskix_abi::method::GRANT);
     assert!(method::BIND == bhaskix_abi::method::BIND);
     assert!(method::RELEASE == bhaskix_abi::method::RELEASE);
@@ -318,6 +319,8 @@ pub mod method {
     pub const SET_TLS: u64 = 65;
     /// Give a `Domain` an address space of its own — RFC 0033 step 5.
     pub const MAKE_SPACE: u64 = 66;
+    /// RFC 0084: give a domain a copy of another's address space.
+    pub const COPY_SPACE: u64 = 75;
     /// Map the memory this capability names into the caller's address space.
     ///
     /// Only on a `Memory` capability. `arg0` = where, page-aligned; `arg1`
@@ -1171,6 +1174,7 @@ fn dispatch_inner(frame: &mut SyscallFrame) -> Outcome {
                 | method::SPAWN_THREAD
                 | method::SET_TLS
                 | method::MAKE_SPACE
+                | method::COPY_SPACE
                 // RFC 0053. **This list is why the arm in `domain_supervise`
                 // was unreachable on the first attempt**: the methods are
                 // whitelisted here as well as handled there, and a method
@@ -3579,6 +3583,63 @@ fn domain_supervise(frame: &SyscallFrame) -> Option<Outcome> {
             Some(_) => Outcome::ok(0),
             None => Outcome::err(Status::Exhausted),
         });
+    }
+
+    if frame.method == method::COPY_SPACE {
+        // Same two refusals as `MAKE_SPACE`, and for its reasons: a target
+        // that already has a space or has threads has somebody running in
+        // memory this would replace.
+        if domain::space_root_of(target).is_some() {
+            return Some(Outcome::err(Status::SlotUnavailable));
+        }
+        if crate::sched::threads_counted_in(target.as_u32()) != 0 {
+            return Some(Outcome::err(Status::SlotUnavailable));
+        }
+        // **The source is a capability the caller holds, resolved the same way
+        // the target was.** A caller that could name a domain by number would
+        // be reading another program's memory with an integer; it names a slot
+        // in its own CSpace and the arena says what is there.
+        let Some((source, may_read_source)) = domain::with(me, |owner| {
+            let slot = owner.cspace.get(frame.arg0 as usize)?;
+            cap::with_arena(|arena| arena.lookup(slot))
+        })
+        .flatten()
+        .filter(|(object, _)| object.kind == ObjectKind::Domain)
+        .map(|(object, rights)| (domain::DomainId::from_u32(object.id as u32), rights)) else {
+            return Some(Outcome::err(Status::NoSuchCapability));
+        };
+        // **`READ` on the source, because `WRITE` on the target is not enough.**
+        // The check at the top of this function demands `WRITE` on the
+        // capability the method is invoked on, which is the domain being
+        // written into. This call also reads every byte of somebody else's
+        // address space, and the capability that says who may do that is the
+        // source's. Without this, a caller holding a diminished handle to the
+        // source could read its whole memory into a domain of its own.
+        if !may_read_source.contains(crate::cap::Rights::READ) {
+            return Some(Outcome::err(Status::InsufficientRights));
+        }
+        let Some(from) = domain::space_root_of(source) else {
+            return Some(Outcome::err(Status::NoSuchCapability));
+        };
+        return Some(
+            match crate::vm::copy_space(from, target, crate::shared::hhdm()) {
+                // **All three packed into the one word an outcome carries**,
+                // frames in the low thirty-two, regions above them, skipped at
+                // the top. Packed rather than left to a second call because a
+                // caller learning what it did *not* get from a different
+                // invocation could be told about a different copy -- the same
+                // reason the ring's verdict and its order travel together.
+                Ok(done) => Outcome::ok(
+                    (done.frames & 0xffff_ffff)
+                        | ((done.regions & 0xffff) << 32)
+                        | ((done.skipped & 0xffff) << 48),
+                ),
+                Err(crate::vm::VmError::MemoryEnvelopeExceeded) => {
+                    Outcome::err(Status::QuotaExceeded)
+                }
+                Err(_) => Outcome::err(Status::Exhausted),
+            },
+        );
     }
 
     // The target's page-table root *is* the authority to touch its memory, and

@@ -63,7 +63,18 @@ The `-ix` is the Unix lineage, the same suffix Minix and Linux carry.
 > would deliver it at the next timer tick — the boot prints signals raised against signals delivered,
 > so that gap is a number rather than a sentence. And a defect filed the same day, twice seen and
 > **open**, has a signal occasionally raised and never delivered at all; it is this work's own and
-> `TRACKER.md` §3 says so. And a **user-mode shell** that reaches all of it through
+> `TRACKER.md` §3 says so.
+>
+> **And since 2026-09-23 a forked child gets its parent's memory**
+> ([RFC 0084](docs/rfc/0084-a-fork-the-kernel-copies.md)) — all of it, where before it got only the
+> part `bin/linuxd` happened to remember. The adapter copied the regions it had answered `mmap` for,
+> so a child arrived without its parent's code and without its parent's stack; the kernel copies the
+> address space now, one method on a domain capability, at 140 cycles a page against the 213,404 the
+> supervisor's kilobyte-at-a-time path cost. The refusals are the interesting half: a region whose
+> frames belong to a shared-memory object, or to a device, is **skipped and counted** rather than
+> reproduced, because handing a child memory nobody granted it would be manufacturing authority
+> rather than copying a space. A fork can now fail because a domain's memory envelope is full, which
+> is correct and was not previously possible. And a **user-mode shell** that reaches all of it through
 > capabilities it holds and nothing else — the block driver, the console, and the filesystem each
 > run as services in their own domains, outside the kernel.
 >

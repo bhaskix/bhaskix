@@ -520,6 +520,50 @@ pub mod method {
     /// replace.
     pub const MAKE_SPACE: u64 = 66;
 
+    /// `COPY_SPACE(source)` on a `Domain` — give it a copy of another
+    /// domain's address space.
+    ///
+    /// [RFC 0084](../../docs/rfc/0084-a-fork-the-kernel-copies.md). `arg0` =
+    /// the caller's own slot holding the **source** `Domain` capability; the
+    /// capability this is invoked on is the **target**. Holding both is the
+    /// whole authority rule, as it is for [`MAKE_SPACE`] and [`END`].
+    ///
+    /// **Generic, in the way RFC 0032 requires.** "Give this domain a copy of
+    /// that one's address space" names no Linux concept; `fork` is the first
+    /// caller and not the definition. A supervisor that builds one process
+    /// from another needs it whatever dialect either speaks.
+    ///
+    /// **Why it is here rather than in the supervisor.** The adapter could
+    /// already map and copy page by page, and did — at 213,404 cycles a page
+    /// through `COPY_OUT` against 140 through the kernel's own direct map, a
+    /// factor of 1,524. Copying the whole of BusyBox in here costs less than
+    /// copying eight kilobytes out there. The expense was never the megabytes;
+    /// it was the crossing.
+    ///
+    /// Answers all three in one word: **frames** copied in the low thirty-two
+    /// bits, **regions** reproduced in the next sixteen, and regions
+    /// **skipped** in the top sixteen. Skipped means those whose pages belong
+    /// to a `Memory` object or to a device, which the target holds no
+    /// capability for and which reproducing would be manufacturing authority;
+    /// a caller that needs them must grant them itself.
+    ///
+    /// One word rather than a second call, because a caller learning what it
+    /// did *not* get from a separate invocation could be told about a
+    /// different copy.
+    ///
+    /// **Frames will be fewer than the regions' pages, and that is correct.**
+    /// A region records a range the source *may* touch; only the pages it
+    /// actually holds a frame for are copied, and the rest are reproduced as
+    /// the same lazily-backed range the source had. A caller that treated the
+    /// frame count as "the target's whole space" would be reading a heap's
+    /// reservation as its contents.
+    ///
+    /// Refused on a target that already has a space or has threads — both mean
+    /// somebody is running in memory this would replace — and on a source that
+    /// has none. Refused with nothing mapped if the target's
+    /// `ResourceEnvelope` will not cover the copy (RFC 0082).
+    pub const COPY_SPACE: u64 = 75;
+
     /// Map the memory this capability names into the caller's address space.
     ///
     /// Only on a `Memory` capability. `arg0` = where, page-aligned; `arg1`

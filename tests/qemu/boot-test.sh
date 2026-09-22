@@ -2944,9 +2944,19 @@ fi
 # started a thread but copied nothing would print zeros, and one that shared the
 # page rather than copying it would be a different bug that this probe cannot
 # tell apart -- which is why the parent writes and only the child reads.
-if grep -qE "linux fork     a Linux program forked: the child is pid [1-9][0-9]*, [1-9][0-9]* bytes of its parent's memory were copied" "$LOG" \
+#
+# **The byte count is matched to at least five figures now, and that is RFC
+# 0084.** It read 8,192 until 2026-09-23 -- the two pages the probe `mmap`'d,
+# which were all a fork could copy, because the adapter copied the regions *it*
+# remembered and it remembers a region because it answered the `mmap` that made
+# it. The probe's code and its stack were mapped by the kernel before it ran
+# and were invisible to the adapter for ever, so a child's `rip` could not
+# point into them. The kernel copies the space now, so it reads 16,384: four
+# pages, two of which no supervisor has ever seen. A four-digit count here
+# would mean the old path is back.
+if grep -qE "linux fork     a Linux program forked: the child is pid [1-9][0-9]*, [1-9][0-9]{4,} bytes of its parent's memory came with it" "$LOG" \
     && grep -qF "copied!" "$LOG"; then
-    pass "a hosted program forked: its child ran, in its own copy of its parent's memory"
+    pass "a hosted program forked: its child ran, in its own copy of its parent's memory -- code and stack included"
 elif grep -qF "linux fork     skipped" "$LOG"; then
     pass "no second cpu, so the fork test was skipped"
 else
@@ -4043,6 +4053,41 @@ if grep -qE "envelope +a domain's own memory is charged" "$LOG"; then
     pass "RFC 0082: a domain's own memory is charged, and refused past its cap"
 else
     fail "the envelope did not bound a domain's own memory: a mapping, a fault or a copy went uncharged"
+    status=1
+fi
+
+# **RFC 0084: a domain can be given a copy of another's address space.** The
+# property a hosted `fork` could not have: a child holding a page its parent
+# mapped, with the parent's bytes in it, that the child never asked for. Until
+# now `bin/linuxd` copied the regions *the adapter remembered*, which is only
+# what `mmap` answered -- not the program's code, not its stack -- so a forked
+# child had to be handed a page by hand before it could run at all.
+#
+# The line is matched field by field rather than as a phrase, because every
+# number in it is a separate claim and a pattern that stops short of a field
+# cannot see that field go wrong:
+#
+#   3 regions   -- the written page, the guard, and a range reserved and never
+#                  touched. A lazily-registered region must be *reproduced*;
+#                  materialising it would charge a child for every page its
+#                  parent merely reserved.
+#   1 frame     -- exactly the page the source had a frame for. Not four more
+#                  for the reserved range.
+#   1 skipped   -- the region whose frames belong to a `Memory` object. The
+#                  target holds no capability naming it, and reproducing the
+#                  mapping would manufacture authority rather than copy a
+#                  space.
+#
+# The self-test also requires that the child's frame is *not* the parent's
+# frame -- a share is not a copy -- that the guard came across with nothing
+# behind it, and that a target whose envelope is empty is refused with nothing
+# mapped and nothing charged. Each was watched red before it was believed.
+if grep -qE "copy space +a domain received 3 region\(s\) and 1 frame\(s\) it never mapped" "$LOG" \
+    && grep -qE "copy space +.*the guard still a guard, 1 region\(s\) skipped" "$LOG" \
+    && grep -qE "copy space +.*an envelope of nothing refused" "$LOG"; then
+    pass "RFC 0084: a domain received a copy of another's address space, refusals included"
+else
+    fail "copying an address space did not reproduce what the target never mapped, or did not refuse what is not its to have"
     status=1
 fi
 
