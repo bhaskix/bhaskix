@@ -1011,6 +1011,49 @@ the distinction is in the table rather than in somebody's head.
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-09-22 (what a fork would cost, measured — and it reverses the reason this project gave for not doing it)
+
+**An estimate in RFC 0083's question 4 is replaced by the boot's own
+numbers, and they say the opposite of what the estimate did.**
+
+That question recorded, two days ago, that recording `execve`'s regions so a
+`fork` copies them would *"cost more than it is worth"* because every BusyBox
+`fork` would copy 2.1 MB for a path that `execve`s immediately. The figure was
+mine and it was never measured.
+
+**Both sides are already instrumented.** A page through `COPY_OUT` costs
+**213,404 cycles warm** — 1,447,268 the first time, two crossings per page
+because the scratch is smaller than a page — and the kernel moves a page
+through the direct map in **140**. A factor of **1,524**.
+
+| | bytes | pages | through `COPY_OUT` | in the kernel |
+|---|---|---|---|---|
+| a fork today | 8,192 | 2 | 426,808 | 280 |
+| the `execve` stack | 65,536 | 16 | 3,414,464 | 2,240 |
+| `bin/hosted` | 85,512 | 21 | 4,481,484 | 2,940 |
+| BusyBox | 2,172,376 | 531 | 113,317,524 | 74,340 |
+
+**Copying the whole of BusyBox in the kernel costs 74,340 cycles — under a
+sixth of what copying today's 8 KiB through `COPY_OUT` costs.** The expensive
+thing is not the megabytes; it is the crossing.
+
+**So the conclusion stands and its reason was wrong**, which is worth more than
+either on its own. Recording `execve`'s regions and copying them through the
+adapter is still the wrong answer — but not because an address space is too
+big to copy. It is because a supervisor copying one a kilobyte at a time is the
+wrong mechanism at *any* size. And the cross-domain copy-on-write that entry
+reached for is not needed to make the cost acceptable: it is needed only if the
+copying stays in ring 3.
+
+That settles the shape of the RFC this owes: **a `fork` that asks the kernel to
+copy a domain's address space**, in the place that already moves these pages
+for every `execve`. Nucleus change, its own RFC, and now with a price attached
+before a line of it is written.
+
+**Measured rather than argued, because the argument was already written down
+and believed.** It had been in the RFC for two days and in a commit message
+that is pushed.
+
 ### 2026-09-22 (the README says a hosted process can catch a signal, with both limits and the open defect)
 
 **A standing rule rather than a flourish**: the README is updated when status

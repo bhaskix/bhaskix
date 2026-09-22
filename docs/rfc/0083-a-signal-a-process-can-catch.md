@@ -240,12 +240,36 @@ predicts.
    answered. That is why a forked child cannot run its parent's code and why
    the probe's children are given a page to stand on.
 
-   **Recording `execve`'s regions would fix half of it and cost more than it
-   is worth in that half**: every BusyBox `fork` would copy 2.1 MB for a path
-   that `execve`s immediately and throws it away, and there is no cross-domain
-   copy-on-write here. The principled fix is a supervisor method that copies
-   the address space the **kernel** actually has — a nucleus change, and its
-   own RFC. Both halves are written down so the next person starts from them.
+   **Priced on 2026-09-22, and the price corrects what this entry first said.**
+   It said recording `execve`'s regions would "cost more than it is worth"
+   because every BusyBox `fork` would copy 2.1 MB. That is true of the
+   *supervisor* path and is not a general objection, which is the opposite of
+   how it was written.
+
+   The boot measures both sides. A page through `COPY_OUT` costs **213,404
+   cycles warm** (1,447,268 the first time, two crossings per page, because
+   the scratch is smaller than a page); the kernel moves a page through the
+   direct map in **140**. That is a factor of **1,524**.
+
+   | | bytes | pages | through `COPY_OUT` | in the kernel |
+   |---|---|---|---|---|
+   | a fork today | 8,192 | 2 | 426,808 | 280 |
+   | the `execve` stack | 65,536 | 16 | 3,414,464 | 2,240 |
+   | `bin/hosted` | 85,512 | 21 | 4,481,484 | 2,940 |
+   | BusyBox | 2,172,376 | 531 | 113,317,524 | 74,340 |
+
+   **So copying the whole of BusyBox in the kernel costs 74,340 cycles —
+   under a sixth of what copying today's 8 KiB through `COPY_OUT` costs.** The
+   expensive thing is not the megabytes; it is the crossing. A supervisor that
+   copies an address space a kilobyte at a time is the wrong mechanism at any
+   size, and the copy-on-write this entry reached for is not needed to make
+   the cost acceptable — it is needed only if the copying stays in ring 3.
+
+   That settles the shape: **the fix belongs in the kernel**, which already
+   moves these pages for every `execve`, and a `fork` that asks it to copy a
+   domain's address space is a nucleus change and its own RFC. What this entry
+   got right is that recording `execve`'s regions and copying them through the
+   adapter is not the way; what it got wrong is the reason.
 
 ## Implementation plan
 
