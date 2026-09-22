@@ -61,7 +61,10 @@ The `-ix` is the Unix lineage, the same suffix Minix and Linux carry.
 > does on Linux. **Two limits, stated because they are real.** Delivery happens at a system call or
 > a fault and nowhere else, so a process that makes no calls does not receive its signal where Linux
 > would deliver it at the next timer tick — the boot prints signals raised against signals delivered,
-> so that gap is a number rather than a sentence. And a defect filed the same day, twice seen and
+> so that gap is a number rather than a sentence. **That sentence was false until 2026-09-23**: the
+> figure was printed only inside the gate's *failure* branch, so it had never appeared on a passing
+> boot, and the gate's own condition does not include it — a boot could lose a delivery, stay green,
+> and say nothing. It is printed on every boot now, and a mismatch prints a phrase a tool can count. And a defect filed the same day, twice seen and
 > **open**, has a signal occasionally raised and never delivered at all; it is this work's own and
 > `TRACKER.md` §3 says so.
 >

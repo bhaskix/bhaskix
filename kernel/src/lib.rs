@@ -9498,6 +9498,71 @@ fn a_hosted_process_ends_its_child(hhdm_base: u64, cpus: u32) -> bool {
         && handler_runs == 2
         && handler_depth == 1
         && handler_self_kill == 0;
+
+    // **The signal accounting, on every boot, whichever way the gate goes.**
+    //
+    // This was printed inside the failure branch below and nowhere else, so it
+    // had never appeared on a passing boot — and the gate's own condition does
+    // not include it, so a boot could lose a delivery and still be green with
+    // the number unprinted. `raised` minus `delivered` is the stated limit of
+    // RFC 0083, and `README.md`, this file's neighbours and two places in
+    // `TRACKER.md` all said the boot prints it. It did not.
+    //
+    // **It is the mistake `switched_holding_report` names three lines from
+    // here**: *"an instrument that only runs when nothing went wrong is the
+    // exact mistake 2026-08-29 spent a day finding three times."* The
+    // undelivered-signal defect in `TRACKER.md` §3 has been open since
+    // 2026-09-21 with a count of clean lane runs attached to it, and those
+    // runs could not have bound anything: they produced no reading. So could
+    // the instrument built for it on 2026-09-22 — the domains still holding a
+    // signal nobody took — which lived in the same branch.
+    //
+    // Not an assertion about the number. There is no right value yet: the
+    // limit is real and known, and a gate on it would fail every boot that
+    // exercises a process which does not come back. What must exist is the
+    // line, so a run can be read after the fact.
+    let (raised, delivered, unbuilt, raised_blocked, unrestored, owed, first_owed) =
+        adapter_signal_record();
+    // **And a phrase a tool can count**, in yellow, when the two disagree.
+    //
+    // `TRACKER.md` §3's undelivered-signal defect has two sightings and a
+    // count of clean lane runs beside it, and that count meant nothing: the
+    // figure was not printed on a clean run, so the runs were not evidence of
+    // anything. A distinctive phrase makes the population countable across CI
+    // history with `tools/ci-count.py`, which is what turns "seen twice" into
+    // a rate.
+    //
+    // **Not a failure**, deliberately. RFC 0083's limit is real — delivery
+    // happens at a call or a fault and nowhere else — so a boot may legitimately
+    // end with a signal outstanding, and a gate that went red on it would be
+    // asserting a property this mechanism does not have. What is asserted is
+    // that the *line* exists; see `tests/qemu/boot-test.sh`.
+    if raised != delivered || owed != 0 {
+        println!(
+            "\x1b[93m    hosted signals A SIGNAL WAS RAISED AND NOT DELIVERED: {raised} raised \
+             against {delivered} delivered, {owed} domain(s) still holding one\x1b[0m"
+        );
+    }
+    println!(
+        "    hosted signals {raised} raised, {delivered} delivered, {unbuilt} frame(s) could not \
+         be built; {raised_blocked} landed on an already-blocked signal, {unrestored} sigreturn(s) \
+         could not read their own uc_sigmask; {owed} domain(s) still hold one nobody took{}",
+        if owed == 0 {
+            alloc::string::String::new()
+        } else if first_owed == u64::MAX {
+            // **Which of the two open readings this boot is.** A domain still
+            // holding the signal says the raise landed where it should and the
+            // delivery never came; none holding it says the raise went
+            // somewhere the target never reads. `raised` minus `delivered`
+            // cannot tell them apart, and they are different bugs.
+            alloc::string::String::from(
+                ", and none of them is named, so a raise reached a domain that never reads",
+            )
+        } else {
+            alloc::format!(", the first being domain {first_owed}")
+        }
+    );
+
     if right {
         println!(
             "    hosted kill    pid {pid} ended a child with SIGTERM and one with SIGKILL, and \
@@ -9552,32 +9617,14 @@ fn a_hosted_process_ends_its_child(hhdm_base: u64, cpus: u32) -> bool {
              {ended_status}; holding {on_trampoline:#x} it forked \
              {forked_anyway}\x1b[0m"
         );
-        // RFC 0083's half, separately, because a line nobody can read to the
-        // end is a line that gets skimmed.
-        let (raised, delivered, unbuilt, raised_blocked, unrestored, owed, first_owed) =
-            adapter_signal_record();
-        println!(
-            "\x1b[91m    hosted catch   DETAIL: the adapter raised {raised} signal(s), \
-             delivered {delivered}, could not build {unbuilt} frame(s); {raised_blocked} \
-             raise(s) landed on a signal already blocked and {unrestored} sigreturn(s) could \
-             not read their own uc_sigmask\x1b[0m"
-        );
-        // **Which of the two open readings this boot is.** A domain still
-        // holding the signal says the raise landed where it should and the
-        // delivery never came; none holding it says the raise went somewhere
-        // the target never reads. `raised` minus `delivered` cannot tell them
-        // apart, and they are different bugs.
-        if first_owed == u64::MAX {
-            println!(
-                "\x1b[91m                   {owed} domain(s) still hold a signal nobody took, \
-                 so the raise reached a domain that never read it\x1b[0m"
-            );
-        } else {
-            println!(
-                "\x1b[91m                   {owed} domain(s) still hold a signal nobody took, \
-                 the first being domain {first_owed}\x1b[0m"
-            );
-        }
+        // RFC 0083's half is **above**, outside this branch, and has been
+        // since 2026-09-23. It used to be here — which meant the figure that
+        // states this mechanism's own limit appeared only on boots that had
+        // already failed for some other reason, and the one sighting of the
+        // undelivered-signal defect was visible only because that boot failed.
+        // `raised`, `delivered` and the domains still owed a delivery are
+        // printed on every boot now; this branch says what the *gate* measured
+        // and nothing else.
         println!(
             "\x1b[91m    hosted catch   FAILED: sigaction answered {installed}, the self-kill \
              {self_kill}; the handler marker is {handler_marker:#x} for signal \

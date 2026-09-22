@@ -4049,6 +4049,32 @@ fi
 # so an owner taking over an empty ledger left a program's whole initial image
 # charged to nobody -- and that a fault in a space whose domain has *ended*
 # says so rather than reporting a full envelope. See TRACKER.md.
+# **RFC 0083's stated limit, as a line that exists on every boot.**
+#
+# This adapter delivers a signal at a call or a fault and nowhere else, so
+# `raised` minus `delivered` is exactly the number of signals waiting on a
+# process that has not come back. `README.md` and two places in `TRACKER.md`
+# have said since 2026-09-19 that the boot prints that figure. It did not: the
+# figure lived inside the `hosted catch` gate's *failure* branch, so it had
+# never appeared on a passing boot -- and the gate's own condition does not
+# include it, so a boot could lose a delivery, stay green, and print nothing.
+#
+# That is why TRACKER §3's undelivered-signal defect has a count of clean lane
+# runs beside it that means nothing. Those runs produced no reading.
+#
+# **This gate asserts the line and not the number.** There is no right value:
+# a process that makes no calls legitimately ends with its signal outstanding,
+# and a gate on equality would assert a property this mechanism does not have.
+# When the two disagree the boot prints A SIGNAL WAS RAISED AND NOT DELIVERED,
+# which `tools/ci-count.py` can count across CI history -- turning "seen twice"
+# into a rate, which is what the defect has been missing.
+if grep -qE "hosted signals +[0-9]+ raised, [0-9]+ delivered" "$LOG"; then
+    pass "the boot says how many signals were raised against how many were delivered"
+else
+    fail "the boot said nothing about signals raised against signals delivered"
+    status=1
+fi
+
 if grep -qE "envelope +a domain's own memory is charged" "$LOG"; then
     pass "RFC 0082: a domain's own memory is charged, and refused past its cap"
 else
