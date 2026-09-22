@@ -367,6 +367,18 @@ pub fn frame_entry_vector() -> u64 {
     FRAME_WITNESS_VECTOR.load(Ordering::Relaxed)
 }
 
+/// [`implausible`], for a caller outside this crate.
+///
+/// The fault path needs it on a frame it has **re-read**, which the bracketed
+/// check around a dispatch cannot give it: a fatal fault halts, so the
+/// on-the-way-out check never runs, and the on-arrival one saw the frame while
+/// it was still good. The 2026-09-23 specimen is exactly that shape — its
+/// re-read frame fails two of the arms below and nothing ran them on it.
+#[must_use]
+pub fn why_implausible(frame: &TrapFrame) -> Option<&'static str> {
+    implausible(frame)
+}
+
 /// Which field of `frame` could not be returned through, if any.
 ///
 /// # Why this is worth checking twice
@@ -409,6 +421,20 @@ fn implausible(frame: &TrapFrame) -> Option<&'static str> {
     // with the ring-3 arm checking nothing, is what a garbage `cs` of `0xed03`
     // would also look like. This kernel installs exactly two selectors per
     // ring and returns through no others.
+    // **The field the dispatch routed on, and the only one never checked
+    // until 2026-09-23.** Every stub pushes its own number as a `push imm32`
+    // constant, so `vector` is written from the instruction stream and cannot
+    // exceed 255. The specimen caught that day re-read as
+    // `0xffff_ffff_9f90_8ce8` — a kernel image pointer sitting in the vector
+    // slot — and the check walked past it, because it examined `cs`, `ss`,
+    // `rip`, `rsp` and `rflags` and nothing else.
+    //
+    // First, deliberately: when this field is wrong the dispatch has already
+    // gone somewhere it was not meant to, and naming that is worth more than
+    // naming a selector further down the same corrupted frame.
+    if frame.vector > 255 {
+        return Some("vector is not a number any stub could have pushed");
+    }
     let user = frame.cs & 3 != 0;
     if user {
         if frame.cs != USER_CS {
@@ -794,6 +820,73 @@ mod tests {
 
     /// Each rejection names a *different* field, so a witness line says which
     /// one rather than only that something was wrong.
+    /// **The field the dispatch routes on.** Every stub pushes its own number
+    /// as a constant, so anything above 255 is a value no stub wrote.
+    #[test]
+    fn a_vector_no_stub_could_have_pushed_is_rejected() {
+        for vector in [256u64, 0xffff, 0xffff_ffff_9f90_8ce8] {
+            let mut frame = kernel_frame();
+            frame.vector = vector;
+            assert_eq!(
+                implausible(&frame),
+                Some("vector is not a number any stub could have pushed"),
+                "vector {vector:#x} should be impossible"
+            );
+        }
+        // And the boundary is a vector, not an off-by-one: 255 is the last
+        // entry in the IDT and a frame carrying it is ordinary.
+        let mut frame = kernel_frame();
+        frame.vector = 255;
+        assert_eq!(implausible(&frame), None);
+    }
+
+    /// **A real corrupted frame, not a constructed one** — the specimen caught
+    /// on the `iommu` lane on 2026-09-23, transcribed from its own report.
+    ///
+    /// It matters that this is a recording rather than an invention. The check
+    /// had existed for three weeks and printed nothing on any sighting of
+    /// `TRACKER.md` §3's interrupt-frame fault, and the reading taken from
+    /// that was that the frames were passing it. They were not: nothing ever
+    /// ran it on the corrupted copy, because a fatal fault never reaches the
+    /// on-the-way-out check and the arrival check saw a frame that was still
+    /// good. This asserts what the check *would* have said.
+    #[test]
+    fn the_specimen_of_2026_09_23_is_rejected_three_ways() {
+        let specimen = TrapFrame {
+            vector: 0xffff_ffff_9f90_8ce8,
+            rip: 0x2,
+            cs: 0x8,
+            rflags: 0xe,
+            rsp: 0x0,
+            ss: 0xffff_ffff_9f6f_d300,
+            ..kernel_frame()
+        };
+        // The vector first, being the field the dispatch routed on.
+        assert_eq!(
+            implausible(&specimen),
+            Some("vector is not a number any stub could have pushed")
+        );
+        // And two arms that already existed and were never consulted: the
+        // stack selector is a kernel *image* pointer rather than a selector,
+        // and `rflags` bit 3 reads as one where no processor writes it.
+        let intact_vector = TrapFrame {
+            vector: 14,
+            ..specimen
+        };
+        assert_eq!(
+            implausible(&intact_vector),
+            Some("ss is not the kernel's, returning to ring 0")
+        );
+        let intact_ss = TrapFrame {
+            ss: 0x10,
+            ..intact_vector
+        };
+        assert_eq!(
+            implausible(&intact_ss),
+            Some("rflags has bits set that no processor writes")
+        );
+    }
+
     #[test]
     fn each_rejection_names_the_field_it_found() {
         let mut cs = kernel_frame();

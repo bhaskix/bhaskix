@@ -336,6 +336,13 @@ fn handle(frame: &mut TrapFrame) {
         end_faulting_domain()
     }
 
+    // **Whether the frame moved under the handler**, read here rather than
+    // only inside the report, because it decides what the witness below says.
+    // A frame whose `vector` no longer matches the one the dispatch routed on
+    // is corruption established -- not inferred -- on a path where the
+    // bracketed plausibility check cannot fire.
+    let changed = dispatched != frame.vector;
+
     report_exception(frame, dispatched);
 
     // A fault in ring 3 is the program's bug, not the machine's.
@@ -370,11 +377,26 @@ fn handle(frame: &mut TrapFrame) {
             "    vector {vector:#x} rip {rip:#018x} cs {cs:#x} rflags {rflags:#x} rsp \
              {rsp:#018x} ss {ss:#x}"
         );
-        // **And how far it got intact**, which is the difference between the
-        // tick's own work and the preempt switch. Printed here rather than
-        // recorded and read later, because the boot this defect produces is one
-        // that halts and never reaches a boot report -- the mistake the frame
-        // witness itself made for six sightings.
+    }
+
+    // **And how far it got intact**, which is the difference between the tick's
+    // own work and the preempt switch.
+    //
+    // **Outside the block above since 2026-09-23, and that is the fix.** It sat
+    // inside it, so it spoke only when `implausible` had already counted a
+    // frame -- and on the boots this defect produces `implausible` *cannot*
+    // count. The check is run on arrival and again on the way out, and a fatal
+    // fault halts: the way-out check is never reached, and the arrival check
+    // saw a frame that was still good. So every specimen of §3's
+    // interrupt-frame fault recorded this phase and threw it away, which is
+    // precisely the mistake the frame witness itself made for six sightings,
+    // repeated one level down. An instrument that speaks only when a different
+    // instrument has already spoken is not an instrument.
+    //
+    // Printed whenever there is any evidence of corruption -- a counted frame,
+    // or a frame that changed under the handler, which is evidence in its own
+    // right and is how this was found.
+    if count > 0 || changed {
         let reached = bhaskix_arch::trap::frame_last_good_phase();
         let arm = match bhaskix_arch::trap::frame_entry_vector() {
             v if v == u64::from(bhaskix_arch::apic::TIMER_VECTOR) => "the timer",
@@ -933,6 +955,31 @@ fn report_exception(frame: &mut TrapFrame, dispatched: u64) {
              dispatch read",
             frame.vector,
         );
+        // **And what is wrong with it, named** -- 2026-09-23.
+        //
+        // `implausible` has bracketed every dispatch since 2026-08-29 and has
+        // printed nothing on any specimen of `TRACKER.md` §3's interrupt-frame
+        // fault. The reading taken from that silence was that the frames were
+        // passing the check. They were not: nothing ever ran it on the
+        // corrupted copy. The check runs on arrival, where the frame is still
+        // good, and again on the way out, which a halting handler never
+        // reaches -- so the one frame that is known to be wrong is the one
+        // frame it was never shown.
+        //
+        // The specimen that found this fails two arms that already existed,
+        // and it is a host test now: its `ss` is a kernel image pointer rather
+        // than a selector, and its `rflags` has bit 3 set. A named field is
+        // worth more than a register dump carrying a caveat.
+        match bhaskix_arch::trap::why_implausible(frame) {
+            Some(why) => println!("  and the frame it changed into is impossible: {why}"),
+            // Worth saying out loud rather than leaving blank. It means the
+            // corruption is inside the fields no check covers -- the general
+            // registers, or `error_code` -- and that is a different search.
+            None => println!(
+                "  and the frame it changed into passes every plausibility check, so whatever \
+                 moved wrote only fields this kernel cannot call impossible"
+            ),
+        }
     }
 
     println!(
