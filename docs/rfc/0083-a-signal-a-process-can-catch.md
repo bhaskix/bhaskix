@@ -139,6 +139,15 @@ mapped before the fork. **The general fix belongs to `fork`, not to signals** �
 a child should be given a stack in its own address space — and is recorded here
 as the next thing that path owes.
 
+**Owed and paid, 2026-09-23.**
+[RFC 0084](0084-a-fork-the-kernel-copies.md) moved the copy into the kernel,
+which has the source's region map and reaches both sets of frames through the
+direct map. A forked child now inherits its parent's stack whoever mapped it,
+so this limit is gone rather than worked around: the probe's hand-made stack is
+no longer what makes the delivery possible. What is written above stays as the
+record of how it was found — the adapter's *"could not build"* counter is still
+the thing that would say so if it came back.
+
 ## Alternatives considered
 
 | Alternative | Why rejected | Would reconsider if |

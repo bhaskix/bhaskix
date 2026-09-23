@@ -98,8 +98,11 @@ done:
         jmp     .
 
         # The routine the child runs, for the reason the killer probe's is:
-        # a fork copies the regions the personality recorded, and this page is
-        # the only one among them.
+        # a fork copied the regions the personality recorded, and this page was
+        # the only one among them. RFC 0084 made that no longer so as of
+        # 2026-09-23 -- a child inherits its parent's whole space -- and this
+        # is kept as written because it works and because the killer probe is
+        # where the new property is asserted.
 inner:
         mov     $57, %eax               # fork
         syscall

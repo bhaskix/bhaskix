@@ -311,7 +311,12 @@ same confusion cost a day one file up, where the kernel's truncated reader made
    child already needed solves it: a fork copies the regions the personality
    recorded, so the parent writes the pid of the process to be ended into that
    page *before* forking the one that will end it, and the child reads it from a
-   fixed address. Armed by dropping the group half of `may_signal`, which reads
+   fixed address. *(The clause about what a fork copies stopped being true on
+   2026-09-23 — [RFC 0084](0084-a-fork-the-kernel-copies.md) moved the copy into
+   the kernel and a child now inherits its parent's whole space. The technique
+   is unaffected: a page written before the fork is carried over either way, and
+   the reason a child needs one is that it arrives with no registers to be
+   handed a pid in, which is still so.)* Armed by dropping the group half of `may_signal`, which reads
    `sibling ... status 768` — 3 << 8, the sibling's `kill` refused with `ESRCH` —
    and leaves the parent blocked for ever on a child nothing ended.
 4. **Whether a descendant's descendant counts.** The rule says "descendant",

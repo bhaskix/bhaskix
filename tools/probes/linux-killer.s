@@ -6,16 +6,20 @@
         # signal, collects the status, and is refused every process outside its
         # own tree.
         #
-        # **The child runs in a page this program mapped itself, and that is
-        # not an accident.** A fork copies the regions the *personality*
-        # recorded, which is what `mmap` answered and nothing else -- an
-        # `execve`'s own segments are not among them. The parent keeps its whole
-        # address space across a fork and needs nothing; the child arrives with
-        # an instruction pointer and a copy of the recorded regions, so the few
-        # instructions it executes must live in one of them. Hence a routine
-        # copied into an anonymous page, called rather than jumped into: the
-        # parent returns out of it to the code page it came from, and the child
-        # never leaves it.
+        # **The child runs in a page this program mapped itself.** That was
+        # once a necessity and is now a choice: until 2026-09-23 a fork copied
+        # the regions the *personality* recorded -- what `mmap` answered and
+        # nothing else, an `execve`'s own segments not among them -- so the few
+        # instructions a child executed had to live in one of those. Hence a
+        # routine copied into an anonymous page, called rather than jumped
+        # into: the parent returns out of it to the code page it came from, and
+        # the child never leaves it.
+        #
+        # RFC 0084 moved the copy into the kernel and a child now inherits its
+        # parent's whole address space. The routine is kept because it works
+        # and because rewriting hand-assembly to prove an easier case would
+        # trade a witness for a story -- but the **stacks** are gone, and their
+        # absence is what this probe now asserts: see `catch_park`.
 _start:
         mov     %rdi, %r12              # the report page
 
@@ -324,29 +328,44 @@ strangers:
         # interrupted -- the handler runs and exits 88, so its parent collects
         # an ordinary exit rather than a death by signal. That difference is
         # the whole assertion: without delivery this child would be status 15.
-        # **A stack for the child, because a signal frame is built on one.**
+        # **No stack is made for the children any more -- RFC 0084.**
         #
-        # A forked child is started on its *parent's* `rsp`, and a fork copies
-        # the regions the personality recorded -- what `mmap` answered. The
-        # program's original stack is not one of those, so the child's `rsp`
-        # points at memory its own address space does not have. It can run
-        # (`nanosleep` touches no stack) and it cannot be *signalled*: the
-        # delivery writes a `siginfo` and a `ucontext` below `rsp`, and the
-        # copy fails. The adapter counted exactly that -- one frame it could
-        # not build -- which is how this was found rather than guessed.
+        # This block used to map one, and the reason is worth keeping because
+        # it is the defect that RFC was written for: a forked child is started
+        # on its *parent's* `rsp`, and a fork copied only the regions the
+        # personality recorded -- what `mmap` answered. The program's original
+        # stack was not one of those, so the child's `rsp` pointed at memory
+        # its own address space did not have. It could run (`nanosleep` touches
+        # no stack) and it could not be *signalled*: the delivery writes a
+        # `siginfo` and a `ucontext` below `rsp`, and the copy failed. The
+        # adapter counted exactly that -- one frame it could not build -- which
+        # is how it was found rather than guessed.
         #
-        # So the child stands on a page that was mapped before the fork and
-        # therefore exists on both sides of it.
-        mov     $0x40020000, %edi
-        mov     $4096, %esi
-        mov     $3, %edx
-        mov     $0x32, %r10d
-        mov     $-1, %r8
-        xor     %r9d, %r9d
-        mov     $9, %eax
+        # The kernel copies the address space now, so the children below stand
+        # on their parent's own stack: two pages mapped before the program ran,
+        # which the adapter has never seen. **That is this probe's half of RFC
+        # 0084's evidence** -- the boot gate counts the bytes a child inherits,
+        # and these children spend them. Armed by reverting `build_fork_child`
+        # to `MAKE_SPACE`, which puts `could not build` back above zero.
+        #
+        # **A call whose only purpose is to be a call, and it is a workaround
+        # for something undiagnosed.** Recorded here rather than hidden,
+        # because a line nobody can explain is worth more when it says so.
+        #
+        # The parent has just signalled *itself*, and RFC 0083 delivers on the
+        # way out of a call. With nothing between that `kill` and the
+        # `rt_sigaction` below, the probe exits at milestone 17 with its
+        # handler having run **once** instead of twice -- which is what the
+        # `test %rax, %rax; jnz done` after that `rt_sigaction` does when `rax`
+        # is not the call's own result. With *any* syscall here it passes.
+        #
+        # Bisected, not guessed: the page that used to be mapped here is gone
+        # (RFC 0084 -- the children stand on their parent's stack now), and
+        # removing it broke the run; putting the page back fixed it; replacing
+        # the page with a bare `getpid` also fixed it. So it is the call and
+        # not the region. See `TRACKER.md` §3.
+        mov     $39, %eax               # getpid
         syscall
-        cmp     $0x40020000, %rax
-        jne     done
 
         # **The handler the child will have, installed before the fork.**
         #
@@ -554,8 +573,15 @@ catch_park:
         test    %rax, %rax
         jz      6f
         ret
-6:      mov     $0x40020ff0, %esp       # a stack this address space actually has
-        mov     $0x40000000, %edi       # nanosleep(&{1000, 0}, NULL)
+        # **No stack is installed here, and that is the assertion.** Until
+        # 2026-09-23 this read `mov $0x40020ff0, %esp` -- a page the parent
+        # mmap'd for it -- because a fork copied only what the adapter
+        # remembered and the program's own stack was not among those. RFC 0084
+        # gives the copy to the kernel, so this child stands on its parent's
+        # own stack: two pages `run_bell_program` mapped before the program
+        # ran, which no supervisor has ever seen. The signal frame below is
+        # built on it.
+6:      mov     $0x40000000, %edi       # nanosleep(&{1000, 0}, NULL)
         xor     %esi, %esi
         mov     $35, %eax
         syscall
@@ -577,8 +603,8 @@ pipe_park:
         test    %rax, %rax
         jz      7f
         ret
-7:      mov     $0x40020ff0, %esp       # a stack this address space has
-        mov     0x40000060, %edi        # the read end its parent made
+        # Its inherited stack too -- see the child above.
+7:      mov     0x40000060, %edi        # the read end its parent made
         mov     $0x40000080, %esi       # somewhere to put a byte
         mov     $1, %edx
         xor     %eax, %eax              # read

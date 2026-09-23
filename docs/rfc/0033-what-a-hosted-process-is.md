@@ -743,6 +743,14 @@ register image.
 worse copying is than copy-on-write — and it is not the number that matters yet, because what step 8
 actually found is that **a fork can only copy the regions the personality knows about**.
 
+> **No longer true as of 2026-09-23**, and the paragraphs below are kept as the record of how the
+> defect was found rather than as a statement of what `fork` does.
+> [RFC 0084](0084-a-fork-the-kernel-copies.md) gives the copy to the kernel, which has the source's
+> region map: a child inherits its parent's code and stack whoever mapped them, and the gate's byte
+> count went from 8,192 to 16,384 — the four frames the probe's parent held, two of which the
+> adapter has never seen. The reason this was not done sooner was measured on 2026-09-22 and was
+> wrong: the expense is the crossing, not the megabytes.
+
 The adapter knows a region because it answered the `mmap` that made it. A program the *kernel*
 started by hand — every hosted probe in this tree — has code and a stack the adapter never saw, so a
 fork of it copies neither. The probe had to be rewritten twice to learn this: the first version wrote
