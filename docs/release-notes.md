@@ -55,8 +55,19 @@ document, release note or README may state or imply that it works."*
 | Loads and runs a real static Linux binary; BusyBox `sh` reaches a prompt and answers what is typed at it | `busybox-test.sh` |
 | **Boots on physical hardware** — a Lenovo SR550, read over serial-over-LAN | 2026-08-23 |
 
-Alongside: **1093 host unit tests**, and **42 of 59 RFCs accepted**, each
-accepted one implemented and measured rather than merely written.
+Alongside, **as measured on 2026-08-30**: **1093 host unit tests**, and **42 of
+59 RFCs accepted**, each accepted one implemented and measured rather than
+merely written.
+
+> **Dated 2026-09-23, because this line was the only measurement in the document
+> without a date on it** — every row of the table above carries one. The header
+> says these figures must be re-taken on the day and will go stale before then;
+> a reader cannot act on that warning for a number that does not say when it was
+> taken. Re-measured the same day, the RFC figure reads **52 accepted of 85
+> written** (`for f in docs/rfc/0*.md; do grep -m1 Status "$f"; done | grep -ci
+> accepted`, excluding the template). The test count is left for the day rather
+> than half-refreshed here: a document with two figures taken three weeks apart
+> and one label between them is worse than one that is plainly out of date.
 
 ---
 
