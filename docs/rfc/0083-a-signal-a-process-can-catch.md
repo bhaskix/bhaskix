@@ -124,6 +124,39 @@ personality event pending" flag checked on return to ring 3 — on the hottest
 path in the system, and phrased so it does not put Linux knowledge back in the
 nucleus, which RFC 0031 gates at 0. A separate RFC.
 
+## A third limit: `raise()` does not deliver before it returns (2026-09-23)
+
+**POSIX requires that a signal sent to the caller by `raise()` be delivered
+before `raise()` returns.** This adapter delivers on the way out of *a* call and
+not on the way out of the `kill` that raised the signal, so a self-signal is
+delivered on the way out of whatever the process calls **next**.
+
+**The scope is bounded by reading `answer_kill`, not guessed.** `raise` on the
+disposition set answers `false` for `SIGKILL` and for a target with no handler,
+and those targets are `END`ed immediately — so `abort()` with no `SIGABRT`
+handler dies at once, as it should. The divergence is confined to a signal the
+target **has installed a handler for**.
+
+**It was found by a probe walking into it, not by reading this document.** The
+killer probe signals itself and then calls `rt_sigaction` to install the handler
+its children will inherit. The delivery lands on the way out of *that* call, so
+the handler that runs is the one it has just installed — `exit_group(88)` — and
+the parent kills itself with the handler it was preparing for its children. The
+boot now prints the handler entry a delivery used and the domain it was for,
+which is what established it: *"the last delivery jumped domain 7 to its handler
+at `0x400100b4`"*, and `child_handler - inner` is `0xb4`.
+
+**Three conclusions were published and withdrawn before that number existed**,
+each from a probe-level experiment whose failure mode was indistinguishable from
+the phenomenon. `TRACKER.md` §3 records all three, because the pattern is worth
+more than the result.
+
+**Closing it is the same change the first limit's trigger names** — delivery on
+return to ring 3 rather than only at a call boundary — and it is the same
+separate RFC. Until then a hosted program that raises a signal at itself and
+changes that signal's disposition before its next call gets the new handler
+where Linux gives it the old one.
+
 ## A second limit, found by the gate
 
 **A signal cannot be delivered to a forked child that has no mapped stack.**
