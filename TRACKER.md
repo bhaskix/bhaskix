@@ -1013,6 +1013,43 @@ the distinction is in the table rather than in somebody's head.
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-09-23 (two CI runs red in a row, three intermittents between them, and one signature nobody had recorded)
+
+**CI 736 and 737 both failed, on consecutive commits of mine, and neither is a
+regression.** Two reds in a row is exactly the pattern that should not be waved
+through on a signature match, so each was attributed before anything was
+concluded.
+
+| run | job | what failed | row |
+|---|---|---|---|
+| 736 | `interactive shell` | `hosted kill FAILED` | the undelivered signal, ~2.1% a boot |
+| 737 | `boot (bios, max)` | `lock order FAILED: 1 real ordering violations` | the nested `wait::WaitQueue`, filed 2026-09-10 |
+| 737 | `boot (iommu)` | the inbound echo was served and the host driver never got its bytes | **not recorded anywhere** |
+
+The lock-order signature matches its row **word for word** — *the first was
+`wait::WaitQueue` (rank 9) taken at `kernel/src/wait.rs:252` …while holding
+`wait::WaitQueue`*.
+
+**The change is ruled out by construction, not by resemblance.**
+`sched::first_thread_owes_reply` — the only new code that takes a lock — has
+exactly one caller, in the step-4 failure branch, and step 4 did not fail in
+either run. It never ran. Nothing in the two commits touches a networking file:
+`git diff --name-only | grep -cE 'net|tcp|ipd'` reads **0**. And the same tree
+was green through a full local suite.
+
+**The third one is a signature this project has never recorded.** Grepping
+`TRACKER.md` for *"never refused one to a closed port"* and *"host driver never
+got its bytes back"* finds nothing — the two gates are in
+`tests/qemu/boot-test.sh` at lines 2766 and 2625, and neither failure has a row.
+It is filed here rather than left in an annotation nobody will grep, which is
+the same gap `tools/ci-count.py` was written to close.
+
+**And the rate of the thing that matters more than any of them:** three distinct
+intermittents surfaced across two CI runs of about twenty boots each. That is
+not a claim that the suite is getting worse — it is the first time anyone has
+counted them together, and it is worth counting again before anyone reasons from
+it.
+
 ### 2026-09-23 (the ring's instrument audited, and it passes the rule that caught two others)
 
 The five instrument rules added to `docs/coding-style.md` §8 today came from
