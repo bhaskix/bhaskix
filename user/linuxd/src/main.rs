@@ -612,16 +612,12 @@ fn publish_signals() {
                 // -- so a child forked from inside a handler is born unable to
                 // receive that signal.
                 first_owed_blocked = dispositions_of(domain as u32).blocked();
-                // **And whose domain it is.** `first_owed` is a domain number
-                // and says nothing about whether the `kill` was aimed there;
-                // a raise landing on the wrong domain reads identically. The
-                // pid is what makes it attributable.
-                //
-                // SAFETY: single-threaded by construction, as elsewhere here.
-                let processes = processes();
-                first_owed_pid = processes
-                    .by_domain(domain as u32, incarnation_of(domain as u32))
-                    .map_or(0, |process| u64::from(process.pid));
+                // **And whose domain it is** — the pid the `kill` was aimed
+                // at, recorded at the raise rather than looked up now. See
+                // [`RAISED_AS_PID`] for why the difference decided a sighting.
+                first_owed_pid = RAISED_AS_PID
+                    .get(domain % limits::MAX_DOMAINS)
+                    .map_or(0, |slot| slot.load(core::sync::atomic::Ordering::Relaxed));
             }
         }
     }
@@ -754,6 +750,22 @@ static RESUMED_TO: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64
 /// and the loss is after the frame was asked for — in the round trip, or in
 /// `take_pending`. Short by one, and it is before: the reply never saw the
 /// signal pending at all, and the search moves out of this function.
+/// The pid each domain was last raised against, recorded **at the raise**.
+///
+/// **Captured where it is true rather than where it is convenient to read**,
+/// which is the whole of the correction. The first version of this looked the
+/// pid up at publish time with `processes.by_domain`, and that requires
+/// `State::Live` — so a target that had already exited and been collected read
+/// **pid 0**, which cannot be told from a domain that never had a process.
+/// `TRACKER.md` §3's tenth sighting is exactly that reading, and it answers
+/// nothing.
+///
+/// `answer_kill` holds the pid and the domain together, at the instant it sets
+/// the bit. That pair is the fact this row needs: the domain still owed a
+/// delivery, against the pid the `kill` was actually aimed at.
+static RAISED_AS_PID: [core::sync::atomic::AtomicU64; limits::MAX_DOMAINS] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; limits::MAX_DOMAINS];
+
 static ARM_FINISHED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// See [`ARM_FINISHED`].
 static ARM_PARKED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
@@ -1546,6 +1558,10 @@ fn answer_kill(request: &PersonalityCall) -> (u64, Answer) {
         }
         if dispositions_of(domain).raise(signal) {
             SIGNALS_RAISED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            // **The pid, here, where it is still true** — see [`RAISED_AS_PID`].
+            if let Some(slot) = RAISED_AS_PID.get((domain as usize) % limits::MAX_DOMAINS) {
+                slot.store(u64::from(*target), core::sync::atomic::Ordering::Relaxed);
+            }
             publish_signals();
             wake_parked(domain);
             caught += 1;

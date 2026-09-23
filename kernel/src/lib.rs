@@ -9617,8 +9617,9 @@ fn a_hosted_process_ends_its_child(hhdm_base: u64, cpus: u32) -> bool {
     }
     if owed != 0 {
         println!(
-            "\x1b[93m    hosted signals the owed domain is {first_owed} (pid {first_owed_pid}) \
-             and its blocked mask is {first_owed_blocked:#x}\
+            "\x1b[93m    hosted signals the owed domain is {first_owed}, and the kill that \
+             filled it named pid {first_owed_pid}; its blocked mask is \
+             {first_owed_blocked:#x}\
              {}\x1b[0m",
             // **Bit 15 and not bit 14.** `Dispositions::raise` does
             // `pending |= 1 << index` with `index == signal`, so the bit *is*
@@ -9855,7 +9856,14 @@ struct SignalRecord {
     arm_parked: u64,
     /// See [`Self::arm_finished`].
     took_nothing: u64,
-    /// The **pid** of the first domain still owed a delivery, or zero.
+    /// The **pid the `kill` was aimed at** for the first domain still owed a
+    /// delivery, recorded at the raise.
+    ///
+    /// **Zero now means the domain was never raised against**, which is the
+    /// reading this field exists for. It used to be looked up at publish time
+    /// with `by_domain`, which requires a *live* process — so a target that
+    /// had exited and been collected read zero too, and the tenth sighting's
+    /// `pid 0` could not be told from a domain that never had one.
     ///
     /// `owed` and `first_owed` say a domain holds a pending signal; neither
     /// says it is the domain the `kill` was aimed at, and a raise landing on
@@ -13545,6 +13553,18 @@ static TCPC_REPORT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU6
 /// **running** somewhere else entirely is a question only the scheduler can
 /// answer, and answering it needs the domain to ask about.
 static TCPC_DOMAIN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(u32::MAX);
+
+/// `bin/tcpd`'s domain, for the same reason [`TCPC_DOMAIN`] exists.
+///
+/// The step-4 row's ninth sighting reads `the scheduler has thread 93 Blocked`
+/// for the *client*, which by that row's own rule — written 2026-09-18, before
+/// any sighting could bias it — puts the fault on the service's side of one
+/// named call. **It does not say which side of `receive` the service is on**,
+/// and those are different bugs: a service parked in `RECV` never took the
+/// message, so the fault is upstream of `bin/tcpd` entirely; a service that is
+/// *running* took it and has not replied, and `RECV`'s handler is where to
+/// look. One word of scheduler state separates them.
+static TCPD_DOMAIN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(u32::MAX);
 /// The TCP service's endpoint, for minting client capabilities to it.
 static TCP_ENDPOINT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
 
@@ -15554,6 +15574,9 @@ fn start_tcp_domain(
         return Err("the tcp doorbell would not install");
     }
 
+    // **Recorded for the step-4 diagnostic**, as `bin/tcpc`'s is. See
+    // [`TCPD_DOMAIN`].
+    TCPD_DOMAIN.store(realm.as_u32(), core::sync::atomic::Ordering::Release);
     let options = sched::SpawnOptions::new()
         .pinned()
         .in_domain(realm.as_u32());
@@ -20697,6 +20720,42 @@ fn report_tcp_client(hhdm: u64) {
             None => println!(
                 "\x1b[91m                   the scheduler has no thread in bin/tcpc's \
                  domain\x1b[0m"
+            ),
+        }
+        // **And the service's own thread, which is the half the ninth sighting
+        // could not supply.** `Blocked` for the client says the fault is on
+        // this side of the call; it does not say whether `bin/tcpd` ever took
+        // the message. Parked in `RECV` means it did not, and the search is
+        // upstream of the service; anything else means it did and has not
+        // replied, and its `RECV` handler is where to look.
+        match sched::first_thread_in_domain(TCPD_DOMAIN.load(core::sync::atomic::Ordering::Acquire))
+        {
+            Some((thread, state)) => println!(
+                "\x1b[91m                   and bin/tcpd's thread {thread} is {state:?}, \
+                 {}\x1b[0m",
+                // **The state alone does not say it, and the first version of
+                // this line claimed it did.** A service parked in `RECV`
+                // having never taken the message and one that took it, did not
+                // answer, and went back to `RECV` are *both* `Blocked`. Only
+                // `reply_to` separates them: set when a message is taken,
+                // cleared when it is answered.
+                match crate::sched::first_thread_owes_reply(
+                    TCPD_DOMAIN.load(core::sync::atomic::Ordering::Acquire),
+                ) {
+                    Some(Some(_)) => {
+                        "owing a reply to a caller it took and did not answer -- \
+                         its RECV handler is where to look"
+                    }
+                    Some(None) => {
+                        "owing nobody a reply, so it never took the message and the search is \
+                         upstream of the service"
+                    }
+                    None => "and the scheduler lost it between two reads",
+                }
+            ),
+            None => println!(
+                "\x1b[91m                   and the scheduler has no thread in bin/tcpd's \
+                 domain at all\x1b[0m"
             ),
         }
     } else if outcome == 2 && detail == 0 {

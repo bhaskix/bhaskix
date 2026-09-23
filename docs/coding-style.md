@@ -301,6 +301,15 @@ Restated per-subsystem in each design doc. The rules:
   A hunt for an open defect threw away the one field that distinguished its two candidate causes
   because its `grep` ended at `[^;]*`, and the same shape truncated a CI annotation at 150
   characters for eight sightings.
+- **Capture a fact where it is true, not where it is convenient to read.** A counter published at
+  the end of a boot describes the end of the boot. `bin/linuxd` spent a word on *which process was
+  owed an undelivered signal* and looked the pid up when the report was written — through a table
+  that only holds **live** processes — so a target that had exited and been collected read **pid
+  0**, indistinguishable from a domain that never had a process at all. The sighting it was built
+  for read exactly that and answered nothing. The pid was in hand at the raise, three lines from
+  where the bit was set; recorded there, zero means *never raised against*, which is the reading
+  the word existed for. **Ask what else could produce the value you are about to read**, and if a
+  timing can, move the capture rather than the interpretation.
 - **Tie a writer to the layout it writes into.** A record published as a bare array literal, at
   offsets derived from constants in another crate, will one day be widened without the constant
   moving — and the write lands past the record with nothing to say so. Give the array the layout's

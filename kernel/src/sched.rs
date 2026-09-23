@@ -5443,6 +5443,30 @@ pub fn threads_present_exact(ids: &[u32]) -> usize {
     present
 }
 
+/// Whether the first thread in `domain` owes a reply, and to whom.
+///
+/// **The discriminator the step-4 row needs, and the reason a thread's state
+/// alone is not it.** A service parked in `RECV` having never taken the
+/// message and one that took it, did not answer, and went back to `RECV` are
+/// **both** `Blocked`. `reply_to` is what tells them apart: it is set when a
+/// message is taken and cleared when it is answered, so a blocked thread with
+/// it set is one that has a caller waiting on an answer it did not send.
+///
+/// Returns `None` if the domain has no thread at all.
+#[must_use]
+pub fn first_thread_owes_reply(domain: u32) -> Option<Option<u32>> {
+    let online = percpu::online_count() as usize;
+    for queue in QUEUES.iter().take(online.min(MAX_CPUS)) {
+        let queue = queue.lock();
+        for thread in queue.threads.iter().flatten() {
+            if thread.domain == domain {
+                return Some(thread.reply_to);
+            }
+        }
+    }
+    None
+}
+
 /// The first thread [`threads_in_domain_exact`] would count, and its state.
 ///
 /// **For a refusal message, not for a decision.** `set_personality` refuses a
