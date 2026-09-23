@@ -9536,6 +9536,9 @@ fn a_hosted_process_ends_its_child(hhdm_base: u64, cpus: u32) -> bool {
         passed,
         passed_what,
         first_owed_blocked,
+        arm_finished,
+        arm_parked,
+        took_nothing,
     } = adapter_signal_record();
     // **And a phrase a tool can count**, in yellow, when the two disagree.
     //
@@ -9586,6 +9589,31 @@ fn a_hosted_process_ends_its_child(hhdm_base: u64, cpus: u32) -> bool {
     // **Whether the signal nobody took is one its target *could* have taken.**
     // A non-zero mask here says the delivery never can happen rather than has
     // not happened yet — see [`SignalRecord::first_owed_blocked`].
+    // **Every path a pending signal can take out of a reply, and where the
+    // lost one went.** Printed whenever any of them fired, so a healthy boot
+    // shows the shape a broken one departs from.
+    if arm_finished != 0 || arm_parked != 0 || took_nothing != 0 {
+        println!(
+            "    hosted signals frames asked for: {arm_finished} on a finished call, \
+             {arm_parked} on a parking one; {took_nothing} taken with nothing pending after all"
+        );
+        // The comparison §3 is short of. `delivered` counts frames actually
+        // built and entered; `arm_finished` counts the finished calls that
+        // asked for one. A delivery lost between the two is a different bug
+        // from one that was never asked for.
+        if owed != 0 && arm_finished + arm_parked == delivered {
+            println!(
+                "\x1b[93m    hosted signals every frame asked for was delivered, so the owed \
+                 signal was never seen pending at a reply\x1b[0m"
+            );
+        } else if owed != 0 {
+            println!(
+                "\x1b[93m    hosted signals {} frame(s) were asked for and not delivered, so one \
+                 was lost after the request\x1b[0m",
+                (arm_finished + arm_parked).saturating_sub(delivered)
+            );
+        }
+    }
     if owed != 0 {
         println!(
             "\x1b[93m    hosted signals the owed domain's blocked mask is {first_owed_blocked:#x}\
@@ -9813,6 +9841,18 @@ struct SignalRecord {
     passed: u64,
     /// See [`Self::passed`].
     passed_what: u64,
+    /// Frames asked for on a finished call, on a call about to park, and the
+    /// times the stash was taken with nothing pending after all.
+    ///
+    /// **`arm_finished` against `delivered` is the decisive comparison** for
+    /// `TRACKER.md` §3: equal, and a delivery was lost *after* its frame was
+    /// asked for; short by one, and the reply never saw the signal pending and
+    /// the search moves out of the adapter's reply path entirely.
+    arm_finished: u64,
+    /// See [`Self::arm_finished`].
+    arm_parked: u64,
+    /// See [`Self::arm_finished`].
+    took_nothing: u64,
     /// The blocked mask of the first domain still owed a delivery.
     ///
     /// **The difference between a delivery that has not happened yet and one
@@ -9871,6 +9911,9 @@ fn adapter_signal_record() -> SignalRecord {
         passed: record[11],
         passed_what: record[12],
         first_owed_blocked: record[13],
+        arm_finished: record[14],
+        arm_parked: record[15],
+        took_nothing: record[16],
     }
 }
 

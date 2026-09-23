@@ -614,7 +614,14 @@ fn publish_signals() {
             }
         }
     }
-    let counts = [
+    // **Typed to the record's own width since 2026-09-23.** It was a bare
+    // literal, and this program named no record size anywhere: an entry added
+    // without bumping `report::SIGNAL_WORDS` in another crate wrote past the
+    // record into the scratch, silently. The layout's assertions protect the
+    // constants from each other and did not protect the writer from the
+    // layout. This array grew three times in one day and the coupling was
+    // remembered by hand each time; now it is a compile error.
+    let counts: [u64; report::SIGNAL_WORDS] = [
         SIGNALS_RAISED.load(core::sync::atomic::Ordering::Relaxed),
         SIGNALS_DELIVERED.load(core::sync::atomic::Ordering::Relaxed),
         SIGNALS_UNBUILT.load(core::sync::atomic::Ordering::Relaxed),
@@ -629,6 +636,9 @@ fn publish_signals() {
         ARM_PASSED.load(core::sync::atomic::Ordering::Relaxed),
         ARM_PASSED_WHAT.load(core::sync::atomic::Ordering::Relaxed),
         first_owed_blocked,
+        ARM_FINISHED.load(core::sync::atomic::Ordering::Relaxed),
+        ARM_PARKED.load(core::sync::atomic::Ordering::Relaxed),
+        TOOK_NOTHING.load(core::sync::atomic::Ordering::Relaxed),
     ];
     for (index, count) in counts.iter().enumerate() {
         // SAFETY: inside the page `ATTACH` mapped from this program's own
@@ -718,6 +728,28 @@ static RESUMED_TO: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64
 /// through, and a count of **zero** with a signal still owed says the domain
 /// never came back to be delivered to at all — which is a different fault and
 /// would move the search out of this function entirely.
+/// Frames asked for so a signal could be delivered on the way out of a
+/// **finished** call, and of a call **about to park**; and the times the stash
+/// was taken and nothing turned out to be pending.
+///
+/// With [`ARM_PASSED`] these partition every path a pending signal can take out
+/// of a reply, which `TRACKER.md` §3 is short of. Seven sightings agree the bit
+/// is set, is not blocked, and that the only reply carrying it was the target's
+/// own `exit_group`; two hypotheses are dead and what is left is a child that
+/// returned from `nanosleep` without any reply of its reaching the check.
+///
+/// **[`ARM_FINISHED`] against `delivered` is the decisive comparison.** Equal,
+/// and the loss is after the frame was asked for — in the round trip, or in
+/// `take_pending`. Short by one, and it is before: the reply never saw the
+/// signal pending at all, and the search moves out of this function.
+static ARM_FINISHED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// See [`ARM_FINISHED`].
+static ARM_PARKED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// See [`ARM_FINISHED`]. The `Nothing pending after all` branch, which the code
+/// there explains as a handler removed between the check and the frame — and
+/// nothing in these probes removes one.
+static TOOK_NOTHING: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 static ARM_PASSED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// The last shape that fell through, in the low thirty-two bits, and the
 /// domain it belonged to in the high thirty-two. See [`ARM_PASSED`].
@@ -804,6 +836,11 @@ fn answer_with_frame(domain: u32, slot: u64, number: u64) -> (u64, Answer) {
         }
         // Nothing pending after all -- a handler removed between the check and
         // here. The call's own answer is still owed.
+        //
+        // **Counted since 2026-09-23**, because nothing in these probes removes
+        // a handler and this branch would be silent if it were taken anyway.
+        TOOK_NOTHING.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        publish_signals();
         return (REPLY_VALUE, Answer::ok(value));
     }
 
@@ -7774,6 +7811,7 @@ extern "C" fn linuxd_main(hertz: u64) -> ! {
                 // redirect costs nothing and its answer is carried through the
                 // frame.
                 REPLY_VALUE => {
+                    ARM_FINISHED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                     await_frame_for_signal(request.domain, reply.value);
                     (REPLY_NEED_FRAME, Answer::ok(0))
                 }
@@ -7790,6 +7828,7 @@ extern "C" fn linuxd_main(hertz: u64) -> ! {
                 // happening, and a timer armed for a call that is not waiting
                 // would ring at a process that has moved on.
                 REPLY_BLOCK_ON | REPLY_BLOCK_ON_RETRY | REPLY_BLOCK_ON_UNTIL => {
+                    ARM_PARKED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                     let _ = deadline_word();
                     await_frame_for_signal(request.domain, memory::errno::EINTR as u64);
                     (REPLY_NEED_FRAME, Answer::ok(0))

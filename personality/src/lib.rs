@@ -274,7 +274,28 @@ pub mod report {
     /// That fits every number `TRACKER.md` §3's specimens carry and it is
     /// timing-dependent, which is the shape of a 2.9% race. This word is what
     /// turns that from a fitting story into a reading.
-    pub const SIGNAL_WORDS: usize = 14;
+    /// **Seventeen since 2026-09-23**, which moved [`SCRATCH_AT`] for the
+    /// fourth time. Fourteen ended at exactly the old boundary and the record
+    /// had no room left.
+    ///
+    /// The three new words account for **every path a pending signal can take
+    /// out of a reply**, which is what `TRACKER.md` §3 is now short of. Seven
+    /// sightings agree that the bit is set, is not blocked, and that the only
+    /// reply carrying it was the target's own `exit_group`. Two hypotheses
+    /// died — an inherited blocked set, measured twice; a raise ordered after
+    /// its wake, read in `answer_kill` — and what is left is a child that
+    /// returned from `nanosleep` without any reply of its reaching the check.
+    ///
+    /// | word | what it counts |
+    /// |---|---|
+    /// | `arm_finished` | a frame asked for on a **finished** call |
+    /// | `arm_parked` | a frame asked for on a call **about to park** |
+    /// | `took_nothing` | the stash taken and `take_pending` answering `None` |
+    ///
+    /// With `passed` those four partition it. `arm_finished` against
+    /// `delivered` is the decisive comparison: equal, and the loss is after the
+    /// frame was asked for; short by one, and it is before.
+    pub const SIGNAL_WORDS: usize = 17;
 
     /// Where bulk staging begins.
     ///
@@ -293,7 +314,9 @@ pub mod report {
     ///
     /// Each move costs the scratch 64 bytes of the 3,584 it started with,
     /// which is a chunk size rather than a capacity.
-    pub const SCRATCH_AT: usize = 640;
+    /// **704 since 2026-09-23**; 640 before that, 576 before that, 512 before
+    /// that. The signal record reached exactly 640 and had nowhere to grow.
+    pub const SCRATCH_AT: usize = 704;
 
     /// How much of the page bulk staging may use.
     ///
