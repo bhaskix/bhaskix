@@ -295,7 +295,19 @@ pub mod report {
     /// With `passed` those four partition it. `arm_finished` against
     /// `delivered` is the decisive comparison: equal, and the loss is after the
     /// frame was asked for; short by one, and it is before.
-    pub const SIGNAL_WORDS: usize = 17;
+    /// **Eighteen since 2026-09-23.** The eighteenth is the **pid** of the
+    /// first domain still owed a delivery, looked up in the process table.
+    ///
+    /// `owed` counts domains holding a pending signal and `first_owed` names
+    /// one; neither says that domain is the one the `kill` was aimed at, and a
+    /// raise landing on the *wrong* domain leaves an identical reading. This
+    /// row's own rule caught that — *a number that cannot say whose it is
+    /// answers no question about anyone*, `coding-style.md` §8 — after an
+    /// elimination had already been published on the strength of it.
+    ///
+    /// The pid the parent killed is in the report already. Equal, and the
+    /// raise landed on the right record; anything else, and it did not.
+    pub const SIGNAL_WORDS: usize = 18;
 
     /// Where bulk staging begins.
     ///

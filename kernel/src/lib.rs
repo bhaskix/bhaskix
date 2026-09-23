@@ -9539,6 +9539,7 @@ fn a_hosted_process_ends_its_child(hhdm_base: u64, cpus: u32) -> bool {
         arm_finished,
         arm_parked,
         took_nothing,
+        first_owed_pid,
     } = adapter_signal_record();
     // **And a phrase a tool can count**, in yellow, when the two disagree.
     //
@@ -9616,7 +9617,8 @@ fn a_hosted_process_ends_its_child(hhdm_base: u64, cpus: u32) -> bool {
     }
     if owed != 0 {
         println!(
-            "\x1b[93m    hosted signals the owed domain's blocked mask is {first_owed_blocked:#x}\
+            "\x1b[93m    hosted signals the owed domain is {first_owed} (pid {first_owed_pid}) \
+             and its blocked mask is {first_owed_blocked:#x}\
              {}\x1b[0m",
             // **Bit 15 and not bit 14.** `Dispositions::raise` does
             // `pending |= 1 << index` with `index == signal`, so the bit *is*
@@ -9853,6 +9855,13 @@ struct SignalRecord {
     arm_parked: u64,
     /// See [`Self::arm_finished`].
     took_nothing: u64,
+    /// The **pid** of the first domain still owed a delivery, or zero.
+    ///
+    /// `owed` and `first_owed` say a domain holds a pending signal; neither
+    /// says it is the domain the `kill` was aimed at, and a raise landing on
+    /// the wrong one reads identically. An elimination was published on the
+    /// strength of that before the distinction was noticed.
+    first_owed_pid: u64,
     /// The blocked mask of the first domain still owed a delivery.
     ///
     /// **The difference between a delivery that has not happened yet and one
@@ -9914,6 +9923,7 @@ fn adapter_signal_record() -> SignalRecord {
         arm_finished: record[14],
         arm_parked: record[15],
         took_nothing: record[16],
+        first_owed_pid: record[17],
     }
 }
 

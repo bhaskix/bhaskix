@@ -597,6 +597,7 @@ fn publish_signals() {
     // delivered, which is rare; the hot check stays `has_pending` on one
     // domain.
     let (mut owed, mut first_owed, mut first_owed_blocked) = (0u64, u64::MAX, 0u64);
+    let mut first_owed_pid = 0u64;
     for domain in 0..limits::MAX_DOMAINS {
         // Pending *at all*, blocked or not: a signal held back by a mask is
         // still owed, and a boot that ends with one outstanding is the defect.
@@ -611,6 +612,16 @@ fn publish_signals() {
                 // -- so a child forked from inside a handler is born unable to
                 // receive that signal.
                 first_owed_blocked = dispositions_of(domain as u32).blocked();
+                // **And whose domain it is.** `first_owed` is a domain number
+                // and says nothing about whether the `kill` was aimed there;
+                // a raise landing on the wrong domain reads identically. The
+                // pid is what makes it attributable.
+                //
+                // SAFETY: single-threaded by construction, as elsewhere here.
+                let processes = processes();
+                first_owed_pid = processes
+                    .by_domain(domain as u32, incarnation_of(domain as u32))
+                    .map_or(0, |process| u64::from(process.pid));
             }
         }
     }
@@ -639,6 +650,7 @@ fn publish_signals() {
         ARM_FINISHED.load(core::sync::atomic::Ordering::Relaxed),
         ARM_PARKED.load(core::sync::atomic::Ordering::Relaxed),
         TOOK_NOTHING.load(core::sync::atomic::Ordering::Relaxed),
+        first_owed_pid,
     ];
     for (index, count) in counts.iter().enumerate() {
         // SAFETY: inside the page `ATTACH` mapped from this program's own
