@@ -247,6 +247,28 @@ We will not pretend to cover these. Each has a note on whether it becomes in-sco
 > letting the nucleus end a domain for its creator without a capability is ambient authority by
 > another name, refused on the same grounds RFC 0031 refuses Linux UID 0.
 
+> **[RFC 0084](rfc/0084-a-fork-the-kernel-copies.md) added `COPY_SPACE` on 2026-09-23, and it is
+> the first entry in this list that confers no new reach.** It is here because a list that records
+> only the widenings is a list nobody can trust the silence of.
+>
+> A compromised `bin/linuxd` could already read and write every hosted domain's memory: `COPY_IN`
+> and `COPY_OUT` take a supervisor handle, it holds one for each process it hosts, and nothing
+> about them is new. `COPY_SPACE` copies a whole address space in the kernel instead of a kilobyte
+> at a time through the adapter. **The price it changes is the cost and not the bound** — 140
+> cycles a page against 213,404 — and a bound that only held because exercising it was slow was
+> never a bound.
+>
+> **Two things about it are narrower than what it replaces.** It demands `READ` on the *source*
+> capability, where `COPY_IN` and `COPY_OUT` take only the `WRITE` that `domain_supervise` already
+> requires on the capability they are invoked on; so this one call is stricter than the path it
+> supersedes. And it refuses to reproduce a region whose frames belong to a `Memory` object or to a
+> device — those are skipped and **counted**, because handing a domain memory nobody granted it
+> would be manufacturing authority, which is the one thing this whole interface exists not to do.
+>
+> What it does not change: the target must be a domain the adapter holds, so this reaches no
+> Bhaskix service and no other supervisor's children, on exactly the terms `END` above is bounded
+> by.
+
 > "Every boot today" stopped being true on 2026-08-28: a boot with `busybox=sh` grants the console
 > to the BusyBox domain, and it is the only one. Every other boot grants nothing and reaches no
 > keystroke at all. It is not
