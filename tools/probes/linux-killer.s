@@ -348,22 +348,29 @@ strangers:
         # and these children spend them. Armed by reverting `build_fork_child`
         # to `MAKE_SPACE`, which puts `could not build` back above zero.
         #
-        # **A call whose only purpose is to be a call, and it is a workaround
-        # for something undiagnosed.** Recorded here rather than hidden,
-        # because a line nobody can explain is worth more when it says so.
+        # **A call whose purpose is to be a call: it collects the delivery of
+        # the self-kill above before the disposition changes below.**
         #
-        # The parent has just signalled *itself*, and RFC 0083 delivers on the
-        # way out of a call. With nothing between that `kill` and the
-        # `rt_sigaction` below, the probe exits at milestone 17 with its
-        # handler having run **once** instead of twice -- which is what the
-        # `test %rax, %rax; jnz done` after that `rt_sigaction` does when `rax`
-        # is not the call's own result. With *any* syscall here it passes.
+        # RFC 0083 delivers a signal on the way out of a call, and not on the
+        # way out of the `kill` that raised it. The parent has just signalled
+        # itself; the delivery is owed and lands on whatever it calls next.
+        # The next thing it would otherwise call is the `rt_sigaction` that
+        # installs `child_handler` -- and then the delivery runs **the handler
+        # that call just installed**, which is `exit_group(88)`. The parent
+        # kills itself with the handler it was preparing for its children.
         #
-        # Bisected, not guessed: the page that used to be mapped here is gone
-        # (RFC 0084 -- the children stand on their parent's stack now), and
-        # removing it broke the run; putting the page back fixed it; replacing
-        # the page with a bare `getpid` also fixed it. So it is the call and
-        # not the region. See `TRACKER.md` §3.
+        # Measured, not reasoned: with this call removed the boot reads
+        # *"the last delivery jumped domain 7 to its handler at 0x400100b4"*,
+        # and `child_handler - inner` is `0xb4` against a copied page at
+        # `0x40010000`. Eleven probe-level experiments failed to establish that
+        # -- two of them looked decisive and were invalid -- and the number
+        # came from an instrument in `bin/linuxd`, which is the only side that
+        # knows it.
+        #
+        # **This is a divergence from Linux and not a fault here.** Linux
+        # delivers on return from the `kill` itself, so the *old* disposition
+        # runs; deferring to the next call means a disposition installed in
+        # between is the one that runs. `TRACKER.md` §3 records it.
         mov     $39, %eax               # getpid
         syscall
 

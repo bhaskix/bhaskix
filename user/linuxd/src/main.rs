@@ -488,9 +488,17 @@ fn deliver_signal_after_call(
     // the handler returns. Written into the *image* before the frame is built
     // from it, so the saved context carries it.
     image[0] = value;
+    // **And where the program will go back to**, published for the boot to
+    // read. This is the instruction after the call that has just been
+    // answered; `rt_sigreturn` should restore exactly it. See [`DELIVERED_AT`].
+    if let Some(slot) = DELIVERED_AT.get((domain as usize) % limits::MAX_DOMAINS) {
+        slot.store(image[15], core::sync::atomic::Ordering::Relaxed);
+    }
     if !write_slot(slot, &image) {
         return None;
     }
+    DELIVERED_ENTRY.store(handler.entry, core::sync::atomic::Ordering::Relaxed);
+    DELIVERED_DOMAIN.store(u64::from(domain), core::sync::atomic::Ordering::Relaxed);
     match deliver_signal(domain, slot, signal, 0, handler) {
         FAULT_RESUME => Some(()),
         _ => None,
@@ -607,6 +615,10 @@ fn publish_signals() {
         SIGNALS_UNRESTORED.load(core::sync::atomic::Ordering::Relaxed),
         owed,
         first_owed,
+        RESUMED_FROM.load(core::sync::atomic::Ordering::Relaxed),
+        RESUMED_TO.load(core::sync::atomic::Ordering::Relaxed),
+        DELIVERED_ENTRY.load(core::sync::atomic::Ordering::Relaxed),
+        DELIVERED_DOMAIN.load(core::sync::atomic::Ordering::Relaxed),
     ];
     for (index, count) in counts.iter().enumerate() {
         // SAFETY: inside the page `ATTACH` mapped from this program's own
@@ -629,6 +641,59 @@ fn publish_signals() {
 /// Zero is "not parked", which is the same sentinel `Process::domain_slot`
 /// uses and for the same reason: slot zero is the console and no park is ever
 /// on it.
+/// The `rip` the last delivery built its frame from, and the one the last
+/// `rt_sigreturn` restored.
+///
+/// [RFC 0083](../../docs/rfc/0083-a-signal-a-process-can-catch.md), and
+/// `TRACKER.md` §3's defect where a handler runs, returns, and the program does
+/// not continue past the call the signal was delivered on.
+///
+/// **Only this program knows these two numbers.** The kernel presents a
+/// thread's registers and takes them back; the probe cannot see its own saved
+/// context; and the boot report had no field for either. Eleven probe-level
+/// experiments were run against that defect and three conclusions published and
+/// withdrawn before it was accepted that no experiment on the far side could
+/// settle where the program goes — the saved `rip` and the restored one are the
+/// question, and they live here.
+///
+/// A delivery that resumes correctly leaves these two **equal**: the frame is
+/// built from the instruction the call would have returned to, and
+/// `rt_sigreturn` puts that same address back. They are published rather than
+/// asserted, because there is no gate to write until it is known which of them
+/// is wrong.
+/// **Per domain, and the first version was not** — which is the single-shared-
+/// slot fault this program already records removing from the `NEED_FRAME`
+/// stash on 2026-09-21, made again on the instrument built to study it. Two
+/// globals gave a *pair* on the first boot that read `saved 0x400100a6,
+/// restored 0x250003c1` and announced that they disagreed. They belong to
+/// different domains: `0x400100a6` is inside the probe's copied routine page,
+/// where a forked child's handler lives — and that handler calls `exit_group`
+/// and never reaches an `rt_sigreturn` at all. A pair assembled from two
+/// programs is not evidence about either.
+static DELIVERED_AT: [core::sync::atomic::AtomicU64; limits::MAX_DOMAINS] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; limits::MAX_DOMAINS];
+
+/// The pair published to the boot: the `rip` a delivery saved **for the domain
+/// that is returning**, and the one its `rt_sigreturn` restored.
+///
+/// Written together, at the `rt_sigreturn`, so the two words always describe
+/// one delivery in one domain. See [`DELIVERED_AT`].
+static RESUMED_FROM: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// See [`RESUMED_FROM`].
+static RESUMED_TO: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// The handler entry the last delivery jumped to, and the domain it was for.
+///
+/// The question nine words could not answer. On the failing configuration in
+/// `TRACKER.md` §3 the boot reads **two delivered** while the target's own
+/// handler marker reads **one run** — so a delivery was counted and the
+/// handler it was counted for did not write its marker. Either it jumped
+/// somewhere else, or it jumped to a *different* handler that writes no
+/// marker. This says which, and the domain keeps the answer attributable.
+static DELIVERED_ENTRY: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// See [`DELIVERED_ENTRY`].
+static DELIVERED_DOMAIN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 static PARKED_ON: [core::sync::atomic::AtomicU64; limits::MAX_DOMAINS] =
     [const { core::sync::atomic::AtomicU64::new(0) }; limits::MAX_DOMAINS];
 
@@ -805,6 +870,15 @@ fn answer_with_frame(domain: u32, slot: u64, number: u64) -> (u64, Answer) {
             edited[8] = registers.r9;
             edited[9] = registers.r10;
             edited[15] = registers.rip;
+            // **Where this `rt_sigreturn` is actually sending the program**,
+            // beside where the delivery meant it to go. See [`DELIVERED_AT`].
+            // **Both, together, for this domain** — see [`DELIVERED_AT`].
+            let saved = DELIVERED_AT
+                .get((domain as usize) % limits::MAX_DOMAINS)
+                .map_or(0, |slot| slot.load(core::sync::atomic::Ordering::Relaxed));
+            RESUMED_FROM.store(saved, core::sync::atomic::Ordering::Relaxed);
+            RESUMED_TO.store(registers.rip, core::sync::atomic::Ordering::Relaxed);
+            publish_signals();
             edited[16] = registers.eflags;
             edited[17] = registers.rsp;
             if !write_slot(slot, &edited) {

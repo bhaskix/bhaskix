@@ -229,7 +229,21 @@ pub mod report {
     /// raise landed where it should and delivery never came; none holding it
     /// means the raise went somewhere the target never reads, and those are
     /// different bugs.
-    pub const SIGNAL_WORDS: usize = 7;
+    /// **Nine since 2026-09-23.** The eighth and ninth are the `rip` a
+    /// delivery built its frame from and the `rip` an `rt_sigreturn` restored.
+    /// `TRACKER.md` §3 carries a defect where a handler demonstrably runs and
+    /// returns and the program does not continue past the call the signal was
+    /// delivered on — and eleven probe-level experiments could not say where
+    /// it went instead, because only this program knows those two numbers.
+    /// Three conclusions were published and withdrawn before it was accepted
+    /// that no probe could settle it.
+    /// **Eleven since 2026-09-23**, the same day as nine. The tenth is the
+    /// handler **entry** a delivery jumped to and the eleventh is the domain
+    /// it was for. Nine was not enough: the pair it added is *the last*
+    /// delivery and `rt_sigreturn` in the boot, and on both a working and a
+    /// failing run that turned out to be a different program's. A number that
+    /// cannot say whose it is answers no question about anyone.
+    pub const SIGNAL_WORDS: usize = 11;
 
     /// Where bulk staging begins.
     ///

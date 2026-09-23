@@ -9521,8 +9521,19 @@ fn a_hosted_process_ends_its_child(hhdm_base: u64, cpus: u32) -> bool {
     // limit is real and known, and a gate on it would fail every boot that
     // exercises a process which does not come back. What must exist is the
     // line, so a run can be read after the fact.
-    let (raised, delivered, unbuilt, raised_blocked, unrestored, owed, first_owed) =
-        adapter_signal_record();
+    let (
+        raised,
+        delivered,
+        unbuilt,
+        raised_blocked,
+        unrestored,
+        owed,
+        first_owed,
+        went_to,
+        came_back,
+        entry,
+        entry_domain,
+    ) = adapter_signal_record();
     // **And a phrase a tool can count**, in yellow, when the two disagree.
     //
     // `TRACKER.md` §3's undelivered-signal defect has two sightings and a
@@ -9541,6 +9552,36 @@ fn a_hosted_process_ends_its_child(hhdm_base: u64, cpus: u32) -> bool {
         println!(
             "\x1b[93m    hosted signals A SIGNAL WAS RAISED AND NOT DELIVERED: {raised} raised \
              against {delivered} delivered, {owed} domain(s) still holding one\x1b[0m"
+        );
+    }
+    // **Where a delivery sent the program, and where that same domain's
+    // `rt_sigreturn` put it back** — the two numbers `TRACKER.md` §3's *"the handler runs, returns,
+    // and the program does not continue"* turns on, and the ones no probe can
+    // see. They are equal on a delivery that resumes correctly: the frame is
+    // built from the instruction the answered call would have returned to, and
+    // `rt_sigreturn` restores that same address.
+    //
+    // Printed rather than asserted, and printed **whenever a delivery has
+    // happened** rather than only when they differ. A boot with no delivery
+    // leaves both zero and says nothing; a boot with one says where it went
+    // whether or not anything looks wrong, because the value of this pair on a
+    // *working* boot is what makes a broken one legible. That is the lesson
+    // this file learned three times today.
+    if entry != 0 {
+        println!(
+            "    hosted signals the last delivery jumped domain {entry_domain} to its handler at \
+             {entry:#x}"
+        );
+    }
+    if went_to != 0 || came_back != 0 {
+        println!(
+            "    hosted signals a delivery saved rip {went_to:#x} and that domain's \
+             rt_sigreturn restored {came_back:#x}{}",
+            if went_to == came_back {
+                ", which agree"
+            } else {
+                " -- THEY DISAGREE, so a handler returned the program somewhere its call did not"
+            }
         );
     }
     println!(
@@ -9680,10 +9721,10 @@ fn adapter_wait_record() -> (i64, u64) {
 /// makes no calls has its signal raised and never receives it. Linux delivers
 /// at any kernel entry, including a timer tick. Printing `raised` alone would
 /// hide that, and printing `delivered` alone would hide it twice.
-fn adapter_signal_record() -> (u64, u64, u64, u64, u64, u64, u64) {
+fn adapter_signal_record() -> (u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64) {
     let page = ADAPTER_REPORT.load(core::sync::atomic::Ordering::Acquire);
     if page == u64::MAX {
-        return (0, 0, 0, 0, 0, 0, u64::MAX);
+        return (0, 0, 0, 0, 0, 0, u64::MAX, 0, 0, 0, 0);
     }
     const FIRST_WORD: usize = bhaskix_personality::report::SIGNAL_AT / 8;
     const WORDS: usize = bhaskix_personality::report::SIGNAL_WORDS;
@@ -9705,10 +9746,11 @@ fn adapter_signal_record() -> (u64, u64, u64, u64, u64, u64, u64) {
         chunk.len()
     });
     if taken.is_none() {
-        return (0, 0, 0, 0, 0, 0, u64::MAX);
+        return (0, 0, 0, 0, 0, 0, u64::MAX, 0, 0, 0, 0);
     }
     (
-        record[0], record[1], record[2], record[3], record[4], record[5], record[6],
+        record[0], record[1], record[2], record[3], record[4], record[5], record[6], record[7],
+        record[8], record[9], record[10],
     )
 }
 
