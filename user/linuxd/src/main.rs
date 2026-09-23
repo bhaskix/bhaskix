@@ -3859,7 +3859,12 @@ fn trace_process() {
     // whether the count came back down rather than only what it ended at.
     let held_now = file_held().iter().filter(|taken| **taken).count() as u64;
     let peak = FILE_PEAK.fetch_max(held_now, Relaxed).max(held_now);
-    let words = [
+    // **Typed to the record's own width**, as `publish_signals`'s is and for
+    // the reason the audit that found both gave: the layout's assertions
+    // protect its constants from each other and do not protect a writer from
+    // the layout. An entry added here without `report::PROCESS_WORDS` moving
+    // would write past the record with nothing to say so.
+    let words: [u64; report::PROCESS_WORDS] = [
         ADMITTED.load(Relaxed),
         FOUND.load(Relaxed),
         LAST_ADMITTED_DOMAIN.load(Relaxed),

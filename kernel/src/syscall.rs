@@ -2670,6 +2670,21 @@ fn adapter_call(frame: &mut SyscallFrame, call: &PersonalityCall) -> Option<u64>
     }
     // Sixteen parks for one call: whatever the adapter is waiting for is not
     // coming, and a hosted program told to try again can decide for itself.
+    //
+    // **Counted since 2026-09-23, and it was the only `EAGAIN` in this function
+    // that said nothing.** The other three are each recorded —
+    // [`PARK_UNGRANTED`], [`PARK_UNNAMED`], [`PARK_REFUSED`] — and this one is
+    // the interesting one, because it answers the *hosted thread* without
+    // asking the adapter again. The adapter therefore makes no reply for that
+    // call, so nothing consults the pending-signal check on the way out of it.
+    //
+    // `TRACKER.md` §3's undelivered-signal row is down to exactly that shape:
+    // twelve sightings, the last of which measured that the woken call produced
+    // **no reply at all** while the child demonstrably resumed. Every fact it
+    // carries fits this path — and none of them had been able to see it,
+    // because nothing counted it. **Whether it is the cause is what this
+    // counter is for**; it is not yet established.
+    PARK_EXHAUSTED.fetch_add(1, Ordering::Relaxed);
     Some(-11i64 as u64)
 }
 
@@ -2978,6 +2993,17 @@ fn may_park_on(slot: u64, domain: u32) -> bool {
         _ => true,
     }
 }
+
+/// Hosted calls answered `EAGAIN` because [`adapter_call`]'s retry loop ran out.
+///
+/// **The one `EAGAIN` in that function that answers the hosted thread without
+/// asking the adapter again.** The other three refuse a park before it happens;
+/// this one ends a call that has been parked sixteen times, and it ends it in
+/// the nucleus. The adapter makes no reply, so nothing consults the
+/// pending-signal check on the way out of the call — see the comment where it
+/// is incremented, and `TRACKER.md` §3's undelivered-signal row, whose twelfth
+/// sighting measured exactly that absence.
+pub static PARK_EXHAUSTED: AtomicU64 = AtomicU64::new(0);
 
 /// Parks refused because the caller's domain was not granted what it named.
 pub static PARK_UNGRANTED: AtomicU64 = AtomicU64::new(0);

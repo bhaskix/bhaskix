@@ -301,6 +301,13 @@ Restated per-subsystem in each design doc. The rules:
   A hunt for an open defect threw away the one field that distinguished its two candidate causes
   because its `grep` ended at `[^;]*`, and the same shape truncated a CI annotation at 150
   characters for eight sightings.
+- **A pattern that matches the observer as well as the observed can never report absence.**
+  `pgrep -f 'make test-boot'` matches the watcher whose own command line contains that string, so
+  it answers *yes, it is running* for ever. As a report that is a lie; as a **wait condition** it
+  is a deadlock, and a watcher written that way waits for itself. The same hour it produced two
+  false statements — a lane called "still running" after it had finished, and an eight-hour QEMU
+  that was a shell whose arguments contained `qemu-system`. Match on something the observer cannot
+  contain: a pidfile, an exit code, a marker the work itself writes when it is done.
 - **Capture a fact where it is true, not where it is convenient to read.** A counter published at
   the end of a boot describes the end of the boot. `bin/linuxd` spent a word on *which process was
   owed an undelivered signal* and looked the pid up when the report was written — through a table

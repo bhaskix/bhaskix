@@ -4995,6 +4995,22 @@ fn personality_boundary_report() {
             ungranted + unnamed + refused
         );
     }
+    // **A call the nucleus ended itself, and the one that reaches no reply** —
+    // see [`syscall::PARK_EXHAUSTED`]. Separate from the line above because
+    // those three refuse a park *before* it happens and this ends a call that
+    // has been parked sixteen times; folding them together would price a
+    // refusal and a truncation as the same event.
+    //
+    // Loud, and on its own line, because `TRACKER.md` §3's undelivered-signal
+    // row fits this shape exactly and had no way to see it. Silent at zero,
+    // which is the ordinary case.
+    let exhausted = syscall::PARK_EXHAUSTED.load(core::sync::atomic::Ordering::Relaxed);
+    if exhausted > 0 {
+        println!(
+            "\x1b[93m    linux park     {exhausted} hosted call(s) RAN OUT OF RETRIES and were \
+             answered EAGAIN by the nucleus, so the adapter never replied to them\x1b[0m"
+        );
+    }
     // **What each hosted program was told its pid is** — RFC 0033 step 4, and
     // the claim is one a coincidence cannot satisfy: two programs that ran in
     // *the same domain slot* were given **different** pids. Under the scheme
@@ -30384,6 +30400,49 @@ fn wait_queue_self_test(hhdm_base: u64) -> bool {
         println!(
             "    wait queues    {total} laps around {RING_SIZE} cpus, slowest {slowest}; {blocks} sleeps, {wakeups} wakeups, {races} races caught in the window"
         );
+    }
+
+    // **The predicate evaluations, on every boot, passing or not** — and this
+    // is a precursor rather than the defect §3's ring row tracks.
+    //
+    // That row's dump is inside `if !ring_retired`, which is **correct** for
+    // its stated defect: a station that fails to retire fails the gate, so the
+    // gate failing is the same event as the defect occurring. The frame
+    // witness's fault was different in kind and this is not it.
+    //
+    // What that gating hides is the *shape* arriving without the failure.
+    // Specimen twenty-one read **273,294 evaluations against about 3,300 for
+    // each sibling** — eighty times — and §3 already prices it: a refused mark
+    // costs a lap, the mark is dropped, `block_self` finds the thread
+    // unblocked and returns, and `wait_until` goes round again. **A station
+    // can spin like that and still retire**, and then nothing says so: a boot
+    // that span eighty times and recovered reads exactly like a healthy one.
+    //
+    // A ratio rather than a threshold, because four stations doing comparable
+    // work should be within a small factor and there is no right value to
+    // assert. **Not a gate**: a boot that spins and recovers is not yet known
+    // to be wrong, and failing on it would assert something unproven. The loud
+    // line is a phrase `tools/ci-count.py` can count, which is what turned the
+    // undelivered-signal row from "seen twice" into a rate.
+    {
+        let evals: [u64; 4] =
+            core::array::from_fn(|id| PREDICATE_EVALS[id].load(Ordering::Relaxed));
+        let widest = evals.iter().copied().max().unwrap_or(0);
+        let narrowest = evals.iter().copied().min().unwrap_or(0).max(1);
+        let spread = widest / narrowest;
+        println!(
+            "    wait queues    predicate evaluations {}/{}/{}/{}, widest {spread}x",
+            evals[0], evals[1], evals[2], evals[3]
+        );
+        // Eight is chosen to sit far above the spread four comparable stations
+        // show and far below the eighty of the one specimen that exists. It is
+        // a starting point and is said to be one.
+        if spread >= 8 {
+            println!(
+                "\x1b[93m    wait queues    A STATION SPUN FAR HARDER THAN ITS SIBLINGS: {spread}x \
+                 between {narrowest} and {widest} evaluations\x1b[0m"
+            );
+        }
     }
 
     ok
