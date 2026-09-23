@@ -243,7 +243,38 @@ pub mod report {
     /// delivery and `rt_sigreturn` in the boot, and on both a working and a
     /// failing run that turned out to be a different program's. A number that
     /// cannot say whose it is answers no question about anyone.
-    pub const SIGNAL_WORDS: usize = 11;
+    /// **Thirteen since 2026-09-23.** The twelfth counts the times a pending
+    /// signal met a reply shape that **neither delivery arm handles**, and the
+    /// thirteenth packs the shape and the domain of the last such.
+    ///
+    /// `TRACKER.md` §3 has two specimens agreeing field for field that the
+    /// `nanosleep`-parked child's delivery goes missing while the pipe-parked
+    /// child's arrives. Those two take different arms by RFC 0083's own
+    /// description — a completed call against a call about to park — so the
+    /// finished-call arm is *inferred* to be the failing one. This is what
+    /// turns that into a measurement, and it answers either way: a count above
+    /// zero names the shape that slipped through, and a count of zero with a
+    /// signal still owed says the domain never came back to be delivered to at
+    /// all.
+    ///
+    /// **Thirteen and not fifteen**: the record would end at 648 against a
+    /// scratch boundary of 640, and the compile-time assertion below would
+    /// refuse it. Two words, chosen for what they answer rather than for what
+    /// would be convenient to collect.
+    /// **Fourteen since 2026-09-23, and fourteen is the last one that fits**:
+    /// the record then ends at exactly [`SCRATCH_AT`], and a fifteenth would
+    /// trip the assertion below. The word is spent on the blocked mask of the
+    /// first domain still owed a delivery.
+    ///
+    /// `Dispositions::inherit` copies the parent's **blocked** set to a forked
+    /// child, deliberately and as Linux does. A handler runs with its own
+    /// signal blocked (step 7), so a child forked while its parent is inside
+    /// that handler is born unable to receive the signal — `has_pending` masks
+    /// it out, no frame is ever asked for, and it stays pending for ever.
+    /// That fits every number `TRACKER.md` §3's specimens carry and it is
+    /// timing-dependent, which is the shape of a 2.9% race. This word is what
+    /// turns that from a fitting story into a reading.
+    pub const SIGNAL_WORDS: usize = 14;
 
     /// Where bulk staging begins.
     ///

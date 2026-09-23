@@ -596,7 +596,7 @@ fn publish_signals() {
     // A scan of the table on a path that runs only when a signal is raised or
     // delivered, which is rare; the hot check stays `has_pending` on one
     // domain.
-    let (mut owed, mut first_owed) = (0u64, u64::MAX);
+    let (mut owed, mut first_owed, mut first_owed_blocked) = (0u64, u64::MAX, 0u64);
     for domain in 0..limits::MAX_DOMAINS {
         // Pending *at all*, blocked or not: a signal held back by a mask is
         // still owed, and a boot that ends with one outstanding is the defect.
@@ -604,6 +604,13 @@ fn publish_signals() {
             owed += 1;
             if first_owed == u64::MAX {
                 first_owed = domain as u64;
+                // **And whether it is blocked**, which is the difference
+                // between a delivery that has not happened yet and one that
+                // never can. `inherit` gives a forked child its parent's
+                // blocked set, and a handler runs with its own signal blocked
+                // -- so a child forked from inside a handler is born unable to
+                // receive that signal.
+                first_owed_blocked = dispositions_of(domain as u32).blocked();
             }
         }
     }
@@ -619,6 +626,9 @@ fn publish_signals() {
         RESUMED_TO.load(core::sync::atomic::Ordering::Relaxed),
         DELIVERED_ENTRY.load(core::sync::atomic::Ordering::Relaxed),
         DELIVERED_DOMAIN.load(core::sync::atomic::Ordering::Relaxed),
+        ARM_PASSED.load(core::sync::atomic::Ordering::Relaxed),
+        ARM_PASSED_WHAT.load(core::sync::atomic::Ordering::Relaxed),
+        first_owed_blocked,
     ];
     for (index, count) in counts.iter().enumerate() {
         // SAFETY: inside the page `ATTACH` mapped from this program's own
@@ -690,6 +700,33 @@ static RESUMED_TO: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64
 /// handler it was counted for did not write its marker. Either it jumped
 /// somewhere else, or it jumped to a *different* handler that writes no
 /// marker. This says which, and the domain keeps the answer attributable.
+/// How many times a pending signal met a reply shape **neither delivery arm
+/// handles**, and the shape and domain of the last such.
+///
+/// [RFC 0083](../../docs/rfc/0083-a-signal-a-process-can-catch.md) delivers on
+/// two arms: a *finished* call, whose answer is carried through the frame, and
+/// a call *about to park*, which is interrupted with `EINTR` instead. Every
+/// other reply shape falls through with the signal still pending — a yield, an
+/// ending, or a frame already being asked for — and until now nothing counted
+/// that.
+///
+/// **`TRACKER.md` §3 has two specimens agreeing field for field** that the
+/// `nanosleep`-parked child's delivery goes missing while the pipe-parked
+/// child's arrives, and those two take *different arms*. That made the
+/// finished-call arm the inferred culprit. This measures it instead, and it
+/// answers either way: a count above zero names the shape that slipped
+/// through, and a count of **zero** with a signal still owed says the domain
+/// never came back to be delivered to at all — which is a different fault and
+/// would move the search out of this function entirely.
+static ARM_PASSED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// The last shape that fell through, in the low thirty-two bits, and the
+/// domain it belonged to in the high thirty-two. See [`ARM_PASSED`].
+///
+/// Packed because the record has two words left before the scratch boundary
+/// and a shape without its domain is the mistake this adapter has now made
+/// twice in one day.
+static ARM_PASSED_WHAT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 static DELIVERED_ENTRY: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// See [`DELIVERED_ENTRY`].
 static DELIVERED_DOMAIN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
@@ -7761,7 +7798,19 @@ extern "C" fn linuxd_main(hertz: u64) -> ! {
                 // of these is a point at which a redirect is safe or needed:
                 // an ending has no program to return to, and a call that is
                 // fetching its own arguments has not happened yet.
-                _ => (how, reply),
+                //
+                // **Counted since 2026-09-23**, because "none of these needs a
+                // redirect" is a claim and the signal stays pending either
+                // way. See [`ARM_PASSED`].
+                other => {
+                    ARM_PASSED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                    ARM_PASSED_WHAT.store(
+                        (other & 0xffff_ffff) | (u64::from(request.domain) << 32),
+                        core::sync::atomic::Ordering::Relaxed,
+                    );
+                    publish_signals();
+                    (other, reply)
+                }
             }
         } else {
             (how, reply)

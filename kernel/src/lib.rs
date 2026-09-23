@@ -9521,7 +9521,7 @@ fn a_hosted_process_ends_its_child(hhdm_base: u64, cpus: u32) -> bool {
     // limit is real and known, and a gate on it would fail every boot that
     // exercises a process which does not come back. What must exist is the
     // line, so a run can be read after the fact.
-    let (
+    let SignalRecord {
         raised,
         delivered,
         unbuilt,
@@ -9533,7 +9533,10 @@ fn a_hosted_process_ends_its_child(hhdm_base: u64, cpus: u32) -> bool {
         came_back,
         entry,
         entry_domain,
-    ) = adapter_signal_record();
+        passed,
+        passed_what,
+        first_owed_blocked,
+    } = adapter_signal_record();
     // **And a phrase a tool can count**, in yellow, when the two disagree.
     //
     // `TRACKER.md` §3's undelivered-signal defect has two sightings and a
@@ -9567,6 +9570,57 @@ fn a_hosted_process_ends_its_child(hhdm_base: u64, cpus: u32) -> bool {
     // whether or not anything looks wrong, because the value of this pair on a
     // *working* boot is what makes a broken one legible. That is the lesson
     // this file learned three times today.
+    // **A pending signal that met a reply shape neither delivery arm handles**
+    // — RFC 0083 delivers on a *finished* call and on a call *about to park*,
+    // and every other shape falls through with the signal still pending.
+    //
+    // `TRACKER.md` §3 has two specimens agreeing field for field that the
+    // `nanosleep`-parked child's delivery goes missing while the pipe-parked
+    // child's arrives, and those two take different arms — which made the
+    // finished-call arm the *inferred* culprit. This is the measurement.
+    //
+    // **It answers either way, which is why it is worth two words.** Above
+    // zero names the shape that slipped through; zero, on a boot that still
+    // owes a delivery, says the domain never came back to be delivered to at
+    // all — a different fault, and one outside this function.
+    // **Whether the signal nobody took is one its target *could* have taken.**
+    // A non-zero mask here says the delivery never can happen rather than has
+    // not happened yet — see [`SignalRecord::first_owed_blocked`].
+    if owed != 0 {
+        println!(
+            "\x1b[93m    hosted signals the owed domain's blocked mask is {first_owed_blocked:#x}\
+             {}\x1b[0m",
+            // **Bit 15 and not bit 14.** `Dispositions::raise` does
+            // `pending |= 1 << index` with `index == signal`, so the bit *is*
+            // the signal number; an off-by-one here would name the wrong
+            // signal in a line whose whole purpose is to name the right one.
+            if first_owed_blocked & (1 << bhaskix_personality::signal::number::SIGTERM) != 0 {
+                " -- SIGTERM among them, so that domain cannot receive the signal it is owed"
+            } else if first_owed_blocked == 0 {
+                " -- nothing blocked, so the delivery was possible and did not happen"
+            } else {
+                ""
+            }
+        );
+    }
+    if passed != 0 {
+        let shape = passed_what & 0xffff_ffff;
+        let whose = passed_what >> 32;
+        println!(
+            "\x1b[93m    hosted signals {passed} pending signal(s) met a reply neither arm \
+             handles; the last was {} in domain {whose}\x1b[0m",
+            match shape {
+                0 => "a value",
+                2 => "a frame request",
+                3 => "a restore",
+                4 => "a yield",
+                5 => "the end of a thread",
+                6 => "the end of a domain",
+                7..=9 => "a park",
+                _ => "an unnamed shape",
+            }
+        );
+    }
     if entry != 0 {
         println!(
             "    hosted signals the last delivery jumped domain {entry_domain} to its handler at \
@@ -9721,10 +9775,61 @@ fn adapter_wait_record() -> (i64, u64) {
 /// makes no calls has its signal raised and never receives it. Linux delivers
 /// at any kernel entry, including a timer tick. Printing `raised` alone would
 /// hide that, and printing `delivered` alone would hide it twice.
-fn adapter_signal_record() -> (u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64) {
+/// What the adapter's signals have done, as a record rather than a tuple.
+///
+/// **Thirteen fields, and it was a thirteen-element tuple until 2026-09-23.**
+/// Clippy calls that a very complex type and is right for a reason this file
+/// paid for: widening the tuple by two required editing its declaration, both
+/// of its early returns, its construction and its destructuring, and getting
+/// one of the five wrong produced a type error each time rather than a
+/// readable diff. A struct is widened in one place and read by name.
+#[derive(Clone, Copy, Debug, Default)]
+struct SignalRecord {
+    /// Signals raised at a hosted process.
+    raised: u64,
+    /// Of those, the ones a handler actually received.
+    delivered: u64,
+    /// Deliveries whose frame could not be built — an unmapped stack, say.
+    unbuilt: u64,
+    /// Raises landing on a signal the target already had blocked.
+    raised_blocked: u64,
+    /// `rt_sigreturn`s that could not read their own frame's `uc_sigmask`.
+    unrestored: u64,
+    /// Domains still holding a signal nobody took, and the first of them.
+    owed: u64,
+    /// See [`Self::owed`]. `u64::MAX` when there is none.
+    first_owed: u64,
+    /// The `rip` a delivery saved, and the one that domain's `rt_sigreturn`
+    /// restored. Equal on a delivery that resumes correctly.
+    went_to: u64,
+    /// See [`Self::went_to`].
+    came_back: u64,
+    /// The handler entry the last delivery jumped to, and its domain.
+    entry: u64,
+    /// See [`Self::entry`].
+    entry_domain: u64,
+    /// Pending signals that met a reply shape neither delivery arm handles,
+    /// and the shape and domain of the last such, packed.
+    passed: u64,
+    /// See [`Self::passed`].
+    passed_what: u64,
+    /// The blocked mask of the first domain still owed a delivery.
+    ///
+    /// **The difference between a delivery that has not happened yet and one
+    /// that never can.** `Dispositions::inherit` gives a forked child its
+    /// parent's blocked set, and a handler runs with its own signal blocked —
+    /// so a child forked while its parent is inside that handler is born
+    /// unable to receive it.
+    first_owed_blocked: u64,
+}
+
+fn adapter_signal_record() -> SignalRecord {
     let page = ADAPTER_REPORT.load(core::sync::atomic::Ordering::Acquire);
     if page == u64::MAX {
-        return (0, 0, 0, 0, 0, 0, u64::MAX, 0, 0, 0, 0);
+        return SignalRecord {
+            first_owed: u64::MAX,
+            ..SignalRecord::default()
+        };
     }
     const FIRST_WORD: usize = bhaskix_personality::report::SIGNAL_AT / 8;
     const WORDS: usize = bhaskix_personality::report::SIGNAL_WORDS;
@@ -9746,12 +9851,27 @@ fn adapter_signal_record() -> (u64, u64, u64, u64, u64, u64, u64, u64, u64, u64,
         chunk.len()
     });
     if taken.is_none() {
-        return (0, 0, 0, 0, 0, 0, u64::MAX, 0, 0, 0, 0);
+        return SignalRecord {
+            first_owed: u64::MAX,
+            ..SignalRecord::default()
+        };
     }
-    (
-        record[0], record[1], record[2], record[3], record[4], record[5], record[6], record[7],
-        record[8], record[9], record[10],
-    )
+    SignalRecord {
+        raised: record[0],
+        delivered: record[1],
+        unbuilt: record[2],
+        raised_blocked: record[3],
+        unrestored: record[4],
+        owed: record[5],
+        first_owed: record[6],
+        went_to: record[7],
+        came_back: record[8],
+        entry: record[9],
+        entry_domain: record[10],
+        passed: record[11],
+        passed_what: record[12],
+        first_owed_blocked: record[13],
+    }
 }
 
 /// What the adapter's last `fork` did: the child's pid and the bytes copied.
