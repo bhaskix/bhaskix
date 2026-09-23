@@ -307,7 +307,11 @@ pub mod report {
     ///
     /// The pid the parent killed is in the report already. Equal, and the
     /// raise landed on the right record; anything else, and it did not.
-    pub const SIGNAL_WORDS: usize = 18;
+    /// **Nineteen since 2026-09-23.** The nineteenth is how many replies the
+    /// first owed domain has made since it was raised against — one means the
+    /// woken call produced none, two or more means one was made and did not
+    /// see the pending bit.
+    pub const SIGNAL_WORDS: usize = 19;
 
     /// Where bulk staging begins.
     ///

@@ -9540,6 +9540,7 @@ fn a_hosted_process_ends_its_child(hhdm_base: u64, cpus: u32) -> bool {
         arm_parked,
         took_nothing,
         first_owed_pid,
+        first_owed_replies,
     } = adapter_signal_record();
     // **And a phrase a tool can count**, in yellow, when the two disagree.
     //
@@ -9618,13 +9619,19 @@ fn a_hosted_process_ends_its_child(hhdm_base: u64, cpus: u32) -> bool {
     if owed != 0 {
         println!(
             "\x1b[93m    hosted signals the owed domain is {first_owed}, and the kill that \
-             filled it named pid {first_owed_pid}; its blocked mask is \
+             filled it named pid {first_owed_pid}, and it has replied {first_owed_replies} \
+             time(s) since -- {}; its blocked mask is \
              {first_owed_blocked:#x}\
              {}\x1b[0m",
             // **Bit 15 and not bit 14.** `Dispositions::raise` does
             // `pending |= 1 << index` with `index == signal`, so the bit *is*
             // the signal number; an off-by-one here would name the wrong
             // signal in a line whose whole purpose is to name the right one.
+            if first_owed_replies <= 1 {
+                "so the woken call produced no reply and the search is in the park and wake path"
+            } else {
+                "so a reply was made that did not see the pending bit"
+            },
             if first_owed_blocked & (1 << bhaskix_personality::signal::number::SIGTERM) != 0 {
                 " -- SIGTERM among them, so that domain cannot receive the signal it is owed"
             } else if first_owed_blocked == 0 {
@@ -9870,6 +9877,12 @@ struct SignalRecord {
     /// the wrong one reads identically. An elimination was published on the
     /// strength of that before the distinction was noticed.
     first_owed_pid: u64,
+    /// How many replies the first owed domain has made since its raise.
+    ///
+    /// **One means the woken call produced no reply at all**, so the kernel
+    /// did not re-present it and the search moves into the park and wake path.
+    /// Two or more means a reply was made and did not see the pending bit.
+    first_owed_replies: u64,
     /// The blocked mask of the first domain still owed a delivery.
     ///
     /// **The difference between a delivery that has not happened yet and one
@@ -9932,6 +9945,7 @@ fn adapter_signal_record() -> SignalRecord {
         arm_parked: record[15],
         took_nothing: record[16],
         first_owed_pid: record[17],
+        first_owed_replies: record[18],
     }
 }
 

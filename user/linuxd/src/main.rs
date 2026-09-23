@@ -598,6 +598,7 @@ fn publish_signals() {
     // domain.
     let (mut owed, mut first_owed, mut first_owed_blocked) = (0u64, u64::MAX, 0u64);
     let mut first_owed_pid = 0u64;
+    let mut first_owed_replies = 0u64;
     for domain in 0..limits::MAX_DOMAINS {
         // Pending *at all*, blocked or not: a signal held back by a mask is
         // still owed, and a boot that ends with one outstanding is the defect.
@@ -615,6 +616,14 @@ fn publish_signals() {
                 // **And whose domain it is** — the pid the `kill` was aimed
                 // at, recorded at the raise rather than looked up now. See
                 // [`RAISED_AS_PID`] for why the difference decided a sighting.
+                first_owed_replies = REPLIES
+                    .get(domain % limits::MAX_DOMAINS)
+                    .map_or(0, |slot| slot.load(core::sync::atomic::Ordering::Relaxed))
+                    .saturating_sub(
+                        REPLIES_AT_RAISE
+                            .get(domain % limits::MAX_DOMAINS)
+                            .map_or(0, |slot| slot.load(core::sync::atomic::Ordering::Relaxed)),
+                    );
                 first_owed_pid = RAISED_AS_PID
                     .get(domain % limits::MAX_DOMAINS)
                     .map_or(0, |slot| slot.load(core::sync::atomic::Ordering::Relaxed));
@@ -647,6 +656,7 @@ fn publish_signals() {
         ARM_PARKED.load(core::sync::atomic::Ordering::Relaxed),
         TOOK_NOTHING.load(core::sync::atomic::Ordering::Relaxed),
         first_owed_pid,
+        first_owed_replies,
     ];
     for (index, count) in counts.iter().enumerate() {
         // SAFETY: inside the page `ATTACH` mapped from this program's own
@@ -709,6 +719,37 @@ static DELIVERED_AT: [core::sync::atomic::AtomicU64; limits::MAX_DOMAINS] =
 static RESUMED_FROM: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// See [`RESUMED_FROM`].
 static RESUMED_TO: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Replies this program has made to each domain, and the count each stood at
+/// when that domain was last raised against.
+///
+/// **The discriminator `TRACKER.md` §3 is down to.** Eleven sightings agree the
+/// bit is set on the right domain, is not blocked, and that the only reply
+/// carrying it was the target's own `exit_group` — while the child
+/// demonstrably returned from its `nanosleep`, since it ran the instruction
+/// that exits 99. Those two are hard to hold together.
+///
+/// The difference between these two says which. **One** reply since the raise
+/// means the woken call produced none at all, so the kernel did not re-present
+/// it and the search moves into the park and wake path. **Two or more** means a
+/// reply was made and did not see the pending bit — a far smaller place, and
+/// `answer_nanosleep_relative`'s retry is where those diverge.
+///
+/// Both reply sites are counted, the main call path and the frame round trip,
+/// because a count that skipped one could not tell a missing reply from a reply
+/// of the shape it declined to look at.
+static REPLIES: [core::sync::atomic::AtomicU64; limits::MAX_DOMAINS] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; limits::MAX_DOMAINS];
+/// See [`REPLIES`].
+static REPLIES_AT_RAISE: [core::sync::atomic::AtomicU64; limits::MAX_DOMAINS] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; limits::MAX_DOMAINS];
+
+/// Adds one to [`REPLIES`] for `domain`.
+fn note_reply(domain: u32) {
+    if let Some(slot) = REPLIES.get((domain as usize) % limits::MAX_DOMAINS) {
+        slot.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    }
+}
 
 /// The handler entry the last delivery jumped to, and the domain it was for.
 ///
@@ -1561,6 +1602,17 @@ fn answer_kill(request: &PersonalityCall) -> (u64, Answer) {
             // **The pid, here, where it is still true** — see [`RAISED_AS_PID`].
             if let Some(slot) = RAISED_AS_PID.get((domain as usize) % limits::MAX_DOMAINS) {
                 slot.store(u64::from(*target), core::sync::atomic::Ordering::Relaxed);
+            }
+            // And where the reply count stood, captured here for the reason
+            // the pid is. See [`REPLIES`].
+            if let (Some(now), Some(mark)) = (
+                REPLIES.get((domain as usize) % limits::MAX_DOMAINS),
+                REPLIES_AT_RAISE.get((domain as usize) % limits::MAX_DOMAINS),
+            ) {
+                mark.store(
+                    now.load(core::sync::atomic::Ordering::Relaxed),
+                    core::sync::atomic::Ordering::Relaxed,
+                );
             }
             publish_signals();
             wake_parked(domain);
@@ -7802,6 +7854,7 @@ extern "C" fn linuxd_main(hertz: u64) -> ! {
             // The deadline too: a call that needed its register frame can still
             // answer a park, and a `BLOCK_ON_UNTIL` replied from here without
             // one would ask the nucleus to arm a timer for the epoch.
+            note_reply(received.badge as u32);
             let _ = call(syscall::REPLY, 0, how, [reply.value, deadline_word(), 0, 0]);
             continue;
         }
@@ -7897,6 +7950,7 @@ extern "C" fn linuxd_main(hertz: u64) -> ! {
         );
         // The second word is the deadline a `BLOCK_ON_UNTIL` names, and zero
         // for every other shape -- see [`REPLY_BLOCK_ON_UNTIL`].
+        note_reply(request.domain);
         let _ = call(syscall::REPLY, 0, how, [reply.value, deadline_word(), 0, 0]);
     }
 
