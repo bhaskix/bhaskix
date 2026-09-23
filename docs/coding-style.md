@@ -273,6 +273,40 @@ Restated per-subsystem in each design doc. The rules:
 > checksum before the second of its two parses. **A parser guarded by a whole-input checksum is
 > unreachable to a fuzzer that does not repair it**, and a target that does not say so reports a
 > clean campaign over the doorway.
+- **An instrument that only speaks when something else has already failed is not an instrument.**
+  Every counter, witness and report must be readable on a **passing** run, because the question it
+  answers is usually *"was this run as healthy as it looked?"* — and a boot that is already red is
+  the one case where somebody was going to look anyway. `switched_holding_report` has said this in
+  its own comment since 2026-08-29; the same fault was found three times on 2026-09-23 alone. The
+  frame witness bracketed every dispatch and printed only when a *different* check had counted
+  something, so ten specimens of an open fault recorded a phase and discarded it. The signal
+  accounting lived inside its gate's failure branch, which voided a 28-run rate bound: those runs
+  were not evidence of absence, they were runs on which the question was never asked. **A count of
+  clean runs means nothing unless the clean runs produced a reading.**
+- **A number that cannot say whose it is answers no question about anyone.** Report per-domain, per
+  thread, per CPU — whatever the unit of the fault is — and publish the identity *with* the value,
+  written together so the pair cannot be assembled from two different subjects. `bin/linuxd`
+  removed a single shared stash for exactly this reason on 2026-09-21 and reintroduced the same
+  shape two days later **on the instrument built to study its consequences**: two globals holding a
+  saved and a restored `rip`, which on their first boot announced a disagreement between two
+  different domains' events.
+- **An experiment whose failure mode is indistinguishable from the phenomenon proves nothing.**
+  Before believing a negative result, ask what the experiment does when it is *itself* wrong. On
+  2026-09-23 three were believed and published, and each produced the same milestone the real fault
+  did: installing `SIG_IGN` where it is not special-cased, so entry `1` is jumped to and the process
+  dies for an unrelated reason; installing a handler at an offset from the wrong page, so the
+  address is negative; and reading a hardcoded `(0 0 0)` label as though it were the checks' output
+  when clippy had reported three findings.
+- **A pattern that stops short of a field cannot see that field go wrong.** Capture whole lines.
+  A hunt for an open defect threw away the one field that distinguished its two candidate causes
+  because its `grep` ended at `[^;]*`, and the same shape truncated a CI annotation at 150
+  characters for eight sightings.
+- **Tie a writer to the layout it writes into.** A record published as a bare array literal, at
+  offsets derived from constants in another crate, will one day be widened without the constant
+  moving — and the write lands past the record with nothing to say so. Give the array the layout's
+  own width (`let counts: [u64; report::SIGNAL_WORDS] = [...]`) so the mismatch is a compile error
+  naming the array. The layout's assertions protect the constants from each other; they do not
+  protect the writer from the layout.
 - **Every bug fix adds a regression test.** No exceptions. If the bug was not testable, say what you
   changed to make it testable.
 - QEMU integration tests run on every PR. The frame-leak test
