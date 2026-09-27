@@ -1051,6 +1051,50 @@ not a claim that the suite is getting worse — it is the first time anyone has
 counted them together, and it is worth counting again before anyone reasons from
 it.
 
+### 2026-09-27 (ring specimen twenty-three, and the spread says which variety it is)
+
+**CI run 742, `boot (uefi, qemu64)`, one station asleep — and the predicate
+spread added on 2026-09-23 earns its first specimen by *excluding* something.**
+
+```
+ring-1 (thread 13) asleep,  44270 laps, last saw token 2 at phase 2, 76036 evaluations;
+        8 wakes landed, 0 not found, 0 contended, 3 migration(s);
+        last decided waiting at #567737, no entry in the ring;
+        last wake #567732, last mark #567738 by itself
+ring-0/2/3 retired,         44270-1 laps, token 1 at phase 3, 78093 / 77406 / 75777 evaluations
+0 wake(s) found no queue holding the thread, 0 found it awake
+5 block/wake races caught by the recheck, 130222 blocks and 130223 wakeups
+```
+
+**The four evaluation counts are within 3.1% of each other — a spread of 1×.**
+Specimen twenty-one's was **eighty**. So this is **not** the spinning variety
+that §3 prices as *a refused mark costs a lap, the mark is dropped, `block_self`
+finds the thread unblocked and returns, and `wait_until` goes round again*. Two
+shapes were being filed under one row, and the spread separates them on sight.
+That is what the line was added for, and it did its job by ruling a cause out
+rather than in.
+
+**What this specimen says instead.** `ring-1` decided **waiting** at #567737 and
+its decision was *correct*: the predicate is `token == id || phase > 2`, it last
+saw **token 2 at phase 2**, and for `id == 1` neither disjunct holds. Then it
+**marked itself blocked at #567738 — after its last delivered wake at
+#567732 — and has no entry in the ring.** The retire's `wake_all` found nothing
+to wake for it: `0 wake(s) found no queue holding the thread`.
+
+**Marked blocked, not enqueued.** That is the shape the row has reasoned about
+and the row's own reading eliminated it: *"`enqueue_and_block` cannot mark
+without enqueueing — it takes a free slot first and marks second, both under the
+queue lock, and returns `false` without marking when the queue is full — and
+`overflowed` reads 0."* This specimen has `no entry in the ring` with a mark by
+itself, so either that reading is wrong or something removes the entry between
+the mark and the retire. **The next step is to instrument the removal**, not to
+re-argue the enqueue.
+
+**And the other three retired at token 1 phase 3 while ring-1 last read token 2
+phase 2** — a *later* token at an *earlier* phase. Worth noting without a theory
+attached: the row's specimens twenty and twenty-one turned on exactly which
+evaluation `SEEN_PHASE` belonged to.
+
 ### 2026-09-23 (the ring's instrument audited, and it passes the rule that caught two others)
 
 The five instrument rules added to `docs/coding-style.md` §8 today came from
