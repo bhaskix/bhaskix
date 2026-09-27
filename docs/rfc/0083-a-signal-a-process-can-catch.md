@@ -124,6 +124,44 @@ personality event pending" flag checked on return to ring 3 — on the hottest
 path in the system, and phrased so it does not put Linux knowledge back in the
 nucleus, which RFC 0031 gates at 0. A separate RFC.
 
+## A fourth limit: a futex wake resumes without an adapter reply (2026-09-27)
+
+**Delivery rides out on the adapter's reply. A hosted call answered
+`REPLY_BLOCK_ON` has none when it wakes**, so a signal pending for that domain
+is not checked at that boundary.
+
+The nucleus's three park arms differ in one line, and it is the line that
+matters here:
+
+| the adapter answers | on a successful wake the nucleus |
+|---|---|
+| `BLOCK_ON_RETRY` | `continue`s — re-asks the adapter, which replies |
+| `BLOCK_ON_UNTIL` | `continue`s — likewise |
+| **`BLOCK_ON`** | **`return Some(0)`** — completes the call itself |
+
+Returning zero is *correct for the futex*: the nucleus's own comment says so —
+*"a `futex` is answered zero, which is what Linux's futex returns"*. The gap is
+not the value, it is that no reply passes through `bin/linuxd` on that path, and
+the pending-signal check lives on the way out of a reply.
+
+**`REPLY_BLOCK_ON` has exactly one caller, `answer_futex`.** So the shape is: a
+hosted program blocked in `futex`, signalled, wakes and resumes with its signal
+still pending — until its next call, which is the first limit above.
+
+**This is not `TRACKER.md` §3's undelivered-signal defect**, and the distinction
+is worth stating because the two look alike. That defect's target is parked in
+`nanosleep`, which `answer_nanosleep_relative` answers `BLOCK_ON_RETRY`, and
+that arm re-asks. The resemblance is what made this worth checking rather than
+assuming.
+
+**Found by enumerating rather than by a sighting.** The row's contradiction rests
+on *no path I know of resumes a thread without a reply* — so the paths were
+counted. `adapter_call` has **eleven** `EAGAIN` returns where four had been
+claimed, and three of them, all in the `BLOCK_ON` arm, had no counter at all
+while the other two arms counted every equivalent. **The asymmetry was the bug**:
+a futex refused for a reason the other arms would have named read as silence.
+All eleven are counted now.
+
 ## A third limit: `raise()` does not deliver before it returns (2026-09-23)
 
 **POSIX requires that a signal sent to the caller by `raise()` be delivered

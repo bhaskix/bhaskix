@@ -2639,6 +2639,7 @@ fn adapter_call(frame: &mut SyscallFrame, call: &PersonalityCall) -> Option<u64>
             }
             crate::fault::reply::BLOCK_ON => {
                 if !may_park_on(answer.1, call.domain) {
+                    PARK_UNGRANTED.fetch_add(1, Ordering::Relaxed);
                     return Some(-11i64 as u64); // EAGAIN
                 }
                 let Some(notification) = adapter_notification(answer.1) else {
@@ -2646,6 +2647,7 @@ fn adapter_call(frame: &mut SyscallFrame, call: &PersonalityCall) -> Option<u64>
                     // holds. That is the adapter being wrong, not the caller, and
                     // a hosted program is told the truth it can act on: nothing
                     // slept, try again.
+                    PARK_UNNAMED.fetch_add(1, Ordering::Relaxed);
                     return Some(-11i64 as u64); // EAGAIN
                 };
                 BLOCKED.fetch_add(1, Ordering::Relaxed);
@@ -2654,7 +2656,22 @@ fn adapter_call(frame: &mut SyscallFrame, call: &PersonalityCall) -> Option<u64>
                     // Congested means another thread is already parked on this
                     // notification -- the adapter handed the same one out twice,
                     // which is its bug and is reported as one it cannot hide.
-                    Err(_) => return Some(-11i64 as u64),
+                    // **The same conditions as the other two arms, and now the same
+                    // counters.** `BLOCK_ON_RETRY` and `BLOCK_ON_UNTIL` separate a thread
+                    // told to stop from a notification that refused, and this arm recorded
+                    // neither -- three of `adapter_call`'s eleven `EAGAIN` returns had no
+                    // counter at all, every one of them here. The asymmetry was the bug: a
+                    // futex refused for a reason the other two arms would have named read
+                    // as silence.
+                    Err(_) => {
+                        if crate::sched::should_die() {
+                            PARK_ENDED.fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            PARK_REFUSED.fetch_add(1, Ordering::Relaxed);
+                            PARK_REFUSED_SLOT.store(answer.1, Ordering::Relaxed);
+                        }
+                        return Some(-11i64 as u64);
+                    }
                 }
             }
             crate::fault::reply::END_THREAD => crate::sched::exit(),
