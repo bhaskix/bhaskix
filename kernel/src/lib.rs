@@ -5004,11 +5004,24 @@ fn personality_boundary_report() {
     // Loud, and on its own line, because `TRACKER.md` §3's undelivered-signal
     // row fits this shape exactly and had no way to see it. Silent at zero,
     // which is the ordinary case.
+    // **Every path that answers a hosted call in the nucleus, in one line.**
+    //
+    // The question this answers is *did the nucleus answer the hosted thread
+    // itself, without the adapter replying* — and each of these does that, so
+    // each belongs here. `PARK_ENDED` was the one that did not: it is reported
+    // in the `input park` line, which is about **console** parks and carries a
+    // different label, so no single grep covered both. That cost an overclaim
+    // on 2026-09-27 — *"all four EAGAIN paths read zero"* — from checking the
+    // absence of `linux park` and not knowing a fifth path reported elsewhere.
+    // It stays in that line too; the two lines answer different questions.
     let exhausted = syscall::PARK_EXHAUSTED.load(core::sync::atomic::Ordering::Relaxed);
-    if exhausted > 0 {
+    let park_ended = syscall::PARK_ENDED.load(core::sync::atomic::Ordering::Relaxed);
+    if exhausted > 0 || park_ended > 0 {
         println!(
-            "\x1b[93m    linux park     {exhausted} hosted call(s) RAN OUT OF RETRIES and were \
-             answered EAGAIN by the nucleus, so the adapter never replied to them\x1b[0m"
+            "\x1b[93m    linux park     the nucleus answered {} hosted call(s) itself: \
+             {exhausted} RAN OUT OF RETRIES, {park_ended} whose thread was told to stop -- the \
+             adapter never replied to any of them\x1b[0m",
+            exhausted + park_ended
         );
     }
     // **What each hosted program was told its pid is** — RFC 0033 step 4, and
