@@ -1051,6 +1051,45 @@ not a claim that the suite is getting worse — it is the first time anyone has
 counted them together, and it is worth counting again before anyone reasons from
 it.
 
+### 2026-09-27 (the intermittent rate, measured: 17% of pushes go red and every one is a known row)
+
+**Asked for and measured rather than estimated.** Runs **685 to 744**, 2026-09-15
+to 2026-09-27: **59 concluded, 10 red — 17% of pushes.** Each red run was opened
+and attributed:
+
+| red runs | signature | row |
+|---|---|---|
+| 4 | `tcp client FAILED at step 4` | the outbound step-4 row |
+| 3 | `N ring stations did not retire` | the ring station row |
+| 2 | `hosted kill FAILED` | the undelivered signal |
+| 1 | inbound echo served, host got no bytes | filed 2026-09-27 |
+| 1 | did not finish booting | the `#GP`/frame family |
+
+Run **705 carries two** — a ring station *and* step 4 — so the rows sum to
+eleven across ten runs. **Every red run in the window matches a row already
+open. None was a regression, and none was unattributable.**
+
+**What that number is and is not.** It is a *per-push* rate, which is the one
+that matters to somebody deciding whether a red CI run means their change is
+wrong: **on any given push, a red is about one in six, and the prior heavily
+favours an existing intermittent over a new break.** It is not a per-boot rate —
+each run boots about twenty machines, so the per-boot rates of the individual
+rows (2.1% for the signal, 1 in 3,744 for the inbound one) are much smaller and
+are not comparable to this figure.
+
+**And it explains a thing this file has recorded four times without connecting
+it**: rows whose "first sighting" turned out not to be. At a 17% push-level rate
+spread across five signatures, a given signature is rare enough that the person
+who meets it has usually never seen it, and common enough that somebody has. The
+remedy already exists — `tools/ci-count.py` — and the gap was never the tool but
+knowing to reach for it.
+
+**The caution from the same day applies to reading this table.** `ci-count.py`
+reads *failed jobs'* logs only, so it is the right instrument for "how often has
+this signature appeared" and the wrong one for "does this happen on healthy
+boots". This measurement did not use it: the ten runs were enumerated from
+`ci-status.sh` and each opened with `--why`.
+
 ### 2026-09-27 (ring specimen twenty-three, and the spread says which variety it is)
 
 **CI run 742, `boot (uefi, qemu64)`, one station asleep — and the predicate
