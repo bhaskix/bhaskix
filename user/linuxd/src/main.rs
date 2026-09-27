@@ -735,9 +735,24 @@ static RESUMED_TO: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64
 /// reply was made and did not see the pending bit — a far smaller place, and
 /// `answer_nanosleep_relative`'s retry is where those diverge.
 ///
-/// Both reply sites are counted, the main call path and the frame round trip,
-/// because a count that skipped one could not tell a missing reply from a reply
-/// of the shape it declined to look at.
+/// **Three of this program's five reply sites are counted, and the choice is
+/// the whole accuracy of the number.** It said *both* until 2026-09-27, when
+/// counting them found five: `HANDLE_METHOD`, `FORGET_METHOD`, `FRAME_METHOD`,
+/// `FAULT_METHOD` and the main call path. Two were instrumented, so
+/// `replied N time(s)` meant *N replies through the two sites somebody had
+/// found* — and the conclusion drawn from it, that a woken call produced no
+/// reply, was a reading with a gap rather than a measurement.
+///
+/// Counted: the **main call path**, the **frame round trip**, and
+/// **`FAULT_METHOD`** — all three answer on a hosted domain's behalf, and a
+/// faulting thread's reply was the one the old pair would have missed
+/// outright.
+///
+/// Not counted: **`HANDLE_METHOD`** and **`FORGET_METHOD`**. Those answer the
+/// *kernel* about a domain slot rather than answering that domain's call;
+/// counting them would inflate the number with events the hosted program never
+/// made. Said here rather than left to be rediscovered, because the exclusion
+/// is a judgement and the next reader deserves to disagree with it.
 static REPLIES: [core::sync::atomic::AtomicU64; limits::MAX_DOMAINS] =
     [const { core::sync::atomic::AtomicU64::new(0) }; limits::MAX_DOMAINS];
 /// See [`REPLIES`].
@@ -7866,6 +7881,7 @@ extern "C" fn linuxd_main(hertz: u64) -> ! {
         if received.method == FAULT_METHOD {
             faults_seen(args[0], args[1]);
             let verdict = deliver(received.badge as u32, args[0], args[1]);
+            note_reply(received.badge as u32);
             let _ = call(syscall::REPLY, 0, 0, [verdict, 0, 0, 0]);
             continue;
         }
