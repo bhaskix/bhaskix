@@ -29427,10 +29427,6 @@ fn domain_self_test(hhdm_base: u64, cpus: u32) -> bool {
             "both domains are over, and destruction returned their capabilities",
             destroyed,
         ),
-        (
-            "destruction returned every capability",
-            capabilities_after == capabilities_before,
-        ),
         ("no domains remain", domain::live() == 0),
     ];
 
@@ -29439,6 +29435,44 @@ fn domain_self_test(hhdm_base: u64, cpus: u32) -> bool {
             println!("\x1b[91m    domains        FAILED: {name}\x1b[0m");
             ok = false;
         }
+    }
+
+    // **Printed on every boot, passing or not** -- and this is the gap that cost
+    // the capability row three sightings. `capabilities_before` and
+    // `capabilities_after` were both computed here from the first version of
+    // this test and **neither was ever printed**: not on a clean boot, and not
+    // even on the failing one, which printed the check's *name* and no numbers.
+    // So three occurrences of `destruction returned every capability` recorded
+    // *the counts differed* and discarded by how many and in which direction --
+    // the difference between a leak and a transient overcount, and between one
+    // capability and forty.
+    //
+    // **The clean boots are the half that was missing.** A delta cannot be
+    // judged without knowing what the count normally is: one capability against
+    // a baseline of twelve is a different fact from one against four hundred,
+    // and nothing in this tree recorded the baseline. It is printed on every
+    // boot for that reason and not as a courtesy -- section 8's first rule, an
+    // instrument that only speaks when something else has already failed is not
+    // an instrument.
+    println!(
+        "    domains        capabilities {capabilities_before} live before, {capabilities_after} after"
+    );
+
+    // Reported with its numbers, always -- the same rule the shares assertion
+    // below states, applied to the assertion that had not followed it. `leaked`
+    // and `lost` are named rather than left to a signed delta: which direction
+    // it went is the first question a specimen has to answer, and a reader
+    // should not have to work it out from two numbers and a subtraction.
+    if capabilities_after != capabilities_before {
+        let (magnitude, direction) = if capabilities_after > capabilities_before {
+            (capabilities_after - capabilities_before, "leaked")
+        } else {
+            (capabilities_before - capabilities_after, "lost")
+        };
+        println!(
+            "\x1b[91m    domains        FAILED: destruction returned every capability -- {capabilities_before} live before, {capabilities_after} after, {magnitude} {direction}\x1b[0m"
+        );
+        ok = false;
     }
 
     // Reported with its numbers, always. A ratio assertion that fails without
