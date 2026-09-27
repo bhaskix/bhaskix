@@ -317,6 +317,15 @@ Restated per-subsystem in each design doc. The rules:
   where the bit was set; recorded there, zero means *never raised against*, which is the reading
   the word existed for. **Ask what else could produce the value you are about to read**, and if a
   timing can, move the capture rather than the interpretation.
+- **A slot that keeps only the latest value answers only about the latest event.** A
+  last-writer-wins global is the right shape for *what happened most recently* and the wrong shape
+  for *whether this ever happened*, and the two questions read identically off it. `wait::CLEARED_AT`
+  records which of two places cleared a wait-queue entry; a station that retires normally is cleared
+  by a wake **last**, so an injection that forced four of the other case still read `a delivered
+  wake` on every station — the record it was built to observe had been overwritten by an ordinary
+  one. The arming is what found it, which is the argument for arming an instrument in the direction
+  you expect it to *fail* as well as the direction you expect it to work. Say in the doc comment
+  which question the slot can answer, or keep a per-cause slot and answer both.
 - **Tie a writer to the layout it writes into.** A record published as a bare array literal, at
   offsets derived from constants in another crate, will one day be widened without the constant
   moving — and the write lands past the record with nothing to say so. Give the array the layout's

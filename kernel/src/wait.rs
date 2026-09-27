@@ -138,6 +138,10 @@ impl Waiters {
         }
     }
 
+    fn holds_waiter(&self, waiter: Waiter) -> bool {
+        self.entries.contains(&Some(waiter))
+    }
+
     fn remove(&mut self, waiter: Waiter) {
         for entry in &mut self.entries {
             if *entry == Some(waiter) {
@@ -176,6 +180,83 @@ pub(crate) enum Fate {
     /// next waker tries again -- the difference between a delayed wake and a
     /// lost one.
     Retained,
+}
+
+/// When each thread's queue entry was last cleared, and why.
+///
+/// **The instrument ring specimen twenty-three asked for.** That specimen shows
+/// `ring-1` marked blocked at event #567738 — *after* its last delivered wake
+/// at #567732 — with **no entry in the ring**. `enqueue_and_block` takes a slot
+/// before it marks, so the mark implies an entry existed at #567738; and an
+/// entry is cleared in exactly two places, by the waiter itself in
+/// `wait_until`'s `remove`, or here on [`Fate::Delivered`]. Both are under the
+/// same lock. So something cleared it after #567738 and nothing recorded doing
+/// so.
+///
+/// Packed as `order << 2 | fate`, with zero meaning *never cleared*. A specimen
+/// that reads *never cleared* while holding no entry says the clearing happened
+/// outside both of those places, which is a different search from either.
+///
+/// Indexed by thread id, wrapped. Sixty-four is every thread this kernel runs
+/// at once and the wrap is stated rather than assumed: two threads aliasing
+/// would make this a number about neither.
+///
+/// **It holds the *last* clearing, not every one, and that matters in one
+/// direction.** A station that retires normally is cleared by a wake last, and
+/// that wake overwrites any earlier `BySleeper` record -- measured, by an
+/// injection that forced four spurious returns and still read `a delivered
+/// wake` on every station until the wake's own record was suppressed. So
+/// `a delivered wake` does **not** mean the sleeper never cleared its own
+/// entry. The reading this is for is the other one: a station left asleep
+/// holding no entry, where the last clearing is the one that lost it.
+static CLEARED_AT: [core::sync::atomic::AtomicU64; 64] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; 64];
+
+/// Why a queue entry was cleared.
+///
+/// **Deliberately not [`Fate`].** `Fate` classifies what a *wake* found, and
+/// only one of its three arms clears anything -- so recording the sleeper's own
+/// removal as `Fate::Unseen` would print the same word for two unrelated
+/// events, and a specimen reading it could not say which happened. The two
+/// places that clear an entry get two names.
+enum Cleared {
+    /// `wake_all` delivered the wake and consumed the entry.
+    ByWake,
+    /// The sleeper removed its own stale entry on re-entering [`WaitQueue::wait_until`].
+    BySleeper,
+}
+
+/// Records that `thread`'s entry was cleared, and by which of the two places.
+fn note_cleared(thread: u32, cause: Cleared) {
+    let code = match cause {
+        Cleared::ByWake => 1u64,
+        Cleared::BySleeper => 2,
+    };
+    if let Some(slot) = CLEARED_AT.get((thread as usize) % 64) {
+        slot.store(
+            (sched::event_mark() << 2) | code,
+            core::sync::atomic::Ordering::Relaxed,
+        );
+    }
+}
+
+/// What [`CLEARED_AT`] holds for `thread`: the event order and the fate, or
+/// `None` if its entry has never been cleared.
+#[must_use]
+pub fn cleared_at(thread: u32) -> Option<(u64, &'static str)> {
+    let packed = CLEARED_AT
+        .get((thread as usize) % 64)?
+        .load(core::sync::atomic::Ordering::Relaxed);
+    if packed == 0 {
+        return None;
+    }
+    Some((
+        packed >> 2,
+        match packed & 3 {
+            1 => "a delivered wake",
+            _ => "the sleeper itself",
+        },
+    ))
 }
 
 /// The choice above, given what the wake attempt found.
@@ -255,6 +336,13 @@ impl WaitQueue {
                 // entry is already gone, but after a *spurious* return it may
                 // not be, and a stale entry would have a later waker try to
                 // wake a thread that is not asleep.
+                // **The waiter's own clearing, recorded beside the waker's** — see
+                // [`CLEARED_AT`]. A specimen that holds no entry and shows neither
+                // has been cleared by something outside both places, which is what
+                // ring specimen twenty-three points at.
+                if waiters.holds_waiter(me) {
+                    note_cleared(me.id, Cleared::BySleeper);
+                }
                 waiters.remove(me);
 
                 if ready() {
@@ -329,6 +417,7 @@ impl WaitQueue {
                 let woke = sched::wake(waiter.id);
                 match fate(woke, sched::is_blocked(waiter.id).is_some()) {
                     Fate::Delivered => {
+                        note_cleared(waiter.id, Cleared::ByWake);
                         *entry = None;
                         woken += 1;
                     }

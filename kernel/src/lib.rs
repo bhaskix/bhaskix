@@ -29801,6 +29801,24 @@ fn rt_latency_self_test(hhdm_base: u64, cpus: u32) -> bool {
     true
 }
 
+/// What cleared a wait-queue entry and when, or the fact that nothing did.
+///
+/// **Separate from [`Recorded`] because the absent case means something here.**
+/// A station holding no entry that was never recorded as cleared was emptied by
+/// neither of the two places that can clear one, and that reading is the only
+/// one that opens a new search. `#0 by nothing` would hide it among the ordinary
+/// ones.
+struct ClearedBy(Option<(u64, &'static str)>);
+
+impl core::fmt::Display for ClearedBy {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self.0 {
+            Some((order, by)) => write!(f, "{by} at #{order}"),
+            None => write!(f, "nothing"),
+        }
+    }
+}
+
 /// An event number, or the fact that there is not one.
 ///
 /// **So a report never prints a bare number it does not have.** The wake order
@@ -30319,11 +30337,19 @@ fn wait_queue_self_test(hhdm_base: u64) -> bool {
                 ("waiting", verdict >> 1)
             };
             let queued = RING.holds(spawned[id]);
+            // **What removed this station's entry, and when.** Specimen
+            // twenty-three reads `no entry` with its own mark *after* its last
+            // delivered wake and `0 wake(s) found no queue holding the thread`,
+            // so an entry it must have had is gone and neither counter above
+            // accounts for it. Exactly two places clear one, and this says
+            // which -- or says *never cleared*, which would put the clearing
+            // outside both and make this a different search from either.
+            let cleared = wait::cleared_at(spawned[id]);
             println!(
                 "\x1b[91m                   {name} (thread {}) {state}, {} laps, last saw token \
                  {} at phase {}, {} predicate evaluations; recent wakes: {woken} landed, {missed} \
                  not found, {busy} contended, {} migration(s); last decided {decided} at \
-                 #{decided_at}, {} in the ring; last wake {}, last mark \
+                 #{decided_at}, {} in the ring, entry cleared by {}; last wake {}, last mark \
                  #{last_mark} by {}\x1b[0m",
                 spawned[id],
                 LAPS[id].load(Ordering::Relaxed),
@@ -30362,6 +30388,12 @@ fn wait_queue_self_test(hhdm_base: u64) -> bool {
                 // `wake_all` find two entries and a third station blocked, and
                 // nothing could name which of those facts to doubt.
                 if queued { "entry held" } else { "no entry" },
+                // **`nothing` is the discriminating reading, not the boring
+                // one.** A station holding no entry that was never recorded as
+                // cleared was emptied by neither `wake_all` nor its own
+                // re-entry, which is the only reading here that opens a new
+                // search rather than closing one.
+                ClearedBy(cleared),
                 // **`nothing recorded`, never a bare zero.** This was derived
                 // from a thirty-two entry ring covering the whole machine, so a
                 // station whose wake was older than about sixty events had no
