@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // A return to ring 3 that zeroes twelve of the thirteen registers it must.
 //
 // `tools/check-ring3-entry.py --root tests/fixtures/ring3-entry` has to refuse
