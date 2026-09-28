@@ -2421,11 +2421,12 @@ pub fn domain_of(thread: u32) -> Option<crate::domain::DomainId> {
 /// before any other, so it cannot be the held half of a cycle.
 #[must_use]
 pub fn current_domain() -> Option<crate::domain::DomainId> {
-    let cpu = percpu::cpu_id() as usize;
-    if cpu >= MAX_CPUS {
-        return None;
-    }
-    let queue = QUEUES[cpu].lock();
+    // **Through [`lock_own_queue`], and this one matters more than the ring.**
+    // A syscall looks its capability index up in the table of the domain this
+    // names, with interrupts on; a caller that moved inside a plain
+    // read-then-lock would have been answered with the domain running where it
+    // used to be, and would have resolved its index in *that* domain's table.
+    let (_, queue) = lock_own_queue()?;
     let current = queue.current;
     let domain = queue.threads[current].as_ref()?.domain;
     if domain == u32::MAX {
@@ -3375,7 +3376,12 @@ pub fn resched() {
 
 /// Marks the running thread finished and never returns.
 pub fn exit() -> ! {
-    let cpu = percpu::cpu_id() as usize;
+    // **No CPU captured here any more.** This read the CPU once and then
+    // locked that CPU's queue three times, each time acting on whoever was
+    // `current` there -- the last time, marking it `Finished`. An exiting
+    // thread that moved in between would have finished *another* thread and
+    // gone on running itself. Each site below finds its own queue through
+    // [`lock_own_queue`] instead, because the thread can move between them.
 
     // Whatever this thread still owed, taken as it stops.
     //
@@ -3433,8 +3439,7 @@ pub fn exit() -> ! {
     // (rank 6) and holding a runqueue (rank 10) across that is the inversion
     // the ranking exists to catch.
     let me = current_thread_id();
-    let my_domain = if cpu < MAX_CPUS {
-        let mut queue = QUEUES[cpu].lock();
+    let my_domain = if let Some((_, mut queue)) = lock_own_queue() {
         let current = queue.current;
         // **Marked as it leaves the books, not when it finishes.** The
         // decrement below is what frees this slot for somebody else, and
@@ -3499,8 +3504,7 @@ pub fn exit() -> ! {
     // costs nothing — the thread is inside `exit` and will never return to its
     // own code — and it means the release happens while this thread is still
     // something the scheduler will come back to.
-    let owed = if cpu < MAX_CPUS {
-        let mut queue = QUEUES[cpu].lock();
+    let owed = if let Some((_, mut queue)) = lock_own_queue() {
         let current = queue.current;
         queue.threads[current].as_mut().and_then(|thread| {
             let id = thread.id;
@@ -3543,8 +3547,7 @@ pub fn exit() -> ! {
 
     // Now that nobody is owed anything, this thread may stop being one the
     // scheduler will return to. See the comment above the take.
-    if cpu < MAX_CPUS {
-        let mut queue = QUEUES[cpu].lock();
+    if let Some((_, mut queue)) = lock_own_queue() {
         let current = queue.current;
         if let Some(thread) = queue.threads[current].as_mut() {
             thread.state = State::Finished;
@@ -3858,6 +3861,30 @@ pub fn describe_now(thread: u32) -> Option<(&'static str, u64)> {
 /// counts them, so a pathology would be visible rather than silent.
 #[must_use]
 pub fn current_thread_id() -> Option<u32> {
+    let (_, queue) = lock_own_queue()?;
+    let current = queue.current;
+    queue.threads[current].as_ref().map(|thread| thread.id)
+}
+
+/// Locks the runqueue of the CPU the caller is **running on**, and says which.
+///
+/// Every function that acts on "the thread running here" used to read the CPU
+/// and then take that CPU's lock, and a caller that moved in between got the
+/// thread running where it *used to be*. [`current_thread_id`] was the one
+/// caught (CI run 761); `current_domain` had the same three lines -- and a
+/// syscall resolves its capability index in the table that answer names -- and
+/// `exit` marked whatever was current on its first CPU `Finished`.
+///
+/// The CPU is read again under the lock, where `preempt` will not switch the
+/// holder out; equal means the caller is `current` on the queue returned.
+/// Different means it moved: the lock is dropped and the read starts over.
+/// Unbounded for the reason [`current_thread_id`] states -- there is no right
+/// answer to give up with -- and every retry is counted.
+///
+/// **Not for a path with interrupts off.** Nothing can move such a caller, and
+/// those paths (the switch, `preempt`, the fault reports) use `try_lock` for
+/// reasons of their own that this blocking acquisition would undo.
+fn lock_own_queue() -> Option<(usize, crate::sync::SpinLockGuard<'static, RunQueue>)> {
     let mut passes = 0u64;
     loop {
         let cpu = percpu::cpu_id() as usize;
@@ -3865,29 +3892,33 @@ pub fn current_thread_id() -> Option<u32> {
             return None;
         }
         let queue = QUEUES[cpu].lock();
-        let current = queue.current;
-        let id = queue.threads[current].as_ref().map(|thread| thread.id);
         let now = percpu::cpu_id() as usize;
         if now == cpu {
             if passes > 0 {
                 IDENTITY_WIDEST.fetch_max(passes, Ordering::Relaxed);
             }
-            return id;
+            return Some((cpu, queue));
         }
+        note_identity_retry(&queue, cpu, now);
         drop(queue);
         passes += 1;
-        IDENTITY_RETRIED.fetch_add(1, Ordering::Relaxed);
-        // What the first version would have answered, kept for the report:
-        // the thread it would have mistaken the caller for.
-        let packed =
-            u64::from(id.unwrap_or(u32::MAX)) | ((cpu as u64) << 32) | ((now as u64) << 40);
-        let _ = FIRST_IDENTITY_RETRY.compare_exchange(
-            u64::MAX,
-            packed,
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        );
     }
+}
+
+/// Counts one retry of [`lock_own_queue`] or [`should_die`], and keeps the
+/// first: the thread the old read would have answered with.
+fn note_identity_retry(queue: &RunQueue, cpu: usize, now: usize) {
+    IDENTITY_RETRIED.fetch_add(1, Ordering::Relaxed);
+    let would = queue.threads[queue.current]
+        .as_ref()
+        .map_or(u32::MAX, |thread| thread.id);
+    let packed = u64::from(would) | ((cpu as u64) << 32) | ((now as u64) << 40);
+    let _ = FIRST_IDENTITY_RETRY.compare_exchange(
+        u64::MAX,
+        packed,
+        Ordering::Relaxed,
+        Ordering::Relaxed,
+    );
 }
 
 /// Reads [`current_thread_id`] had to retry because its caller had moved.
@@ -4242,11 +4273,11 @@ pub fn mismarked_unless() -> u64 {
 /// itself blocked, then finds the thing it was going to wait for has already
 /// arrived, must not be left in a state nothing will wake it from.
 pub fn cancel_block() {
-    let cpu = percpu::cpu_id() as usize;
-    if cpu >= MAX_CPUS {
+    // Unblocking whoever is current on a CPU the caller has left would wake a
+    // thread in the middle of its own block -- see [`lock_own_queue`].
+    let Some((_, mut queue)) = lock_own_queue() else {
         return;
-    }
-    let mut queue = QUEUES[cpu].lock();
+    };
     let current = queue.current;
     if let Some(thread) = queue.threads[current].as_mut()
         && thread.state == State::Blocked
@@ -5806,9 +5837,19 @@ pub static DYING_UNKNOWN: core::sync::atomic::AtomicU64 = core::sync::atomic::At
 /// so the width of that window is measured rather than assumed.
 #[must_use]
 pub fn should_die() -> bool {
+    loop {
+        if let Some(answer) = should_die_once() {
+            return answer;
+        }
+    }
+}
+
+/// One attempt at [`should_die`]: `None` when the caller moved between reading
+/// its CPU and taking that CPU's lock, and must ask again where it is now.
+fn should_die_once() -> Option<bool> {
     let cpu = percpu::cpu_id() as usize;
     if cpu >= MAX_CPUS {
-        return false;
+        return Some(false);
     }
     let Some(queue) = QUEUES[cpu].try_lock() else {
         // **This answers "no" when it means "I do not know", and the two are
@@ -5829,12 +5870,23 @@ pub fn should_die() -> bool {
         // is whether the window is real and how wide, before anything is
         // built on the guess that it is.
         DYING_UNKNOWN.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        return false;
+        return Some(false);
     };
+    // **The same second reading as [`lock_own_queue`].** A syscall asks this
+    // with interrupts on, and a caller that moved before the lock would be
+    // answered for the thread running where it used to be -- told to die for
+    // somebody else's teardown, or told to carry on through its own.
+    let now = percpu::cpu_id() as usize;
+    if now != cpu {
+        note_identity_retry(&queue, cpu, now);
+        return None;
+    }
     let current = queue.current;
-    queue.threads[current]
-        .as_ref()
-        .is_some_and(|thread| thread.dying)
+    Some(
+        queue.threads[current]
+            .as_ref()
+            .is_some_and(|thread| thread.dying),
+    )
 }
 
 /// Whether `cpu` still needs a periodic interrupt to preempt with.
