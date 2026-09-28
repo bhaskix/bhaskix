@@ -1347,6 +1347,18 @@ pub mod socket {
 /// numbers here start at 58 because [`method::DISARM`] is 57 and is the highest
 /// allocated; there is no gap this time.
 pub mod tcp {
+    /// How many words `bin/tcpd`'s report page holds.
+    ///
+    /// **Here, in the crate both sides already depend on, because the two sides
+    /// are separate programs and drifted once.** The kernel read a hardcoded
+    /// byte count while the service wrote an array whose length was inferred,
+    /// tied only by a `debug_assert_eq!` that does not fire in release. Adding a
+    /// word to the array without changing the byte count made the reader index
+    /// past its own slice and *the boot died before printing anything at all* --
+    /// the comment beside that count still records it. One constant, used by the
+    /// writer's array and the reader's slice, cannot drift.
+    pub const REPORT_WORDS: usize = 19;
+
     /// What `bin/tcpc` puts in its detail word on reaching the stream wait,
     /// before it has asked the service anything.
     ///

@@ -206,11 +206,28 @@ fn receive() -> (u64, u64, u64, [u64; 4]) {
             options(nostack),
         );
     }
+    // **Counted here, where the status is in hand, and only when a caller was
+    // actually dequeued.** A `RECV` that returns without one is not a call this
+    // service was asked to answer, and counting it would make `CALLS_SEEN`
+    // exceed `REPLIES_MADE` on every boot -- which is the one reading that
+    // would mean a handler had failed to reply.
+    if status == status::OK {
+        CALLS_SEEN.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        LAST_METHOD.store(method + 1, core::sync::atomic::Ordering::Relaxed);
+        if method == tcp::RECV {
+            RECV_SEEN.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        }
+    }
     (status, badge, method, [a0, a1, a2, a3])
 }
 
 /// Answers the caller this thread received from, and nobody else.
 fn reply(outcome: u64, a1: u64, a2: u64) {
+    // Counted at the definition rather than at seventeen call sites -- see
+    // `CALLS_SEEN`. Before the syscall, so a reply that is made and lost is
+    // counted as made: this exists to tell "never answered" from "answered and
+    // the answer did not arrive", and counting after would merge them.
+    REPLIES_MADE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     let _ = call(syscall::REPLY, 0, 0, [outcome, a1, a2, 0]);
 }
 
@@ -1065,6 +1082,38 @@ fn answer_with_cookie(
 /// `report(bits, outcome::PENDING, 0, 0, 0, 0, 0, 0, 0, 0)`; a run of zeros is
 /// where a twelfth argument goes wrong silently. Loaded inside `report`
 /// instead, the way `bin/ipd` carries most of its words, so no call site moves.
+/// Calls this service dequeued, and answers it made.
+///
+/// **Because the step-4 row has instrumented the caller and never this side.**
+/// That row's ninth sighting reads `the scheduler has thread N Blocked` beside
+/// the client's failure, which means the client is parked waiting for a reply
+/// this service never sent -- and the service has published no call or reply
+/// accounting at all, so a sighting says only that the caller waited. Reading
+/// the `RECV` arm says it always replies, which leaves three possibilities and
+/// nothing in the tree to separate them.
+///
+/// **Counted inside `receive` and `reply`, which are one function each.** Every
+/// answer this service gives goes through `reply`'s seventeen call sites, and an
+/// audit of seventeen sites is how a count goes wrong: `bin/linuxd` counted two
+/// of its five reply sites on 2026-09-26 and reported the shortfall as a
+/// finding. Counting at the definition cannot miss one.
+static CALLS_SEEN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// `RECV` calls specifically -- the method the step-4 client is inside.
+static RECV_SEEN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Answers made, through `reply`'s single definition.
+static REPLIES_MADE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// The method of the last call dequeued, plus one.
+///
+/// **Plus one so that zero means *nothing was ever dequeued*.** Method numbers
+/// start at zero, so a bare method word cannot say the difference between "the
+/// last call was method 0" and "there was no last call" -- and those are the two
+/// readings that separate a service parked waiting for work from one stuck
+/// inside a handler, which is the whole question here.
+static LAST_METHOD: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 static ACK_WHILE_BUSY: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// Cookies counted as offered whose `SYN`/`ACK` never reached the back ring.
@@ -1636,7 +1685,20 @@ fn listen_leg_serving(
 /// Exiting instead — which this program did on both dark arms, one after
 /// the other — left the endpoint dead and every caller queued against it
 /// for ever.
-fn serve_handover_only(dark: u64) -> ! {
+/// Serves what a machine with no network, or no entropy, can still serve.
+///
+/// **It republishes the report, which it did not until 2026-09-28.** This loop
+/// answers callers for the rest of the boot and never wrote the page again, so a
+/// no-network boot froze every counter at the instant that outcome was decided.
+/// The report then read `0 segments in, 0 out, 0 refused` however many calls were
+/// answered -- a snapshot presented as a measurement, the same trap the late
+/// cookie reading exists for. Found by reading the new served counters' baseline
+/// on a *passing* `test-boot` and finding every one of them zero on a boot whose
+/// client held a working connection.
+///
+/// The counter words are loaded inside `report` from atomics, so one call an
+/// iteration refreshes them and no call site has to carry them.
+fn serve_handover_only(dark: u64, bits: u64) -> ! {
     let mut connect_handover = Handover::new(
         (GIFT_SEND, GIFT_RECV),
         (SENDR_AT, RECVR_AT),
@@ -1671,6 +1733,22 @@ fn serve_handover_only(dark: u64) -> ! {
         } else {
             reply(tcp::LATER, 0, 0);
         }
+        // Republished after each answer, so this page's counters are live rather
+        // than frozen at the outcome that started this loop -- see the note on
+        // this function. The words that move are loaded inside `report`.
+        report(bits, outcome_of(dark), 0, 0, 0, 0, 0, 0, 0, 0);
+    }
+}
+
+/// How a darkness this loop was started for reads in the report.
+///
+/// Decided here rather than passed, so the three call sites keep saying *why*
+/// they are dark and only one place maps that onto a report outcome.
+fn outcome_of(dark: u64) -> u64 {
+    if dark == tcp::NO_ENTROPY {
+        outcome::NO_ENTROPY
+    } else {
+        outcome::NO_NETWORK
     }
 }
 
@@ -1698,7 +1776,14 @@ fn report(
     // Eleven now: `offered` joined on 2026-09-03 to split §3's cookie flake
     // into "the ACK never came home" and "the SYN never arrived". The kernel's
     // reader sizes its slice from its own array, so the two move together.
-    let words = [
+    // **Typed to the layout, not merely as long as it happens to be.** This
+    // array and the kernel's slice live in different crates and drifted once: a
+    // word added here without the reader's byte count moving made the reader
+    // index past its own slice, and the boot died before printing anything. An
+    // inferred length cannot catch that and a `debug_assert` does not fire in
+    // release, so the width is the layout's own constant -- adding a word here
+    // is a compile error that names this array.
+    let words: [u64; bhaskix_abi::tcp::REPORT_WORDS] = [
         MARKER,
         state_bits,
         outcome,
@@ -1717,7 +1802,14 @@ fn report(
         ACK_REJECTED.load(core::sync::atomic::Ordering::Relaxed),
         ACK_DUPLICATE.load(core::sync::atomic::Ordering::Relaxed),
         SYNACK_UNSENT.load(core::sync::atomic::Ordering::Relaxed),
+        // Fifteen to eighteen: what this service was asked and what it
+        // answered, for the step-4 row -- see `CALLS_SEEN`.
+        CALLS_SEEN.load(core::sync::atomic::Ordering::Relaxed),
+        RECV_SEEN.load(core::sync::atomic::Ordering::Relaxed),
+        REPLIES_MADE.load(core::sync::atomic::Ordering::Relaxed),
+        LAST_METHOD.load(core::sync::atomic::Ordering::Relaxed),
     ];
+
     // SAFETY: the page this program mapped writable, which nothing else
     // reaches. The marker is written last, so a kernel reading a partial report
     // sees no marker rather than half the fields.
@@ -1783,7 +1875,7 @@ extern "C" fn tcpd_main(hertz: u64) -> ! {
         // The handover needs no key; only a sequence number does, and the
         // minted connection says so when asked.
         report(bits, outcome::NO_ENTROPY, 0, 0, 0, 0, 0, 0, 0, 0);
-        serve_handover_only(tcp::NO_ENTROPY)
+        serve_handover_only(tcp::NO_ENTROPY, bits)
     };
     bits |= state_bits::KEYED;
     report(bits, outcome::PENDING, 0, 0, 0, 0, 0, 0, 0, 0);
@@ -1796,7 +1888,7 @@ extern "C" fn tcpd_main(hertz: u64) -> ! {
         // here would leave the endpoint dead with every caller queued
         // against it for ever.
         report(bits, outcome::NO_NETWORK, 0, 0, 0, 0, 0, 0, 0, 0);
-        serve_handover_only(tcp::UNREACHABLE)
+        serve_handover_only(tcp::UNREACHABLE, bits)
     }
 
     // What this interface is, written by the kernel once the driver has read
@@ -1827,7 +1919,7 @@ extern "C" fn tcpd_main(hertz: u64) -> ! {
     }
     if me == Ipv4Addr::UNSPECIFIED {
         report(bits, outcome::NO_NETWORK, 0, 0, 0, 0, 0, 0, 0, 0);
-        serve_handover_only(tcp::UNREACHABLE)
+        serve_handover_only(tcp::UNREACHABLE, bits)
     }
     bits |= state_bits::CONFIGURED;
 

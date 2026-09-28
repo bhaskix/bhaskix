@@ -20843,12 +20843,20 @@ fn report_tcp_client(hhdm: u64) {
 /// second `unsafe`: the budget counts every line inside one, and a duplicate
 /// of this would have raised it for a diagnostic.
 fn tcp_report_bytes(hhdm: u64, frame: u64) -> &'static [u8] {
-    // SAFETY: a frame the report object owns, through the direct map, read as
-    // the thirteen little-endian words the service wrote there.
+    // **The count is no longer written here.** It said "ten" while the slice read
+    // 88 bytes for eleven words, and later 120 for fifteen -- a number maintained
+    // by hand in one crate against an array in another. Both sides take
+    // `tcp::REPORT_WORDS` from `bhaskix-abi` now, so neither can move alone.
     //
-    // This said "ten" while the slice read 88 bytes for eleven words, and now
-    // reads 120 for fifteen.
-    unsafe { core::slice::from_raw_parts((hhdm + frame) as *const u8, 120) }
+    // Computed here rather than inside the block below, because the budget
+    // counts unsafe *lines* and arithmetic that needs no privilege should not be
+    // inside one. It goes above the `// SAFETY:` run, not between it and the
+    // block: the gate requires them adjacent, and splitting them is the same
+    // mistake as anchoring an edit inside a doc comment.
+    let bytes = bhaskix_abi::tcp::REPORT_WORDS * 8;
+    // SAFETY: a frame the report object owns, through the direct map, read as
+    // the little-endian words the service wrote there.
+    unsafe { core::slice::from_raw_parts((hhdm + frame) as *const u8, bytes) }
 }
 
 /// The cookie count again, at the end of the boot.
@@ -20885,6 +20893,63 @@ fn report_tcp_cookies_late(hhdm: u64) {
         "    tcpd cookies*  {cookies} at the end of the boot, against what the line above read \
          when it was taken"
     );
+    // **What the service was asked and what it answered — here, after the
+    // exchange, because the early snapshot read all zeros on a healthy boot.**
+    //
+    // §3's step-4 row reads `the scheduler has thread N Blocked` beside the
+    // client's failure, meaning the client is parked waiting for a reply this
+    // service never sent. Every instrument built for that row so far has been on
+    // the **caller's** side, so a sighting could say the caller waited and
+    // nothing about whether the service was ever asked. Reading the `RECV` arm
+    // says it always replies, which left three possibilities and nothing to
+    // separate them.
+    //
+    // **The readings, written before the next specimen:**
+    //
+    // * `answers` equal to `calls`, with `recv` non-zero — the service answered
+    //   everything it was asked, so the reply was lost **between** here and the
+    //   caller: the nucleus's reply path, not this service.
+    // * `recv` short of what the caller sent — the request never arrived, so the
+    //   loss is inbound, or the service is parked somewhere else entirely.
+    // * `calls` above `answers` — a handler that returned without replying,
+    //   which would **contradict** the reading of the `RECV` arm and is the one
+    //   outcome that puts the bug back in `bin/tcpd`.
+    //
+    // `last method` is published as the method plus one, so **-1 means nothing
+    // was ever dequeued**: a service parked waiting for work and one stuck
+    // inside a handler are the two readings this row needs to separate, and a
+    // bare method number cannot, because methods start at zero.
+    let mut served = [0u64; 4];
+    for (index, word) in served.iter_mut().enumerate() {
+        let mut buffer = [0u8; 8];
+        buffer.copy_from_slice(&bytes[(15 + index) * 8..(15 + index) * 8 + 8]);
+        *word = u64::from_le_bytes(buffer);
+    }
+    println!(
+        "    tcpd served*   {} call(s) dequeued, {} of them RECV, {} answer(s) made, last method \
+         {}",
+        served[0],
+        served[1],
+        served[2],
+        // **Named, not numbered.** A reader should not have to open `abi` to
+        // learn that 62 is `RECV` -- and `RECV` is the method this row's whole
+        // question is about, so it is the one number that must be legible at a
+        // glance. `none` rather than a negative, because "nothing was ever
+        // dequeued" is a state and not a method.
+        match served[3] {
+            0 => "none",
+            n => match n - 1 {
+                bhaskix_abi::tcp::CONNECT => "CONNECT",
+                bhaskix_abi::tcp::LISTEN => "LISTEN",
+                bhaskix_abi::tcp::ACCEPT => "ACCEPT",
+                bhaskix_abi::tcp::SEND => "SEND",
+                bhaskix_abi::tcp::RECV => "RECV",
+                bhaskix_abi::tcp::SHUTDOWN => "SHUTDOWN",
+                bhaskix_abi::tcp::CONNECT6 => "CONNECT6",
+                _ => "another method",
+            },
+        }
+    );
 }
 
 fn report_tcp_domain(hhdm: u64) {
@@ -20904,7 +20969,7 @@ fn report_tcp_domain(hhdm: u64) {
     // reclaimed: word 9 carries the accepted slot's state and whether an
     // application holds it. The slice below is `words.len() * 8`, so this is
     // the only number to change.
-    let mut words = [0u64; 15];
+    let mut words = [0u64; bhaskix_abi::tcp::REPORT_WORDS];
     // SAFETY: a frame this object owns, through the direct map, read as the
     // **nine** little-endian words the service wrote there.
     //
@@ -20994,6 +21059,14 @@ fn report_tcp_domain(hhdm: u64) {
         "    tcpd unsent    {} cookie(s) offered whose SYN/ACK never reached the ring",
         words[14]
     );
+    // **The served counters are deliberately *not* printed here**, and the
+    // reason is the one the cookie line above documents: this snapshot is taken
+    // before the traffic it would count. Read here they were `0 call(s)
+    // dequeued, 0 of them RECV, 0 answer(s) made` on a boot whose client held a
+    // working connection -- a reading that says only "the report was taken
+    // early", which is the value this row already has too much of. They are in
+    // `report_tcp_cookies_late` instead, beside the cookie count that moved
+    // there for the same reason.
     // **RFC 0061, and a counter whose healthy value is zero.**
     //
     // A peer that completes a handshake to a listening port and closes before
