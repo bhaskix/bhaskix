@@ -2275,7 +2275,11 @@ pub fn foreign_returns(mut f: impl FnMut(u32, u64)) {
     }
 }
 
-fn foreign_call(frame: &mut SyscallFrame) {
+/// `domain` is the caller's, read at entry with interrupts still masked -- see
+/// `bhaskix_syscall_dispatch`. It is what the adapter is told about who is
+/// calling, so it is passed in rather than re-read here, where the caller can
+/// already have been moved.
+fn foreign_call(frame: &mut SyscallFrame, domain: u32) {
     // **The boundary, as a value.** RFC 0031's interface I1: the nucleus is
     // meant to carry a foreign call rather than understand it, and building
     // this frame here is what makes the rest of this file a *personality*
@@ -2299,7 +2303,7 @@ fn foreign_call(frame: &mut SyscallFrame) {
             frame.arg3,
         ],
         crate::sched::current_thread_id().unwrap_or(u32::MAX),
-        crate::telemetry::domain_hint(),
+        domain,
     );
 
     // **Priced before it moves, which is the order RFC 0031 asks for.**
@@ -3302,6 +3306,17 @@ pub unsafe extern "C" fn bhaskix_syscall_dispatch(frame: *mut SyscallFrame) {
     // and this is the kernel's stack and `GS`, which is everything the mask
     // was protecting.
     //
+    // **The caller's domain, read while `IF` is still clear.** `domain_hint`
+    // picks this CPU's slot and then loads it, and once interrupts are on a
+    // thread can be moved between the two -- answered with the domain of
+    // whoever runs on the CPU it left. This one value decides the dialect
+    // below *and* is what `bin/linuxd` is told about which hosted process is
+    // calling, so a wrong read would route a native call to the Linux adapter
+    // or serve a Linux call as a different process. SYSCALL masked
+    // interrupts on entry, so here nothing can move the thread. Found
+    // 2026-09-28 by the audit that followed CI run 761's wrong-thread read.
+    let hint = crate::telemetry::domain_hint();
+
     // SAFETY: the IDT has been installed since bring-up; every vector has a
     // handler.
     unsafe { bhaskix_arch::cpu::enable_interrupts() };
@@ -3326,13 +3341,12 @@ pub unsafe extern "C" fn bhaskix_syscall_dispatch(frame: *mut SyscallFrame) {
     // placement rebuilds, every answer `BadSyscall`. Asking the scheduler
     // instead was correct and cost a runqueue lock on every system call in
     // the machine; the fix that survives is to make the cheap answer true.
-    let hint = crate::telemetry::domain_hint();
     let foreign = (hint as usize) < crate::domain::MAX_DOMAINS
         && crate::domain::LINUX_DOMAINS.load(core::sync::atomic::Ordering::Relaxed)
             & (1u64 << hint)
             != 0;
     if foreign {
-        foreign_call(frame);
+        foreign_call(frame, hint);
     }
 
     let outcome = if foreign { None } else { Some(dispatch(frame)) };
