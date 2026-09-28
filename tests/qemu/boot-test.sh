@@ -4001,9 +4001,9 @@ fi
 # is also what removes a race the first version of this probe had: a child that
 # installed its own handler after forking could be killed before it got there.
 if grep -qE "hosted catch +pid [0-9]+ caught signal 15 it sent itself, once" "$LOG"; then
-    pass "RFC 0083: a hosted process caught a signal it sent itself, and a parked child caught one too"
+    pass "RFC 0083: a hosted process caught a signal it sent itself, and two children signalled in a sleep and a pipe read caught one too"
 else
-    fail "a hosted process did not catch a signal: the handler never ran, or the parked child was ended instead of delivered to"
+    fail "a hosted process did not catch a signal: the handler never ran, or a signalled child was ended instead of delivered to"
     status=1
 fi
 

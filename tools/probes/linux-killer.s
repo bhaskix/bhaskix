@@ -328,6 +328,13 @@ strangers:
         # interrupted -- the handler runs and exits 88, so its parent collects
         # an ordinary exit rather than a death by signal. That difference is
         # the whole assertion: without delivery this child would be status 15.
+        #
+        # **CORRECTION, 2026-09-28: "asleep inside a system call" is the
+        # intent, not what this sequence guarantees.** The `kill` below
+        # follows the `fork` with nothing between, so the signal can reach the
+        # child before its `nanosleep` does, and exit 88 is the answer in both
+        # orders. The kernel's `hosted catch` line says so and prints the
+        # machine-wide counts that show a sleeping call was delivered to.
         # **No stack is made for the children any more -- RFC 0084.**
         #
         # This block used to map one, and the reason is worth keeping because

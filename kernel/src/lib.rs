@@ -9452,8 +9452,15 @@ fn a_hosted_process_ends_its_child(hhdm_base: u64, cpus: u32) -> bool {
     let (on_trampoline, forked_anyway) = (read(176), read(184) as i64);
     // **A signal a process caught** — RFC 0083. Two acts: one this process
     // sent itself and handled on the way out of the very `kill`, and one sent
-    // to a child that was *parked inside a call* and had to be woken to
-    // receive it.
+    // to a child that sleeps in a call it never leaves.
+    //
+    // **CORRECTION, 2026-09-28: "was parked inside a call and had to be woken"
+    // is what this probe was written to test, not what it checks.** The parent
+    // sends the `kill` straight after the `fork`, with nothing between, so the
+    // signal can reach the child before its `nanosleep` does -- and the gate
+    // (the handler's exit, 88) passes in both orders. The pass line below used
+    // to state the parked order as fact; it now says what was checked, and
+    // prints the machine-wide counts that would show a parked delivery.
     /// The code the caught child's handler exits with, chosen so it cannot be
     /// confused with a signal number or with the probe's other exits.
     const CAUGHT_EXIT: u64 = 88;
@@ -9772,19 +9779,31 @@ fn a_hosted_process_ends_its_child(hhdm_base: u64, cpus: u32) -> bool {
         );
         // **RFC 0083, and the line says which half is which.** A signal the
         // process sent itself and handled without leaving the call, and one
-        // sent to a child asleep *inside* a call -- the shape a `^C` at a
-        // shell has to reach, and the one a delivery that only works at a
-        // syscall's return would miss.
+        // sent to a child that sleeps in a call -- the shape a `^C` at a shell
+        // has to reach, and the one a delivery that only works at a syscall's
+        // return would miss.
+        //
+        // **What it does not say is that the child was asleep when the signal
+        // came**, because nothing here orders the two: the `kill` follows the
+        // `fork` immediately. The counts after the semicolon are the evidence
+        // that a delivery reached a sleeping call at all, and they are the
+        // whole machine's -- `hosted timed` and `hosted signals` above print
+        // the same numbers -- so they are labelled as such rather than pinned
+        // on these two children.
         println!(
             "    hosted catch   pid {pid} caught signal {handler_signal} it sent itself, once, \
-             and its `kill` answered {self_kill}; child {caught_child} was parked in a call, \
-             was woken by the signal, and its handler exited it {} where no handler \
-             would have made it a death by 15; child {pipe_child} was parked on a pipe \
-             nobody writes to, whose read re-parks when woken, and its handler exited it {}; \
-             the handler signalled itself and ran twice without ever being entered on top of \
-             itself",
+             and its `kill` answered {self_kill}; child {caught_child}, signalled as it went to \
+             sleep in a `nanosleep` it never leaves, was exited {} by its handler where no \
+             handler would have made it a death by 15; child {pipe_child}, signalled as it went \
+             to read a pipe nobody writes to, was exited {} likewise; the handler signalled \
+             itself and ran twice without ever being entered on top of itself",
             caught_status >> 8,
             pipe_status >> 8
+        );
+        println!(
+            "    hosted catch   whether either child was already asleep is not ordered by this \
+             probe; across the whole machine {early_releases} timed wait(s) were released early \
+             by a signal and {arm_parked} frame(s) were asked for on a parking call"
         );
     } else {
         // Says what was measured. A gate that names a cause it has not measured
@@ -9815,10 +9834,10 @@ fn a_hosted_process_ends_its_child(hhdm_base: u64, cpus: u32) -> bool {
         println!(
             "\x1b[91m    hosted catch   FAILED: sigaction answered {installed}, the self-kill \
              {self_kill}; the handler marker is {handler_marker:#x} for signal \
-             {handler_signal}, run {handler_runs} time(s); the parked child {caught_child} \
+             {handler_signal}, run {handler_runs} time(s); the sleeping child {caught_child} \
              was killed with {caught_kill}, collected {caught_collected} and its status is \
              {caught_status} ({} is the handler's own exit, 15 is a death by signal); the \
-             pipe-parked child {pipe_child} answered pipe2 {pipe_made}, kill {pipe_kill}, \
+             pipe-reading child {pipe_child} answered pipe2 {pipe_made}, kill {pipe_kill}, \
              collected {pipe_collected} status {pipe_status}; the handler reached depth \
              {handler_depth} over {handler_runs} run(s) and its own kill answered \
              {handler_self_kill}\x1b[0m",

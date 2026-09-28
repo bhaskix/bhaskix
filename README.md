@@ -55,8 +55,10 @@ The `-ix` is the Unix lineage, the same suffix Minix and Linux carry.
 >
 > **And since 2026-09-21 a hosted process can *catch* one**
 > ([RFC 0083](docs/rfc/0083-a-signal-a-process-can-catch.md)): it installs a `SIGTERM` handler and
-> the handler runs — whether it signalled itself, or the signal arrived while it was parked in a
-> sleep, or parked on a pipe. `SIGKILL` stays uncatchable in the arithmetic rather than by a check,
+> the handler runs — whether it signalled itself, or signalled a child going to sleep or to read a
+> pipe nobody writes to. (Corrected 2026-09-28: this said the signal "arrived while it was parked";
+> the probe sends it straight after the `fork`, so whether the child was already asleep is not
+> ordered, and the line it prints now says so.) `SIGKILL` stays uncatchable in the arithmetic rather than by a check,
 > a handler is not entered on top of itself, and a forked child inherits its parent's handlers as it
 > does on Linux. **Two limits, stated because they are real.** Delivery happens at a system call or
 > a fault and nowhere else, so a process that makes no calls does not receive its signal where Linux
