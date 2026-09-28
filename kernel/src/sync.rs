@@ -622,7 +622,12 @@ pub fn dump_open_guards(cpu: usize) {
     });
     if !any {
         crate::println!(
-            "      open guard   none -- the counted hold has no open guard, which is itself the answer"
+            // **Not "the counted hold", which this never read.** The old
+            // wording asserted a count beside a fact about guards, and four
+            // sightings were read as a counted hold with no guard -- the
+            // 2026-08-18 tear's shape -- on the strength of a word. The `none`
+            // prefix is kept so a grep over the old logs still matches.
+            "      open guard   none -- nothing on this cpu holds one, whatever the mask says"
         );
     }
 }
@@ -884,6 +889,20 @@ static FIRST_MASK: AtomicU64 = AtomicU64::new(0);
 /// That is the same fault as the console tear, the lock accounting's withdrawn
 /// specimens and this session's mismark share-over-total: a report built from
 /// stores that are not ordered against the load cannot describe one moment.
+/// The hold count on that CPU when the first violation fired.
+///
+/// **Because the verdict beside it was being read as though it had measured
+/// this, and it had not.** `dump_open_guards` printed the words *"the counted
+/// hold has no open guard"* whenever nothing was open, without ever reading the
+/// count -- so four sightings were taken to show a *counted* hold with no guard,
+/// which is the 2026-08-18 tear's shape, when what they showed was only that no
+/// guard was open. This is the number that tells the two apart, and its absence
+/// is why the three markers of that tear were searched for in the logs instead.
+///
+/// Sampled before the claim below, like the mask and the guards, so it counts
+/// what earlier acquisitions left and not this one.
+static FIRST_HOLD_COUNT: AtomicU64 = AtomicU64::new(0);
+
 /// How many guards were **actually open** on that CPU when the first violation
 /// fired, and which ranks they were.
 ///
@@ -970,6 +989,18 @@ pub fn for_each_held(mask: u64, mut each: impl FnMut(&'static str)) {
     }
 }
 
+/// The hold count when the first violation fired.
+///
+/// `None` until a violation has been published, so a zero that means *nothing
+/// recorded* cannot be read as one that means *nothing held*.
+#[must_use]
+pub fn first_hold_count() -> Option<u64> {
+    if !FIRST_READY.load(Ordering::Acquire) {
+        return None;
+    }
+    Some(FIRST_HOLD_COUNT.load(Ordering::Relaxed))
+}
+
 /// How many guards were open when the first violation fired, and their ranks.
 ///
 /// `None` until a violation has been published, so the caller cannot read a
@@ -1039,6 +1070,7 @@ fn record(held: u64, rank: Rank, site: &'static core::panic::Location<'static>) 
             open_count += 1;
             open_ranks |= 1u64 << u64::from(guard_rank);
         });
+        FIRST_HOLD_COUNT.store(u64::from(holds_count()), Ordering::Relaxed);
         FIRST_OPEN_COUNT.store(open_count, Ordering::Relaxed);
         FIRST_OPEN_RANKS.store(open_ranks, Ordering::Relaxed);
         // Last, and with `Release`: everything above must be visible to

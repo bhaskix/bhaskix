@@ -28292,6 +28292,41 @@ fn lock_ordering_self_test() -> bool {
                         "something is held, but not the rank this fired on"
                     }
                 );
+                // **The hold count, which separates two very different bugs
+                // that the guard verdict alone cannot.** The old verdict line
+                // said "the counted hold has no open guard" without ever
+                // reading a count, and four sightings were taken for the
+                // 2026-08-18 tear on the strength of that word. The three
+                // numbers together decide it, and the rule is written here
+                // before any specimen has read it:
+                //
+                // * **count 0, no guard** — nothing was held at all, so the
+                //   *rank bit alone* is stale. That points at `slot()`'s own
+                //   `fetch_or`/`fetch_and` and not at the count, which is where
+                //   the absent `SAVED COUNT`/`COUNT MISMATCH`/`COUNT UNDERFLOW`
+                //   markers already pointed.
+                // * **count above 0, no guard** — a *counted* hold with no
+                //   guard, which **is** the tear family's shape and would
+                //   contradict that reading.
+                // * **count 0, a guard open** — the mirror: a guard nothing
+                //   counted, the `COUNT MISMATCH` side of the same tear.
+                //
+                // Any of the three is a finding. None of them was available on
+                // the four sightings this row is built from.
+                if let Some(holds) = sync::first_hold_count() {
+                    println!(
+                        "\x1b[91m                   {holds} lock(s) counted held on that cpu -- \
+                         {}\x1b[0m",
+                        match (holds, open) {
+                            (0, 0) =>
+                                "nothing held and nothing counted, so the rank bit alone is \
+                                       stale",
+                            (0, _) => "a guard nobody counted",
+                            (_, 0) => "a counted hold with no guard, which is the tear's shape",
+                            _ => "count and guards agree that something is held",
+                        }
+                    );
+                }
             }
             // One line per held rank rather than one line listing them.
             //
