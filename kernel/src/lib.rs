@@ -21535,6 +21535,7 @@ fn measure_deadlines(handoff: &Handoff, when: &str) -> bool {
     };
 
     let micros = |ticks: u64| ticks.saturating_mul(1_000_000) / hertz.max(1);
+    // CPU: diagnostic -- which CPU's ticks this self-test counts; a move skews a measurement, decides nothing.
     let cpu = bhaskix_arch::percpu::cpu_id();
     let ticks_before = trap::ticks_on(cpu);
     let machine_ticks_before = trap::ticks();
@@ -29307,6 +29308,7 @@ extern "C" fn rt_probe(_argument: u64) -> ! {
         Ordering::Relaxed,
         Ordering::Relaxed,
     );
+    // CPU: diagnostic -- records where the probe first ran, for the report.
     RT_FIRST_CPU.store(u64::from(bhaskix_arch::percpu::cpu_id()), Ordering::Relaxed);
     loop {
         RT_GATE.wait_until(|| {
@@ -29342,6 +29344,7 @@ extern "C" fn worker(id: u64) -> ! {
             counter.fetch_add(1, Ordering::Relaxed);
         }
         if let Some(slot) = OBSERVED_CPU.get(id as usize) {
+            // CPU: diagnostic -- the read is the observation this pinning test makes.
             slot.store(u64::from(bhaskix_arch::percpu::cpu_id()), Ordering::Relaxed);
         }
         core::hint::spin_loop();
@@ -29376,6 +29379,7 @@ extern "C" fn migrant(id: u64) -> ! {
             sched::exit();
         }
         if let Some(seen) = MIGRANT_CPUS.get(id as usize) {
+            // CPU: diagnostic -- the read is the observation this migration test makes.
             seen.fetch_or(1 << bhaskix_arch::percpu::cpu_id(), Ordering::Relaxed);
         }
         core::hint::spin_loop();
@@ -30178,6 +30182,7 @@ fn rt_latency_self_test(hhdm_base: u64, cpus: u32) -> bool {
     // so it waits for that CPU's next tick and would measure the tick rate
     // rather than the scheduler. The local number is the one the design
     // controls today, and the cross-CPU gap is recorded as M4-09b.
+    // CPU: diagnostic -- picks the CPU to measure on; a move measures a cross-CPU wake instead.
     let cpu = bhaskix_arch::percpu::cpu_id();
     let options = SpawnOptions::new()
         .policy(Policy::RealTime {
@@ -30270,6 +30275,7 @@ fn rt_latency_self_test(hhdm_base: u64, cpus: u32) -> bool {
             nanos % 1000,
             bhaskix_arch::tsc::to_nanos(loop_ticks).unwrap_or(0) / 1_000_000,
             RT_FIRST_CPU.load(Ordering::Relaxed),
+            // CPU: diagnostic -- printed only.
             bhaskix_arch::percpu::cpu_id(),
             sched::spawn_resched_declines(),
         ),

@@ -281,6 +281,7 @@ pub fn overflowed() -> u64 {
 ///
 /// Returns whether it was accepted.
 fn arm_for(thread: u32, deadline: u64) -> bool {
+    // CPU: any -- the timer is inserted under that table's lock and wakes the thread by id wherever it is.
     let cpu = percpu::cpu_id() as usize;
     if cpu >= MAX_CPUS {
         return false;
@@ -338,6 +339,7 @@ pub fn cancel_wake() {
 /// really migrates between the arm and the cancel is a question about this
 /// machine that nothing had asked. The boot report prints the number.
 fn cancel_for(thread: u32) {
+    // CPU: diagnostic -- only counts cancellations made on another CPU; every table is scanned.
     let here = percpu::cpu_id() as usize;
     for (cpu, timers) in TIMERS
         .iter()
@@ -425,6 +427,7 @@ pub fn sleep_micros(duration_us: u64) {
 /// Must be called from the timer interrupt handler, after acknowledgement, on
 /// a CPU whose APIC is initialised.
 pub unsafe fn on_tick() {
+    // CPU: interrupt -- the timer interrupt handler.
     let cpu = percpu::cpu_id() as usize;
     if cpu >= MAX_CPUS {
         // No per-CPU data yet, so nothing can have registered a timer. Keep
@@ -495,6 +498,7 @@ pub unsafe fn on_tick() {
 /// Must be called from an interrupt handler, after acknowledgement, on a CPU
 /// whose APIC is initialised.
 pub unsafe fn rearm_this_cpu() {
+    // CPU: interrupt -- must be called from an interrupt handler, per its contract.
     let cpu = percpu::cpu_id() as usize;
     if cpu >= MAX_CPUS {
         return;
@@ -682,6 +686,7 @@ pub fn arm_no_later_than(deadline: u64) -> bool {
     }
 
     let moved = 'moved: {
+        // CPU: masked -- interrupts were masked just above.
         let cpu = percpu::cpu_id() as usize;
         if cpu >= MAX_CPUS {
             break 'moved false;

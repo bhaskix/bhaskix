@@ -331,6 +331,17 @@ static REPORT: AtomicBool = AtomicBool::new(true);
 /// twenty-six full runs. A lease per thread is not a test convenience, it is
 /// the semantics: on the machine a thread's holds live with the CPU it
 /// occupies alone, and a test thread is the only occupant of its slot.
+///
+/// **Callers must not be able to move while they use the answer, or must be
+/// harmless when they do.** `lock` and `try_lock` claim inside
+/// `claim_uninterrupted`, and releases run while the guard still counts as a
+/// hold. `preempt`'s veto reads the mask with interrupts on when reached from
+/// `yield_now`; a thread that holds nothing can be moved there and read
+/// another CPU's mask, which can only make it *decline* a switch it could have
+/// taken. `block_self`'s holding report reads it the same way and only prints.
+/// Anything that *decides* from it with interrupts on and nothing held can be
+/// moved between this read and its use -- which is how `lock` came to check
+/// order against another CPU's mask until 2026-09-28.
 fn effective_cpu() -> usize {
     #[cfg(test)]
     {
@@ -338,6 +349,7 @@ fn effective_cpu() -> usize {
     }
     #[cfg(not(test))]
     {
+        // CPU: caller -- see the doc: callers claim with interrupts masked, or hold a lock.
         let cpu = percpu::cpu_id() as usize;
         // Before per-CPU data exists, `cpu_id` answers 0 -- which is correct,
         // since everything that early runs on the bootstrap CPU.
@@ -654,6 +666,7 @@ pub fn for_each_open_guard(
 }
 
 fn record_lock_event(at: &'static core::panic::Location<'static>, rank: u8, acquire: bool) {
+    // CPU: diagnostic -- a per-CPU ring of lock events for the stall dump.
     let cpu = percpu::cpu_id() as usize;
     let ring = &LOCK_EVENTS_PER_CPU[if cpu < MAX_CPUS { cpu } else { 0 }];
     let slot = ring.next.fetch_add(1, Ordering::Relaxed) % LOCK_EVENTS;
@@ -1066,6 +1079,7 @@ fn record(held: u64, rank: Rank, site: &'static core::panic::Location<'static>) 
         // `dump_open_guards`.
         let mut open_count = 0u64;
         let mut open_ranks = 0u64;
+        // CPU: held -- `lock` records after its claim, so the caller counts as a holder and cannot move.
         for_each_open_guard(percpu::cpu_id() as usize, |_at, guard_rank, _since| {
             open_count += 1;
             open_ranks |= 1u64 << u64::from(guard_rank);
@@ -1117,6 +1131,7 @@ fn record(held: u64, rank: Rank, site: &'static core::panic::Location<'static>) 
     // and not yet released, with the line that took it. Two entries means the
     // holds are real; none means the mask is lying. Safe to call here, where
     // the comment above forbids taking a lock, because it only loads atomics.
+    // CPU: held -- as above.
     dump_open_guards(percpu::cpu_id() as usize);
 }
 
@@ -1227,6 +1242,7 @@ impl<T> SpinLock<T> {
             holds_slot().fetch_sub(1, Ordering::Relaxed);
             return None;
         }
+        // CPU: held -- after a counted acquisition, so the caller cannot move.
         self.owner.store(percpu::cpu_id(), Ordering::Relaxed);
         let at = core::panic::Location::caller();
         record_lock_event(at, 255, true);
@@ -1260,6 +1276,7 @@ impl<T> SpinLock<T> {
             .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
             .ok()
             .map(|_| {
+                // CPU: masked -- its two callers hold it only with interrupts masked.
                 self.owner.store(percpu::cpu_id(), Ordering::Relaxed);
                 SpinLockGuard {
                     lock: self,
@@ -1339,6 +1356,7 @@ impl<T> SpinLock<T> {
                 core::hint::spin_loop();
             }
         }
+        // CPU: held -- after the acquisition, so the caller cannot move.
         self.owner.store(percpu::cpu_id(), Ordering::Relaxed);
         let at = core::panic::Location::caller();
         record_lock_event(at, self.rank as u8, true);
@@ -1466,8 +1484,10 @@ impl<T> Drop for SpinLockGuard<'_, T> {
                          earlier (cpu {})",
                         self.at.file(),
                         self.at.line(),
+                        // CPU: diagnostic -- printed only.
                         percpu::cpu_id(),
                     );
+                    // CPU: diagnostic -- which CPU's guards are dumped, printed only.
                     dump_open_guards(percpu::cpu_id() as usize);
                     break;
                 }

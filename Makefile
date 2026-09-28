@@ -1003,6 +1003,16 @@ gates:
 	else \
 	    printf '  \033[1;32mok\033[0m    the ring-3 entry gate refuses a return that leaves a register unset\n'; \
 	fi
+# Every read of "which CPU is this" in the kernel says why a migration cannot
+# split it -- the shape found eight times on 2026-09-28 (see the tool's
+# header). And watched refusing: the fixture holds one justified read and one
+# bare one, and the gate must name the bare one.
+	tools/check-cpu-reads.py
+	@if tools/check-cpu-reads.py --root tests/fixtures/cpu-reads > /dev/null; then \
+	    printf '  \033[1;31mFAIL\033[0m  the CPU-read gate accepted a read with no justification\n'; exit 1; \
+	else \
+	    printf '  \033[1;32mok\033[0m    the CPU-read gate refuses a read with no justification\n'; \
+	fi
 	tools/check-doc-versions.py
 # And watched refusing one. `architecture.md` §7 claimed for a year that
 # architecture-specific instructions appear only in `arch/` while nothing checked

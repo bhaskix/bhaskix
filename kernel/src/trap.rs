@@ -641,6 +641,7 @@ fn handle_interrupt(frame: &mut TrapFrame) {
     match frame.vector as u8 {
         apic::TIMER_VECTOR => {
             TICKS.fetch_add(1, Ordering::Relaxed);
+            // CPU: interrupt -- the tick handler.
             if let Some(count) = usize::try_from(percpu::cpu_id())
                 .ok()
                 .and_then(|cpu| TICKS_PER_CPU.get(cpu))
@@ -1054,6 +1055,7 @@ fn report_exception(frame: &mut TrapFrame, dispatched: u64) {
     // unconditionally -- stale for a non-#PF, but a stale value beside the
     // vector costs one word and the alternative cost a specimen.
     {
+        // CPU: interrupt -- the exception report.
         let cpu = bhaskix_arch::percpu::cpu_id();
         // **`running_now`, not `current_thread_id`, and it is the difference
         // between a report and a wedge.** The blocking one takes this CPU's

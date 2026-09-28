@@ -89,6 +89,7 @@ static DOMAIN_HINT: [DomainHint; MAX_CPUS] =
 /// Records the domain now running on the calling CPU. Called by the switch
 /// path with interrupts off, beside the dispatch event.
 pub fn note_domain(domain: u32) {
+    // CPU: masked -- called by the switch path with interrupts masked.
     let cpu_index = percpu::cpu_id() as usize;
     if cpu_index < MAX_CPUS {
         DOMAIN_HINT[cpu_index].0.store(domain, Ordering::Relaxed);
@@ -97,8 +98,14 @@ pub fn note_domain(domain: u32) {
 
 /// The domain most recently noted for this CPU — the lock-free answer
 /// producers stamp into their events. `u32::MAX` is "none or unknown".
+///
+/// **A decision needs a caller that cannot move**: picking this CPU's slot and
+/// loading it are two steps, and a thread moved between them reads another
+/// CPU's domain. The system-call entry reads it before re-enabling interrupts
+/// for exactly that reason; an event stamp may be briefly wrong and says so.
 #[must_use]
 pub fn domain_hint() -> u32 {
+    // CPU: caller -- see the doc: a decision needs a masked caller; a stamp may be stale.
     let cpu_index = percpu::cpu_id() as usize;
     if cpu_index < MAX_CPUS {
         DOMAIN_HINT[cpu_index].0.load(Ordering::Relaxed)
@@ -157,6 +164,7 @@ pub fn emit(class: EventClass, schema_id: u32, domain: u32, payload: &[u8]) {
         // is the bounded store sequence, entered from ring 0 only.
         unsafe { cpu::disable_interrupts() };
     }
+    // CPU: masked -- interrupts were masked just above.
     let cpu_index = percpu::cpu_id() as usize;
 
     if audit {
@@ -260,6 +268,7 @@ pub fn probe_here(count: u64) {
     if SLOTS.load(Ordering::Relaxed) == 0 {
         return;
     }
+    // CPU: pinned -- run by the probe threads, spawned pinned to each CPU.
     let cpu_index = percpu::cpu_id() as usize;
     let head = header_word(cpu_index, ring::HEAD_OFFSET);
     let at = HHDM.load(Ordering::Relaxed)
@@ -363,6 +372,7 @@ pub fn report() {
         refused += header_word(cpu_index, ring::AUDIT_REFUSED_OFFSET);
     }
 
+    // CPU: diagnostic -- the boot report's own write to one ring, before any consumer exists.
     let cpu_index = percpu::cpu_id() as usize;
     let head = header_word(cpu_index, ring::HEAD_OFFSET);
     {

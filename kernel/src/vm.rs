@@ -1476,6 +1476,7 @@ pub fn handle_fault(address: u64, write: bool) -> FaultOutcome {
         // a lock it never contended, and in kernel mode the machine
         // halted. Found when RFC 0029 step 4's second client doubled
         // exactly that concurrency.
+        // CPU: interrupt -- the page-fault handler, entered through an interrupt gate.
         if SPACES.owner() == Some(bhaskix_arch::percpu::cpu_id()) {
             return FaultOutcome::Unserviceable("address space lock held by this cpu");
         }

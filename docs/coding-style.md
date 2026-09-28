@@ -213,6 +213,22 @@ Restated from [architecture.md](architecture.md) §6 because they are style rule
   system prevents it; do not work around it.
 - **Name what a lock protects, in the type.** `SpinLock<FreeLists>` is better than a `SpinLock<()>`
   next to the data it notionally guards.
+- **"Which CPU is this" is a moment, not a fact — say why yours cannot be split.** A kernel thread
+  with interrupts on and no lock held can be preempted and resumed on another CPU between any two
+  instructions, so `percpu::cpu_id()` followed by anything that acts on *that CPU's* state — its
+  runqueue's `current`, its held-lock mask, its reserve, its domain note — is two instants. Every
+  such read carries a `// CPU: <tag> -- <reason>` comment directly above it, and
+  `tools/check-cpu-reads.py` (in `make gates`) refuses one without. The tags: `masked`,
+  `interrupt`, `held`, `rechecked` (read again under the lock it chose), `pinned`, `boot`,
+  `caller` (the function's doc says what its callers must supply), `hint` (a wrong CPU costs
+  latency, never correctness), `diagnostic`, `any`. To act on *the running thread's* queue from a
+  path with interrupts on, use `sched::lock_own_queue`, which does the re-read for you.
+  > **Why this is a rule.** On 2026-09-28 the shape was found in ten functions, each after it had
+  > shipped: the running thread's id and domain, `exit`, `should_die`, `cancel_block`, `preempt`'s choice of queue, the
+  > lock-order mask, the frame reserve, the system call's dialect and caller, and the syscall exit's
+  > space check. One wedged the ring self-test (CI run 761); one explains the lock-order row's four
+  > sightings; one could have looked a capability index up in another domain's table. None was hard
+  > to fix once seen. What they shared is that nothing asked the question at the line.
 
 ---
 

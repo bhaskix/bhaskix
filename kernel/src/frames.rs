@@ -169,6 +169,7 @@ fn with_reserve<R>(f: impl FnOnce(&mut Reserve) -> R) -> Option<R> {
     // 2026-09-28 arrives with interrupts already off, so it was latent; the
     // `enabled` branch above is what says a caller with them on is allowed.
     // One exit, so the one restore below covers the refusal too.
+    // CPU: masked -- interrupts were masked just above.
     let cpu = percpu::cpu_id() as usize;
     let result = (cpu < MAX_CPUS).then(|| {
         // SAFETY: this CPU is the only writer of its own element, interrupts
@@ -249,6 +250,7 @@ pub fn give(frame: u64) {
 /// tries again, and the reserve is only consulted by faults, which are rarer
 /// than ticks.
 pub fn refill() {
+    // CPU: any -- only a bounds check; `with_reserve` reads its own CPU masked.
     let cpu = percpu::cpu_id() as usize;
     if cpu >= MAX_CPUS {
         return;

@@ -775,6 +775,7 @@ pub fn note_hold_leak(kind: u64, method: u64) {
     let count = HOLD_LEAKS.fetch_add(1, Ordering::Relaxed);
     if count == 0 {
         FIRST_LEAK.store(kind << 32 | (method & 0xffff_ffff), Ordering::Relaxed);
+        // CPU: diagnostic -- printed only.
         let cpu = percpu::cpu_id() as usize;
         crate::println!(
             "\x1b[91m  HOLD LEAK: returning to ring 3 with cpu {}'s hold count nonzero, rank \
@@ -965,6 +966,7 @@ pub enum SpawnError {
 /// nowhere to save the context of whatever is already running, and the first
 /// switch would lose it.
 pub fn init_cpu(name: &'static str, policy: Policy) {
+    // CPU: boot -- each CPU registers itself during bring-up, before it takes interrupts.
     let cpu = percpu::cpu_id() as usize;
     if cpu >= MAX_CPUS {
         return;
@@ -1271,6 +1273,7 @@ pub fn spawn_on_with(
     // to the IPI this CPU would have been sent had the spawn come from any
     // other processor. The fast path is unchanged: a switch that happens
     // directly costs no interrupt.
+    // CPU: hint -- a stale answer sends an unneeded IPI or leaves the target to its next tick.
     if cpu != percpu::cpu_id() {
         notify(cpu);
     } else if preempt_reporting() {
@@ -1407,17 +1410,30 @@ static FS_BASE_LOADED: [core::sync::atomic::AtomicU64; MAX_CPUS] =
 /// `IA32_FS_BASE` is a segment base for *user* accesses: every access through
 /// it is a user-mode access under the caller's own page table, so a wrong value
 /// faults the caller and reaches nothing of the kernel's.
+///
+/// **And the caller must not be able to move** between the write and the
+/// record of it -- interrupts masked (the switch paths, the IPI) or a runqueue
+/// lock held (`set_fs_base`). The record is what the switch path trusts to
+/// skip a reload; one stored against the wrong CPU would let a thread run on
+/// that CPU with somebody else's base.
 unsafe fn load_fs_base(base: u64) {
     // SAFETY: the caller's obligation, restated above.
     unsafe { bhaskix_arch::msr::write(bhaskix_arch::msr::IA32_FS_BASE, base) };
+    // CPU: caller -- see the doc: callers are masked or hold a runqueue lock.
     if let Some(slot) = FS_BASE_LOADED.get(percpu::cpu_id() as usize) {
         slot.store(base, core::sync::atomic::Ordering::Relaxed);
     }
 }
 
 /// What this CPU's `IA32_FS_BASE` holds, as last loaded.
+///
+/// **Callers must not be able to move** -- interrupts masked, or a runqueue
+/// lock held -- exactly as for [`load_fs_base`]: the switch path skips a
+/// reload when this matches, so reading another CPU's slot would let a thread
+/// run with the wrong `FS` base.
 fn fs_base_loaded() -> u64 {
     FS_BASE_LOADED
+        // CPU: caller -- see `load_fs_base`: callers are masked or hold a runqueue lock.
         .get(percpu::cpu_id() as usize)
         .map_or(0, |slot| slot.load(core::sync::atomic::Ordering::Relaxed))
 }
@@ -1502,6 +1518,7 @@ pub fn set_fs_base(thread: u32, base: u64) -> bool {
             //
             // Every other thread still gets it at its next switch, which is
             // where the base travels.
+            // CPU: held -- this runs holding the queue lock of `index`, so the caller cannot move.
             match base_reach(running, thread, index, percpu::cpu_id() as usize) {
                 BaseReach::LoadedHere => {
                     // SAFETY: as `load_fs_base`.
@@ -1564,6 +1581,7 @@ pub fn set_fs_base(thread: u32, base: u64) -> bool {
 /// base still arrives at the next switch, which is what happened before this
 /// existed.
 pub(crate) fn refresh_fs_base_here() {
+    // CPU: interrupt -- runs from the FS-base IPI handler.
     let cpu = percpu::cpu_id() as usize;
     if cpu >= MAX_CPUS {
         return;
@@ -1735,6 +1753,7 @@ fn note_saved_count(id: u32, name: &'static str, count: u32, where_: &'static st
             "    SAVED COUNT    thread {id} ({name}) switched out via {where_} with {count} \
              counted holds and an empty mask -- the count-side tear, mid-poison"
         );
+        // CPU: diagnostic -- which CPU's guards are dumped, printed only.
         crate::sync::dump_open_guards(bhaskix_arch::percpu::cpu_id() as usize);
     }
 }
@@ -1935,6 +1954,7 @@ pub mod reply_trail {
 /// Records one transition. Never prints, never locks, never allocates.
 fn note_reply_trail(kind: u64, thread: u32, caller: Option<u32>) {
     use core::sync::atomic::Ordering;
+    // CPU: diagnostic -- a label in a trace entry.
     let cpu = percpu::cpu_id() as u64 & 0xff;
     let packed = (kind & 0xff) << 56
         | cpu << 48
@@ -2602,6 +2622,7 @@ static EXIT_ROOTLESS_FIRST: core::sync::atomic::AtomicU64 =
 pub fn check_user_space(site: u64) {
     use core::sync::atomic::Ordering;
 
+    // CPU: rechecked -- compared again under the queue's lock below.
     let cpu = percpu::cpu_id() as usize;
     if cpu >= MAX_CPUS {
         return;
@@ -2610,6 +2631,17 @@ pub fn check_user_space(site: u64) {
         EXIT_UNCHECKED.fetch_add(1, Ordering::Relaxed);
         return;
     };
+    // **The CPU again, under the lock.** The system-call exit calls this with
+    // interrupts on, so the thread could have moved since `cpu` was read, and
+    // then `current` below is somebody else -- whose address space would be
+    // compared with *this* CPU's page table and counted as a wrong space the
+    // boot test fails on. Holding the queue, the thread cannot move; a
+    // mismatch means it already had, and the check is skipped as unchecked.
+    // CPU: rechecked -- compared with the read above, under the queue's lock.
+    if percpu::cpu_id() as usize != cpu {
+        EXIT_UNCHECKED.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
     let Some((who, root)) = queue
         .threads
         .get(queue.current)
@@ -2715,6 +2747,7 @@ pub fn switch_gaps() -> (u64, u64) {
 fn finish_switch() {
     use core::sync::atomic::Ordering;
 
+    // CPU: masked -- the switch path runs with interrupts masked.
     let cpu = percpu::cpu_id() as usize;
     let mut root = 0;
     let mut who = 0;
@@ -2767,17 +2800,21 @@ extern "C" fn thread_entered() {
 
 /// Allows the calling CPU to start preempting.
 pub fn start() {
-    let cpu = percpu::cpu_id() as usize;
-    if cpu < MAX_CPUS {
-        QUEUES[cpu].lock().started = true;
+    // Through [`lock_own_queue`]: the boot processor calls this from a
+    // self-test with interrupts on, where a plain read-then-lock could
+    // start preemption on a CPU it had just left.
+    if let Some((_, mut queue)) = lock_own_queue() {
+        queue.started = true;
     }
 }
 
 /// Stops preemption on the calling CPU.
 pub fn stop() {
-    let cpu = percpu::cpu_id() as usize;
-    if cpu < MAX_CPUS {
-        QUEUES[cpu].lock().started = false;
+    // Through [`lock_own_queue`]: the boot processor calls this from a
+    // self-test with interrupts on, where a plain read-then-lock could
+    // stop preemption on a CPU it had just left.
+    if let Some((_, mut queue)) = lock_own_queue() {
+        queue.started = false;
     }
 }
 
@@ -2828,6 +2865,7 @@ pub fn preempt() {
 /// second is reported, so a caller acting on it cannot start an interrupt
 /// storm out of threads that were simply not the best choice.
 fn preempt_reporting() -> bool {
+    // CPU: diagnostic -- feeds only the veto's counters and messages; the queue is chosen from a second read after masking.
     let cpu = percpu::cpu_id() as usize;
     if cpu >= MAX_CPUS {
         return true;
@@ -2976,6 +3014,23 @@ fn preempt_reporting() -> bool {
     if interrupts_were_enabled {
         // SAFETY: re-enabled below on every path out.
         unsafe { cpu::disable_interrupts() };
+    }
+
+    // **Which CPU, read again now that nothing can move this thread.** The
+    // `cpu` above was read with interrupts still on, by `yield_now`,
+    // `resched`, `exit`'s loop and the spawn path, none of which hold a lock
+    // -- so the thread could be preempted and resumed elsewhere before the
+    // mask. Choosing the queue from that stale value would have this CPU make
+    // *another* CPU's scheduling decision: save its own registers as that
+    // CPU's running thread and switch to that CPU's next one, corrupting both.
+    // The reads above only feed the veto's counters and diagnostics, and the
+    // veto's answer cannot be wrong for a thread that holds a lock, which
+    // cannot have moved. Found 2026-09-28 by `tools/check-cpu-reads.py`.
+    // CPU: masked -- interrupts were masked just above.
+    let cpu = percpu::cpu_id() as usize;
+    if cpu >= MAX_CPUS {
+        restore_interrupts(interrupts_were_enabled);
+        return true;
     }
 
     // The lock is taken, the decision made, and the lock *released* before the
@@ -3683,6 +3738,7 @@ pub fn for_each_verdict(mut f: impl FnMut(u32, u32, &'static str, State, u64, u6
 /// The guard is deliberately leaked: the machine is about to fault and halt,
 /// and a lock released on the way out would not reproduce anything.
 pub fn wedge_own_runqueue() {
+    // CPU: diagnostic -- a fault-injection harness that wedges a queue on purpose.
     let cpu = percpu::cpu_id() as usize;
     if cpu >= MAX_CPUS {
         return;
@@ -3749,6 +3805,7 @@ pub enum Running {
 /// when it had something worth saying.
 #[must_use]
 pub fn running_now() -> Running {
+    // CPU: interrupt -- called only from the exception report.
     let cpu = percpu::cpu_id() as usize;
     if cpu >= MAX_CPUS {
         return Running::Nobody;
@@ -3772,6 +3829,7 @@ pub fn running_now() -> Running {
 /// caller, and comparing the two is the point.
 #[must_use]
 pub fn current_fs_base() -> Option<u64> {
+    // CPU: interrupt -- called only from the exception report.
     let cpu = percpu::cpu_id() as usize;
     if cpu >= MAX_CPUS {
         return None;
@@ -3887,11 +3945,13 @@ pub fn current_thread_id() -> Option<u32> {
 fn lock_own_queue() -> Option<(usize, crate::sync::SpinLockGuard<'static, RunQueue>)> {
     let mut passes = 0u64;
     loop {
+        // CPU: rechecked -- compared with the second read below, under the lock.
         let cpu = percpu::cpu_id() as usize;
         if cpu >= MAX_CPUS {
             return None;
         }
         let queue = QUEUES[cpu].lock();
+        // CPU: rechecked -- this is the second read.
         let now = percpu::cpu_id() as usize;
         if now == cpu {
             if passes > 0 {
@@ -3968,6 +4028,7 @@ pub fn identity_retries() -> (u64, u64, Option<(u32, u64, u64)>) {
 /// for. Taking another lock inside it either inverts an order or, for a second
 /// runqueue lock, closes a cycle against a lock of its own rank.
 pub fn block_unless<T>(me: u32, ready: impl FnOnce() -> Option<T>) -> Option<T> {
+    // CPU: rechecked -- `current` is compared with the caller's own id below, and a mismatch refuses.
     let cpu = percpu::cpu_id() as usize;
     if cpu >= MAX_CPUS {
         return ready();
@@ -4030,6 +4091,7 @@ pub fn block_unless<T>(me: u32, ready: impl FnOnce() -> Option<T>) -> Option<T> 
 /// that are already `Blocked`, so an enqueued thread that is still `Ready` is
 /// a lost wakeup waiting to happen.
 pub fn mark_blocked(id: u32) {
+    // CPU: rechecked -- `current` is compared with the caller's own id below, and a mismatch marks the caller where it is.
     let cpu = percpu::cpu_id() as usize;
     if cpu >= MAX_CPUS {
         return;
@@ -4300,6 +4362,7 @@ pub fn cancel_block() {
 /// which is a hang rather than a slowdown.
 #[track_caller]
 pub fn block_self(who: u32) {
+    // CPU: any -- only a bounds check.
     if percpu::cpu_id() as usize >= MAX_CPUS {
         return;
     }
@@ -4355,6 +4418,7 @@ pub fn block_self(who: u32) {
         // what it was missing: either one is listed here -- a file to open
         // -- or none is, and a counted hold with no open guard convicts the
         // count itself.
+        // CPU: diagnostic -- which CPU's guards are dumped, printed only.
         crate::sync::dump_open_guards(bhaskix_arch::percpu::cpu_id() as usize);
     }
 
@@ -4376,6 +4440,7 @@ pub fn block_self(who: u32) {
         // for ever. This is the line that lets the next pass find the caller
         // where it actually is -- the same reasoning `mark_blocked_anywhere`
         // uses when it scans rather than guessing.
+        // CPU: masked -- interrupts were masked before this loop; `current` is also compared with `who`.
         let cpu = percpu::cpu_id() as usize;
         if cpu >= MAX_CPUS {
             restore_interrupts(interrupts_were_enabled);
@@ -4725,6 +4790,7 @@ pub fn wake_from_interrupt(id: u32) -> bool {
             //
             // Not to this CPU: it is inside an interrupt handler and will
             // return to the scheduler on its own.
+            // CPU: interrupt -- runs in an interrupt handler.
             let here = percpu::cpu_id();
             for cpu in 0..percpu::online_count().min(MAX_CPUS as u32) {
                 if cpu != here {
@@ -5112,6 +5178,7 @@ pub fn wake_log_span() -> (u64, u64, usize) {
 
 fn wake_with(id: u32, from_interrupt: bool) -> WakeResult {
     let online = percpu::online_count() as usize;
+    // CPU: hint -- only decides whether to send an IPI.
     let here = percpu::cpu_id();
     let mut contended = false;
 
@@ -5847,6 +5914,7 @@ pub fn should_die() -> bool {
 /// One attempt at [`should_die`]: `None` when the caller moved between reading
 /// its CPU and taking that CPU's lock, and must ask again where it is now.
 fn should_die_once() -> Option<bool> {
+    // CPU: rechecked -- compared with the second read below, under the lock.
     let cpu = percpu::cpu_id() as usize;
     if cpu >= MAX_CPUS {
         return Some(false);
@@ -5876,6 +5944,7 @@ fn should_die_once() -> Option<bool> {
     // with interrupts on, and a caller that moved before the lock would be
     // answered for the thread running where it used to be -- told to die for
     // somebody else's teardown, or told to carry on through its own.
+    // CPU: rechecked -- this is the second read.
     let now = percpu::cpu_id() as usize;
     if now != cpu {
         note_identity_retry(&queue, cpu, now);
