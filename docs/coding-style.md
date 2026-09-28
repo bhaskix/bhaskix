@@ -317,6 +317,20 @@ Restated per-subsystem in each design doc. The rules:
   where the bit was set; recorded there, zero means *never raised against*, which is the reading
   the word existed for. **Ask what else could produce the value you are about to read**, and if a
   timing can, move the capture rather than the interpretation.
+- **Before building an instrument, check whether the answer is in the logs the old one wrote.** An
+  instrument that reports correctly into a place nobody reads is indistinguishable, from the outside,
+  from one that was never built — so the reflex on an open row is to reach for a new witness when the
+  existing one may already have answered. The nested-wait-queue row was hunted for three weeks on the
+  theory that two wait queues nested; `dump_open_guards` had printed
+  `open guard none -- the counted hold has no open guard, which is itself the answer` on **all four**
+  sightings, its own comment stating the rule (*none means the mask is lying*) before the first of
+  them. The verdict was two spaces indented and `annotate_failure_detail` keeps lines past column 15,
+  so no CI annotation ever carried it — and `first_violation`, added precisely to bridge that gap for
+  the rank, the mask and the site, stopped one line short of the line that decided the question. The
+  same reading also found run 489's detail sitting in the cached logs while this file and a doc
+  comment both said it had been lost. **Grep the cached logs for the old witness before designing a
+  new one, and when a gap between a witness and its reader is being closed, check that every line the
+  reader needs comes across — not the ones that were being looked at that day.**
 - **A slot that keeps only the latest value answers only about the latest event.** A
   last-writer-wins global is the right shape for *what happened most recently* and the wrong shape
   for *whether this ever happened*, and the two questions read identically off it. `wait::CLEARED_AT`

@@ -884,6 +884,32 @@ static FIRST_MASK: AtomicU64 = AtomicU64::new(0);
 /// That is the same fault as the console tear, the lock accounting's withdrawn
 /// specimens and this session's mismark share-over-total: a report built from
 /// stores that are not ordered against the load cannot describe one moment.
+/// How many guards were **actually open** on that CPU when the first violation
+/// fired, and which ranks they were.
+///
+/// **The line that decides the wait-queue row, carried to where CI can see
+/// it.** `dump_open_guards` has printed this verdict at violation time since it
+/// was written, and it is the discriminator the mask cannot supply: *two entries
+/// means the holds are real; none means the mask is lying*. All four sightings
+/// of `real ordering violations before the probe` read `open guard none` — and
+/// nobody knew, because that line is printed hundreds of lines before the gate
+/// and is indented two spaces, so `annotate_failure_detail` (which keeps lines
+/// indented past column 15) never carried it. `first_violation` was added for
+/// exactly this gap and stopped one line short of the answer.
+///
+/// Sampled inside the same claim as the rank and the mask, and published by
+/// `FIRST_READY`, so a count of zero means *none were open* rather than *not
+/// sampled*.
+static FIRST_OPEN_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// The ranks of those open guards, as a bit per rank.
+///
+/// Printed beside the claimed mask because their **disagreement** is the
+/// finding: the mask says what this CPU claims to hold, this says what it
+/// demonstrably holds, and a violation recorded against a rank present in the
+/// first and absent from the second is a violation against nobody.
+static FIRST_OPEN_RANKS: AtomicU64 = AtomicU64::new(0);
+
 /// The winner sets this last, with `Release`; the reader takes it first, with
 /// `Acquire`, and reads nothing until it is set.
 static FIRST_READY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
@@ -944,6 +970,21 @@ pub fn for_each_held(mask: u64, mut each: impl FnMut(&'static str)) {
     }
 }
 
+/// How many guards were open when the first violation fired, and their ranks.
+///
+/// `None` until a violation has been published, so the caller cannot read a
+/// zero that means *nothing recorded* as one that means *nothing open*.
+#[must_use]
+pub fn first_open_guards() -> Option<(u64, u64)> {
+    if !FIRST_READY.load(Ordering::Acquire) {
+        return None;
+    }
+    Some((
+        FIRST_OPEN_COUNT.load(Ordering::Relaxed),
+        FIRST_OPEN_RANKS.load(Ordering::Relaxed),
+    ))
+}
+
 /// The first violation's rank, the mask held against it, and where — if there
 /// was one.
 #[must_use]
@@ -986,6 +1027,20 @@ fn record(held: u64, rank: Rank, site: &'static core::panic::Location<'static>) 
     {
         FIRST_RANK.store(u32::from(rank as u8), Ordering::Relaxed);
         FIRST_MASK.store(held, Ordering::Relaxed);
+        // **What is actually open, sampled here rather than described later.**
+        // This runs before the claim below, so the lock being acquired has
+        // neither a mask bit nor an open guard yet: everything counted here was
+        // taken by an earlier acquisition that has not been released. Only
+        // atomics are loaded, which is what makes it safe on this path -- see
+        // `dump_open_guards`.
+        let mut open_count = 0u64;
+        let mut open_ranks = 0u64;
+        for_each_open_guard(percpu::cpu_id() as usize, |_at, guard_rank, _since| {
+            open_count += 1;
+            open_ranks |= 1u64 << u64::from(guard_rank);
+        });
+        FIRST_OPEN_COUNT.store(open_count, Ordering::Relaxed);
+        FIRST_OPEN_RANKS.store(open_ranks, Ordering::Relaxed);
         // Last, and with `Release`: everything above must be visible to
         // whoever sees this set.
         FIRST_READY.store(true, Ordering::Release);

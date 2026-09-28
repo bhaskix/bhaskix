@@ -28256,6 +28256,43 @@ fn lock_ordering_self_test() -> bool {
                 site.file(),
                 site.line()
             );
+            // **What was actually open, which is the line that decides this
+            // row and the one the annotation never carried.** `record` has
+            // printed `open guard none -- the counted hold has no open guard,
+            // which is itself the answer` at violation time since it was
+            // written, hundreds of lines above this gate and indented two
+            // spaces, so `annotate_failure_detail` dropped it on every
+            // sighting. All four occurrences of this gate read `none` and
+            // nobody knew.
+            //
+            // **The decision rule, written here rather than left to a reader.**
+            // The mask says what this CPU *claims* to hold; this says what it
+            // demonstrably holds, each entry being a guard acquired and not
+            // released. So:
+            //
+            // * **`0 open` — the mask is lying.** The rank this violation is
+            //   recorded against is held by nobody, so the violation is against
+            //   no code, and the bug is in the bookkeeping. Two causes of
+            //   exactly that have already been found and fixed: the rank bit
+            //   cleared after the release (2026-08-09), and a thread switched
+            //   out carrying a rank it had not acquired.
+            // * **`N open` with the violated rank among them — the holds are
+            //   real**, and the nesting is in the code that took them.
+            // * **`N open` without the violated rank** — a third thing again,
+            //   and the two numbers printed side by side are what says so.
+            if let Some((open, ranks)) = sync::first_open_guards() {
+                println!(
+                    "\x1b[91m                   {open} guard(s) actually open on that cpu, ranks \
+                     {ranks:#b} against the claimed mask {mask:#b} -- {}\x1b[0m",
+                    if open == 0 {
+                        "nothing held it, so the mask is lying and the violation is against no code"
+                    } else if ranks & (1u64 << u64::from(rank)) != 0 {
+                        "the violated rank is genuinely held, so the nesting is real"
+                    } else {
+                        "something is held, but not the rank this fired on"
+                    }
+                );
+            }
             // One line per held rank rather than one line listing them.
             //
             // Not a style choice: `annotate_failure_detail` keeps the lines
