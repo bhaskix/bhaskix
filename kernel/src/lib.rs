@@ -2327,7 +2327,17 @@ extern "C" fn bringup_watchdog(_: u64) -> ! {
     println!(
         "\x1b[93m  {dropped} messages were DROPPED because a mailbox was already full, and\x1b[0m"
     );
-    println!("  {wake_missed} wakes went missing. Either is enough to strand a caller for ever.");
+    // **Corrected 2026-09-28: only the first of these strands a caller.** This
+    // line read "{wake_missed} wakes went missing. Either is enough to strand a
+    // caller for ever", and the second half was wrong. `ipc.rs` records a wake
+    // that finds its partner not yet blocked as benign -- the partner finds the
+    // message when it checks -- and a healthy `test-boot-iommu` reads 51 of them
+    // and `test-boot` reads 1, both with zero dropped. A report that calls the
+    // routine case fatal sends its reader after the wrong number.
+    println!(
+        "  {wake_missed} wakes reached a partner not yet blocked -- routine, not lost: a healthy \
+         boot has dozens. The dropped count above is the one that strands a caller."
+    );
     println!(
         "  {} deferred wakes were lost.",
         sched::deferred_wakes_lost()
@@ -20801,6 +20811,91 @@ fn report_tcp_client(hhdm: u64) {
                  domain at all\x1b[0m"
             ),
         }
+        // **Where the call actually is**, which the two lines above cannot say.
+        // CI run 753 showed the client parked on its call and `bin/tcpd` parked
+        // owing nobody -- the call in neither's hands. The endpoint's own
+        // queues are a reading of *now*, so they cannot have rotated out the
+        // way a trace can. The rule, written before a sighting read it:
+        //
+        // * **a sender and a receiver both queued** -- a caller and a waiting
+        //   service that never matched, which the rendezvous exists to make
+        //   impossible: the fault is in `ipc`.
+        // * **a sender and no receiver** -- the call is waiting, and `bin/tcpd`
+        //   is parked somewhere other than this endpoint. It binds its inbox
+        //   notification to its receive, so that is where to look.
+        // * **no sender** -- the call is not waiting here. `dropped` above zero
+        //   says it matched and was lost in the handover, which the counter
+        //   exists to catch; zero says it never arrived on this endpoint.
+        let raw_endpoint = TCP_ENDPOINT.load(core::sync::atomic::Ordering::Acquire);
+        let (dropped, wake_missed, _, _, _, _) = ipc::diagnostics();
+        // Whether the service took the call, from the line above. Without it,
+        // an empty queue reads the same for a call the service took and has not
+        // answered and one that never reached it -- and the first version of this
+        // rule said "never arrived" for both.
+        let taken = matches!(
+            crate::sched::first_thread_owes_reply(
+                TCPD_DOMAIN.load(core::sync::atomic::Ordering::Acquire),
+            ),
+            Some(Some(_))
+        );
+        match (raw_endpoint != u64::MAX)
+            .then(|| ipc::queued(ipc::EndpointId::from_u32(raw_endpoint as u32)))
+            .flatten()
+        {
+            Some((senders, receivers)) => println!(
+                "\x1b[91m                   tcpd's endpoint holds {senders} queued sender(s) \
+                 and {receivers} waiting receiver(s); rendezvous dropped after matching \
+                 {dropped}, woke a partner not yet blocked {wake_missed} -- {}\x1b[0m",
+                match (senders > 0, receivers > 0) {
+                    (true, true) =>
+                        "a caller and a waiting service never matched: the fault is in ipc",
+                    (true, false) => {
+                        "the call is waiting and the service is parked elsewhere: look at \
+                         its bound inbox"
+                    }
+                    (false, _) if taken => {
+                        "the call is not waiting because the service took it and has not \
+                         answered: its handler is where to look"
+                    }
+                    (false, _) if dropped > 0 => {
+                        "the call is not waiting here and a matched message was lost in the \
+                         handover"
+                    }
+                    (false, _) => "the call is not waiting here and never arrived on this endpoint",
+                }
+            ),
+            None => println!(
+                "\x1b[91m                   tcpd's endpoint could not be read, so where the \
+                 call is stays unknown\x1b[0m"
+            ),
+        }
+        // **The rendezvous trace for the two threads, with its window said.**
+        // It holds the last 48 events on the whole machine and this prints after
+        // a wait of several seconds, so an event missing from it is one that
+        // rotated out, not one that did not happen -- the reason the queue line
+        // above, which cannot rotate, carries the verdict and this does not.
+        let client =
+            sched::first_thread_in_domain(TCPC_DOMAIN.load(core::sync::atomic::Ordering::Acquire))
+                .map(|(thread, _)| thread);
+        let service =
+            sched::first_thread_in_domain(TCPD_DOMAIN.load(core::sync::atomic::Ordering::Acquire))
+                .map(|(thread, _)| thread);
+        let mut shown = 0;
+        ipc::replay(|event, who, with| {
+            let involved = |t: Option<u32>| t.is_some_and(|t| t == who || t == with);
+            if involved(client) || involved(service) {
+                shown += 1;
+                println!(
+                    "\x1b[91m                   rendezvous: {event}, thread {who} with {with}\x1b[0m"
+                );
+            }
+        });
+        if shown == 0 {
+            println!(
+                "\x1b[91m                   rendezvous: none of the last 48 events involve either \
+                 thread -- rotated out, not absent\x1b[0m"
+            );
+        }
     } else if outcome == 2 && detail == 0 {
         // **And a zero is no longer the step 4 XOR meaning nothing.** Since the
         // line above is published on entry, zero says the program never reached
@@ -20925,6 +21020,21 @@ fn report_tcp_cookies_late(hhdm: u64) {
         buffer.copy_from_slice(&bytes[(15 + index) * 8..(15 + index) * 8 + 8]);
         *word = u64::from_le_bytes(buffer);
     }
+    // **The two rendezvous counters the step-4 verdict prints, on every boot**,
+    // because until now they were printed only on failure and so had no
+    // baseline -- and this tree disagreed with itself about what a non-zero
+    // `wake missed` means. `ipc.rs` says it is *not an error on its own: the
+    // partner may not have marked itself blocked yet, and will find the
+    // message when it checks*; a failure message elsewhere says such wakes are
+    // *enough to strand a caller for ever*. Two boots that ran normally until
+    // an injected fault read 12 and 14, which is the first evidence for the
+    // former. A clean boot's number is what the next step-4 sighting is read
+    // against; `dropped` is the one whose healthy value is zero.
+    let (dropped, wake_missed, _, _, _, _) = ipc::diagnostics();
+    println!(
+        "    ipc handover*  {dropped} rendezvous dropped after matching, {wake_missed} wake(s) \
+         reached a partner not yet blocked"
+    );
     println!(
         "    tcpd served*   {} call(s) dequeued, {} of them RECV, {} answer(s) made, last method \
          {}",
