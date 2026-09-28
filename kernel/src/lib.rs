@@ -29810,7 +29810,10 @@ fn domain_self_test(hhdm_base: u64, cpus: u32) -> bool {
     // asked here is "is it over" rather than "did this call end it".
     let over = |id| domain::destroy(id) || !matches!(domain::state_of(id), Ok(None));
     let destroyed = over(lonely) && over(crowded);
-    let capabilities_after = cap::live();
+    // **The count and the capabilities it counts, from one hold of the arena**
+    // -- so a failing line below can name what is still live rather than only
+    // how many. See `cap::CapNode::site`.
+    let (capabilities_after, survivors) = cap::live_with_survivors::<8>();
 
     let checks = [
         ("a charge within the envelope succeeded", within),
@@ -29873,6 +29876,31 @@ fn domain_self_test(hhdm_base: u64, cpus: u32) -> bool {
         println!(
             "\x1b[91m    domains        FAILED: destruction returned every capability -- {capabilities_before} live before, {capabilities_after} after, {magnitude} {direction}\x1b[0m"
         );
+        // **Which ones.** CI run 760 read `0 live before, 1 after, 1 leaked`
+        // and nothing more, and the arena is machine-wide: the one left over
+        // may be this test's, or something another CPU made while it ran.
+        // The owner and the line that made it tell those apart. Everything
+        // live is listed, up to eight -- against a baseline of zero that *is*
+        // the leak; against a non-zero one it includes what was there before.
+        for survivor in survivors.iter().flatten() {
+            println!(
+                "\x1b[91m                   left live  #{} {:?} {}, charged to {}, {}, rights \
+                 {:#06b}, made at {}\x1b[0m",
+                survivor.index,
+                survivor.object.kind,
+                survivor.object.id,
+                Owner(survivor.owner),
+                Parent(survivor.parent),
+                survivor.rights,
+                Site(survivor.site),
+            );
+        }
+        if capabilities_after > survivors.len() {
+            println!(
+                "\x1b[91m                   and {} more not listed\x1b[0m",
+                capabilities_after - survivors.len()
+            );
+        }
         ok = false;
     }
 
@@ -30234,6 +30262,43 @@ fn rt_latency_self_test(hhdm_base: u64, cpus: u32) -> bool {
         }
     }
     true
+}
+
+/// Who a capability is charged to, in words.
+struct Owner(u32);
+
+impl core::fmt::Display for Owner {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        if self.0 == cap::OWNER_KERNEL {
+            write!(f, "the kernel")
+        } else {
+            write!(f, "domain {}", self.0)
+        }
+    }
+}
+
+/// What a capability was derived from, in words.
+struct Parent(Option<usize>);
+
+impl core::fmt::Display for Parent {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self.0 {
+            Some(index) => write!(f, "derived from #{index}"),
+            None => write!(f, "a root"),
+        }
+    }
+}
+
+/// Where a capability was made, or the fact that it was not recorded.
+struct Site(Option<&'static core::panic::Location<'static>>);
+
+impl core::fmt::Display for Site {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self.0 {
+            Some(site) => write!(f, "{}:{}", site.file(), site.line()),
+            None => write!(f, "an unrecorded site"),
+        }
+    }
 }
 
 /// What cleared a wait-queue entry and when, or the fact that nothing did.

@@ -289,7 +289,34 @@ struct CapNode {
     /// CSpaces a capability happens to sit in, because revocation destroys
     /// nodes without touching any CSpace.
     owner: u32,
+    /// The code that made this node: the first caller outside the arena's
+    /// `#[track_caller]` constructors.
+    ///
+    /// **Because the domain self-test's leak is a count, and a count names
+    /// nothing.** CI run 760 read `0 live before, 1 after, 1 leaked` — a
+    /// capability made during that test and never destroyed, or made
+    /// concurrently by something else on the machine, and the number cannot
+    /// say which. `owner` narrows it to a domain; this names the line. Eight
+    /// bytes a node, printed in the boot's `fixed tables` bill like the rest.
+    site: Option<&'static core::panic::Location<'static>>,
     live: bool,
+}
+
+/// One live capability, as [`Arena::survivors`] reports it.
+#[derive(Clone, Copy, Debug)]
+pub struct Survivor {
+    /// Its arena index.
+    pub index: usize,
+    /// What it names.
+    pub object: ObjectRef,
+    /// The domain charged for it, or [`OWNER_KERNEL`].
+    pub owner: u32,
+    /// The arena index it was derived from, or `None` for a root.
+    pub parent: Option<usize>,
+    /// Its rights, as bits.
+    pub rights: u8,
+    /// Where it was made, if recorded.
+    pub site: Option<&'static core::panic::Location<'static>>,
 }
 
 /// Why a capability operation failed.
@@ -351,6 +378,7 @@ impl Arena {
                 parent: None,
                 generation: 0,
                 owner: OWNER_KERNEL,
+                site: None,
                 live: false,
             }; MAX_CAPABILITIES],
             live: 0,
@@ -371,6 +399,7 @@ impl Arena {
     /// # Errors
     ///
     /// [`CapError::Exhausted`] if the arena is full.
+    #[track_caller]
     pub fn insert_root(
         &mut self,
         object: ObjectRef,
@@ -385,6 +414,7 @@ impl Arena {
     /// # Errors
     ///
     /// [`CapError::Exhausted`] if the arena is full.
+    #[track_caller]
     pub fn insert_root_owned(
         &mut self,
         object: ObjectRef,
@@ -401,6 +431,7 @@ impl Arena {
             parent: None,
             generation,
             owner,
+            site: Some(core::panic::Location::caller()),
             live: true,
         };
         self.live += 1;
@@ -465,6 +496,7 @@ impl Arena {
     /// if it does not carry [`Rights::DERIVE`], [`CapError::RightsNotMonotone`]
     /// if the request would widen authority, [`CapError::Exhausted`] if the
     /// arena is full.
+    #[track_caller]
     pub fn derive(
         &mut self,
         parent: SlotRef,
@@ -479,6 +511,7 @@ impl Arena {
     /// # Errors
     ///
     /// As [`Arena::derive`].
+    #[track_caller]
     pub fn derive_owned(
         &mut self,
         parent: SlotRef,
@@ -544,6 +577,7 @@ impl Arena {
             parent: Some(parent.node),
             generation,
             owner,
+            site: Some(core::panic::Location::caller()),
             live: true,
         };
         self.live += 1;
@@ -711,6 +745,25 @@ impl Arena {
         self.live
     }
 
+    /// Every live capability, in arena order.
+    ///
+    /// For a report that has found the count wrong and needs to say *which*
+    /// ones are there. See [`CapNode::site`].
+    pub fn survivors(&self) -> impl Iterator<Item = Survivor> + '_ {
+        self.nodes
+            .iter()
+            .enumerate()
+            .filter(|(_, node)| node.live)
+            .map(|(index, node)| Survivor {
+                index,
+                object: node.object,
+                owner: node.owner,
+                parent: node.parent.map(|parent| parent.0 as usize),
+                rights: node.rights.bits(),
+                site: node.site,
+            })
+    }
+
     /// The domain charged for a capability, if it is still live.
     #[must_use]
     pub fn owner_of(&self, slot: SlotRef) -> Option<u32> {
@@ -858,9 +911,61 @@ pub fn live() -> usize {
     ARENA.lock().live()
 }
 
+/// The live count and the first `N` live capabilities, from **one** hold of
+/// the arena's lock.
+///
+/// One hold because a count and a list taken separately describe two instants,
+/// and the whole point is to name the capabilities the count is counting.
+/// Copied out rather than printed here: printing takes the console's lock, and
+/// this one is held.
+#[must_use]
+pub fn live_with_survivors<const N: usize>() -> (usize, [Option<Survivor>; N]) {
+    let arena = ARENA.lock();
+    let mut listed = [None; N];
+    for (slot, survivor) in listed.iter_mut().zip(arena.survivors()) {
+        *slot = Some(survivor);
+    }
+    (arena.live(), listed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What the domain self-test prints when its count comes back wrong: the
+    /// capabilities still live, each with its parent and the line that made
+    /// it -- and not the ones that were destroyed.
+    #[test]
+    fn the_survivors_are_the_live_capabilities_and_each_names_where_it_was_made() {
+        let mut arena = Arena::new();
+        let root = arena
+            .insert_root(ObjectRef::new(ObjectKind::Endpoint, 7), Rights::ALL, 0)
+            .expect("room");
+        let line = line!() - 2; // the `.insert_root(` line: a chained call is placed at its method
+        let child = arena.derive(root, Rights::READ, 0).expect("room");
+        let gone = arena
+            .insert_root(ObjectRef::new(ObjectKind::Memory, 9), Rights::ALL, 0)
+            .expect("room");
+        arena.revoke(gone).expect("it may be revoked");
+
+        let survivors: Vec<Survivor> = arena.survivors().collect();
+        assert_eq!(survivors.len(), 2, "the destroyed one is not listed");
+        assert_eq!(survivors.len(), arena.live());
+
+        let (first, second) = (survivors[0], survivors[1]);
+        assert_eq!(first.object, ObjectRef::new(ObjectKind::Endpoint, 7));
+        assert_eq!(first.parent, None);
+        assert_eq!(second.parent, Some(first.index));
+        assert_eq!(second.rights, Rights::READ.bits());
+        assert_eq!(child.node.0 as usize, second.index);
+
+        // **The line of the call, not a line inside the arena** -- which is
+        // what `#[track_caller]` on the public constructors buys, and what
+        // this would lose if one of them dropped the attribute.
+        let site = first.site.expect("recorded");
+        assert_eq!(site.file(), file!());
+        assert_eq!(site.line(), line);
+    }
 
     /// The shape `bin/fsd` is in on every `dir::RELEASE`, and the reason
     /// RFC 0044 asks the **CSpace** rather than the arena's `owner` field.
