@@ -439,6 +439,23 @@ impl Process {
         // mappings that no longer exist — and the first `fork` after an `exec`
         // would copy them.
         self.regions = [None; MAX_REGIONS];
+        // **And the old image's heap is not the new one's either** -- the same
+        // rule as the region list above, for the one mapping that list never
+        // held. `bin/linuxd` maps the break only on a record's *first* `brk`
+        // (`brk_base == 0`) and answers every later one from these two fields,
+        // so carried across an exec they hand the new image the old image's
+        // heap: an address in the old domain, which the new domain has no
+        // region for.
+        //
+        // That is exactly how RFC 0068's demonstration broke. A static glibc
+        // allocates its TLS block with `brk` and copies the TLS image into it
+        // first thing, so the exec'd BusyBox's first store landed on a break
+        // mapped in the domain it had just replaced -- `NotOurs`, a hosted fault
+        // at `0x7030937d3828` in a `memcpy`, and no output. Found 2026-09-28
+        // after running unnoticed since at least 2026-09-19, because no lane
+        // in `make test` sets `bhaskix.busybox=1`.
+        self.brk_base = 0;
+        self.brk_current = 0;
         self.descriptors.close_on_exec(released)
     }
 
@@ -1156,6 +1173,22 @@ mod tests {
             process.mapped_pages(),
             0,
             "a fork after an exec would copy mappings that no longer exist"
+        );
+    }
+
+    #[test]
+    fn an_exec_does_not_hand_the_new_image_the_old_images_heap() {
+        // The adapter maps a break only while `brk_base` is zero, so a record
+        // that kept it across an exec answered the new image with an address in
+        // the old domain. RFC 0068's BusyBox faulted on exactly that.
+        let mut process = Process::new(9, 2, 3, 1);
+        process.brk_base = 0x7030_937d_0000;
+        process.brk_current = 0x7030_937d_4000;
+        process.exec_into(11, 2, layout::base_from(1), |_, _| {});
+        assert_eq!(
+            (process.brk_base, process.brk_current),
+            (0, 0),
+            "the new image's first brk must map a break of its own"
         );
     }
 
