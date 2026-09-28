@@ -20896,6 +20896,109 @@ fn report_tcp_client(hhdm: u64) {
                  thread -- rotated out, not absent\x1b[0m"
             );
         }
+        // **What the client is blocked on**, now that CI run 756 showed its call
+        // never reached `bin/tcpd`'s endpoint: `0 queued sender(s) and 1 waiting
+        // receiver(s)`, the service waiting, nothing dropped. There is no
+        // "blocked on" field, so this reads every place a blocked thread can be
+        // held and names the first that holds it. The order is the rule, written
+        // before a sighting read it -- most specific first:
+        //
+        // 1. **a message in its mailbox** -- the answer reached it and the wake
+        //    did not: a lost wake-up in the scheduler, not a lost call.
+        // 2. **a thread owes it a reply** -- a service took its call and has not
+        //    answered; if that thread is not `bin/tcpd`'s, the call went elsewhere.
+        // 3. **a refusal or a lost answer waiting** -- it was told its call failed
+        //    and has not woken to hear it.
+        // 4. **queued on an endpoint** -- as a sender on one that is not
+        //    `bin/tcpd`'s: its call went somewhere else; as a receiver: it is
+        //    waiting to be called, not calling.
+        // 5. **parked on a notification** -- it is not in a call at all, so the
+        //    stream wait is not where its own report puts it.
+        // 6. **none of these** -- nothing in the kernel names what it waits on,
+        //    and the block itself is the fault.
+        if let Some(client) = client {
+            let tcp_endpoint = (raw_endpoint != u64::MAX).then_some(raw_endpoint as u32);
+            let queued = ipc::where_queued(client);
+            // The queue line's own count, re-read so the verdict below can tell a
+            // client queued where that line said it would be from a contradiction.
+            let waiting_senders = tcp_endpoint
+                .and_then(|endpoint| ipc::queued(ipc::EndpointId::from_u32(endpoint)))
+                .map_or(0, |(senders, _)| senders);
+            let parked = crate::notify::waited_on_by(client);
+            // Plain values: `none` for absence, the number otherwise -- not
+            // `Recorded`, whose `#N` and `nothing recorded` are for event orders.
+            let plain = |value: Option<u64>| {
+                value.map_or(alloc::string::String::from("none"), |v| {
+                    alloc::format!("{v}")
+                })
+            };
+            match sched::wait_facts(client) {
+                Some(facts) => {
+                    println!(
+                        "\x1b[91m                   client thread {client} is {}: mailbox {}, reply \
+                         owed by {}, its call declared for endpoint {} (bin/tcpd's is {}), queued \
+                         {}, parked on notification {}, refusal {}, answer lost {}\x1b[0m",
+                        facts.state,
+                        plain(facts.mailbox_from.map(u64::from)),
+                        plain(facts.owed_by.map(u64::from)),
+                        plain(facts.called_endpoint.map(u64::from)),
+                        plain(tcp_endpoint.map(u64::from)),
+                        match queued {
+                            Some((endpoint, true)) =>
+                                alloc::format!("to send on endpoint {endpoint}"),
+                            Some((endpoint, false)) =>
+                                alloc::format!("to receive on endpoint {endpoint}"),
+                            None => alloc::string::String::from("on no endpoint"),
+                        },
+                        plain(parked.map(|n| n as u64)),
+                        plain(facts.call_refused.map(u64::from)),
+                        facts.answer_lost,
+                    );
+                    let verdict = if facts.mailbox_from.is_some() {
+                        "an answer reached it and the wake did not -- a lost wake-up in the scheduler, \
+                         not a lost call"
+                    } else if let Some(owner) = facts.owed_by {
+                        // Consistent or contradictory depending on what the
+                        // owed-reply line above said -- the first version called
+                        // this a contradiction unconditionally, which is right only
+                        // on a boot like run 756.
+                        if service == Some(owner) && taken {
+                            "bin/tcpd holds its call and has not answered, as the line above says"
+                        } else if service == Some(owner) {
+                            "bin/tcpd holds its call, which contradicts the owed-reply line above -- \
+                             one of the two readings is wrong"
+                        } else {
+                            "another thread holds its call and owes it the answer -- that service, \
+                             not bin/tcpd"
+                        }
+                    } else if facts.call_refused.is_some() || facts.answer_lost {
+                        "it was told its call failed and has not woken to hear it"
+                    } else if let Some((endpoint, as_sender)) = queued {
+                        if !as_sender {
+                            "it is waiting to be called, not calling"
+                        } else if Some(endpoint) == tcp_endpoint && waiting_senders > 0 {
+                            "its call is waiting on bin/tcpd's endpoint, as the queue line says -- \
+                             the service is not taking it"
+                        } else if Some(endpoint) == tcp_endpoint {
+                            "it is queued on bin/tcpd's endpoint, which contradicts the queue line \
+                             above -- one of the two readings is wrong"
+                        } else {
+                            "its call is queued on an endpoint that is not bin/tcpd's"
+                        }
+                    } else if parked.is_some() {
+                        "it is parked on a notification, not in a call -- the stream wait is not \
+                         where its own report puts it"
+                    } else {
+                        "nothing in the kernel names what it waits on -- the block itself is the fault"
+                    };
+                    println!("\x1b[91m                   so: {verdict}\x1b[0m");
+                }
+                None => println!(
+                    "\x1b[91m                   client thread {client} is in no run queue, so what it \
+                     waits on cannot be read\x1b[0m"
+                ),
+            }
+        }
     } else if outcome == 2 && detail == 0 {
         // **And a zero is no longer the step 4 XOR meaning nothing.** Since the
         // line above is published on entry, zero says the program never reached

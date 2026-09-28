@@ -5485,6 +5485,58 @@ pub fn first_thread_owes_reply(domain: u32) -> Option<Option<u32>> {
     None
 }
 
+/// What the scheduler knows about why `thread` is waiting.
+///
+/// There is no "blocked on" field -- a thread blocks in many places and none of
+/// them writes one -- so this collects the facts that stand in for it: news
+/// waiting in the thread's own record, the endpoint its current call was made
+/// for, and whether any other thread owes it a reply.
+#[derive(Clone, Copy, Debug)]
+pub struct WaitFacts {
+    /// Its state.
+    pub state: State,
+    /// The sender of a message delivered to it and not yet taken.
+    pub mailbox_from: Option<u32>,
+    /// A thread holding its call and owing it a reply.
+    pub owed_by: Option<u32>,
+    /// The endpoint its current call declared a receive slot for.
+    pub called_endpoint: Option<u32>,
+    /// A refusal delivered to it and not yet seen.
+    pub call_refused: Option<u32>,
+    /// Whether it was told its answer is gone.
+    pub answer_lost: bool,
+}
+
+/// [`WaitFacts`] for `thread`, or `None` if no run queue holds it.
+///
+/// Scans every queue, blocking, as [`first_thread_owes_reply`] does -- for a
+/// report written from an ordinary thread, never from an interrupt.
+#[must_use]
+pub fn wait_facts(thread: u32) -> Option<WaitFacts> {
+    let online = percpu::online_count() as usize;
+    let mut facts = None;
+    let mut owed_by = None;
+    for queue in QUEUES.iter().take(online.min(MAX_CPUS)) {
+        let queue = queue.lock();
+        for held in queue.threads.iter().flatten() {
+            if held.id == thread {
+                facts = Some(WaitFacts {
+                    state: held.state,
+                    mailbox_from: held.mailbox.map(|(_, from)| from),
+                    owed_by: None,
+                    called_endpoint: held.receive_slot.map(|(endpoint, _)| endpoint),
+                    call_refused: held.call_refused,
+                    answer_lost: held.answer_lost,
+                });
+            }
+            if held.reply_to == Some(thread) {
+                owed_by = Some(held.id);
+            }
+        }
+    }
+    facts.map(|facts| WaitFacts { owed_by, ..facts })
+}
+
 /// The first thread [`threads_in_domain_exact`] would count, and its state.
 ///
 /// **For a refusal message, not for a decision.** `set_personality` refuses a

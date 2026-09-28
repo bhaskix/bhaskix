@@ -772,6 +772,17 @@ pub fn waiter_of(id: NotificationId) -> u32 {
     resolve(id).map_or(0, |slot| slot.waiter.load(Ordering::Acquire))
 }
 
+/// The index of the live notification `thread` is parked on, if any.
+///
+/// The reverse of [`waiter_of`], for a report that has a blocked thread and no
+/// record of what it blocked on. Lock-free, as every read of a slot is.
+#[must_use]
+pub fn waited_on_by(thread: u32) -> Option<usize> {
+    SLOTS.iter().position(|slot| {
+        slot.live.load(Ordering::Acquire) && slot.waiter.load(Ordering::Acquire) == thread
+    })
+}
+
 /// Blocks once, and returns whatever is pending afterwards — possibly nothing.
 ///
 /// [`wait`] loops until the word is non-zero, which is what a caller with no

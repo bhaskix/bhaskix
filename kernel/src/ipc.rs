@@ -825,6 +825,39 @@ pub fn statistics() -> (u64, u64) {
     (table.delivered, table.replied)
 }
 
+/// Which endpoint queue holds `thread`, if any: `(endpoint, as_sender)`.
+///
+/// For a report about a thread that is blocked and should not be. The step-4
+/// failure established that a client's call was not queued on the service's
+/// endpoint; this says whether it is queued on *any* endpoint, which is the
+/// difference between a call sent to the wrong place and one never sent.
+#[must_use]
+pub fn where_queued(thread: u32) -> Option<(u32, bool)> {
+    let table = TABLE.lock();
+    for (index, endpoint) in table.endpoints.iter().enumerate() {
+        if !endpoint.live {
+            continue;
+        }
+        if endpoint
+            .senders
+            .iter()
+            .flatten()
+            .any(|send| send.thread == thread)
+        {
+            return Some((index as u32, true));
+        }
+        if endpoint
+            .receivers
+            .iter()
+            .flatten()
+            .any(|&waiting| waiting == thread)
+        {
+            return Some((index as u32, false));
+        }
+    }
+    None
+}
+
 /// Threads queued on an endpoint, as `(senders, receivers)`.
 #[must_use]
 pub fn queued(id: EndpointId) -> Option<(usize, usize)> {
