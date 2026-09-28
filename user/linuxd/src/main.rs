@@ -1528,7 +1528,13 @@ fn answer_tgkill(request: &PersonalityCall) -> (u64, Answer) {
 fn answer_kill(request: &PersonalityCall) -> (u64, Answer) {
     const SIGKILL: u64 = 9;
     const SIGTERM: u64 = 15;
-    let (raw, signal) = (request.first() as i64, request.second());
+    // `pid_t` is an `int`: see `int_arg`. `kill(-pgid, sig)` from a compiled
+    // program arrives with the upper half zeroed, and read as 64 bits named a
+    // process that does not exist.
+    let (raw, signal) = (
+        i64::from(bhaskix_personality::call::int_arg(request.first())),
+        request.second(),
+    );
 
     // Who is asking. A caller this table cannot name may signal nothing; there
     // is no "unknown caller" worth being generous about, because every hosted
@@ -2574,7 +2580,7 @@ fn answer_poll(request: &PersonalityCall) -> (u64, Answer) {
     // cancelling. Fixing the overflow (`Pace::cycles_ns`) turned it into a
     // fifty-day bounded park, and the datagram probe, which counts only
     // unbounded parks on its bell, failed on every IOMMU boot (2026-09-28).
-    let timeout = match i64::from(request.third() as u32 as i32) {
+    let timeout = match i64::from(bhaskix_personality::call::int_arg(request.third())) {
         negative if negative < 0 => Wait::Forever,
         0 => Wait::Now,
         milliseconds => Wait::For((milliseconds as u64).saturating_mul(1_000_000)),
@@ -3053,7 +3059,14 @@ fn answer_nanosleep_relative(request: &PersonalityCall, at: u64) -> (u64, Answer
     // no signal pending is counted, and answered as it always was, so this
     // change measures the suspected fault without altering it.
     if let Some(early) = took_timed_wait(request.domain) {
-        if early && !dispositions_of(request.domain).has_pending() {
+        if early {
+            // **Interrupted, and said so.** Linux returns `EINTR` from a sleep a
+            // signal cut short, and this answered `0` -- a full sleep -- because
+            // the retry never asked why it woke. The delivery arm carries this
+            // value through the signal frame to the handler's return.
+            if dispositions_of(request.domain).has_pending() {
+                return (REPLY_VALUE, Answer::error(-4)); // EINTR
+            }
             SPURIOUS_SLEEPS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         }
         return (REPLY_VALUE, Answer::ok(0));
@@ -5339,7 +5352,10 @@ fn answer_fstat(request: &PersonalityCall) -> Answer {
 fn answer_newfstatat(request: &PersonalityCall) -> Answer {
     stat_at(
         request,
-        request.first(),
+        // `dirfd` is an `int`, and `AT_FDCWD` is `-100` only in its low half:
+        // re-extended here so the comparison below and `i32::try_from` see the
+        // value Linux would. See `int_arg`.
+        i64::from(bhaskix_personality::call::int_arg(request.first())) as u64,
         request.second(),
         request.third(),
         request.fourth(),
@@ -6479,7 +6495,10 @@ fn answer_wait(request: &PersonalityCall) -> (u64, Answer) {
         return (REPLY_VALUE, Answer::error(-11));
     };
     let (pid, group) = (process.pid, process.pgid);
-    let wanted = WaitFor::from_argument(which as i64, group);
+    // `pid_t` again -- `wait4(-1)`, a shell waiting for any child, arrives from
+    // BusyBox's own libc with the upper half zeroed. See `int_arg`.
+    let wanted =
+        WaitFor::from_argument(i64::from(bhaskix_personality::call::int_arg(which)), group);
     // SAFETY: single-threaded by construction, as elsewhere here.
     let processes = processes();
     match processes.collect(pid, wanted) {

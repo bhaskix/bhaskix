@@ -199,9 +199,47 @@ impl Answer {
 /// is discovered rather than guessed.
 pub const ENOSYS: Answer = Answer::error(-38);
 
+/// An argument Linux declares `int` (or `pid_t`, which is an `int`), read the
+/// way Linux reads it: **the low 32 bits, sign-extended.**
+///
+/// The upper half of a register holding an `int` argument is not the caller's
+/// promise: the System V ABI leaves it undefined, and a 32-bit move -- which is
+/// what a compiler emits for an `int` -- zeroes it. So `-1` can arrive as
+/// `0xffff_ffff_ffff_ffff` or as `0x0000_0000_ffff_ffff`, and only the low half
+/// means anything. Linux truncates; a translator that reads all 64 bits reads
+/// the second form as 4,294,967,295.
+///
+/// Found by `poll`, whose `-1` became fifty days (2026-09-28), and confirmed
+/// reachable from a real program rather than a hand-written probe: the static
+/// BusyBox in this tree loads `wait4`'s pid with `mov 0x10(%rsp),%edi`. So
+/// `wait4(-1)` -- a shell waiting for any child -- and `kill(-pgid)` both
+/// arrive as large positive pids when read as 64 bits. *Established from that
+/// disassembly and this function's test, not observed at a live call*: the one
+/// place the adapter records a wait's answer is a single slot the kernel reads
+/// before BusyBox runs, so nothing reports what its `sh` got back.
+#[must_use]
+pub const fn int_arg(raw: u64) -> i32 {
+    raw as u32 as i32
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_int_argument_is_its_low_half_however_the_upper_half_arrived() {
+        // Sign-extended, as a 64-bit move of the constant leaves it.
+        assert_eq!(int_arg(u64::MAX), -1);
+        // Zero-extended, as a 32-bit move leaves it -- the form that read as
+        // four billion when all 64 bits were taken.
+        assert_eq!(int_arg(0x0000_0000_ffff_ffff), -1);
+        // `AT_FDCWD`, both ways.
+        assert_eq!(int_arg((-100i64) as u64), -100);
+        assert_eq!(int_arg(0x0000_0000_ffff_ff9c), -100);
+        // A small positive value, and one with an undefined upper half.
+        assert_eq!(int_arg(7), 7);
+        assert_eq!(int_arg(0xdead_beef_0000_0007), 7);
+    }
 
     #[test]
     fn the_arguments_are_in_linuxs_order_and_the_fourth_is_r10() {
