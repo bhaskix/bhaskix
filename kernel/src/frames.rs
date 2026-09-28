@@ -155,27 +155,34 @@ static REFILLED: AtomicU64 = AtomicU64::new(0);
 /// CPU's reserve, so the only way an update can be observed half-done is an
 /// interrupt landing inside it — and a page fault is an interrupt.
 fn with_reserve<R>(f: impl FnOnce(&mut Reserve) -> R) -> Option<R> {
-    let cpu = percpu::cpu_id() as usize;
-    if cpu >= MAX_CPUS {
-        return None;
-    }
-
     let enabled = cpu::interrupts_enabled();
     if enabled {
         // SAFETY: re-enabled below before returning.
         unsafe { cpu::disable_interrupts() };
     }
 
-    // SAFETY: this CPU is the only writer of its own element, and interrupts
-    // are masked, so no nested access can observe a partial update. The
-    // reference does not escape this call.
-    let result = f(unsafe { &mut *RESERVES[cpu].as_mut_ptr() });
+    // **Which CPU, read only once interrupts are masked.** This read used to
+    // come first, with interrupts still on: a caller preempted between the two
+    // and resumed elsewhere would then mutate the reserve of a CPU it was no
+    // longer on, unlocked, while that CPU might be mutating it too -- the
+    // SAFETY claim below would have been false. Every caller traced on
+    // 2026-09-28 arrives with interrupts already off, so it was latent; the
+    // `enabled` branch above is what says a caller with them on is allowed.
+    // One exit, so the one restore below covers the refusal too.
+    let cpu = percpu::cpu_id() as usize;
+    let result = (cpu < MAX_CPUS).then(|| {
+        // SAFETY: this CPU is the only writer of its own element, interrupts
+        // are masked so the caller cannot move to another CPU and no nested
+        // access can observe a partial update, and `cpu` was read after the
+        // masking. The reference does not escape this call.
+        f(unsafe { &mut *RESERVES[cpu].as_mut_ptr() })
+    });
 
     if enabled {
         // SAFETY: restoring the caller's state.
         unsafe { cpu::enable_interrupts() };
     }
-    Some(result)
+    result
 }
 
 /// Takes a frame from this CPU's reserve, if it has one.

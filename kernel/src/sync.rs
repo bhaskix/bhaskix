@@ -1059,8 +1059,8 @@ fn record(held: u64, rank: Rank, site: &'static core::panic::Location<'static>) 
         FIRST_RANK.store(u32::from(rank as u8), Ordering::Relaxed);
         FIRST_MASK.store(held, Ordering::Relaxed);
         // **What is actually open, sampled here rather than described later.**
-        // This runs before the claim below, so the lock being acquired has
-        // neither a mask bit nor an open guard yet: everything counted here was
+        // This runs after `lock`'s claim and before its acquisition completes,
+        // so the lock being acquired has no open guard yet: everything counted here was
         // taken by an earlier acquisition that has not been released. Only
         // atomics are loaded, which is what makes it safe on this path -- see
         // `dump_open_guards`.
@@ -1282,11 +1282,20 @@ impl<T> SpinLock<T> {
     /// compare-exchange, and buys the one fact the report was missing.
     #[track_caller]
     pub fn lock(&self) -> SpinLockGuard<'_, T> {
-        let held = held_mask();
+        // **The mask the order is checked against is read inside the claim,
+        // with interrupts off -- not before it.** It used to be read first,
+        // with interrupts on, by a thread that held nothing and so could be
+        // preempted and moved: `held_mask` picks this CPU's slot and then
+        // loads it, and a thread that moved between the two read **another
+        // CPU's** mask -- the genuine holds of whoever was running there -- and
+        // reported a violation against them. That is the lock-order row's
+        // four CI sightings exactly: a different mask every time, run 667
+        // blocked on rank 9 against a mask claiming only rank 10, and **`open
+        // guard none` on every one**, because the guards were counted on the
+        // CPU the thread had moved *to*, where it held nothing. Read under the
+        // claim, the mask and this CPU are one instant.
+        let mut held = 0;
         ACQUISITIONS.fetch_add(1, Ordering::Relaxed);
-        if would_violate(held, self.rank) {
-            record(held, self.rank, core::panic::Location::caller());
-        }
         // **The count goes up before the rank bit, and the order is not
         // arbitrary.** `preempt` asks the count, and the mask is what a switch
         // saves into the outgoing thread. Set the mask first and there are two
@@ -1304,9 +1313,19 @@ impl<T> SpinLock<T> {
         // is held and either says otherwise. Claiming while merely waiting
         // costs a skipped preemption.
         claim_uninterrupted(|| {
+            held = slot().load(Ordering::Relaxed);
             holds_slot().fetch_add(1, Ordering::Relaxed);
             slot().fetch_or(self.rank.bit(), Ordering::Relaxed);
         });
+        // Recorded after the claim, which is also what makes `record`'s own
+        // open-guard sample trustworthy: a thread counted as holding a lock is
+        // one `preempt` will not move, so the CPU `record` reads is this one.
+        // `held` excludes this lock's bit, and its guard is not open until the
+        // acquisition below completes, so what `record` sees is only what was
+        // held before.
+        if would_violate(held, self.rank) {
+            record(held, self.rank, core::panic::Location::caller());
+        }
 
         while self
             .locked
@@ -1727,8 +1746,37 @@ mod tests {
         assert_eq!(accounting(), (0, 0));
     }
 
+    /// Serializes the tests that read the global violation count: one that
+    /// records a violation must not land between another's reset and its
+    /// assertion of zero.
+    static VIOLATION_COUNT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn a_real_nesting_through_lock_is_still_recorded_with_the_mask_it_broke() {
+        // The order check now reads the mask inside the claim rather than
+        // before it. That must not cost the one thing the check is for: a
+        // thread genuinely holding a rank and blocking on the same one.
+        let _serial = VIOLATION_COUNT.lock().unwrap_or_else(|e| e.into_inner());
+        set_held_mask(0);
+        reset_violations();
+        let outer = SpinLock::new(Rank::WaitQueue, ());
+        let inner = SpinLock::new(Rank::WaitQueue, ());
+        let held = outer.lock();
+        drop(inner.lock());
+        drop(held);
+        assert_eq!(violations(), 1, "a nesting of equal ranks is a violation");
+        let (rank, mask, _) = first_violation().expect("recorded");
+        assert_eq!(rank, Rank::WaitQueue as u8);
+        assert_eq!(
+            mask,
+            Rank::WaitQueue.bit(),
+            "the mask recorded is the outer hold, without the inner lock's own bit"
+        );
+    }
+
     #[test]
     fn releasing_and_retaking_one_rank_is_not_a_violation() {
+        let _serial = VIOLATION_COUNT.lock().unwrap_or_else(|e| e.into_inner());
         // The regression the first attempt at the release order caused. Two
         // wait queues taken one after the other are ordinary; only *both at
         // once* is a violation. Clearing the rank bit after the release made
