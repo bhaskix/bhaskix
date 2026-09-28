@@ -9580,7 +9580,22 @@ fn a_hosted_process_ends_its_child(hhdm_base: u64, cpus: u32) -> bool {
         took_nothing,
         first_owed_pid,
         first_owed_replies,
+        early_releases,
+        spurious_sleeps,
+        abandoned_timed,
     } = adapter_signal_record();
+    // **The suspected mechanism of the undelivered signal, on every boot.** A
+    // timed wait released before its deadline leaves that deadline armed on an
+    // idle wake slot; when it fires the kernel keeps the bit, and the next park
+    // on the slot returns at once. If that is right, the first number is
+    // non-zero on healthy boots -- the killer probe's own signal-woken
+    // `nanosleep` is one -- and the second is zero, becoming non-zero only on a
+    // boot where an early release happened to land on a `nanosleep`.
+    println!(
+        "    hosted timed   {early_releases} timed wait(s) released early, {abandoned_timed} \
+         abandoned without a retry -- both now disarmed and given back; {spurious_sleeps} \
+         nanosleep(s) woke early with no signal pending"
+    );
     // **And a phrase a tool can count**, in yellow, when the two disagree.
     //
     // `TRACKER.md` §3's undelivered-signal defect has two sightings and a
@@ -9922,6 +9937,12 @@ struct SignalRecord {
     /// did not re-present it and the search moves into the park and wake path.
     /// Two or more means a reply was made and did not see the pending bit.
     first_owed_replies: u64,
+    /// Timed waits released before their deadline, deadline still armed.
+    early_releases: u64,
+    /// `nanosleep`s woken before their deadline with no signal pending.
+    spurious_sleeps: u64,
+    /// Timed waits abandoned without their retry.
+    abandoned_timed: u64,
     /// The blocked mask of the first domain still owed a delivery.
     ///
     /// **The difference between a delivery that has not happened yet and one
@@ -9985,6 +10006,9 @@ fn adapter_signal_record() -> SignalRecord {
         took_nothing: record[16],
         first_owed_pid: record[17],
         first_owed_replies: record[18],
+        early_releases: record[19],
+        spurious_sleeps: record[20],
+        abandoned_timed: record[21],
     }
 }
 

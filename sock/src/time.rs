@@ -57,6 +57,27 @@ impl Pace {
         self.hertz.saturating_mul(ms) / 1000
     }
 
+    /// How many cycles `ns` nanoseconds are, exactly, saturating at `u64::MAX`.
+    ///
+    /// **Through a 128-bit intermediate, because `ns * hertz` does not fit in
+    /// 64 bits for any sleep a program actually takes.** At 2 GHz it overflows
+    /// past 9.2 seconds and at 1 GHz past 18.4. `bin/linuxd` did that multiply
+    /// in `u64` with `checked_mul`, and on overflow answered `nanosleep` with an
+    /// immediate `EINTR` -- so a hosted `nanosleep(1000 s)` never slept, and the
+    /// killer probe's child, which the probe believed was parked, raced its own
+    /// kill instead. That race is §3's undelivered-signal row (2026-09-28).
+    /// `bin/tcpd`'s `now_nanos` already said the same thing in its own words:
+    /// *128-bit intermediate on purpose*.
+    #[must_use]
+    pub const fn cycles_ns(&self, ns: u64) -> u64 {
+        let cycles = (ns as u128) * (self.hertz as u128) / 1_000_000_000;
+        if cycles > u64::MAX as u128 {
+            u64::MAX
+        } else {
+            cycles as u64
+        }
+    }
+
     /// The absolute deadline `ms` milliseconds from now, saturating.
     #[must_use]
     pub fn after_ms(&self, ms: u64) -> u64 {
@@ -73,6 +94,23 @@ mod tests {
         let pace = Pace::new(0);
         assert!(!pace.calibrated());
         assert_eq!(pace.cycles(3_000), 0);
+    }
+
+    #[test]
+    fn a_long_sleep_in_nanoseconds_converts_exactly_rather_than_overflowing() {
+        // 1000 seconds at 3 GHz is 3e12 cycles. The product before dividing is
+        // 3e21, past u64::MAX -- the multiply bin/linuxd did, and refused.
+        let fast = Pace::new(3_000_000_000);
+        assert_eq!(fast.cycles_ns(1_000_000_000_000), 3_000_000_000_000);
+        // Ten seconds at 2 GHz: the product is 2e19, just past u64::MAX.
+        assert_eq!(
+            Pace::new(2_000_000_000).cycles_ns(10_000_000_000),
+            20_000_000_000
+        );
+        // A duration no clock can reach saturates instead of wrapping.
+        assert_eq!(Pace::new(u64::MAX).cycles_ns(u64::MAX), u64::MAX);
+        // And no clock at all is still zero.
+        assert_eq!(Pace::new(0).cycles_ns(1_000_000_000), 0);
     }
 
     #[test]

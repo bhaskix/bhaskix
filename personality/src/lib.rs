@@ -311,7 +311,7 @@ pub mod report {
     /// first owed domain has made since it was raised against — one means the
     /// woken call produced none, two or more means one was made and did not
     /// see the pending bit.
-    pub const SIGNAL_WORDS: usize = 19;
+    pub const SIGNAL_WORDS: usize = 22;
 
     /// Where bulk staging begins.
     ///

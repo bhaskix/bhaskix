@@ -657,6 +657,12 @@ fn publish_signals() {
         TOOK_NOTHING.load(core::sync::atomic::Ordering::Relaxed),
         first_owed_pid,
         first_owed_replies,
+        // Nineteen and twenty: the suspected producer and victim of the
+        // undelivered signal -- see `EARLY_RELEASES` and `SPURIOUS_SLEEPS`.
+        EARLY_RELEASES.load(core::sync::atomic::Ordering::Relaxed),
+        SPURIOUS_SLEEPS.load(core::sync::atomic::Ordering::Relaxed),
+        // Twenty-one: see `ABANDONED_TIMED`.
+        ABANDONED_TIMED.load(core::sync::atomic::Ordering::Relaxed),
     ];
     for (index, count) in counts.iter().enumerate() {
         // SAFETY: inside the page `ATTACH` mapped from this program's own
@@ -2559,7 +2565,16 @@ enum Wait {
 fn answer_poll(request: &PersonalityCall) -> (u64, Answer) {
     // Milliseconds here, nanoseconds inside, because `ppoll` beside this one
     // brings a `timespec` and the waiting has to be the same waiting.
-    let timeout = match request.third() as i64 {
+    // **The low 32 bits, sign-extended: Linux declares this argument `int`.**
+    // A program's `-1` arrives by a 32-bit move -- that is what a compiler
+    // emits for an `int` -- and a 32-bit move zeroes the register's upper half,
+    // so read as 64 bits it was +4,294,967,295 milliseconds, some fifty days.
+    // That only ever parked for ever because the deadline for fifty days
+    // overflowed into `None`, which the path below reads as unbounded: two bugs
+    // cancelling. Fixing the overflow (`Pace::cycles_ns`) turned it into a
+    // fifty-day bounded park, and the datagram probe, which counts only
+    // unbounded parks on its bell, failed on every IOMMU boot (2026-09-28).
+    let timeout = match i64::from(request.third() as u32 as i32) {
         negative if negative < 0 => Wait::Forever,
         0 => Wait::Now,
         milliseconds => Wait::For((milliseconds as u64).saturating_mul(1_000_000)),
@@ -2675,7 +2690,7 @@ fn poll_with(request: &PersonalityCall, at: u64, count: u64, timeout: Wait) -> (
         }
     }
 
-    if ready == 0 && timeout != Wait::Now && !took_timed_wait(request.domain) {
+    if ready == 0 && timeout != Wait::Now && took_timed_wait(request.domain).is_none() {
         // **A positive timeout waits, and does not return early.** The caller
         // is parked on a deadline; a key arriving sooner does not cut it short,
         // because a thread here waits on one notification and the deadline is
@@ -2911,7 +2926,7 @@ fn select_with(request: &PersonalityCall, timeout: Wait) -> (u64, Answer) {
         }
     }
 
-    if ready == 0 && timeout != Wait::Now && !took_timed_wait(request.domain) {
+    if ready == 0 && timeout != Wait::Now && took_timed_wait(request.domain).is_none() {
         // Both wake sources when the console is what is being waited for, as
         // `poll` does and for the same reason -- RFC 0057.
         if let Wait::For(nanos) = timeout
@@ -3033,8 +3048,14 @@ fn answer_nanosleep(request: &PersonalityCall) -> (u64, Answer) {
 /// remainder would always be zero. Writing a zero would be indistinguishable
 /// from a real short sleep, so nothing is written at all.
 fn answer_nanosleep_relative(request: &PersonalityCall, at: u64) -> (u64, Answer) {
-    // Already slept: this is the retry after the deadline fired.
-    if took_timed_wait(request.domain) {
+    // Already slept: this is the retry after the park was woken. **Not
+    // necessarily by the deadline** -- see `EARLY_RELEASES`. An early wake with
+    // no signal pending is counted, and answered as it always was, so this
+    // change measures the suspected fault without altering it.
+    if let Some(early) = took_timed_wait(request.domain) {
+        if early && !dispositions_of(request.domain).has_pending() {
+            SPURIOUS_SLEEPS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        }
         return (REPLY_VALUE, Answer::ok(0));
     }
     let mut spec = [0u8; 16];
@@ -6328,6 +6349,8 @@ fn resolve_into(slot: u64, component: &[u8]) -> Result<Opened, i64> {
 /// is parked on a notification this program holds and nothing else will signal
 /// it.
 fn note_exit(domain: u32, exit: Exit) {
+    // A process that ends mid-sleep is not coming back for its wake slot.
+    abandon_timed_wait(domain);
     let Some(process) = process_for(domain) else {
         return;
     };
@@ -7658,11 +7681,48 @@ fn deadline_in(nanos: u64) -> Option<u64> {
     if hertz == 0 {
         return None;
     }
-    let ticks = nanos.checked_mul(hertz)? / 1_000_000_000;
+    // **Exact, not `checked_mul`.** `nanos * hertz` overflows 64 bits for any
+    // sleep past a few seconds, and the `None` that produced was answered as an
+    // immediate `EINTR` -- a `nanosleep(1000 s)` that never slept. See
+    // `Pace::cycles_ns`.
+    //
+    // `None` keeps the meaning the `poll` path gives it -- a deadline *so long
+    // this machine cannot name the instant it ends* -- and now means exactly
+    // that: past the end of the cycle counter, some two centuries at 3 GHz,
+    // rather than past a few seconds.
+    let ticks = bhaskix_sock::time::Pace::new(hertz).cycles_ns(nanos);
     bhaskix_sock::time::now().checked_add(ticks)
 }
 
-/// Who is parked on a deadline, and on which wake slot: `(domain, slot + 1)`.
+/// Timed waits abandoned without their retry -- see `abandon_timed_wait`.
+///
+/// **The deterministic witness that a long `nanosleep` now parks.** The killer
+/// probe's `park` child sleeps a thousand seconds and is killed; before
+/// 2026-09-28 that sleep overflowed into an immediate `EINTR`, the child spun
+/// instead, and its death abandoned nothing. Parked for real, its death
+/// abandons a timed wait on every boot the probe runs.
+static ABANDONED_TIMED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Timed waits whose wake slot was released **before its deadline**.
+///
+/// The suspected producer of §3's undelivered signal. `took_timed_wait` releases
+/// a slot on the retry after *any* wake -- a `poll` woken by its descriptor, a
+/// `nanosleep` woken by a signal -- and nothing disarms the deadline it was
+/// armed with. That deadline then fires into an idle slot, and the kernel keeps
+/// the bit: the next park on that slot returns at once. Counted on every boot,
+/// because if this is the mechanism it happens on healthy boots too and only
+/// sometimes lands on a victim.
+static EARLY_RELEASES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// `nanosleep`s that came back before their deadline with **no signal pending**.
+///
+/// The suspected victim. Linux returns from `nanosleep` early only for a
+/// signal; one that returns early without one was woken by something that was
+/// not meant for it. Zero on a healthy boot if the mechanism above is right.
+static SPURIOUS_SLEEPS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Who is parked on a deadline, on which wake slot, and until when:
+/// `(domain, slot + 1, deadline)`.
 ///
 /// **What tells a first call from the retry after it.** `BLOCK_ON_RETRY` asks
 /// the same question again, so a `poll` that armed a timer and parked would,
@@ -7672,23 +7732,67 @@ fn deadline_in(nanos: u64) -> Option<u64> {
 ///
 /// Four, matching `WAITERS` beside it and for the same reason: a fifth is
 /// answered without waiting rather than left unwoken.
-static mut TIMED: [(u32, u32); 4] = [(0, 0); 4];
+static mut TIMED: [(u32, u32, u64); 4] = [(0, 0, 0); 4];
 
-fn timed() -> &'static mut [(u32, u32); 4] {
+fn timed() -> &'static mut [(u32, u32, u64); 4] {
     // SAFETY: single-threaded by construction, as `dispositions_of`.
     unsafe { &mut *core::ptr::addr_of_mut!(TIMED) }
 }
 
-/// Takes this domain's finished timed wait, if it has one.
-fn took_timed_wait(domain: u32) -> bool {
+/// Takes this domain's finished timed wait, if it has one, answering whether
+/// it ended **before its deadline**.
+///
+/// The answer was a bare `true` until 2026-09-28, which made a wake by the
+/// deadline and a wake by anything else the same thing -- and the second is
+/// the one that matters: see [`EARLY_RELEASES`].
+fn took_timed_wait(domain: u32) -> Option<bool> {
+    let table = timed();
+    let entry = table.iter_mut().find(|entry| entry.0 == domain)?;
+    let slot = entry.1 - 1;
+    let early = bhaskix_sock::time::now() < entry.2;
+    *entry = (0, 0, 0);
+    if early {
+        EARLY_RELEASES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        disarm_wake(slot);
+    }
+    release_wake(slot as usize);
+    Some(early)
+}
+
+/// Gives back a timed wait that will never be retried, deadline and all.
+///
+/// **Two ways a timed park ends without its retry**, and both became reachable
+/// on every boot on 2026-09-28, when `nanosleep` past a few seconds started
+/// actually parking instead of overflowing into an immediate `EINTR`: a signal
+/// already pending when the call arrives, which the delivery arm turns into
+/// `EINTR` before the park happens; and a domain ended while parked, which
+/// only `note_exit` and `FORGET` learn of. Either way nothing would release the
+/// `TIMED` entry or the wake slot, and the deadline would stay armed on a slot
+/// nobody waits on -- where, when it fires, the kernel keeps the bit and the
+/// next park on that slot returns at once.
+fn abandon_timed_wait(domain: u32) {
     let table = timed();
     let Some(entry) = table.iter_mut().find(|entry| entry.0 == domain) else {
-        return false;
+        return;
     };
     let slot = entry.1 - 1;
-    *entry = (0, 0);
+    *entry = (0, 0, 0);
+    ABANDONED_TIMED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    disarm_wake(slot);
     release_wake(slot as usize);
-    true
+}
+
+/// Cancels whatever deadline wake slot `slot` was armed with.
+///
+/// `release_wake` only marks the slot free; the deadline armed on it by
+/// `park_until` would otherwise survive to fire into whoever claims it next.
+fn disarm_wake(slot: u32) {
+    let _ = call(
+        syscall::INVOKE,
+        WAKE_SLOT + u64::from(slot),
+        method::DISARM,
+        [0; 4],
+    );
 }
 
 /// Arms a wake slot `nanos` from now and records it, answering the slot to
@@ -7713,7 +7817,7 @@ fn park_until(domain: u32, nanos: u64) -> Option<u64> {
         release_wake(slot);
         return None;
     }
-    table[index] = (domain, slot as u32 + 1);
+    table[index] = (domain, slot as u32 + 1, deadline);
     Some(WAKE_SLOT + slot as u64)
 }
 
@@ -7802,6 +7906,8 @@ extern "C" fn linuxd_main(hertz: u64) -> ! {
             // a socket held by a domain killed and not replaced stays held.
             // That bound is stated in RFC 0058 rather than rounded to "fixed".
             release_sockets_of(received.badge as u32);
+            // And any timed wait it was parked in -- see `abandon_timed_wait`.
+            abandon_timed_wait(received.badge as u32);
             // **And its kept domain capability** -- RFC 0079, and the same
             // shape as the sockets above. `note_exit` releases it for a
             // process that exits; one killed from outside, or one that calls
@@ -7932,6 +8038,10 @@ extern "C" fn linuxd_main(hertz: u64) -> ! {
                 REPLY_BLOCK_ON | REPLY_BLOCK_ON_RETRY | REPLY_BLOCK_ON_UNTIL => {
                     ARM_PARKED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                     let _ = deadline_word();
+                    // The park this answer asked for is not going to happen, so
+                    // a timed one gives its slot and deadline back now -- see
+                    // `abandon_timed_wait`.
+                    abandon_timed_wait(request.domain);
                     await_frame_for_signal(request.domain, memory::errno::EINTR as u64);
                     (REPLY_NEED_FRAME, Answer::ok(0))
                 }
