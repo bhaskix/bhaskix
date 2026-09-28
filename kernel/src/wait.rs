@@ -230,8 +230,9 @@ enum Cleared {
 ///
 /// **Because `BySleeper` records whose *name* the clearing was made under, not
 /// who made it.** `wait_until` takes its identity once, from
-/// `sched::current_thread_id`, and a caller that migrated inside that read is
-/// handed the id of the thread current where it used to be. It would then find
+/// `sched::current_thread_id`, and until 2026-09-28 a caller that migrated
+/// inside that read was handed the id of the thread current where it used to
+/// be -- CI run 761 caught exactly that, and the read now retries. It would then find
 /// that thread's entry here, remove it as its own, evaluate *its own*
 /// predicate, and go on -- leaving the named thread asleep with no entry.
 /// Ring specimen twenty-four (CI run 759) reads `cleared by the sleeper itself

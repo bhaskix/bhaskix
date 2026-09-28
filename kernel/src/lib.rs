@@ -25078,6 +25078,22 @@ fn user_shell(handoff: &Handoff) -> Result<(), &'static str> {
         // interesting fact is that it happens at all; "gave up" should never
         // be anything but zero, since a running thread finds itself on the
         // next pass.
+        // **The identity read, on every boot.** Each retry is a read that
+        // before 2026-09-28 answered with another thread's id -- the ring
+        // wedge's cause, caught by CI run 761. Printed always, so the rate is
+        // measured on healthy boots and not only on the one that wedged.
+        let (retried, widest, first_retry) = sched::identity_retries();
+        println!(
+            "    identity       {retried} read(s) of the running thread retried after the caller \
+             moved, at most {widest} in one read{}",
+            match first_retry {
+                Some((would, from, to)) => alloc::format!(
+                    "; the first would have answered thread {would} (read on cpu {from}, caller \
+                     on cpu {to})"
+                ),
+                None => alloc::string::String::new(),
+            }
+        );
         let (migrated, gave_up) = sched::block_self_migrations();
         if migrated > 0 || gave_up > 0 {
             println!(
@@ -30730,18 +30746,21 @@ fn wait_queue_self_test(hhdm_base: u64) -> bool {
                 name_of(victim)
             );
         }
-        // **Whether the identity a wait runs under can be wrong on this boot.**
-        // Non-zero means `current_thread_id` answered for a CPU its caller
-        // had already left at least once; the first is named, so a specimen
-        // can set it beside the station that stuck.
-        let (moved, first_move) = sched::identity_moves();
-        match first_move {
-            Some((handed, from, to)) => println!(
-                "                   {moved} identity read(s) crossed a migration; the first \
-                 handed back thread {handed} ({}) read on cpu {from}, caller by then on cpu {to}",
-                name_of(handed)
+        // **Whether a wait's identity read crossed a migration on this boot.**
+        // Until 2026-09-28 each of these was a wrong answer -- CI run 761's
+        // specimen named one, beside the station it wedged. They are retried
+        // now, so a non-zero count here beside a stuck station says the retry
+        // did not save it, which would be a new finding rather than the old
+        // one.
+        let (retried, widest, first_retry) = sched::identity_retries();
+        match first_retry {
+            Some((would, from, to)) => println!(
+                "                   {retried} identity read(s) retried after the caller moved, at \
+                 most {widest} in one read; the first would have named thread {would} ({}), \
+                 read on cpu {from} with the caller by then on cpu {to}",
+                name_of(would)
             ),
-            None => println!("                   0 identity reads crossed a migration"),
+            None => println!("                   0 identity reads needed a retry"),
         }
         // **The number that separates the two readings left, and it was
         // computed here already without ever being printed.**

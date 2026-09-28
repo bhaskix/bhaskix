@@ -3818,65 +3818,101 @@ pub fn describe_now(thread: u32) -> Option<(&'static str, u64)> {
     None
 }
 
-/// The identifier of the thread running on this CPU.
+/// The identifier of the thread running on this CPU -- which is the caller.
 ///
 /// `None` before this CPU has a runqueue.
 ///
 /// **Blocking, so not for anything reachable from an interrupt** -- see
 /// [`running_now`], which exists because this one deadlocked a fault report
 /// against a lock the faulting CPU was already holding.
+///
+/// # The CPU is read twice, and the answer is only taken when they agree
+///
+/// Reading the CPU, then taking its queue's lock, then reading `current` are
+/// three instants, and this kernel's spinlocks do not hold interrupts off. A
+/// caller preempted after the first and resumed on another CPU used to be
+/// handed **the thread current where it used to be**: somebody else's id.
+///
+/// That was the ring self-test's wedge. CI run 761 (2026-09-28) caught it
+/// directly: `1 identity read(s) crossed a migration; the first handed back
+/// thread 14 (ring-2) read on cpu 0, caller by then on cpu 3`, beside ring-2
+/// asleep with its entry `cleared by the sleeper itself ... (running as thread
+/// 12, not the sleeper)`. `WaitQueue::wait_until` takes its identity here once
+/// and waits under it; thread 12, told it was 14, took 14's entry off the
+/// queue as its own and left 14 marked asleep with nothing that would wake it.
+/// The same answer reaches about thirty callers -- IPC's caller, the reply
+/// target, a domain's owner -- so the wrong id was never only the ring's.
+///
+/// **Re-read under the lock, and retried until they match.** Holding the lock,
+/// the caller is not switched out: `preempt` declines to deschedule a lock
+/// holder. So a second reading equal to the first means the caller is running
+/// on the CPU whose `current` was read, and `current` is the caller. A
+/// different reading means it moved before the lock; the lock is dropped and
+/// the read starts over on the CPU it is now on.
+///
+/// **Unbounded, on purpose.** A bounded retry has to answer something when it
+/// gives up, and there is no right answer to give: `None` already means "no
+/// runqueue yet", several callers read it as thread 0, and any other thread's
+/// id is the bug. Each extra pass needs another migration inside the few
+/// instructions between the first read and the lock, and [`identity_retries`]
+/// counts them, so a pathology would be visible rather than silent.
 #[must_use]
 pub fn current_thread_id() -> Option<u32> {
-    let cpu = percpu::cpu_id() as usize;
-    if cpu >= MAX_CPUS {
-        return None;
-    }
-    let queue = QUEUES[cpu].lock();
-    let current = queue.current;
-    let id = queue.threads[current].as_ref().map(|thread| thread.id);
-    // INSTRUMENTATION. Counts, and does not correct.
-    //
-    // **The answer above names whoever is current on the CPU read first, and
-    // that need not be the caller.** A caller preempted between `cpu_id()` and
-    // taking the lock, and resumed on another CPU, is handed the id of the
-    // thread running where it *used to be*. `WaitQueue::wait_until` fetches its
-    // identity here once and waits under it for the whole call, so a wrong
-    // answer would have one thread remove another's entry and mark it asleep.
-    // Ring specimen twenty-four (CI run 759) fits that shape; nothing had
-    // measured whether the window opens at all.
-    //
-    // Re-read under the lock, where `preempt` declines to move the holder: a
-    // different CPU now means the caller moved before it got here.
-    let now = percpu::cpu_id() as usize;
-    if now != cpu {
-        IDENTITY_MOVED.fetch_add(1, Ordering::Relaxed);
+    let mut passes = 0u64;
+    loop {
+        let cpu = percpu::cpu_id() as usize;
+        if cpu >= MAX_CPUS {
+            return None;
+        }
+        let queue = QUEUES[cpu].lock();
+        let current = queue.current;
+        let id = queue.threads[current].as_ref().map(|thread| thread.id);
+        let now = percpu::cpu_id() as usize;
+        if now == cpu {
+            if passes > 0 {
+                IDENTITY_WIDEST.fetch_max(passes, Ordering::Relaxed);
+            }
+            return id;
+        }
+        drop(queue);
+        passes += 1;
+        IDENTITY_RETRIED.fetch_add(1, Ordering::Relaxed);
+        // What the first version would have answered, kept for the report:
+        // the thread it would have mistaken the caller for.
         let packed =
             u64::from(id.unwrap_or(u32::MAX)) | ((cpu as u64) << 32) | ((now as u64) << 40);
-        let _ = FIRST_IDENTITY_MOVE.compare_exchange(
+        let _ = FIRST_IDENTITY_RETRY.compare_exchange(
             u64::MAX,
             packed,
             Ordering::Relaxed,
             Ordering::Relaxed,
         );
     }
-    id
 }
 
-/// Times [`current_thread_id`] answered for a CPU its caller had left.
-static IDENTITY_MOVED: AtomicU64 = AtomicU64::new(0);
+/// Reads [`current_thread_id`] had to retry because its caller had moved.
+///
+/// Each one is an answer that, before 2026-09-28, would have been another
+/// thread's id.
+static IDENTITY_RETRIED: AtomicU64 = AtomicU64::new(0);
 
-/// The first such answer: the id handed back, the CPU it was read from, and
-/// the CPU the caller was on by then. First, for the reason [`FIRST_MISMARK`]
-/// keeps its first: it happened on a machine that was still behaving.
-static FIRST_IDENTITY_MOVE: AtomicU64 = AtomicU64::new(u64::MAX);
+/// The most retries a single read needed. One is the expected ceiling: a
+/// caller that has just moved is running, and reads the CPU it is on.
+static IDENTITY_WIDEST: AtomicU64 = AtomicU64::new(0);
 
-/// `(count, first (id handed back, cpu read, cpu by then))` for identity reads
-/// that crossed a migration.
+/// The first retry: the id the old read would have handed back, the CPU it
+/// was read from, and the CPU the caller was on by then. First, for the
+/// reason [`FIRST_MISMARK`] keeps its first.
+static FIRST_IDENTITY_RETRY: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// `(retries, most in one read, first (id it would have handed back, cpu
+/// read, cpu by then))`.
 #[must_use]
-pub fn identity_moves() -> (u64, Option<(u32, u64, u64)>) {
-    let first = FIRST_IDENTITY_MOVE.load(Ordering::Relaxed);
+pub fn identity_retries() -> (u64, u64, Option<(u32, u64, u64)>) {
+    let first = FIRST_IDENTITY_RETRY.load(Ordering::Relaxed);
     (
-        IDENTITY_MOVED.load(Ordering::Relaxed),
+        IDENTITY_RETRIED.load(Ordering::Relaxed),
+        IDENTITY_WIDEST.load(Ordering::Relaxed),
         (first != u64::MAX).then_some((first as u32, (first >> 32) & 0xff, first >> 40)),
     )
 }
@@ -4881,7 +4917,7 @@ static LAST_MARK: [core::sync::atomic::AtomicU64; 256] =
 /// **`source` says which path marked a thread; it does not say who asked.**
 /// Both paths are reached from `mark_blocked(id)`, and `id` is whatever the
 /// caller believed itself to be -- which comes from [`current_thread_id`] and
-/// can name another thread (see [`IDENTITY_MOVED`]). A mark `by itself` made
+/// could name another thread until 2026-09-28 (see [`IDENTITY_RETRIED`]). A mark `by itself` made
 /// while a *different* thread was running is the reading that separates "the
 /// station put itself to sleep" from "a thread holding its name did".
 ///

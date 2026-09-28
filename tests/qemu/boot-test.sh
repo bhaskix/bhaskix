@@ -3666,6 +3666,20 @@ else
     status=1
 fi
 
+# **The running thread's identity, read twice and retried until it agrees** --
+# the ring wedge's cause, caught by CI run 761 (2026-09-28): a caller that moved
+# between reading its CPU and taking that CPU's lock was answered with the id
+# of the thread running where it used to be. Gated on the line being said, and
+# on no single read needing more than a handful of passes: each pass needs a
+# fresh migration inside a few instructions, so a read that needed many is a
+# retry that is not converging, which is a hang in the making.
+if grep -qE "identity +[0-9]+ read\(s\) of the running thread retried after the caller moved, at most [0-3] in one read" "$LOG"; then
+    pass "the running thread's identity is read where a migration cannot split it"
+else
+    fail "the identity line is missing, or one read needed four or more passes"
+    status=1
+fi
+
 # The bill for the four fixed tables RFC 0033 step 3 raised, printed on every
 # boot. Not gated on a size -- a threshold on static memory would be a gate on
 # a linker's arithmetic -- but gated on being *said*: the numbers exist so that
