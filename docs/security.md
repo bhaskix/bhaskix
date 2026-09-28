@@ -568,6 +568,24 @@ not booting, because the operator believes they have protection they do not have
 > it is stated here rather than closed, because a filter that must recognise every address format is
 > a parser with a security obligation and it would be wrong the first time somebody printed an
 > address in a new shape.
+>
+> **A second channel, found and closed 2026-09-28: the registers a program starts with.**
+> `enter_ring3` — every path into ring 3 but the interrupt return — set `rdi` and `rsi` for the
+> program and built its `iretq` frame from five values held in registers the compiler chose **per
+> inlined site**. The other general-purpose registers reached ring 3 holding whatever the kernel last
+> left in them. **Verified:** at three of twenty-one sites the compiler put `cs` in `rdx`, so a
+> program started with `rdx = 0x23` — found because glibc's `_start` treats `rdx` as an exit handler
+> and RFC 0068's BusyBox called it. **Not verified:** whether any of the thirteen ever carried a
+> kernel address. They were never observed at entry, so this states the exposure as possible rather
+> than demonstrated — but a register left at "whatever the kernel had" is exactly the shape through
+> which a slid pointer reaches the program KASLR is hiding it from.
+>
+> All thirteen are now zeroed after the frame is pushed and before `iretq`, as Linux does at
+> `execve`. **Unlike the report, this one has something mechanical watching it**:
+> `tools/check-ring3-entry.py`, in `make gates`, requires every `iretq` to be preceded by each of
+> those registers zeroed or restored, and is watched refusing a fixture that leaves one unset. It
+> reads source rather than the binary; that is sufficient because the zeroing is written in the
+> `asm!` itself, after the compiler's choices, so no register allocation can undo it.
 
 > **Correction, 2026-08-14.** The KASLR row read *"Randomise kernel image and heap base"* until
 > [RFC 0021](rfc/0021-unpredictability.md) went looking for the randomness that would do it. **The

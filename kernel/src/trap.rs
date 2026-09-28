@@ -332,6 +332,70 @@ fn handle(frame: &mut TrapFrame) {
              ended: the personality did not deliver a signal for it",
             frame.rip
         );
+        // **What it had just asked for**, oldest first, as `number(first
+        // argument)`. The line above says where; this says what led there, and
+        // two faults in one day were chased by reading code for hypotheses this
+        // would have settled in a line -- see `domain::RECENT`.
+        //
+        // **One `println!`, not a `print!` per call.** The console is shared,
+        // and another CPU's line landing inside one assembled from pieces tears
+        // it -- the reason the lock-order report prints one line per held rank.
+        // Collected first, formatted once.
+        let mut recent = RecentCalls::default();
+        crate::domain::recent_calls(domain, |number, first| recent.push(number, first));
+        println!("                   its last calls:{recent}");
+        // **The stack at the fault, and the word a `ret` would just have
+        // popped.** A `ret` reads `[rsp]` and then adds eight, so a return that
+        // delivered this `rip` leaves it at `[rsp - 8]`. The rule, written before
+        // any specimen read it:
+        //
+        // * `[-8]` equal to `rip` -- the program *returned* here, and the words
+        //   above it say what it returned through. RFC 0068's `echo` faulted at
+        //   `rip 0x23`, which is this machine's user code selector, so a `ret`
+        //   into the `cs` slot of something frame-shaped on the user stack would
+        //   read `0x23` here with a flags word and a stack address beside it.
+        // * `[-8]` anything else -- it did not return here. An indirect call or
+        //   jump through a register did, which is a different search.
+        //
+        // Read with `copy_from_user`, whose fault is caught by the exception
+        // table, so a stack pointer that is itself wild costs this line and not
+        // the machine.
+        let word = |at: u64| Word(user_word(at));
+        println!(
+            "                   its stack at rsp {:#x}: [-8] {} [0] {} [+8] {} [+16] {}",
+            frame.rsp,
+            word(frame.rsp.wrapping_sub(8)),
+            word(frame.rsp),
+            word(frame.rsp.wrapping_add(8)),
+            word(frame.rsp.wrapping_add(16)),
+        );
+        // **The segment base against what the thread asked for, and the two
+        // words of its thread control block that glibc keeps secrets in.** RFC
+        // 0068's `echo` died in `__run_exit_handlers` calling `ror(handler,
+        // 0x11) ^ %fs:0x30`, which came out `0x23`: either the guard read
+        // through `%fs` is not the one that mangled the handler, or the handler
+        // word was overwritten. The rule, written before any specimen:
+        //
+        // * **register differs from the thread's record** -- the FS base was not
+        //   restored for this thread, and the fault is in the switch path.
+        // * **they agree, and `fs+0x28`/`fs+0x30` are zero** -- the right block,
+        //   emptied: the page holding it was re-materialised, not restored.
+        // * **they agree and the guard is non-zero** -- the base and the guard
+        //   are sound, so the handler word at `rax+0x18` is what changed.
+        //
+        // The register is read, not the per-CPU record of it, because the
+        // record matching the register is the assumption under test.
+        // SAFETY: `IA32_FS_BASE` is architectural on every x86-64 CPU.
+        let register = unsafe { bhaskix_arch::msr::read(bhaskix_arch::msr::IA32_FS_BASE) };
+        let asked = Word(crate::sched::current_fs_base());
+        println!(
+            "                   its fs base: register {register:#x}, thread asked for {asked}; \
+             fs+0x28 {} fs+0x30 {}; rax {:#x}, its +0x18 {}",
+            word(register.wrapping_add(0x28)),
+            word(register.wrapping_add(0x30)),
+            frame.rax,
+            word(frame.rax.wrapping_add(0x18)),
+        );
         crate::sched::check_user_space(3);
         end_faulting_domain()
     }
@@ -420,6 +484,65 @@ fn handle(frame: &mut TrapFrame) {
     println!("  no other domain to blame, and no state left worth trusting.");
     println!("==================================================================");
     cpu::halt_forever()
+}
+
+/// A word the report may not have, printed as hex or as the fact that it is
+/// missing -- without allocating, because this runs in a fault handler and the
+/// heap has a lock of its own.
+struct Word(Option<u64>);
+
+impl core::fmt::Display for Word {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self.0 {
+            Some(value) => write!(f, "{value:#x}"),
+            None => write!(f, "unreadable"),
+        }
+    }
+}
+
+/// One word of the faulting program's memory, or `None` if it is not mapped.
+///
+/// Every user read the hosted-fault report makes goes through here, so the
+/// report costs one `unsafe` line however many words it wants. A fault on the
+/// source is caught by the exception table and becomes `None`, so a wild
+/// pointer costs its own field and not the machine.
+fn user_word(at: u64) -> Option<u64> {
+    let mut word = 0u64;
+    let into = (&raw mut word).cast::<u8>();
+    // SAFETY: `into` is this function's own eight bytes, and the source is
+    // untrusted by contract -- a fault is an error return.
+    unsafe { bhaskix_arch::uaccess::copy_from_user(into, at, size_of::<u64>()) }.ok()?;
+    Some(word)
+}
+
+/// A faulting hosted domain's recent calls, so they print as one whole line.
+#[derive(Default)]
+struct RecentCalls {
+    calls: [(u64, u64); crate::domain::RECENT_CALLS],
+    count: usize,
+}
+
+impl RecentCalls {
+    fn push(&mut self, number: u64, first: u64) {
+        if let Some(slot) = self.calls.get_mut(self.count) {
+            *slot = (number, first);
+            self.count += 1;
+        }
+    }
+}
+
+impl core::fmt::Display for RecentCalls {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        if self.count == 0 {
+            // Said, not left blank: a domain that faulted before making any
+            // call is a different finding from one whose history was lost.
+            return write!(f, " none recorded");
+        }
+        for (number, first) in &self.calls[..self.count] {
+            write!(f, " {number}({first:#x})")?;
+        }
+        Ok(())
+    }
 }
 
 /// Ends the domain whose thread just faulted in ring 3. Never returns.

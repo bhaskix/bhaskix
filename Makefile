@@ -990,6 +990,19 @@ gates:
 	tools/check-unsafe-budget.py --self-test
 	tools/check-unsafe-budget.py
 	tools/check-instruction-containment.py
+# Every return to ring 3 hands a program its own registers or zeroes -- never
+# the kernel's. `enter_ring3` set only `rdi` and `rsi`, the compiler put `cs` in
+# `rdx` at three of its inlined sites, and a program entered there started with
+# `rdx = 0x23`, which glibc registered as an exit handler and RFC 0068's BusyBox
+# called on the way out. Found 2026-09-28. And watched refusing one: the fixture
+# zeroes twelve of the thirteen registers and must be refused, naming the
+# thirteenth.
+	tools/check-ring3-entry.py
+	@if tools/check-ring3-entry.py --root tests/fixtures/ring3-entry > /dev/null; then \
+	    printf '  \033[1;31mFAIL\033[0m  the ring-3 entry gate accepted a return that leaves r15 unset\n'; exit 1; \
+	else \
+	    printf '  \033[1;32mok\033[0m    the ring-3 entry gate refuses a return that leaves a register unset\n'; \
+	fi
 	tools/check-doc-versions.py
 # And watched refusing one. `architecture.md` §7 claimed for a year that
 # architecture-specific instructions appear only in `arch/` while nothing checked

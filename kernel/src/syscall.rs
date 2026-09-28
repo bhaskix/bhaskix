@@ -2380,6 +2380,12 @@ fn foreign_call(frame: &mut SyscallFrame) {
     // reply. This is not the kernel becoming an IPC client: it is a trap
     // becoming a call on an endpoint the domain was given, which is what a
     // foreign system call has always been in this design.
+    // Kept per domain before it is asked, so a hosted fault can say what the
+    // program had just done -- see `domain::RECENT`. Here because this is the
+    // one place every call the nucleus does not answer passes through.
+    if let Some(domain) = crate::sched::current_domain() {
+        crate::domain::note_hosted_call(domain, call.number, call.args[0]);
+    }
     if let Some(value) = adapter_call(frame, &call) {
         frame.kind = value;
         note_return(number, value);

@@ -878,7 +878,17 @@ asm_budget = 10
 # mapping path here makes. Two are the boot self-test writing a pattern into
 # the source's page and reading it back out of the child's, which is the
 # property being proved and cannot be proved without touching both frames.
-unsafe_budget = 2060
+# 2062 for two lines, both in the hosted-fault report and both paid for by two
+# faults on 2026-09-28 that were chased by reading code for what a few words of
+# state would have said. (1) `user_word`, the single place the report reads the
+# faulting program's memory -- stack words and two words of its thread control
+# block -- through `uaccess::copy_from_user`, an `unsafe fn` because its
+# destination is a raw pointer; the source needs no trust, a fault there is
+# caught by the exception table and printed as `unreadable`. (2) One `rdmsr` of
+# `IA32_FS_BASE`, architectural on every x86-64 CPU, read rather than taken from
+# the per-CPU record of it because the record matching the register is exactly
+# the assumption the reading exists to test.
+unsafe_budget = 2062
 # Up thirty-one for RFC 0005 step 9's socket probe -- `ring3_socketeer`, which
 # is `ring3_lister` with a `sockaddr_in6` copied in beside its code instead of
 # two filenames. The same two blocks every hosted probe has: one

@@ -151,7 +151,16 @@ asm_budget = 37
 # specimens overwrite. The frame's own `vector` field is part of the damage in
 # every sighting of §3's frame fault, so the copy taken on the way in is what
 # says which arm a phase belongs to.
-unsafe_budget = 1166
+# 1179 for thirteen lines, one per register: `enter_ring3` now zeroes every
+# general-purpose register it does not hand the program, after the `iretq`
+# frame is pushed. It had set only `rdi` and `rsi`, and the compiler -- choosing
+# per inlined site -- put `cs` in `rdx` at three sites, so a program started with
+# `rdx = 0x23`, which glibc registered as its exit handler and RFC 0068's BusyBox
+# called (2026-09-28). The other registers carried whatever the kernel left,
+# which is the wrong direction for a kernel address to go. Counted one line
+# each on purpose: they are thirteen instructions on the most privileged path in
+# the system, and `tools/check-ring3-entry.py` holds them.
+unsafe_budget = 1179
 # Raised from 1070 for ECAM -- one volatile read of configuration space as
 # memory -- and for counting the bytes the transmitter gives up on. The second
 # is two lines and bought a silent data loss becoming a visible number.

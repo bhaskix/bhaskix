@@ -203,6 +203,28 @@ pub unsafe fn enter_ring3(rip: u64, rsp: u64, arguments: [u64; 2]) -> ! {
     let cs = u64::from(gdt::USER_CODE | 3);
     let ss = u64::from(gdt::USER_DATA | 3);
 
+    // **Every general-purpose register a program is not handed, zeroed,
+    // once the frame no longer needs them.** The comment inside the `asm!`
+    // below already said why -- "undefined" is a value a program will
+    // eventually read -- and applied it to `rdi` and `rsi` only. The
+    // five frame values the `asm!` pushes ride in registers the compiler picks
+    // *per inlined site*, and at three of this function's sites it
+    // picked `rdx` for `cs`: a program entered there started with
+    // `rdx = 0x23`. The x86-64 process-entry ABI makes `rdx` a
+    // termination function to register with `atexit`, so glibc's
+    // `_start` registered `0x23`, and RFC 0068's exec'd BusyBox `echo`
+    // called it on the way out -- `rip 0x23`, found 2026-09-28.
+    //
+    // And it was not only `rdx`. Every register the frame did not use
+    // reached ring 3 holding whatever the kernel last put
+    // in it, which is the wrong direction for a kernel address to
+    // travel. Linux zeroes them at `execve`; so does this, for every
+    // entry, because every entry is somebody's first instruction.
+    //
+    // The zeroing is the thirteen `xor`s after the frame's five `push`es, and
+    // `tools/check-ring3-entry.py` holds it: every `iretq` must be preceded by
+    // each of these registers zeroed or restored.
+
     // SAFETY: the caller guarantees the mappings and the TSS. The `swapgs`
     // establishes the user-mode half of the invariant described in `init`:
     // after it, `GS` holds the user value and `IA32_KERNEL_GS_BASE` holds this
@@ -215,6 +237,19 @@ pub unsafe fn enter_ring3(rip: u64, rsp: u64, arguments: [u64; 2]) -> ! {
             "push {rflags}",
             "push {cs}",
             "push {rip}",
+            "xor eax, eax",
+            "xor ebx, ebx",
+            "xor ecx, ecx",
+            "xor edx, edx",
+            "xor ebp, ebp",
+            "xor r8d, r8d",
+            "xor r9d, r9d",
+            "xor r10d, r10d",
+            "xor r11d, r11d",
+            "xor r12d, r12d",
+            "xor r13d, r13d",
+            "xor r14d, r14d",
+            "xor r15d, r15d",
             "iretq",
             // The System V argument registers, so a program can be handed
             // something at entry. Everything else a domain has arrives through

@@ -3760,6 +3760,24 @@ pub fn running_now() -> Running {
     }
 }
 
+/// The FS base the thread running on this CPU asked for, without blocking.
+///
+/// `None` when this CPU's runqueue lock is already held or nothing is running --
+/// [`running_now`]'s discipline, for the same reason: this is read from a fault
+/// report, and a fault report that took this lock blocking has deadlocked once.
+/// The value is the thread's *record*; the register itself is read by the
+/// caller, and comparing the two is the point.
+#[must_use]
+pub fn current_fs_base() -> Option<u64> {
+    let cpu = percpu::cpu_id() as usize;
+    if cpu >= MAX_CPUS {
+        return None;
+    }
+    let queue = QUEUES[cpu].try_lock()?;
+    let current = queue.current;
+    queue.threads[current].as_ref().map(|thread| thread.fs_base)
+}
+
 /// How many times `thread` has been moved between run queues.
 ///
 /// **For the ring report, and for one question.** Two specimens of §3's

@@ -504,6 +504,66 @@ impl FrameBudget {
     }
 }
 
+/// How many of a hosted domain's most recent Linux calls are kept.
+pub const RECENT_CALLS: usize = 16;
+
+/// Each hosted domain's last [`RECENT_CALLS`] Linux calls, oldest overwritten.
+///
+/// **Because a hosted fault arrived with no history, twice in one day.** RFC
+/// 0068's BusyBox faulted on entry and then, once that was fixed, again at `rip
+/// 0x23` after its forked child printed -- and in both cases the report said
+/// *where* the program faulted and nothing about what it had just asked for.
+/// The per-program trace the boot prints covers the corpus run only, so an
+/// exec'd process has none, and each fault was chased by reading code for
+/// hypotheses the calls themselves would have settled or discarded in one line.
+///
+/// Packed as `(first argument's low 32 bits) << 16 | (number + 1)`, so zero is
+/// an empty slot and a `clone` carries its flags. Reset when a domain is
+/// created in the slot, as its frame budget is, so a reused slot never shows a
+/// predecessor's calls under a new program's name. Written with relaxed stores
+/// from the calling thread and read only after that domain has faulted, so a
+/// torn read costs one misreported entry and nothing else.
+static RECENT: [[core::sync::atomic::AtomicU64; RECENT_CALLS]; MAX_DOMAINS] =
+    [const { [const { core::sync::atomic::AtomicU64::new(0) }; RECENT_CALLS] }; MAX_DOMAINS];
+
+/// Where each domain's next call goes in [`RECENT`].
+static RECENT_NEXT: [core::sync::atomic::AtomicU32; MAX_DOMAINS] =
+    [const { core::sync::atomic::AtomicU32::new(0) }; MAX_DOMAINS];
+
+/// Records one hosted call against `id`, for [`recent_calls`] to replay.
+pub fn note_hosted_call(id: DomainId, number: u64, first: u64) {
+    use core::sync::atomic::Ordering;
+    let slot = id.as_u32() as usize % MAX_DOMAINS;
+    let at = RECENT_NEXT[slot].fetch_add(1, Ordering::Relaxed) as usize % RECENT_CALLS;
+    RECENT[slot][at].store(
+        ((first & 0xffff_ffff) << 16) | ((number + 1) & 0xffff),
+        Ordering::Relaxed,
+    );
+}
+
+/// Replays `id`'s recent calls, oldest first, as `(number, first argument)`.
+pub fn recent_calls(id: DomainId, mut each: impl FnMut(u64, u64)) {
+    use core::sync::atomic::Ordering;
+    let slot = id.as_u32() as usize % MAX_DOMAINS;
+    let next = RECENT_NEXT[slot].load(Ordering::Relaxed) as usize;
+    for offset in 0..RECENT_CALLS {
+        let packed = RECENT[slot][(next + offset) % RECENT_CALLS].load(Ordering::Relaxed);
+        if packed & 0xffff != 0 {
+            each((packed & 0xffff) - 1, packed >> 16);
+        }
+    }
+}
+
+/// Empties `id`'s call history, for a domain newly created in that slot.
+fn forget_calls(id: DomainId) {
+    use core::sync::atomic::Ordering;
+    let slot = id.as_u32() as usize % MAX_DOMAINS;
+    for entry in &RECENT[slot] {
+        entry.store(0, Ordering::Relaxed);
+    }
+    RECENT_NEXT[slot].store(0, Ordering::Relaxed);
+}
+
 /// One budget per domain slot, indexed by [`DomainId`]'s raw index.
 ///
 /// Parallel to [`TABLE`] rather than inside it, for the reason
@@ -1243,6 +1303,9 @@ pub fn create_under(
     if let Some(budget) = budget_of(DomainId(id)) {
         budget.open(envelope.memory_frames);
     }
+    // Beside the budget and for the same reason: a slot's next occupant must
+    // not inherit what the last one did.
+    forget_calls(DomainId(id));
     table.created += 1;
 
     // After the child exists, so a failure above leaves nothing charged. The
