@@ -25073,7 +25073,7 @@ fn user_shell(handoff: &Handoff) -> Result<(), &'static str> {
             println!(
                 "\x1b[91m    block mismark  {mismarked_total} block(s) refused for a caller that \
                  was not the thread being marked ({mismarked_unless} in block_unless); the first \
-                 was thread {} refused a mark on thread {}\x1b[0m",
+                 was a mark asked for thread {} on a cpu running thread {}\x1b[0m",
                 pair.map_or(0, |(caller, _)| caller),
                 pair.map_or(0, |(_, victim)| victim)
             );
@@ -30224,13 +30224,54 @@ fn rt_latency_self_test(hhdm_base: u64, cpus: u32) -> bool {
 /// neither of the two places that can clear one, and that reading is the only
 /// one that opens a new search. `#0 by nothing` would hide it among the ordinary
 /// ones.
-struct ClearedBy(Option<(u64, &'static str)>);
+///
+/// **And, for a sleeper's own clearing, who was actually running.** The second
+/// field is the station's thread, the third the thread current when the
+/// clearing was made (`wait::cleared_while`). They differ only if a thread
+/// waited under a name that was not its own -- ring specimen twenty-four's
+/// suspicion -- and then the line says so in words rather than leaving two
+/// numbers to be compared by eye.
+struct ClearedBy(Option<(u64, &'static str)>, u32, Option<u32>);
 
 impl core::fmt::Display for ClearedBy {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self.0 {
-            Some((order, by)) => write!(f, "{by} at #{order}"),
-            None => write!(f, "nothing"),
+            Some((order, by)) => write!(f, "{by} at #{order}")?,
+            None => return write!(f, "nothing"),
+        }
+        match self.2 {
+            Some(running) if running == self.1 => write!(f, " (running as itself)"),
+            Some(running) => write!(
+                f,
+                " (\x1b[1mrunning as thread {running}, not the sleeper\x1b[22m)"
+            ),
+            None => Ok(()),
+        }
+    }
+}
+
+/// Who a mark was made under: the path, and the thread that was running.
+///
+/// `by itself` from `mark_blocked` means only that the mark was asked for under
+/// the station's id on a CPU where that id was current. The running thread is
+/// what says whether the asker was the station at all -- see
+/// `sched::LAST_MARK_BY`.
+struct MarkedBy(Option<u64>, u32, Option<u32>);
+
+impl core::fmt::Display for MarkedBy {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self.0 {
+            // **Not the same as "no mark".** `last_block_mark` answers `None`
+            // both when nothing was recorded and when the slot holds another
+            // thread, and neither supports a claim about this one.
+            None => return write!(f, "nothing recorded"),
+            Some(0) => write!(f, "itself")?,
+            Some(_) => write!(f, "a completed mark")?,
+        }
+        match self.2 {
+            Some(running) if running == self.1 => write!(f, " while it ran"),
+            Some(running) => write!(f, " while thread {running} ran"),
+            None => write!(f, " (running thread not recorded)"),
         }
     }
 }
@@ -30585,19 +30626,38 @@ fn wait_queue_self_test(hhdm_base: u64) -> bool {
             "                   {} of them were completed by finding the caller on another queue",
             sched::marked_elsewhere()
         );
+        let name_of = |id: u32| -> &'static str {
+            match spawned.iter().position(|&s| s == id) {
+                Some(i) => NAMES[i],
+                None => "not a ring station",
+            }
+        };
         if let Some((caller, victim)) = sched::first_mismark() {
-            let name_of = |id: u32| -> &'static str {
-                match spawned.iter().position(|&s| s == id) {
-                    Some(i) => NAMES[i],
-                    None => "not a ring station",
-                }
-            };
+            // **Worded as what was observed, not who did it.** `caller` is the
+            // id the mark was *asked for*, which is whatever the asker believed
+            // itself to be; `victim` is the thread that was current. Specimen
+            // twenty-four read the old wording -- "thread 14 being refused a
+            // mark on thread 15" -- as thread 14 migrating, when the same pair
+            // is what thread 15 produces if it was handed 14's id.
             println!(
-                "                   the first refusal was thread {caller} ({}) being refused a \
-                 mark on thread {victim} ({})",
+                "                   the first refusal was a mark asked for thread {caller} ({}) \
+                 on a cpu running thread {victim} ({})",
                 name_of(caller),
                 name_of(victim)
             );
+        }
+        // **Whether the identity a wait runs under can be wrong on this boot.**
+        // Non-zero means `current_thread_id` answered for a CPU its caller
+        // had already left at least once; the first is named, so a specimen
+        // can set it beside the station that stuck.
+        let (moved, first_move) = sched::identity_moves();
+        match first_move {
+            Some((handed, from, to)) => println!(
+                "                   {moved} identity read(s) crossed a migration; the first \
+                 handed back thread {handed} ({}) read on cpu {from}, caller by then on cpu {to}",
+                name_of(handed)
+            ),
+            None => println!("                   0 identity reads crossed a migration"),
         }
         // **The number that separates the two readings left, and it was
         // computed here already without ever being printed.**
@@ -30809,7 +30869,7 @@ fn wait_queue_self_test(hhdm_base: u64) -> bool {
                 // cleared was emptied by neither `wake_all` nor its own
                 // re-entry, which is the only reading here that opens a new
                 // search rather than closing one.
-                ClearedBy(cleared),
+                ClearedBy(cleared, spawned[id], wait::cleared_while(spawned[id])),
                 // **`nothing recorded`, never a bare zero.** This was derived
                 // from a thirty-two entry ring covering the whole machine, so a
                 // station whose wake was older than about sixty events had no
@@ -30828,15 +30888,11 @@ fn wait_queue_self_test(hhdm_base: u64) -> bool {
                 // that cleared its queue entry never reached the thread it
                 // named, and `wake_with` reported `Woken` for a thread it did
                 // not leave runnable.
-                match (mark, mark_source) {
-                    // **Not the same as "no mark".** `last_block_mark` answers
-                    // `None` both when nothing was recorded and when the slot
-                    // holds another thread, and neither supports a claim about
-                    // this one.
-                    (None, _) => "nothing recorded",
-                    (Some(_), 0) => "itself",
-                    (Some(_), _) => "a completed mark",
-                }
+                MarkedBy(
+                    mark.map(|_| mark_source),
+                    spawned[id],
+                    sched::last_mark_made_while(spawned[id])
+                )
             );
         }
         // **How far the `recent wakes` counters above can actually see.** They

@@ -3833,7 +3833,52 @@ pub fn current_thread_id() -> Option<u32> {
     }
     let queue = QUEUES[cpu].lock();
     let current = queue.current;
-    queue.threads[current].as_ref().map(|thread| thread.id)
+    let id = queue.threads[current].as_ref().map(|thread| thread.id);
+    // INSTRUMENTATION. Counts, and does not correct.
+    //
+    // **The answer above names whoever is current on the CPU read first, and
+    // that need not be the caller.** A caller preempted between `cpu_id()` and
+    // taking the lock, and resumed on another CPU, is handed the id of the
+    // thread running where it *used to be*. `WaitQueue::wait_until` fetches its
+    // identity here once and waits under it for the whole call, so a wrong
+    // answer would have one thread remove another's entry and mark it asleep.
+    // Ring specimen twenty-four (CI run 759) fits that shape; nothing had
+    // measured whether the window opens at all.
+    //
+    // Re-read under the lock, where `preempt` declines to move the holder: a
+    // different CPU now means the caller moved before it got here.
+    let now = percpu::cpu_id() as usize;
+    if now != cpu {
+        IDENTITY_MOVED.fetch_add(1, Ordering::Relaxed);
+        let packed =
+            u64::from(id.unwrap_or(u32::MAX)) | ((cpu as u64) << 32) | ((now as u64) << 40);
+        let _ = FIRST_IDENTITY_MOVE.compare_exchange(
+            u64::MAX,
+            packed,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        );
+    }
+    id
+}
+
+/// Times [`current_thread_id`] answered for a CPU its caller had left.
+static IDENTITY_MOVED: AtomicU64 = AtomicU64::new(0);
+
+/// The first such answer: the id handed back, the CPU it was read from, and
+/// the CPU the caller was on by then. First, for the reason [`FIRST_MISMARK`]
+/// keeps its first: it happened on a machine that was still behaving.
+static FIRST_IDENTITY_MOVE: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// `(count, first (id handed back, cpu read, cpu by then))` for identity reads
+/// that crossed a migration.
+#[must_use]
+pub fn identity_moves() -> (u64, Option<(u32, u64, u64)>) {
+    let first = FIRST_IDENTITY_MOVE.load(Ordering::Relaxed);
+    (
+        IDENTITY_MOVED.load(Ordering::Relaxed),
+        (first != u64::MAX).then_some((first as u32, (first >> 32) & 0xff, first >> 40)),
+    )
 }
 
 /// Blocks the calling thread unless `ready` produces something first — the
@@ -3990,13 +4035,14 @@ pub fn mark_blocked(id: u32) {
         //
         // Dropping this CPU's lock first, because the thread may be current on
         // a queue this one already holds.
+        let running = thread.id;
         drop(queue);
-        mark_blocked_anywhere(id);
+        mark_blocked_anywhere(id, running);
         return;
     }
     if !thread.dying {
         thread.state = State::Blocked;
-        note_block(id, 0);
+        note_block(id, 0, id);
     }
 }
 
@@ -4004,14 +4050,17 @@ pub fn mark_blocked(id: u32) {
 ///
 /// One queue lock at a time, as `wake_with` does: two runqueue locks are the
 /// same rank and have no order between them.
-fn mark_blocked_anywhere(thread: u32) {
+///
+/// `running` is the thread that was current where the mark was refused, and is
+/// recorded beside the mark: see [`LAST_MARK_BY`].
+fn mark_blocked_anywhere(thread: u32, running: u32) {
     let online = percpu::online_count() as usize;
     for queue in QUEUES.iter().take(online.min(MAX_CPUS)) {
         let mut queue = queue.lock();
         if let Some(found) = queue.threads.iter_mut().flatten().find(|t| t.id == thread) {
             if !found.dying {
                 found.state = State::Blocked;
-                note_block(thread, 1);
+                note_block(thread, 1, running);
             }
             MARKED_ELSEWHERE.fetch_add(1, Ordering::Relaxed);
             return;
@@ -4827,13 +4876,42 @@ pub fn event_mark() -> u64 {
 static LAST_MARK: [core::sync::atomic::AtomicU64; 256] =
     [const { core::sync::atomic::AtomicU64::new(u64::MAX) }; 256];
 
+/// Which thread was running on the CPU that made each [`LAST_MARK`] mark.
+///
+/// **`source` says which path marked a thread; it does not say who asked.**
+/// Both paths are reached from `mark_blocked(id)`, and `id` is whatever the
+/// caller believed itself to be -- which comes from [`current_thread_id`] and
+/// can name another thread (see [`IDENTITY_MOVED`]). A mark `by itself` made
+/// while a *different* thread was running is the reading that separates "the
+/// station put itself to sleep" from "a thread holding its name did".
+///
+/// Packed `running | order << 40`, the order being the same number stored in
+/// [`LAST_MARK`] for that mark: a reader whose orders disagree has caught the
+/// two slots from different marks, and reports that it does not know.
+static LAST_MARK_BY: [core::sync::atomic::AtomicU64; 256] =
+    [const { core::sync::atomic::AtomicU64::new(u64::MAX) }; 256];
+
 /// Records one mark. `source`: 0 marked itself, 1 completed elsewhere.
-fn note_block(id: u32, source: u64) {
+/// `running`: the thread current on the CPU where the mark was asked for.
+fn note_block(id: u32, source: u64, running: u32) {
     let slot = id as usize % LAST_MARK.len();
+    let order = next_event();
     LAST_MARK[slot].store(
-        u64::from(id) | (source << 32) | (next_event() << 40),
+        u64::from(id) | (source << 32) | (order << 40),
         Ordering::Relaxed,
     );
+    LAST_MARK_BY[slot].store(u64::from(running) | (order << 40), Ordering::Relaxed);
+}
+
+/// The thread that was running when `thread`'s last recorded mark was made.
+///
+/// `None` when [`last_block_mark`] has nothing for `thread`, or when the two
+/// slots were caught from different marks.
+#[must_use]
+pub fn last_mark_made_while(thread: u32) -> Option<u32> {
+    let (_, order) = last_block_mark(thread)?;
+    let packed = LAST_MARK_BY[thread as usize % LAST_MARK_BY.len()].load(Ordering::Relaxed);
+    (packed != u64::MAX && packed >> 40 == order).then_some(packed as u32)
 }
 
 /// The last mark recorded for `thread`, as `(source, order)`.

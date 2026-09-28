@@ -226,18 +226,54 @@ enum Cleared {
     BySleeper,
 }
 
+/// Which thread was actually running when a sleeper cleared "its own" entry.
+///
+/// **Because `BySleeper` records whose *name* the clearing was made under, not
+/// who made it.** `wait_until` takes its identity once, from
+/// `sched::current_thread_id`, and a caller that migrated inside that read is
+/// handed the id of the thread current where it used to be. It would then find
+/// that thread's entry here, remove it as its own, evaluate *its own*
+/// predicate, and go on -- leaving the named thread asleep with no entry.
+/// Ring specimen twenty-four (CI run 759) reads `cleared by the sleeper itself
+/// at #117226` with the station's last predicate decision at #117222, which a
+/// sleeper clearing its own entry cannot produce: its next step is to decide.
+///
+/// Read under the queue's lock, where `preempt` declines to move the holder,
+/// so this answer does not share the window it is checking. Packed
+/// `running | order << 40`, the order matching [`CLEARED_AT`]'s; `u64::MAX`
+/// for a clearing by a wake, where the running thread is the waker and says
+/// nothing.
+static CLEARED_AS: [core::sync::atomic::AtomicU64; 64] =
+    [const { core::sync::atomic::AtomicU64::new(u64::MAX) }; 64];
+
 /// Records that `thread`'s entry was cleared, and by which of the two places.
 fn note_cleared(thread: u32, cause: Cleared) {
-    let code = match cause {
-        Cleared::ByWake => 1u64,
-        Cleared::BySleeper => 2,
+    let (code, running) = match cause {
+        Cleared::ByWake => (1u64, None),
+        Cleared::BySleeper => (2, sched::current_thread_id()),
     };
+    let order = sched::event_mark();
     if let Some(slot) = CLEARED_AT.get((thread as usize) % 64) {
+        slot.store((order << 2) | code, core::sync::atomic::Ordering::Relaxed);
+    }
+    if let Some(slot) = CLEARED_AS.get((thread as usize) % 64) {
         slot.store(
-            (sched::event_mark() << 2) | code,
+            running.map_or(u64::MAX, |id| u64::from(id) | (order << 40)),
             core::sync::atomic::Ordering::Relaxed,
         );
     }
+}
+
+/// The thread that was running when `thread`'s entry was last cleared by "the
+/// sleeper itself", or `None` if the last clearing was a wake or the two slots
+/// were caught from different clearings.
+#[must_use]
+pub fn cleared_while(thread: u32) -> Option<u32> {
+    let (order, _) = cleared_at(thread)?;
+    let packed = CLEARED_AS
+        .get((thread as usize) % 64)?
+        .load(core::sync::atomic::Ordering::Relaxed);
+    (packed != u64::MAX && packed >> 40 == order).then_some(packed as u32)
 }
 
 /// What [`CLEARED_AT`] holds for `thread`: the event order and the fate, or
