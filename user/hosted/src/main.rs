@@ -391,6 +391,18 @@ fn exec_busybox() {
     ];
     let envp = [0u64];
 
+    // **Said before the call, because a successful `execve` never comes back to
+    // say anything.** The line below is flushed only on failure -- there is no
+    // "here" to return to on success -- so the two outcomes that matter were
+    // indistinguishable from the log: an `execve` that succeeded printed
+    // nothing, and a function never reached printed nothing. The gate then read
+    // `BusyBox was staged but the hosted execve of it produced no output` for
+    // both, and separating them cost two boots. This line costs one print and
+    // makes the attempt itself visible; where BusyBox is not staged the
+    // `refused errno 2` below follows it, so both outcomes still read whole.
+    let mut announce = Line::new();
+    announce.put(b"hosted exec busybox attempting\n");
+    announce.flush();
     let mut line = Line::new();
     line.put(b"hosted exec busybox ");
     let failed = syscall(
