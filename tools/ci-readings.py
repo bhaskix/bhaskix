@@ -47,6 +47,12 @@ _spec.loader.exec_module(ci)
 # are simply from before the question was asked, and are not fetched.
 LANDED = "2026-09-29"
 
+# The first CI run carrying the killer probe's handshake (`3809af4`). Before
+# it the probe never parked its `nanosleep` child, so a boot with no early
+# release is history there, not a departure -- and flagging it buried the one
+# reading that mattered under fifteen that did not.
+HANDSHAKE_RUN = 771
+
 PATTERNS = {
     "signals": re.compile(r"hosted signals +(\d+) raised, (\d+) delivered"),
     "timed": re.compile(
@@ -73,7 +79,7 @@ def readings(text: str) -> dict[str, tuple[int, ...]]:
     return found
 
 
-def departs(name: str, values: tuple[int, ...]) -> str | None:
+def departs(name: str, values: tuple[int, ...], run: int) -> str | None:
     """Why a reading is off the healthy baseline, or None."""
     if name == "signals" and values[0] != values[1]:
         return f"{values[0]} raised, {values[1]} delivered"
@@ -91,7 +97,7 @@ def departs(name: str, values: tuple[int, ...]) -> str | None:
     # asleep when signalled, so a healthy boot releases at least one timed wait
     # early. Zero means the parked-sleep delivery was not exercised on that
     # boot -- which was every boot before the handshake.
-    if name == "timed" and values[0] == 0:
+    if name == "timed" and values[0] == 0 and run >= HANDSHAKE_RUN:
         return "no timed wait was released early: the parked-sleep delivery was not exercised"
     return None
 
@@ -127,7 +133,7 @@ def main() -> int:
             boots += 1
             for reading, values in found.items():
                 tally[reading][values] += 1
-                why = departs(reading, values)
+                why = departs(reading, values, run["run_number"])
                 if why:
                     odd.append(f"run {run['run_number']} {run['head_sha'][:7]} {name}: {why}")
 
