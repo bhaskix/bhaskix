@@ -258,6 +258,20 @@ compiles. Closing it needs a probe that holds a deliberately diminished
 capability, which is worth building for the whole supervisor interface and not
 for this method alone.
 
+**Gated 2026-09-29, all but one.** The diminished capability turned out not to
+need a probe: a kernel thread spawned *into* a domain resolves that domain's
+own CSpace, which is how the DMA-window and IRQ tests already reach their
+refusals. `copy_space_rights_self_test` gives a `copier` domain six slots with
+exactly the wrong rights and asks six times — a source without `READ` and a
+target without `WRITE` are refused `InsufficientRights`, an empty slot and a
+domain with no space `NoSuchCapability`, the copy with the right rights
+succeeds (**the positive control**, without which six refusals could mean a
+test that never set its slots up), and the same copy into a target that now
+has a space is `SlotUnavailable`. **Armed**: with the `READ` rule removed, the
+first call *copied* — `answers [0, 5, 11, 11, 11, 11]` — and the gate failed.
+**Still unexercised: a target that already has threads**, which needs a
+thread spawned into the target first.
+
 ## Unresolved questions
 
 1. **Copy-on-write across domains.** Now a real optimisation with a real
@@ -275,13 +289,13 @@ for this method alone.
 
 ## Implementation plan
 
-1. `abi/src/lib.rs`: `COPY_SPACE = 75` and its contract, including the packed
+1. ✅ `abi/src/lib.rs`: `COPY_SPACE = 75` and its contract, including the packed
    return.
-2. `kernel/src/vm.rs`: `copy_space`, the region walk, and the single-page
+2. ✅ `kernel/src/vm.rs`: `copy_space`, the region walk, and the single-page
    populate helper.
-3. `kernel/src/syscall.rs`: the method arm beside `MAKE_SPACE`'s, with the two
+3. ✅ `kernel/src/syscall.rs`: the method arm beside `MAKE_SPACE`'s, with the two
    refusals it shares.
-4. `kernel/src/lib.rs` and `tests/qemu/boot-test.sh`: the boot self-test and
+4. ✅ `kernel/src/lib.rs` and `tests/qemu/boot-test.sh`: the boot self-test and
    the gate, armed each way.
-5. `user/linuxd/src/main.rs`: `build_fork_child` calls it.
-6. `TRACKER.md` and `docs/progress.md`, in the same commit.
+5. ✅ `user/linuxd/src/main.rs`: `build_fork_child` calls it.
+6. ✅ `TRACKER.md` and `docs/progress.md`, in the same commit.

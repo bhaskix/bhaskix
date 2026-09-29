@@ -4131,6 +4131,19 @@ else
     status=1
 fi
 
+# **RFC 0084's authority rule, which its testing plan recorded as reasoned and
+# unexercised** -- every caller held full rights, so no gate reached the
+# refusals. From inside a domain holding capabilities with exactly the wrong
+# rights: no READ on the source, no WRITE on the target, an empty slot, a
+# source with no space, then the copy with the right rights as a positive
+# control, and the same copy refused into a target that now has a space.
+if grep -qE "copy rights +COPY_SPACE refused a source held without READ and a target held without WRITE" "$LOG"; then
+    pass "RFC 0084: COPY_SPACE refuses without READ on the source or WRITE on the target"
+else
+    fail "COPY_SPACE's rights were not enforced, or the test that asks did not run"
+    status=1
+fi
+
 # And the figure it produces on the machine as booted, which is what says
 # whether any real domain is near its envelope. Not an assertion about the
 # number -- there is no right value yet -- but an assertion that the boot

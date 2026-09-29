@@ -1465,6 +1465,12 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
     // RFC 0011 step 6: an interrupt a domain holds. Before the DMA tests,
     // because it hands the block device's interrupt to a domain and puts it
     // back — and a device with no interrupt is a driver on the timer.
+    // RFC 0084's authority rule, which its own testing plan recorded as
+    // reasoned and unexercised.
+    if !copy_space_rights_self_test(handoff.hhdm_base.as_u64()) {
+        println!("\x1b[91m    copy rights    FAILED\x1b[0m");
+    }
+
     if !irq_delegation_self_test(handoff) {
         println!("\x1b[91m    irq grant      FAILED\x1b[0m");
     }
@@ -26600,6 +26606,164 @@ fn block_interrupt_self_test(handoff: &Handoff) -> bool {
 ///
 /// `None` on any machine without a usable unit, which is every machine this
 /// project was tested on until today, and the path that must stay unchanged.
+/// What each of [`copy_rights_client`]'s calls was answered, as a status code;
+/// `u64::MAX` until it has run.
+static COPY_RIGHTS: [core::sync::atomic::AtomicU64; 6] =
+    [const { core::sync::atomic::AtomicU64::new(u64::MAX) }; 6];
+static COPY_RIGHTS_DONE: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// The six `COPY_SPACE` calls, made from inside the domain that holds the
+/// capabilities -- the only place the check under test is the one that runs,
+/// for the reason [`dma_client`] gives: `domain_supervise` resolves the
+/// caller's own CSpace.
+///
+/// Slots: 0 the target with `WRITE` only, 1 the source with `WRITE` only (no
+/// `READ`), 2 the source with `READ` only, 3 the target with `READ` only (no
+/// `WRITE`), 4 empty, 5 a domain with no address space, held with `READ`.
+extern "C" fn copy_rights_client(_argument: u64) -> ! {
+    use core::sync::atomic::Ordering;
+
+    let calls: [(u64, u64); 6] = [
+        (0, 1), // source without READ
+        (3, 2), // target without WRITE
+        (0, 4), // source slot empty
+        (0, 5), // source has no space
+        (0, 2), // WRITE on the target, READ on the source: the positive control
+        (0, 2), // the same again, into a target that now has a space
+    ];
+    for (index, (target, source)) in calls.into_iter().enumerate() {
+        let mut frame = syscall::SyscallFrame {
+            kind: syscall::Kind::Invoke as u64,
+            capability: target,
+            method: syscall::method::COPY_SPACE,
+            arg0: source,
+            ..syscall::SyscallFrame::default()
+        };
+        let answered = syscall::dispatch(&mut frame);
+        COPY_RIGHTS[index].store(answered.status as u64, Ordering::Relaxed);
+    }
+    COPY_RIGHTS_DONE.store(true, Ordering::Release);
+    sched::exit();
+}
+
+/// RFC 0084's authority rule, exercised: `COPY_SPACE` needs `WRITE` on the
+/// target and `READ` on the source, and refuses a target that already has a
+/// space.
+///
+/// **Because the RFC's testing plan said, plainly, that it had not been.**
+/// Every caller that existed held full rights to a freshly spawned domain, so
+/// the refusals in `domain_supervise` were "reasoned and unexercised" -- and
+/// for a method that copies one domain's memory into another, the rights check
+/// *is* the security property. A positive control runs among the refusals:
+/// without it, six refusals could as easily mean a test that never set its
+/// slots up as a rule that holds.
+///
+/// Not covered, and said so: a target that already has threads, which needs a
+/// thread spawned into the target first.
+fn copy_space_rights_self_test(hhdm: u64) -> bool {
+    use core::sync::atomic::Ordering;
+    use domain::ResourceEnvelope;
+
+    let (Ok(caller), Ok(target), Ok(source), Ok(spaceless)) = (
+        domain::create("copier", ResourceEnvelope::new()),
+        domain::create("copy-into", ResourceEnvelope::new()),
+        domain::create("copy-from", ResourceEnvelope::new()),
+        domain::create("copy-none", ResourceEnvelope::new()),
+    ) else {
+        println!("\x1b[91m    copy rights    FAILED to create the domains\x1b[0m");
+        return false;
+    };
+    let finish = |ok: bool| {
+        for id in [caller, target, source, spaceless] {
+            domain::destroy(id);
+        }
+        ok
+    };
+
+    // The source needs a space to be copied; an empty one is enough, because
+    // what is under test is who may ask, not what is copied.
+    let Ok(space) = vm::AddressSpace::new(hhdm) else {
+        println!("\x1b[91m    copy rights    FAILED to build the source's space\x1b[0m");
+        return finish(false);
+    };
+    if vm::register_for(source, space).is_none() {
+        println!("\x1b[91m    copy rights    FAILED to give the source a space\x1b[0m");
+        return finish(false);
+    }
+
+    // Capabilities with exactly the rights each call needs to be refused for,
+    // derived from each domain's own root and keeping its badge.
+    let held = |id: domain::DomainId, rights: cap::Rights| {
+        let root = domain::root_capability(id)?;
+        cap::with_arena(|arena| arena.derive(root, rights, u64::from(id.as_u32()))).ok()
+    };
+    let slots = [
+        held(target, cap::Rights::WRITE),
+        held(source, cap::Rights::WRITE),
+        held(source, cap::Rights::READ),
+        held(target, cap::Rights::READ),
+        None,
+        held(spaceless, cap::Rights::READ),
+    ];
+    let placed = domain::with(caller, |owner| {
+        slots.iter().enumerate().all(|(index, slot)| match slot {
+            Some(slot) => owner.cspace.install_at(index, *slot).is_ok(),
+            None => index == 4,
+        })
+    });
+    if placed != Some(true) {
+        println!("\x1b[91m    copy rights    FAILED to install the capabilities\x1b[0m");
+        return finish(false);
+    }
+
+    for answer in &COPY_RIGHTS {
+        answer.store(u64::MAX, Ordering::Relaxed);
+    }
+    COPY_RIGHTS_DONE.store(false, Ordering::Relaxed);
+    let options = sched::SpawnOptions::new().in_domain(caller.as_u32());
+    if sched::spawn_on_with(0, "copier", copy_rights_client, 0, hhdm, options).is_err() {
+        println!("\x1b[91m    copy rights    FAILED to spawn a thread in the domain\x1b[0m");
+        return finish(false);
+    }
+    let done = wait_until(|| COPY_RIGHTS_DONE.load(Ordering::Acquire), 4_000);
+    // The thread has exited once it said so; wait for it to be gone before the
+    // domains it ran in are destroyed underneath it.
+    let _ = wait_until(|| sched::threads_counted_in(caller.as_u32()) == 0, 4_000);
+
+    let got: [u64; 6] = core::array::from_fn(|index| COPY_RIGHTS[index].load(Ordering::Relaxed));
+    let expected = [
+        syscall::Status::InsufficientRights,
+        syscall::Status::InsufficientRights,
+        syscall::Status::NoSuchCapability,
+        syscall::Status::NoSuchCapability,
+        syscall::Status::Ok,
+        syscall::Status::SlotUnavailable,
+    ];
+    let copied = domain::space_root_of(target).is_some();
+    let right = done
+        && got
+            .iter()
+            .zip(expected)
+            .all(|(got, want)| *got == want as u64)
+        && copied;
+
+    if right {
+        println!(
+            "    copy rights    COPY_SPACE refused a source held without READ and a target held \
+             without WRITE, an empty slot and a domain with no space, copied with WRITE and \
+             READ, and refused the same copy into a target that then had a space"
+        );
+    } else {
+        println!(
+            "\x1b[91m    copy rights    FAILED: finished {done}, answers {got:?} against \
+             {expected:?} as codes {:?}, target given a space {copied}\x1b[0m",
+            expected.map(|status| status as u64)
+        );
+    }
+    finish(right)
+}
+
 /// What the delegated domain's thread found, since it cannot return a value.
 static GRANT_ADDRESS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static GRANT_WITHOUT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(u32::MAX);
