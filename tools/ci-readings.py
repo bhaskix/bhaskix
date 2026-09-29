@@ -71,6 +71,11 @@ PATTERNS = {
     # calls ended because their thread was told to stop -- which the killer
     # probe's SIGKILL child and the sibling it ends each contribute one of.
     "park": re.compile(r"linux park +the nucleus answered \d+ hosted call\(s\) itself: (\d+) RAN OUT OF RETRIES, (\d+) whose"),
+    # Parks the nucleus refused, and how many because the notification already
+    # had a waiter -- the signature of a wake slot handed to two parkers at
+    # once (the pipe and wait4 defects of 2026-09-29). Printed only when
+    # non-zero, so every boot that carries it is off baseline.
+    "refused": re.compile(r"linux park +(\d+) parks refused: .*?(\d+) by the notification itself"),
 }
 
 
@@ -92,6 +97,8 @@ def departs(name: str, values: tuple[int, ...], run: int) -> str | None:
         return f"{values[0]} raised, {values[1]} delivered"
     if name == "identity" and values[0] != 0:
         return f"{values[0]} identity retr(ies), at most {values[1]} in one read"
+    if name == "refused" and values[0] != 0:
+        return f"{values[0]} park(s) refused, {values[1]} by a notification that already had a waiter"
     if name == "handover" and values[0] != 0:
         return f"{values[0]} rendezvous dropped after matching"
     if name == "tcpd" and values[0] != values[2]:
