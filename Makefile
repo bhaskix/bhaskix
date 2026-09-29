@@ -1013,6 +1013,15 @@ gates:
 	else \
 	    printf '  \033[1;32mok\033[0m    the CPU-read gate refuses a read with no justification\n'; \
 	fi
+# Every line a ring-3 program writes fits in one console run -- `bin/sup`'s
+# 329-byte report line was split by a kernel print on 2026-09-29 (see the
+# tool's header). And watched refusing a line of that length.
+	tools/check-console-lines.py
+	@if tools/check-console-lines.py --root tests/fixtures/console-lines > /dev/null; then \
+	    printf '  \033[1;31mFAIL\033[0m  the console-line gate accepted a line past one run\n'; exit 1; \
+	else \
+	    printf '  \033[1;32mok\033[0m    the console-line gate refuses a line past one run\n'; \
+	fi
 	tools/check-doc-versions.py
 # And watched refusing one. `architecture.md` §7 claimed for a year that
 # architecture-specific instructions appear only in `arch/` while nothing checked
