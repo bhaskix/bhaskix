@@ -4190,14 +4190,28 @@ fn read_from_pipe(
     let Some(pipe) = pipes.get_mut(index).and_then(Option::as_mut) else {
         return (REPLY_VALUE, Answer::error(-9)); // EBADF
     };
+    // **The slot this reader already holds, from a park it has now come back
+    // from.** Reused if it parks again, given back if it does not -- never
+    // released by the writer that woke it. See [`PIPE_HELD`].
+    let held = take_pipe_slot(request.domain);
     if pipe.would_block() {
         // SAFETY: as above.
         let waiters = pipe_waiters();
-        let Some(slot) = claim_wake() else {
-            return (REPLY_VALUE, Answer::error(-11)); // EAGAIN
+        let slot = match held {
+            Some(slot) => slot,
+            None => {
+                let Some(slot) = claim_wake() else {
+                    return (REPLY_VALUE, Answer::error(-11)); // EAGAIN
+                };
+                slot
+            }
         };
         waiters[index] = slot as u32 + 1;
+        hold_pipe_slot(request.domain, slot);
         return (REPLY_BLOCK_ON_RETRY, Answer::ok(WAKE_SLOT + slot as u64));
+    }
+    if let Some(slot) = held {
+        release_wake(slot);
     }
     let mut bytes = [0u8; SCRATCH_BYTES as usize];
     let take = (count as usize).min(bytes.len());
@@ -4219,6 +4233,17 @@ fn read_from_pipe(
 /// reader parking would overwrite the first's slot and strand it — stated
 /// rather than guarded, because nothing here creates a second reader yet and a
 /// guard for a case that cannot arise is a guard nobody can test.
+///
+/// **It signals and does not release**, since 2026-09-29. It used to give the
+/// slot back the moment it signalled, before the woken reader had taken the
+/// wake -- and the next park anywhere is handed the lowest free slot, which
+/// was that one. The killer probe's handshake made two domains park on pipes
+/// back to back and hit both outcomes: the second parker found the reader
+/// still waiting and was refused as a second waiter (`1 by the notification
+/// itself`, the child's `read` answered `EAGAIN`), or it took the wake meant
+/// for the reader, which then waited on a slot nobody would signal again (CI
+/// run 776, the parent stuck at step 22). The reader owns its slot until it
+/// comes back -- see [`PIPE_HELD`].
 fn wake_pipe_reader(index: usize) {
     // SAFETY: single-threaded by construction, as elsewhere here.
     let waiters = pipe_waiters();
@@ -4235,7 +4260,48 @@ fn wake_pipe_reader(index: usize) {
         method::SIGNAL,
         [0; 4],
     );
-    release_wake(wake as usize);
+}
+
+/// The wake slot each domain's parked pipe read holds, plus one; 0 for none.
+///
+/// **Owned by the reader, not the writer.** A slot is claimed when a read
+/// parks and given back only when that domain's read comes back and does not
+/// park again, or when the domain can no longer come back -- it exits, it is
+/// forgotten, or the park is turned into a signal delivery. Atomics rather than
+/// another single-threaded table, so the fix adds nothing to this program's
+/// `unsafe` budget.
+static PIPE_HELD: [core::sync::atomic::AtomicU32; limits::MAX_DOMAINS] =
+    [const { core::sync::atomic::AtomicU32::new(0) }; limits::MAX_DOMAINS];
+
+/// Records that `domain`'s parked pipe read holds `slot`.
+fn hold_pipe_slot(domain: u32, slot: usize) {
+    if let Some(cell) = PIPE_HELD.get(domain as usize % limits::MAX_DOMAINS) {
+        cell.store(slot as u32 + 1, core::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Takes back the slot `domain`'s pipe read held, if it held one.
+fn take_pipe_slot(domain: u32) -> Option<usize> {
+    let cell = PIPE_HELD.get(domain as usize % limits::MAX_DOMAINS)?;
+    let held = cell.swap(0, core::sync::atomic::Ordering::Relaxed);
+    held.checked_sub(1).map(|slot| slot as usize)
+}
+
+/// Gives back a pipe read's slot that will never be retried, and forgets any
+/// pipe still naming it, so a later writer does not signal a slot somebody
+/// else has since been given.
+fn abandon_pipe_wait(domain: u32) {
+    let Some(slot) = take_pipe_slot(domain) else {
+        return;
+    };
+    // SAFETY: single-threaded by construction, as elsewhere here.
+    let waiters = pipe_waiters();
+    for waiter in waiters.iter_mut() {
+        if *waiter == slot as u32 + 1 {
+            *waiter = 0;
+        }
+    }
+    release_wake(slot);
 }
 
 /// Writes into a pipe, waking a reader that was waiting for it.
@@ -6367,6 +6433,8 @@ fn resolve_into(slot: u64, component: &[u8]) -> Result<Opened, i64> {
 fn note_exit(domain: u32, exit: Exit) {
     // A process that ends mid-sleep is not coming back for its wake slot.
     abandon_timed_wait(domain);
+    // And a pipe read it was parked in.
+    abandon_pipe_wait(domain);
     let Some(process) = process_for(domain) else {
         return;
     };
@@ -7927,6 +7995,7 @@ extern "C" fn linuxd_main(hertz: u64) -> ! {
             release_sockets_of(received.badge as u32);
             // And any timed wait it was parked in -- see `abandon_timed_wait`.
             abandon_timed_wait(received.badge as u32);
+            abandon_pipe_wait(received.badge as u32);
             // **And its kept domain capability** -- RFC 0079, and the same
             // shape as the sockets above. `note_exit` releases it for a
             // process that exits; one killed from outside, or one that calls
@@ -8061,6 +8130,7 @@ extern "C" fn linuxd_main(hertz: u64) -> ! {
                     // a timed one gives its slot and deadline back now -- see
                     // `abandon_timed_wait`.
                     abandon_timed_wait(request.domain);
+                    abandon_pipe_wait(request.domain);
                     await_frame_for_signal(request.domain, memory::errno::EINTR as u64);
                     (REPLY_NEED_FRAME, Answer::ok(0))
                 }

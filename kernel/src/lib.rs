@@ -26608,8 +26608,22 @@ fn block_interrupt_self_test(handoff: &Handoff) -> bool {
 /// project was tested on until today, and the path that must stay unchanged.
 /// What each of [`copy_rights_client`]'s calls was answered, as a status code;
 /// `u64::MAX` until it has run.
-static COPY_RIGHTS: [core::sync::atomic::AtomicU64; 6] =
-    [const { core::sync::atomic::AtomicU64::new(u64::MAX) }; 6];
+static COPY_RIGHTS: [core::sync::atomic::AtomicU64; 7] =
+    [const { core::sync::atomic::AtomicU64::new(u64::MAX) }; 7];
+
+/// Holds [`copy_busy_occupant`] in its domain until the test is done with it.
+static COPY_BUSY_RELEASE: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// A thread whose only job is to be *in* a domain, so a copy into that domain
+/// meets a target with threads -- the refusal that needs someone running in
+/// the memory a copy would replace.
+extern "C" fn copy_busy_occupant(_argument: u64) -> ! {
+    while !COPY_BUSY_RELEASE.load(core::sync::atomic::Ordering::Acquire) {
+        sched::yield_now();
+    }
+    sched::exit();
+}
 static COPY_RIGHTS_DONE: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
@@ -26620,15 +26634,17 @@ static COPY_RIGHTS_DONE: core::sync::atomic::AtomicBool =
 ///
 /// Slots: 0 the target with `WRITE` only, 1 the source with `WRITE` only (no
 /// `READ`), 2 the source with `READ` only, 3 the target with `READ` only (no
-/// `WRITE`), 4 empty, 5 a domain with no address space, held with `READ`.
+/// `WRITE`), 4 empty, 5 a domain with no address space, held with `READ`, 6 a
+/// target with a thread running in it, held with `WRITE`.
 extern "C" fn copy_rights_client(_argument: u64) -> ! {
     use core::sync::atomic::Ordering;
 
-    let calls: [(u64, u64); 6] = [
+    let calls: [(u64, u64); 7] = [
         (0, 1), // source without READ
         (3, 2), // target without WRITE
         (0, 4), // source slot empty
         (0, 5), // source has no space
+        (6, 2), // a target with a thread running in it
         (0, 2), // WRITE on the target, READ on the source: the positive control
         (0, 2), // the same again, into a target that now has a space
     ];
@@ -26659,23 +26675,27 @@ extern "C" fn copy_rights_client(_argument: u64) -> ! {
 /// without it, six refusals could as easily mean a test that never set its
 /// slots up as a rule that holds.
 ///
-/// Not covered, and said so: a target that already has threads, which needs a
-/// thread spawned into the target first.
+/// A target with threads is covered too since 2026-09-29: a `copy-busy`
+/// domain has a thread yielding in it for the length of the test.
 fn copy_space_rights_self_test(hhdm: u64) -> bool {
     use core::sync::atomic::Ordering;
     use domain::ResourceEnvelope;
 
-    let (Ok(caller), Ok(target), Ok(source), Ok(spaceless)) = (
+    let (Ok(caller), Ok(target), Ok(source), Ok(spaceless), Ok(busy)) = (
         domain::create("copier", ResourceEnvelope::new()),
         domain::create("copy-into", ResourceEnvelope::new()),
         domain::create("copy-from", ResourceEnvelope::new()),
         domain::create("copy-none", ResourceEnvelope::new()),
+        domain::create("copy-busy", ResourceEnvelope::new()),
     ) else {
         println!("\x1b[91m    copy rights    FAILED to create the domains\x1b[0m");
         return false;
     };
     let finish = |ok: bool| {
-        for id in [caller, target, source, spaceless] {
+        // The occupant leaves before its domain is destroyed under it.
+        COPY_BUSY_RELEASE.store(true, Ordering::Release);
+        let _ = wait_until(|| sched::threads_counted_in(busy.as_u32()) == 0, 4_000);
+        for id in [caller, target, source, spaceless, busy] {
             domain::destroy(id);
         }
         ok
@@ -26705,6 +26725,7 @@ fn copy_space_rights_self_test(hhdm: u64) -> bool {
         held(target, cap::Rights::READ),
         None,
         held(spaceless, cap::Rights::READ),
+        held(busy, cap::Rights::WRITE),
     ];
     let placed = domain::with(caller, |owner| {
         slots.iter().enumerate().all(|(index, slot)| match slot {
@@ -26714,6 +26735,16 @@ fn copy_space_rights_self_test(hhdm: u64) -> bool {
     });
     if placed != Some(true) {
         println!("\x1b[91m    copy rights    FAILED to install the capabilities\x1b[0m");
+        return finish(false);
+    }
+
+    // Someone in the busy target before anyone asks to copy into it.
+    COPY_BUSY_RELEASE.store(false, Ordering::Relaxed);
+    let occupied = sched::SpawnOptions::new().in_domain(busy.as_u32());
+    if sched::spawn_on_with(0, "copy-busy", copy_busy_occupant, 0, hhdm, occupied).is_err()
+        || !wait_until(|| sched::threads_counted_in(busy.as_u32()) > 0, 4_000)
+    {
+        println!("\x1b[91m    copy rights    FAILED to put a thread in the busy target\x1b[0m");
         return finish(false);
     }
 
@@ -26731,12 +26762,13 @@ fn copy_space_rights_self_test(hhdm: u64) -> bool {
     // domains it ran in are destroyed underneath it.
     let _ = wait_until(|| sched::threads_counted_in(caller.as_u32()) == 0, 4_000);
 
-    let got: [u64; 6] = core::array::from_fn(|index| COPY_RIGHTS[index].load(Ordering::Relaxed));
+    let got: [u64; 7] = core::array::from_fn(|index| COPY_RIGHTS[index].load(Ordering::Relaxed));
     let expected = [
         syscall::Status::InsufficientRights,
         syscall::Status::InsufficientRights,
         syscall::Status::NoSuchCapability,
         syscall::Status::NoSuchCapability,
+        syscall::Status::SlotUnavailable,
         syscall::Status::Ok,
         syscall::Status::SlotUnavailable,
     ];
@@ -26751,8 +26783,9 @@ fn copy_space_rights_self_test(hhdm: u64) -> bool {
     if right {
         println!(
             "    copy rights    COPY_SPACE refused a source held without READ and a target held \
-             without WRITE, an empty slot and a domain with no space, copied with WRITE and \
-             READ, and refused the same copy into a target that then had a space"
+             without WRITE, an empty slot, a domain with no space and a target with a thread in \
+             it, copied with WRITE and READ, and refused the same copy into a target that then \
+             had a space"
         );
     } else {
         println!(

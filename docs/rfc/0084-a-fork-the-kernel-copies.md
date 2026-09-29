@@ -269,8 +269,12 @@ succeeds (**the positive control**, without which six refusals could mean a
 test that never set its slots up), and the same copy into a target that now
 has a space is `SlotUnavailable`. **Armed**: with the `READ` rule removed, the
 first call *copied* — `answers [0, 5, 11, 11, 11, 11]` — and the gate failed.
-**Still unexercised: a target that already has threads**, which needs a
-thread spawned into the target first.
+~~**Still unexercised: a target that already has threads**, which needs a
+thread spawned into the target first.~~ **Gated the same day**: a `copy-busy`
+domain holds a thread yielding in it for the length of the test, and a copy
+into it is refused `SlotUnavailable`. Armed with that refusal removed, the
+copy *went into the domain with a thread running in it* — `answers [5, 5, 2,
+2, 0, 0, 11]` — and the gate failed. **All five refusals are now exercised.**
 
 ## Unresolved questions
 
