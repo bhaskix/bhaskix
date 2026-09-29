@@ -79,6 +79,12 @@ def departs(name: str, values: tuple[int, ...]) -> str | None:
         return f"capabilities {values[0]} before, {values[1]} after"
     if name == "timed" and values[2] != 0:
         return f"{values[2]} nanosleep(s) woke early with no signal pending"
+    # Since the killer probe's handshake (2026-09-29) its `nanosleep` child is
+    # asleep when signalled, so a healthy boot releases at least one timed wait
+    # early. Zero means the parked-sleep delivery was not exercised on that
+    # boot -- which was every boot before the handshake.
+    if name == "timed" and values[0] == 0:
+        return "no timed wait was released early: the parked-sleep delivery was not exercised"
     return None
 
 

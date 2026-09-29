@@ -407,6 +407,25 @@ strangers:
         test    %rax, %rax
         jnz     done
 
+        # **A handshake, so the child is asleep when the signal comes** --
+        # 2026-09-29. The `kill` below used to follow the `fork` with nothing
+        # between, so the child was signalled before it reached `nanosleep`
+        # on every boot measured: `timed wait(s) released early` read 0 on all
+        # 21 boots `tools/ci-readings.py` could read. The path this act names
+        # -- a signal waking a process *parked* in a timed sleep -- was never
+        # run. Now the child writes a byte on its way to sleep, the parent
+        # reads it, and then sleeps 20 ms itself before the `kill`. That makes
+        # "asleep" overwhelmingly likely rather than certain, which is why the
+        # boot's `hosted timed` reading, not this comment, says whether it was.
+        #
+        # pipe2(&fds, 0): read end at 0x40000070, write end four bytes on.
+        mov     $0x40000070, %edi
+        xor     %esi, %esi
+        mov     $293, %eax
+        syscall
+        test    %rax, %rax
+        jnz     done
+
         lea     (catch_park - inner)(%r15), %rax
         call    *%rax
         mov     %rax, 224(%r12)         # word 28: the child's pid
@@ -414,6 +433,18 @@ strangers:
         movq    $18, 120(%r12)
         test    %rax, %rax
         jle     done
+
+        movl    0x40000070, %edi        # read(read end, &byte, 1): the child
+        mov     $0x40000090, %esi       # has said it is on its way to sleep
+        mov     $1, %edx
+        xor     %eax, %eax
+        syscall
+        movq    $0, 0x40000020          # nanosleep(&{0, 20 ms}, NULL): and it
+        movq    $20000000, 0x40000028   # gets there
+        mov     $0x40000020, %edi
+        xor     %esi, %esi
+        mov     $35, %eax
+        syscall
 
         mov     %r13, %rdi                      # kill(child, SIGTERM)
         mov     $15, %esi
@@ -595,7 +626,12 @@ catch_park:
         # own stack: two pages `run_bell_program` mapped before the program
         # ran, which no supervisor has ever seen. The signal frame below is
         # built on it.
-6:      mov     $0x40000000, %edi       # nanosleep(&{1000, 0}, NULL)
+6:      movl    0x40000074, %edi        # write(write end, &byte, 1): on the
+        mov     $0x40000090, %esi       # way to sleep -- see the handshake
+        mov     $1, %edx                # in the parent
+        mov     $1, %eax
+        syscall
+        mov     $0x40000000, %edi       # nanosleep(&{1000, 0}, NULL)
         xor     %esi, %esi
         mov     $35, %eax
         syscall
