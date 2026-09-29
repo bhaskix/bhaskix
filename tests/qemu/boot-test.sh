@@ -4579,6 +4579,18 @@ else
     pass "the bring-up watchdog stayed quiet, as it must on a boot that finished"
 fi
 
+# **Readings, on every boot -- because a passing boot's serial never reaches
+# the CI log.** The dump below is failure-only, so every per-boot counter this
+# tree prints was invisible in CI unless the boot failed: measured 2026-09-29,
+# 56 passing boot and shell jobs across runs 758-767 and **not one** carried
+# the raised-versus-delivered line the undelivered-signal row's fix needed a
+# rate from. A healthy-boot rate cannot be read from failures. These few lines
+# are copied into the job log pass or fail, prefixed `reading`, so a count
+# across CI history reads healthy boots too.
+echo
+grep -aE "hosted signals +[0-9]+ raised, [0-9]+ delivered|identity +[0-9]+ read\(s\) of the running thread|domains +capabilities [0-9]+ live before|hosted timed +[0-9]+ timed wait" "$LOG" \
+    | sed -E 's/^ +/reading  /' || true
+
 if [[ $status -ne 0 ]]; then
     echo
     echo "--- captured serial output ---"
