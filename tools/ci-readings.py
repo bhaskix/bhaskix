@@ -140,7 +140,12 @@ def main() -> int:
     for run in sorted(runs, key=lambda r: r["run_number"]):
         jobs = ci.gh(
             f"/repos/{ci.REPO}/actions/runs/{run['id']}/jobs?per_page=100",
-            jq='.jobs[] | select(.name | test("boot")) | "\\(.id) \\(.name)"',
+            # The soak's "repeated boots and shell runs" job is not a boot
+            # lane: each of its boots keeps its serial as an artifact
+            # (`soak-logs`), never in the job log, so it carries no reading
+            # here and would be counted blind every time. Reading those
+            # artifacts is a larger source this tool does not reach yet.
+            jq='.jobs[] | select(.name | test("boot")) | select(.name | test("repeated") | not) | "\\(.id) \\(.name)"',
         )
         for line in (jobs or "").splitlines():
             job, _, name = line.partition(" ")
