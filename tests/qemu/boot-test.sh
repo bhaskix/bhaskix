@@ -4632,7 +4632,7 @@ fi
 # and of calls dequeued against calls answered has only ever been seen on the
 # boots that failed -- a baseline from healthy boots is what it lacks.
 echo
-grep -aE "hosted signals +[0-9]+ raised, [0-9]+ delivered|identity +[0-9]+ read\(s\) of the running thread|domains +capabilities [0-9]+ live before|hosted timed +[0-9]+ timed wait|ipc handover\* +[0-9]+ rendezvous dropped|tcpd served\* +[0-9]+ call\(s\) dequeued|hosted deliver +[0-9]+ delivered as the call was made|linux park +the nucleus answered|linux park +[0-9]+ parks refused|deadline slots +[0-9]+ arm\(s\) refused" "$LOG" \
+grep -aE "hosted signals +[0-9]+ raised, [0-9]+ delivered|identity +[0-9]+ read\(s\) of the running thread|domains +capabilities [0-9]+ live before|hosted timed +[0-9]+ timed wait|ipc handover\* +[0-9]+ rendezvous dropped|tcpd served\* +[0-9]+ call\(s\) dequeued|hosted deliver +[0-9]+ delivered as the call was made|linux park +the nucleus answered|linux park +[0-9]+ parks refused|deadline slots +[0-9]+ arm\(s\) refused|deadline arms\* +[0-9]+ armed from ring 3" "$LOG" \
     | sed -E 's/\x1b\[[0-9;]*m//g; s/^ +/reading  /' || true
 # **Colour stripped first**, because a line the kernel prints in yellow starts
 # with an escape and not with spaces, and was copied without its prefix -- so

@@ -1329,11 +1329,20 @@ fn dispatch_inner(frame: &mut SyscallFrame) -> Outcome {
     // already read the clock, since `rdtsc` is unprivileged here.
     if kind == Some(Kind::Invoke) && (frame.method == method::ARM || frame.method == method::DISARM)
     {
+        let arming = frame.method == method::ARM;
         let resolved = match resolve_for_ipc(frame.capability, ObjectKind::Notification) {
             Ok(resolved) => resolved,
-            Err(status) => return Outcome::err(status),
+            Err(status) => {
+                if arming {
+                    note_arm(ArmAnswer::NoNotification);
+                }
+                return Outcome::err(status);
+            }
         };
         if !resolved.rights.contains(crate::cap::Rights::WRITE) {
+            if arming {
+                note_arm(ArmAnswer::NoWrite);
+            }
             return Outcome::err(Status::InsufficientRights);
         }
         let id = crate::notify::NotificationId::from_parts(
@@ -1343,7 +1352,14 @@ fn dispatch_inner(frame: &mut SyscallFrame) -> Outcome {
         if frame.method == method::DISARM {
             return Outcome::ok(u64::from(crate::notify::disarm(id)));
         }
-        return match crate::notify::arm(id, frame.arg0, resolved.badge) {
+        let armed = crate::notify::arm(id, frame.arg0, resolved.badge);
+        note_arm(match armed {
+            Ok(()) => ArmAnswer::Armed,
+            Err(crate::notify::NotifyError::Exhausted) => ArmAnswer::NoSlot,
+            Err(crate::notify::NotifyError::EmptyBadge) => ArmAnswer::EmptyBadge,
+            Err(_) => ArmAnswer::Gone,
+        });
+        return match armed {
             Ok(()) => {
                 // Bring this processor's next timer interrupt forward, if the
                 // deadline just armed is sooner than whatever it was going to
@@ -2786,6 +2802,41 @@ static DELIVERED_ON_RETRY: core::sync::atomic::AtomicU64 = core::sync::atomic::A
 /// The Linux number of `rt_sigreturn`, whose `RESTORE` is a return from a
 /// handler rather than an entry into one.
 const RT_SIGRETURN: u64 = 15;
+
+/// How an `ARM` from ring 3 was answered.
+#[derive(Clone, Copy)]
+enum ArmAnswer {
+    Armed = 0,
+    NoNotification = 1,
+    NoWrite = 2,
+    EmptyBadge = 3,
+    Gone = 4,
+    NoSlot = 5,
+}
+
+/// Every `ARM` a program made, by answer.
+///
+/// **Because the callers that matter throw the answer away.** `sock::wait::news`
+/// arms a 100 ms deadline before every `WAIT` so a lost wake is a slowdown,
+/// and ignores whether the arm was accepted -- and CI run 782's TCP client was
+/// parked on its wake with neither the wake nor that deadline arriving. A
+/// program whose wake capability lacked `WRITE`, or carried an empty badge,
+/// would have *every* deadline refused and every healthy boot would still
+/// look healthy, since the wake usually comes. Counted at the one place every
+/// `ARM` passes, so a healthy boot shows whether any program's arms are being
+/// refused at all.
+static ARM_ANSWERS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+
+fn note_arm(answer: ArmAnswer) {
+    ARM_ANSWERS[answer as usize].fetch_add(1, Ordering::Relaxed);
+}
+
+/// `ARM`s answered: armed, no such notification, no `WRITE`, an empty badge,
+/// gone, no free slot.
+#[must_use]
+pub fn arm_answers() -> [u64; 6] {
+    core::array::from_fn(|index| ARM_ANSWERS[index].load(Ordering::Relaxed))
+}
 
 /// The Linux number of `futex`.
 const LINUX_FUTEX: u64 = 202;

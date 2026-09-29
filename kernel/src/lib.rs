@@ -11902,6 +11902,22 @@ fn socket_self_test(hhdm_base: u64, cpus: u32) -> bool {
         }
         wait_millis(5);
     }
+    // **Where a probe that never ended is waiting**, read before it is retired
+    // -- retiring it takes the evidence with it. The failure line used to say
+    // only "never ended", and a blocking `recvfrom` parks on the datagram bell
+    // since RFC 0054, so "a bounded retry" is bounded only if each call comes
+    // back. Seen twice locally on 2026-09-28/29 and never in CI's 8,065 boots;
+    // the TCP step-4 row's client was parked on a notification whose wake and
+    // deadline never came, and this asks the same questions of this probe.
+    let stuck = if ended {
+        None
+    } else {
+        sched::first_thread_in_domain(realm.as_u32()).map(|(thread, state)| {
+            let parked = crate::notify::waited_on_by(thread);
+            let held = parked.and_then(|index| crate::notify::deadline_held_by(index as u32));
+            (thread, state, parked, held, ipc::where_queued(thread))
+        })
+    };
     retire_probe(realm);
 
     // **Ending is not passing, and the first version of this test thought it
@@ -11925,6 +11941,29 @@ fn socket_self_test(hhdm_base: u64, cpus: u32) -> bool {
             "\x1b[91m    linux socket   FAILED: the probe never ended -- a bounded retry on \
              recvfrom should have given up rather than hanging\x1b[0m"
         );
+        match stuck {
+            Some((thread, state, parked, held, queued)) => println!(
+                "\x1b[91m                   its thread {thread} is {state:?}, parked on \
+                 notification {}, which holds {}; queued {}; the adapter's last call {last}, \
+                 stage {stage}, detail {detail}\x1b[0m",
+                parked.map_or(alloc::string::String::from("none"), |n| alloc::format!(
+                    "{n}"
+                )),
+                match held {
+                    Some(due) => alloc::format!("a deadline at {due}"),
+                    None => alloc::string::String::from("no deadline"),
+                },
+                match queued {
+                    Some((endpoint, true)) => alloc::format!("to send on endpoint {endpoint}"),
+                    Some((endpoint, false)) => alloc::format!("to receive on endpoint {endpoint}"),
+                    None => alloc::string::String::from("on no endpoint"),
+                },
+            ),
+            None => println!(
+                "\x1b[91m                   and no thread of it was left to ask; the adapter's \
+                 last call {last}, stage {stage}, detail {detail}\x1b[0m"
+            ),
+        }
     }
     ended
 }
@@ -24828,6 +24867,17 @@ fn user_shell(handoff: &Handoff) -> Result<(), &'static str> {
         "    deadline slots {refused} arm(s) refused for want of a slot, at most {high} of {} armed \
          at once",
         crate::notify::MAX_DEADLINES
+    );
+    // **Every `ARM` a program made, and how it was answered** -- the other half
+    // of the question the line above asks. A refused arm is invisible to the
+    // callers that matter (`news` discards the answer), so a wake capability
+    // that could never arm would look healthy on every boot where its wake
+    // arrived. See `syscall::ARM_ANSWERS`.
+    let [armed, no_notification, no_write, empty_badge, gone, no_slot] = syscall::arm_answers();
+    println!(
+        "    deadline arms* {armed} armed from ring 3; refused {no_notification} for no \
+         notification, {no_write} without WRITE, {empty_badge} for an empty badge, {gone} gone, \
+         {no_slot} for want of a slot"
     );
 
     let (leaks, first_leak) = sched::hold_leaks();

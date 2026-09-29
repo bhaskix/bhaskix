@@ -81,6 +81,12 @@ PATTERNS = {
     # at once -- for the TCP step-4 row, whose client was parked on a wake
     # that `news` had tried to give a 100 ms deadline.
     "slots": re.compile(r"deadline slots +(\d+) arm\(s\) refused for want of a slot, at most (\d+) of"),
+    # Every ARM from ring 3 by answer: armed, then refused for no notification,
+    # without WRITE, for an empty badge, gone, for want of a slot.
+    "arms": re.compile(
+        r"deadline arms\* +(\d+) armed from ring 3; refused (\d+) for no notification, (\d+) "
+        r"without WRITE, (\d+) for an empty badge, (\d+) gone, (\d+) for want of a slot"
+    ),
 }
 
 
@@ -104,6 +110,8 @@ def departs(name: str, values: tuple[int, ...], run: int) -> str | None:
         return f"{values[0]} identity retr(ies), at most {values[1]} in one read"
     if name == "refused" and values[0] != 0:
         return f"{values[0]} park(s) refused, {values[1]} by a notification that already had a waiter"
+    if name == "arms" and sum(values[1:]) != 0:
+        return f"{sum(values[1:])} ARM(s) from ring 3 refused, of {values[0] + sum(values[1:])}"
     if name == "slots" and values[0] != 0:
         return f"{values[0]} deadline arm(s) refused for want of a slot (at most {values[1]} armed)"
     if name == "handover" and values[0] != 0:
