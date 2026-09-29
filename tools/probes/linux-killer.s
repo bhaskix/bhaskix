@@ -127,6 +127,26 @@ _start:
         # *in* the adapter is the other case — it is asleep in a call, which is
         # the state a `^C` at a shell has to be able to end — and a gate whose
         # targets all spin would never touch it.
+        #
+        # **And it has to be asleep for that**, which nothing ensured: the
+        # `kill` followed the `fork` at once, the shape two acts below were
+        # found never to run (2026-09-29). The handshake those acts use starts
+        # here, so every child from this one on inherits it: the child writes
+        # a byte on its way to its call, the parent reads it and sleeps 20 ms
+        # before the `kill`. `PARK_ENDED` -- the nucleus's count of parked
+        # calls ended because their thread was told to stop -- says whether it
+        # worked.
+        #
+        # pipe2(&fds, 0): read end at 0x40000070, write end four bytes on.
+        mov     $0x40000070, %edi
+        xor     %esi, %esi
+        mov     $293, %eax
+        syscall
+        test    %rax, %rax
+        jnz     done
+        movq    $0, 0x40000020          # the 20 ms the parent waits: {0, 20 ms}
+        movq    $20000000, 0x40000028
+
         lea     (park - inner)(%r15), %rax
         call    *%rax
         mov     %rax, 40(%r12)          # word 5
@@ -134,6 +154,16 @@ _start:
         mov     %rax, %r13
         test    %rax, %rax
         jle     done
+
+        movl    0x40000070, %edi        # read(read end, &byte, 1)
+        mov     $0x40000090, %esi
+        mov     $1, %edx
+        xor     %eax, %eax
+        syscall
+        mov     $0x40000020, %edi       # nanosleep(&{0, 20 ms}, NULL)
+        xor     %esi, %esi
+        mov     $35, %eax
+        syscall
 
         mov     %r13, %rdi              # kill(child, SIGKILL)
         mov     $9, %esi
@@ -417,14 +447,7 @@ strangers:
         # reads it, and then sleeps 20 ms itself before the `kill`. That makes
         # "asleep" overwhelmingly likely rather than certain, which is why the
         # boot's `hosted timed` reading, not this comment, says whether it was.
-        #
-        # pipe2(&fds, 0): read end at 0x40000070, write end four bytes on.
-        mov     $0x40000070, %edi
-        xor     %esi, %esi
-        mov     $293, %eax
-        syscall
-        test    %rax, %rax
-        jnz     done
+        # The pipe and the 20 ms were set up before the SIGKILL act above.
 
         lea     (catch_park - inner)(%r15), %rax
         call    *%rax
@@ -439,9 +462,7 @@ strangers:
         mov     $1, %edx
         xor     %eax, %eax
         syscall
-        movq    $0, 0x40000020          # nanosleep(&{0, 20 ms}, NULL): and it
-        movq    $20000000, 0x40000028   # gets there
-        mov     $0x40000020, %edi
+        mov     $0x40000020, %edi       # nanosleep(&{0, 20 ms}, NULL): and it gets there
         xor     %esi, %esi
         mov     $35, %eax
         syscall
@@ -598,7 +619,12 @@ park:
         test    %rax, %rax
         jz      4f
         ret
-4:      mov     $0x40000000, %edi       # nanosleep(&{1000, 0}, NULL)
+4:      movl    0x40000074, %edi        # write(handshake write end, &byte, 1)
+        mov     $0x40000090, %esi
+        mov     $1, %edx
+        mov     $1, %eax
+        syscall
+        mov     $0x40000000, %edi       # nanosleep(&{1000, 0}, NULL)
         xor     %esi, %esi
         mov     $35, %eax
         syscall

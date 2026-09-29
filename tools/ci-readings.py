@@ -67,6 +67,10 @@ PATTERNS = {
     # Signal deliveries on the first ask, and on a retry after a park and a
     # wake -- the second is the path the killer probe's children are for.
     "deliver": re.compile(r"hosted deliver +(\d+) delivered as the call was made, (\d+) to a call"),
+    # Hosted calls the nucleus answered itself: retries exhausted, and parked
+    # calls ended because their thread was told to stop -- which the killer
+    # probe's SIGKILL child and the sibling it ends each contribute one of.
+    "park": re.compile(r"linux park +the nucleus answered \d+ hosted call\(s\) itself: (\d+) RAN OUT OF RETRIES, (\d+) whose"),
 }
 
 
