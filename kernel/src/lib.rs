@@ -21201,6 +21201,37 @@ fn report_tcp_client(hhdm: u64) {
                         "nothing in the kernel names what it waits on -- the block itself is the fault"
                     };
                     println!("\x1b[91m                   so: {verdict}\x1b[0m");
+                    // **Why a parked client did not come back on its own.**
+                    // `sock::wait::news` arms a 100 ms deadline on the wake
+                    // before every `WAIT`, so a lost wake should be a slowdown.
+                    // CI run 782's client was parked on its wake with neither
+                    // arriving, and two readings were left: the arm was
+                    // refused for want of a slot -- `news` discards the answer
+                    // -- or it was armed and never fired. What the table holds
+                    // for that notification now, against the clock, says which.
+                    if let Some(index) = parked {
+                        let (refused, high) = crate::notify::arm_pressure();
+                        let now = bhaskix_arch::tsc::read();
+                        let held = match crate::notify::deadline_held_by(index as u32) {
+                            Some(due) if due <= now => alloc::format!(
+                                "holds a deadline {} cycles past due -- armed and never fired",
+                                now - due
+                            ),
+                            Some(due) => alloc::format!(
+                                "holds a deadline due in {} cycles -- still armed and waiting",
+                                due - now
+                            ),
+                            None => alloc::string::String::from(
+                                "holds no deadline -- none armed, or one that fired and was taken",
+                            ),
+                        };
+                        println!(
+                            "\x1b[91m                   notification {index} {held}; {refused} \
+                             arm(s) refused for want of a slot this boot, at most {high} of {} \
+                             armed at once\x1b[0m",
+                            crate::notify::MAX_DEADLINES
+                        );
+                    }
                 }
                 None => println!(
                     "\x1b[91m                   client thread {client} is in no run queue, so what it \
@@ -24788,6 +24819,15 @@ fn user_shell(handoff: &Handoff) -> Result<(), &'static str> {
     println!(
         "    deadline arms  {hastened} brought this cpu's next interrupt forward, {already} were \
          already soon enough"
+    );
+    // **Whether the deadline table ever ran out** -- every boot, so the TCP
+    // step-4 row's refused-arm reading has a healthy baseline to be set
+    // against. See `notify::ARM_EXHAUSTED`.
+    let (refused, high) = crate::notify::arm_pressure();
+    println!(
+        "    deadline slots {refused} arm(s) refused for want of a slot, at most {high} of {} armed \
+         at once",
+        crate::notify::MAX_DEADLINES
     );
 
     let (leaks, first_leak) = sched::hold_leaks();

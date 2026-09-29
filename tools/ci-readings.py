@@ -29,6 +29,7 @@ Needs `gh auth login`. Not a gate: it needs the network. Logs are cached in
 from __future__ import annotations
 
 import argparse
+import json
 import importlib.util
 import re
 import sys
@@ -76,6 +77,10 @@ PATTERNS = {
     # once (the pipe and wait4 defects of 2026-09-29). Printed only when
     # non-zero, so every boot that carries it is off baseline.
     "refused": re.compile(r"linux park +(\d+) parks refused: .*?(\d+) by the notification itself"),
+    # Deadline arms refused for want of a slot, and the most slots ever armed
+    # at once -- for the TCP step-4 row, whose client was parked on a wake
+    # that `news` had tried to give a 100 ms deadline.
+    "slots": re.compile(r"deadline slots +(\d+) arm\(s\) refused for want of a slot, at most (\d+) of"),
 }
 
 
@@ -99,6 +104,8 @@ def departs(name: str, values: tuple[int, ...], run: int) -> str | None:
         return f"{values[0]} identity retr(ies), at most {values[1]} in one read"
     if name == "refused" and values[0] != 0:
         return f"{values[0]} park(s) refused, {values[1]} by a notification that already had a waiter"
+    if name == "slots" and values[0] != 0:
+        return f"{values[0]} deadline arm(s) refused for want of a slot (at most {values[1]} armed)"
     if name == "handover" and values[0] != 0:
         return f"{values[0]} rendezvous dropped after matching"
     if name == "tcpd" and values[0] != values[2]:
@@ -121,17 +128,37 @@ def departs(name: str, values: tuple[int, ...], run: int) -> str | None:
     return None
 
 
+def runs_since(since) -> list | None:
+    """Finished runs created on or after `since`, asked for by date.
+
+    **Not `ci-count.py`'s `every_run`, which pages through the whole history**
+    -- deliberately, since its denominator is every boot there has been. This
+    tool only ever reads runs since the readings landed, and paging through
+    eight hundred runs to keep fifteen cost the account its hourly API budget
+    on 2026-09-29. `created=>=` narrows the listing on GitHub's side; still
+    paginated, so a busy day is not cut off at a hundred.
+    """
+    out = ci.gh(
+        f"/repos/{ci.REPO}/actions/runs?per_page=100&created=>={since:%Y-%m-%d}",
+        jq=".workflow_runs[] | {id,run_number,conclusion,run_attempt,name,head_sha,created_at}",
+        paginate=True,
+    )
+    if out is None:
+        return None
+    runs = [json.loads(line) for line in out.splitlines() if line.strip()]
+    return [r for r in runs if r["conclusion"] is not None]
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--since", type=ci.a_date, default=ci.a_date(LANDED),
                         help=f"ignore runs before this date (default {LANDED}, when readings landed)")
     options = parser.parse_args()
 
-    runs = ci.every_run()
+    runs = runs_since(options.since)
     if runs is None:
         print("  \033[1;31mFAIL\033[0m  could not list runs -- is `gh auth login` done?")
         return 1
-    runs = [r for r in runs if ci.when(r["created_at"]) >= options.since]
 
     boots = 0
     blind = []

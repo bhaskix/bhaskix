@@ -515,10 +515,50 @@ pub fn arm(id: NotificationId, deadline: u64, badge: u64) -> Result<(), NotifyEr
             // Last, and with a release: everything above is visible to whoever
             // reads this.
             slot.who.store(want, Ordering::Release);
+            let in_use = DEADLINES
+                .iter()
+                .filter(|slot| slot.who.load(Ordering::Relaxed) != 0)
+                .count() as u64;
+            ARMED_HIGH.fetch_max(in_use, Ordering::Relaxed);
             return Ok(());
         }
     }
+    ARM_EXHAUSTED.fetch_add(1, Ordering::Relaxed);
     Err(NotifyError::Exhausted)
+}
+
+/// Arms refused because every deadline slot was armed for somebody else.
+///
+/// **Because a refused deadline is silent where it matters.** `sock::wait::news`
+/// arms a 100 ms deadline before every `WAIT` and discards the answer, so a
+/// refusal turns "a lost wake is a slowdown" into "a lost wake is a hang" --
+/// and the TCP step-4 row's first client-side sighting (CI run 782) was a
+/// client parked on its wake notification with neither the wake nor that
+/// deadline arriving. Nothing could say whether the deadline had been refused.
+static ARM_EXHAUSTED: AtomicU64 = AtomicU64::new(0);
+
+/// The most deadline slots ever armed at once, of [`MAX_DEADLINES`].
+static ARMED_HIGH: AtomicU64 = AtomicU64::new(0);
+
+/// `(arms refused for want of a slot, most slots ever armed at once)`.
+#[must_use]
+pub fn arm_pressure() -> (u64, u64) {
+    (
+        ARM_EXHAUSTED.load(Ordering::Relaxed),
+        ARMED_HIGH.load(Ordering::Relaxed),
+    )
+}
+
+/// The deadline the notification at `index` holds right now, if any --
+/// whichever generation armed it, because a report asking about a stuck
+/// waiter wants to know what the table says about that slot.
+#[must_use]
+pub fn deadline_held_by(index: u32) -> Option<u64> {
+    let want = index + 1;
+    DEADLINES
+        .iter()
+        .find(|slot| slot.who.load(Ordering::Acquire) == want)
+        .map(|slot| slot.deadline.load(Ordering::Acquire))
 }
 
 /// Forgets any deadline armed for `id`. Whether one was armed is the answer.
