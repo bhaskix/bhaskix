@@ -2438,6 +2438,19 @@ else
     status=1
 fi
 
+# **Every armed deadline fires, under load, with signals racing it.** One
+# thread per CPU arms a 2 ms deadline on its own notification and parks on it,
+# forty times, while a waker signals the same notifications at a drifting phase
+# -- the shape the TCP step-4 row's client was left in, parked on a wake whose
+# 100 ms deadline never came. Gated on every wait returning; the lateness is
+# printed, not judged, because an emulator's is not the machine's.
+if grep -qE "deadline load +[0-9]+ waits on [0-9]+ cpu\(s\), each parked on a 2 ms deadline while [0-9]+ signals raced it on the same notification: every one returned" "$LOG"; then
+    pass "every armed deadline fired under load, with signals racing it"
+else
+    fail "an armed deadline did not wake the thread parked on it"
+    status=1
+fi
+
 # RFC 0005 step 6: the futex contract's edges, which is where the RFC says a
 # subtle mistake does not produce an error but a deadlock under load. A WAIT
 # whose word has already changed must refuse to sleep; a WAKE with nobody

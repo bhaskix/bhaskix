@@ -1245,6 +1245,9 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
     if !deadline_self_test() {
         println!("\x1b[91m    deadline       FAILED\x1b[0m");
     }
+    if !deadline_stress_self_test(handoff.hhdm_base.as_u64()) {
+        println!("\x1b[91m    deadline load  FAILED\x1b[0m");
+    }
     if !measure_deadlines(handoff, "bring-up") {
         println!("\x1b[91m    timer delay    FAILED\x1b[0m");
     }
@@ -21610,6 +21613,193 @@ fn report_tcp_domain(hhdm: u64) {
 ///
 /// Measured against the same clock the deadline is expressed in, so the two
 /// cannot disagree about units.
+/// How many times each [`deadline_stresser`] arms and waits.
+const STRESS_ROUNDS: u64 = 40;
+
+/// One stresser per CPU: its notification, how far it got, and its worst
+/// lateness in ticks. `u64::MAX` for a notification not yet made.
+static STRESS_NOTE: [core::sync::atomic::AtomicU64; 8] =
+    [const { core::sync::atomic::AtomicU64::new(u64::MAX) }; 8];
+static STRESS_DONE: [core::sync::atomic::AtomicU64; 8] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; 8];
+static STRESS_WORST: [core::sync::atomic::AtomicU64; 8] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; 8];
+static STRESS_REFUSED: [core::sync::atomic::AtomicU64; 8] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; 8];
+/// How many stressers there are, for the waker; 0 tells the waker to stop.
+static STRESS_LIVE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Signals the waker sent.
+static STRESS_SIGNALS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// **The second source.** The TCP client's wake notification is signalled by
+/// the service as well as by its own deadline, so the two collide on one
+/// notification -- a re-arm replacing a deadline at the instant it fires is
+/// where a lost deadline would live. This signals each stresser's notification
+/// in turn, about as often as their deadlines fall, until they are all done.
+extern "C" fn deadline_waker(_argument: u64) -> ! {
+    use core::sync::atomic::Ordering;
+    const BADGE: u64 = 1 << 8;
+    let mut turn = 0usize;
+    loop {
+        let cpus = STRESS_LIVE.load(Ordering::Acquire) as usize;
+        if cpus == 0 {
+            sched::exit();
+        }
+        let packed = STRESS_NOTE[turn % cpus].load(Ordering::Acquire);
+        let notification = notify::NotificationId::from_parts(packed as u32, (packed >> 32) as u32);
+        if notify::signal(notification, BADGE).is_ok() {
+            STRESS_SIGNALS.fetch_add(1, Ordering::Relaxed);
+        }
+        turn += 1;
+        // Just under the stressers' 2 ms, so the two sources drift past each
+        // other rather than settling into a fixed phase.
+        let until = bhaskix_arch::tsc::read() + bhaskix_arch::tsc::hertz().unwrap_or(0) / 700;
+        while bhaskix_arch::tsc::read() < until {
+            sched::yield_now();
+        }
+    }
+}
+
+/// Arms a 2 ms deadline on its own notification and parks on it, forty times,
+/// with nothing else ever signalling it -- the shape of `sock::wait::news` in a
+/// client whose wake never comes, which is what the TCP step-4 row's client
+/// was left waiting on.
+extern "C" fn deadline_stresser(index: u64) -> ! {
+    use core::sync::atomic::Ordering;
+    const BADGE: u64 = 1 << 7;
+    let slot = index as usize;
+    let packed = STRESS_NOTE[slot].load(Ordering::Acquire);
+    let notification = notify::NotificationId::from_parts(packed as u32, (packed >> 32) as u32);
+    let period = bhaskix_arch::tsc::hertz().unwrap_or(0) / 500;
+    for round in 0..STRESS_ROUNDS {
+        let due = bhaskix_arch::tsc::read() + period;
+        if notify::arm(notification, due, BADGE).is_err() {
+            STRESS_REFUSED[slot].fetch_add(1, Ordering::Relaxed);
+        }
+        time::arm_no_later_than(due);
+        let _ = notify::wait(notification);
+        let late = bhaskix_arch::tsc::read().saturating_sub(due);
+        STRESS_WORST[slot].fetch_max(late, Ordering::Relaxed);
+        STRESS_DONE[slot].store(round + 1, Ordering::Release);
+    }
+    sched::exit();
+}
+
+/// **Every armed deadline fires, under load, on every CPU.**
+///
+/// The TCP step-4 row's client (CI run 782) was parked on its wake with a
+/// 100 ms deadline armed before the wait, and neither the wake nor the
+/// deadline came; every ring-3 `ARM` is accepted on healthy boots, so what was
+/// left is a deadline armed and never fired. The single-deadline test above
+/// arms one and *polls* it; this parks, which is what a client does, on every
+/// CPU at once, forty times each. A wait that never returns is that failure
+/// reproduced; the worst lateness says how close the rest came.
+fn deadline_stress_self_test(hhdm: u64) -> bool {
+    use core::sync::atomic::Ordering;
+    let Some(hertz) = bhaskix_arch::tsc::hertz() else {
+        println!("    deadline load  no calibrated timer; nothing measured");
+        return true;
+    };
+    let cpus = (bhaskix_arch::percpu::online_count() as usize).min(STRESS_NOTE.len());
+    let mut notes = [None; 8];
+    for (slot, note) in notes.iter_mut().enumerate().take(cpus) {
+        let Ok(notification) = notify::create() else {
+            println!("\x1b[91m    deadline load  FAILED: no notification for cpu {slot}\x1b[0m");
+            return false;
+        };
+        STRESS_NOTE[slot].store(
+            u64::from(notification.index()) | (u64::from(notification.generation()) << 32),
+            Ordering::Release,
+        );
+        STRESS_DONE[slot].store(0, Ordering::Relaxed);
+        STRESS_WORST[slot].store(0, Ordering::Relaxed);
+        STRESS_REFUSED[slot].store(0, Ordering::Relaxed);
+        *note = Some(notification);
+        let options = sched::SpawnOptions::new().pinned();
+        if sched::spawn_on_with(
+            slot as u32,
+            "deadline-load",
+            deadline_stresser,
+            slot as u64,
+            hhdm,
+            options,
+        )
+        .is_err()
+        {
+            println!("\x1b[91m    deadline load  FAILED: no thread on cpu {slot}\x1b[0m");
+            return false;
+        }
+    }
+    STRESS_SIGNALS.store(0, Ordering::Relaxed);
+    STRESS_LIVE.store(cpus as u64, Ordering::Release);
+    let waker = sched::SpawnOptions::new().pinned();
+    if sched::spawn_on_with(0, "deadline-waker", deadline_waker, 0, hhdm, waker).is_err() {
+        println!("\x1b[91m    deadline load  FAILED: no waker thread\x1b[0m");
+        return false;
+    }
+    let all_done =
+        || (0..cpus).all(|slot| STRESS_DONE[slot].load(Ordering::Acquire) == STRESS_ROUNDS);
+    let finished = wait_until(all_done, 5_000);
+    STRESS_LIVE.store(0, Ordering::Release);
+    let signals = STRESS_SIGNALS.load(Ordering::Relaxed);
+
+    let micros = |ticks: u64| ticks.saturating_mul(1_000_000) / hertz.max(1);
+    let worst = (0..cpus)
+        .map(|slot| STRESS_WORST[slot].load(Ordering::Relaxed))
+        .max()
+        .unwrap_or(0);
+    let refused: u64 = (0..cpus)
+        .map(|slot| STRESS_REFUSED[slot].load(Ordering::Relaxed))
+        .sum();
+    let mut right = finished && refused == 0;
+    if right {
+        println!(
+            "    deadline load  {} waits on {cpus} cpu(s), each parked on a 2 ms deadline while \
+             {signals} signals raced it on the same notification: every one returned, the latest \
+             {} us after its deadline",
+            STRESS_ROUNDS * cpus as u64,
+            micros(worst)
+        );
+    } else {
+        println!(
+            "\x1b[91m    deadline load  FAILED: finished {finished}, {refused} arm(s) refused, \
+             {signals} racing signal(s), worst {} us late\x1b[0m",
+            micros(worst)
+        );
+        for (slot, note) in notes.iter().enumerate().take(cpus) {
+            let done = STRESS_DONE[slot].load(Ordering::Relaxed);
+            if done == STRESS_ROUNDS {
+                continue;
+            }
+            right = false;
+            let held = note.and_then(|n| notify::deadline_held_by(n.index()));
+            println!(
+                "\x1b[91m                   cpu {slot}'s stresser stopped after {done} of \
+                 {STRESS_ROUNDS} waits; its notification {}\x1b[0m",
+                match held {
+                    Some(due) if due <= bhaskix_arch::tsc::read() => alloc::format!(
+                        "holds a deadline {} us past due -- armed and never fired",
+                        micros(bhaskix_arch::tsc::read() - due)
+                    ),
+                    Some(due) => alloc::format!(
+                        "holds a deadline due in {} us",
+                        micros(due - bhaskix_arch::tsc::read())
+                    ),
+                    None => alloc::string::String::from("holds no deadline"),
+                }
+            );
+        }
+    }
+    // Stressers that finished have exited; one that did not is left parked,
+    // and its notification is left alive under it rather than destroyed.
+    if finished {
+        for note in notes.iter().take(cpus).flatten() {
+            notify::destroy(*note);
+        }
+    }
+    right
+}
+
 fn deadline_self_test() -> bool {
     const BADGE: u64 = 1 << 5;
 
