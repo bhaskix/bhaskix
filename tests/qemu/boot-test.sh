@@ -4592,7 +4592,7 @@ fi
 # and of calls dequeued against calls answered has only ever been seen on the
 # boots that failed -- a baseline from healthy boots is what it lacks.
 echo
-grep -aE "hosted signals +[0-9]+ raised, [0-9]+ delivered|identity +[0-9]+ read\(s\) of the running thread|domains +capabilities [0-9]+ live before|hosted timed +[0-9]+ timed wait|ipc handover\* +[0-9]+ rendezvous dropped|tcpd served\* +[0-9]+ call\(s\) dequeued" "$LOG" \
+grep -aE "hosted signals +[0-9]+ raised, [0-9]+ delivered|identity +[0-9]+ read\(s\) of the running thread|domains +capabilities [0-9]+ live before|hosted timed +[0-9]+ timed wait|ipc handover\* +[0-9]+ rendezvous dropped|tcpd served\* +[0-9]+ call\(s\) dequeued|hosted deliver +[0-9]+ delivered as the call was made" "$LOG" \
     | sed -E 's/^ +/reading  /' || true
 
 if [[ $status -ne 0 ]]; then

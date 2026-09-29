@@ -492,6 +492,23 @@ strangers:
         test    %rax, %rax
         jle     done
 
+        # **The same handshake as the child above, for the same reason**, and
+        # it was needed as much: the kernel's `hosted deliver` reading split
+        # this boot's deliveries into three on the first ask and one on a
+        # retry -- the `nanosleep` child -- so this child's signal was pending
+        # before its first `read`, and "woken, re-asked, still empty, parks
+        # again" had never run. It reuses the first handshake's pipe, which
+        # both the parent and this child still hold.
+        movl    0x40000070, %edi        # read(read end, &byte, 1)
+        mov     $0x40000090, %esi
+        mov     $1, %edx
+        xor     %eax, %eax
+        syscall
+        mov     $0x40000020, %edi       # nanosleep(&{0, 20 ms}, NULL), set above
+        xor     %esi, %esi
+        mov     $35, %eax
+        syscall
+
         mov     %r13, %rdi              # kill(child, SIGTERM)
         mov     $15, %esi
         mov     $62, %eax
@@ -654,7 +671,12 @@ pipe_park:
         jz      7f
         ret
         # Its inherited stack too -- see the child above.
-7:      mov     0x40000060, %edi        # the read end its parent made
+7:      movl    0x40000074, %edi        # write(handshake write end, &byte, 1):
+        mov     $0x40000090, %esi       # on its way to the read below
+        mov     $1, %edx
+        mov     $1, %eax
+        syscall
+        mov     0x40000060, %edi        # the read end its parent made
         mov     $0x40000080, %esi       # somewhere to put a byte
         mov     $1, %edx
         xor     %eax, %eax              # read

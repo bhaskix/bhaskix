@@ -64,6 +64,9 @@ PATTERNS = {
     # reached a partner not yet blocked; tcpd's calls dequeued, RECVs, answers.
     "handover": re.compile(r"ipc handover\* +(\d+) rendezvous dropped after matching, (\d+) wake"),
     "tcpd": re.compile(r"tcpd served\* +(\d+) call\(s\) dequeued, (\d+) of them RECV, (\d+) answer"),
+    # Signal deliveries on the first ask, and on a retry after a park and a
+    # wake -- the second is the path the killer probe's children are for.
+    "deliver": re.compile(r"hosted deliver +(\d+) delivered as the call was made, (\d+) to a call"),
 }
 
 
@@ -97,6 +100,11 @@ def departs(name: str, values: tuple[int, ...], run: int) -> str | None:
     # asleep when signalled, so a healthy boot releases at least one timed wait
     # early. Zero means the parked-sleep delivery was not exercised on that
     # boot -- which was every boot before the handshake.
+    # The `hosted deliver` line landed with the pipe child's handshake, so any
+    # boot that prints it has both children waiting to be signalled asleep:
+    # fewer than two deliveries to a woken call means one of them was not.
+    if name == "deliver" and values[1] < 2:
+        return f"only {values[1]} delivery(ies) met a woken call: a probe child was signalled before it parked"
     if name == "timed" and values[0] == 0 and run >= HANDSHAKE_RUN:
         return "no timed wait was released early: the parked-sleep delivery was not exercised"
     return None

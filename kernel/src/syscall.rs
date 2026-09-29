@@ -2505,6 +2505,7 @@ fn adapter_call(frame: &mut SyscallFrame, call: &PersonalityCall) -> Option<u64>
             [call.first(), call.second(), call.third(), call.fourth()],
             first,
         )?;
+        let answered_first = first;
         first = false;
         match answer.0 {
             // **The adapter needs more than a message can carry.** Some Linux
@@ -2525,6 +2526,7 @@ fn adapter_call(frame: &mut SyscallFrame, call: &PersonalityCall) -> Option<u64>
                         restore_from_slot(frame, slot);
                         crate::fault::give_back(slot);
                         RESTORED.fetch_add(1, Ordering::Relaxed);
+                        note_delivery(call.number, answered_first);
                         return Some(frame.kind);
                     }
                     Some((_, value, _)) => Some(value),
@@ -2541,6 +2543,7 @@ fn adapter_call(frame: &mut SyscallFrame, call: &PersonalityCall) -> Option<u64>
                 restore_from_slot(frame, slot);
                 crate::fault::give_back(slot);
                 RESTORED.fetch_add(1, Ordering::Relaxed);
+                note_delivery(call.number, answered_first);
                 return Some(frame.kind);
             }
             // Acts on the *caller* that only the kernel can perform, chosen by
@@ -2747,7 +2750,52 @@ const USER_FLAGS: u64 = 0x0000_0CD5;
 /// How many callers the adapter resumed from a register image rather than
 /// answering with a value — which is what `rt_sigreturn` is, counted where
 /// the kernel performs it because that is the only side that can see it now.
+///
+/// **And what a signal delivery is too**, which this comment did not say:
+/// since RFC 0083 the adapter answers a delivery `RESTORE` with the frame it
+/// rewrote to enter the handler (`bin/linuxd`'s `deliver_signal_after_call`),
+/// so this counts entries into handlers as well as returns from them. See
+/// [`deliveries_by_ask`] for the split that excludes `rt_sigreturn`.
 pub static RESTORED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Signal deliveries, split by whether the call had been **woken first**.
+///
+/// **Because "delivered to a parked call" had no reading.** A frame rewritten
+/// to enter a handler is a `RESTORE` on any call but `rt_sigreturn`; what the
+/// count could not say is *when* the signal met the call. On the first ask it
+/// was already pending as the call was made -- the adapter delivered at once,
+/// whether the call would have finished or parked. On a **retry** the call had
+/// parked, a wake brought it back, and the adapter delivered on re-asking:
+/// the path RFC 0083's probe acts describe, "woken to catch it". The killer
+/// probe's `nanosleep` child read 0 early releases on every boot until it was
+/// made to wait for its child (2026-09-29); its pipe child has had no reading
+/// at all, and this is it.
+static DELIVERED_ON_FIRST: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static DELIVERED_ON_RETRY: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// The Linux number of `rt_sigreturn`, whose `RESTORE` is a return from a
+/// handler rather than an entry into one.
+const RT_SIGRETURN: u64 = 15;
+
+fn note_delivery(number: u64, answered_first: bool) {
+    if number == RT_SIGRETURN {
+        return;
+    }
+    if answered_first {
+        DELIVERED_ON_FIRST.fetch_add(1, Ordering::Relaxed);
+    } else {
+        DELIVERED_ON_RETRY.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// `(delivered on the first ask, delivered on a retry after a wake)`.
+#[must_use]
+pub fn deliveries_by_ask() -> (u64, u64) {
+    (
+        DELIVERED_ON_FIRST.load(Ordering::Relaxed),
+        DELIVERED_ON_RETRY.load(Ordering::Relaxed),
+    )
+}
 
 /// Asks the adapter one question, blocking this thread until it answers.
 ///
