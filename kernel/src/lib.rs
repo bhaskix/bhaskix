@@ -4954,6 +4954,15 @@ fn personality_boundary_report() {
              named, and none in the nucleus"
         );
     }
+    // **RFC 0085: a futex sleeper comes back for its answer.** Printed every
+    // boot and gated: the clone test's parent sleeps in a futex and is woken
+    // by its child, so a boot that ran it and reads zero here has a dead
+    // return path and the old one still answering.
+    let returned = syscall::FUTEX_ANSWERED_ON_RETURN.load(core::sync::atomic::Ordering::Relaxed);
+    println!(
+        "    futex return   {returned} futex sleeper(s) came back to the adapter for their answer \
+         after a wake"
+    );
     // **The window the `FS` base fix of 2026-08-29 did not close**, printed
     // because the fault it belongs to is still open. `sched::set_fs_base` can
     // only write the register of the CPU it runs on; a target running on

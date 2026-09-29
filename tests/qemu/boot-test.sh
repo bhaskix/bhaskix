@@ -2411,6 +2411,19 @@ else
     status=1
 fi
 
+# **RFC 0085: the woken sleeper above came back to the adapter for its
+# answer.** The clone test passing says the parent came back; it does not say
+# *how*, and a futex answered by the nucleus alone passes it just as well --
+# which is the path that let the futex wake give a slot back before its sleeper
+# had taken the wake. At least one sleeper answered on its return, or the new
+# path is dead.
+if grep -qE "futex return +[1-9][0-9]* futex sleeper\(s\) came back to the adapter for their answer" "$LOG"; then
+    pass "RFC 0085: a woken futex sleeper came back to the adapter for its answer"
+else
+    fail "no futex sleeper came back to the adapter for its answer: the return path did not run"
+    status=1
+fi
+
 # RFC 0005 step 6: the futex contract's edges, which is where the RFC says a
 # subtle mistake does not produce an error but a deadlock under load. A WAIT
 # whose word has already changed must refuse to sleep; a WAKE with nobody

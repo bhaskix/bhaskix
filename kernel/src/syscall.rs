@@ -2695,7 +2695,17 @@ fn adapter_call(frame: &mut SyscallFrame, call: &PersonalityCall) -> Option<u64>
                 );
                 crate::sched::exit()
             }
-            _ => return Some(answer.1),
+            _ => {
+                // **A futex sleeper answered when it came back** -- RFC 0085.
+                // A value on a retry is exactly that: the call parked, a wake
+                // brought it back, and the adapter answered it. Counted here,
+                // on the nucleus's side, so the reading does not depend on the
+                // adapter reporting its own fix.
+                if !answered_first && call.number == LINUX_FUTEX {
+                    FUTEX_ANSWERED_ON_RETURN.fetch_add(1, Ordering::Relaxed);
+                }
+                return Some(answer.1);
+            }
         }
     }
     // Sixteen parks for one call: whatever the adapter is waiting for is not
@@ -2776,6 +2786,15 @@ static DELIVERED_ON_RETRY: core::sync::atomic::AtomicU64 = core::sync::atomic::A
 /// The Linux number of `rt_sigreturn`, whose `RESTORE` is a return from a
 /// handler rather than an entry into one.
 const RT_SIGRETURN: u64 = 15;
+
+/// The Linux number of `futex`.
+const LINUX_FUTEX: u64 = 202;
+
+/// Futex calls answered with a value on a retry: sleepers that parked, were
+/// woken, and came back to the adapter for their answer -- RFC 0085. Zero on a
+/// boot that ran the clone test would mean the return path is dead and the old
+/// one still answering.
+pub static FUTEX_ANSWERED_ON_RETURN: AtomicU64 = AtomicU64::new(0);
 
 fn note_delivery(number: u64, answered_first: bool) {
     if number == RT_SIGRETURN {

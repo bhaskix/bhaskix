@@ -117,6 +117,10 @@ struct Sleeper {
     /// *oldest* — Linux does not promise an order, but a queue that always
     /// woke the newest can starve a waiter for ever under contention.
     arrived: u64,
+    /// A `WAKE` has signalled this sleeper and it has not yet come back for
+    /// its answer -- RFC 0085. The record keeps its slot until then, and a
+    /// woken record is no longer a match for another `WAKE`.
+    woken: bool,
 }
 
 /// There is nothing to unwind and nowhere useful to print to.
@@ -3813,6 +3817,7 @@ static mut SLEEPERS: [Sleeper; WAKES] = [Sleeper {
     domain: 0,
     address: 0,
     arrived: 0,
+    woken: false,
 }; WAKES];
 
 /// Counts arrivals, so a `WAKE` of one takes the oldest sleeper.
@@ -4269,6 +4274,8 @@ enum ParkKind {
     Pipe = 1,
     /// A `wait4` for a child that has not exited.
     Wait = 2,
+    /// A `futex(WAIT)` -- RFC 0085.
+    Futex = 3,
 }
 
 /// The wake slots parked callers hold, keyed by **thread**: `slot + 1` in bits
@@ -7589,6 +7596,7 @@ fn claim_wake() -> Option<usize> {
         domain: u32::MAX,
         address: 0,
         arrived: 0,
+        woken: false,
     };
     Some(index)
 }
@@ -7618,6 +7626,21 @@ fn answer_futex(request: &PersonalityCall) -> (u64, Answer) {
 
     match plan_futex(request.first(), request.second(), request.third()) {
         FutexPlan::Wait { address, expected } => {
+            // **A sleeper coming back for its answer** -- RFC 0085. A thread
+            // that is parked cannot make another call, so a `Futex` slot held
+            // for this thread means this is the return from its own park.
+            let returning = take_slot(ParkKind::Futex, request.domain, request.thread);
+            if let Some(slot) = returning {
+                let table = sleepers();
+                if table[slot].woken {
+                    table[slot].woken = false;
+                    release_wake(slot);
+                    return (REPLY_VALUE, Answer::ok(0));
+                }
+                // Not woken by a `WAKE` -- by a signal, or spuriously. The word
+                // decides, below, and the slot is reused if it parks again.
+            }
+            let mut held = HeldSlot(returning);
             let mut word = [0u8; 4];
             if !copy_in(request.domain, address, &mut word) {
                 return (REPLY_VALUE, Answer::error(-14)); // EFAULT
@@ -7634,17 +7657,28 @@ fn answer_futex(request: &PersonalityCall) -> (u64, Answer) {
                 *counter
             };
             let table = sleepers();
-            let Some(slot) = table.iter().position(|s| s.domain == 0) else {
-                // Every notification is spoken for. A refusal a caller can
-                // act on beats a sleeper the adapter cannot account for.
-                return (REPLY_VALUE, Answer::error(-11));
+            let slot = match held.0.take() {
+                Some(slot) => slot,
+                None => {
+                    let Some(slot) = table.iter().position(|s| s.domain == 0) else {
+                        // Every notification is spoken for. A refusal a caller can
+                        // act on beats a sleeper the adapter cannot account for.
+                        return (REPLY_VALUE, Answer::error(-11));
+                    };
+                    slot
+                }
             };
             table[slot] = Sleeper {
                 domain: request.domain + 1,
                 address,
                 arrived,
+                woken: false,
             };
-            (REPLY_BLOCK_ON, Answer::ok(WAKE_SLOT + slot as u64))
+            hold_slot(ParkKind::Futex, request.domain, request.thread, slot);
+            // `BLOCK_ON_RETRY`, not `BLOCK_ON` -- RFC 0085: the woken sleeper
+            // comes back here for its answer, which is when its slot can be
+            // given back, and which is a reply a pending signal can ride.
+            (REPLY_BLOCK_ON_RETRY, Answer::ok(WAKE_SLOT + slot as u64))
         }
         FutexPlan::Wake { address, count } => {
             let table = sleepers();
@@ -7665,11 +7699,14 @@ fn answer_futex(request: &PersonalityCall) -> (u64, Answer) {
                     method::SIGNAL,
                     [0; 4],
                 );
-                table[index].domain = 0;
+                // **Marked, not freed** -- RFC 0085. The sleeper owns its slot
+                // until it comes back; freeing it here is the defect the pipe
+                // and `wait4` wakes had. Out of the match either way, so a
+                // failed signal cannot be found again by this loop; if that
+                // sleeper does wake it is answered 0, which a futex may be.
+                table[index].domain = u32::MAX;
+                table[index].woken = true;
                 if signalled.status != status::OK {
-                    // The sleeper is unparked or unreachable either way; the
-                    // slot is freed rather than leaked, and the count says
-                    // what actually happened.
                     continue;
                 }
                 woken += 1;

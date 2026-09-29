@@ -162,6 +162,13 @@ while the other two arms counted every equivalent. **The asymmetry was the bug**
 a futex refused for a reason the other arms would have named read as silence.
 All eleven are counted now.
 
+**2026-09-29: the mechanism that closes it exists.**
+[RFC 0085](0085-a-futex-sleeper-comes-back-for-its-answer.md) has the futex
+park answer `BLOCK_ON_RETRY`, so a woken futex sleeper comes back to the
+adapter, and that return is a reply a pending signal can ride. `REPLY_BLOCK_ON`
+has no caller left. The limit is not marked closed until RFC 0085's step 2
+shows a signal delivered to a futex sleeper — a mechanism is not a proof.
+
 ## A third limit: `raise()` does not deliver before it returns (2026-09-23)
 
 **POSIX requires that a signal sent to the caller by `raise()` be delivered
