@@ -1909,7 +1909,10 @@ fi
 # domain" arm was aimed at the console, whose object id names no live domain,
 # so deleting the kind check entirely left the gate green; it is aimed at
 # `DomainControl` now, whose id is zero, and domain zero is real.
-if grep -qE "sup: supervised a running child -- mapped a page into it, wrote a word across, read it back, and was refused an unmapped address, a domain it does not hold, an oversized copy, a capability that is not a domain, a protection that does not exist, a thread that is not its own, and a second program in a domain that already has one" "$LOG"; then
+# Two lines since 2026-09-29: as one it was 329 bytes, past the 256 the
+# console keeps whole, and a kernel line landed between its two runs.
+if grep -qE "sup: supervised a running child -- mapped a page into it, wrote a word across, read it back, and was refused an unmapped address, a domain it does not hold and an oversized copy" "$LOG" \
+    && grep -qE "sup: and was refused a capability that is not a domain, a protection that does not exist, a thread that is not its own, and a second program in a domain that already has one" "$LOG"; then
     pass "a supervisor reached into a child it holds, and was refused everything it should be"
 else
     fail "the supervisor interface did not hold"
@@ -2421,6 +2424,17 @@ if grep -qE "futex return +[1-9][0-9]* futex sleeper\(s\) came back to the adapt
     pass "RFC 0085: a woken futex sleeper came back to the adapter for its answer"
 else
     fail "no futex sleeper came back to the adapter for its answer: the return path did not run"
+    status=1
+fi
+
+# **RFC 0085 step 2, which closes RFC 0083's fourth limit**: a signal sent to a
+# thread asleep in a futex nobody wakes is delivered when it wakes. Before the
+# futex park came back to the adapter, the nucleus answered the woken futex
+# itself and the signal waited for the next call -- the child's exit 96.
+if grep -qE "hosted futex +child [0-9]+, signalled 20 ms after it said it was going to sleep in a futex nobody wakes, was exited 88 by its handler" "$LOG"; then
+    pass "RFC 0085: a signal reached a thread asleep in a futex, and its handler ran"
+else
+    fail "a signal to a futex sleeper was not delivered when it woke"
     status=1
 fi
 

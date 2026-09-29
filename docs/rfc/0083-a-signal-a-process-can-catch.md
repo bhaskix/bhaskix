@@ -124,7 +124,7 @@ personality event pending" flag checked on return to ring 3 — on the hottest
 path in the system, and phrased so it does not put Linux knowledge back in the
 nucleus, which RFC 0031 gates at 0. A separate RFC.
 
-## A fourth limit: a futex wake resumes without an adapter reply (2026-09-27)
+## ~~A fourth limit~~ (closed): a futex wake resumes without an adapter reply (2026-09-27)
 
 **Delivery rides out on the adapter's reply. A hosted call answered
 `REPLY_BLOCK_ON` has none when it wakes**, so a signal pending for that domain
@@ -162,7 +162,14 @@ while the other two arms counted every equivalent. **The asymmetry was the bug**
 a futex refused for a reason the other arms would have named read as silence.
 All eleven are counted now.
 
-**2026-09-29: the mechanism that closes it exists.**
+**Closed 2026-09-29 by [RFC 0085](0085-a-futex-sleeper-comes-back-for-its-answer.md).**
+The killer probe's fourth child sleeps in a futex nobody changes or wakes and
+is signalled; its handler runs and exits 88 (`hosted futex … a signal
+delivered to a futex sleeper when it woke`, gated). Armed by answering the
+futex park `REPLY_BLOCK_ON` again, the child's futex came back with nothing
+delivered — exit 96 — which is this limit, reproduced on demand.
+
+**2026-09-29, earlier: the mechanism that closes it exists.**
 [RFC 0085](0085-a-futex-sleeper-comes-back-for-its-answer.md) has the futex
 park answer `BLOCK_ON_RETRY`, so a woken futex sleeper comes back to the
 adapter, and that return is a reply a pending signal can ride. `REPLY_BLOCK_ON`

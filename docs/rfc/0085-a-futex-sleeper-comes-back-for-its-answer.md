@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | 🔨 **Draft 2026-09-29 — step 1 built and gated, armed red.** A woken futex sleeper comes back to the adapter for its answer, and its wake slot is no longer given back before it has taken the wake. Step 2 — showing a signal delivered to a futex sleeper — is not done. The acceptance call is the project lead's. |
+| **Status** | 🔨 **Draft 2026-09-29 — both steps built and gated, each armed red.** A woken futex sleeper comes back to the adapter for its answer, its wake slot is no longer given back before it has taken the wake, and a signal sent to a futex sleeper is delivered when it wakes — RFC 0083's fourth limit, closed. The acceptance call is the project lead's. |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | userspace (`bin/linuxd`) |
 | **Milestone** | Phase 2 — the Linux personality ([RFC 0005](0005-linux-abi-compatibility.md)) |
@@ -123,7 +123,10 @@ show, and the boot measures hosted call costs already.
    the adapter, whose report record is full and which should not be the only
    witness to its own fix. First boot: `futex return 1`. Armed by switching
    the park back to `REPLY_BLOCK_ON`: 0, and the gate failed.
-2. The fourth limit: a hosted probe act that signals a futex sleeper and
-   requires its handler; RFC 0083's fourth limit is then marked closed.
+2. ✅ The fourth limit: a hosted probe act that signals a futex sleeper and
+   requires its handler; RFC 0083's fourth limit is then marked closed. The
+   killer probe's fourth child, with the same handshake as the other three:
+   its handler exits 88, gated on its own line. Armed by answering the park
+   `REPLY_BLOCK_ON` again: exit 96, the futex back with nothing delivered.
 3. `TRACKER.md`, `docs/progress.md`, and RFC 0083's fourth-limit section, in
    the same commits.

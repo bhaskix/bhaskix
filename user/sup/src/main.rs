@@ -713,12 +713,21 @@ fn supervise_child(image_bytes: u64) -> bool {
         return false;
     }
 
+    // **Two lines, each under the console's 256-byte run.** This was one line
+    // of 329 bytes, and the console service keeps a line whole only up to
+    // `MAX_CONSOLE_RUN`: past it the line goes out as two runs, and on
+    // 2026-09-29 a kernel line landed between them -- `...a thread th` then
+    // `vfs domain bin/vfsd loaded` -- and the gate that looks for the sentence
+    // failed a boot on which everything it tests had held.
     write(
         b"sup: supervised a running child -- mapped a page into it, wrote a word across, \
-read it back, and was refused an unmapped address, a domain it \
-does not hold, an oversized copy, a capability that is not a domain, a protection that \
-does not exist, a thread that is not its own, and a second program in a domain that \
-already has one\n",
+read it back, and was refused an unmapped address, a domain it does not hold and an \
+oversized copy\n",
+    );
+    write(
+        b"sup: and was refused a capability that is not a domain, a protection that does not \
+exist, a thread that is not its own, and a second program in a domain that already has \
+one\n",
     );
     true
 }

@@ -546,6 +546,51 @@ strangers:
         mov     %rax, 304(%r12)         # word 38, and word 39 is the status
         movq    $24, 120(%r12)
 
+        # ---- a child parked in a futex, woken to catch it ----
+        #
+        # **RFC 0085 step 2, and RFC 0083's fourth limit.** A futex park was
+        # the one a woken thread never came back from: the nucleus answered it
+        # itself, so a signal pending for a futex sleeper was delivered at its
+        # next call and not when it woke. RFC 0085 made the park come back to
+        # the adapter; this act is what shows a signal riding that return. The
+        # child sleeps on a private futex whose word nobody changes and nobody
+        # wakes, with the same handshake as the two children above, so only the
+        # signal can end its sleep -- and its handler exits 88, where a futex
+        # that came back without delivering would reach the exit 96 below it.
+        lea     (futex_park - inner)(%r15), %rax
+        call    *%rax
+        mov     %rax, 344(%r12)         # word 43: the child's pid
+        mov     %rax, %r13
+        movq    $25, 120(%r12)
+        test    %rax, %rax
+        jle     done
+
+        movl    0x40000070, %edi        # read(read end, &byte, 1)
+        mov     $0x40000090, %esi
+        mov     $1, %edx
+        xor     %eax, %eax
+        syscall
+        mov     $0x40000020, %edi       # nanosleep(&{0, 20 ms}, NULL)
+        xor     %esi, %esi
+        mov     $35, %eax
+        syscall
+
+        mov     %r13, %rdi              # kill(child, SIGTERM)
+        mov     $15, %esi
+        mov     $62, %eax
+        syscall
+        mov     %rax, 352(%r12)         # word 44
+        movq    $26, 120(%r12)
+
+        mov     %r13, %rdi              # wait4(child, &status, 0, 0)
+        lea     368(%r12), %rsi
+        xor     %edx, %edx
+        xor     %r10d, %r10d
+        mov     $61, %eax
+        syscall
+        mov     %rax, 360(%r12)         # word 45, and word 46 is the status
+        movq    $27, 120(%r12)
+
         movq    $0xC0FFEE, 88(%r12)     # word 11: every step above ran
 done:
         xor     %edi, %edi
@@ -690,6 +735,30 @@ catch_park:
         # above, its call **re-parks** when it is woken, so it is delivered to
         # by the arm that interrupts a call about to block rather than by the
         # one that rides out on a finished call.
+futex_park:
+        mov     $57, %eax               # fork
+        syscall
+        test    %rax, %rax
+        jz      9f
+        ret
+9:      movl    0x40000074, %edi        # write(handshake write end, &byte, 1)
+        mov     $0x40000090, %esi
+        mov     $1, %edx
+        mov     $1, %eax
+        syscall
+        mov     $0x400000a0, %edi       # futex(&word, FUTEX_WAIT_PRIVATE, 0, NULL):
+        mov     $128, %esi              # the word is 0 and nobody changes it or
+        xor     %edx, %edx              # wakes it, so only a signal ends this
+        xor     %r10d, %r10d
+        mov     $202, %eax
+        syscall
+        # Reached only if the futex returned without the handler ending this
+        # process -- the nucleus answering it alone, as it did before RFC 0085.
+        mov     $96, %edi
+        mov     $231, %eax
+        syscall
+        jmp     .
+
 pipe_park:
         mov     $57, %eax               # fork
         syscall
