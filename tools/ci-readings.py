@@ -54,6 +54,10 @@ PATTERNS = {
     ),
     "identity": re.compile(r"identity +(\d+) read\(s\) of the running thread retried.*?at most (\d+)"),
     "capabilities": re.compile(r"capabilities (\d+) live before, (\d+) after"),
+    # For the TCP step-4 row: rendezvous dropped after matching and wakes that
+    # reached a partner not yet blocked; tcpd's calls dequeued, RECVs, answers.
+    "handover": re.compile(r"ipc handover\* +(\d+) rendezvous dropped after matching, (\d+) wake"),
+    "tcpd": re.compile(r"tcpd served\* +(\d+) call\(s\) dequeued, (\d+) of them RECV, (\d+) answer"),
 }
 
 
@@ -75,6 +79,10 @@ def departs(name: str, values: tuple[int, ...]) -> str | None:
         return f"{values[0]} raised, {values[1]} delivered"
     if name == "identity" and values[0] != 0:
         return f"{values[0]} identity retr(ies), at most {values[1]} in one read"
+    if name == "handover" and values[0] != 0:
+        return f"{values[0]} rendezvous dropped after matching"
+    if name == "tcpd" and values[0] != values[2]:
+        return f"tcpd dequeued {values[0]} call(s) and answered {values[2]}"
     if name == "capabilities" and values[0] != values[1]:
         return f"capabilities {values[0]} before, {values[1]} after"
     if name == "timed" and values[2] != 0:
