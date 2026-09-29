@@ -20983,7 +20983,10 @@ fn report_tcp_client(hhdm: u64) {
     }
     if outcome == 9 || outcome == 8 || outcome == 10 || outcome == 11 || outcome == 12 {
         println!("    tcp client     {said}");
-    } else if outcome == 2 && detail == bhaskix_abi::tcp::WAIT_ENTERED {
+    } else if outcome == 2
+        && (detail == bhaskix_abi::tcp::WAIT_ENTERED
+            || bhaskix_abi::tcp::waiting_in(detail).is_some())
+    {
         // **And what the scheduler says that thread is doing**, which the
         // program itself cannot: it writes nothing while it is inside the call.
         // `Blocked` is a thread parked in the rendezvous, waiting for a reply
@@ -20993,10 +20996,32 @@ fn report_tcp_client(hhdm: u64) {
         // **It reached the wait and the first question did not come back.**
         // `bin/tcpc` publishes this before asking the service anything, so the
         // program is inside `stream_state` rather than short of it.
-        println!(
-            "\x1b[91m    tcp client     FAILED at step {step}: {said} — it entered the stream \
-             wait and the first state read has not returned\x1b[0m"
-        );
+        // **Which wait, since 2026-09-29.** `WAIT_ENTERED` used to survive a
+        // first read that found the connection established, and this line read
+        // it as "the first state read has not returned" for a client that was in
+        // fact in the bulk phase -- CI run 782. The client now names the phase
+        // it waits in and the item it waits for.
+        match bhaskix_abi::tcp::waiting_in(detail) {
+            Some((phase, item)) => println!(
+                "\x1b[91m    tcp client     FAILED past step {step}: {said} — it is waiting in \
+                 the {} phase for {} {item} to come back, and bin/tcpc waits up to 60 s for \
+                 each while this report gave up after 15\x1b[0m",
+                if phase == bhaskix_abi::tcp::PHASE_ECHO {
+                    "echo"
+                } else {
+                    "bulk"
+                },
+                if phase == bhaskix_abi::tcp::PHASE_ECHO {
+                    "round"
+                } else {
+                    "chunk"
+                },
+            ),
+            None => println!(
+                "\x1b[91m    tcp client     FAILED at step {step}: {said} — it entered the \
+                 stream wait and the first state read has not returned\x1b[0m"
+            ),
+        }
         // **And what the scheduler says that thread is doing**, which the
         // program itself cannot: it writes nothing while it is inside the call.
         // `Blocked` is a thread parked in the rendezvous, waiting for a reply

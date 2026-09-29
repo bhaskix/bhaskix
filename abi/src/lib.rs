@@ -1376,6 +1376,35 @@ pub mod tcp {
     /// call did not come back, and anything else is a completed pass.
     pub const WAIT_ENTERED: u64 = u64::MAX;
 
+    /// Marks the detail word as "waiting in a later phase": the phase in bits
+    /// 32-39, the item it waits for in bits 0-31.
+    ///
+    /// **Because `WAIT_ENTERED` was the last thing the step-4 loop said.** A
+    /// first read that found the connection already established left the loop
+    /// without writing anything, so the word kept `WAIT_ENTERED` through the
+    /// echoes and the bulk phase, and a client waiting there -- up to sixty
+    /// seconds per chunk, four times the report's patience -- was reported as
+    /// stuck in its first state read. CI run 782 read that way, and a day's
+    /// reasoning about lost deadlines was built on it (2026-09-29).
+    pub const WAITING_IN: u64 = 0xA000_0000_0000_0000;
+
+    /// The echo phase: sixteen-byte round trips, item = the round.
+    pub const PHASE_ECHO: u64 = 6;
+
+    /// The bulk phase: chunks in flight, item = the chunk awaited (or the
+    /// chunk count, for the final drain).
+    pub const PHASE_BULK: u64 = 7;
+
+    /// `(phase, item)` if `detail` carries [`WAITING_IN`].
+    #[must_use]
+    pub const fn waiting_in(detail: u64) -> Option<(u64, u64)> {
+        if detail & 0xF000_0000_0000_0000 == WAITING_IN {
+            Some(((detail >> 32) & 0xff, detail & 0xffff_ffff))
+        } else {
+            None
+        }
+    }
+
     /// Open a connection.
     ///
     /// Invoked on a capability to the TCP service's endpoint. `arg0` is the

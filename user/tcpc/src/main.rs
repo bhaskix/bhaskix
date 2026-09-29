@@ -441,6 +441,12 @@ extern "C" fn tcpc_main(hertz: u64) -> ! {
     loop {
         let (s, _) = stream_state(5);
         state = s;
+        // **Every completed pass is recorded, the first included** -- a first
+        // read that already found the connection established used to break
+        // here without writing, leaving `WAIT_ENTERED` to be read as "the first
+        // read never returned" for the rest of the run. See
+        // `bhaskix_abi::tcp::WAITING_IN`.
+        report_word(3, u64::from(bounded + 1) << 32 | state);
         if state == STATE_ESTABLISHED {
             break;
         }
@@ -493,6 +499,10 @@ extern "C" fn tcpc_main(hertz: u64) -> ! {
         // no calls on the wait path. The consuming RECV afterwards reports
         // the read bytes so the window reopens, off the clock.
         let expected = PAYLOAD[PAYLOAD.len() - 1];
+        report_word(
+            3,
+            abi_tcp::WAITING_IN | abi_tcp::PHASE_ECHO << 32 | index as u64,
+        );
         if !recv_view.wait_for(sent_bytes - 1, expected, WAKE, &pace, 600) {
             report(6, outcome::STUCK, 0);
             exit();
@@ -544,6 +554,7 @@ extern "C" fn tcpc_main(hertz: u64) -> ! {
         if chunk >= depth {
             let awaited = chunk - depth;
             let at = bulk_base + (awaited + 1) * CHUNK - 1;
+            report_word(3, abi_tcp::WAITING_IN | abi_tcp::PHASE_BULK << 32 | awaited);
             if !recv_view.wait_for(at, (awaited as u8).wrapping_add(1), WAKE, &pace, 600) {
                 report(7, outcome::STUCK, awaited);
                 exit();
@@ -564,6 +575,7 @@ extern "C" fn tcpc_main(hertz: u64) -> ! {
         sent_bytes += CHUNK;
     }
     {
+        report_word(3, abi_tcp::WAITING_IN | abi_tcp::PHASE_BULK << 32 | CHUNKS);
         if !recv_view.wait_for(
             sent_bytes - 1,
             (CHUNKS as u8 - 1).wrapping_add(1),
