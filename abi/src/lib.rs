@@ -1357,7 +1357,7 @@ pub mod tcp {
     /// past its own slice and *the boot died before printing anything at all* --
     /// the comment beside that count still records it. One constant, used by the
     /// writer's array and the reader's slice, cannot drift.
-    pub const REPORT_WORDS: usize = 19;
+    pub const REPORT_WORDS: usize = 21;
 
     /// What `bin/tcpc` puts in its detail word on reaching the stream wait,
     /// before it has asked the service anything.

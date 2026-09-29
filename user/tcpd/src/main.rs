@@ -1808,6 +1808,10 @@ fn report(
         RECV_SEEN.load(core::sync::atomic::Ordering::Relaxed),
         REPLIES_MADE.load(core::sync::atomic::Ordering::Relaxed),
         LAST_METHOD.load(core::sync::atomic::Ordering::Relaxed),
+        // Nineteen and twenty: the outbound connection's send side -- see
+        // `SEND_HELD`.
+        SEND_HELD.load(core::sync::atomic::Ordering::Relaxed),
+        SEND_WINDOW.load(core::sync::atomic::Ordering::Relaxed),
     ];
 
     // SAFETY: the page this program mapped writable, which nothing else
@@ -1820,6 +1824,22 @@ fn report(
         core::ptr::write_volatile(REPORT_AT as *mut u64, words[0]);
     }
 }
+
+/// The outbound connection's bytes held unsent (high half) and sent but not
+/// yet acknowledged (low half), as of the last report.
+///
+/// **For the TCP step-4 row, whose CI run 782 is a bulk phase that never came
+/// back**: this service sent about sixty-six fewer segments than a healthy
+/// boot and its last answered call was the client's `SEND`, so it accepted
+/// the data and did not put it on the wire. Held unsent against a window of
+/// zero is the peer's doing; held unsent against an open window is this
+/// service's send path stalling; in flight with retransmissions climbing is
+/// segments lost on the way.
+static SEND_HELD: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// The peer's advertised window (bits 8 and up) and the retransmissions of
+/// the oldest unacknowledged segment (low byte), as of the last report.
+static SEND_WINDOW: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// Bits in the report's state word.
 mod state_bits {
@@ -1968,6 +1988,19 @@ extern "C" fn tcpd_main(hertz: u64) -> ! {
                 .is_some_and(|connection| connection.tcb.state == state::State::Established)
         {
             service.outcome = outcome::ESTABLISHED;
+        }
+        // **The outbound connection's send side**, for the step-4 row -- see
+        // `SEND_HELD`.
+        if let Some(connection) = service.connections[OUTBOUND].as_ref() {
+            let tcb = &connection.tcb;
+            SEND_HELD.store(
+                (u64::from(tcb.unsent()) << 32) | u64::from(tcb.in_flight()),
+                core::sync::atomic::Ordering::Relaxed,
+            );
+            SEND_WINDOW.store(
+                (u64::from(tcb.snd_wnd) << 8) | u64::from(tcb.retransmits),
+                core::sync::atomic::Ordering::Relaxed,
+            );
         }
         report(
             bits,

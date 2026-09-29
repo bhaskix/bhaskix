@@ -21430,6 +21430,18 @@ fn report_tcp_cookies_late(hhdm: u64) {
         buffer.copy_from_slice(&bytes[(15 + index) * 8..(15 + index) * 8 + 8]);
         *word = u64::from_le_bytes(buffer);
     }
+    // **The outbound connection's send side**, words nineteen and twenty --
+    // see `bin/tcpd`'s `SEND_HELD`. For the step-4 row's run 782, where the
+    // service accepted the bulk data and sent about sixty-six fewer segments
+    // than a healthy boot: held unsent against a zero window is the peer's
+    // doing, held unsent against an open one is the service's send path, and
+    // in flight with retransmissions climbing is segments lost on the way.
+    let mut send = [0u64; 2];
+    for (index, word) in send.iter_mut().enumerate() {
+        let mut buffer = [0u8; 8];
+        buffer.copy_from_slice(&bytes[(19 + index) * 8..(19 + index) * 8 + 8]);
+        *word = u64::from_le_bytes(buffer);
+    }
     // **The two rendezvous counters the step-4 verdict prints, on every boot**,
     // because until now they were printed only on failure and so had no
     // baseline -- and this tree disagreed with itself about what a non-zero
@@ -21469,6 +21481,14 @@ fn report_tcp_cookies_late(hhdm: u64) {
                 _ => "another method",
             },
         }
+    );
+    println!(
+        "    tcpd send*     {} byte(s) held unsent, {} in flight, the peer's window {}, {} \
+         retransmission(s) of the oldest",
+        send[0] >> 32,
+        send[0] & 0xffff_ffff,
+        send[1] >> 8,
+        send[1] & 0xff,
     );
 }
 
@@ -30492,6 +30512,27 @@ fn domain_self_test(hhdm_base: u64, cpus: u32) -> bool {
     // asked here is "is it over" rather than "did this call end it".
     let over = |id| domain::destroy(id) || !matches!(domain::state_of(id), Ok(None));
     let destroyed = over(lonely) && over(crowded);
+    // **Wait for the teardown to finish before counting it.** A domain reads as
+    // ended the moment `domain::end` marks it dead under the table lock, and
+    // its root capability is revoked only after that lock is released and its
+    // children are torn down. The burners usually end these domains from
+    // another CPU as their last thread exits, so a count taken at once can land
+    // in that gap and see a root that is about to go -- which is what the
+    // capability row's sightings were: a 50 ms pause injected into that gap
+    // failed this test on the next boot, naming both domains' roots, made at
+    // `domain::create`. Every capability did come back, a moment later.
+    //
+    // Bounded at a second, and **how long it took is printed**, so a slow
+    // teardown stays visible instead of being waited out silently. A real leak
+    // still fails: its count never comes back.
+    let settle_started = bhaskix_arch::tsc::read();
+    let settled = wait_until(|| cap::live() <= capabilities_before, 1_000);
+    let settle_micros = bhaskix_arch::tsc::hertz().map_or(0, |hertz| {
+        bhaskix_arch::tsc::read()
+            .saturating_sub(settle_started)
+            .saturating_mul(1_000_000)
+            / hertz.max(1)
+    });
     // **The count and the capabilities it counts, from one hold of the arena**
     // -- so a failing line below can name what is still live rather than only
     // how many. See `cap::CapNode::site`.
@@ -30541,7 +30582,13 @@ fn domain_self_test(hhdm_base: u64, cpus: u32) -> bool {
     // instrument that only speaks when something else has already failed is not
     // an instrument.
     println!(
-        "    domains        capabilities {capabilities_before} live before, {capabilities_after} after"
+        "    domains        capabilities {capabilities_before} live before, {capabilities_after} after \
+         ({} after {settle_micros} us of teardown)",
+        if settled {
+            "settled"
+        } else {
+            "still unsettled"
+        }
     );
 
     // Reported with its numbers, always -- the same rule the shares assertion

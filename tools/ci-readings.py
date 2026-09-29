@@ -65,6 +65,12 @@ PATTERNS = {
     # reached a partner not yet blocked; tcpd's calls dequeued, RECVs, answers.
     "handover": re.compile(r"ipc handover\* +(\d+) rendezvous dropped after matching, (\d+) wake"),
     "tcpd": re.compile(r"tcpd served\* +(\d+) call\(s\) dequeued, (\d+) of them RECV, (\d+) answer"),
+    # The outbound connection's send side: unsent, in flight, peer window,
+    # retransmissions of the oldest. Recorded, not judged: its healthy values
+    # are what this reading is for.
+    "send": re.compile(
+        r"tcpd send\* +(\d+) byte\(s\) held unsent, (\d+) in flight, the peer's window (\d+), (\d+) retransmission"
+    ),
     # Signal deliveries on the first ask, and on a retry after a park and a
     # wake -- the second is the path the killer probe's children are for.
     "deliver": re.compile(r"hosted deliver +(\d+) delivered as the call was made, (\d+) to a call"),
