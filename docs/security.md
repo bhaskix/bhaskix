@@ -437,7 +437,7 @@ statements about named functions with named tests rather than aspirations:
 
 | Rule | Enforced by | Checked by |
 |---|---|---|
-| 1 — unforgeable | `cap::CSpace`; a domain holds a slot index, never a pointer | A ring 3 program is refused a slot it was not given, before any service is reached (M6-05) |
+| 1 — unforgeable | `cap::CSpace`; a domain holds a slot index, never a pointer — resolved in the table of the caller's domain, which since 2026-09-28 is read where a migration cannot split it (`sched::lock_own_queue`; the system-call entry reads the caller's domain before re-enabling interrupts) | A ring 3 program is refused a slot it was not given, before any service is reached (M6-05). Every read of "which CPU is this" in the kernel carries a justification `tools/check-cpu-reads.py` requires — a check that the question was asked at each site, **not** a proof that each answer is right |
 | 2 — monotone derivation | `cap::Arena::derive`, one function | Exhaustive over all 64×64 rights pairs, on the host |
 | 3 — immediate transitive revocation | `cap::Arena::destroy_subtree`, a fixed-point sweep | A derivation tree is revoked at an interior node and every descendant is dead *before the call returns* — and ring 3 revokes its own derived capability and finds the next call refused (M5-07). **And for the memory they name, since 2026-08-23** — revoking a lending takes the page out of the borrower's address space and gives the address back, while leaving the lender's own mapping and the object alive ([RFC 0044](rfc/0044-revocation-that-reaches-the-mapping.md)) |
 | 4 — granter-set badges | The badge is copied from the capability by the kernel and is never read from the caller's frame | Taking the badge from the frame instead makes a service unable to tell its callers apart, which fails the gate (M5-05) |
@@ -471,6 +471,27 @@ gate that has never failed is a gate nobody has tested.
 > address free — and no plausible wrong fix passes all four. And end to end,
 > **two hosted programs read a file on the same boot**, which is a count
 > rather than a match: one is the old behaviour.
+
+> **Rule 1 had a latent hole too, found and closed 2026-09-28 — not observed.**
+> An index "means nothing outside its own CSpace" only if the kernel knows
+> whose CSpace is the caller's. It asked `sched::current_domain`, which read the
+> CPU, then took that CPU's runqueue lock, then answered with whoever was
+> running there — with interrupts on, in every system call. A caller preempted
+> between the first two steps and resumed on another CPU was answered with the
+> domain running **where it used to be**, and its index would have been looked
+> up in that domain's table. The system-call entry had the same shape one level
+> up: it decided whether a call was Linux or native, and told `bin/linuxd`
+> *which hosted process* was calling, from a per-CPU note read after interrupts
+> were back on.
+>
+> Neither was seen to fire; the window is a few instructions wide. The same
+> shape in `sched::current_thread_id` *was* seen, once in 7,837 CI boots, where
+> it wedged a scheduler self-test (CI run 761) — which is how the class was
+> found. Closed by re-reading the CPU under the lock it chose
+> (`sched::lock_own_queue`) and by reading the caller's domain before the entry
+> re-enables interrupts, and guarded against recurrence by a gate that makes
+> every CPU read in the kernel say why it cannot be split. The gate asks the
+> question; it does not answer it, and a wrong justification would pass it.
 
 ### RBAC is policy, built on this mechanism
 
