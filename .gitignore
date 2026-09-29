@@ -49,3 +49,6 @@ qemu.pid
 # Scratch reference material -- switch configs, vendor dumps. Never published:
 # these describe somebody else's production infrastructure.
 MiscDocs/
+
+# Python bytecode, which tools/ci-readings.py would otherwise leave when it imports ci-count.py.
+__pycache__/

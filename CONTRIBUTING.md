@@ -70,6 +70,12 @@ Not sure whether your idea needs an RFC? Open an issue and ask. The answer is qu
   gate prints>"` reads every failed job's log across CI history and prices it per boot. The
   ring-station row carried *"one in roughly 1200 boots"* for a fortnight; measured, it was **1 in
   225**, and people had reasoned from the wrong figure about whether a fix helped.
+- **And for what a *healthy* boot reads, use `tools/ci-readings.py`.** `ci-count.py` sees failed
+  jobs only, because a passing boot's serial never reaches its CI log. Since 2026-09-29 every boot
+  copies a few `reading` lines into the log anyway — signals raised against delivered, identity
+  retries, the domain test's capability counts, timed waits — and this tallies them across runs,
+  names any boot off the healthy baseline, and counts a boot whose log carries none as *blind*,
+  never as clean.
 - Every bug fix adds a regression test. If the bug was not testable, say what you changed to make it
   testable.
 - Describe the design decision in the PR body, not the diff.
