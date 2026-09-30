@@ -320,6 +320,76 @@ pub fn arm_pair(
     leg(listener_slot, tcp::ARM_PAIR, 0, 0, None, 2).map(|pair| pair as u32)
 }
 
+/// Opens a **new listener** on `port` — RFC 0086 step 3a — and returns its
+/// badge. The listener capability lands in `landing_slot`.
+///
+/// The way a second program listens: `bin/tcpc`'s `LISTEN` uses the service's
+/// one fixed handover, and any other caller opens its own with an open leg
+/// carrying no gift, then gifts the listener's first ring pair (legs 0 and
+/// 1), optionally the wake its connections will ring (leg 3), and completes
+/// (leg 2). The rings are the caller's memory and must not be used for
+/// anything else while the listener lives; more pairs are [`arm_pair`]'s.
+///
+/// # Errors
+///
+/// [`LegError`] from whichever leg refused — `tcp::REFUSED` in its value if
+/// the port is already held — or from declaring `landing_slot`, as
+/// `HandRefused`.
+pub fn listen_open(
+    service_slot: u64,
+    port: u16,
+    rings: (u64, u64),
+    wake: Option<(u64, u64)>,
+    landing_slot: u64,
+) -> Result<u64, LegError> {
+    let port = u64::from(port);
+    leg(service_slot, tcp::LISTEN, port, 0, None, tcp::OPEN_LEG)?;
+    leg(service_slot, tcp::LISTEN, port, 0, Some((rings.0, 0)), 0)?;
+    leg(service_slot, tcp::LISTEN, port, 0, Some((rings.1, 0)), 1)?;
+    if let Some(wake) = wake {
+        leg(service_slot, tcp::LISTEN, port, 0, Some(wake), 3)?;
+    }
+    expect(service_slot, landing_slot).map_err(LegError::HandRefused)?;
+    leg(service_slot, tcp::LISTEN, port, 0, None, 2)
+}
+
+/// Who is at the other end of a connection — RFC 0086 step 3a.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Peer {
+    /// An IPv4 peer: its address in host order, and its port.
+    V4 {
+        /// The address, as a host-order `u32`.
+        address: u32,
+        /// The port.
+        port: u16,
+    },
+    /// `::1`, the only v6 peer the service can have (RFC 0029).
+    Loopback6 {
+        /// The port.
+        port: u16,
+    },
+}
+
+/// Asks the service who is at the other end of the connection in
+/// `connection_slot`. `None` if the service would not say — a retired
+/// connection, or a word this version does not understand.
+#[must_use]
+pub fn peer(connection_slot: u64) -> Option<Peer> {
+    let reply = call(syscall::CALL, connection_slot, tcp::PEER, [0; 4]);
+    if !reply.kernel_ok() || reply.value != tcp::OK {
+        return None;
+    }
+    let port = (reply.second & 0xffff) as u16;
+    match reply.second >> 16 {
+        4 => Some(Peer::V4 {
+            address: reply.third as u32,
+            port,
+        }),
+        6 if reply.third == 1 => Some(Peer::Loopback6 { port }),
+        _ => None,
+    }
+}
+
 /// One `ACCEPT` poll on a listener.
 #[must_use]
 pub fn accept(listener_slot: u64) -> AcceptPoll {

@@ -122,6 +122,17 @@ const PAIR_GIFT_BASE: u64 = 32;
 const PAIR_AT_BASE: u64 = 0x2400_0000;
 const PAIR_STRIDE: u64 = 0x2_0000;
 
+/// Listeners at once — RFC 0086 step 3a. `bin/tcpc`'s demonstration holds
+/// one, and a hosted program's server needs its own on its own port; four is
+/// room for both and two more, refused past that.
+const MAX_LISTENERS: usize = 4;
+
+/// Where the wake a new listener's opener gifts lands: one slot per pair
+/// number, because a listener opened with `OPEN_LEG` is named by the first
+/// pair it takes until it exists. Above [`PAIR_GIFT_BASE`]'s two slots per
+/// pair.
+const LISTENER_WAKE_BASE: u64 = PAIR_GIFT_BASE + 2 * MAX_PAIRS as u64;
+
 /// Bytes in each ring, matching what the kernel granted.
 const RING_BYTES: usize = 16 * 4096;
 
@@ -548,11 +559,25 @@ struct Connection {
     pair: Option<u32>,
 }
 
-/// Where one of a listener's ring pairs is mapped.
+/// Where one of a listener's ring pairs is mapped, and whose it is.
 #[derive(Clone, Copy)]
 struct Pair {
     sendr_at: u64,
     recvr_at: u64,
+    /// The listener this pair was armed on, and returns to — RFC 0086 step
+    /// 3a. A connection's listener is its pair's owner, so neither has to
+    /// remember the other.
+    owner: usize,
+}
+
+/// What an open handover is building — RFC 0086 step 3a.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ArmTarget {
+    /// One more pair for listener `0`, via `ARM_PAIR`.
+    Pair(usize),
+    /// A new listener on port `0`, via `LISTEN` with `OPEN_LEG`: its first
+    /// pair, and the wake every connection it births will ring.
+    Listener(u16),
 }
 
 /// An `ARM_PAIR` in progress: which pair it is filling, and which of its two
@@ -563,6 +588,14 @@ struct Arming {
     pair: u32,
     send_mapped: bool,
     recv_mapped: bool,
+    /// Whether a new listener's wake has landed.
+    notified: bool,
+    target: ArmTarget,
+    /// The badge of the call that opened it — **one caller's handover at a
+    /// time**, so two clients opening at once cannot land their gifts in each
+    /// other's slots. Another caller's legs are answered `LATER`, which
+    /// `sock::tcp::leg` already retries.
+    badge: u64,
 }
 
 impl Arming {
@@ -572,7 +605,15 @@ impl Arming {
             pair: 0,
             send_mapped: false,
             recv_mapped: false,
+            notified: false,
+            target: ArmTarget::Pair(0),
+            badge: 0,
         }
+    }
+
+    /// Where a new listener's wake lands.
+    const fn wake_slot(pair: u32) -> u64 {
+        LISTENER_WAKE_BASE + pair as u64
     }
 
     /// Where pair `pair`'s ring `leg` (0 send, 1 receive) lands and maps.
@@ -646,9 +687,47 @@ struct Service {
     connections: Table<Connection, MAX_CONNECTIONS>,
     /// The slot holding the connection `CONNECT` opened, if one is live.
     outbound: Option<usize>,
-    listener: Option<Listener>,
+    /// Listeners, by index — the index is the one in each listener's badge.
+    listeners: [Option<Listener>; MAX_LISTENERS],
+    /// Which listener `LISTEN`'s own handover made — `bin/tcpc`'s, whose
+    /// rings are pair 0 at fixed addresses. Every other listener is opened
+    /// with `OPEN_LEG`.
+    legacy_listener: Option<usize>,
     /// Every ring pair a listener has been given, by number.
     pairs: [Option<Pair>; MAX_PAIRS],
+}
+
+impl Service {
+    /// The listener holding `port`, if one does.
+    fn listener_on(&self, port: Port) -> Option<usize> {
+        self.listeners
+            .iter()
+            .position(|listener| listener.as_ref().is_some_and(|l| Port(l.port) == port))
+    }
+
+    /// The listener whose capability carries `badge`, if any.
+    fn listener_badged(&self, badge: u64) -> Option<usize> {
+        self.listeners
+            .iter()
+            .position(|listener| listener.as_ref().is_some_and(|l| l.handle == badge))
+    }
+
+    /// Puts `pair` back in its owner's queue. Cannot overflow: a pair is only
+    /// ever armed or held, never both, and each queue has room for every pair.
+    fn rearm(&mut self, pair: u32) {
+        let owner = self
+            .pairs
+            .get(pair as usize)
+            .copied()
+            .flatten()
+            .map(|pair| pair.owner);
+        if let Some(listener) = owner
+            .and_then(|owner| self.listeners.get_mut(owner))
+            .and_then(Option::as_mut)
+        {
+            let _ = listener.armed.arm(pair);
+        }
+    }
 }
 
 /// Performs what one `step` asked for, against one connection's rings.
@@ -833,10 +912,8 @@ fn retire(service: &mut Service, index: usize) {
     if service.outbound == Some(index) {
         service.outbound = None;
     }
-    if let (Some(pair), Some(listener)) = (connection.pair, service.listener.as_mut()) {
-        // Cannot be full: a pair is only ever armed or held, never both, and
-        // the queue has room for every pair there is.
-        let _ = listener.armed.arm(pair);
+    if let Some(pair) = connection.pair {
+        service.rearm(pair);
     }
 }
 
@@ -1083,12 +1160,12 @@ fn accept_syn(
     if !parsed.flags.contains(Flags::SYN) || parsed.acknowledgement.is_some() || !ours {
         return Err(Unmatched::NotOurs);
     }
-    let Some(listener) = service.listener.as_ref() else {
+    let Some(listener) = service
+        .listener_on(parsed.destination)
+        .and_then(|index| service.listeners[index].as_ref())
+    else {
         return Err(Unmatched::NoListener);
     };
-    if parsed.destination != Port(listener.port) {
-        return Err(Unmatched::NoListener);
-    }
     let connection = FourTuple {
         // The address the SYN was sent to, not an assumption about which
         // of ours that was — what makes the same listener serve both
@@ -1279,10 +1356,8 @@ fn accept_cookie(
     if !ours {
         return None;
     }
-    let port = service.listener.as_ref()?.port;
-    if parsed.destination != Port(port) {
-        return None;
-    }
+    let listening = service.listener_on(parsed.destination)?;
+    let port = parsed.destination.0;
 
     let connection = FourTuple {
         local: destination,
@@ -1308,8 +1383,7 @@ fn accept_cookie(
     // refusal is only worth counting for a peer that proved it is there.
     // Finished connections go first, returning their slots and pairs.
     retire_finished(service);
-    let Some(pair) = service
-        .listener
+    let Some(pair) = service.listeners[listening]
         .as_mut()
         .and_then(|listener| listener.armed.take())
     else {
@@ -1319,18 +1393,19 @@ fn accept_cookie(
         ACK_WHILE_BUSY.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         return None;
     };
-    let Some(Pair { sendr_at, recvr_at }) = service.pairs.get(pair as usize).copied().flatten()
+    let Some(Pair {
+        sendr_at, recvr_at, ..
+    }) = service.pairs.get(pair as usize).copied().flatten()
     else {
         // A pair armed and never registered is this program's bug; put it
         // back rather than lose it, and refuse this handshake.
-        if let Some(listener) = service.listener.as_mut() {
+        if let Some(listener) = service.listeners[listening].as_mut() {
             let _ = listener.armed.arm(pair);
         }
         ACK_WHILE_BUSY.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         return None;
     };
-    let notify_slot = service
-        .listener
+    let notify_slot = service.listeners[listening]
         .as_ref()
         .and_then(|listener| listener.notify_slot);
 
@@ -1365,9 +1440,7 @@ fn accept_cookie(
     });
     let Ok(Handle { index, generation }) = born else {
         // No free slot: every one is a live connection. The pair goes back.
-        if let Some(listener) = service.listener.as_mut() {
-            let _ = listener.armed.arm(pair);
-        }
+        service.rearm(pair);
         ACK_WHILE_BUSY.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         return None;
     };
@@ -1507,6 +1580,15 @@ fn declare_gift_slot(connect: &Handover, listen: &Handover, arming: &Arming) {
         let leg = if arming.send_mapped { 1 } else { 0 };
         if !(arming.send_mapped && arming.recv_mapped) {
             let (slot, _) = Arming::place(arming.pair, leg);
+            let _ = call(syscall::INVOKE, ENDPOINT, method::EXPECT, [slot, 0, 0, 0]);
+            return;
+        }
+        // A new listener's wake, once both rings are in (RFC 0086 step 3a).
+        // A caller that sends none goes straight to leg 2 and this
+        // declaration simply goes unused -- it is only made while this
+        // caller's handover is open.
+        if matches!(arming.target, ArmTarget::Listener(_)) && !arming.notified {
+            let slot = Arming::wake_slot(arming.pair);
             let _ = call(syscall::INVOKE, ENDPOINT, method::EXPECT, [slot, 0, 0, 0]);
             return;
         }
@@ -1769,6 +1851,20 @@ fn connect_serving(
     (tcp::OK, handover.handle)
 }
 
+/// A connection's peer as `tcp::PEER` answers it: the family and port in
+/// one word, the address in the other — RFC 0086 step 3a.
+///
+/// A v6 peer is always `::1`, the only v6 address this service can be
+/// reached from (RFC 0029), so its address word is 1; the family word says
+/// which reading applies.
+fn peer_words(tuple: FourTuple) -> (u64, u64) {
+    let port = u64::from(tuple.remote_port.0);
+    match tuple.remote {
+        Address::V4(address) => ((4 << 16) | port, u64::from(address.0)),
+        Address::V6(_) => ((6 << 16) | port, 1),
+    }
+}
+
 /// Answers one `ARM_PAIR` leg on a listener — RFC 0086 step 2.
 ///
 /// [`tcp::OPEN_LEG`] picks the next unused pair and makes its slots owed, so
@@ -1776,17 +1872,40 @@ fn connect_serving(
 /// where [`Arming::place`] says, exactly as `LISTEN`'s legs map pair 0; leg 2
 /// registers the pair and arms the listener with it, answering its number.
 /// A retried leg is answered, not punished, as `connect_leg`'s are.
-fn arm_leg(arming: &mut Arming, service: &mut Service, leg: u64) -> (u64, u64) {
-    if service.listener.is_none() {
-        return (tcp::BARE, 0x40);
+fn arm_leg(
+    arming: &mut Arming,
+    service: &mut Service,
+    leg: u64,
+    target: ArmTarget,
+    badge: u64,
+) -> (u64, u64) {
+    // One caller's handover at a time. Another caller -- or this caller asking
+    // for a different target -- is told to come back; `sock::tcp::leg` retries
+    // `LATER`, so its gifts wait rather than landing in these slots.
+    if arming.open && (arming.badge != badge || arming.target != target) {
+        return (tcp::LATER, 0);
     }
     match leg {
         tcp::OPEN_LEG => {
             if arming.open {
                 return (tcp::OK, 0);
             }
+            match target {
+                ArmTarget::Pair(listener)
+                    if service.listeners.get(listener).is_some_and(Option::is_some) => {}
+                ArmTarget::Pair(_) => return (tcp::BARE, 0x40),
+                ArmTarget::Listener(port) => {
+                    // A port already held is refused before any gift moves.
+                    if service.listener_on(Port(port)).is_some() {
+                        return (tcp::REFUSED, 0);
+                    }
+                    if service.listeners.iter().all(Option::is_some) {
+                        return (tcp::CONGESTED, 1);
+                    }
+                }
+            }
             let Some(pair) = (1..MAX_PAIRS).find(|&n| service.pairs[n].is_none()) else {
-                // Every pair this listener can hold has been given: the
+                // Every pair this service can hold has been given: the
                 // table's refusal, not growth.
                 return (tcp::CONGESTED, 0);
             };
@@ -1795,6 +1914,9 @@ fn arm_leg(arming: &mut Arming, service: &mut Service, leg: u64) -> (u64, u64) {
                 pair: pair as u32,
                 send_mapped: false,
                 recv_mapped: false,
+                notified: false,
+                target,
+                badge,
             };
             (tcp::OK, 0)
         }
@@ -1820,6 +1942,31 @@ fn arm_leg(arming: &mut Arming, service: &mut Service, leg: u64) -> (u64, u64) {
                 other => (tcp::BARE, 0x100 | other << 4 | leg),
             }
         }
+        // A new listener's wake, RFC 0023's leg 3: probed by `PEEK`, as
+        // `connect_leg` probes one. An added pair inherits its listener's.
+        3 => {
+            if !arming.open || !matches!(arming.target, ArmTarget::Listener(_)) {
+                return (tcp::BARE, 0x43);
+            }
+            if arming.notified {
+                return (tcp::OK, 0);
+            }
+            match call(
+                syscall::INVOKE,
+                Arming::wake_slot(arming.pair),
+                method::PEEK,
+                [0; 4],
+            )
+            .0
+            {
+                status_word if status_word == status::OK => {
+                    arming.notified = true;
+                    (tcp::OK, 0)
+                }
+                status_word if status_word == status::NO_SUCH_CAPABILITY => (tcp::BARE, 3),
+                other => (tcp::BARE, 0x30 | other),
+            }
+        }
         2 => {
             if !(arming.open && arming.send_mapped && arming.recv_mapped) {
                 return (tcp::BARE, 2);
@@ -1827,12 +1974,50 @@ fn arm_leg(arming: &mut Arming, service: &mut Service, leg: u64) -> (u64, u64) {
             let pair = arming.pair;
             let (_, sendr_at) = Arming::place(pair, 0);
             let (_, recvr_at) = Arming::place(pair, 1);
-            service.pairs[pair as usize] = Some(Pair { sendr_at, recvr_at });
-            if let Some(listener) = service.listener.as_mut() {
-                let _ = listener.armed.arm(pair);
-            }
+            let answer = match target {
+                ArmTarget::Pair(listener) => {
+                    service.pairs[pair as usize] = Some(Pair {
+                        sendr_at,
+                        recvr_at,
+                        owner: listener,
+                    });
+                    service.rearm(pair);
+                    (tcp::OK, u64::from(pair))
+                }
+                ArmTarget::Listener(port) => {
+                    let Some(index) = service.listeners.iter().position(Option::is_none) else {
+                        return (tcp::CONGESTED, 1);
+                    };
+                    let handle = tcp::handle(index as u32, 1, true);
+                    // The capability back first: a listener nobody holds a
+                    // capability to would take connections nobody can accept.
+                    let handed = call(
+                        syscall::INVOKE,
+                        ENDPOINT,
+                        method::HAND,
+                        [ENDPOINT, rights::READ | rights::WRITE, handle, 0],
+                    );
+                    if handed.0 != status::OK {
+                        return (tcp::BARE, 0x20 | handed.0);
+                    }
+                    service.pairs[pair as usize] = Some(Pair {
+                        sendr_at,
+                        recvr_at,
+                        owner: index,
+                    });
+                    let mut armed = Armed::new();
+                    let _ = armed.arm(pair);
+                    service.listeners[index] = Some(Listener {
+                        port,
+                        handle,
+                        notify_slot: arming.notified.then_some(Arming::wake_slot(pair)),
+                        armed,
+                    });
+                    (tcp::OK, handle)
+                }
+            };
             *arming = Arming::closed();
-            (tcp::OK, u64::from(pair))
+            answer
         }
         _ => (tcp::BARE, 0x40 | leg),
     }
@@ -1855,7 +2040,9 @@ fn listen_leg_serving(
         let answer = connect_leg(handover, args[2]);
         if args[2] == 3
             && handover.notified
-            && let Some(listener) = service.listener.as_mut()
+            && let Some(listener) = service
+                .legacy_listener
+                .and_then(|index| service.listeners[index].as_mut())
         {
             listener.notify_slot = Some(handover.notify_slot);
         }
@@ -1864,25 +2051,38 @@ fn listen_leg_serving(
     if !(handover.send_mapped && handover.recv_mapped) {
         return (tcp::BARE, 2);
     }
-    if service.listener.is_none() {
+    if service.legacy_listener.is_none() {
+        // A port another listener already holds is refused.
+        if service.listener_on(Port(args[0] as u16)).is_some() {
+            return (tcp::REFUSED, 0);
+        }
+        let Some(index) = service.listeners.iter().position(Option::is_none) else {
+            return (tcp::CONGESTED, 1);
+        };
         // `LISTEN`'s own rings are pair 0, armed at once: the one pair every
         // listener had before RFC 0086 step 2, and still all a caller that
-        // never arms another needs.
+        // never arms another needs. In whichever listener slot is free --
+        // since step 3a another program's listener may have come first.
         service.pairs[0] = Some(Pair {
             sendr_at: handover.at.0,
             recvr_at: handover.at.1,
+            owner: index,
         });
         let mut armed = Armed::new();
         let _ = armed.arm(0);
-        service.listener = Some(Listener {
+        service.listeners[index] = Some(Listener {
             port: args[0] as u16,
-            handle: tcp::handle(0, 1, true),
+            handle: tcp::handle(index as u32, 1, true),
             notify_slot: handover.notified.then_some(handover.notify_slot),
             armed,
         });
+        service.legacy_listener = Some(index);
     }
-    if handover.handle == 0 {
-        handover.handle = tcp::handle(0, 1, true);
+    if let Some(listener) = service
+        .legacy_listener
+        .and_then(|index| service.listeners[index].as_ref())
+    {
+        handover.handle = listener.handle;
     }
     let handed = call(
         syscall::INVOKE,
@@ -2185,7 +2385,8 @@ extern "C" fn tcpd_main(hertz: u64) -> ! {
         cookies_offered: 0,
         connections: Table::new(),
         outbound: None,
-        listener: None,
+        listeners: [const { None }; MAX_LISTENERS],
+        legacy_listener: None,
         pairs: [None; MAX_PAIRS],
     };
     let mut arming = Arming::closed();
@@ -2333,22 +2534,35 @@ extern "C" fn tcpd_main(hertz: u64) -> ! {
                     arm_nearest(&service);
                     reply(tcp::OK, 0, 0);
                 }
+                tcp::PEER => {
+                    // RFC 0086 step 3a: who is at the other end. A hosted
+                    // `accept4` must say, and nothing else here could.
+                    let (word, address) = service
+                        .connections
+                        .get(index)
+                        .map_or((0, 0), |connection| peer_words(connection.tcb.connection));
+                    reply(tcp::OK, word, address);
+                }
                 _ => reply(tcp::LATER, 0, 0),
             }
-        } else if service
-            .listener
-            .as_ref()
-            .is_some_and(|listener| listener.handle == badge)
-        {
+        } else if let Some(listening) = service.listener_badged(badge) {
             if method_in == tcp::ACCEPT {
                 // Poll-shaped for the same reason `CONNECT` is: one reply
                 // obligation per thread. The accepted connection's
                 // capability rides the reply that says yes, into the slot
                 // the caller declared — **the oldest established connection
                 // nobody has taken**, and which ring pair it lives in.
+                // Only this listener's: a connection belongs to the listener
+                // that owns the pair it took (RFC 0086 step 3a).
+                let pairs = service.pairs;
                 let ready = service.connections.oldest(|connection| {
-                    connection.pair.is_some()
-                        && !connection.claimed
+                    connection.pair.is_some_and(|pair| {
+                        pairs
+                            .get(pair as usize)
+                            .copied()
+                            .flatten()
+                            .is_some_and(|pair| pair.owner == listening)
+                    }) && !connection.claimed
                         && connection.tcb.state == state::State::Established
                 });
                 let chosen = ready
@@ -2377,7 +2591,13 @@ extern "C" fn tcpd_main(hertz: u64) -> ! {
                     reply(tcp::LATER, 0, 0);
                 }
             } else if method_in == tcp::ARM_PAIR {
-                let (outcome_word, detail) = arm_leg(&mut arming, &mut service, args[2]);
+                let (outcome_word, detail) = arm_leg(
+                    &mut arming,
+                    &mut service,
+                    args[2],
+                    ArmTarget::Pair(listening),
+                    badge,
+                );
                 reply(outcome_word, detail, 0);
             } else {
                 reply(tcp::LATER, 0, 0);
@@ -2389,6 +2609,23 @@ extern "C" fn tcpd_main(hertz: u64) -> ! {
         } else if method_in == tcp::CONNECT6 {
             let (outcome_word, detail) =
                 connect6_leg_serving(&mut connect_handover, &mut service, args);
+            reply(outcome_word, detail, 0);
+        } else if method_in == tcp::LISTEN
+            && (args[2] == tcp::OPEN_LEG
+                || (arming.open
+                    && arming.badge == badge
+                    && arming.target == ArmTarget::Listener(args[0] as u16)))
+        {
+            // RFC 0086 step 3a: a listener opened with `OPEN_LEG`, the way a
+            // second client listens. `bin/tcpc`'s `LISTEN` never sends that
+            // leg and keeps the fixed handover below.
+            let (outcome_word, detail) = arm_leg(
+                &mut arming,
+                &mut service,
+                args[2],
+                ArmTarget::Listener(args[0] as u16),
+                badge,
+            );
             reply(outcome_word, detail, 0);
         } else if method_in == tcp::LISTEN {
             let (outcome_word, detail) =

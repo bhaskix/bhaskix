@@ -1492,8 +1492,21 @@ pub mod tcp {
     /// is `INVOKE`d, not called, and never meets this one.
     pub const ARM_PAIR: u64 = 70;
 
-    /// [`ARM_PAIR`]'s leg that carries no gift — see there.
+    /// [`ARM_PAIR`]'s leg that carries no gift — see there. Since RFC 0086
+    /// step 3a it also opens a **new listener**: `LISTEN` with `arg0` the port
+    /// and `arg2` this leg, then legs 0 and 1 (the listener's first ring
+    /// pair), an optional leg 3 (the wake every connection it births will
+    /// ring), and leg 2, which answers the listener capability into the slot
+    /// the caller declared. A second program listens this way; the fixed
+    /// `LISTEN` handover without it is kept for the first.
     pub const OPEN_LEG: u64 = 9;
+
+    /// On a connection: who is at the other end — RFC 0086 step 3a. The
+    /// reply's second word is the family (4 or 6) shifted left 16 over the
+    /// peer's port; the third is a v4 address, or 1 for `::1`, the only v6
+    /// peer the service can have (RFC 0029). A hosted `accept4` and
+    /// `getpeername` need it, and until this the service told no one.
+    pub const PEER: u64 = 71;
 
     /// `bin/tcpc`'s report word saying where its four-at-once act is —
     /// RFC 0086 step 2: one of the `FOUR_*` states below. Here rather than
@@ -1511,6 +1524,15 @@ pub mod tcp {
     pub const FOUR_DONE: u64 = 2;
     /// Stopped; [`CLIENT_FOUR_SERVED`] says where.
     pub const FOUR_FAILED: u64 = 3;
+
+    /// `bin/tcpc`'s second-listener act — RFC 0086 step 3a: one of the
+    /// `FOUR_*` states, for a listener it opens with [`OPEN_LEG`] on port 8
+    /// while its first still holds port 7.
+    pub const CLIENT_SECOND_STATE: usize = 22;
+    /// The act's result: bits 0–15 the peer's port and 16–47 its v4 address
+    /// as [`PEER`] named them; on failure, bits 56 and up the step it stopped
+    /// at.
+    pub const CLIENT_SECOND_PEER: usize = 23;
 
     /// The first four bytes of a v6 record in the rings between the
     /// protocol service and the TCP service, where a v4 record carries the

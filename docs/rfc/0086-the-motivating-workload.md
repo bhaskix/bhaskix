@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | 🔨 **Draft 2026-09-30 — steps 1 and 2 done.** The workload RFC 0005 was owed from outside is named, its gate defined, its size measured and its system calls traced; `bin/tcpd` holds a table of thirty-two connections and a listener arms ring pairs, gated by four host clients held at once. Steps 3–6 are the work. The acceptance call is the project lead's. |
+| **Status** | 🔨 **Draft 2026-09-30 — steps 1, 2 and 3a done.** The workload RFC 0005 was owed from outside is named, its gate defined, its size measured and its system calls traced; `bin/tcpd` holds a table of thirty-two connections and a listener arms ring pairs, gated by four host clients held at once. `tcpd` serves a second listener opened by any program, and names a connection's peer. Steps 3b–6 are the work. The acceptance call is the project lead's. |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | userspace (`bin/linuxd`, `bin/tcpd`), `personality`, tools |
 | **Milestone** | Phase 2 — the Linux personality ([RFC 0005](0005-linux-abi-compatibility.md)) |
@@ -187,6 +187,44 @@ lets `tcpd`'s space keep a revoked ring as scratch memory. *It does not block
 this RFC's gate:* the Go server's client of `tcpd` will be `bin/linuxd`, which
 owns the rings and outlives every hosted process.
 
+## Step 3a's record (2026-09-30): a second program can listen
+
+**Reading `tcpd` for step 3 found the adapter could not listen at all.** The
+service had one `CONNECT` handover and one `LISTEN` handover for the whole
+machine, both `bin/tcpc`'s, and its gift declaration lists the connect rings
+first — so a client that only listens has its first gift land in the connect
+slot. And no client was ever told who its peer is, which a hosted `accept4`
+must return. Step 2's "more than one listener, left for step 5" therefore
+moved here.
+
+**What landed:**
+
+- **Listeners are a table of four.** Each ring pair records the listener that
+  owns it; a connection's listener is its pair's owner; `ACCEPT` on listener
+  L hands out L's oldest; a retired pair returns to its owner.
+- **A new listener opens with `OPEN_LEG`** — `LISTEN` with the port and the
+  leg that carries no gift, then its first ring pair, an optional wake, and
+  leg 2 answering the listener capability. The open handover now **belongs to
+  the caller that opened it**: another caller's legs are answered `LATER`,
+  which `sock::tcp::leg` retries, so two programs cannot land gifts in each
+  other's slots. A port already held is refused before any gift moves.
+  `tcpc`'s fixed `LISTEN` is kept, in whichever listener slot is free.
+- **`tcp::PEER` (71)** names a connection's peer: family and port in one word,
+  a v4 address (or 1 for `::1`) in the other.
+- `sock::tcp::listen_open` and `sock::tcp::peer`.
+
+**The gate.** After its four-client act, `tcpc` opens a second listener on
+port 8 with `OPEN_LEG` while its first holds 7; the host connects to it once
+the kernel says it is ready; `PEER` must name `10.0.2.2` — `slirp`'s host — and
+the host's bytes must come back. **Armed both ways:** a table of one listener
+refuses the second (`stopped at step 1`), and a `PEER` off by one is caught by
+the address check (`stopped at step 6`).
+
+**Not done, and said:** the plan promised host tests for the listener table
+and pair ownership. That logic is `tcpd`'s own, which has no host tests, and
+it reuses no new pure structure; the boot gate and its two arms are what cover
+it.
+
 ## Design
 
 ### The gate
@@ -296,7 +334,8 @@ is printed so that the number a faster path would improve is on record first.
    pairs, `GONE` for a retired handle; four host clients held at once.
    ✅ 2026-09-30. More than one listener is left for step 5, when the Go server
    and `bin/tcpc` must listen at once.
-3. **Hosted TCP, server side** — stream sockets in `bin/linuxd` over `tcpd`,
+3. **Hosted TCP, server side** — 3a ✅ 2026-09-30: `tcpd` serves more than
+   one listener and names a peer. 3b: stream sockets in `bin/linuxd` over `tcpd`,
    with the calls and options the trace lists; gate: an assembly probe that
    listens, accepts and echoes.
 4. **`epoll`** — create, control, wait, edge- and level-triggered, parked

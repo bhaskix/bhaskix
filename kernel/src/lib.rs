@@ -20504,6 +20504,7 @@ fn report_net_after_exchange(hhdm: u64) {
     }
     report_tcp_client(hhdm);
     report_tcp_four(hhdm);
+    report_tcp_second(hhdm);
 
     // RFC 0018 step 7: what the boundary cost, counted rather than argued.
     //
@@ -20616,6 +20617,9 @@ fn start_tcp_client_domain(
         (16usize, "pair 2 receive"),
         (17usize, "pair 3 send"),
         (18usize, "pair 3 receive"),
+        // RFC 0086 step 3a: a second listener's first pair.
+        (23usize, "second listener send"),
+        (24usize, "second listener receive"),
     ] {
         let ring = shared::create(realm, TCPC_RING_BYTES)
             .map_err(|_| "a tcp client ring would not be created")?;
@@ -20680,13 +20684,13 @@ fn start_tcp_client_domain(
     // more time, which is what an effect looks like.
     match crate::time::now_nanos() {
         Some(nanos) => println!(
-            "    tcp client     bin/tcpc started at {}.{:03} ms: ten rings and two wakes its domain owns, \
+            "    tcp client     bin/tcpc started at {}.{:03} ms: twelve rings and two wakes its domain owns, \
              a badged capability to the service, and nothing wired between them by the kernel",
             nanos / 1_000_000,
             nanos % 1_000_000 / 1_000,
         ),
         None => println!(
-            "    tcp client     bin/tcpc started (no clock yet): ten rings and two wakes its domain owns, \
+            "    tcp client     bin/tcpc started (no clock yet): twelve rings and two wakes its domain owns, \
              a badged capability to the service, and nothing wired between them by the kernel"
         ),
     }
@@ -20955,6 +20959,78 @@ fn report_traced(hhdm: u64) {
     }
 }
 
+/// Where `bin/tcpc`'s report page is in the direct map, if it has one.
+fn tcpc_report_page(hhdm: u64) -> Option<u64> {
+    let raw = TCPC_REPORT.load(core::sync::atomic::Ordering::Acquire);
+    if raw == u64::MAX {
+        return None;
+    }
+    let (pages, count) = shared::frames_of(shared::MemoryId::from_u64(raw))?;
+    (count > 0).then(|| hhdm + pages[0])
+}
+
+/// Word `index` of `bin/tcpc`'s report page, at `base` from
+/// [`tcpc_report_page`]. One reader for the RFC 0086 acts' words, so the
+/// direct-map read is made — and counted against the `unsafe` budget — once.
+fn tcpc_report_word(base: u64, index: usize) -> u64 {
+    let index = index.min(bhaskix_mm::FRAME_SIZE as usize / 8 - 1);
+    // SAFETY: `base` is the first frame of the report object, through the
+    // direct map, and `index` is clamped inside that page.
+    unsafe { core::ptr::read_volatile((base + index as u64 * 8) as *const u64) }
+}
+
+/// RFC 0086 step 3a: a second listener, opened with `OPEN_LEG` on port 8
+/// while the first holds port 7, and `PEER` naming who connected to it.
+///
+/// Runs only after the four-at-once act finished, which is when the client
+/// starts it. Two lines, for the reason `report_tcp_four` gives: the host
+/// connects when it sees the first.
+fn report_tcp_second(hhdm: u64) {
+    use bhaskix_abi::tcp;
+    let Some(base) = tcpc_report_page(hhdm) else {
+        return;
+    };
+    let word = |i: usize| tcpc_report_word(base, i);
+    if word(0) != TCPC_MARKER || word(tcp::CLIENT_FOUR_STATE) != tcp::FOUR_DONE {
+        println!(
+            "    tcp second     not attempted: the client did not finish its four-at-once act"
+        );
+        return;
+    }
+    let mut announced = false;
+    for _ in 0..600u32 {
+        let state = word(tcp::CLIENT_SECOND_STATE);
+        if state == tcp::FOUR_READY && !announced {
+            println!(
+                "    tcp second     ready: a second listener opened with OPEN_LEG on port 8, the first still on 7"
+            );
+            announced = true;
+        }
+        if state == tcp::FOUR_DONE || state == tcp::FOUR_FAILED {
+            break;
+        }
+        wait_millis(100);
+    }
+    let (state, peer) = (
+        word(tcp::CLIENT_SECOND_STATE),
+        word(tcp::CLIENT_SECOND_PEER),
+    );
+    if state == tcp::FOUR_DONE {
+        let address = (peer >> 16) as u32;
+        let [a, b, c, d] = address.to_be_bytes();
+        println!(
+            "    tcp second     two listeners at once: port 8 accepted a host client, PEER named it \
+             {a}.{b}.{c}.{d}:{}, and its bytes came back",
+            peer & 0xffff
+        );
+    } else {
+        println!(
+            "\x1b[91m    tcp second     FAILED: state {state}, stopped at step {}\x1b[0m",
+            peer >> 56
+        );
+    }
+}
+
 /// RFC 0086 step 2: four host clients held at once on one listener.
 ///
 /// `bin/tcpc` runs this act after its demonstration ends (`LOOPED6`), so it is
@@ -20965,20 +21041,10 @@ fn report_traced(hhdm: u64) {
 /// one with the result.
 fn report_tcp_four(hhdm: u64) {
     use bhaskix_abi::tcp;
-    let raw = TCPC_REPORT.load(core::sync::atomic::Ordering::Acquire);
-    if raw == u64::MAX {
-        return;
-    }
-    let Some((pages, count)) = shared::frames_of(shared::MemoryId::from_u64(raw)) else {
+    let Some(base) = tcpc_report_page(hhdm) else {
         return;
     };
-    if count == 0 {
-        return;
-    }
-    let base = hhdm + pages[0];
-    // SAFETY: a frame this object owns, through the direct map; every index
-    // read here is a report word, inside its first page.
-    let word = |i: usize| unsafe { core::ptr::read_volatile((base + i as u64 * 8) as *const u64) };
+    let word = |i: usize| tcpc_report_word(base, i);
     // `LOOPED6` is the client's outcome 12: the only ending after which it goes
     // on to this act. Any other ending is reported by `report_tcp_client`.
     if word(0) != TCPC_MARKER || word(2) != 12 {

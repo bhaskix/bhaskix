@@ -77,7 +77,15 @@ fi
 while [[ "$BHASKIX_CLOSED_PORT" == "$BHASKIX_INBOUND_PORT" ]]; do
     BHASKIX_CLOSED_PORT="$(bhaskix_pick_free_port)" || BHASKIX_CLOSED_PORT=45558
 done
-export BHASKIX_INBOUND_PORT BHASKIX_CLOSED_PORT
+# RFC 0086 step 3a: a second listener, opened with `OPEN_LEG`, on guest port
+# 8 -- so the host can reach two listeners at once.
+if [[ -z "${BHASKIX_SECOND_PORT:-}" ]]; then
+    BHASKIX_SECOND_PORT="$(bhaskix_pick_free_port)" || BHASKIX_SECOND_PORT=45559
+fi
+while [[ "$BHASKIX_SECOND_PORT" == "$BHASKIX_INBOUND_PORT" || "$BHASKIX_SECOND_PORT" == "$BHASKIX_CLOSED_PORT" ]]; do
+    BHASKIX_SECOND_PORT="$(bhaskix_pick_free_port)" || BHASKIX_SECOND_PORT=45559
+done
+export BHASKIX_INBOUND_PORT BHASKIX_CLOSED_PORT BHASKIX_SECOND_PORT
 
 qemu_device_list() {
     local profile="$1"
@@ -180,7 +188,7 @@ qemu_device_list() {
                 # is why the number is stated here rather than picked in the
                 # test. `bin/ipd` forwards TCP by address and not by port, so
                 # the SYN reaches `bin/tcpd` and is answered by it.
-                -netdev "user,id=net0,restrict=on,guestfwd=tcp:10.0.2.100:9-cmd:cat,hostfwd=tcp:127.0.0.1:${BHASKIX_INBOUND_PORT:-45557}-:7,hostfwd=tcp:127.0.0.1:${BHASKIX_CLOSED_PORT:-45558}-:1234"
+                -netdev "user,id=net0,restrict=on,guestfwd=tcp:10.0.2.100:9-cmd:cat,hostfwd=tcp:127.0.0.1:${BHASKIX_INBOUND_PORT:-45557}-:7,hostfwd=tcp:127.0.0.1:${BHASKIX_CLOSED_PORT:-45558}-:1234,hostfwd=tcp:127.0.0.1:${BHASKIX_SECOND_PORT:-45559}-:8"
                 -device "virtio-net-pci,netdev=net0$suffix"
                 # **A second NIC, so that "how many ports?" has an answer other
                 # than one.** RFC 0074: a bond is a thing this system can build

@@ -67,6 +67,15 @@ const INBOUND6: u64 = 12;
 /// clients can be held at once — and the four slots their connections land in.
 const FOUR_RINGS: [(u64, u64); 3] = [(13, 14), (15, 16), (17, 18)];
 const FOUR_CONNECTIONS: [u64; 4] = [19, 20, 21, 22];
+/// RFC 0086 step 3a's act: one more ring pair, the first of a **second
+/// listener** opened with `OPEN_LEG` on its own port, and where that
+/// listener's capability and its one connection land.
+const SECOND_RINGS: (u64, u64) = (23, 24);
+const SECOND_LISTENER: u64 = 25;
+const SECOND_CONNECTION: u64 = 26;
+const SECOND_PORT: u16 = 8;
+/// The host, as `slirp` presents it to the guest: the peer `PEER` must name.
+const SLIRP_HOST: u32 = u32::from_be_bytes([10, 0, 2, 2]);
 const L_WAKE: u64 = 10;
 
 /// Where the report page maps in this program's space.
@@ -79,10 +88,13 @@ const RECVR_AT: u64 = 0x2410_0000;
 const L_SENDR_AT: u64 = 0x2420_0000;
 const L_RECVR_AT: u64 = 0x2430_0000;
 /// And the three extra pairs', send then receive, a megabyte apart as above.
-const FOUR_AT: [(u64, u64); 3] = [
+/// The fourth pair is the second listener's (RFC 0086 step 3a), kept in the
+/// same array so its views are made on the same line as the others'.
+const FOUR_AT: [(u64, u64); 4] = [
     (0x2440_0000, 0x2450_0000),
     (0x2460_0000, 0x2470_0000),
     (0x2480_0000, 0x2490_0000),
+    (0x24a0_0000, 0x24b0_0000),
 ];
 
 /// Bytes each of the four host clients sends, and must get back.
@@ -335,6 +347,7 @@ extern "C" fn tcpc_main(hertz: u64) -> ! {
     .chain(
         FOUR_RINGS
             .iter()
+            .chain(core::iter::once(&SECOND_RINGS))
             .zip(FOUR_AT.iter())
             .flat_map(|(&(send, recv), &(send_at, recv_at))| [(send, send_at), (recv, recv_at)]),
     )
@@ -997,8 +1010,84 @@ extern "C" fn tcpc_main(hertz: u64) -> ! {
     let _ = tcp::shutdown(CONNECTION6);
     let _ = tcp::shutdown(INBOUND6);
     report(19, outcome::LOOPED6, 0);
-    four_at_once(l_send_view, l_recv_view, four_views, &pace);
+    let extra = [four_views[0], four_views[1], four_views[2]];
+    if four_at_once(l_send_view, l_recv_view, extra, &pace) {
+        second_listener(four_views[3], &pace);
+    }
     exit()
+}
+
+/// RFC 0086 step 3a: a **second listener**, opened with `OPEN_LEG` on its own
+/// port while the first still holds port 7 — the way any program but this
+/// one's first `LISTEN` must listen, `bin/linuxd` among them — and `PEER`
+/// asked who connected.
+fn second_listener(pair: (RingView, RingView), pace: &Pace) {
+    let failed = |step: u64| {
+        report_word(abi_tcp::CLIENT_SECOND_PEER, step << 56);
+        report_word(abi_tcp::CLIENT_SECOND_STATE, abi_tcp::FOUR_FAILED);
+    };
+    if tcp::listen_open(
+        SERVICE,
+        SECOND_PORT,
+        SECOND_RINGS,
+        Some((L_WAKE, 2)),
+        SECOND_LISTENER,
+    )
+    .is_err()
+    {
+        return failed(1);
+    }
+    report_word(abi_tcp::CLIENT_SECOND_STATE, abi_tcp::FOUR_READY);
+    if tcp::expect(SERVICE, SECOND_CONNECTION).is_err() {
+        return failed(2);
+    }
+    let mut accepted = false;
+    for _ in 0..600u32 {
+        match tcp::accept(SECOND_LISTENER) {
+            AcceptPoll::Accepted { .. } => {
+                accepted = true;
+                break;
+            }
+            AcceptPoll::Later => news(L_WAKE, pace),
+            _ => return failed(3),
+        }
+    }
+    if !accepted {
+        return failed(4);
+    }
+    let Some(tcp::Peer::V4 { address, port }) = tcp::peer(SECOND_CONNECTION) else {
+        return failed(5);
+    };
+    if address != SLIRP_HOST || port == 0 {
+        return failed(6);
+    }
+    let mut arrived = false;
+    for _ in 0..600u32 {
+        match tcp::recv(SECOND_CONNECTION, 0) {
+            StreamPoll::Ready { delivered, .. } if delivered >= FOUR_LEN => {
+                arrived = true;
+                break;
+            }
+            StreamPoll::Ready { .. } => news(L_WAKE, pace),
+            _ => return failed(7),
+        }
+    }
+    if !arrived {
+        return failed(8);
+    }
+    let (send, recv) = pair;
+    for offset in 0..FOUR_LEN {
+        send.write(offset, recv.read(offset));
+    }
+    if tcp::send(SECOND_CONNECTION, FOUR_LEN).is_err() {
+        return failed(9);
+    }
+    let _ = tcp::shutdown(SECOND_CONNECTION);
+    report_word(
+        abi_tcp::CLIENT_SECOND_PEER,
+        (u64::from(address) << 16) | u64::from(port),
+    );
+    report_word(abi_tcp::CLIENT_SECOND_STATE, abi_tcp::FOUR_DONE);
 }
 
 /// RFC 0086 step 2: four host clients held at once on one listener.
@@ -1018,10 +1107,11 @@ fn four_at_once(
     listen_recv: RingView,
     extra: [(RingView, RingView); 3],
     pace: &Pace,
-) {
+) -> bool {
     let failed = |step: u64, detail: u64| {
         report_word(abi_tcp::CLIENT_FOUR_SERVED, step << 24 | detail);
         report_word(abi_tcp::CLIENT_FOUR_STATE, abi_tcp::FOUR_FAILED);
+        false
     };
     // Views by pair number: 0 is `LISTEN`'s own, and the service numbers each
     // armed pair; whatever number it answers is where that pair's views go.
@@ -1121,6 +1211,7 @@ fn four_at_once(
         (taken << 16) | ((accepted as u64) << 8) | echoed,
     );
     report_word(abi_tcp::CLIENT_FOUR_STATE, abi_tcp::FOUR_DONE);
+    true
 }
 
 core::arch::global_asm!(

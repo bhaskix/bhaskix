@@ -688,6 +688,32 @@ rm -f "$FOUR_VERDICT"
 ) &
 FOUR_DRIVER=$!
 
+# RFC 0086 step 3a: a second listener, opened with `OPEN_LEG` on guest port 8
+# while the first still holds 7. Connected to only once the kernel says it is
+# ready, for the reason the four-client driver gives; its sixteen bytes must
+# come back, and the guest says separately who `PEER` said connected.
+SECOND_VERDICT=$(mktemp)
+rm -f "$SECOND_VERDICT"
+(
+    until grep -aqE "tcp second +(ready|not attempted|FAILED)" "$LOG" 2>/dev/null; do
+        sleep 0.25
+    done
+    grep -aqE "tcp second +ready" "$LOG" || exit 0
+    if { exec 9<>/dev/tcp/127.0.0.1/$BHASKIX_SECOND_PORT; } 2>/dev/null; then
+        printf 'bhaskix-2nd-8-ok' >&9
+        got=$(timeout 20 dd bs=1 count=16 <&9 2>/dev/null || true)
+        exec 9>&- 9<&- || true
+        if [[ "$got" == "bhaskix-2nd-8-ok" ]]; then
+            echo "echoed" > "$SECOND_VERDICT"
+        else
+            echo "got '$got'" > "$SECOND_VERDICT"
+        fi
+    else
+        echo "could not connect" > "$SECOND_VERDICT"
+    fi
+) &
+SECOND_DRIVER=$!
+
 echo "booting ($MODE), up to ${TIMEOUT}s..."
 run_until "$LOG" "Nothing left to do at this milestone" "$TIMEOUT" "${QEMU_ARGS[@]}"
 kill "$INBOUND_DRIVER" 2>/dev/null || true
@@ -698,6 +724,8 @@ kill "$CLOSED_DRIVER" 2>/dev/null || true
 wait "$CLOSED_DRIVER" 2>/dev/null || true
 kill "$FOUR_DRIVER" 2>/dev/null || true
 wait "$FOUR_DRIVER" 2>/dev/null || true
+kill "$SECOND_DRIVER" 2>/dev/null || true
+wait "$SECOND_DRIVER" 2>/dev/null || true
 
 status=0
 
@@ -2767,6 +2795,26 @@ else
     pass "four clients at once not attempted: the client did not reach the end of its demonstration here"
 fi
 rm -f "$FOUR_VERDICT" 2>/dev/null || true
+
+# RFC 0086 step 3a's gate -- see the driver above. Demanded where the
+# four-client act passed, which is where the client goes on to this one.
+if grep -qE "tcp second +two listeners at once: port 8 accepted a host client, PEER named it 10\.0\.2\.2:[1-9][0-9]*, and its bytes came back" "$LOG"; then
+    if [[ "$(cat "$SECOND_VERDICT" 2>/dev/null)" == "echoed" ]]; then
+        pass "a second listener opened with OPEN_LEG served the host while the first held its port, and PEER named the host"
+    else
+        fail "the guest says its second listener served the host; the host says: $(cat "$SECOND_VERDICT" 2>/dev/null || echo 'nothing')"
+        status=1
+    fi
+elif grep -qE "tcp second +FAILED" "$LOG"; then
+    fail "a second listener: $(grep -aoE 'tcp second +FAILED.*' "$LOG" | head -1 | sed 's/\x1b\[[0-9;]*m//g') (host: $(cat "$SECOND_VERDICT" 2>/dev/null || echo 'nothing'))"
+    status=1
+elif grep -qE "tcp four +4 connections held at once" "$LOG"; then
+    fail "the four-client act passed and the second-listener act never reported"
+    status=1
+else
+    pass "a second listener not attempted: the four-client act did not run here"
+fi
+rm -f "$SECOND_VERDICT" 2>/dev/null || true
 
 # **RFC 0061: the port survived connections nobody accepted.**
 #
