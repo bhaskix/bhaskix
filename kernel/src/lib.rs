@@ -5297,6 +5297,61 @@ fn grant_console_wake() -> Result<usize, &'static str> {
     Ok(CONSOLE_WAKE_SLOT)
 }
 
+/// Tags a domain just created as Linux, and says which of two refusals it
+/// met if the tag would not take.
+///
+/// **Two refusals, not one** -- the lesson of the `QEMU_SMP=8` sighting on
+/// 2026-09-02, found at the socket test and applied there alone for four
+/// weeks while eighteen other self-tests kept printing "the tag was refused"
+/// for both. `with` answers `None` when the realm does not resolve, and `Err`
+/// only for `HasThreads`; on a domain created a few lines above, those are
+/// very different facts. A freshly created domain that already has threads
+/// means a previous incarnation's thread is still counted against this slot,
+/// which is a defect in domain reuse; a realm that does not resolve is one
+/// that went away.
+///
+/// On `HasThreads`, the witness: the thread the scan finds and the reuse
+/// guard's counter beside it. A `Running` thread in this slot while the
+/// counter reads zero is the exit window described on
+/// `sched::first_thread_in_domain` -- see TRACKER §3.
+///
+/// **`None` from that scan is a result, not a broken instrument.** It runs
+/// after `set_personality`'s, so a thread that was not `Finished` during the
+/// check can be `Finished` by now and no longer counted. Refused for
+/// `HasThreads` with nothing found a moment later is the window closing while
+/// it was being looked at, which is evidence for it rather than against. What
+/// would argue the other way is a thread found in a state the window does not
+/// explain, or a non-zero reuse counter, which would mean the slot was handed
+/// out while the guard that exists to prevent exactly that said no.
+///
+/// `label` is the caller's report column, padding included. Returns whether
+/// the tag took; the caller does its own cleanup and returns.
+fn tag_linux(realm: domain::DomainId, label: &str) -> bool {
+    match domain::with(realm, |owner| {
+        owner.set_personality(domain::Personality::Linux)
+    }) {
+        Some(Ok(())) => true,
+        Some(Err(error)) => {
+            let found = sched::first_thread_in_domain(realm.as_u32());
+            let counted = sched::threads_counted_in(realm.as_u32());
+            println!(
+                "\x1b[91m    {label}FAILED: a domain created three lines ago refused the Linux \
+                 tag with {error:?} -- if that is HasThreads, a previous incarnation's thread \
+                 is still counted against this slot; the scan found {found:?} and the reuse \
+                 counter reads {counted}\x1b[0m"
+            );
+            false
+        }
+        None => {
+            println!(
+                "\x1b[91m    {label}FAILED: the realm just created does not resolve, so the \
+                 domain went away between `create` and `with`\x1b[0m"
+            );
+            false
+        }
+    }
+}
+
 fn corpus_self_test(hhdm_base: u64, cpus: u32, busybox: bool) -> bool {
     // Which program the loader thread should open. Set before the spawn and
     // read once at the top of it; the two corpus runs are sequential.
@@ -5318,11 +5373,7 @@ fn corpus_self_test(hhdm_base: u64, cpus: u32, busybox: bool) -> bool {
         println!("\x1b[91m    {label}      FAILED: no domain\x1b[0m");
         return false;
     };
-    if domain::with(realm, |owner| {
-        owner.set_personality(domain::Personality::Linux)
-    }) != Some(Ok(()))
-    {
-        println!("\x1b[91m    {label}      FAILED: the tag would not set\x1b[0m");
+    if !tag_linux(realm, alloc::format!("{label}      ").as_str()) {
         return false;
     }
     // Record what *this* domain asks for, which is the L1 work queue: the
@@ -5689,11 +5740,7 @@ fn clone_rendezvous_attempt(hhdm_base: u64, cpu: u32, foreign_before: u64) -> bo
         println!("\x1b[91m    linux clone    FAILED: no domain\x1b[0m");
         return false;
     };
-    if domain::with(realm, |owner| {
-        owner.set_personality(domain::Personality::Linux)
-    }) != Some(Ok(()))
-    {
-        println!("\x1b[91m    linux clone    FAILED: the tag would not set\x1b[0m");
+    if !tag_linux(realm, "linux clone    ") {
         return false;
     }
     let options = sched::SpawnOptions::new()
@@ -6130,11 +6177,7 @@ fn thread_self_test(hhdm_base: u64, cpus: u32) -> bool {
         println!("\x1b[91m    linux futex    FAILED: no domain\x1b[0m");
         return false;
     };
-    if domain::with(realm, |owner| {
-        owner.set_personality(domain::Personality::Linux)
-    }) != Some(Ok(()))
-    {
-        println!("\x1b[91m    linux futex    FAILED: the tag would not set\x1b[0m");
+    if !tag_linux(realm, "linux futex    ") {
         return false;
     }
     let options = sched::SpawnOptions::new()
@@ -6516,11 +6559,7 @@ fn poll_self_test(hhdm_base: u64, cpus: u32) -> bool {
         println!("\x1b[91m    linux poll     FAILED: no domain\x1b[0m");
         return false;
     };
-    if domain::with(realm, |owner| {
-        owner.set_personality(domain::Personality::Linux)
-    }) != Some(Ok(()))
-    {
-        println!("\x1b[91m    linux poll     FAILED: the tag would not set\x1b[0m");
+    if !tag_linux(realm, "linux poll     ") {
         domain::destroy(realm);
         return false;
     }
@@ -6591,11 +6630,7 @@ fn memory_self_test(hhdm_base: u64, cpus: u32) -> bool {
         println!("\x1b[91m    linux memory   FAILED: no domain\x1b[0m");
         return false;
     };
-    if domain::with(realm, |owner| {
-        owner.set_personality(domain::Personality::Linux)
-    }) != Some(Ok(()))
-    {
-        println!("\x1b[91m    linux memory   FAILED: the tag would not set\x1b[0m");
+    if !tag_linux(realm, "linux memory   ") {
         return false;
     }
     let options = sched::SpawnOptions::new()
@@ -6824,11 +6859,7 @@ fn signal_self_test(hhdm_base: u64, cpus: u32) -> bool {
         println!("\x1b[91m    linux signal   FAILED: no domain\x1b[0m");
         return false;
     };
-    if domain::with(realm, |owner| {
-        owner.set_personality(domain::Personality::Linux)
-    }) != Some(Ok(()))
-    {
-        println!("\x1b[91m    linux signal   FAILED: the tag would not set\x1b[0m");
+    if !tag_linux(realm, "linux signal   ") {
         return false;
     }
     let options = sched::SpawnOptions::new()
@@ -9159,11 +9190,7 @@ fn auxv_self_test(hhdm_base: u64, cpus: u32) -> bool {
     // -- and because it proves the image is built for a domain whose every
     // system call is still refused: the stack is what a program reads
     // *before* it makes any.
-    if domain::with(realm, |owner| {
-        owner.set_personality(domain::Personality::Linux)
-    }) != Some(Ok(()))
-    {
-        println!("\x1b[91m    linux stack    FAILED: the tag would not set\x1b[0m");
+    if !tag_linux(realm, "linux stack    ") {
         return false;
     }
     let options = sched::SpawnOptions::new()
@@ -9264,11 +9291,7 @@ fn proc_self_test(hhdm_base: u64, cpus: u32) -> bool {
         println!("\x1b[91m    linux proc     FAILED: no domain\x1b[0m");
         return false;
     };
-    if domain::with(realm, |owner| {
-        owner.set_personality(domain::Personality::Linux)
-    }) != Some(Ok(()))
-    {
-        println!("\x1b[91m    linux proc     FAILED: the tag was refused\x1b[0m");
+    if !tag_linux(realm, "linux proc     ") {
         return false;
     }
     let options = sched::SpawnOptions::new()
@@ -9321,11 +9344,7 @@ fn wait_self_test(hhdm_base: u64, cpus: u32) -> bool {
         println!("\x1b[91m    linux wait     FAILED: no domain\x1b[0m");
         return false;
     };
-    if domain::with(realm, |owner| {
-        owner.set_personality(domain::Personality::Linux)
-    }) != Some(Ok(()))
-    {
-        println!("\x1b[91m    linux wait     FAILED: the tag was refused\x1b[0m");
+    if !tag_linux(realm, "linux wait     ") {
         return false;
     }
     let options = sched::SpawnOptions::new()
@@ -9383,11 +9402,7 @@ fn fork_self_test(hhdm_base: u64, cpus: u32) -> bool {
         println!("\x1b[91m    linux fork     FAILED: no domain\x1b[0m");
         return false;
     };
-    if domain::with(realm, |owner| {
-        owner.set_personality(domain::Personality::Linux)
-    }) != Some(Ok(()))
-    {
-        println!("\x1b[91m    linux fork     FAILED: the tag was refused\x1b[0m");
+    if !tag_linux(realm, "linux fork     ") {
         return false;
     }
     let options = sched::SpawnOptions::new()
@@ -9478,10 +9493,7 @@ fn a_hosted_process_ends_its_child(hhdm_base: u64, cpus: u32) -> bool {
 
     let start = |name: &'static str, entry: extern "C" fn(u64) -> !, cpu: u32| {
         let realm = domain::create(name, domain::ResourceEnvelope::new()).ok()?;
-        if domain::with(realm, |owner| {
-            owner.set_personality(domain::Personality::Linux)
-        }) != Some(Ok(()))
-        {
+        if !tag_linux(realm, "hosted kill    ") {
             return None;
         }
         let options = sched::SpawnOptions::new()
@@ -10481,11 +10493,7 @@ fn pipe_attempt(hhdm_base: u64, attempt: u32) -> Option<bool> {
         println!("\x1b[91m    linux pipe     FAILED: no domain\x1b[0m");
         return Some(false);
     };
-    if domain::with(realm, |owner| {
-        owner.set_personality(domain::Personality::Linux)
-    }) != Some(Ok(()))
-    {
-        println!("\x1b[91m    linux pipe     FAILED: the tag was refused\x1b[0m");
+    if !tag_linux(realm, "linux pipe     ") {
         return Some(false);
     }
     let parked_before = syscall::BLOCKED.load(Ordering::Relaxed);
@@ -10585,11 +10593,7 @@ fn file_self_test(hhdm_base: u64, cpus: u32) -> bool {
         println!("\x1b[91m    linux file     FAILED: no domain\x1b[0m");
         return false;
     };
-    if domain::with(realm, |owner| {
-        owner.set_personality(domain::Personality::Linux)
-    }) != Some(Ok(()))
-    {
-        println!("\x1b[91m    linux file     FAILED: the tag was refused\x1b[0m");
+    if !tag_linux(realm, "linux file     ") {
         return false;
     }
     let options = sched::SpawnOptions::new()
@@ -11191,11 +11195,9 @@ fn killed_domain_gives_its_socket_back(hhdm_base: u64, cpus: u32) -> bool {
     // 2026-09-02 that failed it recorded `[41]=0x3 [49]=0x0` for every foreign
     // call and **three** binds served where a passing boot serves four -- the
     // taker's calls never reached the adapter, which is what an untagged domain
-    // looks like from here. Every other one of the twenty-two callers of
-    // `set_personality` in this file already reads it as `!= Some(Ok(()))`.
-    let started = domain::with(leaker, |owner| {
-        owner.set_personality(domain::Personality::Linux)
-    }) == Some(Ok(()))
+    // looks like from here. Since 2026-09-30 every caller that tags a fresh
+    // domain goes through `tag_linux`, which also says which refusal it met.
+    let started = tag_linux(leaker, "socket reclaim ")
         && sched::spawn_on_with(
             CPU,
             "leaker",
@@ -11274,9 +11276,7 @@ fn killed_domain_gives_its_socket_back(hhdm_base: u64, cpus: u32) -> bool {
         same_slot = taker_slot == leaked_slot;
         // As the leaker above: the inner `Result` decides whether this domain
         // is a Linux one, and discarding it spawns a program that is not.
-        if domain::with(taker, |owner| {
-            owner.set_personality(domain::Personality::Linux)
-        }) == Some(Ok(()))
+        if tag_linux(taker, "socket reclaim ")
             && sched::spawn_on_with(
                 CPU,
                 "taker",
@@ -11530,11 +11530,7 @@ fn bell_wakes_a_poller(hhdm_base: u64, cpus: u32) -> bool {
             break;
         };
         realms[index] = Some(realm);
-        if domain::with(realm, |owner| {
-            owner.set_personality(domain::Personality::Linux)
-        }) != Some(Ok(()))
-        {
-            println!("\x1b[91m    datagram wake  FAILED: the tag would not set\x1b[0m");
+        if !tag_linux(realm, "datagram wake  ") {
             ok = false;
             break;
         }
@@ -11680,11 +11676,7 @@ fn socket_poll_self_test(hhdm_base: u64, cpus: u32) -> bool {
         println!("\x1b[91m    linux socket poll FAILED: no domain\x1b[0m");
         return false;
     };
-    if domain::with(realm, |owner| {
-        owner.set_personality(domain::Personality::Linux)
-    }) != Some(Ok(()))
-    {
-        println!("\x1b[91m    linux socket poll FAILED: the tag would not set\x1b[0m");
+    if !tag_linux(realm, "linux socket poll ") {
         domain::destroy(realm);
         return false;
     }
@@ -11826,52 +11818,11 @@ fn socket_self_test(hhdm_base: u64, cpus: u32) -> bool {
         println!("\x1b[91m    linux socket   FAILED: no domain\x1b[0m");
         return false;
     };
-    // **Two refusals, not one** — the day's lesson, applied where it was found.
-    // `with` answers `None` when the realm does not resolve, and `Err` only
-    // for `HasThreads`; on a domain created three lines above, those are very
-    // different facts. A freshly created domain that already has threads means
-    // a previous incarnation's thread is still counted against this slot, which
-    // is a defect in domain reuse; a realm that does not resolve is one that
-    // went away. The old message said "the tag was refused" for both, and for a
-    // specimen found at `QEMU_SMP=8` on 2026-09-02 it could say no more.
-    match domain::with(realm, |owner| {
-        owner.set_personality(domain::Personality::Linux)
-    }) {
-        Some(Ok(())) => {}
-        Some(Err(error)) => {
-            // The witness, just after the refusal. A count says a thread was
-            // found; this says which one and what it was doing, and prints the
-            // reuse guard's counter beside it. A `Running` thread in this slot
-            // while the counter reads zero is the exit window described on
-            // `sched::first_thread_in_domain` -- see §3.
-            //
-            // **`None` here is a result, not a broken instrument**, and it is
-            // worth saying because it will look like one. This scan runs after
-            // `set_personality`'s, so a thread that was not `Finished` during
-            // the check can be `Finished` by now and no longer counted. That
-            // outcome -- refused for `HasThreads`, nothing found a moment later
-            // -- is the window closing while it was being looked at, which is
-            // evidence for it rather than against. What would argue the other
-            // way is a thread found in a state the window does not explain, or
-            // a non-zero reuse counter, which would mean the slot was handed
-            // out while the guard that exists to prevent exactly that said no.
-            let found = sched::first_thread_in_domain(realm.as_u32());
-            let counted = sched::threads_counted_in(realm.as_u32());
-            println!(
-                "\x1b[91m    linux socket   FAILED: a domain created three lines ago refused the \
-                 Linux tag with {error:?} -- if that is HasThreads, a previous incarnation's \
-                 thread is still counted against this slot; the scan found {found:?} and the \
-                 reuse counter reads {counted}\x1b[0m"
-            );
-            return false;
-        }
-        None => {
-            println!(
-                "\x1b[91m    linux socket   FAILED: the realm just created does not resolve, so \
-                 the domain went away between `create` and `with`\x1b[0m"
-            );
-            return false;
-        }
+    // The two refusals, and the witness for the one that matters, are
+    // `tag_linux`'s -- first written here, for a specimen found at
+    // `QEMU_SMP=8` on 2026-09-02.
+    if !tag_linux(realm, "linux socket   ") {
+        return false;
     }
     let options = sched::SpawnOptions::new()
         .pinned()
@@ -12058,11 +12009,7 @@ fn list_self_test(hhdm_base: u64, cpus: u32) -> bool {
         println!("\x1b[91m    linux dir      FAILED: no domain\x1b[0m");
         return false;
     };
-    if domain::with(realm, |owner| {
-        owner.set_personality(domain::Personality::Linux)
-    }) != Some(Ok(()))
-    {
-        println!("\x1b[91m    linux dir      FAILED: the tag was refused\x1b[0m");
+    if !tag_linux(realm, "linux dir      ") {
         return false;
     }
     let options = sched::SpawnOptions::new()
@@ -12124,11 +12071,7 @@ fn exec_self_test(hhdm_base: u64, cpus: u32) -> bool {
         println!("\x1b[91m    linux exec     FAILED: no domain\x1b[0m");
         return false;
     };
-    if domain::with(realm, |owner| {
-        owner.set_personality(domain::Personality::Linux)
-    }) != Some(Ok(()))
-    {
-        println!("\x1b[91m    linux exec     FAILED: the tag was refused\x1b[0m");
+    if !tag_linux(realm, "linux exec     ") {
         return false;
     }
     let options = sched::SpawnOptions::new()
@@ -12314,11 +12257,7 @@ with {} deferred wake(s) during that write",
         println!("\x1b[91m    hosted exec    FAILED: no domain\x1b[0m");
         return false;
     };
-    if domain::with(realm, |owner| {
-        owner.set_personality(domain::Personality::Linux)
-    }) != Some(Ok(()))
-    {
-        println!("\x1b[91m    hosted exec    FAILED: the tag was refused\x1b[0m");
+    if !tag_linux(realm, "hosted exec    ") {
         return false;
     }
     let options = sched::SpawnOptions::new()
@@ -12404,11 +12343,7 @@ fn personality_self_test(hhdm_base: u64, cpus: u32) -> bool {
         println!("\x1b[91m    personality    FAILED: no domain\x1b[0m");
         return false;
     };
-    if domain::with(realm, |owner| {
-        owner.set_personality(domain::Personality::Linux)
-    }) != Some(Ok(()))
-    {
-        println!("\x1b[91m    personality    FAILED: the tag was refused\x1b[0m");
+    if !tag_linux(realm, "personality    ") {
         return false;
     }
 
