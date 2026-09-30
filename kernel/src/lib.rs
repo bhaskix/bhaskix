@@ -455,6 +455,10 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
         if word == "busybox=1" || word == "bhaskix.busybox=1" {
             STAGE_BUSYBOX.store(true, core::sync::atomic::Ordering::Relaxed);
         }
+        // `bhaskix.clients` — RFC 0086 step 4. See `HOST_CLIENTS`.
+        if word == "clients" || word == "bhaskix.clients" {
+            HOST_CLIENTS.store(true, core::sync::atomic::Ordering::Relaxed);
+        }
         // `tearprobe=<runs>` — tries to reproduce the console tear on demand
         // rather than waiting for it at one boot in twenty-five.
         // `bhaskix.lacp=<ms>` — RFC 0074 step 5. Both spellings, for the
@@ -8682,22 +8686,246 @@ const _: () = assert!(
     "the stream probe's code has grown into the address beside it"
 );
 
-/// The thread that becomes the stream probe — RFC 0086 step 3b. The socket
-/// probe's scaffolding, pointed at a server.
+/// Where the `epoll` probe's code lands in its own space.
+const EPOLL_PROBE_CODE_AT: u64 = 0x0000_0000_1a00_0000;
+
+/// The `epoll` probe, RFC 0086 step 4's witness: a hosted Linux program
+/// listens on port 11 with non-blocking descriptors and learns of the host's
+/// connection, and then of each half of its bytes, only through `epoll_wait`
+/// -- the connection watched edge-triggered and read until `EAGAIN`, as Go's
+/// netpoller does. Writes the bytes back and prints them.
+///
+/// Assembled from [`tools/probes/linux-epoller.s`](../../tools/probes/linux-epoller.s)
+/// by [`tools/probe-bytes.sh`](../../tools/probe-bytes.sh).
+#[rustfmt::skip]
+const EPOLL_PROBE_CODE: [u8; 615] = [
+    0x49, 0x89, 0xfc,                         // mov %rdi,%r12
+    0x49, 0x89, 0xf6,                         // mov %rsi,%r14
+    0xbf, 0x02, 0x00, 0x00, 0x00,             // mov $0x2,%edi
+    0xbe, 0x01, 0x08, 0x00, 0x00,             // mov $0x801,%esi
+    0x31, 0xd2,                               // xor %edx,%edx
+    0xb8, 0x29, 0x00, 0x00, 0x00,             // mov $0x29,%eax
+    0x0f, 0x05,                               // syscall
+    0xbd, 0x01, 0x00, 0x00, 0x00,             // mov $0x1,%ebp
+    0x48, 0x85, 0xc0,                         // test %rax,%rax
+    0x0f, 0x88, 0xc6, 0x01, 0x00, 0x00,       // js 1ed <fail>
+    0x49, 0x89, 0xc5,                         // mov %rax,%r13
+    0x4c, 0x89, 0xef,                         // mov %r13,%rdi
+    0x4c, 0x89, 0xf6,                         // mov %r14,%rsi
+    0xba, 0x10, 0x00, 0x00, 0x00,             // mov $0x10,%edx
+    0xb8, 0x31, 0x00, 0x00, 0x00,             // mov $0x31,%eax
+    0x0f, 0x05,                               // syscall
+    0xbd, 0x02, 0x00, 0x00, 0x00,             // mov $0x2,%ebp
+    0x48, 0x85, 0xc0,                         // test %rax,%rax
+    0x0f, 0x88, 0xa3, 0x01, 0x00, 0x00,       // js 1ed <fail>
+    0x4c, 0x89, 0xef,                         // mov %r13,%rdi
+    0xbe, 0x01, 0x00, 0x00, 0x00,             // mov $0x1,%esi
+    0xb8, 0x32, 0x00, 0x00, 0x00,             // mov $0x32,%eax
+    0x0f, 0x05,                               // syscall
+    0xbd, 0x03, 0x00, 0x00, 0x00,             // mov $0x3,%ebp
+    0x48, 0x85, 0xc0,                         // test %rax,%rax
+    0x0f, 0x88, 0x86, 0x01, 0x00, 0x00,       // js 1ed <fail>
+    0xbf, 0x00, 0x00, 0x08, 0x00,             // mov $0x80000,%edi
+    0xb8, 0x23, 0x01, 0x00, 0x00,             // mov $0x123,%eax
+    0x0f, 0x05,                               // syscall
+    0xbd, 0x04, 0x00, 0x00, 0x00,             // mov $0x4,%ebp
+    0x48, 0x85, 0xc0,                         // test %rax,%rax
+    0x0f, 0x88, 0x6c, 0x01, 0x00, 0x00,       // js 1ed <fail>
+    0x49, 0x89, 0xc7,                         // mov %rax,%r15
+    0x41, 0xc7, 0x44, 0x24, 0x40, 0x01, 0x00, 0x00, 0x00, // movl $0x1,0x40(%r12)
+    0x49, 0xc7, 0x44, 0x24, 0x44, 0x6c, 0x00, 0x00, 0x00, // movq $0x6c,0x44(%r12)
+    0x4c, 0x89, 0xff,                         // mov %r15,%rdi
+    0xbe, 0x01, 0x00, 0x00, 0x00,             // mov $0x1,%esi
+    0x4c, 0x89, 0xea,                         // mov %r13,%rdx
+    0x4d, 0x8d, 0x54, 0x24, 0x40,             // lea 0x40(%r12),%r10
+    0xb8, 0xe9, 0x00, 0x00, 0x00,             // mov $0xe9,%eax
+    0x0f, 0x05,                               // syscall
+    0xbd, 0x05, 0x00, 0x00, 0x00,             // mov $0x5,%ebp
+    0x48, 0x85, 0xc0,                         // test %rax,%rax
+    0x0f, 0x88, 0x32, 0x01, 0x00, 0x00,       // js 1ed <fail>
+    0x4c, 0x89, 0xff,                         // mov %r15,%rdi
+    0x49, 0x8d, 0xb4, 0x24, 0x80, 0x00, 0x00, 0x00, // lea 0x80(%r12),%rsi
+    0xba, 0x04, 0x00, 0x00, 0x00,             // mov $0x4,%edx
+    0x41, 0xba, 0xff, 0xff, 0xff, 0xff,       // mov $0xffffffff,%r10d
+    0xb8, 0xe8, 0x00, 0x00, 0x00,             // mov $0xe8,%eax
+    0x0f, 0x05,                               // syscall
+    0xbd, 0x06, 0x00, 0x00, 0x00,             // mov $0x6,%ebp
+    0x48, 0x85, 0xc0,                         // test %rax,%rax
+    0x0f, 0x88, 0x07, 0x01, 0x00, 0x00,       // js 1ed <fail>
+    0x74, 0xd3,                               // je bb <listener>
+    0x49, 0x83, 0xbc, 0x24, 0x84, 0x00, 0x00, 0x00, 0x6c, // cmpq $0x6c,0x84(%r12)
+    0x48, 0xc7, 0xc0, 0x12, 0xff, 0xff, 0xff, // mov $0xffffffffffffff12,%rax
+    0x0f, 0x85, 0xef, 0x00, 0x00, 0x00,       // jne 1ed <fail>
+    0x4c, 0x89, 0xef,                         // mov %r13,%rdi
+    0x31, 0xf6,                               // xor %esi,%esi
+    0x31, 0xd2,                               // xor %edx,%edx
+    0x41, 0xba, 0x00, 0x08, 0x00, 0x00,       // mov $0x800,%r10d
+    0xb8, 0x20, 0x01, 0x00, 0x00,             // mov $0x120,%eax
+    0x0f, 0x05,                               // syscall
+    0xbd, 0x07, 0x00, 0x00, 0x00,             // mov $0x7,%ebp
+    0x48, 0x85, 0xc0,                         // test %rax,%rax
+    0x0f, 0x88, 0xcd, 0x00, 0x00, 0x00,       // js 1ed <fail>
+    0x48, 0x89, 0xc3,                         // mov %rax,%rbx
+    0x41, 0xc7, 0x44, 0x24, 0x40, 0x01, 0x20, 0x00, 0x80, // movl $0x80002001,0x40(%r12)
+    0x49, 0xc7, 0x44, 0x24, 0x44, 0x63, 0x00, 0x00, 0x00, // movq $0x63,0x44(%r12)
+    0x4c, 0x89, 0xff,                         // mov %r15,%rdi
+    0xbe, 0x01, 0x00, 0x00, 0x00,             // mov $0x1,%esi
+    0x48, 0x89, 0xda,                         // mov %rbx,%rdx
+    0x4d, 0x8d, 0x54, 0x24, 0x40,             // lea 0x40(%r12),%r10
+    0xb8, 0xe9, 0x00, 0x00, 0x00,             // mov $0xe9,%eax
+    0x0f, 0x05,                               // syscall
+    0xbd, 0x08, 0x00, 0x00, 0x00,             // mov $0x8,%ebp
+    0x48, 0x85, 0xc0,                         // test %rax,%rax
+    0x0f, 0x88, 0x93, 0x00, 0x00, 0x00,       // js 1ed <fail>
+    0x45, 0x31, 0xf6,                         // xor %r14d,%r14d
+    0x4c, 0x89, 0xff,                         // mov %r15,%rdi
+    0x49, 0x8d, 0xb4, 0x24, 0x80, 0x00, 0x00, 0x00, // lea 0x80(%r12),%rsi
+    0xba, 0x04, 0x00, 0x00, 0x00,             // mov $0x4,%edx
+    0x41, 0xba, 0xff, 0xff, 0xff, 0xff,       // mov $0xffffffff,%r10d
+    0xb8, 0xe8, 0x00, 0x00, 0x00,             // mov $0xe8,%eax
+    0x0f, 0x05,                               // syscall
+    0xbd, 0x08, 0x00, 0x00, 0x00,             // mov $0x8,%ebp
+    0x48, 0x85, 0xc0,                         // test %rax,%rax
+    0x78, 0x69,                               // js 1ed <fail>
+    0x74, 0xd7,                               // je 15d <connection>
+    0x48, 0x89, 0xdf,                         // mov %rbx,%rdi
+    0x4b, 0x8d, 0x34, 0x34,                   // lea (%r12,%r14,1),%rsi
+    0xba, 0x10, 0x00, 0x00, 0x00,             // mov $0x10,%edx
+    0x44, 0x29, 0xf2,                         // sub %r14d,%edx
+    0x31, 0xc0,                               // xor %eax,%eax
+    0x0f, 0x05,                               // syscall
+    0x48, 0x83, 0xf8, 0xf5,                   // cmp $0xfffffffffffffff5,%rax
+    0x74, 0xbe,                               // je 15d <connection>
+    0xbd, 0x09, 0x00, 0x00, 0x00,             // mov $0x9,%ebp
+    0x48, 0x85, 0xc0,                         // test %rax,%rax
+    0x7e, 0x44,                               // jle 1ed <fail>
+    0x49, 0x01, 0xc6,                         // add %rax,%r14
+    0x49, 0x83, 0xfe, 0x10,                   // cmp $0x10,%r14
+    0x7c, 0xd4,                               // jl 186 <drain>
+    0x48, 0x89, 0xdf,                         // mov %rbx,%rdi
+    0x4c, 0x89, 0xe6,                         // mov %r12,%rsi
+    0xba, 0x10, 0x00, 0x00, 0x00,             // mov $0x10,%edx
+    0xb8, 0x01, 0x00, 0x00, 0x00,             // mov $0x1,%eax
+    0x0f, 0x05,                               // syscall
+    0xbf, 0x01, 0x00, 0x00, 0x00,             // mov $0x1,%edi
+    0x4c, 0x89, 0xe6,                         // mov %r12,%rsi
+    0xba, 0x10, 0x00, 0x00, 0x00,             // mov $0x10,%edx
+    0xb8, 0x01, 0x00, 0x00, 0x00,             // mov $0x1,%eax
+    0x0f, 0x05,                               // syscall
+    0x48, 0x89, 0xdf,                         // mov %rbx,%rdi
+    0xb8, 0x03, 0x00, 0x00, 0x00,             // mov $0x3,%eax
+    0x0f, 0x05,                               // syscall
+    0x31, 0xff,                               // xor %edi,%edi
+    0xb8, 0xe7, 0x00, 0x00, 0x00,             // mov $0xe7,%eax
+    0x0f, 0x05,                               // syscall
+    0xeb, 0xfe,                               // jmp 1eb <done+0x9>
+    0x48, 0xf7, 0xd8,                         // neg %rax
+    0x48, 0x8d, 0x35, 0x60, 0x00, 0x00, 0x00, // lea 0x60(%rip),%rsi # 257 <hex>
+    0x89, 0xc1,                               // mov %eax,%ecx
+    0x83, 0xe1, 0x0f,                         // and $0xf,%ecx
+    0x8a, 0x14, 0x0e,                         // mov (%rsi,%rcx,1),%dl
+    0x41, 0x88, 0x54, 0x24, 0x0d,             // mov %dl,0xd(%r12)
+    0x89, 0xc1,                               // mov %eax,%ecx
+    0xc1, 0xe9, 0x04,                         // shr $0x4,%ecx
+    0x83, 0xe1, 0x0f,                         // and $0xf,%ecx
+    0x8a, 0x14, 0x0e,                         // mov (%rsi,%rcx,1),%dl
+    0x41, 0x88, 0x54, 0x24, 0x0c,             // mov %dl,0xc(%r12)
+    0x41, 0xc7, 0x04, 0x24, 0x65, 0x70, 0x6f, 0x6c, // movl $0x6c6f7065,(%r12)
+    0x41, 0xc7, 0x44, 0x24, 0x04, 0x20, 0x66, 0x61, 0x69, // movl $0x69616620,0x4(%r12)
+    0x66, 0x41, 0xc7, 0x44, 0x24, 0x08, 0x6c, 0x20, // movw $0x206c,0x8(%r12)
+    0x8d, 0x45, 0x30,                         // lea 0x30(%rbp),%eax
+    0x41, 0x88, 0x44, 0x24, 0x0a,             // mov %al,0xa(%r12)
+    0x41, 0xc6, 0x44, 0x24, 0x0b, 0x20,       // movb $0x20,0xb(%r12)
+    0x41, 0xc6, 0x44, 0x24, 0x0e, 0x0a,       // movb $0xa,0xe(%r12)
+    0xbf, 0x01, 0x00, 0x00, 0x00,             // mov $0x1,%edi
+    0x4c, 0x89, 0xe6,                         // mov %r12,%rsi
+    0xba, 0x0f, 0x00, 0x00, 0x00,             // mov $0xf,%edx
+    0xb8, 0x01, 0x00, 0x00, 0x00,             // mov $0x1,%eax
+    0x0f, 0x05,                               // syscall
+    0xeb, 0x8b,                               // jmp 1e2 <done>
+    0x30, 0x31,                               // xor %dh,(%rcx)
+    0x32, 0x33,                               // xor (%rbx),%dh
+    0x34, 0x35,                               // xor $0x35,%al
+    0x36, 0x37,                               // ss (bad)
+    0x38, 0x39,                               // cmp %bh,(%rcx)
+    0x61,                                     // (bad)
+    0x62,                                     // .byte 0x62
+    0x63, 0x64, 0x65, 0x66,                   // movslq 0x66(%rbp,%riz,2),%esp
+];
+
+/// Where the `epoll` probe's `sockaddr_in` for `0.0.0.0:11` is placed.
+const EPOLL_PROBE_ADDRESS_AT: u64 = 1024;
+const _: () = assert!(
+    EPOLL_PROBE_CODE.len() < EPOLL_PROBE_ADDRESS_AT as usize,
+    "the epoll probe's code has grown into the address beside it"
+);
+
+/// A hosted server probe: its code, where it runs, the port it listens on,
+/// and the words its kernel lines say.
+struct ServerProbe {
+    code: &'static [u8],
+    code_at: u64,
+    address_at: u64,
+    port: u16,
+    /// The column every line of this probe starts with, fifteen wide.
+    label: &'static str,
+    /// The domain's and the thread's name.
+    name: &'static str,
+    entry: extern "C" fn(u64) -> !,
+    /// What went wrong if it never ended, for the line that says so.
+    stuck: &'static str,
+}
+
+const STREAM_PROBE: ServerProbe = ServerProbe {
+    code: &STREAM_PROBE_CODE,
+    code_at: STREAM_PROBE_CODE_AT,
+    address_at: STREAM_PROBE_ADDRESS_AT,
+    port: 10,
+    label: "linux stream   ",
+    name: "streamer",
+    entry: ring3_streamer,
+    stuck: "a blocking accept4 or read never came back",
+};
+
+const EPOLL_PROBE: ServerProbe = ServerProbe {
+    code: &EPOLL_PROBE_CODE,
+    code_at: EPOLL_PROBE_CODE_AT,
+    address_at: EPOLL_PROBE_ADDRESS_AT,
+    port: 11,
+    label: "linux epoll    ",
+    name: "epoller",
+    entry: ring3_epoller,
+    // It does come back -- with nothing, before the nucleus's park limit --
+    // and loops; what never happens is the report it waits for.
+    stuck: "epoll_wait never reported what the probe was waiting for",
+};
+
+/// The thread that becomes the stream probe — RFC 0086 step 3b.
 extern "C" fn ring3_streamer(hhdm_base: u64) -> ! {
+    enter_server_probe(hhdm_base, &STREAM_PROBE)
+}
+
+/// The thread that becomes the `epoll` probe — RFC 0086 step 4.
+extern "C" fn ring3_epoller(hhdm_base: u64) -> ! {
+    enter_server_probe(hhdm_base, &EPOLL_PROBE)
+}
+
+/// A server probe's ring 3 entry. The socket probe's scaffolding, pointed at a
+/// server; shared since step 4 so the two server probes cannot drift apart.
+fn enter_server_probe(hhdm_base: u64, probe: &ServerProbe) -> ! {
     use bhaskix_boot::VirtAddr;
     use bhaskix_mm::{Protection, VirtRange};
     use vm::AddressSpace;
 
-    const BUFFER_AT: u64 = STREAM_PROBE_CODE_AT + bhaskix_mm::FRAME_SIZE;
+    let buffer_at = probe.code_at + bhaskix_mm::FRAME_SIZE;
 
     let stop = || -> ! { sched::exit() };
     let Ok(mut space) = AddressSpace::new(hhdm_base) else {
         stop()
     };
     for (at, protection) in [
-        (STREAM_PROBE_CODE_AT, Protection::ReadExecute),
-        (BUFFER_AT, Protection::ReadWrite),
+        (probe.code_at, Protection::ReadExecute),
+        (buffer_at, Protection::ReadWrite),
     ] {
         let Some(range) = VirtRange::from_pages(VirtAddr(at), 1) else {
             stop()
@@ -8706,26 +8934,27 @@ extern "C" fn ring3_streamer(hhdm_base: u64) -> ! {
             stop()
         }
     }
-    let Some(code_pa) = space.translate(VirtAddr(STREAM_PROBE_CODE_AT)) else {
+    let Some(code_pa) = space.translate(VirtAddr(probe.code_at)) else {
         stop()
     };
-    // A `sockaddr_in` for `0.0.0.0:10`: the family little-endian, the port
-    // big-endian, the address zero -- the layout `parse_endpoint` reads.
+    // A `sockaddr_in` for `0.0.0.0` and the probe's port: the family
+    // little-endian, the port big-endian, the address zero -- the layout
+    // `parse_endpoint` reads.
     let mut address = [0u8; 16];
     address[0..2].copy_from_slice(&2u16.to_le_bytes()); // AF_INET
-    address[2..4].copy_from_slice(&10u16.to_be_bytes());
+    address[2..4].copy_from_slice(&probe.port.to_be_bytes());
     // SAFETY: a freshly mapped frame this space owns, filled through the
     // direct map; the executable mapping is never writable, and the address
     // sits past the code, which a `const` assertion above holds clear of it.
     unsafe {
         core::ptr::copy_nonoverlapping(
-            STREAM_PROBE_CODE.as_ptr(),
+            probe.code.as_ptr(),
             (hhdm_base + code_pa) as *mut u8,
-            STREAM_PROBE_CODE.len(),
+            probe.code.len(),
         );
         core::ptr::copy_nonoverlapping(
             address.as_ptr(),
-            (hhdm_base + code_pa + STREAM_PROBE_ADDRESS_AT) as *mut u8,
+            (hhdm_base + code_pa + probe.address_at) as *mut u8,
             address.len(),
         );
     }
@@ -8735,9 +8964,9 @@ extern "C" fn ring3_streamer(hhdm_base: u64) -> ! {
     // the writable page it works in and `rsi` the address beside its code.
     unsafe {
         bhaskix_arch::syscall::enter_ring3(
-            STREAM_PROBE_CODE_AT,
-            BUFFER_AT + 0x0f00,
-            [BUFFER_AT, STREAM_PROBE_CODE_AT + STREAM_PROBE_ADDRESS_AT],
+            probe.code_at,
+            buffer_at + 0x0f00,
+            [buffer_at, probe.code_at + probe.address_at],
         )
     }
 }
@@ -8750,8 +8979,21 @@ extern "C" fn ring3_streamer(hhdm_base: u64) -> ! {
 /// the probe prints them too, so the serial log carries bytes only the host
 /// could have sent.
 fn stream_self_test(hhdm_base: u64, cpus: u32) -> bool {
+    server_probe_test(hhdm_base, cpus, &STREAM_PROBE)
+}
+
+/// RFC 0086 step 4: the same, through `epoll` with non-blocking descriptors.
+/// The host harness connects to port 11 once it sees `linux epoll    started`
+/// and sends its sixteen bytes in two halves.
+fn epoll_self_test(hhdm_base: u64, cpus: u32) -> bool {
+    server_probe_test(hhdm_base, cpus, &EPOLL_PROBE)
+}
+
+/// A server probe's test, whichever probe: see [`stream_self_test`].
+fn server_probe_test(hhdm_base: u64, cpus: u32, probe: &ServerProbe) -> bool {
+    let label = probe.label;
     if cpus < 2 {
-        println!("\x1b[93m    linux stream   skipped, needs a second cpu\x1b[0m");
+        println!("\x1b[93m    {label}skipped, needs a second cpu\x1b[0m");
         return true;
     }
     const CPU: u32 = 3;
@@ -8767,41 +9009,39 @@ fn stream_self_test(hhdm_base: u64, cpus: u32) -> bool {
         }) == Some(true);
     if !machine_has_network {
         println!(
-            "    linux stream   skipped: no network this machine can drive, so there is no host to serve"
+            "    {label}skipped: no network this machine can drive, so there is no host to serve"
+        );
+        return true;
+    }
+    if !HOST_CLIENTS.load(core::sync::atomic::Ordering::Relaxed) {
+        println!(
+            "    {label}skipped: no host client was promised -- a harness that connects one boots with bhaskix.clients"
         );
         return true;
     }
     if !holds_tcp {
         println!(
-            "\x1b[91m    linux stream   FAILED: this machine has a network and the adapter holds no TCP\x1b[0m"
+            "\x1b[91m    {label}FAILED: this machine has a network and the adapter holds no TCP\x1b[0m"
         );
         return false;
     }
-    let Ok(realm) = domain::create("streamer", domain::ResourceEnvelope::new()) else {
-        println!("\x1b[91m    linux stream   FAILED: no domain\x1b[0m");
+    let Ok(realm) = domain::create(probe.name, domain::ResourceEnvelope::new()) else {
+        println!("\x1b[91m    {label}FAILED: no domain\x1b[0m");
         return false;
     };
-    if !tag_linux(realm, "linux stream   ") {
+    if !tag_linux(realm, label) {
         return false;
     }
     let options = sched::SpawnOptions::new()
         .pinned()
         .in_domain(realm.as_u32());
-    if sched::spawn_on_with(
-        CPU,
-        "streamer",
-        ring3_streamer,
-        hhdm_base,
-        hhdm_base,
-        options,
-    )
-    .is_err()
-    {
-        println!("\x1b[91m    linux stream   FAILED: the probe would not spawn\x1b[0m");
+    if sched::spawn_on_with(CPU, probe.name, probe.entry, hhdm_base, hhdm_base, options).is_err() {
+        println!("\x1b[91m    {label}FAILED: the probe would not spawn\x1b[0m");
         return false;
     }
     println!(
-        "    linux stream   started: a hosted server will listen on port 10 and wait for the host"
+        "    {label}started: a hosted server will listen on port {} and wait for the host",
+        probe.port
     );
     // Forty seconds: the host retries every half second until the probe is
     // listening, and every call the probe makes is a round trip through the
@@ -8887,12 +9127,13 @@ fn stream_self_test(hhdm_base: u64, cpus: u32) -> bool {
     // see.
     if ended {
         println!(
-            "    linux stream   the hosted server ended: what it echoed to the host is on the \
+            "    {label}the hosted server ended: what it echoed to the host is on the \
              console above, or nothing is"
         );
     } else {
         println!(
-            "\x1b[91m    linux stream   FAILED: the probe never ended -- a blocking accept4 or read never came back\x1b[0m"
+            "\x1b[91m    {label}FAILED: the probe never ended -- {}\x1b[0m",
+            probe.stuck
         );
     }
     ended
@@ -17708,6 +17949,19 @@ const HOSTED_PROGRAM: &[u8] = b"bin/hosted";
 /// it on every lane is not this file's decision to make.
 static STAGE_BUSYBOX: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
+/// Whether this boot's harness will connect a host client to the hosted
+/// server probes — `bhaskix.clients` on the command line. RFC 0086 step 4.
+///
+/// **Off unless promised**, because a server probe waits for a client and a
+/// network is not a promise that one will come: `bond-test`'s and
+/// `lacp-test`'s machines have no forward to the probes' ports, and the SR550
+/// has no harness at all. The stream probe used to *seem* not to need this: on
+/// those machines its blocking `accept` was answered `EAGAIN` by a wait that
+/// could not last, it ended, and ending looked like success. When step 4 made
+/// that wait last, `shell-test.sh iommu` waited forty seconds for nobody and
+/// failed -- which was the truth arriving, not a new defect.
+static HOST_CLIENTS: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
 /// How many bytes of BusyBox reached the disk, and how many it has.
 static BUSYBOX_STAGED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static BUSYBOX_WANTED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
@@ -26054,6 +26308,9 @@ fn user_shell(handoff: &Handoff) -> Result<(), &'static str> {
     }
     if !stream_self_test(hhdm, bhaskix_arch::percpu::online_count()) {
         println!("\x1b[91m    linux stream   FAILED\x1b[0m");
+    }
+    if !epoll_self_test(hhdm, bhaskix_arch::percpu::online_count()) {
+        println!("\x1b[91m    linux epoll    FAILED\x1b[0m");
     }
     // **Immediately after the gate it explains, and not in `kernel_main`.**
     // The first version of this was up with the other personality reports,

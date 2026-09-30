@@ -269,7 +269,11 @@ asm_budget = 3
 # the one place a view of the ring pool is made, whose claim is the mapping
 # `init` made. Every ring access after that goes through `bhaskix-sock`'s
 # `RingView`, reviewed once there, rather than a volatile loop here.
-unsafe_budget = 123
+# 124 since RFC 0086 step 4 (2026-09-30), up one: the accessor for the `epoll`
+# table in `epoll.rs`, the same single-threaded statement as every table here.
+# The TCP wake's owner and the rest of the step are an atomic and arithmetic,
+# chosen so that one line is the whole cost.
+unsafe_budget = 124
 # Up five for RFC 0005 step 9's datagram page: the volatile writes that stage
 # a payload into it, the volatile reads that take one back out, and the static
 # that remembers whether it has been mapped.

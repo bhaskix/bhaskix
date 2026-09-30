@@ -519,7 +519,9 @@ $(USER_TCPD): $(TCPD_DIR)/src/main.rs $(TCPD_DIR)/link.ld $(TCPD_DIR)/Cargo.toml
 # that needs no machine was kept in that crate while the rest of it was in the
 # kernel, and this is what that separation was for: the move changes where the
 # code runs and not what it says.
-$(USER_LINUXD): $(LINUXD_DIR)/src/main.rs $(LINUXD_DIR)/link.ld $(LINUXD_DIR)/Cargo.toml \
+# Every source file, not `main.rs` alone: until 2026-09-30 a change to
+# `stream.rs` alone rebuilt nothing, and a boot tested the previous adapter.
+$(USER_LINUXD): $(wildcard $(LINUXD_DIR)/src/*.rs) $(LINUXD_DIR)/link.ld $(LINUXD_DIR)/Cargo.toml \
               $(wildcard abi/src/*.rs) $(wildcard personality/src/*.rs) \
               $(wildcard elf/src/*.rs) $(wildcard rand/src/*.rs) $(wildcard sock/src/*.rs)
 	cd $(LINUXD_DIR) && RUSTFLAGS="$(LINUXD_FLAGS)" \

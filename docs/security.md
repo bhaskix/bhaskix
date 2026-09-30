@@ -228,6 +228,13 @@ We will not pretend to cover these. Each has a note on whether it becomes in-sco
 > service still takes only rings a caller gifts and answers only the capabilities it minted, and a
 > hosted listener or connection is a capability the *adapter* holds, never the hosted process. The
 > same price stated the same way as the network was on 2026-08-23: enumerated rather than absorbed.
+>
+> **Step 4 (`epoll`, 2026-09-30) adds no capability**, and one thing worth saying: a hosted
+> listener's connections are now **accepted by the adapter before any process asks**, because
+> `tcpd` cannot say a connection waits without handing it over. Such a connection is held in the
+> adapter's table until a process `accept`s it or its listener closes; a process never holds one it
+> did not accept, and a peer's bytes sit unread in the adapter's rings meanwhile — which is where
+> they already sat.
 
 > **[RFC 0079](rfc/0079-a-signal-a-process-may-send-another.md) added the power to *end* a hosted
 > process, on 2026-09-15, and it is the largest single widening in this list.** Everything above

@@ -291,6 +291,21 @@ if [[ "$MODE" == "iommu-off" ]]; then
     }
 fi
 
+# RFC 0086 step 4: **the one lane that promises the hosted server probes a
+# client.** Its own image, for the reason `iommu-off` has one: the command line
+# is baked in. The kernel runs the stream and `epoll` server probes only when a
+# boot says `bhaskix.clients`, because a network is not a client -- see
+# `HOST_CLIENTS` in the kernel -- and this lane is the one whose drivers below
+# connect to ports 10 and 11.
+if [[ "$MODE" == "iommu" ]]; then
+    ISO="$REPO_ROOT/build/iso-iommu-clients.iso"
+    make -C "$REPO_ROOT" iso CMDLINE="bhaskix.clients" \
+        ISO="$ISO" ISO_ROOT="$REPO_ROOT/build/iso_root_iommu_clients" >/dev/null 2>&1 || {
+        fail "could not build an image with bhaskix.clients"
+        exit 1
+    }
+fi
+
 # The machine, from `devices.sh`, which both QEMU harnesses share.
 #
 # It used to be built here and built again in `shell-test.sh`, and the two
@@ -741,6 +756,35 @@ rm -f "$HOSTED_VERDICT"
 ) &
 HOSTED_DRIVER=$!
 
+# RFC 0086 step 4: the same through `epoll`, on guest port 11 -- and the
+# sixteen bytes in **two halves a third of a second apart**, so the probe,
+# which reads edge-triggered until `EAGAIN`, only finishes if `epoll_wait`
+# reports the second half as a second edge.
+EPOLL_VERDICT=$(mktemp)
+rm -f "$EPOLL_VERDICT"
+(
+    until grep -aqE "linux epoll +(started|skipped|FAILED)" "$LOG" 2>/dev/null; do
+        sleep 0.25
+    done
+    grep -aqE "linux epoll +started" "$LOG" || exit 0
+    for _ in $(seq 1 60); do
+        if { exec 6<>/dev/tcp/127.0.0.1/$BHASKIX_EPOLL_PORT; } 2>/dev/null; then
+            printf 'bhaskix-' >&6
+            sleep 0.3
+            printf 'epoll-ok' >&6
+            got=$(timeout 10 dd bs=1 count=16 <&6 2>/dev/null || true)
+            exec 6>&- 6<&- || true
+            if [[ "$got" == "bhaskix-epoll-ok" ]]; then
+                echo "echoed" > "$EPOLL_VERDICT"
+                exit 0
+            fi
+        fi
+        sleep 0.5
+    done
+    echo "never echoed" > "$EPOLL_VERDICT"
+) &
+EPOLL_DRIVER=$!
+
 echo "booting ($MODE), up to ${TIMEOUT}s..."
 run_until "$LOG" "Nothing left to do at this milestone" "$TIMEOUT" "${QEMU_ARGS[@]}"
 kill "$INBOUND_DRIVER" 2>/dev/null || true
@@ -755,6 +799,8 @@ kill "$SECOND_DRIVER" 2>/dev/null || true
 wait "$SECOND_DRIVER" 2>/dev/null || true
 kill "$HOSTED_DRIVER" 2>/dev/null || true
 wait "$HOSTED_DRIVER" 2>/dev/null || true
+kill "$EPOLL_DRIVER" 2>/dev/null || true
+wait "$EPOLL_DRIVER" 2>/dev/null || true
 
 status=0
 
@@ -2855,6 +2901,9 @@ if grep -qE "linux stream +the hosted server ended" "$LOG"; then
         fail "the hosted server ended without serving the host: the host says $(cat "$HOSTED_VERDICT" 2>/dev/null || echo 'nothing'), its bytes are $(grep -aqF 'bhaskix-htcp-srv' "$LOG" && echo 'on' || echo 'not on') the console, and the probe said: $(grep -aoE 'htcp fail [0-9] [0-9a-f]{2}' "$LOG" | head -1 || true)"
         status=1
     fi
+elif grep -qE "linux stream +skipped" "$LOG" && [[ "$MODE" == "iommu" ]]; then
+    fail "the hosted TCP server was skipped on the lane that promises it a client: $(grep -aoE 'linux stream +skipped.*' "$LOG" | head -1 | sed -E 's/linux stream +//')"
+    status=1
 elif grep -qE "linux stream +skipped" "$LOG"; then
     pass "a hosted TCP server not attempted: $(grep -aoE 'linux stream +skipped.*' "$LOG" | head -1 | sed -E 's/linux stream +//')"
 else
@@ -2862,6 +2911,25 @@ else
     status=1
 fi
 rm -f "$HOSTED_VERDICT" 2>/dev/null || true
+
+# RFC 0086 step 4: a hosted server that learns of its client, and of each half
+# of its bytes, only through `epoll_wait`. Decided as the stream probe's is: by
+# the host's verdict and the bytes on the console, never by the probe ending.
+if grep -qE "linux epoll +the hosted server ended" "$LOG"; then
+    if [[ "$(cat "$EPOLL_VERDICT" 2>/dev/null)" == "echoed" ]] && grep -aqF "bhaskix-epoll-ok" "$LOG"; then
+        pass "a hosted Linux program served a TCP client through epoll, edge-triggered, both halves"
+    else
+        fail "the epoll server ended without serving the host: the host says $(cat "$EPOLL_VERDICT" 2>/dev/null || echo 'nothing'), its bytes are $(grep -aqF 'bhaskix-epoll-ok' "$LOG" && echo 'on' || echo 'not on') the console, and the probe said: $(grep -aoE 'epol fail [0-9] [0-9a-f]{2}' "$LOG" | head -1 || true)"
+    fi
+elif grep -qE "linux epoll +skipped" "$LOG" && [[ "$MODE" == "iommu" ]]; then
+    fail "the hosted epoll server was skipped on the lane that promises it a client: $(grep -aoE 'linux epoll +skipped.*' "$LOG" | head -1 | sed -E 's/linux epoll +//')"
+    status=1
+elif grep -qE "linux epoll +skipped" "$LOG"; then
+    pass "a hosted epoll server not attempted: $(grep -aoE 'linux epoll +skipped.*' "$LOG" | head -1 | sed -E 's/linux epoll +//')"
+else
+    fail "the hosted epoll server did not conclude: $(grep -aoE 'linux epoll.*' "$LOG" | tail -1 | sed 's/\x1b\[[0-9;]*m//g') (host: $(cat "$EPOLL_VERDICT" 2>/dev/null || echo 'nothing'))"
+fi
+rm -f "$EPOLL_VERDICT" 2>/dev/null || true
 
 # **RFC 0061: the port survived connections nobody accepted.**
 #

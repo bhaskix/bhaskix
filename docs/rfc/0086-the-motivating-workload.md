@@ -280,6 +280,91 @@ where that changes; a pair given to a listener stays with it, since `tcpd` has
 no un-listen; and the send side has no flow control the adapter can see, so a
 write is bounded to a page and trusts the peer to keep acknowledging.
 
+## Step 4's record (2026-09-30): `epoll`
+
+**What landed.** `epoll_create`, `epoll_create1`, `epoll_ctl` (`ADD`, `MOD`,
+`DEL`), `epoll_wait` and `epoll_pwait` for hosted programs. The interest set
+and its rules are `personality::epoll`, host-tested: the operations and their
+errnos, the **packed twelve-byte** `struct epoll_event` (read from the build
+host's `sys/epoll.h`, not recalled), `EPOLLONESHOT` re-armed by `MOD`, and
+**edge-triggered for real** — each interest keeps a watermark of the news it was
+last told, the adapter's count of what has happened on that descriptor, and an
+`EPOLLET` interest is reported only when the count has moved past it. Readiness
+comes from where `poll` already asks, plus hosted streams: a connection asks
+`bin/tcpd` how far the peer's stream has reached, which takes nothing, and a
+listener **accepts eagerly** into a queue of the adapter's own, because `tcpd`
+has no way to say a connection waits without handing it over. `poll` and
+`select` now answer a stream too, where step 3b said it could not tell. A
+descriptor with no count of its own (a pipe, the console) in an edge-triggered
+interest is reported as level-triggered — too often rather than never.
+
+**How a wait waits.** A set of nothing but hosted streams parks on the wake
+`tcpd` rings on every connection's news, if no other thread holds it (the
+nucleus allows one waiter), with the caller's deadline armed on it for a bounded
+wait. Anything else waits ten milliseconds at a time. **Go's netpoller will take
+the second path:** it registers a pipe or `eventfd` of its own to interrupt
+itself, which no single notification here covers. Correct, and slower than it
+will need to be; step 5 measures it.
+
+**The gate.** `tools/probes/linux-epoller.s` listens on port 11 with
+**non-blocking** descriptors, so nothing waits except `epoll_wait`, learns of
+the host's connection from it, and watches the connection
+`EPOLLIN | EPOLLRDHUP | EPOLLET`, reading until `EAGAIN` before it waits again.
+The host sends its sixteen bytes in two halves a third of a second apart, so the
+probe finishes only if the second half is reported as a second edge. **Watched
+failing:** with the connection's news pinned so no second edge could come, the
+probe read the first half, was told `EAGAIN`, and never heard again —
+`epoll_wait never reported what the probe was waiting for`. The server-probe
+harness in the kernel is now one function both probes use, so they cannot drift.
+
+**Five things building it found:**
+
+1. **The nucleus parks one hosted call at most sixteen times**, then answers the
+   thread `EAGAIN` itself without asking the adapter. An `epoll_wait` must not
+   end that way — Go treats any error but `EINTR` from it as fatal (recalled from
+   its runtime's source, not read here) — so each waiting thread's parks are
+   counted and the wait is answered **zero events** after twelve: a wait for
+   ever that returns early with nothing, which callers written against Linux's
+   spurious wake-ups already loop on.
+2. **Step 3b's blocking `accept` was answered `EAGAIN` when the host was late.**
+   Reproduced by holding the host back one second: `htcp fail 4 0b` on the
+   ten-millisecond retry, served when the wait parks on the TCP wake instead,
+   which blocking stream calls now do when they can. This is very likely the
+   intermittent failure `TRACKER.md` §3 recorded the same day, and that row says
+   what is and is not established.
+3. **A descriptor's "last holder" counted every row with the same number,
+   whatever it named.** A stream at index 0 and a file in slot 0 each kept the
+   other "held", so closing the stream never gave its connection back. Any
+   connection whose index matched a pipe, file or datagram handle its process
+   held would have leaked — inferred from the code, not seen on a boot, and
+   host-tested now. `holders` compares the kind, and for a socket the tag bits
+   a `dup` copies.
+4. **The adapter's build did not depend on its own second file.** The make rule
+   named `src/main.rs` alone, so a change to `stream.rs` rebuilt nothing and a
+   boot tested the previous adapter — found because the first attempt at the red
+   run above passed. CI builds clean and was not affected.
+5. **The stream probe had been passing on machines no client could reach.**
+   `shell-test.sh iommu`, `bond-test` and `lacp-test` boot a network with no
+   harness connecting to port 10, and step 3b's probe "passed" there because its
+   blocking `accept` was answered `EAGAIN` (finding 2) and it ended. With the
+   wait made to last, the first full suite waited forty seconds for nobody on
+   the shell lane and failed. **The server probes now run only when a boot says
+   `bhaskix.clients`** — a network is not a promise of a client, and the SR550
+   has no harness at all — and print why they skipped otherwise.
+   `boot-test.sh iommu` builds its own image with the flag, and there a skip is
+   a failure: armed by building that image without it, which failed both gates.
+   Building that arm also found the two new branches printing `FAIL` without
+   failing the script; they set the status now.
+
+**Slot pressure, measured on this boot rather than on Go:** at most 4 of 16
+deadline slots armed at once, none refused. A Go process is step 5's
+measurement, as question 2 says.
+
+**What is interim, and said in `epoll.rs`:** a set is answered only for the
+domain that made it, so a child that inherits one across `fork` is told `EINVAL`
+rather than half-sharing it; a set cannot watch another set; at most 32 events
+are reported per call and 8 sets exist machine-wide.
+
 ## Design
 
 ### The gate
@@ -384,8 +469,12 @@ is printed so that the number a faster path would improve is on record first.
    for. Which one is pinned is the lead's call; re-taking the trace with it is
    the step after that call.
 2. **Slot pools of sixteen.** Wake slots and deadline slots are sixteen each;
-   a Go process parks several futex sleepers plus its netpoller. Measured in
-   step 4 before anything is resized.
+   a Go process parks several futex sleepers plus its netpoller. ~~Measured in
+   step 4 before anything is resized.~~ Step 4's boot armed at most 4 of 16
+   deadline slots with no refusal, but it ran no Go process, so it does not
+   answer this; **measured in step 5**, which does. Also open for step 5: the
+   adapter's four timed-wait entries (`TIMED`, `UNTIL` in `bin/linuxd`), which a
+   netpoller on the retry path and several sleeping goroutines will share.
 
 ## Implementation plan
 
@@ -400,7 +489,10 @@ is printed so that the number a faster path would improve is on record first.
    with the calls and options the trace lists; gate: an assembly probe that
    listens, accepts and echoes.
 4. **`epoll`** — create, control, wait, edge- and level-triggered, parked
-   through the adapter's wake slots; slot pressure measured.
+   through the adapter's wake slots; slot pressure measured. ✅ 2026-09-30:
+   parked on `tcpd`'s wake for a set of streams, a timed retry otherwise; gate:
+   an assembly probe served through `epoll`, edge-triggered, in two halves.
+   Slot pressure under Go moves to step 5, which has the process to measure.
 5. **The server and the load** — `corpus/httpd.go`, its image, the boot flag,
    `tools/http-load.py`, `make test-http` in CI, 300 s in the soak.
 6. **Step 10's record** — the measured result against the gate, in RFC 0005

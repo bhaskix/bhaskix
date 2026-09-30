@@ -407,26 +407,41 @@ impl Table {
             // is what makes the double-release case fall out correctly: the
             // first of two `FD_CLOEXEC` duplicates sees its twin and reports
             // false, the second sees nothing and reports true.
-            let last = self.holders(entry.handle) == 0;
+            let last = self.holders(&entry) == 0;
             released(entry, last);
             closed += 1;
         }
         closed
     }
 
-    /// How many descriptors name `handle`.
+    /// How many descriptors name the same thing `like` names.
     ///
     /// **`dup` is what makes this necessary.** Two descriptors may name one
     /// open file, and whoever holds the capability behind that handle must not
     /// give it back while a second row still points at it. Linux keeps a
     /// reference count inside the file object; this crate has no objects, so
     /// the count is a question asked of the table.
+    ///
+    /// **The same thing, not the same number.** A handle is an index into
+    /// whichever pool its kind draws from — a file slot, a pipe, a datagram
+    /// slot, a stream, an `epoll` set — so two kinds' handles collide as a
+    /// matter of course. This counted every row with the same number until
+    /// 2026-09-30, so a hosted stream at index 0 and a file in slot 0 each
+    /// kept the other "still held": closing the stream never gave back its
+    /// connection. A socket's `offset` carries its tags (family, and whether
+    /// it is a stream), which a `dup` copies, so for sockets it is compared
+    /// too; for a file it is a position two duplicates may move apart, and it
+    /// is not.
     #[must_use]
-    pub fn holders(&self, handle: u64) -> usize {
+    pub fn holders(&self, like: &Entry) -> usize {
         self.entries
             .iter()
             .flatten()
-            .filter(|entry| entry.handle == handle)
+            .filter(|entry| {
+                entry.kind == like.kind
+                    && entry.handle == like.handle
+                    && (entry.kind != Kind::Socket || entry.offset == like.offset)
+            })
             .count()
     }
 
@@ -1402,18 +1417,18 @@ mod tests {
             writable: false,
         };
         let first = table.insert(entry, 0).expect("room");
-        assert_eq!(table.holders(99), 1);
+        assert_eq!(table.holders(&entry), 1);
         let (second, displaced) = table.dup3(first, first + 5, false).expect("a free number");
         assert!(displaced.is_none());
-        assert_eq!(table.holders(99), 2, "two rows name one open file");
+        assert_eq!(table.holders(&entry), 2, "two rows name one open file");
         table.close(first).expect("open");
         assert_eq!(
-            table.holders(99),
+            table.holders(&entry),
             1,
             "the capability is still named, and must not be given back"
         );
         table.close(second).expect("open");
-        assert_eq!(table.holders(99), 0, "now it may be");
+        assert_eq!(table.holders(&entry), 0, "now it may be");
     }
 
     /// The case that makes the obvious one-line fix wrong.
@@ -1439,7 +1454,7 @@ mod tests {
         let first = table.insert(entry, 0).expect("room");
         let (_second, displaced) = table.dup3(first, first + 5, true).expect("a free number");
         assert!(displaced.is_none());
-        assert_eq!(table.holders(42), 2, "two rows, one open file");
+        assert_eq!(table.holders(&entry), 2, "two rows, one open file");
 
         let mut released = std::vec::Vec::new();
         let closed = table.close_on_exec(|entry, last| released.push((entry.handle, last)));
@@ -1489,8 +1504,41 @@ mod tests {
             std::vec![(7, false)],
             "a row still names it, so the capability stays"
         );
-        assert_eq!(table.holders(7), 1);
+        assert_eq!(table.holders(&entry), 1);
         assert!(table.get(survivor).is_some(), "the survivor is still open");
+    }
+
+    /// Two kinds' handles share numbers, and must not count as each other.
+    #[test]
+    fn a_handle_number_shared_by_two_kinds_is_two_things() {
+        let mut table = Table::new();
+        let file = Entry {
+            handle: 0,
+            inode: 0,
+            kind: Kind::File,
+            close_on_exec: false,
+            offset: 0,
+            size: 10,
+            readable: true,
+            writable: false,
+        };
+        let stream = Entry {
+            kind: Kind::Socket,
+            offset: 2,
+            ..file
+        };
+        let datagram = Entry {
+            kind: Kind::Socket,
+            offset: 0,
+            ..file
+        };
+        table.insert(file, 0).expect("room");
+        let at = table.insert(stream, 0).expect("room");
+        table.insert(datagram, 0).expect("room");
+        let closed = table.close(at).expect("open");
+        assert_eq!(table.holders(&closed), 0, "the stream's last row is gone");
+        assert_eq!(table.holders(&file), 1);
+        assert_eq!(table.holders(&datagram), 1);
     }
 
     /// The ordinary case, which is what actually leaked.

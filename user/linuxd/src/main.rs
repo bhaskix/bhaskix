@@ -50,6 +50,7 @@ use bhaskix_personality::report;
 use bhaskix_personality::signal::{self, Dispositions, Handler, Registers, number::SIGSEGV};
 use bhaskix_personality::thread::{self, ClonePlan};
 
+mod epoll;
 mod stream;
 
 /// One page to report through, written by this program and read by the
@@ -1928,6 +1929,18 @@ fn answer(request: &PersonalityCall) -> (u64, Answer) {
         // `poll` on the console has to park exactly as a blocking read does.
         POLL => return answer_poll(request),
         PPOLL => return answer_ppoll(request),
+        // RFC 0086 step 4. The waits are here for the reason `poll` is: they
+        // park. `epoll_pwait`'s signal mask is ignored for the reason
+        // `answer_ppoll` gives.
+        EPOLL_WAIT | EPOLL_PWAIT => return epoll::wait(request, wait_millis(request.fourth())),
+        EPOLL_CREATE1 => return (REPLY_VALUE, epoll::create(request, request.first())),
+        // `epoll_create(size)`: the size has been ignored since Linux 2.6.8,
+        // except that it must be positive.
+        EPOLL_CREATE if bhaskix_personality::call::int_arg(request.first()) <= 0 => {
+            return (REPLY_VALUE, Answer::error(-22));
+        }
+        EPOLL_CREATE => return (REPLY_VALUE, epoll::create(request, 0)),
+        EPOLL_CTL => return (REPLY_VALUE, epoll::control(request)),
         SELECT => return answer_select(request),
         PSELECT6 => return answer_pselect(request),
         // `clock_nanosleep(clock, flags, request, remain)` -- RFC 0055.
@@ -2637,12 +2650,22 @@ fn answer_poll(request: &PersonalityCall) -> (u64, Answer) {
     // cancelling. Fixing the overflow (`Pace::cycles_ns`) turned it into a
     // fifty-day bounded park, and the datagram probe, which counts only
     // unbounded parks on its bell, failed on every IOMMU boot (2026-09-28).
-    let timeout = match i64::from(bhaskix_personality::call::int_arg(request.third())) {
+    poll_with(
+        request,
+        request.first(),
+        request.second(),
+        wait_millis(request.third()),
+    )
+}
+
+/// An `int` of milliseconds as a [`Wait`] -- `poll`'s timeout and
+/// `epoll_wait`'s, both declared `int`, both negative for ever.
+fn wait_millis(word: u64) -> Wait {
+    match i64::from(bhaskix_personality::call::int_arg(word)) {
         negative if negative < 0 => Wait::Forever,
         0 => Wait::Now,
         milliseconds => Wait::For((milliseconds as u64).saturating_mul(1_000_000)),
-    };
-    poll_with(request, request.first(), request.second(), timeout)
+    }
 }
 
 /// `ppoll(fds, nfds, timespec, sigmask, sigsetsize)` — RFC 0055.
@@ -2876,9 +2899,9 @@ fn condition_of(
         // than an error.
         // A stream is not a datagram socket, and its handle is not a slot on
         // `bin/ipd` -- asking there would be asking about somebody else's
-        // socket. Step 4 (`epoll`) is where a stream's readiness is answered;
-        // until then `poll` says it cannot tell (RFC 0086 step 3b).
-        Kind::Socket if stream::is_stream(&entry) => Condition::Unanswered,
+        // socket. Asked of `bin/tcpd` instead, since RFC 0086 step 4; step 3b
+        // answered that it could not tell.
+        Kind::Socket if stream::is_stream(&entry) => stream::condition(&entry).0,
         Kind::Socket if entry.handle != u64::MAX => {
             let port = entry.size as u16;
             let waiting = if entry.offset != 0 {
@@ -3390,6 +3413,13 @@ const GETPEERNAME: u64 = 52;
 const SETSOCKOPT: u64 = 54;
 const GETSOCKOPT: u64 = 55;
 const SHUTDOWN: u64 = 48;
+/// The `epoll` calls RFC 0086 step 4 adds, from the build host's
+/// `asm/unistd_64.h` on 2026-09-30.
+const EPOLL_CREATE: u64 = 213;
+const EPOLL_WAIT: u64 = 232;
+const EPOLL_CTL: u64 = 233;
+const EPOLL_PWAIT: u64 = 281;
+const EPOLL_CREATE1: u64 = 291;
 /// `bind(fd, sockaddr, length)`.
 const BIND: u64 = 49;
 /// `sendto(fd, buffer, length, flags, sockaddr, addrlen)`.
@@ -4397,6 +4427,10 @@ fn take_slot(kind: ParkKind, domain: u32, thread: u32) -> Option<usize> {
 /// so a later writer or exit does not signal a slot somebody else has since
 /// been given.
 fn abandon_held(domain: u32, thread: Option<u32>) {
+    // The TCP wake and an `epoll` wait's count of parks are held the same way,
+    // by a parked thread, and are given back for the same reasons.
+    stream::abandon_wake(domain, thread);
+    epoll::abandon(domain, thread);
     for cell in &HELD {
         let held = cell.load(core::sync::atomic::Ordering::Relaxed);
         if held == 0 || (held >> 16) & 0xffff != (u64::from(domain) + 1) & 0xffff {
@@ -6291,8 +6325,13 @@ fn answer_recvfrom(request: &PersonalityCall) -> Answer {
 /// than a question asked here because the two callers learn it at different
 /// moments: `close` after removing one row, `close_on_exec` after removing one
 /// of possibly several.
-fn give_back_descriptor(entry: bhaskix_personality::file::Entry, last: bool) {
+fn give_back_descriptor(entry: bhaskix_personality::file::Entry, last: bool, domain: u32) {
     use bhaskix_personality::file::Kind;
+
+    // An `epoll` set goes with its last descriptor -- RFC 0086 step 4.
+    if entry.kind == Kind::Epoll && last {
+        epoll::close(&entry, domain);
+    }
 
     // **Except the root**, which was never claimed from the pool and must
     // never be given back to it: `release_file_slot` `DELETE`s the capability
@@ -6370,8 +6409,10 @@ fn answer_close(request: &PersonalityCall) -> Answer {
             // this one is the directory the kernel granted this program at
             // boot. One hosted `close(dirfd)` would take every hosted
             // process's filesystem away for the life of the machine.
-            let last = process.descriptors.holders(entry.handle) == 0;
-            give_back_descriptor(entry, last);
+            let last = process.descriptors.holders(&entry) == 0;
+            give_back_descriptor(entry, last, request.domain);
+            // And no set watches it any longer.
+            epoll::forget_descriptor(request.domain, descriptor);
             Answer::ok(0)
         }
         Err(errno) => Answer::error(errno),
@@ -6429,7 +6470,7 @@ fn answer_dup(request: &PersonalityCall) -> Answer {
             // contract -- and its capability goes with it unless another
             // descriptor still names the same file.
             if let Some(entry) = displaced
-                && process.descriptors.holders(entry.handle) == 0
+                && process.descriptors.holders(&entry) == 0
                 && matches!(
                     entry.kind,
                     bhaskix_personality::file::Kind::File
@@ -6635,6 +6676,9 @@ fn note_exit(domain: u32, exit: Exit) {
 /// capability, and releasing on the first of them would take the socket from
 /// the second.
 fn release_sockets_of(domain: u32) {
+    // Its `epoll` sets, which are this program's memory rather than a
+    // service's, but are held by the domain all the same -- RFC 0086 step 4.
+    epoll::forget_domain(domain);
     let Some(process) = process_for(domain) else {
         return;
     };
@@ -6651,7 +6695,7 @@ fn release_sockets_of(domain: u32) {
         // endpoint: the adapter waiting for itself, for ever. That is how the
         // first hosted stream probe to exit took every hosted program down.
         if stream::is_stream(&entry) {
-            if process.descriptors.holders(entry.handle) == 1 {
+            if process.descriptors.holders(&entry) == 1 {
                 stream::close(&entry);
             }
             if let Some(process) = process_for(domain)
@@ -6663,7 +6707,7 @@ fn release_sockets_of(domain: u32) {
         }
         if entry.kind == bhaskix_personality::file::Kind::Socket
             && entry.handle != u64::MAX
-            && process.descriptors.holders(entry.handle) == 1
+            && process.descriptors.holders(&entry) == 1
         {
             release_socket_slot(entry.handle);
             // **Forgotten as well as released, or the second caller releases it
@@ -7177,7 +7221,10 @@ fn answer_execve(request: &PersonalityCall) -> (u64, Answer) {
             // `last` is `close_on_exec`'s own answer to whether a surviving
             // row still names the handle, which is the part `dup` makes
             // impossible for a caller to work out for itself.
-            process.exec_into(child, generation, drawn_base(), give_back_descriptor);
+            // The old domain is the one an `epoll` set was made by.
+            process.exec_into(child, generation, drawn_base(), |entry, last| {
+                give_back_descriptor(entry, last, from);
+            });
             trace_exec(pid, from, child);
         }
     }

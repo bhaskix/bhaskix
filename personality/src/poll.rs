@@ -25,6 +25,10 @@ pub const POLLERR: u16 = 0x008;
 pub const POLLHUP: u16 = 0x010;
 /// The descriptor names nothing. **Reported whether or not it was asked for.**
 pub const POLLNVAL: u16 = 0x020;
+/// The peer has closed its writing half: a stream reads to its end and then
+/// finds nothing more. Linux's `POLLRDHUP`, the same bit as `EPOLLRDHUP`,
+/// from the build host's `sys/epoll.h` (RFC 0086 step 4).
+pub const POLLRDHUP: u16 = 0x2000;
 
 /// What the adapter can see about one descriptor.
 ///
@@ -74,6 +78,24 @@ pub enum Condition {
     Socket {
         /// Whether a datagram is waiting to be received.
         datagram_waiting: bool,
+    },
+    /// A connected TCP stream — RFC 0086 step 4.
+    ///
+    /// Always writable, for the reason step 3b states: the adapter cannot see
+    /// the service's send-side flow control, so a write never waits. Readable
+    /// when the peer's bytes are waiting *or* the peer has finished, because a
+    /// `read` then returns without waiting — with the end of the stream.
+    Stream {
+        /// Bytes the peer has sent that the program has not read.
+        unread: u64,
+        /// Whether the peer has closed its writing half.
+        peer_closed: bool,
+    },
+    /// A listening TCP socket, with connections waiting to be accepted.
+    Listener {
+        /// Connections accepted from the service and not yet taken by the
+        /// program's `accept`.
+        waiting: usize,
     },
     /// A descriptor this adapter cannot answer for.
     ///
@@ -150,6 +172,26 @@ pub fn revents(requested: u16, condition: Condition) -> u16 {
                 }
             }
             out
+        }
+        Condition::Stream {
+            unread,
+            peer_closed,
+        } => {
+            let mut out = requested & POLLOUT;
+            if unread > 0 || peer_closed {
+                out |= requested & POLLIN;
+            }
+            if peer_closed {
+                out |= requested & POLLRDHUP;
+            }
+            out
+        }
+        Condition::Listener { waiting } => {
+            if waiting > 0 {
+                requested & POLLIN
+            } else {
+                0
+            }
         }
         Condition::Unanswered => 0,
     }

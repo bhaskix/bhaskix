@@ -92,7 +92,15 @@ fi
 while [[ "$BHASKIX_HOSTED_PORT" == "$BHASKIX_INBOUND_PORT" || "$BHASKIX_HOSTED_PORT" == "$BHASKIX_CLOSED_PORT" || "$BHASKIX_HOSTED_PORT" == "$BHASKIX_SECOND_PORT" ]]; do
     BHASKIX_HOSTED_PORT="$(bhaskix_pick_free_port)" || BHASKIX_HOSTED_PORT=45560
 done
-export BHASKIX_INBOUND_PORT BHASKIX_CLOSED_PORT BHASKIX_SECOND_PORT BHASKIX_HOSTED_PORT
+# RFC 0086 step 4: a hosted Linux program serving through `epoll`, on guest
+# port 11.
+if [[ -z "${BHASKIX_EPOLL_PORT:-}" ]]; then
+    BHASKIX_EPOLL_PORT="$(bhaskix_pick_free_port)" || BHASKIX_EPOLL_PORT=45561
+fi
+while [[ "$BHASKIX_EPOLL_PORT" == "$BHASKIX_INBOUND_PORT" || "$BHASKIX_EPOLL_PORT" == "$BHASKIX_CLOSED_PORT" || "$BHASKIX_EPOLL_PORT" == "$BHASKIX_SECOND_PORT" || "$BHASKIX_EPOLL_PORT" == "$BHASKIX_HOSTED_PORT" ]]; do
+    BHASKIX_EPOLL_PORT="$(bhaskix_pick_free_port)" || BHASKIX_EPOLL_PORT=45561
+done
+export BHASKIX_INBOUND_PORT BHASKIX_CLOSED_PORT BHASKIX_SECOND_PORT BHASKIX_HOSTED_PORT BHASKIX_EPOLL_PORT
 
 qemu_device_list() {
     local profile="$1"
@@ -195,7 +203,7 @@ qemu_device_list() {
                 # is why the number is stated here rather than picked in the
                 # test. `bin/ipd` forwards TCP by address and not by port, so
                 # the SYN reaches `bin/tcpd` and is answered by it.
-                -netdev "user,id=net0,restrict=on,guestfwd=tcp:10.0.2.100:9-cmd:cat,hostfwd=tcp:127.0.0.1:${BHASKIX_INBOUND_PORT:-45557}-:7,hostfwd=tcp:127.0.0.1:${BHASKIX_CLOSED_PORT:-45558}-:1234,hostfwd=tcp:127.0.0.1:${BHASKIX_SECOND_PORT:-45559}-:8,hostfwd=tcp:127.0.0.1:${BHASKIX_HOSTED_PORT:-45560}-:10"
+                -netdev "user,id=net0,restrict=on,guestfwd=tcp:10.0.2.100:9-cmd:cat,hostfwd=tcp:127.0.0.1:${BHASKIX_INBOUND_PORT:-45557}-:7,hostfwd=tcp:127.0.0.1:${BHASKIX_CLOSED_PORT:-45558}-:1234,hostfwd=tcp:127.0.0.1:${BHASKIX_SECOND_PORT:-45559}-:8,hostfwd=tcp:127.0.0.1:${BHASKIX_HOSTED_PORT:-45560}-:10,hostfwd=tcp:127.0.0.1:${BHASKIX_EPOLL_PORT:-45561}-:11"
                 -device "virtio-net-pci,netdev=net0$suffix"
                 # **A second NIC, so that "how many ports?" has an answer other
                 # than one.** RFC 0074: a bond is a thing this system can build

@@ -17,6 +17,15 @@
 //!   milliseconds at a time. `bin/tcpd` rings [`adapter::TCP_WAKE`] when there
 //!   is news, but a notification has one waiter and several hosted threads may
 //!   block; step 4's `epoll` is where readiness replaces the retry.
+//!   **Since step 4 (2026-09-30)** a blocking wait parks on that
+//!   wake when nobody else holds it -- see [`park_on_wake`] -- and falls back
+//!   to the ten-millisecond retry only when somebody does. It matters beyond
+//!   speed: a blocking `accept` that waited a second on the retry was
+//!   answered `EAGAIN` -- **reproduced 2026-09-30** by holding the host back
+//!   one second: `htcp fail 4 0b` on the retry, served on the wake. Which of
+//!   the retry path's two `EAGAIN`s it was (the nucleus parks one call at
+//!   most sixteen times; the adapter may find no timed-wait slot) is not
+//!   established, and `TRACKER.md` says so.
 //! - **A pair given to a listener stays with it.** `bin/tcpd` has no way to
 //!   stop listening, so a hosted listener that closes keeps its pairs for the
 //!   life of the boot.
@@ -30,9 +39,12 @@
 use bhaskix_abi::{adapter, method, status, syscall};
 use bhaskix_personality::call::{Answer, PersonalityCall};
 use bhaskix_personality::file::{Entry, Kind};
+use bhaskix_personality::poll::Condition;
 use bhaskix_personality::socket::{self, Endpoint, SockOpt, errno, write_endpoint};
 use bhaskix_sock::ring::RingView;
 use bhaskix_sock::tcp::{self, AcceptPoll, Peer, StreamPoll};
+use core::sync::atomic::AtomicU64;
+use core::sync::atomic::Ordering::Relaxed;
 
 use super::{REPLY_BLOCK_ON_RETRY, REPLY_VALUE};
 
@@ -90,6 +102,13 @@ struct Connection {
     sent: u64,
     peer: Peer,
     local_port: u16,
+    /// Taken from `tcpd` and not yet given to the program: the listener it
+    /// waits in. Step 4 accepts **eagerly**, because `tcpd` has no way to ask
+    /// whether a connection waits without taking it, and `epoll` must be able
+    /// to say a listener is readable without an `accept`.
+    pending_on: Option<usize>,
+    /// When it was taken, so `accept` hands out the oldest first.
+    born: u64,
 }
 
 struct Tcp {
@@ -104,6 +123,11 @@ struct Tcp {
     pool_used: usize,
     /// `tcpd`'s pair number → the adapter's pool pair, plus one (0: unknown).
     pool_of: [u8; 64],
+    /// Connections each listener has been given, ever: the news an
+    /// edge-triggered `epoll` interest in it counts.
+    births: [u64; adapter::TCP_LISTENER_COUNT],
+    /// Connections taken, ever, for [`Connection::born`].
+    taken: u64,
 }
 
 static mut TCP: Tcp = Tcp {
@@ -114,6 +138,8 @@ static mut TCP: Tcp = Tcp {
     connections: [None; adapter::TCP_CONNECTION_COUNT],
     pool_used: 0,
     pool_of: [0; 64],
+    births: [0; adapter::TCP_LISTENER_COUNT],
+    taken: 0,
 };
 
 fn tcp() -> &'static mut Tcp {
@@ -323,56 +349,95 @@ pub(crate) fn listen(request: &PersonalityCall) -> Answer {
     Answer::ok(0)
 }
 
-/// Collects a finished retry park and parks again, or answers `EAGAIN` if no
-/// park can be had.
+/// Who is parked on [`adapter::TCP_WAKE`]: `(domain + 1) << 32 | thread`, or
+/// 0 for nobody.
+///
+/// **One owner, because the nucleus allows one waiter** (RFC 0010): a second
+/// park on the same notification is refused, and a refused park is a hosted
+/// call answered `EAGAIN`. So the wake is claimed by exactly one parked
+/// thread, given back when that thread's call comes back, and everybody else
+/// waits the old way. An atomic, so this adds nothing to the `unsafe` budget.
+static WAKE_OWNER: AtomicU64 = AtomicU64::new(0);
+
+const fn wake_key(domain: u32, thread: u32) -> u64 {
+    ((domain as u64 + 1) << 32) | thread as u64
+}
+
+/// Claims [`adapter::TCP_WAKE`] for this thread's park, if nobody holds it.
+///
+/// **No wake can be lost between looking and parking.** `tcpd` signals the
+/// notification whether or not anybody waits, and the nucleus keeps the bit;
+/// news that arrives after this program looked and before the caller parks
+/// leaves the bit set, and the park returns at once.
+pub(crate) fn park_on_wake(domain: u32, thread: u32) -> bool {
+    WAKE_OWNER
+        .compare_exchange(0, wake_key(domain, thread), Relaxed, Relaxed)
+        .is_ok()
+}
+
+/// A thread's call has come back: the wake is free again if it held it.
+pub(crate) fn wake_returned(domain: u32, thread: u32) {
+    let _ = WAKE_OWNER.compare_exchange(wake_key(domain, thread), 0, Relaxed, Relaxed);
+}
+
+/// A domain -- or one of its threads -- will never come back for the wake:
+/// it ended, or its park became a signal delivery.
+pub(crate) fn abandon_wake(domain: u32, thread: Option<u32>) {
+    let held = WAKE_OWNER.load(Relaxed);
+    let same_domain = held >> 32 == u64::from(domain) + 1;
+    let same_thread = thread.is_none_or(|thread| held & 0xffff_ffff == u64::from(thread));
+    if held != 0 && same_domain && same_thread {
+        let _ = WAKE_OWNER.compare_exchange(held, 0, Relaxed, Relaxed);
+    }
+}
+
+/// Parks a blocking stream call until there is news: on the wake when this
+/// thread can have it, and otherwise ten milliseconds at a time. Answers
+/// `EAGAIN` if no park can be had at all.
 fn wait_and_retry(request: &PersonalityCall) -> (u64, Answer) {
     let _ = super::took_timed_wait(request.domain);
+    if park_on_wake(request.domain, request.thread) {
+        return (REPLY_BLOCK_ON_RETRY, Answer::ok(adapter::TCP_WAKE as u64));
+    }
     match super::park_until(request.domain, RETRY_NANOS) {
         Some(slot) => (REPLY_BLOCK_ON_RETRY, Answer::ok(slot)),
         None => (REPLY_VALUE, Answer::error(errno::EAGAIN)),
     }
 }
 
-/// `accept4(fd, addr, addrlen, flags)` and `accept` (flags 0).
-pub(crate) fn accept(request: &PersonalityCall, flags: u64) -> (u64, Answer) {
-    let (_, stream) = match stream_of(request, request.first()) {
-        Ok(found) => found,
-        Err(code) => return (REPLY_VALUE, Answer::error(code)),
-    };
-    let State::Listening { port, listener } = stream.state else {
-        return (REPLY_VALUE, Answer::error(errno::EINVAL));
-    };
+/// Takes one connection from `tcpd` for `listener`, into this program's table
+/// and not yet into any process. Answers whether one was taken.
+///
+/// A full table takes nothing: the connection waits in `tcpd`, which is where
+/// Linux's backlog would hold it too.
+fn take_one(listener: usize, port: u16) -> Result<bool, i64> {
     let table = tcp();
     let Some(connection) = table.connections.iter().position(Option::is_none) else {
-        return (REPLY_VALUE, Answer::error(-24)); // EMFILE
+        return Ok(false);
     };
     let landing = (adapter::TCP_CONNECTIONS + connection) as u64;
     if tcp::expect(adapter::TCP_SERVICE as u64, landing).is_err() {
-        return (REPLY_VALUE, Answer::error(errno::EIO));
+        return Err(errno::EIO);
     }
     let pair = match tcp::accept((adapter::TCP_LISTENERS + listener) as u64) {
         AcceptPoll::Accepted { pair } => pair,
-        AcceptPoll::Later if stream.nonblocking => {
-            let _ = super::took_timed_wait(request.domain);
-            return (REPLY_VALUE, Answer::error(errno::EAGAIN));
-        }
-        AcceptPoll::Later => return wait_and_retry(request),
-        _ => return (REPLY_VALUE, Answer::error(errno::EIO)),
+        AcceptPoll::Later => return Ok(false),
+        _ => return Err(errno::EIO),
     };
-    let _ = super::took_timed_wait(request.domain);
     let pool = match table.pool_of.get(pair as usize).copied() {
         Some(tagged) if tagged > 0 => usize::from(tagged - 1),
         // A pair this adapter never armed: not its connection to serve.
         _ => {
             let _ = tcp::shutdown(landing);
             let _ = super::call(syscall::INVOKE, landing, method::DELETE, [0; 4]);
-            return (REPLY_VALUE, Answer::error(errno::EIO));
+            return Err(errno::EIO);
         }
     };
     let peer = tcp::peer(landing).unwrap_or(Peer::V4 {
         address: 0,
         port: 0,
     });
+    table.taken += 1;
     table.connections[connection] = Some(Connection {
         pool,
         consumed: 0,
@@ -380,7 +445,75 @@ pub(crate) fn accept(request: &PersonalityCall, flags: u64) -> (u64, Answer) {
         sent: 0,
         peer,
         local_port: port,
+        pending_on: Some(listener),
+        born: table.taken,
     });
+    table.births[listener] += 1;
+    Ok(true)
+}
+
+/// The oldest connection waiting in `listener`.
+fn oldest_pending(listener: usize) -> Option<usize> {
+    tcp()
+        .connections
+        .iter()
+        .enumerate()
+        .filter_map(|(index, held)| {
+            held.filter(|held| held.pending_on == Some(listener))
+                .map(|held| (held.born, index))
+        })
+        .min()
+        .map(|(_, index)| index)
+}
+
+/// Connections waiting in `listener`.
+fn waiting(listener: usize) -> usize {
+    tcp()
+        .connections
+        .iter()
+        .flatten()
+        .filter(|held| held.pending_on == Some(listener))
+        .count()
+}
+
+/// Shuts a connection and gives its capability back.
+fn drop_connection(connection: usize) {
+    let slot = (adapter::TCP_CONNECTIONS + connection) as u64;
+    let _ = tcp::shutdown(slot);
+    let _ = super::call(syscall::INVOKE, slot, method::DELETE, [0; 4]);
+    tcp().connections[connection] = None;
+}
+
+/// `accept4(fd, addr, addrlen, flags)` and `accept` (flags 0).
+pub(crate) fn accept(request: &PersonalityCall, flags: u64) -> (u64, Answer) {
+    wake_returned(request.domain, request.thread);
+    let (_, stream) = match stream_of(request, request.first()) {
+        Ok(found) => found,
+        Err(code) => return (REPLY_VALUE, Answer::error(code)),
+    };
+    let State::Listening { port, listener } = stream.state else {
+        return (REPLY_VALUE, Answer::error(errno::EINVAL));
+    };
+    let taken = match oldest_pending(listener) {
+        Some(connection) => Ok(connection),
+        None => match take_one(listener, port) {
+            Ok(true) => oldest_pending(listener).ok_or(errno::EIO),
+            Ok(false) if stream.nonblocking => Err(errno::EAGAIN),
+            Ok(false) => return wait_and_retry(request),
+            Err(code) => Err(code),
+        },
+    };
+    let _ = super::took_timed_wait(request.domain);
+    let connection = match taken {
+        Ok(connection) => connection,
+        Err(code) => return (REPLY_VALUE, Answer::error(code)),
+    };
+    let table = tcp();
+    let Some(mut held) = table.connections[connection] else {
+        return (REPLY_VALUE, Answer::error(errno::EIO));
+    };
+    held.pending_on = None;
+    table.connections[connection] = Some(held);
     let made = install(
         request,
         Stream {
@@ -393,20 +526,81 @@ pub(crate) fn accept(request: &PersonalityCall, flags: u64) -> (u64, Answer) {
         flags & socket::kind::CLOEXEC != 0,
     );
     if (made.value as i64) < 0 {
-        table.connections[connection] = None;
-        let _ = tcp::shutdown(landing);
-        let _ = super::call(syscall::INVOKE, landing, method::DELETE, [0; 4]);
+        drop_connection(connection);
         return (REPLY_VALUE, made);
     }
     // The peer's address, if the caller asked. A caller that passed no buffer
     // is not told, which is what a null pointer means.
     if request.second() != 0 && request.third() != 0 {
-        let Some(endpoint) = endpoint_of(&stream, peer) else {
+        let Some(endpoint) = endpoint_of(&stream, held.peer) else {
             return (REPLY_VALUE, made);
         };
         let _ = write_address(request.domain, request.second(), request.third(), &endpoint);
     }
     (REPLY_VALUE, made)
+}
+
+/// What a stream descriptor is doing, for `poll`, `select` and `epoll` — and
+/// the count of news on it an edge-triggered interest compares, which only
+/// grows.
+///
+/// A listener with nothing waiting asks `tcpd` for one, so a connection that
+/// has arrived is seen without an `accept`. A connection asks `tcpd` how far
+/// the peer's stream has reached, which takes nothing, and tells it what the
+/// program has read since it last asked, as `read` does.
+///
+/// A socket neither listening nor connected reports nothing — Linux says
+/// `EPOLLOUT | EPOLLHUP` for one, and nothing here connects out yet.
+pub(crate) fn condition(entry: &Entry) -> (Condition, Option<u64>) {
+    let Some(Some(stream)) = tcp().streams.get(entry.handle as usize).copied() else {
+        return (Condition::Unknown, None);
+    };
+    match stream.state {
+        State::Fresh | State::Bound { .. } => (Condition::Listener { waiting: 0 }, None),
+        State::Listening { port, listener } => {
+            if waiting(listener) == 0 {
+                let _ = take_one(listener, port);
+            }
+            (
+                Condition::Listener {
+                    waiting: waiting(listener),
+                },
+                Some(tcp().births[listener]),
+            )
+        }
+        State::Connected { connection } => {
+            let Some(mut held) = tcp().connections[connection] else {
+                return (Condition::Unknown, None);
+            };
+            let slot = (adapter::TCP_CONNECTIONS + connection) as u64;
+            match tcp::recv(slot, held.consumed - held.told) {
+                StreamPoll::Ready { state, delivered } => {
+                    held.told = held.consumed;
+                    tcp().connections[connection] = Some(held);
+                    let closed = !peer_may_send(state);
+                    (
+                        Condition::Stream {
+                            unread: delivered.saturating_sub(held.consumed),
+                            peer_closed: closed,
+                        },
+                        // Plus one so that the first look is news: a quiet,
+                        // writable connection is reported once, as Linux does
+                        // on `EPOLL_CTL_ADD`.
+                        Some(1 + delivered + u64::from(closed)),
+                    )
+                }
+                // Gone, or the service would not say: readable, so the
+                // program's `read` learns which.
+                _ => (
+                    Condition::Stream {
+                        unread: 0,
+                        peer_closed: true,
+                    },
+                    Some(u64::MAX),
+                ),
+            }
+        }
+    }
 }
 
 fn endpoint_of(stream: &Stream, peer: Peer) -> Option<Endpoint> {
@@ -458,6 +652,7 @@ pub(crate) fn read(
     buffer: u64,
     count: u64,
 ) -> (u64, Answer) {
+    wake_returned(request.domain, request.thread);
     let (_, stream) = match stream_of(request, descriptor) {
         Ok(found) => found,
         Err(code) => return (REPLY_VALUE, Answer::error(code)),
@@ -686,17 +881,22 @@ pub(crate) fn nonblocking(entry: &Entry) -> bool {
 
 /// A stream descriptor's last row closed: a connection is shut and its
 /// capability dropped (its pair returns to the listener when `tcpd` retires
-/// it); a listener keeps its pairs, which is this step's stated limit.
+/// it); a listener keeps its pairs, which is this step's stated limit, and
+/// sheds the connections it had taken and nobody accepted.
 pub(crate) fn close(entry: &Entry) {
     let index = entry.handle as usize;
     let Some(Some(stream)) = tcp().streams.get(index).copied() else {
         return;
     };
-    if let State::Connected { connection } = stream.state {
-        let slot = (adapter::TCP_CONNECTIONS + connection) as u64;
-        let _ = tcp::shutdown(slot);
-        let _ = super::call(syscall::INVOKE, slot, method::DELETE, [0; 4]);
-        tcp().connections[connection] = None;
+    match stream.state {
+        State::Connected { connection } => drop_connection(connection),
+        // Connections taken for a listener nobody will accept from again.
+        State::Listening { listener, .. } => {
+            while let Some(connection) = oldest_pending(listener) {
+                drop_connection(connection);
+            }
+        }
+        State::Fresh | State::Bound { .. } => {}
     }
     let _ = stream.domain;
     tcp().streams[index] = None;
