@@ -11,7 +11,7 @@
 | | |
 |---|---|
 | RFCs accepted | **52** |
-| RFCs open | 31 |
+| RFCs open | 32 |
 | RFCs closed without shipping | 2 |
 | Milestone rows done | **92 of 95** |
 | Phase 2 bullets done | **12 of 13** |
@@ -104,6 +104,7 @@ gantt
     RFC 0079 a signal a process may send another :done, r0079, 2026-09-15, 1d
     RFC 0083 a signal a process can catch :active, r0083, 2026-09-21, 2026-09-30
     RFC 0085 A futex sleeper comes back for its answer :active, r0085, 2026-09-29, 2026-09-30
+    RFC 0086 The motivating workload — a Go HTTP server under... :active, r0086, 2026-09-30, 2026-09-30
     section Process & tooling
     RFC 0001 License — Apache-2.0 :done, r0001, 2026-08-03, 1d
     RFC 0007 Live patching the nucleus :active, r0007, 2026-08-04, 2026-09-30
@@ -194,6 +195,7 @@ gantt
 | 0083 | a signal a process can catch | 2026-09-21 |
 | 0084 | a fork the kernel copies | 2026-09-23 |
 | 0085 | A futex sleeper comes back for its answer | 2026-09-29 |
+| 0086 | The motivating workload — a Go HTTP server under load | 2026-09-30 |
 
 ## Annexes
 

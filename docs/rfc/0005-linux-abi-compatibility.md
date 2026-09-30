@@ -34,9 +34,12 @@ with numbers:
   reviewable.
 
 **What has not changed**: the three rules, the tension with RFC 0003, the tiering, the
-three hard parts, and the refusals. **What is still owed from outside**: the motivating
+three hard parts, and the refusals. ~~**What is still owed from outside**: the motivating
 workload's trace (implementation step 1) — the tiers stay provisional until a real
-binary's histogram exists, and the public corpus is the work queue in the meantime.
+binary's histogram exists, and the public corpus is the work queue in the meantime.~~
+**Owed no longer, 2026-09-30:** the project lead named the workload — a static Go `net/http`
+server under sixteen concurrent clients for five minutes — and its trace under that load is
+published in [RFC 0086](0086-the-motivating-workload.md), which carries step 10 from here.
 
 ---
 
@@ -870,6 +873,14 @@ called as though it had one — the same shape as
   open files falling from 127. A seventh is `EMFILE`.
 
 ## Step 10's record (2026-08-19): the gate is unmet, and it is reported unmet rather than redefined
+
+> **2026-09-30: the workload is named, and the first reason below no longer
+> holds.** A static Go `net/http` server serving sixteen concurrent keep-alive
+> clients for five minutes, zero errors — chosen by the project lead, not by
+> this project, which is what the paragraph below asked for. Its trace, its
+> gate and the four blockers between here and a pass are
+> [RFC 0086](0086-the-motivating-workload.md). The second reason — Tier 2's
+> wiring — was answered by the relocation this record goes on to describe.
 
 **Step 10 cannot be run, and the reason is not a shortfall in this
 project.** The step is *"the motivating workload runs under load"*, and the

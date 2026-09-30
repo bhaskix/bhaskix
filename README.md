@@ -15,10 +15,14 @@ Linux's kernel architecture inside Bhaskix. Two properties have to survive that 
 worth having: Linux `root` is not Bhaskix authority, and a compromised Linux application is not a
 compromised system. → [RFC 0031](docs/rfc/0031-linux-compatibility-as-an-adapter.md), a draft
 
-> **A direction, not a commitment — and today it runs a static Go binary and nothing larger.** No
-> shell utility, web server or database has ever run here. The milestones are written down as
-> [L1–L4](docs/roadmap.md#linux-compatibility--l1-to-l4), every one of them unmet, and nothing in
-> this repository will say otherwise before a test proves it.
+> **A direction, not a commitment.** ~~Today it runs a static Go binary and nothing larger. No
+> shell utility, web server or database has ever run here.~~ **Stale since 2026-08-27, corrected
+> 2026-09-30:** a static BusyBox nobody here built runs its `echo` applet and its `sh`, gated on
+> every boot; no web server or database has ever run here. The web server that will be tried first
+> is named — a static Go `net/http` server under sixteen concurrent clients
+> ([RFC 0086](docs/rfc/0086-the-motivating-workload.md)) — and it does not run yet. The milestones
+> are written down as [L1–L4](docs/roadmap.md#linux-compatibility--l1-to-l4), every one of them
+> unmet, and nothing in this repository will say otherwise before a test proves it.
 
 **Bhaskix** — from *bhāskara* (भास्कर), Sanskrit for "the light-maker", the sun; and the name of two
 of India's great mathematician-astronomers. Bhāskara I (c. 600–680 CE) was the first person known to
@@ -94,7 +98,10 @@ The `-ix` is the Unix lineage, the same suffix Minix and Linux carry.
 > rather than argued about.
 >
 > What is genuinely not here: **no libc and no self-hosting** — the Linux personality runs Go
-> binaries in ring 3 but its file and socket tiers are not started. **No cryptography at all**; a
+> binaries in ring 3 ~~but its file and socket tiers are not started~~ *(stale, corrected
+> 2026-09-30: files and directories have been served since 2026-08-23 and UDP sockets since the
+> same day)* — and **TCP and `epoll` for hosted programs are not built**, which is what stands
+> between it and a network server. **No cryptography at all**; a
 > grep for eleven primitive names returns nothing, and where it will come from is a decision RFC
 > that has not been adopted. **USB is a keyboard and nothing else** — no storage, no hubs, no USB 3
 > — and a machine with no i8042 *and no IOMMU* still has no keyboard, because a bus master nothing
