@@ -636,6 +636,58 @@ rm -f "$CLOSED_VERDICT"
 ) &
 CLOSED_DRIVER=$!
 
+# **RFC 0086 step 2: four clients held at once on one listener.**
+#
+# `bin/tcpd` kept one accepted connection until this step, so a second client's
+# handshake waited for the first to finish. `bin/tcpc` arms three more ring
+# pairs after its demonstration and says so; the kernel prints `tcp four ...
+# ready`, and only then does this connect -- earlier, one of the
+# demonstration's own `ACCEPT`s would take a connection meant for this.
+#
+# All four are opened before any is written to, so all four are live at once;
+# each writes its own sixteen bytes and must read back exactly those. A service
+# that crossed two connections' rings fails here, on the host, where the bytes
+# are compared against what each client actually sent.
+FOUR_VERDICT=$(mktemp)
+rm -f "$FOUR_VERDICT"
+(
+    until grep -aqE "tcp four +(ready|not attempted|FAILED)" "$LOG" 2>/dev/null; do
+        sleep 0.25
+    done
+    grep -aqE "tcp four +ready" "$LOG" || exit 0
+    opened=0
+    for fd in 5 6 7 8; do
+        if eval "exec $fd<>/dev/tcp/127.0.0.1/$BHASKIX_INBOUND_PORT" 2>/dev/null; then
+            opened=$((opened + 1))
+        fi
+    done
+    if [[ $opened -ne 4 ]]; then
+        echo "opened $opened of 4" > "$FOUR_VERDICT"
+        exit 0
+    fi
+    for fd in 5 6 7 8; do
+        printf 'bhaskix-4way-%03d' "$fd" >&"$fd"
+    done
+    good=0
+    wrong=""
+    for fd in 5 6 7 8; do
+        want=$(printf 'bhaskix-4way-%03d' "$fd")
+        got=$(timeout 20 dd bs=1 count=16 <&"$fd" 2>/dev/null || true)
+        if [[ "$got" == "$want" ]]; then
+            good=$((good + 1))
+        else
+            wrong="$wrong client $fd got '$got';"
+        fi
+        eval "exec $fd>&- $fd<&-" || true
+    done
+    if [[ $good -eq 4 ]]; then
+        echo "all four echoed" > "$FOUR_VERDICT"
+    else
+        echo "$good of 4 echoed:$wrong" > "$FOUR_VERDICT"
+    fi
+) &
+FOUR_DRIVER=$!
+
 echo "booting ($MODE), up to ${TIMEOUT}s..."
 run_until "$LOG" "Nothing left to do at this milestone" "$TIMEOUT" "${QEMU_ARGS[@]}"
 kill "$INBOUND_DRIVER" 2>/dev/null || true
@@ -644,6 +696,8 @@ kill "$WEDGE_DRIVER" 2>/dev/null || true
 wait "$WEDGE_DRIVER" 2>/dev/null || true
 kill "$CLOSED_DRIVER" 2>/dev/null || true
 wait "$CLOSED_DRIVER" 2>/dev/null || true
+kill "$FOUR_DRIVER" 2>/dev/null || true
+wait "$FOUR_DRIVER" 2>/dev/null || true
 
 status=0
 
@@ -2693,6 +2747,26 @@ else
     status=1
 fi
 rm -f "$INBOUND_VERDICT" 2>/dev/null || true
+
+# RFC 0086 step 2's gate -- see the driver above. Demanded exactly where the
+# client reached the end of its demonstration, which is where the act runs.
+if grep -qE "tcp four +4 connections held at once" "$LOG"; then
+    if [[ "$(cat "$FOUR_VERDICT" 2>/dev/null)" == "all four echoed" ]]; then
+        pass "four host clients held at once on one listener, each echoed its own bytes"
+    else
+        fail "the guest says it held and echoed four clients; the host says: $(cat "$FOUR_VERDICT" 2>/dev/null || echo 'nothing')"
+        status=1
+    fi
+elif grep -qE "tcp four +FAILED" "$LOG"; then
+    fail "four clients at once: $(grep -aoE 'tcp four +FAILED.*' "$LOG" | head -1 | sed 's/\x1b\[[0-9;]*m//g') (host: $(cat "$FOUR_VERDICT" 2>/dev/null || echo 'nothing'))"
+    status=1
+elif grep -qE "tcp client +did everything outcome 9 says, then opened a v6 connection" "$LOG"; then
+    fail "the client reached the end of its demonstration and the four-at-once act never reported"
+    status=1
+else
+    pass "four clients at once not attempted: the client did not reach the end of its demonstration here"
+fi
+rm -f "$FOUR_VERDICT" 2>/dev/null || true
 
 # **RFC 0061: the port survived connections nobody accepted.**
 #

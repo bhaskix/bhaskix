@@ -13804,7 +13804,20 @@ static UDP6_REPORT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU6
 static DHCP_REPORT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
 
 const TCPD_STACK: u64 = 0x0000_0000_1600_0000;
-const TCPD_STACK_PAGES: u64 = 4;
+/// Sixteen pages since RFC 0086 step 2, which took the service's connection
+/// table from two entries to thirty-two, each about 280 bytes (a 152-byte
+/// control block, measured on the host, plus its deadlines and ring
+/// addresses) -- ~9 KiB for the table alone.
+///
+/// ~~Eight pages~~ was the first answer, reasoned from that ~9 KiB, and **a
+/// boot falsified it**: `tcpd` faulted writing `0x15fff7e8`, 34.8 KiB below the
+/// top of a 32 KiB stack, on its first `CONNECT`. The table is built by value
+/// and moved into place, and a step lends a connection out and back, so the
+/// frames hold more than one copy of what the arithmetic counted once. So the
+/// fault proves the need exceeds 34.8 KiB and does not say by how much; 64 KiB
+/// is roughly double what was proved, not a measured peak. A stack overflow
+/// here takes every TCP connection on the machine with it.
+const TCPD_STACK_PAGES: u64 = 16;
 const TCPD_PROGRAM: &[u8] = b"bin/tcpd";
 const TCPD_MARKER: u64 = 0x3144_5043_5444_0a54;
 static TCP_REPORT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
@@ -20388,6 +20401,7 @@ fn report_net_after_exchange(hhdm: u64) {
         wait_millis(100);
     }
     report_tcp_client(hhdm);
+    report_tcp_four(hhdm);
 
     // RFC 0018 step 7: what the boundary cost, counted rather than argued.
     //
@@ -20487,11 +20501,19 @@ fn start_tcp_client_domain(
     // The rings, owned by the *client's* domain. `Rights::ALL` from `name`
     // is what a creator holds over its own object — including the GRANT and
     // DERIVE the gift needs.
+    // Slots 13 to 18 since RFC 0086 step 2: three more pairs the client arms
+    // its listener with, so four host clients can be held at once.
     for (slot, label) in [
         (2usize, "send"),
         (3usize, "receive"),
         (5usize, "listener send"),
         (6usize, "listener receive"),
+        (13usize, "pair 1 send"),
+        (14usize, "pair 1 receive"),
+        (15usize, "pair 2 send"),
+        (16usize, "pair 2 receive"),
+        (17usize, "pair 3 send"),
+        (18usize, "pair 3 receive"),
     ] {
         let ring = shared::create(realm, TCPC_RING_BYTES)
             .map_err(|_| "a tcp client ring would not be created")?;
@@ -20556,13 +20578,13 @@ fn start_tcp_client_domain(
     // more time, which is what an effect looks like.
     match crate::time::now_nanos() {
         Some(nanos) => println!(
-            "    tcp client     bin/tcpc started at {}.{:03} ms: four rings and two wakes its domain owns, \
+            "    tcp client     bin/tcpc started at {}.{:03} ms: ten rings and two wakes its domain owns, \
              a badged capability to the service, and nothing wired between them by the kernel",
             nanos / 1_000_000,
             nanos % 1_000_000 / 1_000,
         ),
         None => println!(
-            "    tcp client     bin/tcpc started (no clock yet): four rings and two wakes its domain owns, \
+            "    tcp client     bin/tcpc started (no clock yet): ten rings and two wakes its domain owns, \
              a badged capability to the service, and nothing wired between them by the kernel"
         ),
     }
@@ -20827,6 +20849,75 @@ fn report_traced(hhdm: u64) {
              {decoded} decoded, {refused} refused, {bad_rings} bad rings, {wrong_cpu} wrong-cpu\
 \x1b[0m",
             words[1]
+        );
+    }
+}
+
+/// RFC 0086 step 2: four host clients held at once on one listener.
+///
+/// `bin/tcpc` runs this act after its demonstration ends (`LOOPED6`), so it is
+/// waited for only on a machine where that ending was reached. Two lines: one
+/// when the client has armed its pairs and is waiting — the host harness
+/// waits for exactly that line before it connects, because a client connecting
+/// earlier would be accepted by one of the demonstration's own `ACCEPT`s — and
+/// one with the result.
+fn report_tcp_four(hhdm: u64) {
+    use bhaskix_abi::tcp;
+    let raw = TCPC_REPORT.load(core::sync::atomic::Ordering::Acquire);
+    if raw == u64::MAX {
+        return;
+    }
+    let Some((pages, count)) = shared::frames_of(shared::MemoryId::from_u64(raw)) else {
+        return;
+    };
+    if count == 0 {
+        return;
+    }
+    let base = hhdm + pages[0];
+    // SAFETY: a frame this object owns, through the direct map; every index
+    // read here is a report word, inside its first page.
+    let word = |i: usize| unsafe { core::ptr::read_volatile((base + i as u64 * 8) as *const u64) };
+    // `LOOPED6` is the client's outcome 12: the only ending after which it goes
+    // on to this act. Any other ending is reported by `report_tcp_client`.
+    if word(0) != TCPC_MARKER || word(2) != 12 {
+        println!(
+            "    tcp four       not attempted: the client did not reach the end of its demonstration"
+        );
+        return;
+    }
+    let mut announced = false;
+    // Sixty seconds: the host connects within a second of the ready line, and
+    // each client's echo is one segment each way.
+    for _ in 0..600u32 {
+        let state = word(tcp::CLIENT_FOUR_STATE);
+        if state == tcp::FOUR_READY && !announced {
+            println!(
+                "    tcp four       ready: three ring pairs armed beside LISTEN's own, waiting for four clients at once"
+            );
+            announced = true;
+        }
+        if state == tcp::FOUR_DONE || state == tcp::FOUR_FAILED {
+            break;
+        }
+        wait_millis(100);
+    }
+    let (state, served) = (word(tcp::CLIENT_FOUR_STATE), word(tcp::CLIENT_FOUR_SERVED));
+    let (echoed, accepted, pairs, ghosts, step) = (
+        served & 0xff,
+        (served >> 8) & 0xff,
+        (served >> 16) & 0xf,
+        (served >> 20) & 0xf,
+        served >> 24,
+    );
+    if state == tcp::FOUR_DONE && echoed == 4 && accepted == 4 && pairs == 0xf {
+        println!(
+            "    tcp four       4 connections held at once on one listener, each on its own ring pair \
+             (pairs 0b{pairs:04b}), each client's bytes echoed back to it; {ghosts} ghost(s) turned away"
+        );
+    } else {
+        println!(
+            "\x1b[91m    tcp four       FAILED: state {state}, stopped at step {step}; {accepted} accepted, \
+             {echoed} echoed, pairs 0b{pairs:04b}, {ghosts} ghost(s) turned away\x1b[0m"
         );
     }
 }
@@ -21555,15 +21646,21 @@ fn report_tcp_domain(hhdm: u64) {
     // while the one accepted slot was occupied, and an `ACK` whose cookie did
     // not verify. Both are counted now.
     //
-    // `busy` is expected to carry most of it: the service holds **one**
+    // ~~`busy` is expected to carry most of it: the service holds **one**
     // inbound connection at a time (`ACCEPTED` is a single slot) and the
     // harness opens five, so some are refused by construction rather than by a
-    // defect. A boot where `busy` accounts for the shortfall says this is
-    // capacity; one where `rejected` does says the keyed hash is failing, which
-    // would be a different and worse thing. Neither could be said before.
+    // defect.~~ **Stale since RFC 0086 step 2 (2026-09-30):** the service holds
+    // a table, and a verified `ACK` is refused only when no slot *or* no ring
+    // pair is free -- counted after the cookie verifies, so it counts peers
+    // that proved they are there. A boot where it accounts for the shortfall
+    // says this is capacity; one where `rejected` does says the keyed hash is
+    // failing, which would be a different and worse thing. The third word
+    // counted an `ACK` repeated by the peer already in the one slot; a table
+    // lookup now finds that peer's connection before the cookie path is asked,
+    // so it stays zero and is printed as what it now is.
     println!(
-        "    tcpd ack       {} stranger(s) refused for a busy slot, {} whose cookie did not \
-         verify, {} retransmission(s) from the peer already in it",
+        "    tcpd ack       {} refused for want of a free slot or ring pair, {} whose cookie did not \
+         verify, {} repeated by a peer already connected (a table lookup answers those first now)",
         words[11], words[12], words[13]
     );
     // **A cookie counted as offered whose answer never left.** `offered` is

@@ -265,8 +265,12 @@ pub fn shutdown(connection_slot: u64) -> Result<(), u64> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AcceptPoll {
     /// An established connection's capability has landed in the slot the
-    /// program declared with [`expect`].
-    Accepted,
+    /// program declared with [`expect`]; its stream lives in ring pair
+    /// `pair` — 0 for `LISTEN`'s own, else the number [`arm_pair`] returned.
+    Accepted {
+        /// The ring pair the connection took.
+        pair: u32,
+    },
     /// Nothing yet; ask again after a wake.
     Later,
     /// No wire on this machine.
@@ -277,6 +281,45 @@ pub enum AcceptPoll {
     KernelSaid(u64),
 }
 
+/// Arms the listener in `listener_slot` with one more ring pair — RFC 0086
+/// step 2. Returns the pair's number, which [`accept`] names again when it
+/// hands out the connection that took it.
+///
+/// The rings are gifted, so they must be memory capabilities in
+/// `send_ring_slot` and `recv_ring_slot` that this program no longer needs
+/// for anything else: the service writes the peer's stream into the second
+/// and reads this program's out of the first for as long as a connection
+/// holds the pair, and the pair returns to the listener by itself when that
+/// connection is gone.
+///
+/// # Errors
+///
+/// [`LegError`] from whichever of the four legs refused, with its words.
+pub fn arm_pair(
+    listener_slot: u64,
+    send_ring_slot: u64,
+    recv_ring_slot: u64,
+) -> Result<u32, LegError> {
+    leg(listener_slot, tcp::ARM_PAIR, 0, 0, None, tcp::OPEN_LEG)?;
+    leg(
+        listener_slot,
+        tcp::ARM_PAIR,
+        0,
+        0,
+        Some((send_ring_slot, 0)),
+        0,
+    )?;
+    leg(
+        listener_slot,
+        tcp::ARM_PAIR,
+        0,
+        0,
+        Some((recv_ring_slot, 0)),
+        1,
+    )?;
+    leg(listener_slot, tcp::ARM_PAIR, 0, 0, None, 2).map(|pair| pair as u32)
+}
+
 /// One `ACCEPT` poll on a listener.
 #[must_use]
 pub fn accept(listener_slot: u64) -> AcceptPoll {
@@ -285,7 +328,9 @@ pub fn accept(listener_slot: u64) -> AcceptPoll {
         return AcceptPoll::KernelSaid(reply.status);
     }
     match reply.value {
-        tcp::OK => AcceptPoll::Accepted,
+        tcp::OK => AcceptPoll::Accepted {
+            pair: reply.third as u32,
+        },
         tcp::LATER => AcceptPoll::Later,
         tcp::UNREACHABLE => AcceptPoll::Unreachable,
         word => AcceptPoll::ServiceSaid(word),

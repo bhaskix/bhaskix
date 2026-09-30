@@ -888,7 +888,11 @@ asm_budget = 10
 # `IA32_FS_BASE`, architectural on every x86-64 CPU, read rather than taken from
 # the per-CPU record of it because the record matching the register is exactly
 # the assumption the reading exists to test.
-unsafe_budget = 2062
+# 2063 for one line, RFC 0086 step 2: `report_tcp_four` reads two words of
+# `bin/tcpc`'s report page through the direct map, the same read every other
+# report reader in `lib.rs` makes, for the act that holds four host clients on
+# one listener. Written as one line on purpose; it was three before tightening.
+unsafe_budget = 2063
 # Up thirty-one for RFC 0005 step 9's socket probe -- `ring3_socketeer`, which
 # is `ring3_lister` with a `sockaddr_in6` copied in beside its code instead of
 # two filenames. The same two blocks every hosted probe has: one

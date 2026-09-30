@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | 🔨 **Draft 2026-09-30 — step 1 done.** The workload RFC 0005 was owed from outside is named, its gate defined, its size measured and its system calls traced. Steps 2–6 are the work. The acceptance call is the project lead's. |
+| **Status** | 🔨 **Draft 2026-09-30 — steps 1 and 2 done.** The workload RFC 0005 was owed from outside is named, its gate defined, its size measured and its system calls traced; `bin/tcpd` holds a table of thirty-two connections and a listener arms ring pairs, gated by four host clients held at once. Steps 3–6 are the work. The acceptance call is the project lead's. |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | userspace (`bin/linuxd`, `bin/tcpd`), `personality`, tools |
 | **Milestone** | Phase 2 — the Linux personality ([RFC 0005](0005-linux-abi-compatibility.md)) |
@@ -108,6 +108,81 @@ are never told to install one. Go 1.14 added signal-based preemption, which
 would add `tgkill` + `SIGURG` traffic this trace cannot show. Step 1 therefore
 also makes CI print `go version`, and step 5 pins one toolchain if they differ.
 
+## Step 2's record (2026-09-30): a table, not two slots
+
+**What reading `tcpd` found** was more than a constant. Slot 1, `ACCEPTED`,
+was named in the cookie path, RFC 0061's reclaim, the `ACCEPT` handler and the
+report. A listener held **one ring pair**, taken by the first connection it
+birthed — its own comment said re-arming was "the table's next step". Rings
+are the program's memory, gifted once into fixed CSpace slots and mapped at
+fixed addresses. And every handle was minted with **generation 1**, so a
+capability kept from an earlier connection carried the same badge as the next
+connection in its slot: latent with one slot, a hole with a table.
+
+**What landed:**
+
+- **`net::tcp::table`**, host-tested and `unsafe`-free: `N` slots with a
+  generation each that moves on when a slot is emptied, birth order so
+  `ACCEPT` hands out the oldest, `lend`/`give_back` so a state-machine step
+  borrows its connection without ending it, and `Armed`, a FIFO of ring pairs.
+  Seven tests; the stale-handle one was watched failing with the generation
+  bump removed.
+- **`tcp::ARM_PAIR` (70)** on a listener: `LISTEN`'s legs, preceded by a leg
+  carrying no gift (`OPEN_LEG`). That leg exists because a service thread has
+  **one** gift declaration and `tcpd` declares it before it knows the next
+  call: a slot always owed for arming would sit ahead of every wake in the
+  declaration list and starve `CONNECT`'s and `LISTEN`'s leg 3 for ever.
+- **A pair returns to its listener by itself** when the connection that took
+  it leaves the table — exactly what `LISTEN`'s one pair always did, which is
+  why no re-arm verb was needed and every existing caller is unchanged.
+  `ACCEPT` names the pair in its reply's third word.
+- **Thirty-two connections**, a verified `ACK` taking a free slot *and* an
+  armed pair or being dropped and counted; a stream method on a retired
+  handle answers `GONE`, where it used to answer `LATER` for ever; the
+  outbound connection is an ordinary table entry whose handle is re-issued
+  per `CONNECT`, so the v6 connection no longer reuses the v4 one's badge.
+
+**The stack, found by a boot rather than by arithmetic.** The table is about
+9 KiB (a 152-byte control block, measured on the host, in an entry of about
+280), so `tcpd`'s 16 KiB stack went to 32 — and the first boot faulted 34.8 KiB
+below its top on the first `CONNECT`: the table is built by value and moved,
+and a step lends a connection out and back, so the frames hold more than one
+copy. It is 64 KiB now, which is about double what the fault proved, **not a
+measured peak**.
+
+**The gate.** `bin/tcpc` arms three pairs beside `LISTEN`'s own after its
+demonstration, and the kernel prints `tcp four ... ready`; only then does the
+host open four connections through `hostfwd` — earlier, one of the
+demonstration's own `ACCEPT`s would take one — all four before writing to any,
+each sending its own sixteen bytes and demanding them back. The guest reports
+`4 connections held at once ... pairs 0b1111`, the host `all four echoed`.
+**Armed:** a table of two gives `1 accepted, 0 echoed` on the guest and
+`0 of 4 echoed` on the host.
+
+**The first full suite failed it, and the host was right.** The guest said
+four held and echoed; the host said `3 of 4 echoed: client 8 got ''`. One of
+the four connections `bin/tcpc` accepted was a *ghost*: an early attempt by the
+boot's other inbound driver, whose `SYN` `slirp` kept retrying after the host
+had given up, arriving now with its own sixteen bytes. The guest cannot tell a
+ghost at `ACCEPT`; it can by what it says. So the act reads each accepted
+connection's bytes, shuts, drops and counts anything that does not start
+`bhaskix-4way-`, and keeps accepting until four real clients are held — still
+before serving any. **Watched working by forcing it:** with the first real
+client misread as a ghost, the act stops at `3 accepted ... 1 ghost(s) turned
+away`, which also shows the slot a ghost held is reused by the next accept.
+
+**A defect this step exposed and did not cause.** On a networked boot,
+`bin/tcpd` is **killed** after `bin/tcpc` exits: a *ghost* connection — an old
+attempt by the host's inbound driver, whose `SYN` `slirp` kept retrying after
+the host had given up — arrives with sixteen bytes, takes the listener's free
+pair, and `tcpd` writes them into rings that were revoked with `tcpc`'s domain.
+The same fault, at the listener's own ring (`0x2370_0000`), is in two serial
+logs taken today before this step and in ten CI job logs; the boot passes
+because nothing gates `tcpd` staying alive. It means **a program that gifts
+rings and exits can take the machine's TCP service down with the next
+packet** — a service-side question (what `tcpd` does when a ring is revoked
+under it), recorded in TRACKER §3 and not answered here.
+
 ## Design
 
 ### The gate
@@ -199,9 +274,12 @@ is printed so that the number a faster path would improve is on record first.
 
 ## Unresolved questions
 
-1. **Which Go.** CI's toolchain is unknown until step 1's `go version` line
-   reports; if it differs from the build host's, which one is pinned is the
-   lead's call.
+1. **Which Go.** ~~CI's toolchain is unknown until step 1's `go version` line
+   reports~~ **CI reports go 1.24.13** (run 793, 2026-09-30) against the build
+   host's go 1.13.8 — eleven minor versions apart, across 1.14's signal-based
+   preemption, so the Linux trace above is not the list CI's binary will ask
+   for. Which one is pinned is the lead's call; re-taking the trace with it is
+   the step after that call.
 2. **Slot pools of sixteen.** Wake slots and deadline slots are sixteen each;
    a Go process parks several futex sleepers plus its netpoller. Measured in
    step 4 before anything is resized.
@@ -210,8 +288,10 @@ is printed so that the number a faster path would improve is on record first.
 
 1. **The decision, the gate, the trace** — this document; RFC 0005 and
    TRACKER updated; CI prints `go version`. ✅ 2026-09-30.
-2. **`tcpd` holds a table** — 32 connections, a listener with a backlog,
-   `CONGESTED` at size; the inbound gate opens several at once.
+2. **`tcpd` holds a table** — 32 connections, a listener armed with ring
+   pairs, `GONE` for a retired handle; four host clients held at once.
+   ✅ 2026-09-30. More than one listener is left for step 5, when the Go server
+   and `bin/tcpc` must listen at once.
 3. **Hosted TCP, server side** — stream sockets in `bin/linuxd` over `tcpd`,
    with the calls and options the trace lists; gate: an assembly probe that
    listens, accepts and echoes.

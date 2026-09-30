@@ -28,7 +28,7 @@
 #![no_std]
 #![no_main]
 
-use bhaskix_abi::{syscall, tcp as abi_tcp};
+use bhaskix_abi::{method, syscall, tcp as abi_tcp};
 use bhaskix_sock::call::{attach, call};
 use bhaskix_sock::ring::RingView;
 use bhaskix_sock::tcp::{self, AcceptPoll, LegError, StreamPoll};
@@ -62,6 +62,11 @@ const WAKE: u64 = 9;
 /// are the v4 story's, reused — the handover survives its connection.
 const CONNECTION6: u64 = 11;
 const INBOUND6: u64 = 12;
+/// RFC 0086 step 2's act: three more ring pairs, each a send and a receive
+/// ring this domain owns, armed on the listener beside `LISTEN`'s own so four
+/// clients can be held at once — and the four slots their connections land in.
+const FOUR_RINGS: [(u64, u64); 3] = [(13, 14), (15, 16), (17, 18)];
+const FOUR_CONNECTIONS: [u64; 4] = [19, 20, 21, 22];
 const L_WAKE: u64 = 10;
 
 /// Where the report page maps in this program's space.
@@ -73,6 +78,15 @@ const SENDR_AT: u64 = 0x2400_0000;
 const RECVR_AT: u64 = 0x2410_0000;
 const L_SENDR_AT: u64 = 0x2420_0000;
 const L_RECVR_AT: u64 = 0x2430_0000;
+/// And the three extra pairs', send then receive, a megabyte apart as above.
+const FOUR_AT: [(u64, u64); 3] = [
+    (0x2440_0000, 0x2450_0000),
+    (0x2460_0000, 0x2470_0000),
+    (0x2480_0000, 0x2490_0000),
+];
+
+/// Bytes each of the four host clients sends, and must get back.
+const FOUR_LEN: u64 = 16;
 
 /// Bytes in each stream ring this program owns.
 const RING_BYTES: u64 = 4 * 4096;
@@ -318,6 +332,12 @@ extern "C" fn tcpc_main(hertz: u64) -> ! {
         (L_RECV_RING, L_RECVR_AT),
     ]
     .into_iter()
+    .chain(
+        FOUR_RINGS
+            .iter()
+            .zip(FOUR_AT.iter())
+            .flat_map(|(&(send, recv), &(send_at, recv_at))| [(send, send_at), (recv, recv_at)]),
+    )
     .all(|(slot, at)| attach(slot, at, true));
     if !attached {
         report(0, outcome::REFUSED, 0xA);
@@ -326,12 +346,13 @@ extern "C" fn tcpc_main(hertz: u64) -> ! {
     // SAFETY: each ring was attached just above at its fixed address, and
     // stays mapped for the life of this program — the one claim the views
     // carry, made where the mapping was made.
-    let (send_view, recv_view, l_send_view, l_recv_view) = unsafe {
+    let (send_view, recv_view, l_send_view, l_recv_view, four_views) = unsafe {
         (
             RingView::new(SENDR_AT, RING_BYTES),
             RingView::new(RECVR_AT, RING_BYTES),
             RingView::new(L_SENDR_AT, RING_BYTES),
             RingView::new(L_RECVR_AT, RING_BYTES),
+            FOUR_AT.map(|(s, r)| (RingView::new(s, RING_BYTES), RingView::new(r, RING_BYTES))),
         )
     };
     for (index, byte) in PAYLOAD.iter().enumerate() {
@@ -637,7 +658,7 @@ extern "C" fn tcpc_main(hertz: u64) -> ! {
     let mut accepted = false;
     for _ in 0..100u32 {
         match tcp::accept(LISTENER) {
-            AcceptPoll::Accepted => {
+            AcceptPoll::Accepted { .. } => {
                 accepted = true;
                 break;
             }
@@ -820,7 +841,7 @@ extern "C" fn tcpc_main(hertz: u64) -> ! {
     let mut accepted6 = false;
     for _ in 0..300u32 {
         match tcp::accept(LISTENER) {
-            AcceptPoll::Accepted => {
+            AcceptPoll::Accepted { .. } => {
                 accepted6 = true;
                 break;
             }
@@ -976,7 +997,130 @@ extern "C" fn tcpc_main(hertz: u64) -> ! {
     let _ = tcp::shutdown(CONNECTION6);
     let _ = tcp::shutdown(INBOUND6);
     report(19, outcome::LOOPED6, 0);
+    four_at_once(l_send_view, l_recv_view, four_views, &pace);
     exit()
+}
+
+/// RFC 0086 step 2: four host clients held at once on one listener.
+///
+/// Until this step `bin/tcpd` kept one accepted connection, so a second
+/// client's handshake waited for the first to finish. The act arms three more
+/// ring pairs beside `LISTEN`'s own, says it is ready, accepts four
+/// connections **before serving any of them** — so all four are live in the
+/// service's table together — and then echoes each client's bytes back to
+/// that client. The host checks each got its own bytes; a service that mixed
+/// up pairs or connections fails there rather than here.
+///
+/// Reported through two words the kernel reads, so the demonstration's own
+/// outcome — `LOOPED6`, already written — is not moved by anything here.
+fn four_at_once(
+    listen_send: RingView,
+    listen_recv: RingView,
+    extra: [(RingView, RingView); 3],
+    pace: &Pace,
+) {
+    let failed = |step: u64, detail: u64| {
+        report_word(abi_tcp::CLIENT_FOUR_SERVED, step << 24 | detail);
+        report_word(abi_tcp::CLIENT_FOUR_STATE, abi_tcp::FOUR_FAILED);
+    };
+    // Views by pair number: 0 is `LISTEN`'s own, and the service numbers each
+    // armed pair; whatever number it answers is where that pair's views go.
+    let mut views = [(listen_send, listen_recv); 4];
+    for (index, &(send_slot, recv_slot)) in FOUR_RINGS.iter().enumerate() {
+        match tcp::arm_pair(LISTENER, send_slot, recv_slot) {
+            Ok(pair) if (1..4).contains(&pair) => views[pair as usize] = extra[index],
+            Ok(pair) => return failed(1, u64::from(pair)),
+            Err(_) => return failed(2, index as u64),
+        }
+    }
+    report_word(abi_tcp::CLIENT_FOUR_STATE, abi_tcp::FOUR_READY);
+
+    // **Ghosts are sorted out by what they say, not refused at the door.**
+    // `slirp` keeps retrying the `SYN` of a host connection the host has
+    // already given up on, so a connection from an early attempt by the boot's
+    // other inbound driver can arrive now, carrying its sixteen bytes; the
+    // first run of this act accepted one in place of a real client, echoed it,
+    // and left that client unanswered -- the host said so, the guest could not
+    // have. A real client's bytes start with `bhaskix-4way-`; anything else is
+    // shut, dropped and counted, and accepting goes on. All four real ones are
+    // still accepted before any of them is served.
+    const PREFIX: &[u8] = b"bhaskix-4way-";
+    let mut pairs = [0u32; 4];
+    let mut accepted = 0usize;
+    let mut ghosts = 0u64;
+    for _ in 0..600u32 {
+        if accepted == FOUR_CONNECTIONS.len() {
+            break;
+        }
+        let slot = FOUR_CONNECTIONS[accepted];
+        if tcp::expect(SERVICE, slot).is_err() {
+            return failed(3, accepted as u64);
+        }
+        let pair = match tcp::accept(LISTENER) {
+            AcceptPoll::Accepted { pair } if (pair as usize) < views.len() => pair,
+            AcceptPoll::Later => {
+                news(L_WAKE, pace);
+                continue;
+            }
+            _ => return failed(4, accepted as u64),
+        };
+        let mut arrived = false;
+        for _ in 0..600u32 {
+            match tcp::recv(slot, 0) {
+                StreamPoll::Ready { delivered, .. } if delivered >= FOUR_LEN => {
+                    arrived = true;
+                    break;
+                }
+                StreamPoll::Ready { state, .. } if state != STATE_ESTABLISHED => break,
+                StreamPoll::Ready { .. } => news(L_WAKE, pace),
+                _ => break,
+            }
+        }
+        let (_, recv) = views[pair as usize];
+        let real = arrived
+            && PREFIX
+                .iter()
+                .enumerate()
+                .all(|(offset, byte)| recv.read(offset as u64) == *byte);
+        if real {
+            pairs[accepted] = pair;
+            accepted += 1;
+        } else {
+            let _ = tcp::shutdown(slot);
+            let _ = call(syscall::INVOKE, slot, method::DELETE, [0; 4]);
+            ghosts += 1;
+        }
+    }
+    let taken = pairs[..accepted]
+        .iter()
+        .fold(0u64, |mask, &pair| mask | 1 << pair)
+        | (ghosts.min(15) << 4);
+    if accepted < FOUR_CONNECTIONS.len() {
+        return failed(5, (taken << 16) | ((accepted as u64) << 8));
+    }
+
+    let mut echoed = 0u64;
+    for (&connection, &pair) in FOUR_CONNECTIONS.iter().zip(pairs.iter()) {
+        // Its sixteen bytes are already here: they are how it was told from a
+        // ghost above.
+        let (send, recv) = views[pair as usize];
+        // A new connection's stream starts at offset 0 of its pair, whoever
+        // held the pair before: the service numbers bytes from the
+        // connection's own initial sequence.
+        for offset in 0..FOUR_LEN {
+            send.write(offset, recv.read(offset));
+        }
+        if tcp::send(connection, FOUR_LEN).is_err() {
+            return failed(8, (taken << 16) | (4 << 8) | echoed);
+        }
+        let _ = tcp::shutdown(connection);
+        echoed += 1;
+    }
+    report_word(
+        abi_tcp::CLIENT_FOUR_SERVED,
+        (taken << 16) | ((accepted as u64) << 8) | echoed,
+    );
+    report_word(abi_tcp::CLIENT_FOUR_STATE, abi_tcp::FOUR_DONE);
 }
 
 core::arch::global_asm!(

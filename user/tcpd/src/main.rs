@@ -49,6 +49,7 @@ use bhaskix_net::tcp::{
     FourTuple, cookie, isn,
     segment::{self, Segment},
     state::{self, Action, Event, Tcb, Timer},
+    table::{Armed, Handle, Table},
 };
 use bhaskix_net::{Address, Ipv4Addr, Ipv6Addr, Port};
 
@@ -103,6 +104,23 @@ const RECVR_AT: u64 = 0x2350_0000;
 /// births.
 const L_SENDR_AT: u64 = 0x2360_0000;
 const L_RECVR_AT: u64 = 0x2370_0000;
+
+/// Ring pairs a listener can be armed with, `LISTEN`'s own included as pair 0
+/// — RFC 0086 step 2. Each is gifted once, mapped once, and returns to the
+/// listener whenever the connection that took it leaves the table, so this
+/// bounds the connections a listener holds at once, not the connections it
+/// serves in a boot.
+const MAX_PAIRS: usize = 32;
+
+/// Where pair `n`'s gifts land, for `n` from 1: two CSpace slots each, above
+/// every slot this program was granted or declares for anything else.
+const PAIR_GIFT_BASE: u64 = 32;
+
+/// Where pair `n` maps, for `n` from 1: a window of [`PAIR_STRIDE`] bytes, its
+/// send ring at the bottom and its receive ring half-way up. Below the
+/// fixed rings' addresses nothing else is mapped at this height.
+const PAIR_AT_BASE: u64 = 0x2400_0000;
+const PAIR_STRIDE: u64 = 0x2_0000;
 
 /// Bytes in each ring, matching what the kernel granted.
 const RING_BYTES: usize = 16 * 4096;
@@ -486,14 +504,16 @@ impl Deadlines {
     }
 }
 
-/// Live connections at once. Two: one a caller opens outbound, one a
-/// listener accepts. A table refusing at its size is this project's posture;
-/// a third caller is told `CONGESTED` rather than growing anything.
-const MAX_CONNECTIONS: usize = 2;
-
-/// The outbound connection's slot in the table, and the accepted one's.
-const OUTBOUND: usize = 0;
-const ACCEPTED: usize = 1;
+/// Live connections at once — RFC 0086 step 2.
+///
+/// ~~Two: one a caller opens outbound, one a listener accepts.~~ **Two until
+/// 2026-09-30**, in slots fixed by name, which is what kept this service from
+/// serving more than one client at a time. Thirty-two now: the named workload
+/// is sixteen concurrent clients, and a slot is held through `TIME_WAIT`. A
+/// table refusing at its size is still this project's posture: a verified
+/// `ACK` that finds no free slot is dropped and counted, and the peer's
+/// retransmission finds one later.
+const MAX_CONNECTIONS: usize = 32;
 
 /// One live connection: the machine, its timers, and the rings its stream
 /// lives in — RFC 0022's gifts, mapped where the handover put them.
@@ -522,20 +542,65 @@ struct Connection {
     /// the outbound connection, which the program that asked for it holds from
     /// the moment it exists.
     claimed: bool,
+    /// Which of the listener's ring pairs this connection took, or `None` for
+    /// the outbound connection, whose rings `CONNECT` gifted. What makes a
+    /// connection an *accepted* one, now that no slot number says so.
+    pair: Option<u32>,
+}
+
+/// Where one of a listener's ring pairs is mapped.
+#[derive(Clone, Copy)]
+struct Pair {
+    sendr_at: u64,
+    recvr_at: u64,
+}
+
+/// An `ARM_PAIR` in progress: which pair it is filling, and which of its two
+/// gifts have landed. Opened by [`tcp::OPEN_LEG`], so that its slots are only
+/// declared while a caller has said a gift is coming.
+struct Arming {
+    open: bool,
+    pair: u32,
+    send_mapped: bool,
+    recv_mapped: bool,
+}
+
+impl Arming {
+    const fn closed() -> Self {
+        Self {
+            open: false,
+            pair: 0,
+            send_mapped: false,
+            recv_mapped: false,
+        }
+    }
+
+    /// Where pair `pair`'s ring `leg` (0 send, 1 receive) lands and maps.
+    const fn place(pair: u32, leg: u64) -> (u64, u64) {
+        let n = pair as u64 - 1;
+        (
+            PAIR_GIFT_BASE + 2 * n + leg,
+            PAIR_AT_BASE + n * PAIR_STRIDE + leg * (PAIR_STRIDE / 2),
+        )
+    }
 }
 
 /// A port with a caller waiting behind it: RFC 0020's `LISTEN`, existing
-/// only once its rings crossed. The rings' addresses live here because the
-/// connection a `SYN` births takes them; a listener with spent rings can
-/// birth nothing more until the table's next step adds re-arming.
+/// only once its rings crossed.
+///
+/// ~~The rings' addresses live here because the connection a `SYN` births
+/// takes them; a listener with spent rings can birth nothing more until the
+/// table's next step adds re-arming.~~ That step is RFC 0086 step 2: the
+/// rings live in [`Service::pairs`], `LISTEN`'s as pair 0, and this holds the
+/// ones waiting for a connection.
 struct Listener {
     port: u16,
     /// The badge on the listener capability, bit 63 set.
     handle: u64,
-    sendr_at: u64,
-    recvr_at: u64,
-    /// The gifted wake the accepted connection inherits (RFC 0023).
+    /// The gifted wake every accepted connection inherits (RFC 0023).
     notify_slot: Option<u64>,
+    /// Pairs armed and not taken, oldest first.
+    armed: Armed<u32, MAX_PAIRS>,
 }
 
 /// Everything the serve loop carries.
@@ -578,15 +643,19 @@ struct Service {
     /// This one does: offered above zero with accepted at zero is the `ACK`
     /// not coming home; both at zero is the `SYN` never arriving.
     cookies_offered: u64,
-    connections: [Option<Connection>; MAX_CONNECTIONS],
+    connections: Table<Connection, MAX_CONNECTIONS>,
+    /// The slot holding the connection `CONNECT` opened, if one is live.
+    outbound: Option<usize>,
     listener: Option<Listener>,
+    /// Every ring pair a listener has been given, by number.
+    pairs: [Option<Pair>; MAX_PAIRS],
 }
 
 /// Performs what one `step` asked for, against one connection's rings.
 ///
 /// `index` says which table slot the connection came out of, because one
 /// duty is not the connection's own: the report's outcome word narrates the
-/// outbound demonstration, and only slot `OUTBOUND` writes it.
+/// outbound demonstration, and only the outbound slot writes it.
 fn perform(
     service: &mut Service,
     connection: &mut Connection,
@@ -652,7 +721,7 @@ fn perform(
                 connection.wake_owed = true;
             }
             Action::Closed(ended) => {
-                if index == OUTBOUND {
+                if service.outbound == Some(index) {
                     service.outcome = match ended {
                         state::Ended::Refused => outcome::REFUSED,
                         state::Ended::Unreachable => outcome::UNREACHABLE,
@@ -686,7 +755,9 @@ fn perform(
 /// Take-out, step, put-back: the connection leaves the table for the length
 /// of the step so `perform` can hold it and the service's counters at once.
 fn drive_at(service: &mut Service, index: usize, event: Event<'_>) {
-    let Some(mut connection) = service.connections[index].take() else {
+    // Lent, not removed: a removal would move the slot's generation on and
+    // strand the handle the program holds for this very connection.
+    let Some(mut connection) = service.connections.lend(index) else {
         return;
     };
     let before = connection.tcb.state;
@@ -731,7 +802,10 @@ fn drive_at(service: &mut Service, index: usize, event: Event<'_>) {
     // `LAST-ACK` waiting for an acknowledgement from a peer that has already
     // gone, and `LAST-ACK` is no more `Closed` than `CLOSE-WAIT` was. It would
     // move the wedge one state along and leave it standing.
-    if index == ACCEPTED && state::reclaim_unclaimed(connection.tcb.state, connection.claimed) {
+    // An accepted connection is one that took a listener's pair; the outbound
+    // connection is `claimed` from birth, so the rule never touches it.
+    let accepted = connection.pair.is_some();
+    if accepted && state::reclaim_unclaimed(connection.tcb.state, connection.claimed) {
         let (tcb, actions) = state::step(connection.tcb, Event::Abort, now);
         connection.tcb = tcb;
         perform(service, &mut connection, index, &actions);
@@ -739,19 +813,58 @@ fn drive_at(service: &mut Service, index: usize, event: Event<'_>) {
     }
     // Dropped rather than parked: no capability was ever handed out naming
     // this slot, so nothing can be holding one.
-    if index == ACCEPTED && !connection.claimed && connection.tcb.state == state::State::Closed {
-        service.connections[index] = None;
-        return;
+    let dropped = accepted && !connection.claimed && connection.tcb.state == state::State::Closed;
+    // Put back first, then retired if it is done: `retire` removes through the
+    // table, which is what moves the generation on.
+    if service.connections.give_back(index, connection).is_ok() && dropped {
+        retire(service, index);
     }
-    service.connections[index] = Some(connection);
+}
+
+/// Takes the connection in `index` out of the table for good: its generation
+/// moves on, so any capability naming it answers `GONE` from now on, and the
+/// ring pair it took goes back to the listener it came from — RFC 0086
+/// step 2, and exactly what `LISTEN`'s single pair always did when its one
+/// accepted connection was done.
+fn retire(service: &mut Service, index: usize) {
+    let Some(connection) = service.connections.remove(index) else {
+        return;
+    };
+    if service.outbound == Some(index) {
+        service.outbound = None;
+    }
+    if let (Some(pair), Some(listener)) = (connection.pair, service.listener.as_mut()) {
+        // Cannot be full: a pair is only ever armed or held, never both, and
+        // the queue has room for every pair there is.
+        let _ = listener.armed.arm(pair);
+    }
+}
+
+/// Retires every accepted connection that has finished — `CLOSED`, or
+/// sitting out `TIME_WAIT` — so its slot and its pair can serve the next
+/// peer.
+///
+/// `TIME_WAIT` holds the tuple, not the slot: this is the same early release
+/// the single accepted slot always had, applied to every slot that is done.
+fn retire_finished(service: &mut Service) {
+    for index in 0..MAX_CONNECTIONS {
+        let finished = service.connections.get(index).is_some_and(|connection| {
+            connection.pair.is_some()
+                && matches!(
+                    connection.tcb.state,
+                    state::State::Closed | state::State::TimeWait
+                )
+        });
+        if finished {
+            retire(service, index);
+        }
+    }
 }
 
 /// Arms the inbox for the nearest deadline of any connection, or disarms it.
 fn arm_nearest(service: &Service) {
-    let nearest = service
-        .connections
-        .iter()
-        .flatten()
+    let nearest = (0..MAX_CONNECTIONS)
+        .filter_map(|index| service.connections.get(index))
         .filter_map(|connection| connection.deadlines.nearest())
         .min();
     match nearest {
@@ -770,8 +883,9 @@ fn fire_due(service: &mut Service) {
     for index in 0..MAX_CONNECTIONS {
         loop {
             let now = now_nanos(service.hertz);
-            let Some(timer) = service.connections[index]
-                .as_mut()
+            let Some(timer) = service
+                .connections
+                .get_mut(index)
                 .and_then(|connection| connection.deadlines.due(now))
             else {
                 break;
@@ -856,20 +970,13 @@ fn drain_forward(service: &mut Service) {
         // be assumed: a segment belongs to the connection whose four-tuple
         // it names, or — if it is a `SYN` to a port somebody is listening
         // on — it births the accepted connection, or it has nobody.
-        let mut index = None;
-        for (candidate, connection) in service.connections.iter().enumerate() {
-            if let Some(connection) = connection {
-                let expected = connection.tcb.connection;
-                if source == expected.remote
-                    && destination == expected.local
-                    && parsed.source == expected.remote_port
-                    && parsed.destination == expected.local_port
-                {
-                    index = Some(candidate);
-                    break;
-                }
-            }
-        }
+        let index = service.connections.find(|connection| {
+            let expected = connection.tcb.connection;
+            source == expected.remote
+                && destination == expected.local
+                && parsed.source == expected.remote_port
+                && parsed.destination == expected.local_port
+        });
         let index = match index {
             Some(index) => index,
             None => match accept_syn(service, &parsed, source, destination) {
@@ -902,14 +1009,14 @@ fn drain_forward(service: &mut Service) {
         // many, with the peer's `FIN`, which occupies a number and is not a
         // byte, subtracted back out. Byte `k` of the peer's stream is sequence
         // `irs + 1 + k`, mirroring the send side.
-        let Some(connection) = service.connections[index].as_ref() else {
+        let Some(connection) = service.connections.get(index) else {
             continue;
         };
         let before = connection.tcb.rcv_nxt;
         let fin_before = connection.tcb.fin_received;
         let synchronised = connection.tcb.state.can_receive();
         drive_at(service, index, Event::Arrived(parsed));
-        let Some(connection) = service.connections[index].as_ref() else {
+        let Some(connection) = service.connections.get(index) else {
             continue;
         };
         // Only a synchronised connection's advance is data. A `SYN·ACK` moves
@@ -941,7 +1048,7 @@ fn drain_forward(service: &mut Service) {
                     core::ptr::write_volatile((recvr_at + slot as u64) as *mut u8, *byte);
                 }
             }
-            if let Some(connection) = service.connections[index].as_mut() {
+            if let Some(connection) = service.connections.get_mut(index) {
                 connection.delivered += delivered as u64;
             }
         }
@@ -1071,9 +1178,10 @@ fn answer_with_cookie(
 /// `None` for anything that is not one: a segment with no acknowledgement, one
 /// carrying `SYN` (that is a fresh request, not a completion), one for a port
 /// nothing listens on, one whose number this key did not mint, and one that
-/// arrives when the single accepted slot is genuinely occupied by a live
-/// connection.
-/// ACKs discarded because the one accepted slot was already occupied.
+/// arrives when ~~the single accepted slot is genuinely occupied by a live
+/// connection~~ no table slot or no armed ring pair is free (RFC 0086 step 2).
+/// ~~ACKs discarded because the one accepted slot was already occupied.~~
+/// ACKs discarded for want of a slot or a ring pair — see the static below.
 ///
 /// **A static, and this program had none until 2026-09-05.** The natural place
 /// is two more parameters on `report`, which already takes ten positional ones
@@ -1114,6 +1222,9 @@ static REPLIES_MADE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU
 /// inside a handler, which is the whole question here.
 static LAST_METHOD: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
+///
+/// Since RFC 0086 step 2: verified `ACK`s refused because no table slot or no
+/// armed ring pair was free. The peer retransmits and the cookie stays valid.
 static ACK_WHILE_BUSY: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// Cookies counted as offered whose `SYN`/`ACK` never reached the back ring.
@@ -1138,6 +1249,11 @@ static SYNACK_UNSENT: core::sync::atomic::AtomicU64 = core::sync::atomic::Atomic
 /// Separated from [`ACK_WHILE_BUSY`] because the two look identical at the
 /// refusal and mean opposite things: this one is a peer whose connection is
 /// already up saying so again.
+///
+/// **Never incremented since RFC 0086 step 2**, and kept in the report so the
+/// word's position does not move: with a table, `drain_forward` finds a
+/// connected peer's connection by its four-tuple before the cookie path is
+/// asked, so a repeated `ACK` never reaches the place this counted it.
 static ACK_DUPLICATE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// ACKs whose cookie did not verify.
@@ -1163,63 +1279,14 @@ fn accept_cookie(
     if !ours {
         return None;
     }
-    let listener = service.listener.as_ref()?;
-    if parsed.destination != Port(listener.port) {
-        return None;
-    }
-
-    // TIME_WAIT holds the tuple, not the slot — the same reclamation the
-    // outbound slot got, and it moved here with the allocation it guards.
-    if let Some(held) = service.connections[ACCEPTED].as_ref()
-        && matches!(
-            held.tcb.state,
-            state::State::Closed | state::State::TimeWait
-        )
-    {
-        service.connections[ACCEPTED] = None;
-    }
-    // **Whose ACK is being refused, which the first version of this counter
-    // could not say.** The slot being occupied covers two different events: a
-    // *different* peer turned away, which is a handshake lost, and *this same*
-    // peer retransmitting an ACK for the connection already in the slot, which
-    // costs nothing because its connection is up. Counting both under one name
-    // made `busy 2` unreadable -- two refusals or two duplicates, and the
-    // number could not say. Only a stranger is counted.
-    let refusing_a_stranger = service.connections[ACCEPTED].as_ref().is_some_and(|held| {
-        held.tcb.connection.remote != source || held.tcb.connection.remote_port != parsed.source
-    });
-    if service.connections[ACCEPTED].is_some() {
-        // Still one accepted connection at a time. A peer whose cookie
-        // arrives now will retransmit its `ACK`, and the cookie stays valid
-        // for its whole window.
-        //
-        // **This comment used to end "this is not the wedge: the slot is held
-        // by a peer that completed a handshake and is being served, not by one
-        // that sent a packet and vanished", and it named two cases out of
-        // three.** The third is a peer that completed a handshake, was never
-        // delivered to an application, and *left*: it parked in `CLOSE-WAIT`
-        // holding this slot for the rest of the boot, and every `ACK` that
-        // reached here afterwards was dropped by the line below -- which is
-        // why a wedged port still answers every `SYN` with a cookie and can
-        // never build on one. RFC 0061 reclaims it in `drive_at`. The
-        // sentence was written while looking at this function, and the case it
-        // missed was three lines further on.
-        //
-        // **Counted since 2026-09-05.** Ten green boots at eight CPUs offered 64
-        // cookies and saw 45 come home -- a 30% loss on boots the gate calls
-        // green, because the gate passes on any non-zero count. This is one of
-        // the two places that loss can happen and neither could say so.
-        if refusing_a_stranger {
-            ACK_WHILE_BUSY.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        } else {
-            ACK_DUPLICATE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        }
+    let port = service.listener.as_ref()?.port;
+    if parsed.destination != Port(port) {
         return None;
     }
 
     let connection = FourTuple {
         local: destination,
-        local_port: Port(listener.port),
+        local_port: Port(port),
         remote: source,
         remote_port: parsed.source,
     };
@@ -1235,11 +1302,43 @@ fn accept_cookie(
         return None;
     };
 
+    // **Room, asked after the cookie verifies rather than before** — RFC 0086
+    // step 2. With one accepted slot the question was whether it was taken;
+    // with a table it is whether a slot *and* a ring pair are free, and a
+    // refusal is only worth counting for a peer that proved it is there.
+    // Finished connections go first, returning their slots and pairs.
+    retire_finished(service);
+    let Some(pair) = service
+        .listener
+        .as_mut()
+        .and_then(|listener| listener.armed.take())
+    else {
+        // Every pair is held by a live connection. The peer retransmits its
+        // `ACK` and the cookie stays valid for its whole window, so this is a
+        // handshake delayed, not lost.
+        ACK_WHILE_BUSY.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        return None;
+    };
+    let Some(Pair { sendr_at, recvr_at }) = service.pairs.get(pair as usize).copied().flatten()
+    else {
+        // A pair armed and never registered is this program's bug; put it
+        // back rather than lose it, and refuse this handshake.
+        if let Some(listener) = service.listener.as_mut() {
+            let _ = listener.armed.arm(pair);
+        }
+        ACK_WHILE_BUSY.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        return None;
+    };
+    let notify_slot = service
+        .listener
+        .as_ref()
+        .and_then(|listener| listener.notify_slot);
+
     // The peer's initial sequence is one below where its `ACK` sits: byte `k`
     // of its stream is `irs + 1 + k`, so the number this segment is at *is*
     // `irs + 1`.
     let irs = bhaskix_net::tcp::Sequence(parsed.sequence.0.wrapping_sub(1));
-    service.connections[ACCEPTED] = Some(Connection {
+    let born = service.connections.insert(Connection {
         claimed: false,
         tcb: Tcb::from_cookie(
             connection,
@@ -1250,20 +1349,33 @@ fn accept_cookie(
             accepted.mss,
         ),
         deadlines: Deadlines::new(),
-        sendr_at: listener.sendr_at,
-        recvr_at: listener.recvr_at,
+        sendr_at,
+        recvr_at,
         delivered: 0,
-        handle: tcp::handle(ACCEPTED as u32, 1, false),
-        notify_slot: listener.notify_slot,
+        // Set below, once the table has said which slot and generation.
+        handle: 0,
+        notify_slot,
         // **Owed from birth.** `drive_at` rings the caller's wake when a step
         // *changes* the state, and a connection rebuilt from a cookie is born
         // `Established` — so the transition that used to be the news never
         // happens, and whoever is waiting to accept would never be told. The
         // connection coming into existence is the news; this says so.
         wake_owed: true,
+        pair: Some(pair),
     });
+    let Ok(Handle { index, generation }) = born else {
+        // No free slot: every one is a live connection. The pair goes back.
+        if let Some(listener) = service.listener.as_mut() {
+            let _ = listener.armed.arm(pair);
+        }
+        ACK_WHILE_BUSY.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        return None;
+    };
+    if let Some(born) = service.connections.get_mut(index as usize) {
+        born.handle = tcp::handle(index, generation, false);
+    }
     service.cookies_accepted += 1;
-    Some(ACCEPTED)
+    Some(index as usize)
 }
 
 /// Why a segment that named no connection could not become one.
@@ -1386,7 +1498,19 @@ impl Handover {
 /// that lands consumes it, and a service that forgets to renew is deaf to
 /// the next caller. Declaring the same slot twice replaces, which makes
 /// this safe to call unconditionally.
-fn declare_gift_slot(connect: &Handover, listen: &Handover) {
+fn declare_gift_slot(connect: &Handover, listen: &Handover, arming: &Arming) {
+    // **An open `ARM_PAIR` goes first** — RFC 0086 step 2. It is only open
+    // because its caller just said, in a leg carrying no gift, that a ring is
+    // on its way; it is never owed otherwise, so it cannot starve the wakes
+    // below the way a slot always owed would.
+    if arming.open {
+        let leg = if arming.send_mapped { 1 } else { 0 };
+        if !(arming.send_mapped && arming.recv_mapped) {
+            let (slot, _) = Arming::place(arming.pair, leg);
+            let _ = call(syscall::INVOKE, ENDPOINT, method::EXPECT, [slot, 0, 0, 0]);
+            return;
+        }
+    }
     // Rings before wakes, both handovers' rings before either's wake, and
     // the order is load-bearing: one declaration exists per thread, so a
     // slot declared for a gift the caller never sends blocks every gift
@@ -1554,7 +1678,9 @@ fn connect_serving(
         // the handover is where gifts arrive, the table is where they act.
         if leg == 3
             && handover.notified
-            && let Some(connection) = service.connections[OUTBOUND].as_mut()
+            && let Some(connection) = service
+                .outbound
+                .and_then(|index| service.connections.get_mut(index))
         {
             connection.notify_slot = Some(handover.notify_slot);
         }
@@ -1570,15 +1696,17 @@ fn connect_serving(
     // slot check below skipped creation and handed the caller a dying
     // connection whose news had already happened, which is a caller frozen
     // in a wait no wake ends.
-    if let Some(held) = service.connections[OUTBOUND].as_ref()
-        && matches!(
-            held.tcb.state,
-            state::State::Closed | state::State::TimeWait
-        )
+    if let Some(index) = service.outbound
+        && service.connections.get(index).is_some_and(|held| {
+            matches!(
+                held.tcb.state,
+                state::State::Closed | state::State::TimeWait
+            )
+        })
     {
-        service.connections[OUTBOUND] = None;
+        retire(service, index);
     }
-    if service.connections[OUTBOUND].is_none() {
+    if service.outbound.is_none() {
         let connection = FourTuple {
             local,
             local_port: Port(LOCAL_PORT),
@@ -1586,20 +1714,30 @@ fn connect_serving(
             remote_port: Port(remote_port),
         };
         let iss = isn::initial_sequence(&service.key, connection, now_nanos(service.hertz));
-        service.connections[OUTBOUND] = Some(Connection {
+        let Ok(Handle { index, generation }) = service.connections.insert(Connection {
             claimed: true,
             tcb: Tcb::new(connection),
             deadlines: Deadlines::new(),
             sendr_at: handover.at.0,
             recvr_at: handover.at.1,
             delivered: 0,
-            handle: tcp::handle(OUTBOUND as u32, 1, false),
+            handle: 0,
             notify_slot: handover.notified.then_some(handover.notify_slot),
             wake_owed: false,
-        });
+            pair: None,
+        }) else {
+            // Every slot is a live connection: the refusal the table's size
+            // exists to make, told to the caller rather than grown past.
+            return (tcp::CONGESTED, 0);
+        };
+        let index = index as usize;
+        if let Some(born) = service.connections.get_mut(index) {
+            born.handle = tcp::handle(index as u32, generation, false);
+        }
+        service.outbound = Some(index);
         drive_at(
             service,
-            OUTBOUND,
+            index,
             Event::Connect {
                 iss,
                 window: WINDOW,
@@ -1607,8 +1745,17 @@ fn connect_serving(
         );
         arm_nearest(service);
     }
-    if handover.handle == 0 {
-        handover.handle = tcp::handle(OUTBOUND as u32, 1, false);
+    // **The live connection's handle, every time**, not the first one minted:
+    // a second `CONNECT` — the v6 story after the v4 one — is a new connection
+    // under a new generation, and handing out the old badge would give the
+    // caller a capability to nothing. Before generations it was the same
+    // badge either way, which is exactly the reuse they exist to end.
+    if let Some(handle) = service
+        .outbound
+        .and_then(|index| service.connections.get(index))
+        .map(|connection| connection.handle)
+    {
+        handover.handle = handle;
     }
     let handed = call(
         syscall::INVOKE,
@@ -1620,6 +1767,75 @@ fn connect_serving(
         return (tcp::BARE, 0x20 | handed.0);
     }
     (tcp::OK, handover.handle)
+}
+
+/// Answers one `ARM_PAIR` leg on a listener — RFC 0086 step 2.
+///
+/// [`tcp::OPEN_LEG`] picks the next unused pair and makes its slots owed, so
+/// the next receive declares where the ring lands; legs 0 and 1 map the rings
+/// where [`Arming::place`] says, exactly as `LISTEN`'s legs map pair 0; leg 2
+/// registers the pair and arms the listener with it, answering its number.
+/// A retried leg is answered, not punished, as `connect_leg`'s are.
+fn arm_leg(arming: &mut Arming, service: &mut Service, leg: u64) -> (u64, u64) {
+    if service.listener.is_none() {
+        return (tcp::BARE, 0x40);
+    }
+    match leg {
+        tcp::OPEN_LEG => {
+            if arming.open {
+                return (tcp::OK, 0);
+            }
+            let Some(pair) = (1..MAX_PAIRS).find(|&n| service.pairs[n].is_none()) else {
+                // Every pair this listener can hold has been given: the
+                // table's refusal, not growth.
+                return (tcp::CONGESTED, 0);
+            };
+            *arming = Arming {
+                open: true,
+                pair: pair as u32,
+                send_mapped: false,
+                recv_mapped: false,
+            };
+            (tcp::OK, 0)
+        }
+        0 | 1 => {
+            if !arming.open {
+                return (tcp::BARE, 0x40 | leg);
+            }
+            let mapped = if leg == 0 {
+                &mut arming.send_mapped
+            } else {
+                &mut arming.recv_mapped
+            };
+            if *mapped {
+                return (tcp::OK, 0);
+            }
+            let (slot, at) = Arming::place(arming.pair, leg);
+            match call(syscall::INVOKE, slot, method::ATTACH, [at, 1, 0, 0]).0 {
+                status_word if status_word == status::OK => {
+                    *mapped = true;
+                    (tcp::OK, 0)
+                }
+                status_word if status_word == status::NO_SUCH_CAPABILITY => (tcp::BARE, leg),
+                other => (tcp::BARE, 0x100 | other << 4 | leg),
+            }
+        }
+        2 => {
+            if !(arming.open && arming.send_mapped && arming.recv_mapped) {
+                return (tcp::BARE, 2);
+            }
+            let pair = arming.pair;
+            let (_, sendr_at) = Arming::place(pair, 0);
+            let (_, recvr_at) = Arming::place(pair, 1);
+            service.pairs[pair as usize] = Some(Pair { sendr_at, recvr_at });
+            if let Some(listener) = service.listener.as_mut() {
+                let _ = listener.armed.arm(pair);
+            }
+            *arming = Arming::closed();
+            (tcp::OK, u64::from(pair))
+        }
+        _ => (tcp::BARE, 0x40 | leg),
+    }
 }
 
 /// Answers one `LISTEN` leg on a machine that has a network.
@@ -1649,12 +1865,20 @@ fn listen_leg_serving(
         return (tcp::BARE, 2);
     }
     if service.listener.is_none() {
+        // `LISTEN`'s own rings are pair 0, armed at once: the one pair every
+        // listener had before RFC 0086 step 2, and still all a caller that
+        // never arms another needs.
+        service.pairs[0] = Some(Pair {
+            sendr_at: handover.at.0,
+            recvr_at: handover.at.1,
+        });
+        let mut armed = Armed::new();
+        let _ = armed.arm(0);
         service.listener = Some(Listener {
             port: args[0] as u16,
             handle: tcp::handle(0, 1, true),
-            sendr_at: handover.at.0,
-            recvr_at: handover.at.1,
             notify_slot: handover.notified.then_some(handover.notify_slot),
+            armed,
         });
     }
     if handover.handle == 0 {
@@ -1712,7 +1936,7 @@ fn serve_handover_only(dark: u64, bits: u64) -> ! {
         true,
     );
     loop {
-        declare_gift_slot(&connect_handover, &listen_handover);
+        declare_gift_slot(&connect_handover, &listen_handover, &Arming::closed());
         let (status_in, badge, method_in, args) = receive();
         if status_in != status::OK {
             continue;
@@ -1959,9 +2183,12 @@ extern "C" fn tcpd_main(hertz: u64) -> ! {
         unclaimed_reclaimed: 0,
         cookies_accepted: 0,
         cookies_offered: 0,
-        connections: [None, None],
+        connections: Table::new(),
+        outbound: None,
         listener: None,
+        pairs: [None; MAX_PAIRS],
     };
+    let mut arming = Arming::closed();
 
     // Bind the inbox to this thread, so `receive` wakes for a caller, a frame
     // or a deadline — whichever comes first — and says which.
@@ -1982,16 +2209,17 @@ extern "C" fn tcpd_main(hertz: u64) -> ! {
     );
 
     loop {
+        let outbound = service
+            .outbound
+            .and_then(|index| service.connections.get(index));
         if service.outcome == outcome::PENDING
-            && service.connections[OUTBOUND]
-                .as_ref()
-                .is_some_and(|connection| connection.tcb.state == state::State::Established)
+            && outbound.is_some_and(|connection| connection.tcb.state == state::State::Established)
         {
             service.outcome = outcome::ESTABLISHED;
         }
         // **The outbound connection's send side**, for the step-4 row -- see
         // `SEND_HELD`.
-        if let Some(connection) = service.connections[OUTBOUND].as_ref() {
+        if let Some(connection) = outbound {
             let tcb = &connection.tcb;
             SEND_HELD.store(
                 (u64::from(tcb.unsent()) << 32) | u64::from(tcb.in_flight()),
@@ -2008,9 +2236,7 @@ extern "C" fn tcpd_main(hertz: u64) -> ! {
             service.taken,
             service.sent,
             service.refused,
-            service.connections[OUTBOUND]
-                .as_ref()
-                .map_or(0, |connection| state_number(&connection.tcb)),
+            outbound.map_or(0, |connection| state_number(&connection.tcb)),
             // **In the parameter order, which they were not before 2026-09-03.**
             //
             // `report`'s `words` array indexes by parameter *name*, and this
@@ -2034,8 +2260,14 @@ extern "C" fn tcpd_main(hertz: u64) -> ! {
             // `CLOSE-WAIT` state below it means an application still holds it,
             // and any other state means the connection never reached the one
             // the rule tests for. Bit 16 says the slot is occupied at all.
-            service.connections[ACCEPTED]
-                .as_ref()
+            //
+            // **The oldest accepted connection, since RFC 0086 step 2** — there
+            // is no single accepted slot any more, and the oldest is the one a
+            // wedge would have been holding longest.
+            service
+                .connections
+                .oldest(|connection| connection.pair.is_some())
+                .and_then(|index| service.connections.get(index))
                 .map_or(0, |connection| {
                     state_number(&connection.tcb) | (u64::from(connection.claimed) << 8) | (1 << 16)
                 }),
@@ -2044,7 +2276,7 @@ extern "C" fn tcpd_main(hertz: u64) -> ! {
             service.unclaimed_reclaimed,
         );
 
-        declare_gift_slot(&connect_handover, &listen_handover);
+        declare_gift_slot(&connect_handover, &listen_handover, &arming);
         let (status_in, badge, method_in, args) = receive();
         if status_in == status::NOTIFIED {
             // A frame, a deadline, or both — the word does not say which
@@ -2062,11 +2294,9 @@ extern "C" fn tcpd_main(hertz: u64) -> ! {
         // caller's badge and answers `CONNECT` and `LISTEN`; a connection
         // capability carries the handle this service minted and answers the
         // stream; a listener capability carries bit 63 and answers `ACCEPT`.
-        let connection_index = service.connections.iter().position(|connection| {
-            connection
-                .as_ref()
-                .is_some_and(|connection| connection.handle != 0 && connection.handle == badge)
-        });
+        let connection_index = service
+            .connections
+            .find(|connection| connection.handle != 0 && connection.handle == badge);
         if let Some(index) = connection_index {
             match method_in {
                 tcp::SEND => {
@@ -2093,7 +2323,7 @@ extern "C" fn tcpd_main(hertz: u64) -> ! {
                         drive_at(&mut service, index, Event::Read(args[0] as u32));
                         arm_nearest(&service);
                     }
-                    let packed = service.connections[index].as_ref().map_or(0, |connection| {
+                    let packed = service.connections.get(index).map_or(0, |connection| {
                         state_number(&connection.tcb) << 32 | connection.delivered
                     });
                     reply(tcp::OK, packed, 0);
@@ -2114,12 +2344,17 @@ extern "C" fn tcpd_main(hertz: u64) -> ! {
                 // Poll-shaped for the same reason `CONNECT` is: one reply
                 // obligation per thread. The accepted connection's
                 // capability rides the reply that says yes, into the slot
-                // the caller declared.
-                let established = service.connections[ACCEPTED]
-                    .as_ref()
-                    .is_some_and(|connection| connection.tcb.state == state::State::Established);
-                if established {
-                    let handle = tcp::handle(ACCEPTED as u32, 1, false);
+                // the caller declared — **the oldest established connection
+                // nobody has taken**, and which ring pair it lives in.
+                let ready = service.connections.oldest(|connection| {
+                    connection.pair.is_some()
+                        && !connection.claimed
+                        && connection.tcb.state == state::State::Established
+                });
+                let chosen = ready
+                    .and_then(|index| service.connections.get(index).map(|held| (index, held)))
+                    .map(|(index, held)| (index, held.handle, held.pair.unwrap_or(0)));
+                if let Some((index, handle, pair)) = chosen {
                     let handed = call(
                         syscall::INVOKE,
                         ENDPOINT,
@@ -2131,16 +2366,19 @@ extern "C" fn tcpd_main(hertz: u64) -> ! {
                         // user, and the obligation `CLOSE-WAIT` names is
                         // theirs. Before here it was the service's, and
                         // nobody discharged it.
-                        if let Some(held) = service.connections[ACCEPTED].as_mut() {
+                        if let Some(held) = service.connections.get_mut(index) {
                             held.claimed = true;
                         }
-                        reply(tcp::OK, handle, 0);
+                        reply(tcp::OK, handle, u64::from(pair));
                     } else {
                         reply(tcp::BARE, 0x20 | handed.0, 0);
                     }
                 } else {
                     reply(tcp::LATER, 0, 0);
                 }
+            } else if method_in == tcp::ARM_PAIR {
+                let (outcome_word, detail) = arm_leg(&mut arming, &mut service, args[2]);
+                reply(outcome_word, detail, 0);
             } else {
                 reply(tcp::LATER, 0, 0);
             }
@@ -2156,6 +2394,15 @@ extern "C" fn tcpd_main(hertz: u64) -> ! {
             let (outcome_word, detail) =
                 listen_leg_serving(&mut listen_handover, &mut service, args);
             reply(outcome_word, detail, 0);
+        } else if matches!(method_in, tcp::SEND | tcp::RECV | tcp::SHUTDOWN)
+            && badge != 0
+            && !tcp::parts(badge).2
+        {
+            // A stream method on a connection badge that names no live
+            // connection: its slot was retired and its generation moved on —
+            // RFC 0086 step 2. `LATER` would have the caller poll a connection
+            // that no longer exists for ever; `GONE` is the truth.
+            reply(tcp::GONE, 0, 0);
         } else {
             reply(tcp::LATER, 0, 0);
         }

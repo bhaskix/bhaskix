@@ -1434,6 +1434,12 @@ pub mod tcp {
     /// `SYN` has arrived and completed its handshake; then the reply carries
     /// the connection capability into the slot the caller declared with
     /// [`method::EXPECT`], exactly as `CONNECT` leg 2 does.
+    ///
+    /// Since RFC 0086 step 2 a listener can hold several established
+    /// connections at once; this hands out the **oldest**, and the reply's
+    /// third word names the ring pair it took — 0 for `LISTEN`'s own, else
+    /// the number [`ARM_PAIR`] answered — so the program knows which of its
+    /// rings the stream lives in.
     pub const ACCEPT: u64 = 60;
 
     /// On a connection: "I have written `arg0` bytes into the send ring."
@@ -1462,6 +1468,49 @@ pub mod tcp {
     /// `arg2` the port, `arg3` the leg. The legs are [`CONNECT`]'s,
     /// unchanged — the handover never looked inside an address.
     pub const CONNECT6: u64 = 67;
+
+    /// On a listener: arm it with one more ring pair — RFC 0086 step 2.
+    ///
+    /// A connection's rings are the program's memory, and bytes arrive from
+    /// the moment the peer's `ACK` is accepted, before anybody calls
+    /// [`ACCEPT`] — so a listener can only take as many connections at once
+    /// as it holds pairs for. `LISTEN`'s own rings are its first pair; this
+    /// adds more. The legs are `LISTEN`'s — `arg2` 0 the send ring, 1 the
+    /// receive ring, 2 complete — preceded by leg [`OPEN_LEG`], which carries
+    /// no gift and tells the service to declare where the next one lands.
+    /// **That leg exists because a service thread has one gift declaration**
+    /// and declares it before it knows what the next call is: a slot always
+    /// owed for arming would sit ahead of every wake in the declaration list
+    /// and starve them. Leg 2 answers the pair's number in the reply's second
+    /// word; [`ACCEPT`] names that number again in its third word when it
+    /// hands out the connection that took the pair.
+    ///
+    /// **A pair returns to the listener by itself** when the connection that
+    /// took it leaves the service's table, which is what a `LISTEN`'s single
+    /// pair always did. Numbered 70 because the network services share one
+    /// method series (58–69 are TCP's and UDP's); the kernel's own method 70
+    /// is `INVOKE`d, not called, and never meets this one.
+    pub const ARM_PAIR: u64 = 70;
+
+    /// [`ARM_PAIR`]'s leg that carries no gift — see there.
+    pub const OPEN_LEG: u64 = 9;
+
+    /// `bin/tcpc`'s report word saying where its four-at-once act is —
+    /// RFC 0086 step 2: one of the `FOUR_*` states below. Here rather than
+    /// written twice, because the kernel reads the page this program writes
+    /// and a word index stated on each side is two statements of one layout.
+    pub const CLIENT_FOUR_STATE: usize = 20;
+    /// The act's result: bits 0–7 connections echoed, 8–15 connections
+    /// accepted, 16–19 which ring pairs they took (one bit per pair), 20–23
+    /// ghosts turned away (connections whose first bytes were not a four-way
+    /// client's, capped at 15), 24 and up the step a failure stopped at.
+    pub const CLIENT_FOUR_SERVED: usize = 21;
+    /// Three pairs armed beside `LISTEN`'s own; waiting for four clients.
+    pub const FOUR_READY: u64 = 1;
+    /// All four accepted at once and each echoed to its own sender.
+    pub const FOUR_DONE: u64 = 2;
+    /// Stopped; [`CLIENT_FOUR_SERVED`] says where.
+    pub const FOUR_FAILED: u64 = 3;
 
     /// The first four bytes of a v6 record in the rings between the
     /// protocol service and the TCP service, where a v4 record carries the

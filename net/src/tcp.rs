@@ -21,6 +21,7 @@ pub mod cookie;
 pub mod isn;
 pub mod segment;
 pub mod state;
+pub mod table;
 
 pub use segment::{Flags, Options, Segment};
 pub use state::{Action, Actions, Emit, Ended, Event, State, Tcb, Timer, step};

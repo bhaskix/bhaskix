@@ -52,4 +52,7 @@ asm_budget = 2
 # memory-wait's volatile poll and every ring access moved into
 # bhaskix-sock, reviewed once there. What remains is the panic ud2 and
 # the report-page writes.
-unsafe_budget = 12
+# 13 since RFC 0086 step 2: the three extra ring pairs' views, made in the
+# block that already makes the first four -- the one claim a view carries
+# (the ring is mapped there for the program's life) made where the mapping is.
+unsafe_budget = 13
