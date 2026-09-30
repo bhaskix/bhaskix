@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | 🔨 **Draft 2026-09-30 — steps 1, 2 and 3a done.** The workload RFC 0005 was owed from outside is named, its gate defined, its size measured and its system calls traced; `bin/tcpd` holds a table of thirty-two connections and a listener arms ring pairs, gated by four host clients held at once. `tcpd` serves a second listener opened by any program, and names a connection's peer. Steps 3b–6 are the work. The acceptance call is the project lead's. |
+| **Status** | 🔨 **Draft 2026-09-30 — steps 1, 2, 3a and 3b done.** The workload RFC 0005 was owed from outside is named, its gate defined, its size measured and its system calls traced; `bin/tcpd` holds a table of thirty-two connections and a listener arms ring pairs, gated by four host clients held at once. `tcpd` serves a second listener opened by any program, and names a connection's peer; and a hosted Linux program listens, accepts and echoes a host client through `bin/linuxd`. Steps 4–6 are the work. The acceptance call is the project lead's. |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | userspace (`bin/linuxd`, `bin/tcpd`), `personality`, tools |
 | **Milestone** | Phase 2 — the Linux personality ([RFC 0005](0005-linux-abi-compatibility.md)) |
@@ -225,6 +225,61 @@ and pair ownership. That logic is `tcpd`'s own, which has no host tests, and
 it reuses no new pure structure; the boot gate and its two arms are what cover
 it.
 
+## Step 3b's record (2026-09-30): a hosted program serves a TCP client
+
+**What landed.** A hosted stream socket is `bin/linuxd`'s: its listener and
+connections are capabilities to `bin/tcpd` the adapter holds, and its bytes
+move through a pool of seventeen ring pairs the kernel grants the adapter at
+start — the project lead's choice (2026-09-30) over a kernel method for making
+memory. `socket`, `bind`, `listen` (a listener opened with `OPEN_LEG`, armed up
+to the backlog from the pool), `accept4` (the peer from `PEER`, v4-mapped on a
+dual-stack socket), `read`, `write`, `sendto`/`recvfrom` on a stream,
+`shutdown`, `getsockname`, `getpeername`, `setsockopt` for the seven options
+the step-1 trace saw, `getsockopt(SO_ERROR)`, `O_NONBLOCK` kept through `fcntl`,
+and `close`. The option numbers and syscall numbers were read from the build
+host's headers, not recalled; the option table and the v4-mapped encoding are
+host-tested in `personality::socket`.
+
+**The gate.** An assembly probe — `tools/probes/linux-streamer.s` — listens on
+port 10, blocks in `accept4` until the host connects, blocks in `read` until
+sixteen bytes have come, writes them back and prints them. The host must get
+its bytes back *and* the console must carry them; the guest's own line says
+only that the probe ended, because ending is not serving.
+
+**Three things building it found, each of which would have come back:**
+
+1. **The pool arrives after the adapter starts.** `bin/linuxd` starts early and
+   the kernel grants the pool once `bin/tcpd` exists, so mapping the pool once
+   at start found nothing and refused every hosted stream for the rest of the
+   boot. It is mapped on the first stream `socket()`, resuming where it
+   stopped.
+2. **A hosted process's exit released its stream as a datagram slot.**
+   `release_sockets_of` treated every socket with a handle as a UDP slot; a
+   stream's handle is a table index and the first is 0, and releasing "slot 0"
+   is a `CALL` on the adapter's own endpoint — the adapter waiting for itself,
+   for ever, and every hosted program behind it. Found by listing every thread
+   queued on an endpoint: the adapter's was sending on its own.
+3. **`HAND` could not say which way it meant.** The kernel read a `HAND` as a
+   server handing into its reply whenever the thread was answering somebody,
+   and the adapter stages its rings for `bin/tcpd` *while* answering the hosted
+   program's `listen` — so the stage was refused `SlotUnavailable`. **`HAND`
+   gained `HAND_STAGE`**, an `arg3` bit saying "for my next call" whatever the
+   thread is doing; a `HAND` without it is read exactly as before, and
+   `sock::tcp::leg` sets it. A kernel interface extended, backward-compatibly,
+   inside this step rather than planned before it — said so here.
+
+**Two kernel limits raised, each counted rather than guessed:**
+`shared::MAX_OBJECTS` 64 → 128 (a boot peaked at 45 live and the pool adds 34),
+and `notify::MAX_NOTIFICATIONS` 32 → 64 (a boot used all thirty-two, and the
+adapter's TCP wake made the `two sources` self-test's notification the
+thirty-third, which failed it).
+
+**What is interim, and said in `stream.rs`:** a blocking `accept`/`read` waits
+by retrying every ten milliseconds, not by readiness — step 4's `epoll` is
+where that changes; a pair given to a listener stays with it, since `tcpd` has
+no un-listen; and the send side has no flow control the adapter can see, so a
+write is bounded to a page and trusts the peer to keep acknowledging.
+
 ## Design
 
 ### The gate
@@ -292,8 +347,14 @@ the adapter's copy cost per request.
 - **No new parser of untrusted input in the nucleus.** HTTP is parsed by the
   Go program in its own domain. The adapter decodes `sockaddr` structures and
   socket options from a hosted process, which is untrusted input: the decoding
-  lives in `personality/src/socket.rs`, host-tested, and the existing
-  `linux_sockaddr` fuzz target is extended over the option decoding.
+  lives in `personality/src/socket.rs`, host-tested, ~~and the existing
+  `linux_sockaddr` fuzz target is extended over the option decoding~~ —
+  **not extended, corrected 2026-09-30:** `plan_setsockopt` turned out to parse
+  no buffer at all — it matches two integers and checks a length, and the only
+  value it reads (`IPV6_V6ONLY`'s) is one `int` copied in whole — so its host
+  test covers every branch and a fuzzer would add nothing. The `sockaddr` a
+  hosted program hands `bind` is still parsed by `parse_endpoint`, which that
+  fuzz target already covers.
 
 ## Performance implications
 
@@ -335,7 +396,7 @@ is printed so that the number a faster path would improve is on record first.
    ✅ 2026-09-30. More than one listener is left for step 5, when the Go server
    and `bin/tcpc` must listen at once.
 3. **Hosted TCP, server side** — 3a ✅ 2026-09-30: `tcpd` serves more than
-   one listener and names a peer. 3b: stream sockets in `bin/linuxd` over `tcpd`,
+   one listener and names a peer. 3b ✅ 2026-09-30: stream sockets in `bin/linuxd` over `tcpd`,
    with the calls and options the trace lists; gate: an assembly probe that
    listens, accepts and echoes.
 4. **`epoll`** — create, control, wait, edge- and level-triggered, parked

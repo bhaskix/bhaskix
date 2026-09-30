@@ -100,8 +100,10 @@ The `-ix` is the Unix lineage, the same suffix Minix and Linux carry.
 > What is genuinely not here: **no libc and no self-hosting** — the Linux personality runs Go
 > binaries in ring 3 ~~but its file and socket tiers are not started~~ *(stale, corrected
 > 2026-09-30: files and directories have been served since 2026-08-23 and UDP sockets since the
-> same day)* — and **TCP and `epoll` for hosted programs are not built**, which is what stands
-> between it and a network server. **No cryptography at all**; a
+> same day)* — and ~~**TCP and `epoll` for hosted programs are not built**~~ *(TCP's server side
+> since 2026-09-30: a hosted program listens, accepts and echoes a host client, gated)* **`epoll`
+> for hosted programs is not built**, which is what stands between it and a real network server:
+> Go's runtime waits on nothing else. **No cryptography at all**; a
 > grep for eleven primitive names returns nothing, and where it will come from is a decision RFC
 > that has not been adopted. **USB is a keyboard and nothing else** — no storage, no hubs, no USB 3
 > — and a machine with no i8042 *and no IOMMU* still has no keyboard, because a bus master nothing

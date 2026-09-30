@@ -220,6 +220,14 @@ We will not pretend to cover these. Each has a note on whether it becomes in-sco
 > One directory is shared by every hosted process, for no principled reason beyond L1's cost. That
 > is RFC 0060's own unresolved question 1, said there as it is said here: a shared scratch directory
 > between mutually distrusting processes is a real weakness and not a simplification.
+>
+> **2026-09-30, [RFC 0086](rfc/0086-the-motivating-workload.md) step 3b: the adapter now holds TCP.**
+> `bin/tcpd`'s endpoint under the adapter's own badge, seventeen ring pairs it owns, and the wake
+> `tcpd` rings for news — so a compromised adapter reads and writes **every hosted TCP stream**, as
+> it already reads every hosted file and datagram. It gains nothing against `bin/tcpd` itself: the
+> service still takes only rings a caller gifts and answers only the capabilities it minted, and a
+> hosted listener or connection is a capability the *adapter* holds, never the hosted process. The
+> same price stated the same way as the network was on 2026-08-23: enumerated rather than absorbed.
 
 > **[RFC 0079](rfc/0079-a-signal-a-process-may-send-another.md) added the power to *end* a hosted
 > process, on 2026-09-15, and it is the largest single widening in this list.** Everything above

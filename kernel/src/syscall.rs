@@ -4670,7 +4670,20 @@ fn hand(frame: &SyscallFrame) -> Outcome {
     // revoked between staging and calling has to fail *there*, so a check here
     // would be reassurance that expires. Until the rendezvous consumes gifts
     // (RFC 0022 step 2), a staged gift is inert.
-    let caller = match crate::sched::reply_target(server) {
+    //
+    // **Unless the caller says which** -- RFC 0086 step 3b. A thread answering
+    // somebody can also be about to call somebody: `bin/linuxd` stages a ring
+    // for `bin/tcpd` while it answers a hosted program's `listen`, and reading
+    // that as a hand into the hosted program's reply refused it, because the
+    // hosted program had invited nothing. `HAND_STAGE` in `arg3` settles it; a
+    // `HAND` without it is read exactly as before.
+    let staging = frame.arg3 & bhaskix_abi::method::HAND_STAGE != 0;
+    let answering = if staging {
+        None
+    } else {
+        crate::sched::reply_target(server)
+    };
+    let caller = match answering {
         Some(caller) => caller,
         None => {
             let Ok(slot) = u32::try_from(frame.arg0) else {

@@ -894,7 +894,16 @@ asm_budget = 10
 # report reader in `lib.rs` makes, for the acts that hold four host clients on
 # one listener and open a second listener. One reader, so the line is counted
 # once however many acts use it.
-unsafe_budget = 2063
+# 2083 for twenty more, RFC 0086 step 3b: `ring3_streamer`, the hosted TCP
+# server probe's entry -- the copy of its code and its `sockaddr_in` into the
+# frame it will run from, the install of its space, and the ring-3 entry. The
+# same three blocks every probe entry here has, and the same order of cost the
+# socket probe's entry was recorded at ("up thirty-one"). **The recoverable
+# part is named rather than left:** every probe entry repeats this scaffolding,
+# and one helper they all called would count it once; that is a refactor of
+# twenty-two entries (counted: that many `enter_ring3` calls in `lib.rs`), not
+# part of this step.
+unsafe_budget = 2083
 # Up thirty-one for RFC 0005 step 9's socket probe -- `ring3_socketeer`, which
 # is `ring3_lister` with a `sockaddr_in6` copied in beside its code instead of
 # two filenames. The same two blocks every hosted probe has: one

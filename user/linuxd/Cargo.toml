@@ -264,7 +264,12 @@ asm_budget = 3
 # no budget at all: the pending set is arithmetic in `bhaskix-personality`,
 # which forbids `unsafe` outright, and the stash and the parked-slot table are
 # atomics chosen over a `static mut` for precisely this reason.
-unsafe_budget = 121
+# 123 since RFC 0086 step 3b (2026-09-30), up two, both in `stream.rs`: the one
+# accessor for the hosted-TCP table, single-threaded like every table here, and
+# the one place a view of the ring pool is made, whose claim is the mapping
+# `init` made. Every ring access after that goes through `bhaskix-sock`'s
+# `RingView`, reviewed once there, rather than a volatile loop here.
+unsafe_budget = 123
 # Up five for RFC 0005 step 9's datagram page: the volatile writes that stage
 # a payload into it, the volatile reads that take one back out, and the static
 # that remembers whether it has been mapped.

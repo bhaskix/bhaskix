@@ -42,7 +42,12 @@ use crate::sync::{Rank, SpinLock};
 ///
 /// Fixed, because the signal path indexes this array from an interrupt
 /// handler and must not chase an allocation.
-pub const MAX_NOTIFICATIONS: usize = 32;
+///
+/// **64 since RFC 0086 step 3b (2026-09-30), from 32**, because a boot used
+/// every one of the thirty-two: the adapter's TCP wake was the thirty-third,
+/// and the next self-test that asked for a notification -- `two sources` --
+/// was refused and failed. Counted by that boot, not assumed.
+pub const MAX_NOTIFICATIONS: usize = 64;
 
 /// Names a notification, with the generation that was current when it was
 /// named. A stale name does not address a reused slot.

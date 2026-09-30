@@ -50,6 +50,8 @@ use bhaskix_personality::report;
 use bhaskix_personality::signal::{self, Dispositions, Handler, Registers, number::SIGSEGV};
 use bhaskix_personality::thread::{self, ClonePlan};
 
+mod stream;
+
 /// One page to report through, written by this program and read by the
 /// kernel. Not a console: this program is started before the console service
 /// exists, and every other service that must say something that early says it
@@ -942,6 +944,31 @@ fn answer_with_frame(domain: u32, slot: u64, number: u64) -> (u64, Answer) {
     let (rdi, rsi, rdx, r10, r8, r9) = (image[5], image[4], image[3], image[9], image[7], image[8]);
 
     match number {
+        // Five arguments, RFC 0086 step 3b. A stream records what it keeps
+        // (`IPV6_V6ONLY`); a datagram socket has the known options accepted
+        // and nothing kept -- Go sets them on every socket it opens.
+        SETSOCKOPT | GETSOCKOPT => {
+            let request = PersonalityCall::new(
+                Dialect::Linux,
+                number,
+                [rdi, rsi, rdx, r10, r8, r9],
+                0,
+                domain,
+            );
+            let stream = stream_fd(&request, rdi);
+            let answer = match (number, stream) {
+                (SETSOCKOPT, true) => stream::setsockopt(&request, rsi, rdx, r10, r8),
+                (GETSOCKOPT, true) => stream::getsockopt(&request, rsi, rdx, r10, r8),
+                (SETSOCKOPT, false) => {
+                    match bhaskix_personality::socket::plan_setsockopt(rsi, rdx, r8) {
+                        Ok(_) => Answer::ok(0),
+                        Err(code) => Answer::error(code),
+                    }
+                }
+                _ => Answer::error(bhaskix_personality::socket::errno::ENOPROTOOPT),
+            };
+            (REPLY_VALUE, answer)
+        }
         // Six arguments, which is two more than a message carries.
         SENDTO | RECVFROM => {
             let request = PersonalityCall::new(
@@ -951,6 +978,17 @@ fn answer_with_frame(domain: u32, slot: u64, number: u64) -> (u64, Answer) {
                 0,
                 domain,
             );
+            // On a stream the address is ignored, as Linux ignores it on a
+            // connected socket, and the call is a `write` or a `read` that
+            // does not wait.
+            if stream_fd(&request, rdi) {
+                return if number == SENDTO {
+                    (REPLY_VALUE, stream::write(&request, rdi, rsi, rdx))
+                } else {
+                    let (_, answer) = stream::read(&request, rdi, rsi, rdx);
+                    (REPLY_VALUE, answer)
+                };
+            }
             (
                 REPLY_VALUE,
                 if number == SENDTO {
@@ -1779,7 +1817,7 @@ fn answer(request: &PersonalityCall) -> (u64, Answer) {
     // datagram never came back.
     if matches!(
         request.number,
-        CLONE | RT_SIGRETURN | FORK | SENDTO | RECVFROM
+        CLONE | RT_SIGRETURN | FORK | SENDTO | RECVFROM | SETSOCKOPT | GETSOCKOPT
     ) {
         return (REPLY_NEED_FRAME, Answer::ok(0));
     }
@@ -1836,6 +1874,9 @@ fn answer(request: &PersonalityCall) -> (u64, Answer) {
                     REPLY_VALUE,
                     read_proc(request, handle, request.second(), request.third()),
                 ),
+                Some((Kind::Socket, _)) if stream_fd(request, request.first()) => {
+                    stream::read(request, request.first(), request.second(), request.third())
+                }
                 _ => (REPLY_VALUE, answer_read(request)),
             };
         }
@@ -1848,6 +1889,15 @@ fn answer(request: &PersonalityCall) -> (u64, Answer) {
         // caller's memory, so each belongs in this block.
         SOCKET => return (REPLY_VALUE, answer_socket(request)),
         BIND => return (REPLY_VALUE, answer_bind(request)),
+        // RFC 0086 step 3b: the server side of a hosted stream.
+        LISTEN => return (REPLY_VALUE, stream::listen(request)),
+        ACCEPT => return stream::accept(request, 0),
+        ACCEPT4 => return stream::accept(request, request.fourth()),
+        SHUTDOWN => return (REPLY_VALUE, stream::shutdown(request)),
+        GETSOCKNAME if stream_fd(request, request.first()) => {
+            return (REPLY_VALUE, stream::getsockname(request));
+        }
+        GETPEERNAME => return (REPLY_VALUE, stream::getpeername(request)),
 
         IOCTL => return (REPLY_VALUE, answer_ioctl(request)),
         FSTAT => return (REPLY_VALUE, answer_fstat(request)),
@@ -2189,6 +2239,9 @@ fn answer_from_message(request: &PersonalityCall) -> Answer {
             match descriptor_kind(request, fd) {
                 Some((Kind::Pipe, handle)) => {
                     return write_to_pipe(request, handle as usize, buffer, count);
+                }
+                Some((Kind::Socket, _)) if stream_fd(request, fd) => {
+                    return stream::write(request, fd, buffer, count);
                 }
                 // **A file opened through the writable directory is written**
                 // — RFC 0060 step 3. This arm answered `EROFS` for every
@@ -2821,6 +2874,11 @@ fn condition_of(
         // An unbound socket has no service to ask -- `bind` is what claims the
         // capability -- and nothing can arrive on it, so it is quiet rather
         // than an error.
+        // A stream is not a datagram socket, and its handle is not a slot on
+        // `bin/ipd` -- asking there would be asking about somebody else's
+        // socket. Step 4 (`epoll`) is where a stream's readiness is answered;
+        // until then `poll` says it cannot tell (RFC 0086 step 3b).
+        Kind::Socket if stream::is_stream(&entry) => Condition::Unanswered,
         Kind::Socket if entry.handle != u64::MAX => {
             let port = entry.size as u16;
             let waiting = if entry.offset != 0 {
@@ -3322,6 +3380,16 @@ const MKDIRAT: u64 = 258;
 const UNLINKAT: u64 = 263;
 /// `socket(family, type, protocol)`.
 const SOCKET: u64 = 41;
+/// The stream calls RFC 0086 step 3b adds, numbered from the build host's
+/// `asm/unistd_64.h` on 2026-09-30.
+const LISTEN: u64 = 50;
+const ACCEPT: u64 = 43;
+const ACCEPT4: u64 = 288;
+const GETSOCKNAME: u64 = 51;
+const GETPEERNAME: u64 = 52;
+const SETSOCKOPT: u64 = 54;
+const GETSOCKOPT: u64 = 55;
+const SHUTDOWN: u64 = 48;
 /// `bind(fd, sockaddr, length)`.
 const BIND: u64 = 49;
 /// `sendto(fd, buffer, length, flags, sockaddr, addrlen)`.
@@ -5793,9 +5861,20 @@ fn answer_fcntl(request: &PersonalityCall) -> Answer {
                 0
             };
             let _ = fcntl::FD_CLOEXEC;
-            Answer::ok(access | directory)
+            // A stream keeps `O_NONBLOCK`, and says so (RFC 0086 step 3b).
+            let nonblocking = if stream::is_stream(&entry) && stream::nonblocking(&entry) {
+                bhaskix_personality::socket::kind::NONBLOCK
+            } else {
+                0
+            };
+            Answer::ok(access | directory | nonblocking)
         }
-        Fcntl::WriteStatusFlags => Answer::ok(0),
+        Fcntl::WriteStatusFlags => {
+            if stream::is_stream(&entry) {
+                stream::set_nonblocking(&entry, request.third());
+            }
+            Answer::ok(0)
+        }
     }
 }
 
@@ -5818,8 +5897,12 @@ fn answer_socket(request: &PersonalityCall) -> Answer {
     // for a TCP socket would fail at `connect` with something that says
     // nothing about why; RFC 0022's three-leg handover is step 9's second half
     // and is not here.
+    // ~~**Streams are refused and datagrams are not.**~~ Since RFC 0086
+    // step 3b a stream is a hosted TCP socket over `bin/tcpd`, served in
+    // `stream.rs`; it is still refused with `EPROTONOSUPPORT` on a machine
+    // that granted no ring pool, where there is nothing to serve it with.
     if plan.stream {
-        return Answer::error(-93); // EPROTONOSUPPORT
+        return stream::socket(request, &plan);
     }
     let Some(process) = process_for(request.domain) else {
         return Answer::error(-11);
@@ -5870,6 +5953,11 @@ fn answer_bind(request: &PersonalityCall) -> Answer {
     };
     if entry.kind != Kind::Socket {
         return Answer::error(-88); // ENOTSOCK
+    }
+    // A stream socket's port is recorded, not bound: `bin/tcpd` claims it at
+    // `listen` (RFC 0086 step 3b).
+    if stream::is_stream(&entry) {
+        return stream::bind(request, port, v6);
     }
     if entry.handle != u64::MAX {
         return Answer::error(-22); // EINVAL: already bound
@@ -6218,7 +6306,14 @@ fn give_back_descriptor(entry: bhaskix_personality::file::Entry, last: bool) {
     // that was never bound holds nothing -- `u64::MAX` is the row's way of
     // saying so -- and releasing that would compute an index far outside the
     // six.
-    if entry.kind == Kind::Socket && entry.handle != u64::MAX && last {
+    // A stream's `handle` is an index into `stream.rs`'s table, not a
+    // datagram slot, and giving it to `release_socket_slot` would free
+    // somebody's datagram socket.
+    if stream::is_stream(&entry) {
+        if last {
+            stream::close(&entry);
+        }
+    } else if entry.kind == Kind::Socket && entry.handle != u64::MAX && last {
         release_socket_slot(entry.handle);
     }
     // **A pipe end closing is a count, not a teardown** — RFC 0033 step 7.
@@ -6550,6 +6645,22 @@ fn release_sockets_of(domain: u32) {
         let Some(entry) = process.descriptors.get(number).copied() else {
             continue;
         };
+        // **A stream's handle is not a datagram slot** -- RFC 0086 step 3b.
+        // It is an index into `stream.rs`'s table, the first stream's is 0,
+        // and releasing "datagram slot 0" is a `CALL` on this program's own
+        // endpoint: the adapter waiting for itself, for ever. That is how the
+        // first hosted stream probe to exit took every hosted program down.
+        if stream::is_stream(&entry) {
+            if process.descriptors.holders(entry.handle) == 1 {
+                stream::close(&entry);
+            }
+            if let Some(process) = process_for(domain)
+                && let Some(entry) = process.descriptors.get_mut(number)
+            {
+                entry.handle = u64::MAX;
+            }
+            continue;
+        }
         if entry.kind == bhaskix_personality::file::Kind::Socket
             && entry.handle != u64::MAX
             && process.descriptors.holders(entry.handle) == 1
@@ -7574,6 +7685,16 @@ fn incarnation_of(domain: u32) -> u32 {
 /// The one lookup `read` and `write` share: both have to know whether a number
 /// is a file, a pipe or the console before they can do anything with it, and
 /// neither should have to reach into the process table itself to find out.
+/// Whether descriptor `fd` is a hosted stream socket — RFC 0086 step 3b.
+fn stream_fd(request: &PersonalityCall, fd: u64) -> bool {
+    let Ok(descriptor) = i32::try_from(fd) else {
+        return false;
+    };
+    process_for(request.domain)
+        .and_then(|process| process.descriptors.get(descriptor).copied())
+        .is_some_and(|entry| stream::is_stream(&entry))
+}
+
 fn descriptor_kind(request: &PersonalityCall, fd: u64) -> Option<(Kind, u64)> {
     let descriptor = i32::try_from(fd).ok()?;
     let process = process_for(request.domain)?;
@@ -8028,6 +8149,9 @@ fn park_until(domain: u32, nanos: u64) -> Option<u64> {
 extern "C" fn linuxd_main(hertz: u64) -> ! {
     // SAFETY: before anything else runs here, and single-threaded.
     unsafe { HERTZ = hertz };
+    // RFC 0086 step 3b: the TCP ring pool, if this machine has granted one
+    // yet -- asked again at each stream `socket()` until it has.
+    let _ = stream::init();
     // The report page, into this program's own space. If it will not map the
     // adapter still serves — a trace is a convenience and refusing to work
     // without one would be the wrong priority.

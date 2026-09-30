@@ -229,7 +229,7 @@ pub mod adapter {
     pub const HANDLE_CAPACITY: usize = NETWORK - HANDLE_FLOOR;
 
     /// Every fixed grant, for the checks below.
-    const FIXED: [usize; 13] = [
+    const FIXED: [usize; 15] = [
         ENDPOINT,
         REPORT,
         FAULTS,
@@ -243,6 +243,8 @@ pub mod adapter {
         WRITABLE_DIR,
         NETWORK,
         PAYLOAD,
+        TCP_SERVICE,
+        TCP_WAKE,
     ];
 
     /// The first slot holding a hosted process's own domain — RFC 0079.
@@ -272,6 +274,39 @@ pub mod adapter {
     /// domain.
     pub const DOMAIN_COUNT: usize = 32;
 
+    /// `bin/tcpd`'s endpoint, badged as this adapter — RFC 0086 step 3b. The
+    /// badge is its own, not `bin/tcpc`'s, because `tcpd` gives an open
+    /// handover to the caller that opened it and tells callers apart by it.
+    pub const TCP_SERVICE: usize = DOMAIN_FLOOR + DOMAIN_COUNT;
+    /// The notification `tcpd` rings for news on a hosted listener or
+    /// connection: gifted as each listener's wake, and inherited by every
+    /// connection a listener births.
+    pub const TCP_WAKE: usize = TCP_SERVICE + 1;
+    /// The first of the ring pool: `TCP_RING_COUNT` 16 KiB stream rings this
+    /// adapter owns, granted at start — the project lead's choice over a
+    /// kernel method for making memory (2026-09-30). Pair `n` is rings
+    /// `2n` (send) and `2n + 1` (receive).
+    pub const TCP_RINGS: usize = TCP_WAKE + 1;
+    /// Seventeen pairs: sixteen connections for RFC 0086's sixteen clients,
+    /// and a listener's first pair.
+    pub const TCP_RING_COUNT: usize = 34;
+    /// Where a hosted listener's capability lands, one slot each.
+    pub const TCP_LISTENERS: usize = TCP_RINGS + TCP_RING_COUNT;
+    /// How many hosted listeners at once — `bin/tcpd`'s own limit is four and
+    /// `bin/tcpc` holds one of them.
+    pub const TCP_LISTENER_COUNT: usize = 3;
+    /// Where an accepted connection's capability lands, one slot each.
+    pub const TCP_CONNECTIONS: usize = TCP_LISTENERS + TCP_LISTENER_COUNT;
+    /// How many hosted TCP connections at once.
+    pub const TCP_CONNECTION_COUNT: usize = 16;
+    /// The badge on [`TCP_SERVICE`]: this adapter's own on `bin/tcpd`'s
+    /// endpoint, distinct from `bin/tcpc`'s, since the service gives an open
+    /// handover to the caller whose badge opened it.
+    pub const TCP_SERVICE_BADGE: u64 = 0x7C_A1;
+    /// The badge on [`TCP_WAKE`], and so on every gift of it: badges only
+    /// narrow, so a derivation the adapter gifts must carry the same one.
+    pub const TCP_WAKE_BADGE: u64 = 0x7C_A2;
+
     /// Whether `slot` is one a pool allocates from.
     const fn in_a_pool(slot: usize) -> bool {
         (slot >= WAKES && slot < WAKES + WAKE_COUNT)
@@ -280,6 +315,9 @@ pub mod adapter {
             || (slot >= FILE_FLOOR && slot <= FILE_TOP)
             || (slot >= DOMAIN_FLOOR && slot < DOMAIN_FLOOR + DOMAIN_COUNT)
             || slot == DATAGRAM_BELL
+            || (slot >= TCP_RINGS && slot < TCP_RINGS + TCP_RING_COUNT)
+            || (slot >= TCP_LISTENERS && slot < TCP_LISTENERS + TCP_LISTENER_COUNT)
+            || (slot >= TCP_CONNECTIONS && slot < TCP_CONNECTIONS + TCP_CONNECTION_COUNT)
     }
 
     // **No fixed grant may sit where a pool allocates**, and no two may share a
@@ -318,6 +356,11 @@ pub mod adapter {
         // The domain slots sit above the files and inside the CSpace.
         assert!(DOMAIN_FLOOR > FILE_TOP);
         assert!(DOMAIN_FLOOR + DOMAIN_COUNT <= crate::limits::CSPACE_SLOTS);
+        // RFC 0086 step 3b: the TCP grants and pools sit above the domains,
+        // one after another, and inside the CSpace.
+        assert!(TCP_SERVICE >= DOMAIN_FLOOR + DOMAIN_COUNT);
+        assert!(TCP_CONNECTIONS + TCP_CONNECTION_COUNT <= crate::limits::CSPACE_SLOTS);
+        assert!(TCP_RING_COUNT.is_multiple_of(2));
     };
 }
 
@@ -730,7 +773,20 @@ pub mod method {
     /// bare, and every refusal — no declaration, no `GRANT`, rights or badge
     /// not monotone — restores the staged gift, so a retry needs no second
     /// `HAND`.
+    ///
+    /// **`arg3` bit 0, [`HAND_STAGE`], says the second, whatever the thread is
+    /// doing** — RFC 0086 step 3b. Which direction was meant used to be read
+    /// only from whether the thread was answering somebody, and a thread can
+    /// be both: `bin/linuxd` stages a ring for its own call to `bin/tcpd` *while*
+    /// answering a hosted program, and the kernel read that as handing the
+    /// ring into the hosted program's reply -- which had declared nothing, so
+    /// it was refused `SlotUnavailable`. A `HAND` with the bit clear is read
+    /// exactly as before.
     pub const HAND: u64 = 47;
+
+    /// [`HAND`]'s `arg3` bit: stage for this thread's next `Call`, even while
+    /// answering a caller.
+    pub const HAND_STAGE: u64 = 1;
     /// Give a derived capability to the domain this capability names.
     ///
     /// Only on a `Domain`. `arg0` = the caller's slot to derive from, `arg1` =

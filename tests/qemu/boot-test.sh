@@ -714,6 +714,33 @@ rm -f "$SECOND_VERDICT"
 ) &
 SECOND_DRIVER=$!
 
+# RFC 0086 step 3b: a hosted Linux program's own TCP server, on guest port 10.
+# Retried every half second from `linux stream   started` until the probe is
+# listening: before it listens `bin/tcpd` answers with a reset (RFC 0047), so
+# an early attempt fails fast rather than leaving a ghost behind.
+HOSTED_VERDICT=$(mktemp)
+rm -f "$HOSTED_VERDICT"
+(
+    until grep -aqE "linux stream +(started|skipped|FAILED)" "$LOG" 2>/dev/null; do
+        sleep 0.25
+    done
+    grep -aqE "linux stream +started" "$LOG" || exit 0
+    for _ in $(seq 1 60); do
+        if { exec 7<>/dev/tcp/127.0.0.1/$BHASKIX_HOSTED_PORT; } 2>/dev/null; then
+            printf 'bhaskix-htcp-srv' >&7
+            got=$(timeout 10 dd bs=1 count=16 <&7 2>/dev/null || true)
+            exec 7>&- 7<&- || true
+            if [[ "$got" == "bhaskix-htcp-srv" ]]; then
+                echo "echoed" > "$HOSTED_VERDICT"
+                exit 0
+            fi
+        fi
+        sleep 0.5
+    done
+    echo "never echoed" > "$HOSTED_VERDICT"
+) &
+HOSTED_DRIVER=$!
+
 echo "booting ($MODE), up to ${TIMEOUT}s..."
 run_until "$LOG" "Nothing left to do at this milestone" "$TIMEOUT" "${QEMU_ARGS[@]}"
 kill "$INBOUND_DRIVER" 2>/dev/null || true
@@ -726,6 +753,8 @@ kill "$FOUR_DRIVER" 2>/dev/null || true
 wait "$FOUR_DRIVER" 2>/dev/null || true
 kill "$SECOND_DRIVER" 2>/dev/null || true
 wait "$SECOND_DRIVER" 2>/dev/null || true
+kill "$HOSTED_DRIVER" 2>/dev/null || true
+wait "$HOSTED_DRIVER" 2>/dev/null || true
 
 status=0
 
@@ -2815,6 +2844,24 @@ else
     pass "a second listener not attempted: the four-client act did not run here"
 fi
 rm -f "$SECOND_VERDICT" 2>/dev/null || true
+
+# RFC 0086 step 3b's gate -- see the driver above. The guest says the probe
+# ended after writing back; the host says whether its own bytes came back; the
+# console carries them. All three, or it did not happen.
+if grep -qE "linux stream +the hosted server ended" "$LOG"; then
+    if [[ "$(cat "$HOSTED_VERDICT" 2>/dev/null)" == "echoed" ]] && grep -aqF "bhaskix-htcp-srv" "$LOG"; then
+        pass "a hosted Linux program served a TCP client from the host: blocking accept4 and read, its bytes back"
+    else
+        fail "the hosted server ended without serving the host: the host says $(cat "$HOSTED_VERDICT" 2>/dev/null || echo 'nothing'), its bytes are $(grep -aqF 'bhaskix-htcp-srv' "$LOG" && echo 'on' || echo 'not on') the console, and the probe said: $(grep -aoE 'htcp fail [0-9] [0-9a-f]{2}' "$LOG" | head -1 || true)"
+        status=1
+    fi
+elif grep -qE "linux stream +skipped" "$LOG"; then
+    pass "a hosted TCP server not attempted: $(grep -aoE 'linux stream +skipped.*' "$LOG" | head -1 | sed -E 's/linux stream +//')"
+else
+    fail "the hosted TCP server did not conclude: $(grep -aoE 'linux stream.*' "$LOG" | tail -1 | sed 's/\x1b\[[0-9;]*m//g') (host: $(cat "$HOSTED_VERDICT" 2>/dev/null || echo 'nothing'))"
+    status=1
+fi
+rm -f "$HOSTED_VERDICT" 2>/dev/null || true
 
 # **RFC 0061: the port survived connections nobody accepted.**
 #

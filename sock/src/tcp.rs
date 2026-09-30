@@ -55,17 +55,43 @@ pub fn leg(
     gift: Option<(u64, u64)>,
     leg_number: u64,
 ) -> Result<u64, LegError> {
+    leg_words(service_slot, verb, a0, a1, gift, leg_number).map(|(second, _)| second)
+}
+
+/// [`leg`], answering both of the reply's free words — the second is the
+/// detail `leg` returns, the third is what a leg that answers two things puts
+/// beside it (a new listener's first ring pair, RFC 0086 step 3b).
+///
+/// # Errors
+///
+/// As [`leg`].
+pub fn leg_words(
+    service_slot: u64,
+    verb: u64,
+    a0: u64,
+    a1: u64,
+    gift: Option<(u64, u64)>,
+    leg_number: u64,
+) -> Result<(u64, u64), LegError> {
     for _ in 0..50_000u32 {
         if let Some((slot, badge)) = gift {
             // The badge travels with the gift, and for the wakes it must:
             // their capabilities are badged, badges are one-way, and a
             // signal ORs the badge into the word — zero would OR nothing
             // and ring nobody.
+            // Staging, said outright (RFC 0086 step 3b): a program that also
+            // serves -- `bin/linuxd` -- would otherwise have this read as a
+            // hand into the reply it owes.
             let staged = call(
                 syscall::INVOKE,
                 service_slot,
                 method::HAND,
-                [slot, rights::READ | rights::WRITE, badge, 0],
+                [
+                    slot,
+                    rights::READ | rights::WRITE,
+                    badge,
+                    method::HAND_STAGE,
+                ],
             );
             if !staged.kernel_ok() {
                 return Err(LegError::HandRefused(staged.status));
@@ -80,7 +106,7 @@ pub fn leg(
             continue;
         }
         if reply.kernel_ok() && reply.value == tcp::OK {
-            return Ok(reply.second);
+            return Ok((reply.second, reply.third));
         }
         return Err(LegError::Refused {
             status: reply.status,
@@ -114,11 +140,19 @@ pub fn leg6(
     low.copy_from_slice(&address[8..]);
     for _ in 0..50_000u32 {
         if let Some((slot, badge)) = gift {
+            // Staging, said outright (RFC 0086 step 3b): a program that also
+            // serves -- `bin/linuxd` -- would otherwise have this read as a
+            // hand into the reply it owes.
             let staged = call(
                 syscall::INVOKE,
                 service_slot,
                 method::HAND,
-                [slot, rights::READ | rights::WRITE, badge, 0],
+                [
+                    slot,
+                    rights::READ | rights::WRITE,
+                    badge,
+                    method::HAND_STAGE,
+                ],
             );
             if !staged.kernel_ok() {
                 return Err(LegError::HandRefused(staged.status));
@@ -321,7 +355,9 @@ pub fn arm_pair(
 }
 
 /// Opens a **new listener** on `port` — RFC 0086 step 3a — and returns its
-/// badge. The listener capability lands in `landing_slot`.
+/// badge and the number of the ring pair `rings` became (step 3b), which
+/// [`accept`] names again when a connection takes it. The listener
+/// capability lands in `landing_slot`.
 ///
 /// The way a second program listens: `bin/tcpc`'s `LISTEN` uses the service's
 /// one fixed handover, and any other caller opens its own with an open leg
@@ -341,7 +377,7 @@ pub fn listen_open(
     rings: (u64, u64),
     wake: Option<(u64, u64)>,
     landing_slot: u64,
-) -> Result<u64, LegError> {
+) -> Result<(u64, u32), LegError> {
     let port = u64::from(port);
     leg(service_slot, tcp::LISTEN, port, 0, None, tcp::OPEN_LEG)?;
     leg(service_slot, tcp::LISTEN, port, 0, Some((rings.0, 0)), 0)?;
@@ -350,7 +386,8 @@ pub fn listen_open(
         leg(service_slot, tcp::LISTEN, port, 0, Some(wake), 3)?;
     }
     expect(service_slot, landing_slot).map_err(LegError::HandRefused)?;
-    leg(service_slot, tcp::LISTEN, port, 0, None, 2)
+    leg_words(service_slot, tcp::LISTEN, port, 0, None, 2)
+        .map(|(handle, pair)| (handle, pair as u32))
 }
 
 /// Who is at the other end of a connection — RFC 0086 step 3a.

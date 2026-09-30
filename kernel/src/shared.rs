@@ -36,7 +36,15 @@ use crate::sync::{Rank, SpinLock};
 use bhaskix_mm::{FRAME_SIZE, Zone};
 
 /// Memory objects that can exist at once.
-pub const MAX_OBJECTS: usize = 64;
+///
+/// **128 since RFC 0086 step 3b (2026-09-30), from 64**, and the reason is
+/// counted: a boot peaked at 45 live, and the Linux adapter's TCP ring pool
+/// adds 34 more — one object per ring, because `bin/tcpd` takes each ring as
+/// its own gift. Sixty-four would have refused the pool at boot. The cost is
+/// the arena's static size, which the boot report's `fixed tables` line
+/// states; the peak is printed beside the limit so the next raise is also
+/// counted rather than guessed.
+pub const MAX_OBJECTS: usize = 128;
 // Raised from 16 on 2026-08-12, from 24 on 2026-08-15, from 32 on
 // 2026-08-18, and from 48 on 2026-09-08, each **measured full before being
 // raised**: 16 of 16 on the boot that refused the DHCP client's memory, 24 of

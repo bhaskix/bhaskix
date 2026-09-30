@@ -103,6 +103,17 @@ pub mod errno {
     pub const EADDRINUSE: i64 = -98;
     /// The network is down. Confirmed against `asm-generic/errno.h`.
     pub const ENETDOWN: i64 = -100;
+    /// Nothing to take yet, on a descriptor that asked not to wait.
+    pub const EAGAIN: i64 = -11;
+    /// An option this personality does not know at a level it does. Read
+    /// from the build host's `asm-generic/errno.h`, as every value here.
+    pub const ENOPROTOOPT: i64 = -92;
+    /// A stream call on a socket that is not connected.
+    pub const ENOTCONN: i64 = -107;
+    /// A call a listening socket does not answer, or the reverse.
+    pub const EOPNOTSUPP: i64 = -95;
+    /// Writing to a stream whose other end is gone.
+    pub const EPIPE: i64 = -32;
 }
 
 /// The bytes of a `struct sockaddr_in`. Confirmed against this machine's
@@ -369,8 +380,180 @@ pub fn errno_for(answer: u64) -> i64 {
     }
 }
 
+/// Socket option levels and names — RFC 0086 step 3b. Read from the build
+/// host's `asm-generic/socket.h`, `netinet/tcp.h`, `linux/in6.h` and
+/// `linux/in.h` on 2026-09-30, not recalled.
+pub mod option {
+    /// `SOL_SOCKET`.
+    pub const SOL_SOCKET: u64 = 1;
+    /// `IPPROTO_TCP`, which is also the level for TCP's options.
+    pub const IPPROTO_TCP: u64 = 6;
+    /// `IPPROTO_IPV6`.
+    pub const IPPROTO_IPV6: u64 = 41;
+    /// `SO_REUSEADDR`.
+    pub const SO_REUSEADDR: u64 = 2;
+    /// `SO_ERROR`, read-only: the pending error, taken as it is read.
+    pub const SO_ERROR: u64 = 4;
+    /// `SO_BROADCAST`.
+    pub const SO_BROADCAST: u64 = 6;
+    /// `SO_KEEPALIVE`.
+    pub const SO_KEEPALIVE: u64 = 9;
+    /// `TCP_NODELAY`.
+    pub const TCP_NODELAY: u64 = 1;
+    /// `TCP_KEEPIDLE`.
+    pub const TCP_KEEPIDLE: u64 = 4;
+    /// `TCP_KEEPINTVL`.
+    pub const TCP_KEEPINTVL: u64 = 5;
+    /// `IPV6_V6ONLY`.
+    pub const IPV6_V6ONLY: u64 = 26;
+}
+
+/// An option `setsockopt` accepts — the seven a Go `net/http` server was
+/// traced setting (RFC 0086 step 1).
+///
+/// **Accepted is not honoured**, and the difference is stated here rather
+/// than left for a reader to assume: `bin/tcpd` has no Nagle delay to turn
+/// off, sends no keepalives, and binds nothing a second time, so
+/// `TCP_NODELAY`, the keepalive options and `SO_REUSEADDR` change nothing it
+/// does. They are accepted because refusing them would stop a correct
+/// program for asking about behaviour this system already has or does not
+/// offer. Only `IPV6_V6ONLY` is *kept*: it decides how an IPv4 peer is
+/// written back to a v6 socket.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SockOpt {
+    /// `SO_REUSEADDR`.
+    ReuseAddr,
+    /// `SO_KEEPALIVE`.
+    KeepAlive,
+    /// `SO_BROADCAST`.
+    Broadcast,
+    /// `TCP_NODELAY`.
+    NoDelay,
+    /// `TCP_KEEPIDLE`.
+    KeepIdle,
+    /// `TCP_KEEPINTVL`.
+    KeepInterval,
+    /// `IPV6_V6ONLY`, with whether it was set.
+    V6Only,
+}
+
+/// What `setsockopt(level, name, _, length)` is asking for.
+///
+/// # Errors
+///
+/// [`errno::EINVAL`] for a value shorter than the `int` every one of these
+/// takes; [`errno::ENOPROTOOPT`] for an option this personality does not
+/// know — what Linux answers for a name it does not recognise.
+pub fn plan_setsockopt(level: u64, name: u64, length: u64) -> Result<SockOpt, i64> {
+    let known = match (level, name) {
+        (option::SOL_SOCKET, option::SO_REUSEADDR) => SockOpt::ReuseAddr,
+        (option::SOL_SOCKET, option::SO_KEEPALIVE) => SockOpt::KeepAlive,
+        (option::SOL_SOCKET, option::SO_BROADCAST) => SockOpt::Broadcast,
+        (option::IPPROTO_TCP, option::TCP_NODELAY) => SockOpt::NoDelay,
+        (option::IPPROTO_TCP, option::TCP_KEEPIDLE) => SockOpt::KeepIdle,
+        (option::IPPROTO_TCP, option::TCP_KEEPINTVL) => SockOpt::KeepInterval,
+        (option::IPPROTO_IPV6, option::IPV6_V6ONLY) => SockOpt::V6Only,
+        _ => return Err(errno::ENOPROTOOPT),
+    };
+    if length < 4 {
+        return Err(errno::EINVAL);
+    }
+    Ok(known)
+}
+
+/// How a TCP peer is written back to a hosted program — RFC 0086 step 3b.
+///
+/// A v4 socket gets the v4 address. A **v6 socket that is not `V6ONLY` gets a
+/// v4 peer as `::ffff:a.b.c.d`**, which is what Linux does and what a
+/// dual-stack server — Go's `net/http` listens on `::` that way, as the step 1
+/// trace showed — expects to parse. A `V6ONLY` socket cannot have a v4 peer at
+/// all, so `None` says that is a mistake upstream rather than inventing one.
+#[must_use]
+pub fn peer_endpoint(v6_socket: bool, v6_only: bool, peer: [u8; 4], port: u16) -> Option<Endpoint> {
+    if !v6_socket {
+        return Some(Endpoint::V4 {
+            address: peer,
+            port,
+        });
+    }
+    if v6_only {
+        return None;
+    }
+    let mut address = [0u8; 16];
+    address[10] = 0xff;
+    address[11] = 0xff;
+    address[12..].copy_from_slice(&peer);
+    Some(Endpoint::V6 {
+        address,
+        port,
+        scope: 0,
+    })
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_seven_traced_options_are_accepted_and_nothing_else_is() {
+        use option::*;
+        for (level, name) in [
+            (SOL_SOCKET, SO_REUSEADDR),
+            (SOL_SOCKET, SO_KEEPALIVE),
+            (SOL_SOCKET, SO_BROADCAST),
+            (IPPROTO_TCP, TCP_NODELAY),
+            (IPPROTO_TCP, TCP_KEEPIDLE),
+            (IPPROTO_TCP, TCP_KEEPINTVL),
+            (IPPROTO_IPV6, IPV6_V6ONLY),
+        ] {
+            assert!(plan_setsockopt(level, name, 4).is_ok(), "{level}/{name}");
+            assert_eq!(
+                plan_setsockopt(level, name, 2),
+                Err(errno::EINVAL),
+                "short {level}/{name}"
+            );
+        }
+        // A real option at the wrong level, and a name nobody set.
+        assert_eq!(
+            plan_setsockopt(SOL_SOCKET, TCP_KEEPIDLE, 4),
+            Err(errno::ENOPROTOOPT)
+        );
+        assert_eq!(plan_setsockopt(IPPROTO_TCP, 99, 4), Err(errno::ENOPROTOOPT));
+        assert_eq!(plan_setsockopt(0, SO_REUSEADDR, 4), Err(errno::ENOPROTOOPT));
+    }
+
+    #[test]
+    fn a_v4_peer_is_v4_mapped_on_a_dual_stack_socket_and_refused_on_a_v6_only_one() {
+        let peer = [10, 0, 2, 2];
+        assert_eq!(
+            peer_endpoint(false, false, peer, 4000),
+            Some(Endpoint::V4 {
+                address: peer,
+                port: 4000
+            })
+        );
+        let Some(Endpoint::V6 {
+            address,
+            port,
+            scope,
+        }) = peer_endpoint(true, false, peer, 4000)
+        else {
+            panic!("a dual-stack socket gets a v6 answer");
+        };
+        assert_eq!(
+            address,
+            [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 10, 0, 2, 2]
+        );
+        assert_eq!((port, scope), (4000, 0));
+        assert_eq!(peer_endpoint(true, true, peer, 4000), None);
+        // And it writes as a `sockaddr_in6` a program can read back.
+        let mut out = [0u8; SOCKADDR_IN6_BYTES];
+        let written =
+            write_endpoint(&mut out, &peer_endpoint(true, false, peer, 4000).unwrap()).unwrap();
+        assert_eq!(
+            parse_endpoint(&out, written),
+            peer_endpoint(true, false, peer, 4000).ok_or(0)
+        );
+    }
+
     #[test]
     fn a_taken_port_and_a_full_service_are_different_answers() {
         use outcome as socket;

@@ -1027,6 +1027,21 @@ the distinction is in the table rather than in somebody's head.
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-09-30 (a hosted Linux program serves a TCP client)
+
+RFC 0086 step 3b. A hosted stream socket is `bin/linuxd`'s, over `bin/tcpd`,
+with rings from a pool the kernel grants the adapter; a probe listens, blocks
+in `accept4` and `read`, and echoes a host client, gated on the host's bytes
+coming back and appearing on the console. Building it found three things that
+would have recurred: the pool is granted after the adapter starts, so it is
+now mapped on first use; a hosted process's exit released a stream as a
+datagram slot, which is a `CALL` on the adapter's own endpoint and stalled
+every hosted program; and `HAND` could not say it meant "stage for my next
+call" while its thread was answering somebody, so it gained `HAND_STAGE`,
+backward-compatibly. `shared::MAX_OBJECTS` went to 128 and
+`notify::MAX_NOTIFICATIONS` to 64, each on a boot's count. `security.md` T11
+names the new reach: every hosted TCP stream.
+
 ### 2026-09-30 (a second program can listen)
 
 RFC 0086 step 3a. `bin/tcpd` had one `LISTEN` handover for the machine, and

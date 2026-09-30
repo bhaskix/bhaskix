@@ -8562,6 +8562,342 @@ extern "C" fn ring3_socketeer(hhdm_base: u64) -> ! {
     }
 }
 
+/// Where the stream probe's code lands in its own space.
+const STREAM_PROBE_CODE_AT: u64 = 0x0000_0000_1900_0000;
+
+/// The stream probe, RFC 0086 step 3b's witness: a hosted Linux program
+/// listens on port 10, blocks in `accept4` until the host connects, blocks in
+/// `read` until sixteen bytes have come, writes them back, and prints them.
+///
+/// Assembled from [`tools/probes/linux-streamer.s`](../../tools/probes/linux-streamer.s)
+/// by [`tools/probe-bytes.sh`](../../tools/probe-bytes.sh), which verifies its
+/// transcription against the assembled binary.
+#[rustfmt::skip]
+const STREAM_PROBE_CODE: [u8; 355] = [
+    0x49, 0x89, 0xfc,                         // mov %rdi,%r12
+    0x49, 0x89, 0xf6,                         // mov %rsi,%r14
+    0xbf, 0x02, 0x00, 0x00, 0x00,             // mov $0x2,%edi
+    0xbe, 0x01, 0x00, 0x00, 0x00,             // mov $0x1,%esi
+    0x31, 0xd2,                               // xor %edx,%edx
+    0xb8, 0x29, 0x00, 0x00, 0x00,             // mov $0x29,%eax
+    0x0f, 0x05,                               // syscall
+    0x48, 0x85, 0xc0,                         // test %rax,%rax
+    0xbd, 0x01, 0x00, 0x00, 0x00,             // mov $0x1,%ebp
+    0x0f, 0x88, 0xc2, 0x00, 0x00, 0x00,       // js e9 <fail>
+    0x49, 0x89, 0xc5,                         // mov %rax,%r13
+    0x4c, 0x89, 0xef,                         // mov %r13,%rdi
+    0x4c, 0x89, 0xf6,                         // mov %r14,%rsi
+    0xba, 0x10, 0x00, 0x00, 0x00,             // mov $0x10,%edx
+    0xb8, 0x31, 0x00, 0x00, 0x00,             // mov $0x31,%eax
+    0x0f, 0x05,                               // syscall
+    0x48, 0x85, 0xc0,                         // test %rax,%rax
+    0xbd, 0x02, 0x00, 0x00, 0x00,             // mov $0x2,%ebp
+    0x0f, 0x88, 0x9f, 0x00, 0x00, 0x00,       // js e9 <fail>
+    0x4c, 0x89, 0xef,                         // mov %r13,%rdi
+    0xbe, 0x01, 0x00, 0x00, 0x00,             // mov $0x1,%esi
+    0xb8, 0x32, 0x00, 0x00, 0x00,             // mov $0x32,%eax
+    0x0f, 0x05,                               // syscall
+    0x48, 0x85, 0xc0,                         // test %rax,%rax
+    0xbd, 0x03, 0x00, 0x00, 0x00,             // mov $0x3,%ebp
+    0x0f, 0x88, 0x82, 0x00, 0x00, 0x00,       // js e9 <fail>
+    0x4c, 0x89, 0xef,                         // mov %r13,%rdi
+    0x31, 0xf6,                               // xor %esi,%esi
+    0x31, 0xd2,                               // xor %edx,%edx
+    0x45, 0x31, 0xd2,                         // xor %r10d,%r10d
+    0xb8, 0x20, 0x01, 0x00, 0x00,             // mov $0x120,%eax
+    0x0f, 0x05,                               // syscall
+    0x48, 0x85, 0xc0,                         // test %rax,%rax
+    0xbd, 0x04, 0x00, 0x00, 0x00,             // mov $0x4,%ebp
+    0x78, 0x67,                               // js e9 <fail>
+    0x48, 0x89, 0xc3,                         // mov %rax,%rbx
+    0x45, 0x31, 0xff,                         // xor %r15d,%r15d
+    0x48, 0x89, 0xdf,                         // mov %rbx,%rdi
+    0x4b, 0x8d, 0x34, 0x3c,                   // lea (%r12,%r15,1),%rsi
+    0xba, 0x10, 0x00, 0x00, 0x00,             // mov $0x10,%edx
+    0x44, 0x29, 0xfa,                         // sub %r15d,%edx
+    0x31, 0xc0,                               // xor %eax,%eax
+    0x0f, 0x05,                               // syscall
+    0xbd, 0x05, 0x00, 0x00, 0x00,             // mov $0x5,%ebp
+    0x48, 0x85, 0xc0,                         // test %rax,%rax
+    0x7e, 0x44,                               // jle e9 <fail>
+    0x49, 0x01, 0xc7,                         // add %rax,%r15
+    0x49, 0x83, 0xff, 0x10,                   // cmp $0x10,%r15
+    0x7c, 0xda,                               // jl 88 <more>
+    0x48, 0x89, 0xdf,                         // mov %rbx,%rdi
+    0x4c, 0x89, 0xe6,                         // mov %r12,%rsi
+    0xba, 0x10, 0x00, 0x00, 0x00,             // mov $0x10,%edx
+    0xb8, 0x01, 0x00, 0x00, 0x00,             // mov $0x1,%eax
+    0x0f, 0x05,                               // syscall
+    0xbf, 0x01, 0x00, 0x00, 0x00,             // mov $0x1,%edi
+    0x4c, 0x89, 0xe6,                         // mov %r12,%rsi
+    0xba, 0x10, 0x00, 0x00, 0x00,             // mov $0x10,%edx
+    0xb8, 0x01, 0x00, 0x00, 0x00,             // mov $0x1,%eax
+    0x0f, 0x05,                               // syscall
+    0x48, 0x89, 0xdf,                         // mov %rbx,%rdi
+    0xb8, 0x03, 0x00, 0x00, 0x00,             // mov $0x3,%eax
+    0x0f, 0x05,                               // syscall
+    0x31, 0xff,                               // xor %edi,%edi
+    0xb8, 0xe7, 0x00, 0x00, 0x00,             // mov $0xe7,%eax
+    0x0f, 0x05,                               // syscall
+    0xeb, 0xfe,                               // jmp e7 <done+0x9>
+    0x48, 0xf7, 0xd8,                         // neg %rax
+    0x48, 0x8d, 0x35, 0x60, 0x00, 0x00, 0x00, // lea 0x60(%rip),%rsi # 153 <hex>
+    0x89, 0xc1,                               // mov %eax,%ecx
+    0x83, 0xe1, 0x0f,                         // and $0xf,%ecx
+    0x8a, 0x14, 0x0e,                         // mov (%rsi,%rcx,1),%dl
+    0x41, 0x88, 0x54, 0x24, 0x0d,             // mov %dl,0xd(%r12)
+    0x89, 0xc1,                               // mov %eax,%ecx
+    0xc1, 0xe9, 0x04,                         // shr $0x4,%ecx
+    0x83, 0xe1, 0x0f,                         // and $0xf,%ecx
+    0x8a, 0x14, 0x0e,                         // mov (%rsi,%rcx,1),%dl
+    0x41, 0x88, 0x54, 0x24, 0x0c,             // mov %dl,0xc(%r12)
+    0x41, 0xc7, 0x04, 0x24, 0x68, 0x74, 0x63, 0x70, // movl $0x70637468,(%r12)
+    0x41, 0xc7, 0x44, 0x24, 0x04, 0x20, 0x66, 0x61, 0x69, // movl $0x69616620,0x4(%r12)
+    0x66, 0x41, 0xc7, 0x44, 0x24, 0x08, 0x6c, 0x20, // movw $0x206c,0x8(%r12)
+    0x8d, 0x45, 0x30,                         // lea 0x30(%rbp),%eax
+    0x41, 0x88, 0x44, 0x24, 0x0a,             // mov %al,0xa(%r12)
+    0x41, 0xc6, 0x44, 0x24, 0x0b, 0x20,       // movb $0x20,0xb(%r12)
+    0x41, 0xc6, 0x44, 0x24, 0x0e, 0x0a,       // movb $0xa,0xe(%r12)
+    0xbf, 0x01, 0x00, 0x00, 0x00,             // mov $0x1,%edi
+    0x4c, 0x89, 0xe6,                         // mov %r12,%rsi
+    0xba, 0x0f, 0x00, 0x00, 0x00,             // mov $0xf,%edx
+    0xb8, 0x01, 0x00, 0x00, 0x00,             // mov $0x1,%eax
+    0x0f, 0x05,                               // syscall
+    0xeb, 0x8b,                               // jmp de <done>
+    0x30, 0x31,                               // xor %dh,(%rcx)
+    0x32, 0x33,                               // xor (%rbx),%dh
+    0x34, 0x35,                               // xor $0x35,%al
+    0x36, 0x37,                               // ss (bad)
+    0x38, 0x39,                               // cmp %bh,(%rcx)
+    0x61,                                     // (bad)
+    0x62,                                     // .byte 0x62
+    0x63, 0x64, 0x65, 0x66,                   // movslq 0x66(%rbp,%riz,2),%esp
+];
+
+/// Where the stream probe's `sockaddr_in` for `0.0.0.0:10` is placed, past
+/// its code.
+const STREAM_PROBE_ADDRESS_AT: u64 = 512;
+const _: () = assert!(
+    STREAM_PROBE_CODE.len() < STREAM_PROBE_ADDRESS_AT as usize,
+    "the stream probe's code has grown into the address beside it"
+);
+
+/// The thread that becomes the stream probe — RFC 0086 step 3b. The socket
+/// probe's scaffolding, pointed at a server.
+extern "C" fn ring3_streamer(hhdm_base: u64) -> ! {
+    use bhaskix_boot::VirtAddr;
+    use bhaskix_mm::{Protection, VirtRange};
+    use vm::AddressSpace;
+
+    const BUFFER_AT: u64 = STREAM_PROBE_CODE_AT + bhaskix_mm::FRAME_SIZE;
+
+    let stop = || -> ! { sched::exit() };
+    let Ok(mut space) = AddressSpace::new(hhdm_base) else {
+        stop()
+    };
+    for (at, protection) in [
+        (STREAM_PROBE_CODE_AT, Protection::ReadExecute),
+        (BUFFER_AT, Protection::ReadWrite),
+    ] {
+        let Some(range) = VirtRange::from_pages(VirtAddr(at), 1) else {
+            stop()
+        };
+        if space.map_anonymous(range, protection).is_err() {
+            stop()
+        }
+    }
+    let Some(code_pa) = space.translate(VirtAddr(STREAM_PROBE_CODE_AT)) else {
+        stop()
+    };
+    // A `sockaddr_in` for `0.0.0.0:10`: the family little-endian, the port
+    // big-endian, the address zero -- the layout `parse_endpoint` reads.
+    let mut address = [0u8; 16];
+    address[0..2].copy_from_slice(&2u16.to_le_bytes()); // AF_INET
+    address[2..4].copy_from_slice(&10u16.to_be_bytes());
+    // SAFETY: a freshly mapped frame this space owns, filled through the
+    // direct map; the executable mapping is never writable, and the address
+    // sits past the code, which a `const` assertion above holds clear of it.
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            STREAM_PROBE_CODE.as_ptr(),
+            (hhdm_base + code_pa) as *mut u8,
+            STREAM_PROBE_CODE.len(),
+        );
+        core::ptr::copy_nonoverlapping(
+            address.as_ptr(),
+            (hhdm_base + code_pa + STREAM_PROBE_ADDRESS_AT) as *mut u8,
+            address.len(),
+        );
+    }
+    // SAFETY: the higher half is copied from the running table.
+    unsafe { vm::install(space) };
+    // SAFETY: the entry is the first byte of the read-execute page; `rdi` is
+    // the writable page it works in and `rsi` the address beside its code.
+    unsafe {
+        bhaskix_arch::syscall::enter_ring3(
+            STREAM_PROBE_CODE_AT,
+            BUFFER_AT + 0x0f00,
+            [BUFFER_AT, STREAM_PROBE_CODE_AT + STREAM_PROBE_ADDRESS_AT],
+        )
+    }
+}
+
+/// RFC 0086 step 3b: a hosted Linux program serves one TCP client from the
+/// host, with blocking `accept4` and `read`.
+///
+/// The host harness connects once it sees `linux stream   started`, retrying
+/// until the probe is listening, sends sixteen bytes and requires them back;
+/// the probe prints them too, so the serial log carries bytes only the host
+/// could have sent.
+fn stream_self_test(hhdm_base: u64, cpus: u32) -> bool {
+    if cpus < 2 {
+        println!("\x1b[93m    linux stream   skipped, needs a second cpu\x1b[0m");
+        return true;
+    }
+    const CPU: u32 = 3;
+    let adapter = syscall::ADAPTER_DOMAIN.load(core::sync::atomic::Ordering::Relaxed);
+    let machine_has_network = network_endpoint_capability().is_some()
+        && NET_CONTAINED.load(core::sync::atomic::Ordering::Acquire);
+    let holds_tcp = adapter != u32::MAX
+        && domain::with(domain::DomainId::from_u32(adapter), |owner| {
+            owner
+                .cspace
+                .get(bhaskix_abi::adapter::TCP_SERVICE)
+                .is_some()
+        }) == Some(true);
+    if !machine_has_network {
+        println!(
+            "    linux stream   skipped: no network this machine can drive, so there is no host to serve"
+        );
+        return true;
+    }
+    if !holds_tcp {
+        println!(
+            "\x1b[91m    linux stream   FAILED: this machine has a network and the adapter holds no TCP\x1b[0m"
+        );
+        return false;
+    }
+    let Ok(realm) = domain::create("streamer", domain::ResourceEnvelope::new()) else {
+        println!("\x1b[91m    linux stream   FAILED: no domain\x1b[0m");
+        return false;
+    };
+    if !tag_linux(realm, "linux stream   ") {
+        return false;
+    }
+    let options = sched::SpawnOptions::new()
+        .pinned()
+        .in_domain(realm.as_u32());
+    if sched::spawn_on_with(
+        CPU,
+        "streamer",
+        ring3_streamer,
+        hhdm_base,
+        hhdm_base,
+        options,
+    )
+    .is_err()
+    {
+        println!("\x1b[91m    linux stream   FAILED: the probe would not spawn\x1b[0m");
+        return false;
+    }
+    println!(
+        "    linux stream   started: a hosted server will listen on port 10 and wait for the host"
+    );
+    // Forty seconds: the host retries every half second until the probe is
+    // listening, and every call the probe makes is a round trip through the
+    // adapter and, for the stream ones, `bin/tcpd`.
+    let mut ended = false;
+    for _ in 0..8000 {
+        if sched::threads_counted_in(realm.as_u32()) == 0 {
+            ended = true;
+            break;
+        }
+        wait_millis(5);
+    }
+    // **Where the probe and the adapter are, when it did not end** -- read
+    // before the probe is retired, as the socket test reads its own. The
+    // adapter is single-threaded and serves every hosted program, so an
+    // adapter stuck inside a call -- to `bin/tcpd`, or, as the first version
+    // of this step found, to itself -- stalls this probe and every other at
+    // once; which one is stuck, and on what, is the first question.
+    if !ended {
+        let adapter = syscall::ADAPTER_DOMAIN.load(core::sync::atomic::Ordering::Relaxed);
+        // `tcpd`'s endpoint, as the raw word the capability names -- its low
+        // half is the index `where_queued` reports -- so "queued on endpoint
+        // N" can be read against it.
+        println!(
+            "\x1b[91m                   bin/tcpd's endpoint is {:#x}\x1b[0m",
+            TCP_ENDPOINT.load(core::sync::atomic::Ordering::Acquire)
+        );
+        // Every thread queued on an endpoint, by name: what found the
+        // adapter waiting on its *own* endpoint on 2026-09-30 (RFC 0086 step 3b).
+        sched::for_each(|cpu, id, name, state, _, _, _| {
+            if let Some((endpoint, sending)) = ipc::where_queued(id) {
+                println!(
+                    "\x1b[91m                   thread {id} {name} cpu {cpu} {state:?} {} endpoint {endpoint}\x1b[0m",
+                    if sending {
+                        "sending on"
+                    } else {
+                        "receiving on"
+                    }
+                );
+            }
+        });
+        let tcpd = TCPD_DOMAIN.load(core::sync::atomic::Ordering::Acquire);
+        for (who, domain) in [
+            ("probe", realm.as_u32()),
+            ("adapter", adapter),
+            ("tcpd", tcpd),
+        ] {
+            match sched::first_thread_in_domain(domain) {
+                Some((thread, state)) => {
+                    let queued = match ipc::where_queued(thread) {
+                        Some((endpoint, true)) => {
+                            alloc::format!("queued to send on endpoint {endpoint}")
+                        }
+                        Some((endpoint, false)) => {
+                            alloc::format!("queued to receive on endpoint {endpoint}")
+                        }
+                        None => alloc::string::String::from("queued on no endpoint"),
+                    };
+                    let facts = sched::run_facts(thread);
+                    wait_millis(10);
+                    let later = sched::run_facts(thread);
+                    let gained = match (facts, later) {
+                        (Some(first), Some(second)) => second.cycles.saturating_sub(first.cycles),
+                        _ => 0,
+                    };
+                    println!(
+                        "\x1b[91m                   the {who}'s thread {thread} is {state:?}, {queued}, and ran \
+                         {gained} tick(s) of the next 10 ms\x1b[0m"
+                    );
+                }
+                None => println!(
+                    "\x1b[91m                   the {who} has no thread left to ask\x1b[0m"
+                ),
+            }
+        }
+    }
+    retire_probe(realm);
+    // **Ending is not serving**, which the socket test above learned first
+    // and this test's first version forgot: the probe exits on the first call
+    // that fails as well as after it has written back, so "it ended" is true
+    // either way. What decides it is the host's verdict and the bytes on the
+    // console, which the gate reads; this line says only what the kernel can
+    // see.
+    if ended {
+        println!(
+            "    linux stream   the hosted server ended: what it echoed to the host is on the \
+             console above, or nothing is"
+        );
+    } else {
+        println!(
+            "\x1b[91m    linux stream   FAILED: the probe never ended -- a blocking accept4 or read never came back\x1b[0m"
+        );
+    }
+    ended
+}
+
 /// The thread that runs [`SOCKET_POLL_CODE`] — RFC 0056's witness.
 ///
 /// The socket probe's scaffolding, pointed at a different program: same
@@ -16074,9 +16410,10 @@ const ADAPTER_STAGING_PAGES: u64 = 16;
 /// The adapter's first futex-wake slot, and how many there are.
 ///
 /// Sixteen because that is how many hosted threads may be asleep in a futex at
-/// once, and because the kernel's whole notification table is thirty-two
+/// once, and because the kernel's whole notification table ~~is thirty-two
 /// ([`notify::MAX_NOTIFICATIONS`]) — half of it is as much as one personality
-/// may take. A seventeenth sleeper is refused with `EAGAIN`, which is a Linux
+/// may take~~ was thirty-two when this was chosen; it is sixty-four since RFC
+/// 0086 step 3b, so the sixteen are now a quarter of it. A seventeenth sleeper is refused with `EAGAIN`, which is a Linux
 /// answer a correct caller already retries.
 const FUTEX_WAKE_SLOT: usize = bhaskix_abi::adapter::WAKES;
 const FUTEX_WAKES: usize = bhaskix_abi::adapter::WAKE_COUNT;
@@ -20979,6 +21316,72 @@ fn tcpc_report_word(base: u64, index: usize) -> u64 {
     unsafe { core::ptr::read_volatile((base + index as u64 * 8) as *const u64) }
 }
 
+/// The adapter's TCP grants — RFC 0086 step 3b. See the call site.
+fn grant_adapter_tcp(adapter: domain::DomainId) -> Result<(), &'static str> {
+    use bhaskix_abi::adapter;
+    // The two badges live in `abi::adapter`, because the adapter must gift
+    // the wake under the same one the kernel mints it with.
+    const ADAPTER_TCP_BADGE: u64 = adapter::TCP_SERVICE_BADGE;
+    const ADAPTER_TCP_WAKE_BADGE: u64 = adapter::TCP_WAKE_BADGE;
+
+    let raw = TCP_ENDPOINT.load(core::sync::atomic::Ordering::Acquire);
+    if raw == u64::MAX {
+        return Err("no TCP service on this machine");
+    }
+    let root = cap::with_arena(|arena| {
+        arena
+            .insert_root(
+                cap::ObjectRef::new(cap::ObjectKind::Endpoint, raw),
+                cap::Rights::ALL,
+                0,
+            )
+            .ok()
+    })
+    .ok_or("the endpoint capability would not be created")?;
+    let service = cap::with_arena(|arena| {
+        arena
+            .derive(
+                root,
+                cap::Rights::READ.union(cap::Rights::WRITE),
+                ADAPTER_TCP_BADGE,
+            )
+            .ok()
+    })
+    .ok_or("the endpoint capability would not derive")?;
+    let install = |slot: usize, capability| {
+        domain::with(adapter, |owner| {
+            owner.cspace.install_at(slot, capability).is_ok()
+        }) == Some(true)
+    };
+    if !install(adapter::TCP_SERVICE, service) {
+        return Err("the endpoint capability would not install");
+    }
+
+    // The rings, owned by the adapter's domain and charged to it -- the same
+    // ownership `bin/tcpc`'s have, and the reason a gift of one can cross.
+    for index in 0..adapter::TCP_RING_COUNT {
+        let ring =
+            shared::create(adapter, TCPC_RING_BYTES).map_err(|_| "a ring would not be created")?;
+        let named = shared::name(ring).map_err(|_| "a ring would not be named")?;
+        if !install(adapter::TCP_RINGS + index, named) {
+            return Err("a ring would not install");
+        }
+    }
+
+    let wake = crate::notify::create().map_err(|_| "the wake would not be created")?;
+    let root = crate::notify::name(wake).map_err(|_| "the wake would not be named")?;
+    let wake_cap = cap::with_arena(|arena| {
+        arena
+            .derive(root, cap::Rights::ALL, ADAPTER_TCP_WAKE_BADGE)
+            .ok()
+    })
+    .ok_or("the wake would not derive")?;
+    if !install(adapter::TCP_WAKE, wake_cap) {
+        return Err("the wake would not install");
+    }
+    Ok(())
+}
+
 /// RFC 0086 step 3a: a second listener, opened with `OPEN_LEG` on port 8
 /// while the first holds port 7, and `PEER` naming who connected to it.
 ///
@@ -24804,6 +25207,24 @@ fn user_shell(handoff: &Handoff) -> Result<(), &'static str> {
             ),
         }
 
+        // **And TCP — RFC 0086 step 3b.** `bin/tcpd`'s endpoint, badged as
+        // this adapter; a pool of stream rings the adapter owns, because no
+        // ring-3 program can make memory and the project lead chose a granted
+        // pool over a kernel method for it (2026-09-30); and one wake `tcpd`
+        // rings for news on any hosted listener or connection. What a
+        // compromise of the adapter reaches grows again: every hosted TCP
+        // stream -- `security.md` §1 T11 says so.
+        match grant_adapter_tcp(domain::DomainId::from_u32(adapter)) {
+            Ok(()) => println!(
+                "    linux domain   holds TCP now: bin/tcpd's endpoint, {} ring pairs it owns and a \
+                 wake, so a hosted program can listen and accept",
+                bhaskix_abi::adapter::TCP_RING_COUNT / 2
+            ),
+            Err(why) => {
+                println!("\x1b[93m    linux domain   no TCP for hosted programs: {why}\x1b[0m")
+            }
+        }
+
         // **And a page for the datagrams themselves, at slot 89.** `SEND_TO`
         // reads its payload with `DRAIN` from *offset zero* of a memory object
         // the caller names, so the adapter needs one of its own: the report
@@ -25630,6 +26051,9 @@ fn user_shell(handoff: &Handoff) -> Result<(), &'static str> {
     }
     if !killed_domain_gives_its_socket_back(hhdm, bhaskix_arch::percpu::online_count()) {
         println!("\x1b[91m    socket reclaim FAILED\x1b[0m");
+    }
+    if !stream_self_test(hhdm, bhaskix_arch::percpu::online_count()) {
+        println!("\x1b[91m    linux stream   FAILED\x1b[0m");
     }
     // **Immediately after the gate it explains, and not in `kernel_main`.**
     // The first version of this was up with the other personality reports,
