@@ -1022,6 +1022,19 @@ the distinction is in the table rather than in somebody's head.
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-09-30 (the nightly soak's boots are read)
+
+A passing soak left nothing behind: it boots twenty times, runs QEMU itself
+rather than through `boot-test.sh`, and uploads its logs only on failure. The
+comment in `tools/ci-readings.py` said every soak boot kept its serial as an
+artifact; the artifact listing of a passing run is empty, so that was wrong,
+and twenty boots a night were read by nobody. The reading pattern now lives in
+`tests/qemu/readings.sh`, sourced by both harnesses, and the soak prints each
+boot's readings under a header that `ci-readings.py` splits on -- so the rows
+waiting on a count of clean boots gain twenty a night. Soak runs are named as
+the soak's, since its run numbers are its own, and the handshake rule reads a
+time for the same reason.
+
 ### 2026-09-30 (every refused tag says which refusal it was)
 
 A domain created for a self-test can refuse the Linux tag two ways -- it went

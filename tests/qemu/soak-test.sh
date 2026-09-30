@@ -48,6 +48,7 @@ DOMAIN_DISK="$REPO_ROOT/build/domain-disk.img"
 # for why the list is not written here.
 # shellcheck source=tests/qemu/devices.sh
 source "$REPO_ROOT/tests/qemu/devices.sh"
+source "$REPO_ROOT/tests/qemu/readings.sh"
 qemu_device_list disks
 
 RUNS="${1:-40}"
@@ -200,6 +201,18 @@ for log in "$WORK"/run-*.log; do
             grep -m 8 -E "$CANARIES" "$log" | sed 's/^/    /'
         }
     fi
+done
+
+# **Every boot's readings, pass or fail**, each under a header naming its
+# boot so `tools/ci-readings.py` can count them one by one. Until 2026-09-30
+# a passing soak left nothing behind: its logs are uploaded only on failure,
+# so twenty boots a night were read by nobody. A boot whose section carries no
+# reading -- cut short before the report -- is counted blind by that tool,
+# never clean.
+echo
+for log in "$WORK"/run-*.log; do
+    echo "readings of soak boot $(basename "$log" .log)"
+    print_readings "$log"
 done
 
 passed=$((RUNS - failed - truncated))

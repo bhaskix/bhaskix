@@ -75,7 +75,9 @@ Not sure whether your idea needs an RFC? Open an issue and ask. The answer is qu
   copies a few `reading` lines into the log anyway — signals raised against delivered, identity
   retries, the domain test's capability counts, timed waits — and this tallies them across runs,
   names any boot off the healthy baseline, and counts a boot whose log carries none as *blind*,
-  never as clean.
+  never as clean. Since 2026-09-30 the nightly soak's twenty boots count too, each read separately.
+  The pattern lives in `tests/qemu/readings.sh`, which both harnesses source: a reading added
+  there reaches both.
 - Every bug fix adds a regression test. If the bug was not testable, say what you changed to make it
   testable.
 - Describe the design decision in the PR body, not the diff.

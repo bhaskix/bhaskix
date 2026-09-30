@@ -48,11 +48,16 @@ _spec.loader.exec_module(ci)
 # are simply from before the question was asked, and are not fetched.
 LANDED = "2026-09-29"
 
-# The first CI run carrying the killer probe's handshake (`3809af4`). Before
-# it the probe never parked its `nanosleep` child, so a boot with no early
-# release is history there, not a departure -- and flagging it buried the one
-# reading that mattered under fifteen that did not.
-HANDSHAKE_RUN = 771
+# When the first run carrying the killer probe's handshake (`3809af4`, CI run
+# 771) was created. Before it the probe never parked its `nanosleep` child, so
+# a boot with no early release is history there, not a departure -- and
+# flagging it buried the one reading that mattered under fifteen that did not.
+# A time rather than a run number, because the soak numbers its runs apart
+# from CI: soak run 53 is newer than CI run 771.
+HANDSHAKE_AT = "2026-09-29T04:22:58Z"
+
+# The soak prints each boot's readings under this header, since 2026-09-30.
+SOAK_BOOT = re.compile(r"readings of soak boot (\S+)")
 
 PATTERNS = {
     "signals": re.compile(r"hosted signals +(\d+) raised, (\d+) delivered"),
@@ -108,7 +113,7 @@ def readings(text: str) -> dict[str, tuple[int, ...]]:
     return found
 
 
-def departs(name: str, values: tuple[int, ...], run: int) -> str | None:
+def departs(name: str, values: tuple[int, ...], handshake: bool) -> str | None:
     """Why a reading is off the healthy baseline, or None."""
     if name == "signals" and values[0] != values[1]:
         return f"{values[0]} raised, {values[1]} delivered"
@@ -137,9 +142,24 @@ def departs(name: str, values: tuple[int, ...], run: int) -> str | None:
     # fewer than two deliveries to a woken call means one of them was not.
     if name == "deliver" and values[1] < 2:
         return f"only {values[1]} delivery(ies) met a woken call: a probe child was signalled before it parked"
-    if name == "timed" and values[0] == 0 and run >= HANDSHAKE_RUN:
+    if name == "timed" and values[0] == 0 and handshake:
         return "no timed wait was released early: the parked-sleep delivery was not exercised"
     return None
+
+
+def soak_boots(text: str) -> list[tuple[str, dict[str, tuple[int, ...]]]]:
+    """A soak job log's boots, each with its readings, split at the headers.
+
+    Empty for a soak that printed no headers -- one from before they existed.
+    """
+    boots: list[tuple[str, list[str]]] = []
+    for line in text.splitlines():
+        header = SOAK_BOOT.search(line)
+        if header:
+            boots.append((header.group(1), []))
+        elif boots:
+            boots[-1][1].append(line)
+    return [(boot, readings("\n".join(lines))) for boot, lines in boots]
 
 
 def runs_since(since) -> list | None:
@@ -178,32 +198,52 @@ def main() -> int:
     blind = []
     tally: dict[str, Counter] = {name: Counter() for name in PATTERNS}
     odd = []
-    for run in sorted(runs, key=lambda r: r["run_number"]):
+    for run in sorted(runs, key=lambda r: r["created_at"]):
+        # The soak numbers its runs apart from CI, so its runs are named as
+        # the soak's: "run 53" alone would read as a CI run from August.
+        soak = run["name"] == "soak"
+        label = f"{'soak' if soak else 'run'} {run['run_number']}"
+        handshake = run["created_at"] >= HANDSHAKE_AT
         jobs = ci.gh(
             f"/repos/{ci.REPO}/actions/runs/{run['id']}/jobs?per_page=100",
-            # The soak's "repeated boots and shell runs" job is not a boot
-            # lane: each of its boots keeps its serial as an artifact
-            # (`soak-logs`), never in the job log, so it carries no reading
-            # here and would be counted blind every time. Reading those
-            # artifacts is a larger source this tool does not reach yet.
-            jq='.jobs[] | select(.name | test("boot")) | select(.name | test("repeated") | not) | "\\(.id) \\(.name)"',
+            # The soak's one job, "repeated boots and shell runs", carries
+            # twenty boots, each under its own header since 2026-09-30.
+            jq='.jobs[] | select(.name | test("boot")) | "\\(.id) \\(.name)"',
         )
         for line in (jobs or "").splitlines():
             job, _, name = line.partition(" ")
-            text = ci.job_log(job)
-            found = readings(text or "")
-            if not found:
-                blind.append(f"{run['run_number']} {name}")
-                continue
-            boots += 1
-            for reading, values in found.items():
-                tally[reading][values] += 1
-                why = departs(reading, values, run["run_number"])
-                if why:
-                    odd.append(f"run {run['run_number']} {run['head_sha'][:7]} {name}: {why}")
+            text = ci.job_log(job) or ""
+            if soak:
+                # **Until 2026-09-30 a passing soak's boots reached nobody**:
+                # its logs are uploaded only on failure, and this tool's
+                # comment said they were kept as an artifact every time. A
+                # soak from before the headers is one blind entry, not twenty
+                # clean boots and not nothing.
+                found_boots = soak_boots(text)
+                if not found_boots:
+                    blind.append(f"{label} {name} (every boot: no per-boot readings printed)")
+                    continue
+            else:
+                found_boots = [("", readings(text))]
+            for boot, found in found_boots:
+                where = f"{label} {run['head_sha'][:7]} {name}{' ' + boot if boot else ''}"
+                if not found:
+                    blind.append(where)
+                    continue
+                boots += 1
+                for reading, values in found.items():
+                    tally[reading][values] += 1
+                    why = departs(reading, values, handshake)
+                    if why:
+                        odd.append(f"{where}: {why}")
 
     print(f"  readings from {boots} boot(s) in {len(runs)} run(s) since {options.since:%Y-%m-%d}; "
           f"{len(blind)} boot log(s) carried none -- blind, not clean")
+    # Named, not only counted: "1 blind" says nothing about whether it was a
+    # soak from before its headers or a boot lane cut short, and only the
+    # second is news.
+    for where in blind:
+        print(f"  \033[2m  blind         {where}\033[0m")
     for reading, counts in tally.items():
         shown = ", ".join(f"{'/'.join(map(str, values))} x{n}" for values, n in counts.most_common())
         print(f"    {reading:<13} {shown or 'no readings'}")
