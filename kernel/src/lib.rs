@@ -10794,6 +10794,99 @@ fn lending_self_test(hhdm: u64) -> bool {
     ok
 }
 
+/// RFC 0087: a holder that opted in survives its lender; one that did not is
+/// refused as before.
+///
+/// An owner lends one object to two holders, one whose space was built with
+/// `keep_revoked_as_scratch` and one whose space was not, and then the object
+/// is revoked — what an owner's death does to everything it lent. The opted-in
+/// holder's page must then be servable, **by a frame that is not the one it
+/// was lent** (the whole of what makes this not a grant), and the plain
+/// holder's must still be refused. Asked through `commit_page`, which is the
+/// servicing a fault does, so the answer is the one a program touching the
+/// page would get — without a program, and without `unsafe`.
+fn revoked_scratch_self_test(hhdm: u64) -> bool {
+    use bhaskix_boot::VirtAddr;
+    use bhaskix_mm::Protection;
+
+    const AT: u64 = 0x0000_0000_6200_0000;
+
+    let (Ok(owner), Ok(holder), Ok(plain)) = (
+        domain::create("lender2", domain::ResourceEnvelope::new()),
+        domain::create("scratcher", domain::ResourceEnvelope::new()),
+        domain::create("plainholder", domain::ResourceEnvelope::new()),
+    ) else {
+        println!("\x1b[91m    revoke scratch FAILED: no domains\x1b[0m");
+        return false;
+    };
+    let before = vm::scratched();
+
+    let outcome = (|| {
+        let id = shared::create(owner, bhaskix_mm::FRAME_SIZE).ok()?;
+        let lent_frame = shared::frame_at(id, 0)?;
+        let mut kept = vm::AddressSpace::new(hhdm).ok()?;
+        kept.keep_revoked_as_scratch();
+        let kept_root = vm::register_for(holder, kept)?;
+        let plain_root = vm::register_for(plain, vm::AddressSpace::new(hhdm).ok()?)?;
+        for root in [kept_root, plain_root] {
+            vm::with_space(root, |space| {
+                shared::map_into(id, space, VirtAddr(AT), Protection::ReadWrite)
+            })?
+            .ok()?;
+        }
+        let mapped = vm::frame_for_read(kept_root, AT).map(|frame| frame & !0xfff)
+            == Some(lent_frame)
+            && vm::frame_for_read(plain_root, AT).is_some();
+
+        shared::revoke(id);
+
+        let kept_served = vm::commit_page(kept_root, AT);
+        let fresh =
+            vm::frame_for_read(kept_root, AT).is_some_and(|frame| frame & !0xfff != lent_frame);
+        let plain_refused =
+            !vm::commit_page(plain_root, AT) && vm::frame_for_read(plain_root, AT).is_none();
+        Some((mapped, kept_served, fresh, plain_refused))
+    })();
+    let turned = vm::scratched() - before;
+
+    domain::destroy(plain);
+    domain::destroy(holder);
+    domain::destroy(owner);
+
+    let Some((mapped, served, fresh, refused)) = outcome else {
+        println!("\x1b[91m    revoke scratch FAILED: the arrangement could not be built\x1b[0m");
+        return false;
+    };
+    let checks = [
+        ("both holders had the loan mapped to begin with", mapped),
+        (
+            "the holder that opted in was served its page after the revocation",
+            served,
+        ),
+        ("with a frame that is not the one it was lent", fresh),
+        (
+            "the holder that did not opt in was refused, as before",
+            refused,
+        ),
+        ("exactly one region was turned into scratch", turned == 1),
+    ];
+    let mut ok = true;
+    for (name, passed) in checks {
+        if !passed {
+            println!("\x1b[91m    revoke scratch FAILED: {name}\x1b[0m");
+            ok = false;
+        }
+    }
+    if ok {
+        println!(
+            "    revoke scratch a revoked loan left the holder that opted in a fresh page, not the \
+             lent frame, and the holder that did not a refusal; {} region(s) turned since boot",
+            vm::scratched()
+        );
+    }
+    ok
+}
+
 /// Whether `bin/ipd` rang the datagram bell — RFC 0058 Part B's gate.
 fn datagram_bell_report() {
     // **Whether this machine could have rung it at all.** `bin/ipd` starts on
@@ -15911,6 +16004,15 @@ extern "C" fn tcp_domain_entry(hhdm_base: u64) -> ! {
     let Ok(mut space) = AddressSpace::new(hhdm_base) else {
         stop("the address space would not be created")
     };
+    // **RFC 0087: this service survives its lenders.** Every stream ring it
+    // maps is another program's memory, gifted across a `CONNECT`, `LISTEN` or
+    // `ARM_PAIR`, and a program that exits takes its rings with it. Without
+    // this, the next segment for such a ring is a refused fault that kills
+    // `tcpd` and every other program's connections -- which on a networked
+    // boot happened whenever a late connection reached a ring `bin/tcpc` had
+    // taken with it (TRACKER §3). Chosen here, by the kernel that builds the
+    // space, and never by the program in it.
+    space.keep_revoked_as_scratch();
     let Some(stack) = VirtRange::from_pages(VirtAddr(TCPD_STACK), TCPD_STACK_PAGES) else {
         stop("the stack range is not a range")
     };
@@ -25414,6 +25516,9 @@ fn user_shell(handoff: &Handoff) -> Result<(), &'static str> {
     // round.
     if !lending_self_test(hhdm) {
         println!("\x1b[91m    lending        FAILED\x1b[0m");
+    }
+    if !revoked_scratch_self_test(hhdm) {
+        println!("\x1b[91m    revoke scratch FAILED\x1b[0m");
     }
     if !file_self_test(hhdm, bhaskix_arch::percpu::online_count()) {
         println!("\x1b[91m    linux file     FAILED\x1b[0m");

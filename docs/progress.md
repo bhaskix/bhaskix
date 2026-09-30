@@ -11,7 +11,7 @@
 | | |
 |---|---|
 | RFCs accepted | **52** |
-| RFCs open | 32 |
+| RFCs open | 33 |
 | RFCs closed without shipping | 2 |
 | Milestone rows done | **92 of 95** |
 | Phase 2 bullets done | **12 of 13** |
@@ -86,6 +86,7 @@ gantt
     section Memory & scheduling
     RFC 0024 Preemption on wake :crit, r0024, 2026-08-15, 1d
     RFC 0062 a thread may not run with a TLS base it did not... :active, r0062, 2026-09-01, 2026-09-30
+    RFC 0087 A holder that survives its lender :active, r0087, 2026-09-30, 2026-09-30
     section Userspace & personality
     RFC 0005 Linux ABI compatibility as a domain personality :active, r0005, 2026-08-03, 2026-09-30
     RFC 0027 A sockets API worth the name :done, r0027, 2026-08-17, 1d
@@ -196,6 +197,7 @@ gantt
 | 0084 | a fork the kernel copies | 2026-09-23 |
 | 0085 | A futex sleeper comes back for its answer | 2026-09-29 |
 | 0086 | The motivating workload — a Go HTTP server under load | 2026-09-30 |
+| 0087 | A holder that survives its lender | 2026-09-30 |
 
 ## Annexes
 

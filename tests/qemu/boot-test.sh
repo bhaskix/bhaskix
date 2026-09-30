@@ -4057,6 +4057,27 @@ else
     status=1
 fi
 
+# RFC 0087: a holder that opted in survives its lender, one that did not is
+# refused as before, and the page the survivor is given is not the one it was
+# lent -- which is what keeps this from being a grant.
+if grep -qE "revoke scratch a revoked loan left the holder that opted in a fresh page, not the lent frame, and the holder that did not a refusal; [1-9][0-9]* region" "$LOG"; then
+    pass "a revoked loan becomes fresh memory for a holder that opted in, and a refusal for one that did not"
+else
+    fail "the revoked-scratch self test did not pass: $(grep -aoE 'revoke scratch.*' "$LOG" | head -1)"
+    status=1
+fi
+
+# **And `bin/tcpd` is still alive.** Until RFC 0087 it died on networked boots
+# whenever a late connection reached a ring `bin/tcpc` had taken with it, and
+# every one of those boots passed: nothing here asked whether the TCP service
+# was still there. The kernel says so when a domain is torn down by a fault.
+if grep -aqF 'Domain "tcp" is gone' "$LOG"; then
+    fail "bin/tcpd was killed during the boot: $( { grep -aoE 'the region map refused this access: .*' "$LOG" || grep -aoE 'EXCEPTION: .*' "$LOG"; } | tail -1 | tr -d '\r')"
+    status=1
+else
+    pass "bin/tcpd was never killed on this boot"
+fi
+
 if grep -qE "memory objects +[1-9][0-9]* created, [1-9][0-9]* destroyed, none live; two domains shared one object; [1-9][0-9]* mappings revoked out of their page tables; no frame lost" "$LOG"; then
     pass "two domains share an object, revocation takes it from both, nothing leaks"
 else

@@ -98,6 +98,11 @@ pub struct AddressSpace {
     /// initial image was charged to nobody — which was true of this change for
     /// an afternoon, and is what [`AddressSpace::own`] transfers.
     charged: u64,
+    /// Whether a shared region revoked out of this space becomes scratch
+    /// memory rather than a refusal — [RFC 0087](../../docs/rfc/0087-a-holder-that-survives-its-lender.md).
+    /// Off for every space unless whoever builds it says otherwise; see
+    /// [`AddressSpace::keep_revoked_as_scratch`].
+    scratch_on_revoke: bool,
 }
 
 impl AddressSpace {
@@ -138,7 +143,48 @@ impl AddressSpace {
             hhdm_base,
             owner: None,
             charged: 0,
+            scratch_on_revoke: false,
         })
+    }
+
+    /// Opts this space in to surviving its lenders — RFC 0087.
+    ///
+    /// A service that maps memory other domains gift it (`bin/tcpd`'s stream
+    /// rings) cannot control when a gifting domain dies, and its objects are
+    /// revoked with it. Without this, the service's next touch of such a ring
+    /// is a refused fault that kills the service — and with it every other
+    /// program's connections. With it, the revoked region becomes anonymous:
+    /// the next touch is a fresh zeroed frame, charged to this space's owner.
+    /// The lender's frames are unmapped first and are never reachable here.
+    ///
+    /// **A choice for whoever builds the space**, never something the space's
+    /// own program can make: a program that could opt itself in could turn any
+    /// revocation it suffers into memory it keeps writing, and a lender
+    /// revoking a loan is exactly the moment that must not be softened by the
+    /// borrower.
+    pub fn keep_revoked_as_scratch(&mut self) {
+        self.scratch_on_revoke = true;
+    }
+
+    /// Turns the shared region at `start`, backed by `object`, into scratch
+    /// memory if this space opted in; says whether it did.
+    ///
+    /// Called by `shared::revoke` for every mapping it takes away, **before**
+    /// the pages are unmapped, for the lock-order reason `shared::unmap_roots`
+    /// gives. In the window between the two, the region says anonymous and
+    /// the table still maps the object's frame, which is still the object's —
+    /// it is freed only once every mapping is gone — so a touch there reaches
+    /// memory that is still valid, and the next one after the unmapping is
+    /// served a fresh frame.
+    pub fn revoked_to_scratch(&mut self, start: VirtAddr, object: u32) -> bool {
+        if !self.scratch_on_revoke {
+            return false;
+        }
+        let turned = self.regions.orphan_shared(start, object).is_ok();
+        if turned {
+            SCRATCHED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        }
+        turned
     }
 
     /// Physical address of this space's top-level page table.
@@ -770,6 +816,19 @@ pub const MAX_SPACES: usize = 32;
 /// worth doing: a count that stays small beside a domain's leaf pages is a gap
 /// worth leaving, and one that does not is a gap worth closing.
 static PAGE_TABLE_FRAMES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Shared regions turned into scratch memory by a revocation — RFC 0087.
+///
+/// **Counted, because the refusal this replaces was loud and this is not.** A
+/// service that opted in keeps running where it used to die, and the only
+/// trace that its lender vanished under it would otherwise be nothing at all.
+static SCRATCHED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// How many revoked regions have become scratch memory, since boot.
+#[must_use]
+pub fn scratched() -> u64 {
+    SCRATCHED.load(core::sync::atomic::Ordering::Relaxed)
+}
 
 /// How many frames page tables are holding, uncharged to anybody.
 #[must_use]
@@ -1595,6 +1654,16 @@ fn service_fault(space: &mut AddressSpace, address: u64, write: bool) -> FaultOu
     // a test. The region map outlives the mapping by design -- revocation
     // works on page tables, because page tables are what grant access -- so
     // this arm is what stops the stale entry becoming an accidental grant.
+    //
+    // **Still the rule, with one opt-in exception since RFC 0087
+    // (2026-09-30).** A space its builder marked with
+    // `keep_revoked_as_scratch` has its revoked shared regions turned
+    // *anonymous* by `shared::revoke`, so a fault on one never reaches this
+    // arm -- it is served by the anonymous path below as a fresh zeroed frame.
+    // That is not the accidental grant this arm prevents: the lender's frames
+    // were unmapped first and are not what is handed out, the holder pays for
+    // what it gets, it happens only where the space's builder chose it, and
+    // `SCRATCHED` counts every region it happens to.
     if matches!(region.backing, Backing::Shared { .. }) {
         return FaultOutcome::Refused("a shared region was revoked, or never mapped");
     }

@@ -453,6 +453,47 @@ impl RangeMap {
         Ok(self.regions.remove(index))
     }
 
+    /// Turns the shared region starting exactly at `start`, backed by
+    /// `object`, into an **anonymous** one over the same range with the same
+    /// protection — [RFC 0087](../../docs/rfc/0087-a-holder-that-survives-its-lender.md).
+    ///
+    /// For a holder that opted to survive its lender: once the object's pages
+    /// are gone from this space, the region's next touch is served a fresh
+    /// zeroed frame by demand paging instead of being refused. The frames the
+    /// object owned are never reached through this — they were unmapped first,
+    /// and nothing here names them.
+    ///
+    /// **In place, and it cannot fail half-way.** The region keeps its slot in
+    /// the sorted array, so nothing is removed or inserted and nothing
+    /// allocates; either the region matched and changed, or nothing did.
+    /// `copy_on_write` and `populate` are cleared: the first describes a frame
+    /// shared with a parent and the second an eager mapping, and neither is
+    /// true of memory that has just been emptied.
+    ///
+    /// # Errors
+    ///
+    /// [`RangeMapError::NotFound`] if no region starts at `start`, or the one
+    /// that does is not shared memory of `object` — so a revocation of one
+    /// object can never blank a region belonging to another.
+    pub fn orphan_shared(
+        &mut self,
+        start: VirtAddr,
+        object: u32,
+    ) -> Result<VmRegion, RangeMapError> {
+        let region = self
+            .regions
+            .iter_mut()
+            .find(|region| region.range.start == start)
+            .ok_or(RangeMapError::NotFound)?;
+        if region.backing != (Backing::Shared { object }) {
+            return Err(RangeMapError::NotFound);
+        }
+        region.backing = Backing::Anonymous;
+        region.flags.copy_on_write = false;
+        region.flags.populate = false;
+        Ok(*region)
+    }
+
     /// Removes and returns every region, leaving the map empty.
     ///
     /// Used when tearing an address space down, where every mapping has to be
@@ -531,6 +572,75 @@ mod tests {
     }
 
     const PAGE: u64 = crate::FRAME_SIZE;
+
+    /// RFC 0087: a revoked shared region becomes anonymous in place, and only
+    /// the one it names.
+    #[test]
+    fn an_orphaned_shared_region_keeps_its_range_and_protection_and_nothing_else_moves() {
+        let mut map = RangeMap::new();
+        let shared = VmRegion::new(
+            range(0x10000, 4),
+            Protection::ReadWrite,
+            Backing::Shared { object: 7 },
+        );
+        map.insert(region(0x1000, 2)).unwrap();
+        map.insert(shared).unwrap();
+        map.insert(region(0x40000, 1)).unwrap();
+
+        let changed = map.orphan_shared(VirtAddr(0x10000), 7).unwrap();
+        assert_eq!(changed.backing, Backing::Anonymous);
+        assert_eq!(changed.range, shared.range);
+        assert_eq!(changed.protection, Protection::ReadWrite);
+        assert_eq!(
+            map.find(VirtAddr(0x10000 + PAGE)).unwrap().backing,
+            Backing::Anonymous
+        );
+        assert_eq!(map.len(), 3, "nothing inserted or removed");
+        map.check_invariants().unwrap();
+    }
+
+    #[test]
+    fn orphaning_refuses_another_objects_region_and_every_other_backing() {
+        let mut map = RangeMap::new();
+        map.insert(VmRegion::new(
+            range(0x10000, 1),
+            Protection::ReadOnly,
+            Backing::Shared { object: 3 },
+        ))
+        .unwrap();
+        map.insert(region(0x20000, 1)).unwrap();
+        map.insert(VmRegion::new(
+            range(0x30000, 1),
+            Protection::ReadOnly,
+            Backing::Direct { physical: 0 },
+        ))
+        .unwrap();
+
+        // Another object's revocation cannot blank this one.
+        assert_eq!(
+            map.orphan_shared(VirtAddr(0x10000), 4),
+            Err(RangeMapError::NotFound)
+        );
+        // Not the start of the region.
+        assert_eq!(
+            map.orphan_shared(VirtAddr(0x10000 + 0x800), 3),
+            Err(RangeMapError::NotFound)
+        );
+        // Anonymous and device memory are not shared memory.
+        assert_eq!(
+            map.orphan_shared(VirtAddr(0x20000), 3),
+            Err(RangeMapError::NotFound)
+        );
+        assert_eq!(
+            map.orphan_shared(VirtAddr(0x30000), 3),
+            Err(RangeMapError::NotFound)
+        );
+        assert_eq!(
+            map.find(VirtAddr(0x10000)).unwrap().backing,
+            Backing::Shared { object: 3 },
+            "a refusal changes nothing"
+        );
+    }
 
     /// The middle of a region becomes its own, and the two ends survive.
     ///

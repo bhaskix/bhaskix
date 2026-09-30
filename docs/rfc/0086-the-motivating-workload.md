@@ -181,7 +181,11 @@ logs taken today before this step and in ten CI job logs; the boot passes
 because nothing gates `tcpd` staying alive. It means **a program that gifts
 rings and exits can take the machine's TCP service down with the next
 packet** — a service-side question (what `tcpd` does when a ring is revoked
-under it), recorded in TRACKER §3 and not answered here.
+under it), recorded in TRACKER §3 and not answered here — **answered the
+same day by [RFC 0087](0087-a-holder-that-survives-its-lender.md)**, which
+lets `tcpd`'s space keep a revoked ring as scratch memory. *It does not block
+this RFC's gate:* the Go server's client of `tcpd` will be `bin/linuxd`, which
+owns the rings and outlives every hosted process.
 
 ## Design
 

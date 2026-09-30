@@ -686,6 +686,15 @@ pub fn revoke(id: MemoryId) -> usize {
 
     let mut removed = 0;
     for mapping in mappings.iter().flatten() {
+        // **RFC 0087: a holder that opted in keeps the range as scratch.**
+        // Before the pages, for the lock-order reason `unmap_roots` gives: the
+        // space table (rank 0) is taken and released here, and the shootdown
+        // below takes rank 4 afterwards. A space that did not opt in is left
+        // exactly as before -- its region still says shared, and a touch is
+        // refused by `vm::service_fault`.
+        let _ = crate::vm::with_space(mapping.root, |space| {
+            space.revoked_to_scratch(bhaskix_boot::VirtAddr(mapping.address), id.index)
+        });
         for page in 0..mapping.pages {
             let address = mapping.address + page * FRAME_SIZE;
             // SAFETY: `root` is a page table this object was mapped into, and
