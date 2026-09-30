@@ -64,9 +64,15 @@ failed=0
 slowest=0
 for run in $(seq 1 "$RUNS"); do
     start=$(date +%s)
-    if BHASKIX_SHELL_LOG="$WORK/run-$run.log" \
-        "$REPO_ROOT/tests/qemu/shell-test.sh" "$MODE" > "$WORK/out-$run.txt" 2>&1
-    then
+    passed=0
+    BHASKIX_SHELL_LOG="$WORK/run-$run.log" \
+        "$REPO_ROOT/tests/qemu/shell-test.sh" "$MODE" > "$WORK/out-$run.txt" 2>&1 && passed=1
+    # Each run's readings, kept before a passing run's output is deleted and
+    # printed after the progress line, relabelled with the run so
+    # `ci-readings.py` counts ten boots rather than one mode ten times.
+    sed -nE "s/^readings of shell boot .*/readings of soak shell run-$run/p; /^reading  /p" \
+        "$WORK/out-$run.txt" >> "$WORK/readings.txt"
+    if [[ $passed -eq 1 ]]; then
         rm -f "$WORK/run-$run.log" "$WORK/out-$run.txt"
         printf '.'
     else
@@ -82,6 +88,8 @@ for run in $(seq 1 "$RUNS"); do
     [[ $seconds -gt $slowest ]] && slowest=$seconds
 done
 echo
+echo
+cat "$WORK/readings.txt" 2>/dev/null || true
 
 # The slowest run, because it is the number that says whether a failure was the
 # machine or the clock. A good run of this test finishes in about twenty

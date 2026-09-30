@@ -1022,6 +1022,18 @@ the distinction is in the table rather than in somebody's head.
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-09-30 (the shell boots are read too)
+
+The soak change above left two sets of boots unread, and the larger one was
+not the soak's. `shell-test.sh` printed no readings, and `ci-readings.py`
+fetched only jobs named for boots -- so the four shell boots of **every** CI
+run were never counted, alongside the soak's ten shell runs a night. The
+shell harness now prints its readings under a header naming its mode, the
+shell soak keeps each run's before deleting a passing run's output, and the
+tool splits every multi-boot job the same way. Jobs from before the headers
+are not fetched rather than counted blind, the rule `LANDED` already follows.
+A CI run now reads nine boots -- the five `boot` jobs and four shell modes -- not five.
+
 ### 2026-09-30 (the nightly soak's boots are read)
 
 A passing soak left nothing behind: it boots twenty times, runs QEMU itself

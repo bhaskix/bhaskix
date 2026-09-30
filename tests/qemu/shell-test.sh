@@ -353,6 +353,7 @@ echo "booting and typing at it, up to ${TIMEOUT}s..."
 # were true. Neither was checkable against the other.
 # shellcheck source=tests/qemu/devices.sh
 source "$REPO_ROOT/tests/qemu/devices.sh"
+source "$REPO_ROOT/tests/qemu/readings.sh"
 
 if [[ "$MODE" == "iommu" ]]; then
     qemu_device_list full yes
@@ -812,6 +813,14 @@ for marker in "KERNEL PANIC" "EXCEPTION" "FAILED" "unexpected interrupt on vecto
         status=1
     fi
 done
+
+# **Readings, pass or fail**, under a header naming the mode -- see
+# `readings.sh`. Until 2026-09-30 this harness printed none, and
+# `ci-readings.py` read only jobs named for boots, so the four shell boots of
+# every CI run and the soak's ten shell runs a night were read by nobody.
+echo
+echo "readings of shell boot $MODE"
+print_readings "$LOG"
 
 restore_image
 

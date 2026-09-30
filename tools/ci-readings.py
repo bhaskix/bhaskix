@@ -56,8 +56,17 @@ LANDED = "2026-09-29"
 # from CI: soak run 53 is newer than CI run 771.
 HANDSHAKE_AT = "2026-09-29T04:22:58Z"
 
-# The soak prints each boot's readings under this header, since 2026-09-30.
-SOAK_BOOT = re.compile(r"readings of soak boot (\S+)")
+# The harnesses that boot more than once in a job print each boot's readings
+# under a header: `soak-test.sh`'s boots, `shell-test.sh`'s mode (four to a CI
+# `interactive shell` job), and `soak-shell.sh`'s runs.
+SECTION = re.compile(r"readings of ((?:soak boot|shell boot|soak shell) \S+)")
+
+# When those headers existed in every harness. A sectioned job from a run
+# created before it is from before the question was asked -- its harness
+# printed no readings at all -- and is not fetched, exactly as boots before
+# `LANDED` are not: counting twenty-four shell jobs blind would bury the
+# blind entry that means something.
+SECTIONS_AT = "2026-09-30T10:10:04Z"
 
 PATTERNS = {
     "signals": re.compile(r"hosted signals +(\d+) raised, (\d+) delivered"),
@@ -147,14 +156,14 @@ def departs(name: str, values: tuple[int, ...], handshake: bool) -> str | None:
     return None
 
 
-def soak_boots(text: str) -> list[tuple[str, dict[str, tuple[int, ...]]]]:
-    """A soak job log's boots, each with its readings, split at the headers.
+def sections(text: str) -> list[tuple[str, dict[str, tuple[int, ...]]]]:
+    """A job log's boots, each with its readings, split at the headers.
 
-    Empty for a soak that printed no headers -- one from before they existed.
+    Empty for a log that printed no headers.
     """
     boots: list[tuple[str, list[str]]] = []
     for line in text.splitlines():
-        header = SOAK_BOOT.search(line)
+        header = SECTION.search(line)
         if header:
             boots.append((header.group(1), []))
         elif boots:
@@ -195,6 +204,7 @@ def main() -> int:
         return 1
 
     boots = 0
+    before = 0
     blind = []
     tally: dict[str, Counter] = {name: Counter() for name in PATTERNS}
     odd = []
@@ -206,22 +216,26 @@ def main() -> int:
         handshake = run["created_at"] >= HANDSHAKE_AT
         jobs = ci.gh(
             f"/repos/{ci.REPO}/actions/runs/{run['id']}/jobs?per_page=100",
-            # The soak's one job, "repeated boots and shell runs", carries
-            # twenty boots, each under its own header since 2026-09-30.
-            jq='.jobs[] | select(.name | test("boot")) | "\\(.id) \\(.name)"',
+            # The soak's one job, "repeated boots and shell runs", and CI's
+            # "interactive shell" each carry several boots under headers.
+            jq='.jobs[] | select(.name | test("boot|shell")) | "\\(.id) \\(.name)"',
         )
         for line in (jobs or "").splitlines():
             job, _, name = line.partition(" ")
+            sectioned = soak or "shell" in name
+            if sectioned and run["created_at"] < SECTIONS_AT:
+                before += 1
+                continue
             text = ci.job_log(job) or ""
-            if soak:
-                # **Until 2026-09-30 a passing soak's boots reached nobody**:
-                # its logs are uploaded only on failure, and this tool's
-                # comment said they were kept as an artifact every time. A
-                # soak from before the headers is one blind entry, not twenty
-                # clean boots and not nothing.
-                found_boots = soak_boots(text)
+            if sectioned:
+                # **Until 2026-09-30 these boots reached nobody**: the soak
+                # uploads its logs only on failure -- this tool's comment said
+                # they were kept as an artifact every time -- and the shell
+                # harness printed no readings at all. A sectioned job with no
+                # header now is one that stopped before printing any: blind.
+                found_boots = sections(text)
                 if not found_boots:
-                    blind.append(f"{label} {name} (every boot: no per-boot readings printed)")
+                    blind.append(f"{label} {name} (no boot's readings printed)")
                     continue
             else:
                 found_boots = [("", readings(text))]
@@ -238,7 +252,8 @@ def main() -> int:
                         odd.append(f"{where}: {why}")
 
     print(f"  readings from {boots} boot(s) in {len(runs)} run(s) since {options.since:%Y-%m-%d}; "
-          f"{len(blind)} boot log(s) carried none -- blind, not clean")
+          f"{len(blind)} boot log(s) carried none -- blind, not clean; {before} shell or soak "
+          f"job(s) from before their harness printed readings, not read")
     # Named, not only counted: "1 blind" says nothing about whether it was a
     # soak from before its headers or a boot lane cut short, and only the
     # second is news.
