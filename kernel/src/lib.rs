@@ -11918,7 +11918,20 @@ fn socket_self_test(hhdm_base: u64, cpus: u32) -> bool {
         sched::first_thread_in_domain(realm.as_u32()).map(|(thread, state)| {
             let parked = crate::notify::waited_on_by(thread);
             let held = parked.and_then(|index| crate::notify::deadline_held_by(index as u32));
-            (thread, state, parked, held, ipc::where_queued(thread))
+            // Sampled twice, 10 ms apart: a `Running` thread that gains
+            // cycles is being run, and one that gains none is not.
+            let first = sched::run_facts(thread);
+            wait_millis(10);
+            let second = sched::run_facts(thread);
+            (
+                thread,
+                state,
+                parked,
+                held,
+                ipc::where_queued(thread),
+                first,
+                second,
+            )
         })
     };
     retire_probe(realm);
@@ -11945,23 +11958,49 @@ fn socket_self_test(hhdm_base: u64, cpus: u32) -> bool {
              recvfrom should have given up rather than hanging\x1b[0m"
         );
         match stuck {
-            Some((thread, state, parked, held, queued)) => println!(
-                "\x1b[91m                   its thread {thread} is {state:?}, parked on \
+            Some((thread, state, parked, held, queued, first, second)) => {
+                println!(
+                    "\x1b[91m                   its thread {thread} is {state:?}, parked on \
                  notification {}, which holds {}; queued {}; the adapter's last call {last}, \
                  stage {stage}, detail {detail}\x1b[0m",
-                parked.map_or(alloc::string::String::from("none"), |n| alloc::format!(
-                    "{n}"
-                )),
-                match held {
-                    Some(due) => alloc::format!("a deadline at {due}"),
-                    None => alloc::string::String::from("no deadline"),
-                },
-                match queued {
-                    Some((endpoint, true)) => alloc::format!("to send on endpoint {endpoint}"),
-                    Some((endpoint, false)) => alloc::format!("to receive on endpoint {endpoint}"),
-                    None => alloc::string::String::from("on no endpoint"),
-                },
-            ),
+                    parked.map_or(alloc::string::String::from("none"), |n| alloc::format!(
+                        "{n}"
+                    )),
+                    match held {
+                        Some(due) => alloc::format!("a deadline at {due}"),
+                        None => alloc::string::String::from("no deadline"),
+                    },
+                    match queued {
+                        Some((endpoint, true)) => alloc::format!("to send on endpoint {endpoint}"),
+                        Some((endpoint, false)) =>
+                            alloc::format!("to receive on endpoint {endpoint}"),
+                        None => alloc::string::String::from("on no endpoint"),
+                    },
+                );
+                match (first, second) {
+                    (Some(first), Some(second)) => println!(
+                        "\x1b[91m                   on cpu {} {}, {} tick(s) since it was \
+                         dispatched; it gained {} of the {} tick(s) between two looks{}\x1b[0m",
+                        second.cpu,
+                        if second.current {
+                            "and current there"
+                        } else {
+                            "but waiting in its queue"
+                        },
+                        second.since_dispatch,
+                        second.cycles.saturating_sub(first.cycles),
+                        second.at.saturating_sub(first.at),
+                        if first.cpu == second.cpu {
+                            ""
+                        } else {
+                            ", and it moved CPU between them"
+                        },
+                    ),
+                    _ => println!(
+                        "\x1b[91m                   and no run queue held it when asked where it runs\x1b[0m"
+                    ),
+                }
+            }
             None => println!(
                 "\x1b[91m                   and no thread of it was left to ask; the adapter's \
                  last call {last}, stage {stage}, detail {detail}\x1b[0m"

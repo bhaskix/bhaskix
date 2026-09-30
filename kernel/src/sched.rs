@@ -5787,6 +5787,50 @@ pub fn first_thread_in_domain(domain: u32) -> Option<(u32, State)> {
     None
 }
 
+/// Where a thread's time is going, as its run queue sees it.
+pub struct RunFacts {
+    /// The CPU whose queue holds it.
+    pub cpu: usize,
+    /// Whether it is that CPU's current thread at this instant.
+    pub current: bool,
+    /// TSC ticks since it was last dispatched.
+    pub since_dispatch: u64,
+    /// Real CPU ticks it has consumed in all.
+    pub cycles: u64,
+    /// The TSC when this was read.
+    pub at: u64,
+}
+
+/// Where `thread` is: on a CPU or waiting in a queue, and how long since it
+/// last ran.
+///
+/// For a probe whose thread reads `Running` and never finishes, which is two
+/// different failures: a thread current on its CPU all along is spinning in
+/// the nucleus or ring 3, and one sitting in a queue is not being chosen.
+/// Sampled twice, `cycles` separates them without guessing.
+pub fn run_facts(thread: u32) -> Option<RunFacts> {
+    let online = percpu::online_count() as usize;
+    for (cpu, queue) in QUEUES.iter().take(online.min(MAX_CPUS)).enumerate() {
+        let queue = queue.lock();
+        let found = queue.threads.iter().enumerate().find_map(|(index, held)| {
+            held.as_ref()
+                .filter(|held| held.id == thread)
+                .map(|held| (index, held))
+        });
+        if let Some((index, held)) = found {
+            let at = tsc::read();
+            return Some(RunFacts {
+                cpu,
+                current: queue.current == index,
+                since_dispatch: at.saturating_sub(held.last_start),
+                cycles: held.cycles,
+                at,
+            });
+        }
+    }
+    None
+}
+
 /// Like [`threads_in_domain`], but **blocks** for each queue rather than
 /// skipping one it cannot take.
 ///
