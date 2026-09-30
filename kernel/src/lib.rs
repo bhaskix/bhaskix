@@ -11979,15 +11979,17 @@ fn socket_self_test(hhdm_base: u64, cpus: u32) -> bool {
                 );
                 match (first, second) {
                     (Some(first), Some(second)) => println!(
-                        "\x1b[91m                   on cpu {} {}, {} tick(s) since it was \
-                         dispatched; it gained {} of the {} tick(s) between two looks{}\x1b[0m",
+                        "\x1b[91m                   then, 10 ms apart: on cpu {}, {:?} {}, {} tick(s) \
+                         since the scheduler last charged it; it gained {} of the {} tick(s) \
+                         between the two looks{}\x1b[0m",
                         second.cpu,
+                        second.state,
                         if second.current {
                             "and current there"
                         } else {
-                            "but waiting in its queue"
+                            "and not current there"
                         },
-                        second.since_dispatch,
+                        second.since_charged,
                         second.cycles.saturating_sub(first.cycles),
                         second.at.saturating_sub(first.at),
                         if first.cpu == second.cpu {

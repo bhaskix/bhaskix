@@ -5791,10 +5791,19 @@ pub fn first_thread_in_domain(domain: u32) -> Option<(u32, State)> {
 pub struct RunFacts {
     /// The CPU whose queue holds it.
     pub cpu: usize,
+    /// Its state at this instant -- not at whatever earlier instant a caller
+    /// read it. A failure line that printed one state and judged by another
+    /// read a blocked thread as one "waiting in its queue" on 2026-09-30.
+    pub state: State,
     /// Whether it is that CPU's current thread at this instant.
     pub current: bool,
-    /// TSC ticks since it was last dispatched.
-    pub since_dispatch: u64,
+    /// TSC ticks since the scheduler last charged it.
+    ///
+    /// **Not since it was dispatched:** `last_start` is reset at every
+    /// scheduling point that charges the running thread, a timer tick
+    /// included, so for a thread that keeps running this is time since the
+    /// last such point.
+    pub since_charged: u64,
     /// Real CPU ticks it has consumed in all.
     pub cycles: u64,
     /// The TSC when this was read.
@@ -5821,8 +5830,9 @@ pub fn run_facts(thread: u32) -> Option<RunFacts> {
             let at = tsc::read();
             return Some(RunFacts {
                 cpu,
+                state: held.state,
                 current: queue.current == index,
-                since_dispatch: at.saturating_sub(held.last_start),
+                since_charged: at.saturating_sub(held.last_start),
                 cycles: held.cycles,
                 at,
             });
