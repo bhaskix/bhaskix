@@ -6842,7 +6842,15 @@ fn memory_self_test(hhdm_base: u64, cpus: u32) -> bool {
                     core::ptr::read_volatile((hhdm_base + report_pa + 24) as *const u64),
                 ]
             };
-            if answers[1] == 42 {
+            // **The last answer, not the first.** This stopped as soon as the
+            // read-back appeared, before the probe had stored `munmap`'s and
+            // `madvise`'s answers -- invisible while both were expected to be
+            // zero, which is what an unwritten slot holds. When `madvise` came
+            // to answer `ENOMEM` (2026-10-01) CI run 802's `uefi, max` lane read
+            // the slot early and reported `madvise 0`, with the kernel's own
+            // record showing it had returned -12. `madvise` is the probe's last
+            // store, so once it is non-zero every earlier one has landed.
+            if answers[1] == 42 && answers[3] != 0 {
                 break;
             }
         }
