@@ -317,6 +317,26 @@ pub mod report {
     /// see the pending bit.
     pub const SIGNAL_WORDS: usize = 22;
 
+    /// The load record — [RFC 0086](../../docs/rfc/0086-the-motivating-workload.md):
+    /// what the adapter's copies into and out of hosted processes have cost
+    /// since it started, as running totals.
+    ///
+    /// | word | what it counts |
+    /// |---|---|
+    /// | 0, 1, 2 | `COPY_IN` crossings, bytes, cycles |
+    /// | 3, 4, 5 | `COPY_OUT` crossings, bytes, cycles |
+    ///
+    /// **Totals, so a reader takes a difference.** The RFC's gate reports
+    /// "the adapter's copy cost per request" and its step 6 record had to say
+    /// that figure was not instrumented: the only copy price on record was the
+    /// boot's one-page microbenchmark at [`COPY_AT`], taken before the server
+    /// ran. A total read before and after a run prices that run alone, whatever
+    /// else the boot moved earlier.
+    pub const LOAD_AT: usize = SIGNAL_AT + SIGNAL_WORDS * 8;
+
+    /// How many words [`LOAD_AT`] holds.
+    pub const LOAD_WORDS: usize = 6;
+
     /// Where bulk staging begins.
     ///
     /// Rounded up from the end of the records, so the boundary is legible in a
@@ -334,9 +354,12 @@ pub mod report {
     ///
     /// Each move costs the scratch 64 bytes of the 3,584 it started with,
     /// which is a chunk size rather than a capacity.
-    /// **704 since 2026-09-23**; 640 before that, 576 before that, 512 before
-    /// that. The signal record reached exactly 640 and had nowhere to grow.
-    pub const SCRATCH_AT: usize = 704;
+    /// ~~**704 since 2026-09-23**; 640 before that, 576 before that, 512 before
+    /// that. The signal record reached exactly 640 and had nowhere to grow.~~
+    /// **768 since 2026-10-01**, the fifth move: the signal record ended at
+    /// exactly 704, and [`LOAD_AT`]'s six words go after it. A page is still
+    /// two crossings at 3,328 bytes.
+    pub const SCRATCH_AT: usize = 768;
 
     /// How much of the page bulk staging may use.
     ///
@@ -360,7 +383,12 @@ pub mod report {
     /// because the next person to write a literal there will be caught by it.
     const _: () = assert!(PROCESS_AT + PROCESS_WORDS * 8 <= BIND_AT);
     const _: () = assert!(BIND_AT + BIND_WORDS * 8 <= SIGNAL_AT);
-    const _: () = assert!(SIGNAL_AT + SIGNAL_WORDS * 8 <= SCRATCH_AT);
+    const _: () = assert!(SIGNAL_AT + SIGNAL_WORDS * 8 <= LOAD_AT);
+    const _: () = assert!(LOAD_AT + LOAD_WORDS * 8 <= SCRATCH_AT);
+    /// **A page is still two crossings.** Moving the scratch boundary is
+    /// cheap only while this holds; the copy counts RFC 0036 measured assume
+    /// it.
+    const _: () = assert!(PAGE.div_ceil(SCRATCH_BYTES) == 2);
 
     /// **Every record ends before the next one begins.**
     ///

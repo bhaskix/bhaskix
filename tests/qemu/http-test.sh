@@ -10,8 +10,10 @@
 # **Passes when**, for the whole run: the load tool saw no error and every
 # client was served; the kernel says the server was still running when its time
 # was up; during its run no park was refused, none ran out of retries, and no
-# deadline arm was refused for want of a slot; and nothing printed `FAILED`.
-# Throughput and latency are printed, not judged.
+# deadline arm was refused for want of a slot; the adapter recorded its copies
+# (RFC 0086's per-run copy cost -- present, not judged); and nothing printed
+# `FAILED`. Throughput, latency and the copy cost per response are printed, not
+# judged.
 #
 #   tests/qemu/http-test.sh [seconds]      (default 30; the nightly soak runs 300)
 set -uo pipefail
@@ -116,6 +118,30 @@ if [[ "$run" =~ during\ its\ run:\ 0\ park\(s\)\ refused,\ 0\ ran\ out\ of\ retr
     pass "$run"
 else
     fail "the server was refused a park or a deadline during its run: ${run:-no park line was printed}"
+fi
+
+# **The adapter's copy cost per response** -- RFC 0086's "reported, not
+# gated". The kernel prints the run's totals and only the host knows how many
+# responses there were, so the division is here. The figure is not judged; its
+# *presence* is: a run that served responses and recorded no crossing has an
+# instrument that is not counting, and a number nobody can trust is worse than
+# none.
+copies="$(grep -aoE 'copies during its run: .*' "$LOG" | head -1 | clean)"
+responses="$(sed -n 's/^http load  \([0-9]*\) responses checked.*/\1/p' "$LOG.load" 2>/dev/null | head -1)"
+if [[ "$copies" =~ run:\ ([0-9]+)\ in\ \(([0-9]+)\ bytes,\ ([0-9]+)\ cycles\),\ ([0-9]+)\ out\ \(([0-9]+)\ bytes,\ ([0-9]+)\ cycles\)\;\ ([0-9]+)\ cycles\ per ]] \
+    && [[ ${responses:-0} -gt 0 ]]; then
+    m=("${BASH_REMATCH[@]}")
+    if [[ $((m[1] + m[4])) -gt 0 ]]; then
+        pass "$copies"
+        echo "  info  per response: $(awk -v r="$responses" -v ci="${m[1]}" -v bi="${m[2]}" \
+            -v yi="${m[3]}" -v co="${m[4]}" -v bo="${m[5]}" -v yo="${m[6]}" 'BEGIN {
+            printf "%.2f crossings in and %.2f out, %.0f bytes in and %.0f out, %.0f cycles copying",
+                ci / r, co / r, bi / r, bo / r, (yi + yo) / r }')"
+    else
+        fail "the server answered $responses responses and the adapter recorded no copy: $copies"
+    fi
+elif [[ ${responses:-0} -gt 0 ]]; then
+    fail "the server answered $responses responses and the kernel printed no copy totals: ${copies:-no line}"
 fi
 
 # What `MADV_DONTNEED` did during the run, printed and not judged: a short run

@@ -1130,6 +1130,44 @@ fn write_slot(slot: u64, image: &[u64; FAULT_REGISTERS]) -> bool {
     true
 }
 
+/// Where the load record sits: the copies' running totals.
+const LOAD_RECORD_AT: u64 = REPORT_AT + report::LOAD_AT as u64;
+
+/// What every copy through [`copy_in`] and [`copy_out_through`] has cost since
+/// this program started — crossings, bytes and cycles, `COPY_IN` then
+/// `COPY_OUT`, in [`report::LOAD_AT`]'s order.
+///
+/// [RFC 0086](../../../docs/rfc/0086-the-motivating-workload.md)'s gate
+/// reports "the adapter's copy cost per request", and step 6 had to record
+/// that it was not instrumented. Every byte of a hosted stream crosses through
+/// those two wrappers, so they are where it is counted.
+///
+/// **Not counted, on purpose:** the three `INVOKE`s of `COPY_IN` or
+/// `COPY_OUT` written out in full elsewhere — `sched_getaffinity`'s eight
+/// bytes, a file `write` staged into [`STAGING`], and `execve`'s segment
+/// copies out of [`STAGING`]. None of them is on a stream path. The rest of
+/// an `execve`'s copies do go through `copy_out_through` and are counted;
+/// they happen before any run a reader would difference.
+static LOAD: [core::sync::atomic::AtomicU64; report::LOAD_WORDS] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; report::LOAD_WORDS];
+
+/// Adds one crossing of `bytes` that took `cycles` to [`LOAD`], `outward` for
+/// `COPY_OUT`, and publishes the record.
+fn note_copy(outward: bool, bytes: usize, cycles: u64) {
+    use core::sync::atomic::Ordering;
+    let first = if outward { 3 } else { 0 };
+    LOAD[first].fetch_add(1, Ordering::Relaxed);
+    LOAD[first + 1].fetch_add(bytes as u64, Ordering::Relaxed);
+    LOAD[first + 2].fetch_add(cycles, Ordering::Relaxed);
+    for (index, total) in LOAD.iter().enumerate() {
+        let at = (LOAD_RECORD_AT + index as u64 * 8) as *mut u64;
+        let value = total.load(Ordering::Relaxed);
+        // SAFETY: inside the page `ATTACH` mapped from this program's own
+        // object, at an offset the crate asserts ends before the scratch area.
+        unsafe { core::ptr::write_volatile(at, value) };
+    }
+}
+
 /// Reads bytes out of a hosted process's memory, through the capability this
 /// program holds for its domain.
 ///
@@ -1141,11 +1179,17 @@ fn copy_in(domain: u32, address: u64, out: &mut [u8]) -> bool {
     if out.len() > SCRATCH_BYTES as usize {
         return false;
     }
+    let started = bhaskix_sock::time::now();
     let moved = call(
         syscall::INVOKE,
         handle_of(domain),
         method::COPY_IN,
         [REPORT, SCRATCH_AT_OFFSET, address, out.len() as u64],
+    );
+    note_copy(
+        false,
+        out.len(),
+        bhaskix_sock::time::now().saturating_sub(started),
     );
     if moved.status != status::OK {
         return false;
@@ -1201,11 +1245,17 @@ fn copy_out_through(handle: u64, address: u64, bytes: &[u8]) -> bool {
             );
         }
     }
+    let started = bhaskix_sock::time::now();
     let moved = call(
         syscall::INVOKE,
         handle,
         method::COPY_OUT,
         [REPORT, SCRATCH_AT_OFFSET, address, bytes.len() as u64],
+    );
+    note_copy(
+        true,
+        bytes.len(),
+        bhaskix_sock::time::now().saturating_sub(started),
     );
     moved.status == status::OK
 }

@@ -543,8 +543,9 @@ same day) and in CI (run 804, its first).
 **What those numbers are not, said:** they are measured under QEMU's TCG on the
 build host, not on hardware; the round-trip price is the boot's, taken before
 the server ran, not a figure *under this load* — the step's plan asked for the
-adapter's copy cost under load, and that per-run figure is not instrumented
-yet; and the latency tail is reported, not explained. **What the server runs
+adapter's copy cost under load, and ~~that per-run figure is not instrumented
+yet~~ that figure is measured since 2026-10-01, the same day (the record
+below); and the latency tail is reported, not explained. **What the server runs
 without:** Go's signal-based preemption (`tgkill` refuses `SIGURG`), so it is
 preempted cooperatively only.
 
@@ -554,6 +555,49 @@ listener armed with ring pairs; a second program may listen; hosted TCP in
 toolchain, `eventfd`, `prlimit64`, `clock_gettime`, lazy zero-fill, partial
 `MAP_FIXED` and `munmap`, `MADV_DONTNEED` that discards, a `clone` that starts a
 thread as Linux does, and the faults, waits and shootdowns each of those found.
+
+### After step 6 (2026-10-01): the copy cost per response, measured
+
+The gate's "reported, not gated" list named the adapter's copy cost per
+request, and step 6 had to say it was not instrumented. It is now. `bin/linuxd`
+keeps running totals of every copy through its two wrappers — crossings, bytes
+and cycles, `COPY_IN` and `COPY_OUT` apart — in a load record on its report
+page (`personality::report::LOAD_AT`). The kernel reads it before the server
+starts and after the run and prints the difference, and `http-test.sh` divides
+that by the responses the host counted. The lane fails if a run that served
+responses recorded no crossing, which was watched happening once with the
+publish switched off.
+
+**The five-minute run, 2026-10-01** (65,803 responses, 0 errors, 0 reconnects,
+p50 68.7 ms, p99 259.8 ms):
+
+| per response | in (`COPY_IN`) | out (`COPY_OUT`) |
+|---|---|---|
+| crossings | 1.45 | 12.82 |
+| bytes | 140 | 269 |
+| cycles copying, both directions | 924,788 | |
+
+Across the run that is 939,025 crossings at a mean of **64,805 cycles each**,
+and 60.9 billion cycles in copies — about 25 s of the adapter's one thread out
+of 300, at the roughly 2.4 GHz step 6's figures assumed (an inferred rate, not
+one this run measured). The thirty-second lane read the same to within 2%
+(1.47 and 12.94 crossings, 926,160 cycles).
+
+**What the numbers say, and what they do not.** `COPY_IN` reads the server's
+memory, so it carries what the server *writes* — 140 bytes in 1.45 crossings,
+which is the size of one response with its headers. `COPY_OUT` carries what
+the server *reads* — the request — and every small answer written back into
+its memory. The cost is in the *count* of those outward crossings, not in
+their bytes: they carry 21 bytes on average, and a request of the load tool's
+shape is about 75 bytes, so most of the thirteen are answers rather than
+request bytes (inferred from those sizes, not counted). Which calls make them — `epoll_wait`'s events, `clock_gettime`'s `timespec`, a
+`sockaddr`, a futex's word — is **not** measured by this record, which counts
+by direction and not by call; that is the next instrument if a faster path is
+wanted, and a path that batched small answers would be priced against these
+figures. The record also counts every copy through the wrappers, not only
+stream bytes; three direct copies elsewhere (`sched_getaffinity`, a file
+`write`'s staging, `execve`'s segments) are outside it, and none is on a
+stream path.
 
 ## Design
 

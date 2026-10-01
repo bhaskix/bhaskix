@@ -5372,6 +5372,51 @@ fn tag_linux(realm: domain::DomainId, label: &str) -> bool {
     }
 }
 
+/// The adapter's copy totals — [`bhaskix_personality::report::LOAD_AT`] —
+/// read until two reads in a row agree, or zeros if there is no report page.
+///
+/// **Twice, because the writer is live.** `bin/linuxd` publishes six words
+/// one store at a time on another processor, so a single read can take a
+/// crossing's count without its cycles. Two equal reads in a row cannot have
+/// straddled a publish.
+fn adapter_load_record() -> [u64; bhaskix_personality::report::LOAD_WORDS] {
+    const WORDS: usize = bhaskix_personality::report::LOAD_WORDS;
+    const FIRST_WORD: usize = bhaskix_personality::report::LOAD_AT / 8;
+    let page = ADAPTER_REPORT.load(core::sync::atomic::Ordering::Acquire);
+    if page == u64::MAX {
+        return [0; WORDS];
+    }
+    let object = shared::MemoryId::from_u64(page);
+    let read = || {
+        let mut record = [0u64; WORDS];
+        let mut at = 0usize;
+        let taken = shared::drain_into(object, (FIRST_WORD + WORDS) * 8, &mut |chunk: &[u8]| {
+            for word in chunk.as_chunks::<8>().0 {
+                if at >= FIRST_WORD + WORDS {
+                    break;
+                }
+                if at >= FIRST_WORD {
+                    let mut eight = [0u8; 8];
+                    eight.copy_from_slice(word);
+                    record[at - FIRST_WORD] = u64::from_le_bytes(eight);
+                }
+                at += 1;
+            }
+            chunk.len()
+        });
+        taken.map(|_| record)
+    };
+    let mut last = read();
+    for _ in 0..16 {
+        let again = read();
+        if again.is_some() && again == last {
+            break;
+        }
+        last = again;
+    }
+    last.unwrap_or([0; WORDS])
+}
+
 /// RFC 0086 step 5: **the motivating workload** — `bin/httpd`, a static Go
 /// `net/http` server, run in a Linux-tagged domain for `bhaskix.httpd=<s>`
 /// seconds while the host loads it.
@@ -5419,6 +5464,7 @@ fn httpd_self_test(hhdm_base: u64, cpus: u32) -> bool {
         ]
     };
     let before = parks();
+    let copies_before = adapter_load_record();
     let faults_before = fault::HANDED.load(Ordering::Relaxed);
     let restored_before = syscall::RESTORED.load(Ordering::Relaxed);
     CORPUS_PROGRAM.store(2, Ordering::Release);
@@ -5455,6 +5501,7 @@ fn httpd_self_test(hhdm_base: u64, cpus: u32) -> bool {
     }
     let made = syscall::stop_tracing();
     let after = parks();
+    let copies_after = adapter_load_record();
     let [
         refused_parks,
         exhausted,
@@ -5474,6 +5521,24 @@ fn httpd_self_test(hhdm_base: u64, cpus: u32) -> bool {
         crate::notify::arm_pressure().1,
         crate::notify::MAX_DEADLINES,
         syscall::PARK_REFUSED_SLOT.load(Ordering::Relaxed)
+    );
+    // **What the adapter's copies cost during the run** -- RFC 0086's
+    // "reported, not gated" copy cost, as totals the host divides by the
+    // responses it counted. Every hosted stream byte crosses here.
+    let [
+        in_crossings,
+        in_bytes,
+        in_cycles,
+        out_crossings,
+        out_bytes,
+        out_cycles,
+    ] = core::array::from_fn::<u64, 6, _>(|at| copies_after[at].wrapping_sub(copies_before[at]));
+    let crossings = in_crossings + out_crossings;
+    println!(
+        "{LABEL}copies during its run: {in_crossings} in ({in_bytes} bytes, {in_cycles} \
+         cycles), {out_crossings} out ({out_bytes} bytes, {out_cycles} cycles); {} cycles per \
+         crossing",
+        (in_cycles + out_cycles).checked_div(crossings).unwrap_or(0)
     );
     // **Where it faulted, if it did** -- the faults handed to the adapter
     // during the run, and the last of them. A Go server that dies prints
