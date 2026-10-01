@@ -2134,6 +2134,17 @@ pub static TRACED_SEEN: [core::sync::atomic::AtomicU64; 64] =
 /// How many it has asked, which may exceed what [`TRACED_SEEN`] holds.
 pub static TRACED_CALLS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
+/// How many times the traced domain asked each call number, by number.
+///
+/// [RFC 0086](../../docs/rfc/0086-the-motivating-workload.md): the adapter's
+/// copy record showed twelve outward crossings per response averaging 21
+/// bytes, and a count by *direction* cannot say which calls make them. This
+/// is a count by *number*, and it interprets nothing: the nucleus learns how
+/// often a number was asked, not what it means. 512 covers every x86-64
+/// Linux number; a larger one is counted in [`TRACED_CALLS`] and not here.
+pub static TRACED_BY_NUMBER: [core::sync::atomic::AtomicU64; 512] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; 512];
+
 /// The distinct numbers the traced domain was answered `-ENOSYS` for, in the
 /// order first refused; `u64::MAX` is empty. RFC 0086 step 5: what a program
 /// somebody else wrote *needs* is the calls it was refused, and a list of
@@ -2165,6 +2176,9 @@ pub fn trace_domain(domain: u32) {
     TRACED_CALLS.store(0, Ordering::Relaxed);
     for slot in TRACED_SEEN.iter().chain(TRACED_REFUSED.iter()) {
         slot.store(u64::MAX, Ordering::Relaxed);
+    }
+    for count in &TRACED_BY_NUMBER {
+        count.store(0, Ordering::Relaxed);
     }
     TRACED_DOMAIN.store(domain, Ordering::Release);
 }
@@ -2397,6 +2411,12 @@ fn foreign_call(frame: &mut SyscallFrame, domain: u32) {
         let at = TRACED_CALLS.fetch_add(1, Ordering::Relaxed);
         if let Some(slot) = TRACED_SEEN.get(at as usize) {
             slot.store(number, Ordering::Relaxed);
+        }
+        if let Some(count) = usize::try_from(number)
+            .ok()
+            .and_then(|number| TRACED_BY_NUMBER.get(number))
+        {
+            count.fetch_add(1, Ordering::Relaxed);
         }
     }
     let mut event = [0u8; 16];

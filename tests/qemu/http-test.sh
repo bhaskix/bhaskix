@@ -144,6 +144,15 @@ elif [[ ${responses:-0} -gt 0 ]]; then
     fail "the server answered $responses responses and the kernel printed no copy totals: ${copies:-no line}"
 fi
 
+# **Which calls make those crossings**: the server's most-asked call numbers,
+# per response. Printed, not judged; the kernel counts numbers and names none.
+most="$(grep -aoE "most-asked calls, number x count:.*" "$LOG" | head -1 | clean | sed 's/.*count://')"
+if [[ -n "$most" && ${responses:-0} -gt 0 ]]; then
+    echo "  info  most-asked calls per response (number: count):$(for pair in $most; do
+        awk -v n="${pair%x*}" -v c="${pair#*x}" -v r="$responses" 'BEGIN { printf " %s: %.2f", n, c / r }'
+    done)"
+fi
+
 # What `MADV_DONTNEED` did during the run, printed and not judged: a short run
 # may release nothing, which is no failure. Whether the kernel serves a discard
 # at all is asserted on every boot of every lane, by the memory probe's own

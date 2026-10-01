@@ -5566,6 +5566,27 @@ fn httpd_self_test(hhdm_base: u64, cpus: u32) -> bool {
             fault::LAST_HANDED_ERROR.load(Ordering::Relaxed)
         );
     }
+    // **Which calls the server made, most first** -- the eight numbers it
+    // asked most during its run, so the copy line's crossings can be put to
+    // names by whoever reads it. Numbers, not names: the nucleus counts and
+    // does not interpret.
+    let mut busiest = [(0u64, 0usize); 8];
+    for (number, count) in syscall::TRACED_BY_NUMBER.iter().enumerate() {
+        let count = count.load(Ordering::Relaxed);
+        if let Some(lowest) = busiest
+            .iter_mut()
+            .min_by_key(|(held, _)| *held)
+            .filter(|(held, _)| count > *held)
+        {
+            *lowest = (count, number);
+        }
+    }
+    busiest.sort_unstable_by_key(|(count, _)| core::cmp::Reverse(*count));
+    let mut most = alloc::string::String::new();
+    for (count, number) in busiest.iter().filter(|(count, _)| *count > 0) {
+        most.push_str(&alloc::format!(" {number}x{count}"));
+    }
+    println!("{LABEL}its most-asked calls, number x count:{most}");
     let mut refused = alloc::string::String::new();
     for slot in syscall::TRACED_REFUSED.iter() {
         let number = slot.load(Ordering::Relaxed);

@@ -590,14 +590,48 @@ the server *reads* — the request — and every small answer written back into
 its memory. The cost is in the *count* of those outward crossings, not in
 their bytes: they carry 21 bytes on average, and a request of the load tool's
 shape is about 75 bytes, so most of the thirteen are answers rather than
-request bytes (inferred from those sizes, not counted). Which calls make them — `epoll_wait`'s events, `clock_gettime`'s `timespec`, a
+request bytes (inferred from those sizes, not counted). ~~Which calls make them — `epoll_wait`'s events, `clock_gettime`'s `timespec`, a
 `sockaddr`, a futex's word — is **not** measured by this record, which counts
 by direction and not by call; that is the next instrument if a faster path is
 wanted, and a path that batched small answers would be priced against these
-figures. The record also counts every copy through the wrappers, not only
+figures.~~ **Measured the next day** — see "Which calls", below. The record also counts every copy through the wrappers, not only
 stream bytes; three direct copies elsewhere (`sched_getaffinity`, a file
 `write`'s staging, `execve`'s segments) are outside it, and none is on a
 stream path.
+
+### Which calls (2026-10-02): the server spends its calls asking the time
+
+The kernel now counts the traced domain's calls **by number**
+(`syscall::TRACED_BY_NUMBER`, a count per number that interprets none of them),
+prints the eight most asked, and `http-test.sh` divides by the responses. A
+thirty-second run of 2026-10-02, 7,106 responses:
+
+| number | call | per response |
+|---|---|---|
+| 228 | `clock_gettime` | **11.50** |
+| 0 | `read` | 1.32 |
+| 1 | `write` | 1.00 |
+| 202 | `futex` | 0.30 |
+| 35 | `nanosleep` | 0.26 |
+| 281 | `epoll_pwait` | 0.23 |
+
+Names from the build host's `asm/unistd_64.h`, checked against the adapter's
+own constants. **About four calls in five are the runtime reading its clock**,
+and they account for the copy record too: 11.5 crossings of a 16-byte
+`timespec` plus one request read is the 12.85 outward crossings and the 269
+bytes. Go reads the time through the vDSO on Linux; a process here has none
+(`personality/src/clock.rs`), so each `nanotime` is a full round trip to the
+adapter and a crossing back.
+
+**What would remove them is a design decision, not a tuning step**, and it is
+recorded here rather than taken: a time page mapped into hosted processes with
+the code that reads it — a vDSO, which Go finds through `AT_SYSINFO_EHDR` (read in go 1.27.1's
+`runtime/vdso_linux.go` and `sys_linux_amd64.s`, where `nanotime1` calls
+`vdsoClockgettimeSym`, 2026-10-02) —
+would answer these without a call. Answering them in the nucleus instead is
+ruled out by RFC 0031's count of Linux numbers interpreted there, which is 0.
+Either would want its own RFC and the lead's word, and these figures are what
+it would be measured against.
 
 ## Design
 
