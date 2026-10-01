@@ -1131,6 +1131,52 @@ impl AddressSpace {
         Ok(())
     }
 
+    /// Serves `MAP_FIXED` over part of an **untouched** anonymous region —
+    /// [RFC 0086](../../docs/rfc/0086-the-motivating-workload.md) step 5.
+    ///
+    /// A fixed mapping replaces what was there with fresh zeroed pages. Inside
+    /// one anonymous region none of whose pages in the range has a frame yet,
+    /// the pages *are* fresh zeroed pages already — demand paging will zero
+    /// each on its first touch — so the replacement is the range taking the
+    /// new protection, which [`Self::protect`] does, splitting the region.
+    /// Nothing is freed, so no frame's ownership is in question and a
+    /// copy-on-write region needs no special case: none of its pages in the
+    /// range is present.
+    ///
+    /// **Why it exists:** go 1.27.1's heap reserves a whole arena `PROT_NONE`
+    /// and then commits it four megabytes at a time with `MAP_FIXED`
+    /// read-write (`runtime/mem_linux.go`, `sysReserveOS` and `sysMapOS`, read
+    /// 2026-10-01). `MAP_AT` replaced only an *exact* match, so the first
+    /// commit was refused and the runtime threw "out of memory".
+    ///
+    /// # Errors
+    ///
+    /// [`VmError::Region`] (`NotFound`) if the range is not wholly inside one
+    /// anonymous region, or any page of it is already present — a replacement
+    /// that would have to free frames is still refused, as before.
+    pub fn replace_untouched(
+        &mut self,
+        start: VirtAddr,
+        pages: u64,
+        protection: Protection,
+    ) -> Result<(), VmError> {
+        let refused = VmError::Region(bhaskix_mm::vm::RangeMapError::NotFound);
+        let range = VirtRange::from_pages(start, pages).ok_or(refused)?;
+        let whole = self.regions.find(start).is_some_and(|region| {
+            matches!(region.backing, Backing::Anonymous)
+                && region.range.start.as_u64() <= range.start.as_u64()
+                && region.range.end.as_u64() >= range.end.as_u64()
+        });
+        if !whole
+            || range
+                .pages_iter()
+                .any(|page| self.translate(page).is_some())
+        {
+            return Err(refused);
+        }
+        self.protect(start, pages, protection)
+    }
+
     /// Marks an already-mapped range copy-on-write.
     ///
     /// Drops write permission in the page table while leaving the region's

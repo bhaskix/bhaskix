@@ -50,7 +50,9 @@ use bhaskix_personality::report;
 use bhaskix_personality::signal::{self, Dispositions, Handler, Registers, number::SIGSEGV};
 use bhaskix_personality::thread::{self, ClonePlan};
 
+mod clone;
 mod epoll;
+mod eventfd;
 mod stream;
 
 /// One page to report through, written by this program and read by the
@@ -1007,30 +1009,19 @@ fn answer_with_frame(domain: u32, slot: u64, number: u64) -> (u64, Answer) {
                 };
                 return (REPLY_VALUE, Answer::error(errno));
             };
-            // **The entry is `r9`, and that is this personality's own
-            // contract rather than Linux's.** Linux resumes the child after
-            // its own `syscall` instruction, which needs the child to start
-            // with the parent's whole register file; this system starts it at
-            // an address the caller named in the sixth slot. Stated here as
-            // it was stated in the nucleus, because moving code is not the
-            // moment to quietly change what it promises.
-            if r9 == 0 {
-                return (REPLY_VALUE, Answer::error(memory::errno::ENOSYS));
-            }
-            let made = call(
-                syscall::INVOKE,
-                handle_of(domain),
-                method::SPAWN_THREAD,
-                [r9, stack, tls.unwrap_or(0), 0],
+            // ~~**The entry is `r9`, and that is this personality's own
+            // contract rather than Linux's.**~~ Retired 2026-10-01 (RFC 0086
+            // step 5): the child now starts as Linux starts it, just after the
+            // parent's `syscall` with the parent's registers -- see `clone.rs`,
+            // and the project lead's choice of a trampoline over a kernel method.
+            let request = PersonalityCall::new(
+                Dialect::Linux,
+                number,
+                [rdi, rsi, rdx, r10, r8, r9],
+                0,
+                domain,
             );
-            if made.status != status::OK {
-                return (REPLY_VALUE, Answer::error(-11));
-            }
-            // Linux's `clone` returns the child's tid to the parent and zero
-            // to the child. The child never returns through here at all -- it
-            // starts where the caller said -- so the zero is delivered by
-            // construction, and this is only the parent's half.
-            (REPLY_VALUE, Answer::ok(made.args[0] + 1))
+            (REPLY_VALUE, clone::spawn(&request, &image, stack, tls))
         }
         RT_SIGRETURN => {
             // The handler was entered with `rsp` at the frame base; the `ret`
@@ -1804,6 +1795,9 @@ fn invoke(capability: u64, what: u64, args: [u64; 4]) -> Answer {
 /// report prints that count on every boot, so the progress is a number rather
 /// than a claim.
 fn answer(request: &PersonalityCall) -> (u64, Answer) {
+    // A clone child's trampoline slot is freed on its second call -- see
+    // `clone.rs` for the race its first call left open.
+    clone::seen(request.domain, request.thread);
     // The two that cannot be answered from a message alone say so, and the
     // kernel asks again with the caller's register frame.
     // **`fork` needs the frame too**, and for the plainest reason: the child
@@ -1870,6 +1864,9 @@ fn answer(request: &PersonalityCall) -> (u64, Answer) {
             return match descriptor_kind(request, request.first()) {
                 Some((Kind::Pipe, handle)) => {
                     read_from_pipe(request, handle as usize, request.second(), request.third())
+                }
+                Some((Kind::EventFd, handle)) => {
+                    eventfd::read(request, handle as usize, request.second(), request.third())
                 }
                 Some((Kind::Proc, handle)) => (
                     REPLY_VALUE,
@@ -1941,6 +1938,16 @@ fn answer(request: &PersonalityCall) -> (u64, Answer) {
         }
         EPOLL_CREATE => return (REPLY_VALUE, epoll::create(request, 0)),
         EPOLL_CTL => return (REPLY_VALUE, epoll::control(request)),
+        // RFC 0086 step 5: what Go's netpoller cannot start without.
+        EVENTFD2 => {
+            return (
+                REPLY_VALUE,
+                eventfd::create(request, request.first(), request.second()),
+            );
+        }
+        EVENTFD => return (REPLY_VALUE, eventfd::create(request, request.first(), 0)),
+        PRLIMIT64 => return (REPLY_VALUE, answer_prlimit(request)),
+        CLOCK_GETTIME => return (REPLY_VALUE, answer_clock_gettime(request)),
         SELECT => return answer_select(request),
         PSELECT6 => return answer_pselect(request),
         // `clock_nanosleep(clock, flags, request, remain)` -- RFC 0055.
@@ -2253,6 +2260,9 @@ fn answer_from_message(request: &PersonalityCall) -> Answer {
                 Some((Kind::Pipe, handle)) => {
                     return write_to_pipe(request, handle as usize, buffer, count);
                 }
+                Some((Kind::EventFd, handle)) => {
+                    return eventfd::write(request, handle as usize, buffer, count);
+                }
                 Some((Kind::Socket, _)) if stream_fd(request, fd) => {
                     return stream::write(request, fd, buffer, count);
                 }
@@ -2563,9 +2573,10 @@ const POLLFD_BYTES: usize = 8;
 /// So the instant is recorded on the first park and consulted on every retry:
 /// past it, the wait is over and the answer is whatever is ready now; before
 /// it, the same deadline is named again.
-static mut UNTIL: [(u32, u64); 4] = [(0, 0); 4];
+static mut UNTIL: [(u64, u64); WAKES] = [(0, 0); WAKES];
 
-fn until() -> &'static mut [(u32, u64); 4] {
+/// Keyed by [`waiter_key`], for the reason given there.
+fn until() -> &'static mut [(u64, u64); WAKES] {
     // SAFETY: single-threaded by construction, as `dispositions_of`.
     unsafe { &mut *core::ptr::addr_of_mut!(UNTIL) }
 }
@@ -2575,9 +2586,10 @@ fn until() -> &'static mut [(u32, u64); 4] {
 ///
 /// `None` means the wait is over — either it just expired, or this machine
 /// cannot time it.
-fn deadline_for(domain: u32, nanos: u64) -> Option<u64> {
+fn deadline_for(domain: u32, thread: u32, nanos: u64) -> Option<u64> {
+    let key = waiter_key(domain, thread);
     let table = until();
-    if let Some(entry) = table.iter_mut().find(|entry| entry.0 == domain) {
+    if let Some(entry) = table.iter_mut().find(|entry| entry.0 == key) {
         if bhaskix_sock::time::now() >= entry.1 {
             *entry = (0, 0);
             return None;
@@ -2586,13 +2598,14 @@ fn deadline_for(domain: u32, nanos: u64) -> Option<u64> {
     }
     let deadline = deadline_in(nanos)?;
     let slot = table.iter_mut().find(|entry| entry.0 == 0)?;
-    *slot = (domain, deadline);
+    *slot = (key, deadline);
     Some(deadline)
 }
 
 /// Forgets a domain's timed wait, for the paths that end one early.
-fn forget_deadline(domain: u32) {
-    if let Some(entry) = until().iter_mut().find(|entry| entry.0 == domain) {
+fn forget_deadline(domain: u32, thread: u32) {
+    let key = waiter_key(domain, thread);
+    if let Some(entry) = until().iter_mut().find(|entry| entry.0 == key) {
         *entry = (0, 0);
     }
 }
@@ -2776,7 +2789,10 @@ fn poll_with(request: &PersonalityCall, at: u64, count: u64, timeout: Wait) -> (
         }
     }
 
-    if ready == 0 && timeout != Wait::Now && took_timed_wait(request.domain).is_none() {
+    if ready == 0
+        && timeout != Wait::Now
+        && took_timed_wait(request.domain, request.thread).is_none()
+    {
         // **A positive timeout waits, and does not return early.** The caller
         // is parked on a deadline; a key arriving sooner does not cut it short,
         // because a thread here waits on one notification and the deadline is
@@ -2792,7 +2808,7 @@ fn poll_with(request: &PersonalityCall, at: u64, count: u64, timeout: Wait) -> (
         // millisecond in was not noticed until the interval ended.
         if let Wait::For(nanos) = timeout
             && (waits_on_console || waits_on_socket)
-            && let Some(deadline) = deadline_for(request.domain, nanos)
+            && let Some(deadline) = deadline_for(request.domain, request.thread, nanos)
         {
             // The console wins a set naming both: only one notification can be
             // parked on, and the interactive one is the one a person is waiting
@@ -2807,7 +2823,7 @@ fn poll_with(request: &PersonalityCall, at: u64, count: u64, timeout: Wait) -> (
             return (REPLY_BLOCK_ON_UNTIL, Answer::ok(bell));
         }
         if let Wait::For(nanos) = timeout
-            && let Some(slot) = park_until(request.domain, nanos)
+            && let Some(slot) = park_until(request.domain, request.thread, nanos)
         {
             return (REPLY_BLOCK_ON_RETRY, Answer::ok(slot));
         }
@@ -2836,7 +2852,7 @@ fn poll_with(request: &PersonalityCall, at: u64, count: u64, timeout: Wait) -> (
     }
     // The wait, however it ended, is over: the next `poll` from this domain
     // starts its own.
-    forget_deadline(request.domain);
+    forget_deadline(request.domain, request.thread);
     if !copy_out(request.domain, at, entries) {
         return (REPLY_VALUE, Answer::error(-14)); // EFAULT
     }
@@ -2920,6 +2936,7 @@ fn condition_of(
             datagram_waiting: false,
         },
         Kind::Epoll => Condition::Unanswered,
+        Kind::EventFd => eventfd::condition(&entry),
     }
 }
 
@@ -3017,12 +3034,15 @@ fn select_with(request: &PersonalityCall, timeout: Wait) -> (u64, Answer) {
         }
     }
 
-    if ready == 0 && timeout != Wait::Now && took_timed_wait(request.domain).is_none() {
+    if ready == 0
+        && timeout != Wait::Now
+        && took_timed_wait(request.domain, request.thread).is_none()
+    {
         // Both wake sources when the console is what is being waited for, as
         // `poll` does and for the same reason -- RFC 0057.
         if let Wait::For(nanos) = timeout
             && (waits_on_console || waits_on_socket)
-            && let Some(deadline) = deadline_for(request.domain, nanos)
+            && let Some(deadline) = deadline_for(request.domain, request.thread, nanos)
         {
             // The console wins a set naming both: only one notification can be
             // parked on, and the interactive one is the one a person is waiting
@@ -3037,7 +3057,7 @@ fn select_with(request: &PersonalityCall, timeout: Wait) -> (u64, Answer) {
             return (REPLY_BLOCK_ON_UNTIL, Answer::ok(bell));
         }
         if let Wait::For(nanos) = timeout
-            && let Some(slot) = park_until(request.domain, nanos)
+            && let Some(slot) = park_until(request.domain, request.thread, nanos)
         {
             return (REPLY_BLOCK_ON_RETRY, Answer::ok(slot));
         }
@@ -3048,7 +3068,7 @@ fn select_with(request: &PersonalityCall, timeout: Wait) -> (u64, Answer) {
             return (REPLY_BLOCK_ON_RETRY, Answer::ok(DATAGRAM_BELL));
         }
     }
-    forget_deadline(request.domain);
+    forget_deadline(request.domain, request.thread);
     for (which, at) in sets.iter().enumerate() {
         if *at != 0 && !copy_out(request.domain, *at, &answer[which][..bytes]) {
             return (REPLY_VALUE, Answer::error(-14)); // EFAULT
@@ -3143,7 +3163,7 @@ fn answer_nanosleep_relative(request: &PersonalityCall, at: u64) -> (u64, Answer
     // necessarily by the deadline** -- see `EARLY_RELEASES`. An early wake with
     // no signal pending is counted, and answered as it always was, so this
     // change measures the suspected fault without altering it.
-    if let Some(early) = took_timed_wait(request.domain) {
+    if let Some(early) = took_timed_wait(request.domain, request.thread) {
         if early {
             // **Interrupted, and said so.** Linux returns `EINTR` from a sleep a
             // signal cut short, and this answered `0` -- a full sleep -- because
@@ -3169,7 +3189,7 @@ fn answer_nanosleep_relative(request: &PersonalityCall, at: u64) -> (u64, Answer
     if total == 0 {
         return (REPLY_VALUE, Answer::ok(0));
     }
-    match park_until(request.domain, total) {
+    match park_until(request.domain, request.thread, total) {
         Some(slot) => (REPLY_BLOCK_ON_RETRY, Answer::ok(slot)),
         // No clock, or no slot left. Answering success without sleeping would
         // be a lie a caller cannot detect; `EINTR` is the honest one -- the
@@ -3420,6 +3440,13 @@ const EPOLL_WAIT: u64 = 232;
 const EPOLL_CTL: u64 = 233;
 const EPOLL_PWAIT: u64 = 281;
 const EPOLL_CREATE1: u64 = 291;
+/// RFC 0086 step 5's calls, from the build host's `asm/unistd_64.h` on
+/// 2026-10-01.
+const EVENTFD: u64 = 284;
+const EVENTFD2: u64 = 290;
+const PRLIMIT64: u64 = 302;
+/// `clock_gettime(clock, timespec)` -- RFC 0086 step 5.
+const CLOCK_GETTIME: u64 = 228;
 /// `bind(fd, sockaddr, length)`.
 const BIND: u64 = 49;
 /// `sendto(fd, buffer, length, flags, sockaddr, addrlen)`.
@@ -4374,10 +4401,12 @@ enum ParkKind {
     Wait = 2,
     /// A `futex(WAIT)` -- RFC 0085.
     Futex = 3,
+    /// A `read` of an eventfd at zero -- RFC 0086 step 5.
+    EventFd = 4,
 }
 
 /// The wake slots parked callers hold, keyed by **thread**: `slot + 1` in bits
-/// 0-7, the kind in 8-9, `domain + 1` in 16-31 and the thread in 32-63; 0 is
+/// 0-7, the kind in 8-15, `domain + 1` in 16-31 and the thread in 32-63; 0 is
 /// an empty entry.
 ///
 /// **Owned by the parked caller, not by whoever wakes it** -- the fix of
@@ -4450,6 +4479,7 @@ fn abandon_held(domain: u32, thread: Option<u32>) {
                 *waiter = 0;
             }
         }
+        eventfd::forget_waiter_slot(slot);
         // SAFETY: as above.
         let parents = waiters();
         for entry in parents.iter_mut() {
@@ -6332,6 +6362,10 @@ fn give_back_descriptor(entry: bhaskix_personality::file::Entry, last: bool, dom
     if entry.kind == Kind::Epoll && last {
         epoll::close(&entry, domain);
     }
+    // And an eventfd's counter -- RFC 0086 step 5.
+    if entry.kind == Kind::EventFd && last {
+        eventfd::close(&entry, domain);
+    }
 
     // **Except the root**, which was never claimed from the pool and must
     // never be given back to it: `release_file_slot` `DELETE`s the capability
@@ -6386,6 +6420,59 @@ fn give_back_descriptor(entry: bhaskix_personality::file::Entry, last: bool, dom
                 *slot = None;
             }
         }
+    }
+}
+
+/// `prlimit64(pid, resource, new, old)` -- RFC 0086 step 5; the rules are
+/// `bhaskix_personality::limit`'s. Only the caller itself may be asked about:
+/// a pid of zero or its own.
+fn answer_prlimit(request: &PersonalityCall) -> Answer {
+    use bhaskix_personality::limit::{Limit, plan};
+
+    let Some(process) = process_for(request.domain) else {
+        return Answer::error(-11); // EAGAIN
+    };
+    let pid = bhaskix_personality::call::int_arg(request.first());
+    if pid != 0 && pid as u32 != process.pid {
+        return Answer::error(-1); // EPERM
+    }
+    let new = if request.third() == 0 {
+        None
+    } else {
+        let mut bytes = [0u8; 16];
+        if !copy_in(request.domain, request.third(), &mut bytes) {
+            return Answer::error(-14); // EFAULT
+        }
+        Some(Limit::from_bytes(&bytes))
+    };
+    let limit = match plan(request.second(), new) {
+        Ok(limit) => limit,
+        Err(code) => return Answer::error(code),
+    };
+    if request.fourth() != 0 && !copy_out(request.domain, request.fourth(), &limit.to_bytes()) {
+        return Answer::error(-14); // EFAULT
+    }
+    Answer::ok(0)
+}
+
+/// `clock_gettime(clock, timespec)` -- RFC 0086 step 5; what it answers, and
+/// why the realtime clock starts in 1970, is `bhaskix_personality::clock`'s.
+fn answer_clock_gettime(request: &PersonalityCall) -> Answer {
+    use bhaskix_personality::clock;
+
+    if let Err(code) = clock::plan(request.first()) {
+        return Answer::error(code);
+    }
+    // No measured rate is no clock at all, and a caller told `EINVAL` is told
+    // the truth; one handed zero forever would wait for ever instead.
+    if hertz() == 0 {
+        return Answer::error(clock::EINVAL);
+    }
+    let nanos = clock::nanos(bhaskix_sock::time::now(), hertz());
+    if copy_out(request.domain, request.second(), &clock::timespec(nanos)) {
+        Answer::ok(0)
+    } else {
+        Answer::error(-14) // EFAULT
     }
 }
 
@@ -6623,7 +6710,7 @@ fn resolve_into(slot: u64, component: &[u8]) -> Result<Opened, i64> {
 /// it.
 fn note_exit(domain: u32, exit: Exit) {
     // A process that ends mid-sleep is not coming back for its wake slot.
-    abandon_timed_wait(domain);
+    abandon_timed_wait(domain, None);
     // And a pipe read or a `wait4` any of its threads was parked in.
     abandon_held(domain, None);
     let Some(process) = process_for(domain) else {
@@ -6679,6 +6766,8 @@ fn release_sockets_of(domain: u32) {
     // Its `epoll` sets, which are this program's memory rather than a
     // service's, but are held by the domain all the same -- RFC 0086 step 4.
     epoll::forget_domain(domain);
+    eventfd::forget_domain(domain);
+    clone::forget_domain(domain);
     let Some(process) = process_for(domain) else {
         return;
     };
@@ -8100,9 +8189,23 @@ static SPURIOUS_SLEEPS: core::sync::atomic::AtomicU64 = core::sync::atomic::Atom
 ///
 /// Four, matching `WAITERS` beside it and for the same reason: a fifth is
 /// answered without waiting rather than left unwoken.
-static mut TIMED: [(u32, u32, u64); 4] = [(0, 0, 0); 4];
+static mut TIMED: [(u64, u32, u64); WAKES] = [(0, 0, 0); WAKES];
 
-fn timed() -> &'static mut [(u32, u32, u64); 4] {
+/// The key both timed tables are kept under: **a thread, not a domain**.
+///
+/// They were keyed by domain until 2026-10-01 (RFC 0086 step 5), from when a
+/// hosted process had one thread. A Go server has a dozen, several asleep in
+/// `nanosleep` or retrying at once, and one thread coming back ran
+/// `took_timed_wait(domain)` -- which took *another* thread's entry and gave
+/// its wake slot back while that thread was still parked on it. The slot was
+/// handed out again, the nucleus refused the second waiter, and the server's
+/// first thirty-second run counted 290,062 refused parks. Sized to the wake
+/// pool, since every entry holds one of its slots.
+const fn waiter_key(domain: u32, thread: u32) -> u64 {
+    ((domain as u64 + 1) << 32) | thread as u64
+}
+
+fn timed() -> &'static mut [(u64, u32, u64); WAKES] {
     // SAFETY: single-threaded by construction, as `dispositions_of`.
     unsafe { &mut *core::ptr::addr_of_mut!(TIMED) }
 }
@@ -8113,9 +8216,10 @@ fn timed() -> &'static mut [(u32, u32, u64); 4] {
 /// The answer was a bare `true` until 2026-09-28, which made a wake by the
 /// deadline and a wake by anything else the same thing -- and the second is
 /// the one that matters: see [`EARLY_RELEASES`].
-fn took_timed_wait(domain: u32) -> Option<bool> {
+fn took_timed_wait(domain: u32, thread: u32) -> Option<bool> {
+    let key = waiter_key(domain, thread);
     let table = timed();
-    let entry = table.iter_mut().find(|entry| entry.0 == domain)?;
+    let entry = table.iter_mut().find(|entry| entry.0 == key)?;
     let slot = entry.1 - 1;
     let early = bhaskix_sock::time::now() < entry.2;
     *entry = (0, 0, 0);
@@ -8138,16 +8242,27 @@ fn took_timed_wait(domain: u32) -> Option<bool> {
 /// `TIMED` entry or the wake slot, and the deadline would stay armed on a slot
 /// nobody waits on -- where, when it fires, the kernel keeps the bit and the
 /// next park on that slot returns at once.
-fn abandon_timed_wait(domain: u32) {
-    let table = timed();
-    let Some(entry) = table.iter_mut().find(|entry| entry.0 == domain) else {
-        return;
-    };
-    let slot = entry.1 - 1;
-    *entry = (0, 0, 0);
-    ABANDONED_TIMED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-    disarm_wake(slot);
-    release_wake(slot as usize);
+/// `thread` of `None` is every thread of the domain -- the domain ended.
+fn abandon_timed_wait(domain: u32, thread: Option<u32>) {
+    for entry in timed().iter_mut() {
+        let same_domain = entry.0 >> 32 == u64::from(domain) + 1;
+        let same_thread = thread.is_none_or(|thread| entry.0 & 0xffff_ffff == u64::from(thread));
+        if entry.0 == 0 || !same_domain || !same_thread {
+            continue;
+        }
+        let slot = entry.1 - 1;
+        *entry = (0, 0, 0);
+        ABANDONED_TIMED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        disarm_wake(slot);
+        release_wake(slot as usize);
+    }
+    for entry in until().iter_mut() {
+        let same_domain = entry.0 >> 32 == u64::from(domain) + 1;
+        let same_thread = thread.is_none_or(|thread| entry.0 & 0xffff_ffff == u64::from(thread));
+        if entry.0 != 0 && same_domain && same_thread {
+            *entry = (0, 0);
+        }
+    }
 }
 
 /// Cancels whatever deadline wake slot `slot` was armed with.
@@ -8170,7 +8285,7 @@ fn disarm_wake(slot: u32) {
 /// asks the nucleus for nothing it was not already given. The console's own
 /// notification is `READ` and deliberately cannot be armed: a program that
 /// could set a timer on the keyboard could fake a keystroke's wake.
-fn park_until(domain: u32, nanos: u64) -> Option<u64> {
+fn park_until(domain: u32, thread: u32, nanos: u64) -> Option<u64> {
     let deadline = deadline_in(nanos)?;
     let table = timed();
     let index = table.iter().position(|entry| entry.0 == 0)?;
@@ -8185,7 +8300,7 @@ fn park_until(domain: u32, nanos: u64) -> Option<u64> {
         release_wake(slot);
         return None;
     }
-    table[index] = (domain, slot as u32 + 1, deadline);
+    table[index] = (waiter_key(domain, thread), slot as u32 + 1, deadline);
     Some(WAKE_SLOT + slot as u64)
 }
 
@@ -8278,7 +8393,7 @@ extern "C" fn linuxd_main(hertz: u64) -> ! {
             // That bound is stated in RFC 0058 rather than rounded to "fixed".
             release_sockets_of(received.badge as u32);
             // And any timed wait it was parked in -- see `abandon_timed_wait`.
-            abandon_timed_wait(received.badge as u32);
+            abandon_timed_wait(received.badge as u32, None);
             abandon_held(received.badge as u32, None);
             // **And its kept domain capability** -- RFC 0079, and the same
             // shape as the sockets above. `note_exit` releases it for a
@@ -8413,7 +8528,7 @@ extern "C" fn linuxd_main(hertz: u64) -> ! {
                     // The park this answer asked for is not going to happen, so
                     // a timed one gives its slot and deadline back now -- see
                     // `abandon_timed_wait`.
-                    abandon_timed_wait(request.domain);
+                    abandon_timed_wait(request.domain, Some(request.thread));
                     abandon_held(request.domain, Some(request.thread));
                     await_frame_for_signal(request.domain, memory::errno::EINTR as u64);
                     (REPLY_NEED_FRAME, Answer::ok(0))

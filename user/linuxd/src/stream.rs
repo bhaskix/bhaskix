@@ -375,6 +375,12 @@ pub(crate) fn park_on_wake(domain: u32, thread: u32) -> bool {
         .is_ok()
 }
 
+/// Whether a thread is parked on the wake -- so a write that is news for it,
+/// an eventfd's, should ring it.
+pub(crate) fn wake_is_held() -> bool {
+    WAKE_OWNER.load(Relaxed) != 0
+}
+
 /// A thread's call has come back: the wake is free again if it held it.
 pub(crate) fn wake_returned(domain: u32, thread: u32) {
     let _ = WAKE_OWNER.compare_exchange(wake_key(domain, thread), 0, Relaxed, Relaxed);
@@ -395,11 +401,11 @@ pub(crate) fn abandon_wake(domain: u32, thread: Option<u32>) {
 /// thread can have it, and otherwise ten milliseconds at a time. Answers
 /// `EAGAIN` if no park can be had at all.
 fn wait_and_retry(request: &PersonalityCall) -> (u64, Answer) {
-    let _ = super::took_timed_wait(request.domain);
+    let _ = super::took_timed_wait(request.domain, request.thread);
     if park_on_wake(request.domain, request.thread) {
         return (REPLY_BLOCK_ON_RETRY, Answer::ok(adapter::TCP_WAKE as u64));
     }
-    match super::park_until(request.domain, RETRY_NANOS) {
+    match super::park_until(request.domain, request.thread, RETRY_NANOS) {
         Some(slot) => (REPLY_BLOCK_ON_RETRY, Answer::ok(slot)),
         None => (REPLY_VALUE, Answer::error(errno::EAGAIN)),
     }
@@ -503,7 +509,7 @@ pub(crate) fn accept(request: &PersonalityCall, flags: u64) -> (u64, Answer) {
             Err(code) => Err(code),
         },
     };
-    let _ = super::took_timed_wait(request.domain);
+    let _ = super::took_timed_wait(request.domain, request.thread);
     let connection = match taken {
         Ok(connection) => connection,
         Err(code) => return (REPLY_VALUE, Answer::error(code)),
@@ -674,16 +680,16 @@ pub(crate) fn read(
     if available == 0 {
         tcp().connections[index] = Some(connection);
         if !peer_may_send(state) {
-            let _ = super::took_timed_wait(request.domain);
+            let _ = super::took_timed_wait(request.domain, request.thread);
             return (REPLY_VALUE, Answer::ok(0)); // end of stream
         }
         if stream.nonblocking {
-            let _ = super::took_timed_wait(request.domain);
+            let _ = super::took_timed_wait(request.domain, request.thread);
             return (REPLY_VALUE, Answer::error(errno::EAGAIN));
         }
         return wait_and_retry(request);
     }
-    let _ = super::took_timed_wait(request.domain);
+    let _ = super::took_timed_wait(request.domain, request.thread);
     let take = available.min(count).min(CHUNK as u64) as usize;
     let mut bytes = [0u8; CHUNK];
     let ring = view(2 * connection.pool + 1);

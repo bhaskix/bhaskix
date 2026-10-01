@@ -13,6 +13,15 @@
 //!   the instant it is being filled.
 //! - **No stack or heap.** The caller maps those; the loader places
 //!   segments and reports an entry point.
+//! - **Zero-fill is lazy** (RFC 0086 step 5, 2026-10-01). The pages of a
+//!   segment past its file's last page hold nothing but zeros, and Linux gives
+//!   them a frame only when they are touched. This loader gave every one a
+//!   frame at load, which was harmless until the first Go `net/http` server:
+//!   go 1.27.1 links `crypto/internal/fips140/drbg.memory`, a 32 MiB `.bss`
+//!   buffer it barely touches, and the eager load charged all of it to the
+//!   domain before the program ran -- the server's 32 MiB envelope was full at
+//!   its sixth call. Those pages are now a lazy region, zeroed when first
+//!   faulted as every anonymous page is. Executable segments stay eager.
 
 pub use bhaskix_elf::{ElfError, Image, MAX_SEGMENTS, Segment, page_span, parse};
 
@@ -53,12 +62,32 @@ pub fn load_into(
 ) -> Result<u64, ElfError> {
     for segment in image.segments() {
         let (start, end) = page_span(segment).ok_or(ElfError::MappingFailed)?;
-        let pages = (end - start) / PAGE_SIZE;
-
-        let range = VirtRange::from_pages(VirtAddr(start), pages).ok_or(ElfError::MappingFailed)?;
-        space
-            .map_anonymous(range, protection_of(segment))
-            .map_err(|_| ElfError::MappingFailed)?;
+        // The pages that carry bytes from the file, eagerly; the rest -- zeros
+        // alone -- lazily, unless the segment is executable. See the module
+        // note. A segment with no file bytes is lazy from its first page.
+        let file_end = (segment.address + segment.file_size as u64)
+            .checked_next_multiple_of(PAGE_SIZE)
+            .ok_or(ElfError::MappingFailed)?;
+        let eager_end = match segment.protection {
+            bhaskix_elf::Protection::ReadExecute => end,
+            _ if segment.file_size == 0 => start,
+            _ => file_end.clamp(start, end),
+        };
+        let eager = (eager_end - start) / PAGE_SIZE;
+        if eager > 0 {
+            let range =
+                VirtRange::from_pages(VirtAddr(start), eager).ok_or(ElfError::MappingFailed)?;
+            space
+                .map_anonymous(range, protection_of(segment))
+                .map_err(|_| ElfError::MappingFailed)?;
+        }
+        if end > eager_end {
+            let range = VirtRange::from_pages(VirtAddr(eager_end), (end - eager_end) / PAGE_SIZE)
+                .ok_or(ElfError::MappingFailed)?;
+            space
+                .map_anonymous_lazy(range, protection_of(segment))
+                .map_err(|_| ElfError::MappingFailed)?;
+        }
 
         // Copy page by page: the mapping is contiguous in virtual space and
         // need not be in physical, so there is no single destination slice.

@@ -286,6 +286,24 @@ pub struct SyscallFrame {
     /// free one is `r11` — which holds the user's `RFLAGS` until that value is
     /// safely on the stack.
     pub user_rsp: u64,
+    /// The callee-saved registers, **saved since 2026-10-01** (RFC 0086 step
+    /// 5): a Linux `clone` child starts with its parent's whole register file,
+    /// and go 1.27.1's runtime hands its child `R12` and `R13` that way. The
+    /// dispatcher never needed them -- the compiler keeps them for it -- so the
+    /// frame never held them, and the personality's staged image read them as
+    /// zero. Popped back on the way out, so a frame nobody edits returns them
+    /// exactly as they came in.
+    pub r15: u64,
+    /// See [`SyscallFrame::r15`].
+    pub r14: u64,
+    /// See [`SyscallFrame::r15`].
+    pub r13: u64,
+    /// See [`SyscallFrame::r15`].
+    pub r12: u64,
+    /// See [`SyscallFrame::r15`].
+    pub rbp: u64,
+    /// See [`SyscallFrame::r15`].
+    pub rbx: u64,
     /// Fourth argument (`r9`).
     pub arg3: u64,
     /// Third argument (`r8`).
@@ -350,6 +368,14 @@ bhaskix_syscall_entry:
     push r10                    // arg1
     push r8                     // arg2
     push r9                     // arg3
+    // The callee-saved six -- RFC 0086 step 5; see `SyscallFrame::r15`.
+    // Sixteen pushes in all, so the stack is still 16-aligned at the `call`.
+    push rbx
+    push rbp
+    push r12
+    push r13
+    push r14
+    push r15
 
     // Only now is `r11` free: its user value is on the stack. Every other
     // register still belongs to the caller and must reach the far side of the
@@ -377,6 +403,12 @@ bhaskix_syscall_entry:
     // `r11` is dead here: it is popped again below, for the flags.
     pop r11                     // user_rsp, saved per thread
     mov gs:[16], r11            // the slot may have been somebody else's
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbp
+    pop rbx
     pop r9
     pop r8
     pop r10

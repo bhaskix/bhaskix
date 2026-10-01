@@ -273,7 +273,13 @@ asm_budget = 3
 # table in `epoll.rs`, the same single-threaded statement as every table here.
 # The TCP wake's owner and the rest of the step are an atomic and arithmetic,
 # chosen so that one line is the whole cost.
-unsafe_budget = 124
+# 125 since RFC 0086 step 5 (2026-10-01), up one: the accessor for the eventfd
+# table in `eventfd.rs`, the same statement again. Parking a reader reuses the
+# pipes' wake slots and `HELD`, which cost nothing new.
+# 126 the same day, up one more: the accessor for `clone.rs`'s trampoline
+# pages. The trampoline itself is written through `COPY_OUT` and built by
+# `bhaskix-personality`, which forbids `unsafe`.
+unsafe_budget = 126
 # Up five for RFC 0005 step 9's datagram page: the volatile writes that stage
 # a payload into it, the volatile reads that take one back out, and the static
 # that remembers whether it has been mapped.

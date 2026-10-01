@@ -455,6 +455,16 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
         if word == "busybox=1" || word == "bhaskix.busybox=1" {
             STAGE_BUSYBOX.store(true, core::sync::atomic::Ordering::Relaxed);
         }
+        // `bhaskix.httpd=<seconds>` — RFC 0086 step 5. See `HTTPD_SECONDS`.
+        if let Some(value) = word
+            .strip_prefix("bhaskix.httpd=")
+            .or_else(|| word.strip_prefix("httpd="))
+            && let Ok(seconds) = value.parse::<u64>()
+        {
+            // An hour at most: past the harness's own budget a run is a hang,
+            // and a hang reports nothing.
+            HTTPD_SECONDS.store(seconds.min(3600), core::sync::atomic::Ordering::Relaxed);
+        }
         // `bhaskix.clients` — RFC 0086 step 4. See `HOST_CLIENTS`.
         if word == "clients" || word == "bhaskix.clients" {
             HOST_CLIENTS.store(true, core::sync::atomic::Ordering::Relaxed);
@@ -4144,6 +4154,8 @@ const GO_PROGRAM: &[u8] = b"bin/go-hello";
 /// was built from a source file in `corpus/`; this is somebody else's binary,
 /// unmodified, so what it asks for is not a thing this project chose.
 const BUSYBOX_PROGRAM: &[u8] = b"bin/busybox";
+/// RFC 0086's server, `corpus/httpd`, in the HTTP lane's image alone.
+const HTTPD_PROGRAM: &[u8] = b"bin/httpd";
 
 /// Which corpus program the next `ring3_corpus` thread should load.
 ///
@@ -4290,11 +4302,14 @@ extern "C" fn ring3_go(hhdm_base: u64) -> ! {
     use vm::AddressSpace;
 
     let stop = || -> ! { sched::exit() };
-    let busybox = CORPUS_PROGRAM.load(core::sync::atomic::Ordering::Acquire) == 1;
-    let (program, label) = if busybox {
-        (BUSYBOX_PROGRAM, "busybox")
-    } else {
-        (GO_PROGRAM, "go corpus")
+    let which = CORPUS_PROGRAM.load(core::sync::atomic::Ordering::Acquire);
+    let busybox = which == 1;
+    let (program, label) = match which {
+        1 => (BUSYBOX_PROGRAM, "busybox"),
+        // Padded to the column the other two labels reach with their own
+        // six spaces, so every line below lines up.
+        2 => (HTTPD_PROGRAM, "httpd    "),
+        _ => (GO_PROGRAM, "go corpus"),
     };
     let Ok(file) = vfs::open(program) else {
         println!("\x1b[93m    {label}      absent from the image\x1b[0m");
@@ -4382,6 +4397,7 @@ extern "C" fn ring3_go(hhdm_base: u64) -> ! {
         // The lane that types. `sh` with no `-c` reads until end of input.
         (true, true) => &[b"sh"],
         (true, false) => &[b"sh", b"-c", b"echo hi from sh"],
+        _ if which == 2 => &[b"httpd"],
         _ => &[b"go-hello"],
     };
     let env: [&[u8]; 0] = [];
@@ -5356,6 +5372,155 @@ fn tag_linux(realm: domain::DomainId, label: &str) -> bool {
     }
 }
 
+/// RFC 0086 step 5: **the motivating workload** — `bin/httpd`, a static Go
+/// `net/http` server, run in a Linux-tagged domain for `bhaskix.httpd=<s>`
+/// seconds while the host loads it.
+///
+/// The host decides whether it *served*: `tests/qemu/http-test.sh` waits for
+/// the program's own `httpd listening`, runs sixteen clients and checks every
+/// body. What only the kernel can say is said here: whether the server was
+/// **still running** when its time was up, how many calls it made, and every
+/// call it was refused `-ENOSYS` — the list step 5 exists to empty.
+///
+/// **Its own envelope, 8192 frames (32 MiB)**: the same server peaked at
+/// 12.4 MiB resident under the same load on Linux (2026-10-01), and the default
+/// sixteen is too close to that to be the thing a failure is about.
+fn httpd_self_test(hhdm_base: u64, cpus: u32) -> bool {
+    use core::sync::atomic::Ordering;
+    const LABEL: &str = "    httpd          ";
+
+    let seconds = HTTPD_SECONDS.load(Ordering::Relaxed);
+    if seconds == 0 {
+        return true;
+    }
+    if cpus < 2 {
+        println!("\x1b[93m{LABEL}skipped, needs a second cpu\x1b[0m");
+        return true;
+    }
+    if vfs::open(HTTPD_PROGRAM).is_err() {
+        println!(
+            "\x1b[91m{LABEL}FAILED: this boot asked for the server and bin/httpd is not in its image\x1b[0m"
+        );
+        return false;
+    }
+    // **The parks, counted across this run alone** -- the RFC's gate asks
+    // that the server was never refused a park and never ran out of retries,
+    // and the boot's own park readings are printed long before it starts.
+    let parks = || {
+        [
+            syscall::PARK_REFUSED.load(Ordering::Relaxed),
+            syscall::PARK_EXHAUSTED.load(Ordering::Relaxed),
+            syscall::PARK_UNARMED.load(Ordering::Relaxed),
+            syscall::PARK_UNGRANTED.load(Ordering::Relaxed),
+            syscall::PARK_UNNAMED.load(Ordering::Relaxed),
+            crate::notify::arm_pressure().0,
+            frames::misses(),
+            frames::REFILLED_ON_MISS.load(Ordering::Relaxed),
+        ]
+    };
+    let before = parks();
+    let faults_before = fault::HANDED.load(Ordering::Relaxed);
+    let restored_before = syscall::RESTORED.load(Ordering::Relaxed);
+    CORPUS_PROGRAM.store(2, Ordering::Release);
+    let envelope = domain::ResourceEnvelope {
+        memory_frames: 8192,
+        ..domain::ResourceEnvelope::new()
+    };
+    let Ok(realm) = domain::create("httpd", envelope) else {
+        println!("\x1b[91m{LABEL}FAILED: no domain\x1b[0m");
+        return false;
+    };
+    if !tag_linux(realm, "httpd          ") {
+        return false;
+    }
+    syscall::trace_domain(realm.as_u32());
+    let options = sched::SpawnOptions::new()
+        .pinned()
+        .in_domain(realm.as_u32());
+    if sched::spawn_on_with(3, "httpd", ring3_go, hhdm_base, hhdm_base, options).is_err() {
+        println!("\x1b[91m{LABEL}FAILED: the loader thread would not spawn\x1b[0m");
+        return false;
+    }
+    println!("{LABEL}started: bin/httpd in a Linux domain, to serve for {seconds} s");
+    // Its time, and thirty seconds more for the host to notice it listening
+    // and for the last requests to drain. Ended early only by the server
+    // ending, which is the failure this watches for.
+    let mut alive = true;
+    for _ in 0..(seconds + 30) * 200 {
+        wait_millis(5);
+        if sched::threads_counted_in(realm.as_u32()) == 0 {
+            alive = false;
+            break;
+        }
+    }
+    let made = syscall::stop_tracing();
+    let after = parks();
+    let [
+        refused_parks,
+        exhausted,
+        unarmed,
+        ungranted,
+        unnamed,
+        arms,
+        misses,
+        refilled,
+    ] = core::array::from_fn::<u64, 8, _>(|at| after[at] - before[at]);
+    println!(
+        "{LABEL}during its run: {refused_parks} park(s) refused, {exhausted} ran out of \
+         retries, {unarmed} unarmed, {ungranted} ungranted, {unnamed} unnamed; {arms} deadline \
+         arm(s) refused for want of a slot, at most {} of {} armed at once this boot; \
+         the last park refused named slot {:#x}; the fault path's frame reserve ran dry \
+         {misses} time(s), {refilled} of them served by a refill on the spot",
+        crate::notify::arm_pressure().1,
+        crate::notify::MAX_DEADLINES,
+        syscall::PARK_REFUSED_SLOT.load(Ordering::Relaxed)
+    );
+    // **Where it faulted, if it did** -- the faults handed to the adapter
+    // during the run, and the last of them. A Go server that dies prints
+    // Go's own verdict on the console; this is the machine's.
+    let faults = fault::HANDED.load(Ordering::Relaxed) - faults_before;
+    // Signal deliveries and returns, both counted where the kernel resumes a
+    // thread from a register image -- whether signals are in play at all.
+    println!(
+        "{LABEL}{} thread(s) resumed from a register image during its run (signal deliveries and \
+         returns)",
+        syscall::RESTORED.load(Ordering::Relaxed) - restored_before
+    );
+    if faults > 0 {
+        println!(
+            "{LABEL}{faults} fault(s) handed to the adapter during its run; the last at {:#x}, \
+             rip {:#x}, error {:#x}",
+            fault::LAST_HANDED.load(Ordering::Relaxed),
+            fault::LAST_HANDED_RIP.load(Ordering::Relaxed),
+            fault::LAST_HANDED_ERROR.load(Ordering::Relaxed)
+        );
+    }
+    let mut refused = alloc::string::String::new();
+    for slot in syscall::TRACED_REFUSED.iter() {
+        let number = slot.load(Ordering::Relaxed);
+        if number == u64::MAX {
+            break;
+        }
+        refused.push_str(&alloc::format!(" {number}"));
+    }
+    if refused.is_empty() {
+        refused.push_str(" none");
+    }
+    retire_probe(realm);
+    if alive {
+        println!(
+            "{LABEL}still serving after {seconds} s and the host's load: {made} calls, \
+             refused -ENOSYS:{refused}"
+        );
+    } else {
+        println!(
+            "\x1b[91m{LABEL}FAILED: the server ended before its time was up, after {made} calls; \
+             refused -ENOSYS:{refused}\x1b[0m"
+        );
+    }
+    alive
+}
+
 fn corpus_self_test(hhdm_base: u64, cpus: u32, busybox: bool) -> bool {
     // Which program the loader thread should open. Set before the spawn and
     // read once at the top of it; the two corpus runs are sequential.
@@ -5500,7 +5665,7 @@ const CLONE_REPORT_AT: u64 = 0x0000_0000_6002_0000;
 /// in the same address space *and* the futex wait/wake pair actually
 /// blocks and releases — which is the half step 6 could not prove with one
 /// thread, and the half Go's scheduler lives on.
-const CLONE_CODE: [u8; 241] = [
+const CLONE_CODE: [u8; 246] = [
     0x49, 0x89, 0xff, // mov r15, rdi          ; report page (shared, both threads)
     0x4c, 0x89, 0xfe, // mov rsi, r15
     0x48, 0x81, 0xc6, 0x00, 0x08, 0x00, 0x00, // add rsi, 0x800        ; child stack top
@@ -5517,7 +5682,11 @@ const CLONE_CODE: [u8; 241] = [
     0x4d, 0x89, 0xf8, // mov r8, r15           ; tls = the shared page, which
     //                                   this personality hands the child in
     //                                   rdi (see cloned_thread)
-    0x4c, 0x8d, 0x0d, 0x75, 0x00, 0x00, 0x00, // lea r9, [rip+child]   ; the entry
+    0x4c, 0x8d, 0x0d, 0x75, 0x00, 0x00,
+    0x00, // lea r9, [rip+child]   ; ~~the entry~~ vestigial since
+    //                                   2026-10-01: nothing reads r9 as an entry
+    //                                   any more, and since the `jz` above it has
+    //                                   pointed five bytes short of `child:`
     //                                   (0x75, and it has moved three times:
     //                                   the parent's tail grew a wait for the
     //                                   test's word at step 9 and a futex
@@ -5530,6 +5699,11 @@ const CLONE_CODE: [u8; 241] = [
     //                                   where `child:` now begins)
     0xb8, 0x38, 0x00, 0x00, 0x00, // mov eax, 56           ; clone
     0x0f, 0x05, // syscall
+    0x48, 0x85, 0xc0, // test rax, rax         ; **the child comes back here too** --
+    0x74, 0x6e, // jz child              ; Linux resumes it after the syscall with
+    //                                   rax zero and the parent's registers (RFC
+    //                                   0086 step 5, 2026-10-01). Until then this
+    //                                   personality started it at `r9`, below.
     0x49, 0x89, 0x47, 0x08, // mov [r15+8], rax      ; the tid the parent got
     // **"I am about to wait", for the test to read.** One of the two witnesses
     // that let the kernel hold the child back until the parent is genuinely
@@ -5580,7 +5754,10 @@ const CLONE_CODE: [u8; 241] = [
     0xb8, 0xca, 0x00, 0x00, 0x00, // mov eax, 202          ; futex
     0x0f, 0x05, // syscall
     0xeb, 0xfe, // jmp $                 ; only if the park ever returns
-    0x49, 0x89, 0xff, // child: mov r15, rdi   ; the page, as handed over
+    0x90, 0x90, 0x90, // child: (nop x3)       ; r15 is the page already: the child has
+    //                                   its parent's registers, and `rdi` is the
+    //                                   clone flags. This was `mov r15, rdi`, when
+    //                                   the page was handed over in `rdi`.
     // **The child waits to be let go, and is let go by the only party that can
     // know.** Until 2026-08-26 this was `sched_yield` twice and a spin of four
     // million -- an attempt to lose a race on purpose, which worked until it
@@ -8070,31 +8247,40 @@ const PIPE_PROBE_CODE_AT: u64 = 0x0000_0000_1400_0000;
 /// probes in this file had a jump or a `lea` off by one because the padding and
 /// the label were counted by hand; this one was laid out by a script that patches
 /// its own branches, and the array below is that script's output.
+///
+/// **Rewritten to Linux's `clone` on 2026-10-01** (RFC 0086 step 5): the child
+/// used to start at the address in `r9` and take its page from `rdi`. It now
+/// comes back from the `syscall` with `rax` zero and its parent's registers,
+/// so a `test`/`jz` after the call sends it to `child:`, whose first
+/// instruction -- `mov r12, rdi` -- became three `nop`s (`r12` is the page
+/// already; `rdi` is the flags). Five bytes inserted, the one branch that
+/// crosses them moved, and the result checked with `objdump` rather than by
+/// counting. The `lea r9` is vestigial.
 #[rustfmt::skip]
-const PIPE_PROBE_CODE: [u8; 179] = [
+const PIPE_PROBE_CODE: [u8; 184] = [
     0x49, 0x89, 0xfc, 0x31, 0xf6, 0xb8, 0x25, 0x01,
     0x00, 0x00, 0x0f, 0x05, 0x48, 0x85, 0xc0, 0x75,
-    0x54, 0xbf, 0x00, 0x0f, 0x0d, 0x00, 0x4c, 0x89,
+    0x59, 0xbf, 0x00, 0x0f, 0x0d, 0x00, 0x4c, 0x89,
     0xe6, 0x48, 0x81, 0xc6, 0x00, 0x08, 0x00, 0x00,
     0x31, 0xd2, 0x4d, 0x31, 0xd2, 0x4d, 0x89, 0xe0,
     0x4c, 0x8d, 0x0d, 0x41, 0x00, 0x00, 0x00, 0xb8,
-    0x38, 0x00, 0x00, 0x00, 0x0f, 0x05, 0x41, 0x8b,
-    0x3c, 0x24, 0x4c, 0x89, 0xe6, 0x48, 0x83, 0xc6,
-    0x40, 0xba, 0x20, 0x00, 0x00, 0x00, 0x31, 0xc0,
-    0x0f, 0x05, 0x48, 0x85, 0xc0, 0x7e, 0x16, 0x48,
-    0x89, 0xc2, 0x4c, 0x89, 0xe6, 0x48, 0x83, 0xc6,
-    0x40, 0xbf, 0x01, 0x00, 0x00, 0x00, 0xb8, 0x01,
-    0x00, 0x00, 0x00, 0x0f, 0x05, 0x31, 0xff, 0xb8,
-    0xe7, 0x00, 0x00, 0x00, 0x0f, 0x05, 0xeb, 0xfe,
-    0x49, 0x89, 0xfc, 0xb8, 0x18, 0x00, 0x00, 0x00,
-    0x0f, 0x05, 0xb8, 0x18, 0x00, 0x00, 0x00, 0x0f,
-    0x05, 0x41, 0x8b, 0x7c, 0x24, 0x04, 0x48, 0x8d,
-    0x35, 0x17, 0x00, 0x00, 0x00, 0xba, 0x0f, 0x00,
-    0x00, 0x00, 0xb8, 0x01, 0x00, 0x00, 0x00, 0x0f,
-    0x05, 0x31, 0xff, 0xb8, 0x3c, 0x00, 0x00, 0x00,
-    0x0f, 0x05, 0xeb, 0xfe, 0x74, 0x68, 0x72, 0x6f,
-    0x75, 0x67, 0x68, 0x20, 0x61, 0x20, 0x70, 0x69,
-    0x70, 0x65, 0x0a,
+    0x38, 0x00, 0x00, 0x00, 0x0f, 0x05, 0x48, 0x85,
+    0xc0, 0x74, 0x3a, 0x41, 0x8b, 0x3c, 0x24, 0x4c,
+    0x89, 0xe6, 0x48, 0x83, 0xc6, 0x40, 0xba, 0x20,
+    0x00, 0x00, 0x00, 0x31, 0xc0, 0x0f, 0x05, 0x48,
+    0x85, 0xc0, 0x7e, 0x16, 0x48, 0x89, 0xc2, 0x4c,
+    0x89, 0xe6, 0x48, 0x83, 0xc6, 0x40, 0xbf, 0x01,
+    0x00, 0x00, 0x00, 0xb8, 0x01, 0x00, 0x00, 0x00,
+    0x0f, 0x05, 0x31, 0xff, 0xb8, 0xe7, 0x00, 0x00,
+    0x00, 0x0f, 0x05, 0xeb, 0xfe, 0x90, 0x90, 0x90,
+    0xb8, 0x18, 0x00, 0x00, 0x00, 0x0f, 0x05, 0xb8,
+    0x18, 0x00, 0x00, 0x00, 0x0f, 0x05, 0x41, 0x8b,
+    0x7c, 0x24, 0x04, 0x48, 0x8d, 0x35, 0x17, 0x00,
+    0x00, 0x00, 0xba, 0x0f, 0x00, 0x00, 0x00, 0xb8,
+    0x01, 0x00, 0x00, 0x00, 0x0f, 0x05, 0x31, 0xff,
+    0xb8, 0x3c, 0x00, 0x00, 0x00, 0x0f, 0x05, 0xeb,
+    0xfe, 0x74, 0x68, 0x72, 0x6f, 0x75, 0x67, 0x68,
+    0x20, 0x61, 0x20, 0x70, 0x69, 0x70, 0x65, 0x0a,
 ];
 
 /// What the child writes, and what the parent must print. Fifteen bytes,
@@ -17962,6 +18148,11 @@ static STAGE_BUSYBOX: core::sync::atomic::AtomicBool = core::sync::atomic::Atomi
 /// failed -- which was the truth arriving, not a new defect.
 static HOST_CLIENTS: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
+/// How long the motivating workload's server runs — `bhaskix.httpd=<seconds>`,
+/// RFC 0086 step 5. Zero, and the server is not started, unless a boot asks:
+/// only `tests/qemu/http-test.sh` does, on an image that carries `bin/httpd`.
+static HTTPD_SECONDS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 /// How many bytes of BusyBox reached the disk, and how many it has.
 static BUSYBOX_STAGED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static BUSYBOX_WANTED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
@@ -26312,6 +26503,9 @@ fn user_shell(handoff: &Handoff) -> Result<(), &'static str> {
     if !epoll_self_test(hhdm, bhaskix_arch::percpu::online_count()) {
         println!("\x1b[91m    linux epoll    FAILED\x1b[0m");
     }
+    if !httpd_self_test(hhdm, bhaskix_arch::percpu::online_count()) {
+        println!("\x1b[91m    httpd          FAILED\x1b[0m");
+    }
     // **Immediately after the gate it explains, and not in `kernel_main`.**
     // The first version of this was up with the other personality reports,
     // which run before this bring-up thread has started a single hosted
@@ -27297,7 +27491,10 @@ extern "C" fn user_shell_entry(hhdm_base: u64) -> ! {
 /// `GO_CORPUS_IN_IMAGE=1` built it in. A missing *program* still fails, which
 /// is what the check is for.
 fn expected_bin_entries() -> usize {
-    18 + usize::from(vfs::open(GO_PROGRAM).is_ok())
+    // Each optional program counted by its own presence, `bin/httpd` since
+    // RFC 0086 step 5: only the HTTP lane's image carries it, and its first
+    // boot failed this check exactly as the note in `vfs_self_test` promises.
+    18 + usize::from(vfs::open(GO_PROGRAM).is_ok()) + usize::from(vfs::open(HTTPD_PROGRAM).is_ok())
 }
 
 /// Largest filesystem image this will read off a disk.

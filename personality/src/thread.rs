@@ -169,6 +169,94 @@ pub fn plan_futex(address: u64, operation: u64, value: u64) -> FutexPlan {
     }
 }
 
+/// Bytes a [`clone_trampoline`] needs at most.
+pub const TRAMPOLINE_BYTES: usize = 256;
+
+/// The code a cloned thread starts on — RFC 0086 step 5 — so that it begins
+/// **as Linux begins it**: just after its parent's `syscall`, with the
+/// parent's registers, `rax` zero, the new stack, and its own TLS base.
+///
+/// This personality starts a thread at an address and a stack and nothing
+/// else (`SPAWN_THREAD`). It used to start it at the address the caller put in
+/// `r9`, a contract of this project's own; go 1.27.1's `runtime.clone` puts
+/// its `g` there and expects the child to come back from the `syscall` with
+/// `SI`, `R12` and `R13` as it left them (`runtime/sys_linux_amd64.s`, read
+/// 2026-10-01), so every Go thread started on a heap address and faulted.
+///
+/// The trampoline, in order:
+///
+/// 1. `arch_prctl(ARCH_SET_FS, tls)` when the caller asked for `CLONE_SETTLS`,
+///    and `gettid` otherwise — **a call either way**, first, so the adapter
+///    learns the thread has started and may reuse the trampoline's slot. The
+///    TLS is set before anything reads through `fs`. A signal cannot arrive
+///    first: the child starts with its parent's mask, and Go blocks every
+///    signal across `clone`.
+/// 2. Every general register the parent had, as an immediate — `rcx` and
+///    `r11` as a `sysret` leaves them (the return address and the flags).
+/// 3. `rsp` to the new stack, `rax` to zero, and a jump to the return address.
+///
+/// Position-independent: nothing in it is relative.
+#[must_use]
+pub fn clone_trampoline(
+    parent: &crate::signal::Registers,
+    stack: u64,
+    tls: Option<u64>,
+) -> ([u8; TRAMPOLINE_BYTES], usize) {
+    let mut out = [0u8; TRAMPOLINE_BYTES];
+    let mut at = 0;
+    let mut emit = |bytes: &[u8]| {
+        out[at..at + bytes.len()].copy_from_slice(bytes);
+        at += bytes.len();
+    };
+    // `movabs reg, imm64`: REX.W (+B for r8-r15), then 0xb8 + the register.
+    let movabs = |register: u8, value: u64| -> [u8; 10] {
+        let mut bytes = [0u8; 10];
+        bytes[0] = if register >= 8 { 0x49 } else { 0x48 };
+        bytes[1] = 0xb8 + (register & 7);
+        bytes[2..].copy_from_slice(&value.to_le_bytes());
+        bytes
+    };
+    const RAX: u8 = 0;
+    const RCX: u8 = 1;
+    const RDX: u8 = 2;
+    const RBX: u8 = 3;
+    const RSP: u8 = 4;
+    const RBP: u8 = 5;
+    const RSI: u8 = 6;
+    const RDI: u8 = 7;
+    match tls {
+        Some(base) => {
+            emit(&movabs(RAX, 158)); // arch_prctl
+            emit(&movabs(RDI, 0x1002)); // ARCH_SET_FS
+            emit(&movabs(RSI, base));
+        }
+        None => emit(&movabs(RAX, 186)), // gettid
+    }
+    emit(&[0x0f, 0x05]); // syscall
+    for (register, value) in [
+        (RBX, parent.rbx),
+        (RDX, parent.rdx),
+        (RSI, parent.rsi),
+        (RDI, parent.rdi),
+        (RBP, parent.rbp),
+        (8, parent.r8),
+        (9, parent.r9),
+        (10, parent.r10),
+        (11, parent.eflags),
+        (12, parent.r12),
+        (13, parent.r13),
+        (14, parent.r14),
+        (15, parent.r15),
+        (RSP, stack),
+        (RCX, parent.rip),
+    ] {
+        emit(&movabs(register, value));
+    }
+    emit(&[0x31, 0xc0]); // xor eax, eax
+    emit(&[0xff, 0xe1]); // jmp rcx
+    (out, at)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -323,5 +411,86 @@ mod tests {
                 "op {unknown}"
             );
         }
+    }
+
+    fn parent() -> crate::signal::Registers {
+        crate::signal::Registers {
+            rax: 56,
+            rbx: 0x1111,
+            rcx: 0xdead,
+            rdx: 0x2222,
+            rsi: 0x7000_0000,
+            rdi: 0xd0f00,
+            rbp: 0x3333,
+            rsp: 0x6000_0000,
+            r8: 0x4444,
+            r9: 0x5555,
+            r10: 0x6666,
+            r11: 0xbeef,
+            r12: 0x7777,
+            r13: 0x8888,
+            r14: 0x9999,
+            r15: 0xaaaa,
+            rip: 0x48_b64e,
+            eflags: 0x246,
+            cr2: 0,
+        }
+    }
+
+    /// Finds `movabs <register>, imm64` in `code` and answers its value.
+    fn loaded(code: &[u8], rex: u8, opcode: u8) -> Option<u64> {
+        code.windows(10)
+            .rev()
+            .find(|w| w[0] == rex && w[1] == opcode)
+            .map(|w| u64::from_le_bytes(w[2..10].try_into().unwrap()))
+    }
+
+    #[test]
+    fn a_cloned_thread_sets_its_tls_first_then_is_its_parent_with_rax_zero() {
+        let (code, length) = clone_trampoline(&parent(), 0x5000_0000, Some(0x9853c8));
+        let code = &code[..length];
+        assert!(length <= TRAMPOLINE_BYTES);
+        // arch_prctl(ARCH_SET_FS, tls), then the syscall, before anything else.
+        assert_eq!(&code[..2], &[0x48, 0xb8]);
+        assert_eq!(u64::from_le_bytes(code[2..10].try_into().unwrap()), 158);
+        assert_eq!(u64::from_le_bytes(code[12..20].try_into().unwrap()), 0x1002);
+        assert_eq!(
+            u64::from_le_bytes(code[22..30].try_into().unwrap()),
+            0x9853c8
+        );
+        assert_eq!(&code[30..32], &[0x0f, 0x05]);
+        // What Go's child reads: SI, R12, R13 -- and the rest besides.
+        assert_eq!(loaded(code, 0x48, 0xbe), Some(0x7000_0000), "rsi");
+        assert_eq!(loaded(code, 0x49, 0xbc), Some(0x7777), "r12");
+        assert_eq!(loaded(code, 0x49, 0xbd), Some(0x8888), "r13");
+        assert_eq!(loaded(code, 0x49, 0xb9), Some(0x5555), "r9");
+        assert_eq!(loaded(code, 0x48, 0xbf), Some(0xd0f00), "rdi");
+        assert_eq!(
+            loaded(code, 0x49, 0xbb),
+            Some(0x246),
+            "r11, as sysret leaves it"
+        );
+        assert_eq!(
+            loaded(code, 0x48, 0xbc),
+            Some(0x5000_0000),
+            "rsp is the new stack"
+        );
+        assert_eq!(
+            loaded(code, 0x48, 0xb9),
+            Some(0x48_b64e),
+            "rcx, the return address"
+        );
+        assert_eq!(
+            &code[length - 4..],
+            &[0x31, 0xc0, 0xff, 0xe1],
+            "rax zero, then jmp rcx"
+        );
+    }
+
+    #[test]
+    fn without_settls_the_first_call_is_gettid() {
+        let (code, _) = clone_trampoline(&parent(), 0x5000_0000, None);
+        assert_eq!(u64::from_le_bytes(code[2..10].try_into().unwrap()), 186);
+        assert_eq!(&code[10..12], &[0x0f, 0x05]);
     }
 }

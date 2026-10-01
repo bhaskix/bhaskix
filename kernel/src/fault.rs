@@ -186,6 +186,16 @@ pub static PAGE: AtomicU64 = AtomicU64::new(u64::MAX);
 
 /// Faults handed over, resumed, and ended.
 pub static HANDED: AtomicU64 = AtomicU64::new(0);
+
+/// The last fault handed over: its address, where it happened, and the
+/// error code -- RFC 0086 step 5. The adapter's own log keeps the first four
+/// faults of the boot, which a long-running program's are never among; a Go
+/// server that dies minutes in needs the latest.
+pub static LAST_HANDED: AtomicU64 = AtomicU64::new(0);
+/// See [`LAST_HANDED`].
+pub static LAST_HANDED_RIP: AtomicU64 = AtomicU64::new(0);
+/// See [`LAST_HANDED`].
+pub static LAST_HANDED_ERROR: AtomicU64 = AtomicU64::new(0);
 /// Faults the adapter asked to resume.
 pub static RESUMED: AtomicU64 = AtomicU64::new(0);
 /// Faults that found no free slot.
@@ -325,6 +335,9 @@ pub fn hand_over(frame: &mut bhaskix_arch::trap::TrapFrame, address: u64) -> boo
     }
 
     HANDED.fetch_add(1, Ordering::Relaxed);
+    LAST_HANDED.store(address, Ordering::Relaxed);
+    LAST_HANDED_RIP.store(frame.rip, Ordering::Relaxed);
+    LAST_HANDED_ERROR.store(frame.error_code, Ordering::Relaxed);
     // **Interrupts on, before anything blocks.** See the module documentation:
     // the fault arrived through an interrupt gate with `IF` clear, and a
     // thread that blocks with the mask still up leaves its CPU deaf to the
@@ -386,13 +399,15 @@ pub fn hand_over(frame: &mut bhaskix_arch::trap::TrapFrame, address: u64) -> boo
 /// Writes a *system call's* register frame into a slot, for a call whose
 /// arguments do not fit in a message.
 ///
-/// **The image has holes, and they are the truth rather than an omission.**
+/// ~~**The image has holes, and they are the truth rather than an omission.**
 /// A system call arrives through the `SYSCALL` entry stub, which saves what
 /// the ABI says is caller-saved and nothing else — so `rbx`, `rbp` and
-/// `r12`–`r15` are not in the frame and read as zero here. Every Linux call
-/// that needs a fifth or sixth argument takes it in `r10`, `r8` or `r9`,
-/// which *are* saved; a call that wanted a callee-saved register would be a
-/// call this cannot serve, and the zero says so rather than inventing one.
+/// `r12`–`r15` are not in the frame and read as zero here.~~ **No longer, since
+/// 2026-10-01** (RFC 0086 step 5): the stub saves the callee-saved six as well,
+/// because a Linux `clone` child starts with its parent's whole register file
+/// and Go's hands its child `R12` and `R13`. The one hole left is `rcx`, which
+/// `SYSCALL` itself destroys. What a *restore* puts back is unchanged: see
+/// `restore_from_slot`, which still leaves these six as they were.
 ///
 /// Answers the slot, or `None` when none is free.
 pub fn stage_frame(frame: &bhaskix_arch::syscall::SyscallFrame) -> Option<usize> {
@@ -403,13 +418,19 @@ pub fn stage_frame(frame: &bhaskix_arch::syscall::SyscallFrame) -> Option<usize>
     let slot = claim()?;
     let mut image = [0u64; REGISTERS];
     image[0] = frame.kind; //        rax
+    image[1] = frame.rbx;
     image[2] = 0; //                 rcx -- destroyed by SYSCALL itself
     image[3] = frame.arg0; //        rdx
     image[4] = frame.method; //      rsi
     image[5] = frame.capability; //  rdi
+    image[6] = frame.rbp;
     image[7] = frame.arg2; //        r8
     image[8] = frame.arg3; //        r9
     image[9] = frame.arg1; //        r10
+    image[11] = frame.r12;
+    image[12] = frame.r13;
+    image[13] = frame.r14;
+    image[14] = frame.r15;
     image[15] = frame.rip;
     image[16] = frame.rflags;
     image[17] = frame.user_rsp;

@@ -235,6 +235,13 @@ We will not pretend to cover these. Each has a note on whether it becomes in-sco
 > adapter's table until a process `accept`s it or its listener closes; a process never holds one it
 > did not accept, and a peer's bytes sit unread in the adapter's rings meanwhile — which is where
 > they already sat.
+>
+> **Step 5 (2026-10-01) widens what the adapter *sees*, not what it holds.** The `SYSCALL` stub
+> now saves `rbx`, `rbp` and `r12`–`r15`, so a call staged for the adapter (one with five or six
+> arguments) shows it the calling thread's whole register file rather than the caller-saved half —
+> which a `clone` needs, and which a fault or a signal delivery already showed it. And each `clone`
+> writes a trampoline into a read-execute page of the process's own; the adapter could always write
+> a hosted process's memory, and it writes code there only through the same `COPY_OUT`.
 
 > **[RFC 0079](rfc/0079-a-signal-a-process-may-send-another.md) added the power to *end* a hosted
 > process, on 2026-09-15, and it is the largest single widening in this list.** Everything above

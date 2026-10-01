@@ -183,6 +183,9 @@ pub enum Kind {
     /// nothing behind it: no capability, no service, no file. The `handle`
     /// says *which* file, and its contents are written afresh on every read.
     Proc,
+    /// An `eventfd` — RFC 0086 step 5. A counter in the adapter, named by
+    /// `handle`; see [`crate::eventfd`].
+    EventFd,
 }
 
 /// One open descriptor.
@@ -1035,6 +1038,9 @@ pub fn stat_of(entry: &Entry) -> StatFields {
         // regular file, which is what a program calls `fstat` to find out.
         Kind::Pipe => mode::IFIFO,
         Kind::Epoll => mode::IFREG,
+        // The same kind of thing as an `epoll` set -- an anonymous inode, with
+        // nothing on a filesystem behind it -- and answered the same way.
+        Kind::EventFd => mode::IFREG,
     };
     let permissions = if entry.writable { 0o644 } else { 0o444 };
     StatFields {

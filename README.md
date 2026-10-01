@@ -18,9 +18,13 @@ compromised system. → [RFC 0031](docs/rfc/0031-linux-compatibility-as-an-adapt
 > **A direction, not a commitment.** ~~Today it runs a static Go binary and nothing larger. No
 > shell utility, web server or database has ever run here.~~ **Stale since 2026-08-27, corrected
 > 2026-09-30:** a static BusyBox nobody here built runs its `echo` applet and its `sh`, gated on
-> every boot; no web server or database has ever run here. The web server that will be tried first
+> every boot; ~~no web server or database has ever run here. The web server that will be tried first
 > is named — a static Go `net/http` server under sixteen concurrent clients
-> ([RFC 0086](docs/rfc/0086-the-motivating-workload.md)) — and it does not run yet. The milestones
+> ([RFC 0086](docs/rfc/0086-the-motivating-workload.md)) — and it does not run yet.~~ **Since
+> 2026-10-01 a static Go 1.27.1 `net/http` server runs** in a Linux domain and has served sixteen
+> keep-alive clients for thirty seconds with every response checked — once; every longer run has
+> corrupted its memory, for a reason not yet found, so it is not yet a gate
+> ([RFC 0086](docs/rfc/0086-the-motivating-workload.md)); no database has ever run here. The milestones
 > are written down as [L1–L4](docs/roadmap.md#linux-compatibility--l1-to-l4), every one of them
 > unmet, and nothing in this repository will say otherwise before a test proves it.
 
@@ -103,8 +107,10 @@ The `-ix` is the Unix lineage, the same suffix Minix and Linux carry.
 > same day)* — and ~~**TCP and `epoll` for hosted programs are not built**~~ *(TCP's server side
 > since 2026-09-30: a hosted program listens, accepts and echoes a host client, gated)* ~~**`epoll`
 > for hosted programs is not built**~~ *(built 2026-09-30, edge-triggered, gated by a probe served
-> only through `epoll_wait`)* — what stands between it and a real network server is now the Go
-> server itself, which has not yet been run here. **No cryptography at all**; a
+> only through `epoll_wait`)* — ~~what stands between it and a real network server is now the Go
+> server itself, which has not yet been run here~~ *(it runs, 2026-10-01, and corrupts itself on
+> runs past about a minute; Go's signal-based preemption is refused, so it is preempted
+> cooperatively only)*. **No cryptography at all**; a
 > grep for eleven primitive names returns nothing, and where it will come from is a decision RFC
 > that has not been adopted. **USB is a keyboard and nothing else** — no storage, no hubs, no USB 3
 > — and a machine with no i8042 *and no IOMMU* still has no keyboard, because a bus master nothing

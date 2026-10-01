@@ -2123,11 +2123,36 @@ pub static TRACED_SEEN: [core::sync::atomic::AtomicU64; 64] =
 /// How many it has asked, which may exceed what [`TRACED_SEEN`] holds.
 pub static TRACED_CALLS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
+/// The distinct numbers the traced domain was answered `-ENOSYS` for, in the
+/// order first refused; `u64::MAX` is empty. RFC 0086 step 5: what a program
+/// somebody else wrote *needs* is the calls it was refused, and a list of
+/// every call it made in order buries those in the first sixty-four.
+pub static TRACED_REFUSED: [core::sync::atomic::AtomicU64; 16] =
+    [const { core::sync::atomic::AtomicU64::new(u64::MAX) }; 16];
+
+/// Records `number` as refused if `domain` is the traced one and `value` is
+/// `-ENOSYS`. Distinct numbers only; a full list keeps its first sixteen.
+fn note_refused(domain: u32, number: u64, value: u64) {
+    use core::sync::atomic::Ordering;
+    if value != bhaskix_personality::call::ENOSYS.value
+        || domain != TRACED_DOMAIN.load(Ordering::Acquire)
+    {
+        return;
+    }
+    for slot in TRACED_REFUSED.iter() {
+        match slot.compare_exchange(u64::MAX, number, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return,
+            Err(held) if held == number => return,
+            Err(_) => {}
+        }
+    }
+}
+
 /// Starts recording `domain`'s foreign calls, discarding any previous run.
 pub fn trace_domain(domain: u32) {
     use core::sync::atomic::Ordering;
     TRACED_CALLS.store(0, Ordering::Relaxed);
-    for slot in TRACED_SEEN.iter() {
+    for slot in TRACED_SEEN.iter().chain(TRACED_REFUSED.iter()) {
         slot.store(u64::MAX, Ordering::Relaxed);
     }
     TRACED_DOMAIN.store(domain, Ordering::Release);
@@ -2409,6 +2434,7 @@ fn foreign_call(frame: &mut SyscallFrame, domain: u32) {
     if let Some(value) = adapter_call(frame, &call) {
         frame.kind = value;
         note_return(number, value);
+        note_refused(call.domain, number, value);
         // **Not priced here**, and that is what keeps the comparison honest:
         // `adapter_call` prices its own round trips, and folding them into the
         // nucleus figure would average two different placements into one
@@ -2423,6 +2449,7 @@ fn foreign_call(frame: &mut SyscallFrame, domain: u32) {
     // saved it, which is what preserves it.
     frame.kind = bhaskix_personality::call::ENOSYS.value;
     note_return(number, bhaskix_personality::call::ENOSYS.value);
+    note_refused(call.domain, number, bhaskix_personality::call::ENOSYS.value);
     price_foreign_call(started);
 }
 
@@ -2752,6 +2779,10 @@ fn adapter_call(frame: &mut SyscallFrame, call: &PersonalityCall) -> Option<u64>
 /// and cannot be restored here -- the same stated narrowing `rt_sigreturn`
 /// has carried since RFC 0005 step 4, and structural rather than a shortcut:
 /// widening it means widening the entry stub.
+/// **`rbx`, `rbp` and `r12`–`r15` are not restored from the image**, though
+/// since RFC 0086 step 5 the image carries them: the frame's own copies are
+/// popped back, so they return as they came. A handler that edits one of them
+/// in its `ucontext` is therefore not obeyed -- as before the image held them.
 fn restore_from_slot(frame: &mut SyscallFrame, slot: usize) {
     let Some(image) = crate::fault::take_frame(slot) else {
         return;
@@ -3928,6 +3959,15 @@ fn domain_supervise(frame: &SyscallFrame) -> Option<Outcome> {
                         });
                     if exact {
                         let _ = space.unmap(bhaskix_boot::VirtAddr(address));
+                    } else if lazy
+                        && space
+                            .replace_untouched(bhaskix_boot::VirtAddr(address), pages, protection)
+                            .is_ok()
+                    {
+                        // Part of an untouched reservation: see
+                        // `AddressSpace::replace_untouched`. Done, and not
+                        // mapped again below, which would overlap it.
+                        return true;
                     }
                 }
                 if lazy {

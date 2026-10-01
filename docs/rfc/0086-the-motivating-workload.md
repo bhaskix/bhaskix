@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | 🔨 **Draft 2026-09-30 — steps 1, 2, 3a and 3b done.** The workload RFC 0005 was owed from outside is named, its gate defined, its size measured and its system calls traced; `bin/tcpd` holds a table of thirty-two connections and a listener arms ring pairs, gated by four host clients held at once. `tcpd` serves a second listener opened by any program, and names a connection's peer; and a hosted Linux program listens, accepts and echoes a host client through `bin/linuxd`. Steps 4–6 are the work. The acceptance call is the project lead's. |
+| **Status** | 🔨 **Draft 2026-09-30 — ~~steps 1, 2, 3a and 3b done~~ steps 1–4 done, step 5 built and not yet passing** (this cell read "3b" through step 4's landing; corrected 2026-10-01). The workload RFC 0005 was owed from outside is named, its gate defined, its size measured and its system calls traced; `bin/tcpd` holds a table of thirty-two connections and a listener arms ring pairs, gated by four host clients held at once. `tcpd` serves a second listener opened by any program, and names a connection's peer; a hosted Linux program listens, accepts and echoes a host client through `bin/linuxd`; `epoll` works edge-triggered; and **the Go server runs and serves sixteen keep-alive clients** — thirty seconds with every body checked, once — **but corrupts its own memory on longer runs**, so the lane is out of `make test` and CI until that is found (TRACKER §3). Step 5's gate and step 6 are left. The acceptance call is the project lead's. |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | userspace (`bin/linuxd`, `bin/tcpd`), `personality`, tools |
 | **Milestone** | Phase 2 — the Linux personality ([RFC 0005](0005-linux-abi-compatibility.md)) |
@@ -301,10 +301,10 @@ interest is reported as level-triggered — too often rather than never.
 **How a wait waits.** A set of nothing but hosted streams parks on the wake
 `tcpd` rings on every connection's news, if no other thread holds it (the
 nucleus allows one waiter), with the caller's deadline armed on it for a bounded
-wait. Anything else waits ten milliseconds at a time. **Go's netpoller will take
+wait. Anything else waits ten milliseconds at a time. ~~**Go's netpoller will take
 the second path:** it registers a pipe or `eventfd` of its own to interrupt
 itself, which no single notification here covers. Correct, and slower than it
-will need to be; step 5 measures it.
+will need to be; step 5 measures it.~~ **Wrong about Go 1.27.1, corrected 2026-10-01:** its netpoller interrupts itself with an `eventfd`, and since step 5 an eventfd write rings the same TCP wake, so a set of streams and eventfds still parks there.
 
 **The gate.** `tools/probes/linux-epoller.s` listens on port 11 with
 **non-blocking** descriptors, so nothing waits except `epoll_wait`, learns of
@@ -321,8 +321,9 @@ harness in the kernel is now one function both probes use, so they cannot drift.
 
 1. **The nucleus parks one hosted call at most sixteen times**, then answers the
    thread `EAGAIN` itself without asking the adapter. An `epoll_wait` must not
-   end that way — Go treats any error but `EINTR` from it as fatal (recalled from
-   its runtime's source, not read here) — so each waiting thread's parks are
+   end that way — Go treats any error but `EINTR` from it as fatal (~~recalled from
+   its runtime's source, not read here~~ **read 2026-10-01** in go 1.27.1's
+   `runtime/netpoll_epoll.go`, and it holds) — so each waiting thread's parks are
    counted and the wait is answered **zero events** after twelve: a wait for
    ever that returns early with nothing, which callers written against Linux's
    spurious wake-ups already loop on.
@@ -364,6 +365,111 @@ measurement, as question 2 says.
 domain that made it, so a child that inherits one across `fork` is told `EINVAL`
 rather than half-sharing it; a set cannot watch another set; at most 32 events
 are reported per call and 8 sets exist machine-wide.
+
+## Step 5's record (2026-10-01): the Go server, under load — built, not passing
+
+**The toolchain is pinned: go 1.27.1**, the project lead's choice of
+2026-10-01 over CI's 1.24.13 and the build host's 1.13.8.
+`tools/fetch-go.sh` holds the version and the sha256 go.dev publishes for it,
+checks the tarball before unpacking, and is the only Go any build here uses —
+`go-hello` included. CI caches it keyed on that script.
+
+**The server** is `corpus/httpd`: `net.Listen(":8080")`, a line saying it
+listens, then `http.Serve` with a handler answering `bhaskix <path>`. Built
+static and stripped it is 5,779,616 bytes; on Linux, under the same load, it
+peaked at 12.4 MiB resident with 11 threads and made 35 distinct system calls
+(measured 2026-10-01).
+
+**The gate** is `tests/qemu/http-test.sh`: its own image (`bin/httpd` in a
+ramdisk no other lane carries, and `bhaskix.httpd=<s>`), sixteen keep-alive
+clients from `tools/http-load.py`, every body checked. It passes when the load
+tool saw no error and every client was served, the kernel says the server was
+still running at the end, and during its run **no park was refused, none ran
+out of retries and no deadline arm was refused** — counted across the run by
+the kernel's own line, because the boot's park readings are printed before the
+server starts. `make test-http` runs thirty seconds and `make soak-http` three
+hundred; ~~in `make test` and a CI job, and in the nightly soak~~ **neither is
+in `make test`, CI or the soak yet** — see *The corruption* below. **Armed twice:**
+a load tool expecting one wrong byte in one response, and a server that exits
+after 300 requests; each failed the lane, the second on both the host's side
+and the kernel's.
+
+**First passing run, 30 s:** 6,654 responses from 16 clients (220.8/s), 0
+errors, 0 reconnects; latency p50 65.5 ms, p99 267.6 ms, max 638.8 ms; 98,969
+calls by the server; refused `-ENOSYS`: 157 (`prctl`, naming memory areas —
+Go ignores the answer) and 234 (`tgkill`, see below). Reported, not gated.
+
+**What it took, each found by running the server and each a defect that would
+have come back:**
+
+1. **`eventfd2` and `prlimit64`** — the two calls on Linux's list the adapter
+   did not answer. Go's netpoller cannot start without an eventfd and throws
+   if it reports anything but `EPOLLIN` (`runtime/netpoll_epoll.go`, read).
+   Both host-tested in `personality` (`eventfd`, `limit`); an eventfd write
+   rings the TCP wake, so a netpoller parked there is woken at once.
+2. **`clock_gettime`.** With no vDSO, Go's `nanotime1` makes the syscall and
+   reads the result buffer **whatever it answered** (read in
+   `sys_linux_amd64.s`); refused, the runtime's clock was stack garbage and the
+   server hung before listening. The monotonic clocks are the cycle counter;
+   `CLOCK_REALTIME` is the Unix epoch plus the time since boot, because there
+   is no RTC — stated in `personality::clock` rather than invented.
+3. **The ELF loader gave every zero-fill page a frame at load.** Go 1.27.1
+   links `crypto/internal/fips140/drbg.memory`, 32 MiB of `.bss`, through
+   `net/http`; the server's 32 MiB envelope was full at its sixth call. Pages
+   past a segment's file bytes are a lazy region now, as on Linux.
+4. **`MAP_FIXED` over part of a reservation was refused.** Go reserves its
+   arena `PROT_NONE` and commits four megabytes at a time; `MAP_AT` replaced
+   only an exact match, and Go threw "out of memory". An untouched sub-range of
+   one anonymous region is now served by reprotecting it (`replace_untouched`),
+   which needs no frame freed; a range with touched pages is still refused.
+5. **`clone` did not start a thread the way Linux does.** The adapter started
+   the child at the address in `r9`, this project's own contract; Go puts its
+   `g` there and expects the child back from the `syscall` with the parent's
+   registers. The lead chose an adapter trampoline over a kernel method: each
+   clone gets code in a page of the process that sets its TLS, loads the
+   parent's registers, and returns with `rax` zero. **That needed the kernel
+   after all** — the `SYSCALL` stub saved no callee-saved register, so the
+   staged frame read `rbx`, `rbp` and `r12`–`r15` as zero, and Go's child reads
+   `R12` and `R13`. The stub saves them now (six pushes and pops a call). The
+   two kernel probes written to the old contract — the clone probe and the
+   pipe probe — were rewritten to Linux's, with `objdump` checking each branch.
+6. **The adapter's timed waits were keyed by domain.** One thread's call took
+   back another thread's wake slot while it was still parked; the first
+   thirty-second run counted 290,062 refused parks. Keyed by thread now, and
+   sized to the wake pool.
+7. **An empty fault-path frame reserve did not try the allocator**, though its
+   own module note said it did; a tickless CPU faulting in Go's heap ran it dry
+   and a thread lost its fault, stalling every connection at once. It refills
+   on the spot now, still without ever waiting for a lock; the lane's run line
+   counts how often (2 of 2 on the first passing run).
+
+**The corruption — open.** Every run past about a minute has died: four of
+three hundred seconds and one of a hundred and twenty, each differently —
+`stopm holding locks`; a map pointer of 8 (`maps.(*Iter).Init`); a signal
+arriving with no `g`; a plain `GET` whose `MultipartForm` was not nil
+(`net/http.(*response).finishRequest`); and, with `GOMAXPROCS=1`, "concurrent
+map read and map write", which one P should make impossible unless memory is
+being damaged or two OS threads run as one `m`. During every one of them no
+park was refused and no retry ran out. **Ruled out, by reading or by a run:**
+`madvise` as a no-op (Go zeroes by its own high-water mark, not by trusting
+released memory); SSE state across switches (both switch sites save and
+restore it); a kernel stack overflow (guarded, and would double-fault); an
+unzeroed frame on a supervisor's write (committed through demand paging, which
+zeroes); a call delivered to the adapter twice (congestion is refused before
+queueing); the per-domain clone hand-off (it refuses a second, and Go would
+have said so). **Fixed on the way and not the whole answer:** the trampoline's
+slot was given back at the child's first call, while it was still running the
+trampoline; it is given back at the second now. **Found while looking, and not
+shown to matter here:** `tlb::shootdown` invalidates one page, and an unmap or
+replace of several touched pages invalidates only the first on the other CPUs.
+The lead's decision (2026-10-01): land what is built, keep the lane out of
+`make test` and CI, and find the cause next.
+
+**What is not done, said:** `tgkill` carries only a fatal signal a thread sends
+itself, so Go's `SIGURG` preemption is refused and a goroutine is preempted only
+cooperatively — a goroutine spinning without a function call would starve the
+rest. The throughput is the adapter's per-call copy cost and is not tuned. The
+thirty-second lane's latency tail (p99 ≈ 270 ms) is reported, not explained.
 
 ## Design
 
@@ -467,7 +573,9 @@ is printed so that the number a faster path would improve is on record first.
    host's go 1.13.8 — eleven minor versions apart, across 1.14's signal-based
    preemption, so the Linux trace above is not the list CI's binary will ask
    for. Which one is pinned is the lead's call; re-taking the trace with it is
-   the step after that call.
+   the step after that call. **Answered 2026-10-01: go 1.27.1, pinned by the
+   lead**, and the trace re-taken with it on Linux — 35 calls, of which
+   `eventfd2` and `prlimit64` were unanswered here (step 5's record).
 2. **Slot pools of sixteen.** Wake slots and deadline slots are sixteen each;
    a Go process parks several futex sleepers plus its netpoller. ~~Measured in
    step 4 before anything is resized.~~ Step 4's boot armed at most 4 of 16
@@ -475,6 +583,11 @@ is printed so that the number a faster path would improve is on record first.
    answer this; **measured in step 5**, which does. Also open for step 5: the
    adapter's four timed-wait entries (`TIMED`, `UNTIL` in `bin/linuxd`), which a
    netpoller on the retry path and several sleeping goroutines will share.
+   **Answered by step 5's runs:** the deadline slots were never short (at most 4
+   of 16 armed, none refused), but the timed-wait tables were — keyed by domain,
+   one Go thread gave back another's slot — and are now keyed by thread and
+   sized to the sixteen wake slots. The lane's own run line counts it, and
+   none of the failing runs refused one.
 
 ## Implementation plan
 
@@ -493,7 +606,7 @@ is printed so that the number a faster path would improve is on record first.
    parked on `tcpd`'s wake for a set of streams, a timed retry otherwise; gate:
    an assembly probe served through `epoll`, edge-triggered, in two halves.
    Slot pressure under Go moves to step 5, which has the process to measure.
-5. **The server and the load** — `corpus/httpd.go`, its image, the boot flag,
+5. 🔨 2026-10-01, built and not passing — **The server and the load** — `corpus/httpd.go`, its image, the boot flag,
    `tools/http-load.py`, `make test-http` in CI, 300 s in the soak.
 6. **Step 10's record** — the measured result against the gate, in RFC 0005
    and here.

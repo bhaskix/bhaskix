@@ -12,14 +12,17 @@
 //! or listener of `bin/tcpd` besides (`stream::condition`). When nothing is
 //! ready:
 //!
-//! - **A set of nothing but hosted streams parks on the TCP wake** `tcpd`
-//!   rings on every connection's news, if no other thread holds it — with the
-//!   caller's deadline armed on it for a bounded wait.
+//! - **A set of nothing but hosted streams and eventfds parks on the TCP
+//!   wake** `tcpd` rings on every connection's news, if no other thread holds
+//!   it — with the caller's deadline armed on it for a bounded wait. An eventfd
+//!   write rings the same wake (step 5), which is how Go's `netpollBreak`
+//!   reaches a netpoller parked here.
 //! - **Anything else waits ten milliseconds at a time**, because a set naming
 //!   a pipe or the console as well has no single notification that covers it.
-//!   A Go program's netpoller registers a pipe or an `eventfd` of its own to
-//!   interrupt itself, so this is the path it takes: correct, and slower than
-//!   it will need to be. Stated here rather than discovered in step 5.
+//!   ~~A Go program's netpoller registers a pipe or an `eventfd` of its own to
+//!   interrupt itself, so this is the path it takes~~ — true for step 4 alone,
+//!   and no longer: Go 1.27.1's netpoller registers an eventfd, and eventfds
+//!   park on the wake since step 5 (2026-10-01).
 //!
 //! # Never the sixteenth park
 //!
@@ -188,11 +191,11 @@ pub(crate) fn wait(request: &PersonalityCall, timeout: Wait) -> (u64, Answer) {
     let key = waiter_key(request.domain, request.thread);
     // Whatever this thread parked on last time, it is back.
     stream::wake_returned(request.domain, request.thread);
-    let _ = super::took_timed_wait(request.domain);
+    let _ = super::took_timed_wait(request.domain, request.thread);
 
     let finish = |ready: usize, out: &[u8]| -> (u64, Answer) {
         forget_waiter(key);
-        super::forget_deadline(request.domain);
+        super::forget_deadline(request.domain, request.thread);
         if ready > 0 && !super::copy_out(request.domain, request.second(), out) {
             return (REPLY_VALUE, Answer::error(EFAULT));
         }
@@ -234,6 +237,9 @@ pub(crate) fn wait(request: &PersonalityCall, timeout: Wait) -> (u64, Answer) {
         }
         let (condition, news) = match super::descriptor_row(request, fd as u64) {
             Some(entry) if stream::is_stream(&entry) => stream::condition(&entry),
+            // An eventfd rings the TCP wake itself when it is written, so a
+            // set holding one may still park there -- RFC 0086 step 5.
+            Some(entry) if entry.kind == Kind::EventFd => (super::eventfd::condition(&entry), None),
             Some(_) => {
                 only_streams = false;
                 (super::condition_of(request, fd as u64, &mut console), None)
@@ -264,7 +270,7 @@ pub(crate) fn wait(request: &PersonalityCall, timeout: Wait) -> (u64, Answer) {
         return finish(ready, &out[..ready * EVENT_BYTES]);
     }
     let deadline = match timeout {
-        Wait::For(nanos) => match super::deadline_for(request.domain, nanos) {
+        Wait::For(nanos) => match super::deadline_for(request.domain, request.thread, nanos) {
             Some(deadline) => Some(deadline),
             // The wait is over, or this machine cannot time it.
             None => return finish(0, &[]),
@@ -288,7 +294,7 @@ pub(crate) fn wait(request: &PersonalityCall, timeout: Wait) -> (u64, Answer) {
             None => (REPLY_BLOCK_ON_RETRY, Answer::ok(wake)),
         };
     }
-    match super::park_until(request.domain, RETRY_NANOS) {
+    match super::park_until(request.domain, request.thread, RETRY_NANOS) {
         Some(slot) => (REPLY_BLOCK_ON_RETRY, Answer::ok(slot)),
         None => finish(0, &[]),
     }

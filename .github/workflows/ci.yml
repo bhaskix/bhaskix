@@ -116,11 +116,11 @@ jobs:
         run: |
           {
             qemu-system-x86_64 --version
-            # The Go corpus is built with whatever Go the runner happens to
-            # have -- never installed here -- and it built `corpus/hello.go`
-            # 25% larger than the build host's go 1.13.8 with nothing saying
-            # which version it was. RFC 0086 step 1.
-            command -v go >/dev/null && go version || echo "no go toolchain"
+            # ~~The Go corpus is built with whatever Go the runner happens to
+            # have~~ -- since RFC 0086 step 5 (2026-10-01) every Go build uses
+            # the pinned toolchain `tools/fetch-go.sh` fetches; this job builds
+            # none, so it prints the pin rather than the runner's own `go`.
+            echo "pinned go: $(sed -n 's/^VERSION=//p' tools/fetch-go.sh)"
             echo "--- OVMF images present ---"
             ls -la /usr/share/OVMF/ 2>/dev/null || echo "no /usr/share/OVMF"
           } | tee ci-env-${{ matrix.firmware }}-${{ matrix.cpu }}.txt

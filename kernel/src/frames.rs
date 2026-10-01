@@ -192,27 +192,42 @@ fn with_reserve<R>(f: impl FnOnce(&mut Reserve) -> R) -> Option<R> {
 /// whether it is about to be overwritten wholesale, as a copy-on-write copy
 /// is, and zeroing a page that is immediately overwritten is a measurable cost
 /// on the fault path.
+///
+/// **A dry reserve tries the allocator once, without waiting** — which the
+/// module note above always said it did, and until 2026-10-01 it did not: an
+/// empty reserve answered `None` and the fault was unserviceable. RFC 0086
+/// step 5's Go server found it, faulting in its heap faster than the timer
+/// refilled a tickless CPU's sixty-four, and a thread that lost its fault
+/// stalled every connection the server had. The fallback is [`refill`] itself,
+/// whose only reach for the allocator is `try_with`: a held allocator still
+/// makes the fault unserviceable, and nothing on this path ever waits.
 #[must_use]
 pub fn take() -> Option<u64> {
-    let taken = with_reserve(|reserve| {
-        if reserve.count == 0 {
-            return None;
-        }
-        reserve.count -= 1;
-        Some(reserve.frames[reserve.count])
-    })?;
-
-    match taken {
-        Some(frame) => {
-            HITS.fetch_add(1, Ordering::Relaxed);
-            Some(frame)
-        }
-        None => {
-            MISSES.fetch_add(1, Ordering::Relaxed);
-            None
-        }
+    let pop = || {
+        with_reserve(|reserve| {
+            if reserve.count == 0 {
+                return None;
+            }
+            reserve.count -= 1;
+            Some(reserve.frames[reserve.count])
+        })
+        .flatten()
+    };
+    if let Some(frame) = pop() {
+        HITS.fetch_add(1, Ordering::Relaxed);
+        return Some(frame);
     }
+    MISSES.fetch_add(1, Ordering::Relaxed);
+    refill();
+    let frame = pop();
+    if frame.is_some() {
+        REFILLED_ON_MISS.fetch_add(1, Ordering::Relaxed);
+    }
+    frame
 }
+
+/// Misses that [`take`]'s own refill turned into a frame.
+pub static REFILLED_ON_MISS: AtomicU64 = AtomicU64::new(0);
 
 /// Returns a frame to this CPU's reserve, or to the allocator if it is full.
 ///

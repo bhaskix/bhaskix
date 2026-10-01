@@ -77,12 +77,22 @@ SUP_DIR      := user/sup
 HELLO_DIR    := user/hello
 HELLO        := $(HELLO_DIR)/target/$(TARGET)/release/hello
 HELLO_BPK    := build/hello.bpk
-# RFC 0005 step 7: the Tier 0 corpus. A real static Go binary, built with
-# the toolchain on this machine, carried into the image and loaded by the
-# kernel's own ELF loader into a Linux-tagged domain. Built only if `go` is
-# present -- a contributor without it still builds everything else, and the
-# boot test says the corpus is absent rather than failing.
-GO           := $(shell command -v go 2>/dev/null)
+# RFC 0005 step 7: the Tier 0 corpus. A real static Go binary, carried into
+# the image and loaded by the kernel's own ELF loader into a Linux-tagged
+# domain. ~~Built with the toolchain on this machine~~ -- **built with the one
+# pinned Go** since 2026-10-01 (RFC 0086 step 5): `tools/fetch-go.sh` fetches
+# it into `build/toolchain` and checks its sha256, and the version is read from
+# that script so it is written in one place. A machine that cannot fetch it
+# still builds everything else, and the boot test says the corpus is absent
+# rather than failing -- the posture this had when `go` was whatever was on
+# the PATH, which gave the build host go 1.13.8 and CI go 1.24.13.
+GO_VERSION   := $(shell sed -n 's/^VERSION=//p' tools/fetch-go.sh)
+GO           := build/toolchain/go$(GO_VERSION)/bin/go
+# Fetched inside each recipe that needs it, and quiet: a failure is the
+# recipe's to report. `GOTOOLCHAIN=local` so `go` never fetches another
+# toolchain on its own because a `go.mod` asked for one.
+GO_FETCH     := tools/fetch-go.sh >/dev/null
+GO_ENV       := GOTOOLCHAIN=local CGO_ENABLED=0 GOOS=linux GOARCH=amd64
 GO_HELLO     := build/go-hello
 # The L1 corpus: a real static BusyBox, the first program in this project's
 # history that somebody else wrote, built by somebody else, for Linux. Taken
@@ -125,6 +135,25 @@ $(GO_CORPUS_STAMP): FORCE
 	@printf '%s' '$(GO_CORPUS_IN_IMAGE)' | cmp -s - $@ 2>/dev/null || printf '%s' '$(GO_CORPUS_IN_IMAGE)' > $@
 FORCE:
 .PHONY: FORCE
+
+# RFC 0086 step 5: **the motivating workload's server**, `corpus/httpd`, built
+# with the pinned Go. 5.8 MB, so it is in no image unless asked: only the HTTP
+# lane asks (`tests/qemu/http-test.sh`), and it builds its own ramdisk and ISO
+# under its own names so the shared `build/initrd.tar` never carries it. The
+# stamp is `GO_CORPUS_STAMP`'s, for the same reason.
+HTTPD          := build/httpd
+HTTPD_IN_IMAGE ?= 0
+HTTPD_STAMP    := build/.httpd-in-image
+$(HTTPD_STAMP): FORCE
+	@mkdir -p $(dir $@)
+	@printf '%s' '$(HTTPD_IN_IMAGE)' | cmp -s - $@ 2>/dev/null || printf '%s' '$(HTTPD_IN_IMAGE)' > $@
+ifeq ($(HTTPD_IN_IMAGE),1)
+HTTPD_DEP      := $(HTTPD)
+HTTPD_FILE     := --file bin/httpd=$(HTTPD)
+else
+HTTPD_DEP      :=
+HTTPD_FILE     :=
+endif
 
 ifeq ($(GO_CORPUS_IN_IMAGE),1)
 GO_CORPUS_DEP   := $(GO_HELLO)
@@ -243,7 +272,7 @@ OVMF_VARS    := $(firstword $(wildcard $(OVMF_DIR)OVMF_VARS$(OVMF_SUFFIX).fd))
 
 .PHONY: FORCE all kernel iso demo run run-uefi progress test test-host test-boot test-boot-uefi test-boot-uefi-qemu64 test-boot-iommu test-keyboard \
         test-boot-iommu-off test-boot-qemu64 test-boot-native test-boot-native-full \
-        test-placements mkfs test-shell test-faults test-usb-keyboard test-lacp test-bond fmt clippy gates hooks clean distclean help
+        test-placements mkfs test-shell test-faults test-usb-keyboard test-lacp test-bond test-http fmt clippy gates hooks clean distclean help
 
 all: iso
 
@@ -336,13 +365,14 @@ FORCE:
 # and mkimage stages, hashes, verifies with the machine's own parsers, and
 # drives the same tar flags this rule always trusted. Assembled twice and
 # byte-compared every build: determinism is a gate, not a hope.
-$(INITRD): $(MKIMAGE) $(shell find $(INITRD_DIR) packages -type f 2>/dev/null | sort) $(PROBE) $(USER_SHELL) $(USER_VFSD) $(USER_CONSOLED) $(USER_BLKD) $(USER_AHCID) $(USER_NETD) $(USER_IPD) $(USER_DHCPD) $(USER_UDP6) $(USER_TCPD) $(USER_LINUXD) $(USER_TCPC) $(USER_TRACED) $(USER_FSD) $(USER_SUP) $(FS_IMAGE) $(HELLO_BPK) $(GREEDY_BPK) $(BUSYBOX) $(GO_CORPUS_DEP) $(HOSTED) $(GO_CORPUS_STAMP)
+$(INITRD): $(MKIMAGE) $(shell find $(INITRD_DIR) packages -type f 2>/dev/null | sort) $(PROBE) $(USER_SHELL) $(USER_VFSD) $(USER_CONSOLED) $(USER_BLKD) $(USER_AHCID) $(USER_NETD) $(USER_IPD) $(USER_DHCPD) $(USER_UDP6) $(USER_TCPD) $(USER_LINUXD) $(USER_TCPC) $(USER_TRACED) $(USER_FSD) $(USER_SUP) $(FS_IMAGE) $(HELLO_BPK) $(GREEDY_BPK) $(BUSYBOX) $(GO_CORPUS_DEP) $(HOSTED) $(GO_CORPUS_STAMP) $(HTTPD_DEP) $(HTTPD_STAMP)
 	@mkdir -p $(dir $@)
 	./$(MKIMAGE) $@ $(INITRD_ROOT) --root . --static $(INITRD_DIR) \
 	    --file fs.img=$(FS_IMAGE) \
 	    --file hello.bpk=$(HELLO_BPK) \
 	    --file greedy.bpk=$(GREEDY_BPK) \
 	    $(GO_CORPUS_FILE) \
+	    $(HTTPD_FILE) \
 	    --file bin/hosted=$(HOSTED) \
 	    --file bin/busybox=$(BUSYBOX) \
 	    \
@@ -352,6 +382,7 @@ $(INITRD): $(MKIMAGE) $(shell find $(INITRD_DIR) packages -type f 2>/dev/null | 
 	    --file hello.bpk=$(HELLO_BPK) \
 	    --file greedy.bpk=$(GREEDY_BPK) \
 	    $(GO_CORPUS_FILE) \
+	    $(HTTPD_FILE) \
 	    --file bin/hosted=$(HOSTED) \
 	    --file bin/busybox=$(BUSYBOX) \
 	    $(foreach manifest,$(PACKAGES),--package $(manifest))
@@ -407,15 +438,25 @@ $(BUSYBOX):
 	    echo "no static busybox on this machine: $@ left empty, the corpus gate will say so"; \
 	fi
 
-$(GO_HELLO): corpus/hello.go
+$(GO_HELLO): corpus/hello.go tools/fetch-go.sh
 	@mkdir -p $(dir $@)
-	@if [ -n "$(GO)" ]; then \
-	    CGO_ENABLED=0 GOOS=linux GOARCH=amd64 $(GO) build -ldflags '-s -w' \
-	        -o $@ corpus/hello.go && echo "built $@ ($$(stat -c%s $@) bytes)"; \
+	@if $(GO_FETCH); then \
+	    $(GO_ENV) $(GO) build -ldflags '-s -w' \
+	        -o $@ corpus/hello.go && echo "built $@ ($$(stat -c%s $@) bytes, $$($(GO) env GOVERSION))"; \
 	else \
 	    : > $@; \
 	    echo "no go toolchain: $@ left empty, the corpus gate will say so"; \
 	fi
+
+# **Refused rather than left empty**, unlike the Go corpus above: nothing
+# builds this except a lane that is about to run it, and an empty `bin/httpd`
+# would reach the kernel as a program that made no calls.
+$(HTTPD): corpus/httpd/main.go corpus/httpd/go.mod tools/fetch-go.sh
+	@mkdir -p $(dir $@)
+	@$(GO_FETCH) || { echo "no pinned Go toolchain: $@ cannot be built (tools/fetch-go.sh)"; exit 1; }
+	cd corpus/httpd && $(GO_ENV) $(CURDIR)/$(GO) build -trimpath -ldflags '-s -w' \
+	    -o $(CURDIR)/$@ .
+	@echo "built $@ ($$(stat -c%s $@) bytes, $$($(GO) env GOVERSION))"
 
 # The demonstration package, emitted and verified by the same tool and the
 # same parsers the installer uses.
@@ -760,6 +801,20 @@ test-lacp: $(ISO)
 # gate inside the guest cannot arrange for itself. Like `test-lacp` it builds
 # the image it needs -- one told to wait for the failover rather than glance at
 # the bond -- and puts the default back afterwards.
+# RFC 0086 step 5, and RFC 0005 step 10's gate: a static Go `net/http` server
+# in a Linux domain, sixteen keep-alive clients from the host, every body
+# checked. The lane builds its own image with the server in it, so it depends
+# on nothing but the sources `make iso` already follows.
+#
+# **Not in `make test` and not in CI, on the project lead's decision of
+# 2026-10-01**: the server corrupts its own memory on runs past about a minute
+# (TRACKER §3, the Go heap-corruption row), and a lane that fails at random is
+# a lane people learn to ignore. Run it by hand until that row is closed; it
+# joins `make test`, CI and the nightly soak in the change that closes it.
+HTTP_SECONDS ?= 30
+test-http:
+	tests/qemu/http-test.sh $(HTTP_SECONDS)
+
 test-bond: $(ISO)
 	tests/qemu/bond-test.sh
 
@@ -857,7 +912,7 @@ test-shell: $(ISO)
 # rendezvous stall of M6-08, and the `sched::exit` lock ordering of RFC 0017
 # step 6, which passed every gate in the single run that verified it and hung
 # the shell about three times in ten.
-.PHONY: soak soak-boot soak-shell
+.PHONY: soak soak-boot soak-shell soak-http
 soak: soak-boot soak-shell
 
 # Does it come up, repeatedly.
@@ -869,6 +924,11 @@ soak-boot: $(ISO)
 # a time on purpose: the shell test writes to the domain disk.
 soak-shell: $(ISO)
 	tests/qemu/soak-shell.sh $(SOAK_SHELL_RUNS) $(SOAK_SHELL_MODE)
+
+# Does it *serve*, for as long as WL1 says: five minutes, sixteen clients.
+# Not part of `soak` yet, for the reason `test-http` gives.
+soak-http:
+	tests/qemu/http-test.sh 300
 
 SOAK_RUNS ?= 40
 SOAK_JOBS ?= 2

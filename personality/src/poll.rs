@@ -97,6 +97,14 @@ pub enum Condition {
         /// program's `accept`.
         waiting: usize,
     },
+    /// An `eventfd` — RFC 0086 step 5: readable while its counter is
+    /// non-zero, writable while a 1 would fit.
+    EventFd {
+        /// A read would return now.
+        readable: bool,
+        /// A write of 1 would return now.
+        writable: bool,
+    },
     /// A descriptor this adapter cannot answer for.
     ///
     /// **Zero, and not a guess.** One holder left: `epoll`, which has no
@@ -192,6 +200,16 @@ pub fn revents(requested: u16, condition: Condition) -> u16 {
             } else {
                 0
             }
+        }
+        Condition::EventFd { readable, writable } => {
+            let mut out = 0;
+            if readable {
+                out |= requested & POLLIN;
+            }
+            if writable {
+                out |= requested & POLLOUT;
+            }
+            out
         }
         Condition::Unanswered => 0,
     }
