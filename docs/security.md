@@ -242,6 +242,8 @@ We will not pretend to cover these. Each has a note on whether it becomes in-sco
 > which a `clone` needs, and which a fault or a signal delivery already showed it. And each `clone`
 > writes a trampoline into a read-execute page of the process's own; the adapter could always write
 > a hosted process's memory, and it writes code there only through the same `COPY_OUT`.
+> `DISCARD_AT` (the same day) lets the holder of a domain capability drop frames behind a range it
+> maps — no reach beyond what `UNMAP_AT` already gave it.
 
 > **[RFC 0079](rfc/0079-a-signal-a-process-may-send-another.md) added the power to *end* a hosted
 > process, on 2026-09-15, and it is the largest single widening in this list.** Everything above

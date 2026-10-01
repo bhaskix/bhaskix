@@ -190,14 +190,57 @@ pub fn plan_mprotect(
     Ok((addr, pages, protection & prot::READ != 0, write, execute))
 }
 
-/// `madvise` is advice, and this kernel takes none of it — every hint Go
-/// gives (`MADV_DONTNEED`, `MADV_FREE`, `MADV_HUGEPAGE`) is about page
-/// reclaim policy that does not exist here yet. Answered `0` rather than
-/// refused, because advice a kernel declines to follow is not an error, and
-/// `-ENOSYS` here makes Go's allocator take a slower path for no reason.
-#[must_use]
-pub const fn plan_madvise() -> i64 {
-    0
+/// `MADV_DONTNEED` and `MADV_FREE`, from the build host's `bits/mman-linux.h`.
+pub mod advice {
+    /// The pages' contents are gone: the next touch reads zeros.
+    pub const DONTNEED: u64 = 4;
+    /// The pages may be reclaimed or may keep their contents.
+    pub const FREE: u64 = 8;
+}
+
+/// What an `madvise(addr, length, advice)` must do.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Madvise {
+    /// Drop the frames behind these pages, keeping the mapping, so the next
+    /// touch of each reads zeros.
+    Discard {
+        /// The first page.
+        at: u64,
+        /// How many.
+        pages: u64,
+    },
+    /// Advice that changes nothing a program can observe here.
+    Nothing,
+}
+
+/// What an `madvise` means.
+///
+/// ~~`madvise` is advice, and this kernel takes none of it~~ — **wrong for
+/// `MADV_DONTNEED`, corrected 2026-10-01** (RFC 0086 step 5). It is not advice:
+/// Linux promises the range reads as zeros afterwards, and go 1.27.1 builds on
+/// that promise — `runtime/mheap.go`'s `initSpan` treats a span whose pages
+/// were all released this way as already zeroed and skips clearing it, while
+/// `GODEBUG=madvdontneed` is at its default of 1 (`runtime/mem_linux.go`). Answered
+/// as a no-op, released pages kept their old bytes and Go handed them out as
+/// fresh objects: a Go server's `Request` with a `MultipartForm` nobody sent,
+/// and "found bad pointer in Go heap", on every run past a minute.
+///
+/// `MADV_FREE` stays a no-op, and truthfully: Linux may keep the contents too,
+/// and Go zeroes such memory itself. The rest — `MADV_HUGEPAGE` and the like —
+/// is reclaim policy this kernel does not have.
+///
+/// # Errors
+///
+/// `EINVAL` for an address that is not page-aligned, as Linux.
+pub fn plan_madvise(addr: u64, length: u64, how: u64) -> Result<Madvise, i64> {
+    if !addr.is_multiple_of(PAGE) {
+        return Err(errno::EINVAL);
+    }
+    if how != advice::DONTNEED || length == 0 {
+        return Ok(Madvise::Nothing);
+    }
+    let pages = pages_for(length).ok_or(errno::EINVAL)?;
+    Ok(Madvise::Discard { at: addr, pages })
 }
 
 #[cfg(test)]
@@ -367,7 +410,26 @@ mod tests {
     }
 
     #[test]
-    fn madvise_is_advice_and_declining_it_is_not_an_error() {
-        assert_eq!(plan_madvise(), 0);
+    fn dontneed_discards_the_range_and_other_advice_changes_nothing() {
+        assert_eq!(
+            plan_madvise(0x10000, 4096 * 3 - 1, advice::DONTNEED),
+            Ok(Madvise::Discard {
+                at: 0x10000,
+                pages: 3
+            }),
+            "a partial last page is a page"
+        );
+        assert_eq!(
+            plan_madvise(0x10000, 4096, advice::FREE),
+            Ok(Madvise::Nothing)
+        );
+        assert_eq!(
+            plan_madvise(0x10000, 0, advice::DONTNEED),
+            Ok(Madvise::Nothing)
+        );
+        assert_eq!(
+            plan_madvise(0x10001, 4096, advice::DONTNEED),
+            Err(errno::EINVAL)
+        );
     }
 }

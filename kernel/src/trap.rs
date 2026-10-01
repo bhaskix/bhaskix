@@ -223,9 +223,13 @@ fn handle(frame: &mut TrapFrame) {
         // read. Taken from the CPU rather than from any kernel bookkeeping,
         // because bookkeeping is what may be wrong when a fault is handled.
         let write = frame.error_code & (1 << 1) != 0;
+        // Bit 0: clear for a page that was not present, set for a present
+        // page whose protection refused the access. See `handle_fault`'s
+        // spurious-fault arm for why it matters.
+        let not_present = frame.error_code & 1 == 0;
         let address = read_cr2();
 
-        match crate::vm::handle_fault(address, write) {
+        match crate::vm::handle_fault(address, write, not_present) {
             crate::vm::FaultOutcome::Handled => {
                 // **The fourth way back to ring 3, and the one the other three
                 // did not cover.** A demand-paging fault taken in user mode is

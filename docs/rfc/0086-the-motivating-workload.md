@@ -448,22 +448,46 @@ three hundred seconds and one of a hundred and twenty, each differently —
 `stopm holding locks`; a map pointer of 8 (`maps.(*Iter).Init`); a signal
 arriving with no `g`; a plain `GET` whose `MultipartForm` was not nil
 (`net/http.(*response).finishRequest`); and, with `GOMAXPROCS=1`, "concurrent
-map read and map write", which one P should make impossible unless memory is
-being damaged or two OS threads run as one `m`. During every one of them no
-park was refused and no retry ran out. **Ruled out, by reading or by a run:**
-`madvise` as a no-op (Go zeroes by its own high-water mark, not by trusting
-released memory); SSE state across switches (both switch sites save and
-restore it); a kernel stack overflow (guarded, and would double-fault); an
-unzeroed frame on a supervisor's write (committed through demand paging, which
-zeroes); a call delivered to the adapter twice (congestion is refused before
-queueing); the per-domain clone hand-off (it refuses a second, and Go would
-have said so). **Fixed on the way and not the whole answer:** the trampoline's
-slot was given back at the child's first call, while it was still running the
-trampoline; it is given back at the second now. **Found while looking, and not
-shown to matter here:** `tlb::shootdown` invalidates one page, and an unmap or
-replace of several touched pages invalidates only the first on the other CPUs.
-The lead's decision (2026-10-01): land what is built, keep the lane out of
-`make test` and CI, and find the cause next.
+map read and map write". During every one of them no park was refused and no
+retry ran out. ~~**Ruled out, by reading or by a run:** `madvise` as a no-op
+(Go zeroes by its own high-water mark, not by trusting released memory)~~ —
+**that one was wrong, corrected 2026-10-01**: go 1.27.1's `initSpan` treats a
+span whose pages were all released with `MADV_DONTNEED` as already zeroed
+(`runtime/mheap.go`, while `GODEBUG=madvdontneed` is at its default of 1), and
+the earlier reading had looked at `allocNeedsZero` alone. Still ruled out by
+reading: SSE state across switches, kernel stack overflow, an unzeroed frame on
+a supervisor write, a call delivered twice, the per-domain clone hand-off.
+
+**The hunt, 2026-10-01 — each by a boot, not by reading.** A pure-Go program
+with no networking, building and checking maps on eight goroutines, corrupts
+its heap within seconds ("found bad pointer in Go heap"), so the adapter's
+sockets, `epoll` and eventfds are **not** the cause. It still does with
+`GOMAXPROCS=1`, with work-stealing off, and with every one of its threads on
+one CPU; one goroutine verifying 16 MiB page by page for ninety seconds does
+not. Tested directly and found intact: every general register across
+`sched_yield`, `getpid`, `clock_gettime`, `futex` wake, a blocking `futex` wait
+and `nanosleep`; every general register across timer preemption mid-loop; `X0`–
+`X14` across preemption; each thread's `FS` base against its record at every
+call, and no two live threads sharing one; 4 MiB of long-lived objects through
+700 verification passes while the corruption happened elsewhere. Backed out one
+at a time without effect: restoring the callee-saved registers on syscall exit,
+lazy zero-fill in the ELF loader, the reserve's allocator fallback (with a
+sixteenfold reserve), and refused preemption (`asyncpreemptoff=1`); a 128 KiB
+initial stack changed nothing either. **What remains is newly allocated memory
+holding what it should not** — Go's last reports are pointers into freed spans —
+in a program with several threads.
+
+**Five real defects fixed on the way, none of them the whole answer:** the
+clone trampoline's slot was reused while a child was still running it; a
+not-present fault serviced after another CPU had mapped the page was handed to
+the program as a bad access (now retried); `munmap` dropped its length and
+removed the whole region (`UNMAP_AT` takes a page count now — Go frees the
+misaligned head of an aligned arena this way); `MADV_DONTNEED` was a no-op
+(`DISCARD_AT` drops the frames); and every unmap now invalidates each page on
+every CPU **before** its frame is freed — it did only when the space was loaded
+on the calling CPU, which `is_active`'s own note said would stop being enough
+once threads ran on several. The lead's decision stands: the lane stays out of
+`make test` and CI until the cause is found.
 
 **What is not done, said:** `tgkill` carries only a fatal signal a thread sends
 itself, so Go's `SIGURG` preemption is refused and a goroutine is preempted only

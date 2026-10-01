@@ -387,24 +387,6 @@ impl AddressSpace {
         Ok(())
     }
 
-    /// Whether this address space is currently loaded in `CR3`.
-    ///
-    /// Decides whether unmapping needs a TLB shootdown. A translation can only
-    /// be cached by a CPU that has actually run in this address space, so a
-    /// space no CPU has loaded needs no interruption at all — which is what
-    /// keeps tearing down a thousand address spaces from costing a thousand
-    /// rounds of IPIs.
-    ///
-    /// The check is against *this* CPU's `CR3` only, which is sufficient
-    /// because secondary CPUs never load an address space: they idle in the
-    /// one the bootloader built. That stops being true the moment threads run
-    /// on more than one CPU, and this must become a per-space "loaded on"
-    /// mask when it does.
-    fn is_active(&self) -> bool {
-        // SAFETY: reading CR3 at CPL 0 has no side effects.
-        unsafe { paging::active_page_table() == self.root }
-    }
-
     /// Unmaps and frees the first `count` pages of `range`.
     ///
     /// Answers how many frames it actually freed, **and releases them from
@@ -414,7 +396,16 @@ impl AddressSpace {
     fn unmap_pages(&mut self, range: VirtRange, count: u64) -> u64 {
         let root = self.root;
         let hhdm = self.hhdm_base;
-        let active = self.is_active();
+        // ~~`self.is_active()`~~ -- **every unmap shoots down, since
+        // 2026-10-01** (RFC 0086 step 5). The test asked whether this space
+        // was loaded on *this* CPU, which `is_active`'s own note says stopped
+        // being enough the moment threads ran on more than one: a supervisor
+        // unmapping a hosted process's memory from its own CPU shot down
+        // nothing here, freed the frames, and a thread of that process on
+        // another CPU went on writing through translations to frames already
+        // handed back to the allocator. Shooting down a space nobody has loaded
+        // costs an IPI round and is otherwise harmless.
+        let active = true;
 
         // The sixth stall capture found this function's heap closure held
         // for the whole of a boot hang, shooting down page after page — and
@@ -638,6 +629,86 @@ impl AddressSpace {
             self.unmap_pages(region.range, region.range.pages());
         }
         Ok(())
+    }
+
+    /// Drops the frames behind `pages` pages from `start`, keeping the regions:
+    /// `MADV_DONTNEED`, and [`bhaskix_abi::method::DISCARD_AT`]. Answers the
+    /// pages that had frames, which the caller must invalidate on every CPU.
+    ///
+    /// Page by page, because a range a runtime releases may cross several of
+    /// the regions its commits split an arena into. Anonymous pages only.
+    ///
+    /// # Errors
+    ///
+    /// [`VmError::Region`] if any page of the range is in no region; nothing
+    /// is dropped then.
+    pub fn discard(
+        &mut self,
+        start: VirtAddr,
+        pages: u64,
+    ) -> Result<alloc::vec::Vec<u64>, VmError> {
+        let refused = VmError::Region(bhaskix_mm::vm::RangeMapError::NotFound);
+        let range = VirtRange::from_pages(start, pages).ok_or(refused)?;
+        let mut present = alloc::vec::Vec::new();
+        for page in range.pages_iter() {
+            let region = self.regions.find(page).ok_or(refused)?;
+            if region.backing == Backing::Anonymous && self.translate(page).is_some() {
+                present.push(page.as_u64());
+            }
+        }
+        for &page in &present {
+            if let Some(one) = VirtRange::from_pages(VirtAddr(page), 1) {
+                self.unmap_pages(one, 1);
+            }
+        }
+        Ok(present)
+    }
+
+    /// Unmaps `pages` pages from `start` — part of a region, or all of it —
+    /// and answers the pages that had frames, which the caller must invalidate
+    /// on every CPU.
+    ///
+    /// **Part of a region is the case that matters**, RFC 0086 step 5
+    /// (2026-10-01). go 1.27.1 reserves `size + align` for an aligned arena and
+    /// then frees the misaligned head and tail (`runtime/mem.go`,
+    /// `sysReserveAligned`). `UNMAP_AT` could only remove a region by its start,
+    /// so freeing the head removed the **whole** reservation, the aligned middle
+    /// Go goes on using included; its untouched part then looked free, a later
+    /// reservation could land on it, and two parts of Go's heap shared
+    /// addresses. Every five-minute run of the Go server died of heap
+    /// corruption until this was found.
+    ///
+    /// The range is isolated with the region map's own split
+    /// ([`bhaskix_mm::vm::RegionMap::reprotect`], protection unchanged) and the
+    /// isolated piece unmapped, which frees its frames and returns the owner's
+    /// charge exactly as a whole-region unmap does.
+    ///
+    /// # Errors
+    ///
+    /// [`VmError::Region`] if the range is not wholly inside one region.
+    pub fn unmap_range(
+        &mut self,
+        start: VirtAddr,
+        pages: u64,
+    ) -> Result<alloc::vec::Vec<u64>, VmError> {
+        let refused = VmError::Region(bhaskix_mm::vm::RangeMapError::NotFound);
+        let range = VirtRange::from_pages(start, pages).ok_or(refused)?;
+        let region = *self.regions.find(start).ok_or(refused)?;
+        if region.range.end.as_u64() < range.end.as_u64() {
+            return Err(refused);
+        }
+        let present = range
+            .pages_iter()
+            .filter(|page| self.translate(*page).is_some())
+            .map(|page| page.as_u64())
+            .collect();
+        if region.range != range {
+            self.regions
+                .reprotect(start, pages, region.protection)
+                .map_err(VmError::Region)?;
+        }
+        self.unmap(start)?;
+        Ok(present)
     }
 
     /// Physical address backing `address`, if any.
@@ -1556,6 +1627,10 @@ pub unsafe fn uninstall() -> Option<AddressSpace> {
     spaces[slot].take()
 }
 
+/// Faults on a page that another CPU had already mapped by the time this one
+/// held the lock — see the spurious-fault arm in [`handle_fault`].
+pub static SPURIOUS_FAULTS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 /// Services a page fault against the installed address space.
 ///
 /// This is the point of the whole design in `docs/memory.md` §3: the region map
@@ -1566,7 +1641,7 @@ pub unsafe fn uninstall() -> Option<AddressSpace> {
 /// `write` comes from the architectural error code, not from any bookkeeping —
 /// bookkeeping is exactly what may be wrong when a fault is being handled.
 #[must_use]
-pub fn handle_fault(address: u64, write: bool) -> FaultOutcome {
+pub fn handle_fault(address: u64, write: bool, not_present: bool) -> FaultOutcome {
     // `try_lock` throughout. A fault can interrupt code already holding either
     // lock, and spinning here would hang the machine with no output. Reporting
     // an unserviceable fault is worse than servicing it and far better than a
@@ -1600,6 +1675,27 @@ pub fn handle_fault(address: u64, write: bool) -> FaultOutcome {
     else {
         return FaultOutcome::NotOurs;
     };
+    // **A fault on a page that was not there, and is there now, is a race and
+    // not a bug** -- RFC 0086 step 5, 2026-10-01. Two threads of one space
+    // touch the same lazy page at once; one wins the lock and maps it; the
+    // other's fault, raised before that and serviced after, finds the page
+    // present. `service_fault`'s present-page arm answers `NotOurs` there --
+    // correctly for a *protection* fault, which retrying would only repeat --
+    // so the loser was handed to its personality as a bad access, and a Go
+    // server got a `SIGSEGV` for memory it owned. Five runs died of it, five
+    // different ways, before it was found: every one at a valid address.
+    //
+    // The architectural error code says which kind this was. A not-present
+    // fault on a page now present is retried after invalidating this CPU's
+    // entry; if the retry faults again it does so as a protection fault, and
+    // takes the path below. So this cannot loop.
+    let page = VirtAddr(address & !(PAGE_SIZE - 1));
+    if not_present && space.translate(page).is_some() {
+        // SAFETY: `invlpg` at CPL 0 cannot fault, mapped or not.
+        unsafe { paging::invalidate(page.as_u64()) };
+        SPURIOUS_FAULTS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        return FaultOutcome::Handled;
+    }
     service_fault(space, address, write)
 }
 

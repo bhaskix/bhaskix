@@ -607,6 +607,14 @@ pub mod method {
     /// `ResourceEnvelope` will not cover the copy (RFC 0082).
     pub const COPY_SPACE: u64 = 75;
 
+    /// Drop the frames behind `arg1` pages from `arg0` in the target domain's
+    /// space, keeping every mapping, so the next touch of each page is a fresh
+    /// zeroed frame — Linux's `MADV_DONTNEED`, which a Go runtime relies on
+    /// (RFC 0086 step 5). Pages without a frame are skipped; a page no region
+    /// covers refuses the whole call before anything is dropped. Only
+    /// anonymous memory is discarded: a lent region's frames are its lender's.
+    pub const DISCARD_AT: u64 = 76;
+
     /// Map the memory this capability names into the caller's address space.
     ///
     /// Only on a `Memory` capability. `arg0` = where, page-aligned; `arg1`

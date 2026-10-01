@@ -5479,6 +5479,12 @@ fn httpd_self_test(hhdm_base: u64, cpus: u32) -> bool {
     // during the run, and the last of them. A Go server that dies prints
     // Go's own verdict on the console; this is the machine's.
     let faults = fault::HANDED.load(Ordering::Relaxed) - faults_before;
+    println!(
+        "{LABEL}MADV_DONTNEED this boot: {} discard(s) dropping {} frame(s), {} refused",
+        syscall::DISCARDS.load(Ordering::Relaxed),
+        syscall::DISCARDED_PAGES.load(Ordering::Relaxed),
+        syscall::DISCARDS_REFUSED.load(Ordering::Relaxed)
+    );
     // Signal deliveries and returns, both counted where the kernel resumes a
     // thread from a register image -- whether signals are in play at all.
     println!(
@@ -6845,7 +6851,12 @@ fn memory_self_test(hhdm_base: u64, cpus: u32) -> bool {
     retire_probe(realm);
 
     // A plausible address, the pattern read back out of the second page,
-    // and both of the calls that answer zero having answered zero.
+    // `munmap` answering zero, and `madvise(MADV_DONTNEED)` on the range just
+    // unmapped answering `ENOMEM` -- which is Linux's answer for an unmapped
+    // range. It answered zero until 2026-10-01, when `madvise` was a no-op
+    // that took every call as advice; RFC 0086 step 5 made `MADV_DONTNEED`
+    // drop frames, because Go trusts it to, and this probe is what said the
+    // range was gone.
     let mapped_somewhere = answers[0] >= 0x0000_7000_0000_0000 && answers[0] % 4096 == 0;
     // `security.md` §1 gap 3: a hosted process's `mmap` region is drawn per
     // process rather than bumped from one shared counter at a fixed base. The
@@ -6853,12 +6864,17 @@ fn memory_self_test(hhdm_base: u64, cpus: u32) -> bool {
     // rather than refusing to run a program — so the line says which world this
     // is, exactly as the IOMMU lines do, instead of implying the stronger one.
     let drawn = answers[0] != 0x0000_7000_0000_0000;
-    if report_pa != 0 && mapped_somewhere && answers[1] == 42 && answers[2] == 0 && answers[3] == 0
+    const ENOMEM: u64 = -12i64 as u64;
+    if report_pa != 0
+        && mapped_somewhere
+        && answers[1] == 42
+        && answers[2] == 0
+        && answers[3] == ENOMEM
     {
         println!(
             "    linux memory   a Linux program mapped two anonymous pages at {:#x}, wrote and \
-             read 42 in the second (so the lazy commit reached it), unmapped them, and had its \
-             madvise taken as advice",
+             read 42 in the second (so the lazy commit reached it), unmapped them, and was \
+             told ENOMEM for discarding what it no longer had, as Linux answers",
             answers[0]
         );
         if drawn {

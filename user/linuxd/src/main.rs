@@ -2103,11 +2103,14 @@ fn answer_from_message(request: &PersonalityCall) -> Answer {
         },
         MUNMAP => match memory::plan_munmap(request.first(), request.second()) {
             Ok((address, pages)) => {
-                let _ = pages;
+                // **The length is passed, not dropped** -- RFC 0086 step 5. It
+                // was `let _ = pages`, and the kernel removed the whole region
+                // starting at `address`: Go's freeing of an aligned arena's
+                // misaligned head unreserved the arena itself.
                 let answer = invoke(
                     handle_of(request.domain),
                     method::UNMAP_AT,
-                    [address, 0, 0, 0],
+                    [address, pages, 0, 0],
                 );
                 // The list follows the mapping, or a `fork` after an unmap
                 // would copy memory that is not there any more.
@@ -2180,7 +2183,27 @@ fn answer_from_message(request: &PersonalityCall) -> Answer {
         MKDIR => answer_make_directory(request, request.first()),
         UNLINKAT => answer_unlink(request, request.second()),
         UNLINK | RMDIR => answer_unlink(request, request.first()),
-        MADVISE => Answer::ok(memory::plan_madvise() as u64),
+        // RFC 0086 step 5: `MADV_DONTNEED` drops the pages, because Go
+        // trusts them to read as zeros afterwards -- see `plan_madvise`.
+        MADVISE => match memory::plan_madvise(request.first(), request.second(), request.third()) {
+            // Refused only for a range no region covers, which Linux answers
+            // `ENOMEM`: the addresses are not mapped.
+            Ok(memory::Madvise::Discard { at, pages }) => {
+                let reply = call(
+                    syscall::INVOKE,
+                    handle_of(request.domain),
+                    method::DISCARD_AT,
+                    [at, pages, 0, 0],
+                );
+                if reply.status == status::OK {
+                    Answer::ok(0)
+                } else {
+                    Answer::error(memory::errno::ENOMEM)
+                }
+            }
+            Ok(memory::Madvise::Nothing) => Answer::ok(0),
+            Err(errno) => Answer::error(errno),
+        },
         // Signal masking is recorded nowhere and honoured nowhere yet. Zero
         // rather than `-ENOSYS`, because a runtime told it cannot mask signals
         // takes a slower path for a promise nothing here breaks: no signal is

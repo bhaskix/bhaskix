@@ -146,6 +146,7 @@ const _: () = {
     assert!(method::SET_TLS == bhaskix_abi::method::SET_TLS);
     assert!(method::MAKE_SPACE == bhaskix_abi::method::MAKE_SPACE);
     assert!(method::COPY_SPACE == bhaskix_abi::method::COPY_SPACE);
+    assert!(method::DISCARD_AT == bhaskix_abi::method::DISCARD_AT);
     assert!(method::GRANT == bhaskix_abi::method::GRANT);
     assert!(method::BIND == bhaskix_abi::method::BIND);
     assert!(method::RELEASE == bhaskix_abi::method::RELEASE);
@@ -321,6 +322,8 @@ pub mod method {
     pub const MAKE_SPACE: u64 = 66;
     /// RFC 0084: give a domain a copy of another's address space.
     pub const COPY_SPACE: u64 = 75;
+    /// RFC 0086 step 5: drop the frames behind a range, keeping the mappings.
+    pub const DISCARD_AT: u64 = 76;
     /// Map the memory this capability names into the caller's address space.
     ///
     /// Only on a `Memory` capability. `arg0` = where, page-aligned; `arg1`
@@ -4033,19 +4036,50 @@ fn domain_supervise(frame: &SyscallFrame) -> Option<Outcome> {
             }
         }
         method::UNMAP_AT => {
+            // `arg1` is a page count since RFC 0086 step 5: zero is the whole
+            // region that starts at `arg0`, as before; anything else is that
+            // many pages of it, which may be part of a region -- see
+            // `AddressSpace::unmap_range` for why a Go runtime needs that.
+            let (start, pages) = (bhaskix_boot::VirtAddr(frame.arg0), frame.arg1);
             let unmapped = crate::vm::with_space(root, |space| {
-                space.unmap(bhaskix_boot::VirtAddr(frame.arg0)).is_ok()
+                let pages = if pages == 0 {
+                    space
+                        .regions()
+                        .find(start)
+                        .map_or(0, |region| region.range.pages())
+                } else {
+                    pages
+                };
+                space.unmap_range(start, pages).ok()
             });
             match unmapped {
-                Some(true) => {
-                    // The target may be running on another CPU right now, so
-                    // the stale translation has to go the way `shared::revoke`
-                    // sends it. An unmap whose shootdown is skipped is a page
-                    // the other CPU can still write after it was taken away.
-                    crate::tlb::shootdown(frame.arg0);
+                Some(Some(present)) => {
+                    // Every page that had a frame was shot down on every CPU
+                    // *before* its frame was freed, inside `unmap_pages` --
+                    // which until 2026-10-01 did so only when the space was
+                    // loaded on the calling CPU, so a supervisor's unmap freed
+                    // frames other CPUs could still reach (TRACKER §3). This
+                    // arm used to invalidate `arg0` alone, afterwards.
+                    let _ = present;
                     Outcome::ok(0)
                 }
                 _ => Outcome::err(Status::NoSuchCapability),
+            }
+        }
+        method::DISCARD_AT => {
+            let (start, pages) = (bhaskix_boot::VirtAddr(frame.arg0), frame.arg1);
+            match crate::vm::with_space(root, |space| space.discard(start, pages).ok()) {
+                Some(Some(present)) => {
+                    DISCARDS.fetch_add(1, Ordering::Relaxed);
+                    DISCARDED_PAGES.fetch_add(present.len() as u64, Ordering::Relaxed);
+                    // Shot down on every CPU before each frame was freed,
+                    // inside `unmap_pages`.
+                    Outcome::ok(0)
+                }
+                _ => {
+                    DISCARDS_REFUSED.fetch_add(1, Ordering::Relaxed);
+                    Outcome::err(Status::NoSuchCapability)
+                }
             }
         }
         method::PROTECT_AT => {
@@ -4069,6 +4103,16 @@ fn domain_supervise(frame: &SyscallFrame) -> Option<Outcome> {
         _ => return None,
     })
 }
+
+/// `DISCARD_AT`s answered, the frames they dropped, and those refused — RFC
+/// 0086 step 5. A refused one matters more than it looks: a Go runtime whose
+/// `MADV_DONTNEED` fails stops asking and goes on trusting released memory to
+/// be zero.
+pub static DISCARDS: AtomicU64 = AtomicU64::new(0);
+/// See [`DISCARDS`].
+pub static DISCARDED_PAGES: AtomicU64 = AtomicU64::new(0);
+/// See [`DISCARDS`].
+pub static DISCARDS_REFUSED: AtomicU64 = AtomicU64::new(0);
 
 /// Reads a protection word, refusing what the region map cannot represent.
 ///
