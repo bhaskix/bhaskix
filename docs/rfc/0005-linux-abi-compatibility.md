@@ -874,6 +874,15 @@ called as though it had one — the same shape as
 
 ## Step 10's record (2026-08-19): the gate is unmet, and it is reported unmet rather than redefined
 
+> **2026-10-01: met.** The named workload — a static Go 1.27.1 `net/http`
+> server in a Linux-tagged domain — served sixteen keep-alive host clients for
+> five minutes: 61,447 responses, every body checked, zero errors, the server
+> still running at the end. Gated on every push for thirty seconds and nightly
+> for five minutes; the numbers, what they are measured under and what they
+> leave out are [RFC 0086](0086-the-motivating-workload.md)'s step-6 record.
+> Everything below is the record of the day it could not be run, kept as it
+> was written.
+
 > **2026-09-30: the workload is named, and the first reason below no longer
 > holds.** A static Go `net/http` server serving sixteen concurrent keep-alive
 > clients for five minutes, zero errors — chosen by the project lead, not by
@@ -1248,6 +1257,9 @@ problem; on the compatibility path it is a cost we are choosing knowingly.
 **The real gate:** the motivating workload runs. Until the actual Go
 application starts, serves, and stays up under load, "Bhaskix runs Go" is not a
 claim the project makes — in the README, in a talk, or anywhere else.
+**Met 2026-10-01** ([RFC 0086](0086-the-motivating-workload.md)), and the claim
+it withheld may now be made **as measured**: a static Go `net/http` server,
+sixteen clients, five minutes, under QEMU — not "Go runs", and not on hardware.
 
 **Contributors without the workload** can work against the public corpus,
 which is why it is defined as programs rather than as one binary.
@@ -1302,4 +1314,5 @@ before M5 delivers user mode and M6 delivers the ELF loader.
 8. **Tier 1.** Files, directories, synthetic `/proc`. Fuzz target mandatory
    before merge.
 9. **Tier 2.** Sockets and `epoll`, after the Phase 2 network stack.
-10. **The real gate.** The motivating workload runs under load.
+10. **The real gate.** The motivating workload runs under load. ✅ **Met
+    2026-10-01** — [RFC 0086](0086-the-motivating-workload.md).

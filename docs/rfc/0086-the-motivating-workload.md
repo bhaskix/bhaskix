@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | 🔨 **Draft 2026-09-30 — ~~steps 1, 2, 3a and 3b done~~ ~~steps 1–4 done, step 5 built and not yet passing~~ steps 1–5 done** (this cell read "3b" through step 4's landing; corrected 2026-10-01; step 5 passed the same day). The workload RFC 0005 was owed from outside is named, its gate defined, its size measured and its system calls traced; `bin/tcpd` holds a table of thirty-two connections and a listener arms ring pairs, gated by four host clients held at once. `tcpd` serves a second listener opened by any program, and names a connection's peer; a hosted Linux program listens, accepts and echoes a host client through `bin/linuxd`; `epoll` works edge-triggered; and **the Go server serves sixteen keep-alive clients for five minutes, every body checked, zero errors** — thirty seconds on every push, three hundred nightly. ~~It corrupted its own memory on longer runs~~ — found and fixed 2026-10-01: the kernel refused every `MADV_DONTNEED`. Step 6, the record against RFC 0005 step 10, is left. The acceptance call is the project lead's. |
+| **Status** | 🔨 **Draft 2026-09-30 — ~~steps 1, 2, 3a and 3b done~~ ~~steps 1–4 done, step 5 built and not yet passing~~ ~~steps 1–5 done~~ all six steps done** (this cell read "3b" through step 4's landing; corrected 2026-10-01; steps 5 and 6 the same day). The workload RFC 0005 was owed from outside is named, its gate defined, its size measured and its system calls traced; `bin/tcpd` holds a table of thirty-two connections and a listener arms ring pairs, gated by four host clients held at once. `tcpd` serves a second listener opened by any program, and names a connection's peer; a hosted Linux program listens, accepts and echoes a host client through `bin/linuxd`; `epoll` works edge-triggered; and **the Go server serves sixteen keep-alive clients for five minutes, every body checked, zero errors** — thirty seconds on every push, three hundred nightly. ~~It corrupted its own memory on longer runs~~ — found and fixed 2026-10-01: the kernel refused every `MADV_DONTNEED`. Step 6's record says the gate is met, against RFC 0005 step 10. The acceptance call is the project lead's. |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | userspace (`bin/linuxd`, `bin/tcpd`), `personality`, tools |
 | **Milestone** | Phase 2 — the Linux personality ([RFC 0005](0005-linux-abi-compatibility.md)) |
@@ -517,6 +517,44 @@ cooperatively — a goroutine spinning without a function call would starve the
 rest. The throughput is the adapter's per-call copy cost and is not tuned. The
 thirty-second lane's latency tail (p99 ≈ 270 ms) is reported, not explained.
 
+## Step 6's record (2026-10-01): RFC 0005 step 10's gate, met
+
+**The gate, as step 1 defined it:** a statically linked Go `net/http` server in
+a Linux-tagged domain serves sixteen concurrent keep-alive clients from the
+host for five minutes, every response checked, zero errors; throughput and
+latency reported, not gated.
+
+**Met.** The five-minute run of 2026-10-01: 61,447 responses from 16 clients
+in 300.1 s, every body checked, **0 errors, 0 reconnects**; the server still
+running at the end, after 889,249 calls; during the run **no park refused, none
+out of retries, no deadline arm refused**. The thirty-second lane has passed
+on every run since, locally (5,794 responses, 0 errors, in the suite of the
+same day) and in CI (run 804, its first).
+
+**Reported, not gated:**
+
+| | |
+|---|---|
+| throughput | 204.7 responses/s (five minutes); 192.5/s (thirty seconds) |
+| latency | p50 41.3 ms, p99 301.4 ms, max 1,278.6 ms (five minutes) |
+| adapter calls per response | about 14.5 — 889,249 calls for 61,447 responses, every Linux call the server made, its runtime's included |
+| an adapter round trip | floor 161,226 cycles, mean 694,931 over the boot's first 1,002 round trips — about 67 µs and 289 µs at the 2.40 GHz the same boot's `cost` line implies |
+
+**What those numbers are not, said:** they are measured under QEMU's TCG on the
+build host, not on hardware; the round-trip price is the boot's, taken before
+the server ran, not a figure *under this load* — the step's plan asked for the
+adapter's copy cost under load, and that per-run figure is not instrumented
+yet; and the latency tail is reported, not explained. **What the server runs
+without:** Go's signal-based preemption (`tgkill` refuses `SIGURG`), so it is
+preempted cooperatively only.
+
+**What it took**, steps 2–5: `tcpd` holds a table of connections and a
+listener armed with ring pairs; a second program may listen; hosted TCP in
+`bin/linuxd`; `epoll`, edge-triggered; and, for the server itself, a pinned
+toolchain, `eventfd`, `prlimit64`, `clock_gettime`, lazy zero-fill, partial
+`MAP_FIXED` and `munmap`, `MADV_DONTNEED` that discards, a `clone` that starts a
+thread as Linux does, and the faults, waits and shootdowns each of those found.
+
 ## Design
 
 ### The gate
@@ -654,5 +692,5 @@ is printed so that the number a faster path would improve is on record first.
    Slot pressure under Go moves to step 5, which has the process to measure.
 5. ✅ 2026-10-01 — **The server and the load** — `corpus/httpd.go`, its image, the boot flag,
    `tools/http-load.py`, `make test-http` in CI, 300 s in the soak.
-6. **Step 10's record** — the measured result against the gate, in RFC 0005
+6. ✅ 2026-10-01 — **Step 10's record** — the measured result against the gate, in RFC 0005
    and here.
