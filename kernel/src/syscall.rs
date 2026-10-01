@@ -1178,6 +1178,14 @@ fn dispatch_inner(frame: &mut SyscallFrame) -> Outcome {
                 | method::SET_TLS
                 | method::MAKE_SPACE
                 | method::COPY_SPACE
+                // RFC 0086 step 5 -- and the comment below came true a second
+                // time: `DISCARD_AT` was handled in `domain_supervise` and
+                // missing here, so every `MADV_DONTNEED` was refused. Go took
+                // the refusal to mean the memory was released anyway, reused
+                // it as zeroed, and its heap filled with old bytes -- the
+                // corruption five-minute runs died of, found by logging every
+                // call the Go program made (2026-10-01).
+                | method::DISCARD_AT
                 // RFC 0053. **This list is why the arm in `domain_supervise`
                 // was unreachable on the first attempt**: the methods are
                 // whitelisted here as well as handled there, and a method

@@ -118,6 +118,13 @@ else
     fail "the server was refused a park or a deadline during its run: ${run:-no park line was printed}"
 fi
 
+# What `MADV_DONTNEED` did during the run, printed and not judged: a short run
+# may release nothing, which is no failure. Whether the kernel serves a discard
+# at all is asserted on every boot of every lane, by the memory probe's own
+# discard-and-read-zero (`MEMORY_CODE`), since a whitelist that left it out
+# made every Go run past a minute corrupt its heap (2026-10-01).
+echo "  info  $(grep -aoE 'MADV_DONTNEED this boot: .*' "$LOG" | head -1 | clean)"
+
 for marker in "KERNEL PANIC" "EXCEPTION" "FAILED"; do
     if grep -aqF -- "$marker" "$LOG"; then
         fail "found failure marker: $marker -- $(grep -am1 -F -- "$marker" "$LOG" | clean | cut -c1-200)"

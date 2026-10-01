@@ -717,7 +717,7 @@ run-uefi: $(ISO)
 test: fmt clippy test-host gates test-boot test-boot-uefi test-boot-iommu test-boot-iommu-off \
       test-boot-qemu64 test-boot-uefi-qemu64 test-boot-native test-boot-native-full \
       test-placements test-shell \
-      test-keyboard test-usb-keyboard test-busybox test-bond test-lacp test-faults
+      test-keyboard test-usb-keyboard test-busybox test-bond test-lacp test-faults test-http
 	@echo
 	@echo "  all checks passed"
 
@@ -806,11 +806,10 @@ test-lacp: $(ISO)
 # checked. The lane builds its own image with the server in it, so it depends
 # on nothing but the sources `make iso` already follows.
 #
-# **Not in `make test` and not in CI, on the project lead's decision of
-# 2026-10-01**: the server corrupts its own memory on runs past about a minute
-# (TRACKER §3, the Go heap-corruption row), and a lane that fails at random is
-# a lane people learn to ignore. Run it by hand until that row is closed; it
-# joins `make test`, CI and the nightly soak in the change that closes it.
+# ~~Not in `make test` and not in CI~~ -- out from 2026-10-01 while the server
+# corrupted its own memory, and back the same day in the change that found why:
+# the kernel refused every `MADV_DONTNEED` (TRACKER §3). Thirty seconds here
+# and in CI; three hundred in the nightly soak.
 HTTP_SECONDS ?= 30
 test-http:
 	tests/qemu/http-test.sh $(HTTP_SECONDS)
@@ -913,7 +912,7 @@ test-shell: $(ISO)
 # step 6, which passed every gate in the single run that verified it and hung
 # the shell about three times in ten.
 .PHONY: soak soak-boot soak-shell soak-http
-soak: soak-boot soak-shell
+soak: soak-boot soak-shell soak-http
 
 # Does it come up, repeatedly.
 soak-boot: $(ISO)
@@ -926,7 +925,6 @@ soak-shell: $(ISO)
 	tests/qemu/soak-shell.sh $(SOAK_SHELL_RUNS) $(SOAK_SHELL_MODE)
 
 # Does it *serve*, for as long as WL1 says: five minutes, sixteen clients.
-# Not part of `soak` yet, for the reason `test-http` gives.
 soak-http:
 	tests/qemu/http-test.sh 300
 

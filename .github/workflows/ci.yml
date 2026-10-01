@@ -387,6 +387,68 @@ jobs:
             target/x86_64-unknown-none/release/bhaskix
           retention-days: 7
 
+  # RFC 0086 step 5, and RFC 0005 step 10's gate: a static Go `net/http` server
+  # in a Linux domain, sixteen keep-alive clients from the host for thirty
+  # seconds, every body checked. The nightly soak runs it for five minutes.
+  http:
+    name: http (go server under load)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: rustup show active-toolchain
+
+      - name: Cache apt archives
+        uses: actions/cache@v4
+        with:
+          path: .aptcache
+          key: apt-${{ runner.os }}-qemu-xorriso-mtools-ovmf-v1
+      - name: Install QEMU, xorriso
+        run: |
+          mkdir -p .aptcache
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq -o Dir::Cache::archives="$PWD/.aptcache" qemu-system-x86 xorriso mtools
+
+      # **The pinned Go, not the runner's** -- version and sha256 live in
+      # `tools/fetch-go.sh`. Keyed on that file, so changing the pin changes the
+      # key; the script checks the tarball's hash whether it came from the
+      # cache or from go.dev.
+      - name: Cache the pinned Go
+        uses: actions/cache@v4
+        with:
+          path: build/toolchain
+          key: go-${{ runner.os }}-${{ hashFiles('tools/fetch-go.sh') }}
+      - name: Fetch the pinned Go
+        run: tools/fetch-go.sh && build/toolchain/go*/bin/go version | tee ci-env-http.txt
+
+      - name: Cache Limine
+        uses: actions/cache@v4
+        with:
+          path: boot/limine/limine
+          key: limine-v8.x-binary-${{ runner.os }}-v1
+      - name: Fetch Limine
+        run: |
+          if [ ! -d boot/limine/limine/.git ]; then
+            git clone --branch v8.x-binary --depth 1 \
+              https://github.com/limine-bootloader/limine.git boot/limine/limine
+          fi
+          make -C boot/limine/limine
+
+      - name: Serve sixteen clients for thirty seconds, every body checked
+        env:
+          QEMU_CPU: max
+          BHASKIX_HTTP_LOG: http.log
+        run: make test-http
+
+      - name: Upload the serial log on failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: bhaskix-http-failed
+          path: |
+            http.log
+            ci-env-http.txt
+          retention-days: 7
+
   faults:
     name: fault injection
     runs-on: ubuntu-latest

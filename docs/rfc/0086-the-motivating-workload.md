@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | 🔨 **Draft 2026-09-30 — ~~steps 1, 2, 3a and 3b done~~ steps 1–4 done, step 5 built and not yet passing** (this cell read "3b" through step 4's landing; corrected 2026-10-01). The workload RFC 0005 was owed from outside is named, its gate defined, its size measured and its system calls traced; `bin/tcpd` holds a table of thirty-two connections and a listener arms ring pairs, gated by four host clients held at once. `tcpd` serves a second listener opened by any program, and names a connection's peer; a hosted Linux program listens, accepts and echoes a host client through `bin/linuxd`; `epoll` works edge-triggered; and **the Go server runs and serves sixteen keep-alive clients** — thirty seconds with every body checked, once — **but corrupts its own memory on longer runs**, so the lane is out of `make test` and CI until that is found (TRACKER §3). Step 5's gate and step 6 are left. The acceptance call is the project lead's. |
+| **Status** | 🔨 **Draft 2026-09-30 — ~~steps 1, 2, 3a and 3b done~~ ~~steps 1–4 done, step 5 built and not yet passing~~ steps 1–5 done** (this cell read "3b" through step 4's landing; corrected 2026-10-01; step 5 passed the same day). The workload RFC 0005 was owed from outside is named, its gate defined, its size measured and its system calls traced; `bin/tcpd` holds a table of thirty-two connections and a listener arms ring pairs, gated by four host clients held at once. `tcpd` serves a second listener opened by any program, and names a connection's peer; a hosted Linux program listens, accepts and echoes a host client through `bin/linuxd`; `epoll` works edge-triggered; and **the Go server serves sixteen keep-alive clients for five minutes, every body checked, zero errors** — thirty seconds on every push, three hundred nightly. ~~It corrupted its own memory on longer runs~~ — found and fixed 2026-10-01: the kernel refused every `MADV_DONTNEED`. Step 6, the record against RFC 0005 step 10, is left. The acceptance call is the project lead's. |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | userspace (`bin/linuxd`, `bin/tcpd`), `personality`, tools |
 | **Milestone** | Phase 2 — the Linux personality ([RFC 0005](0005-linux-abi-compatibility.md)) |
@@ -366,7 +366,7 @@ domain that made it, so a child that inherits one across `fork` is told `EINVAL`
 rather than half-sharing it; a set cannot watch another set; at most 32 events
 are reported per call and 8 sets exist machine-wide.
 
-## Step 5's record (2026-10-01): the Go server, under load — built, not passing
+## Step 5's record (2026-10-01): the Go server, under load — passing
 
 **The toolchain is pinned: go 1.27.1**, the project lead's choice of
 2026-10-01 over CI's 1.24.13 and the build host's 1.13.8.
@@ -388,8 +388,9 @@ still running at the end, and during its run **no park was refused, none ran
 out of retries and no deadline arm was refused** — counted across the run by
 the kernel's own line, because the boot's park readings are printed before the
 server starts. `make test-http` runs thirty seconds and `make soak-http` three
-hundred; ~~in `make test` and a CI job, and in the nightly soak~~ **neither is
-in `make test`, CI or the soak yet** — see *The corruption* below. **Armed twice:**
+hundred; both are in `make test`, a CI job and the nightly soak — ~~**neither is
+in `make test`, CI or the soak yet**~~ they were out for the day the corruption
+below was open. **Armed twice:**
 a load tool expecting one wrong byte in one response, and a server that exits
 after 300 requests; each failed the lane, the second on both the host's side
 and the kernel's.
@@ -443,7 +444,24 @@ have come back:**
    on the spot now, still without ever waiting for a lock; the lane's run line
    counts how often (2 of 2 on the first passing run).
 
-**The corruption — open.** Every run past about a minute has died: four of
+**The five-minute run, 2026-10-01, after the fix below:** 61,447 responses from
+16 clients in 300.1 s (204.7/s), 0 errors, 0 reconnects; latency p50 41.3 ms,
+p99 301.4 ms, max 1,278.6 ms; 889,249 calls by the server, no park refused.
+
+**The corruption — ~~open~~ found and fixed the same day.** **The cause:** the
+kernel whitelists supervisor methods twice — once where each is handled
+(`domain_supervise`) and once where an `INVOKE` is routed there — and
+`DISCARD_AT` was added to the first and not the second. Every
+`MADV_DONTNEED` was therefore refused. Go 1.27.1 treats memory it has released
+that way as zeroed when it next allocates it, so it handed out objects full of
+old bytes. Found by logging every call the program made, which showed
+`madvise(…, MADV_DONTNEED)` answered `ENOMEM` on memory mapped four calls
+earlier. **Guarded now on every boot of every lane:** the memory probe discards
+its mapped range and must read 0 where it wrote 42; with the whitelist entry
+removed it fails `discard -12 then read 42`. The rest of this paragraph is how
+it was narrowed, kept because each ruling-out is a fact about this kernel.
+
+Every run past about a minute had died: four of
 three hundred seconds and one of a hundred and twenty, each differently —
 `stopm holding locks`; a map pointer of 8 (`maps.(*Iter).Init`); a signal
 arriving with no `g`; a plain `GET` whose `MultipartForm` was not nil
@@ -486,8 +504,12 @@ misaligned head of an aligned arena this way); `MADV_DONTNEED` was a no-op
 (`DISCARD_AT` drops the frames); and every unmap now invalidates each page on
 every CPU **before** its frame is freed — it did only when the space was loaded
 on the calling CPU, which `is_active`'s own note said would stop being enough
-once threads ran on several. The lead's decision stands: the lane stays out of
-`make test` and CI until the cause is found.
+once threads ran on several. ~~The lead's decision stands: the lane stays out
+of `make test` and CI until the cause is found.~~ The cause was found the same
+day — see the top of this paragraph — and the lane is back in both. Two more
+rulings-out from that day, by boots: the emulator (it corrupted under KVM and
+with Go limited to baseline instructions) and concurrent collection
+(`gcstoptheworld=2`).
 
 **What is not done, said:** `tgkill` carries only a fatal signal a thread sends
 itself, so Go's `SIGURG` preemption is refused and a goroutine is preempted only
@@ -630,7 +652,7 @@ is printed so that the number a faster path would improve is on record first.
    parked on `tcpd`'s wake for a set of streams, a timed retry otherwise; gate:
    an assembly probe served through `epoll`, edge-triggered, in two halves.
    Slot pressure under Go moves to step 5, which has the process to measure.
-5. 🔨 2026-10-01, built and not passing — **The server and the load** — `corpus/httpd.go`, its image, the boot flag,
+5. ✅ 2026-10-01 — **The server and the load** — `corpus/httpd.go`, its image, the boot flag,
    `tools/http-load.py`, `make test-http` in CI, 300 s in the soak.
 6. **Step 10's record** — the measured result against the gate, in RFC 0005
    and here.

@@ -6494,7 +6494,14 @@ const MEMORY_REPORT_AT: u64 = 0x0000_0000_4002_0000;
 /// two anonymous pages, writes a pattern into the **second** one (so the
 /// lazy commit has to reach past the first), reads it back, unmaps the
 /// range, and gives `madvise` its advice. Each answer lands in the report.
-const MEMORY_CODE: [u8; 116] = [
+///
+/// **And before it unmaps, it discards** — RFC 0086 step 5 (2026-10-01).
+/// `madvise(MADV_DONTNEED)` on the mapped range must answer 0, and the page
+/// that held 42 must read 0 afterwards, because that is the promise a Go
+/// runtime builds on. The kernel refused every discard for a day — its method
+/// was missing from a whitelist — and Go reused the memory with its old bytes;
+/// this is the boot-time check that would have said so on every lane.
+const MEMORY_CODE: [u8; 151] = [
     0x49, 0x89, 0xff, // mov r15, rdi          ; report page
     0x31, 0xff, // xor edi, edi          ; addr = NULL
     0xbe, 0x00, 0x20, 0x00, 0x00, // mov esi, 8192         ; length
@@ -6507,11 +6514,19 @@ const MEMORY_CODE: [u8; 116] = [
     0x49, 0x89, 0x07, // mov [r15], rax        ; report the address
     0x48, 0x89, 0xc3, // mov rbx, rax          ; keep it
     0x48, 0x85, 0xc0, // test rax, rax
-    0x78, 0x41, // js done               ; refused: leave proof zero
+    0x78, 0x64, // js done               ; refused: leave proof zero
     0x48, 0xc7, 0x83, 0x00, 0x10, 0x00, 0x00, 0x2a, 0x00, 0x00,
     0x00, // mov qword [rbx+0x1000], 42
     0x48, 0x8b, 0x83, 0x00, 0x10, 0x00, 0x00, // mov rax, [rbx+0x1000]
     0x49, 0x89, 0x47, 0x08, // mov [r15+8], rax      ; report what read back
+    0x48, 0x89, 0xdf, // mov rdi, rbx
+    0xbe, 0x00, 0x20, 0x00, 0x00, // mov esi, 8192
+    0xba, 0x04, 0x00, 0x00, 0x00, // mov edx, 4            ; MADV_DONTNEED
+    0xb8, 0x1c, 0x00, 0x00, 0x00, // mov eax, 28           ; madvise, still mapped
+    0x0f, 0x05, // syscall
+    0x49, 0x89, 0x47, 0x20, // mov [r15+32], rax     ; its answer: 0
+    0x48, 0x8b, 0x83, 0x00, 0x10, 0x00, 0x00, // mov rax, [rbx+0x1000]
+    0x49, 0x89, 0x47, 0x28, // mov [r15+40], rax     ; the 42 is gone: 0
     0x48, 0x89, 0xdf, // mov rdi, rbx
     0xbe, 0x00, 0x20, 0x00, 0x00, // mov esi, 8192
     0xb8, 0x0b, 0x00, 0x00, 0x00, // mov eax, 11           ; munmap
@@ -6828,20 +6843,20 @@ fn memory_self_test(hhdm_base: u64, cpus: u32) -> bool {
         return false;
     }
 
-    let mut answers = [0u64; 4];
+    let mut answers = [0u64; 6];
     let mut report_pa = 0;
     for _ in 0..400 {
         report_pa = MEMORY_REPORT_PA.load(Ordering::Acquire);
         if report_pa != 0 {
-            // SAFETY: a frame the probe's space owns, through the direct map.
-            answers = unsafe {
-                [
-                    core::ptr::read_volatile((hhdm_base + report_pa) as *const u64),
-                    core::ptr::read_volatile((hhdm_base + report_pa + 8) as *const u64),
-                    core::ptr::read_volatile((hhdm_base + report_pa + 16) as *const u64),
-                    core::ptr::read_volatile((hhdm_base + report_pa + 24) as *const u64),
-                ]
-            };
+            // One read in a loop rather than one line per word: the probe
+            // reports six words since RFC 0086 step 5, and each line of an
+            // `unsafe` block counts against the budget.
+            for (index, slot) in answers.iter_mut().enumerate() {
+                let at = hhdm_base + report_pa + 8 * index as u64;
+                // SAFETY: a frame the probe's space owns, through the direct
+                // map, and `index` is below the six words it writes.
+                *slot = unsafe { core::ptr::read_volatile(at as *const u64) };
+            }
             // **The last answer, not the first.** This stopped as soon as the
             // read-back appeared, before the probe had stored `munmap`'s and
             // `madvise`'s answers -- invisible while both were expected to be
@@ -6878,11 +6893,16 @@ fn memory_self_test(hhdm_base: u64, cpus: u32) -> bool {
         && answers[1] == 42
         && answers[2] == 0
         && answers[3] == ENOMEM
+        // The discard of the still-mapped range answered 0, and the page that
+        // held 42 reads 0 after it -- see `MEMORY_CODE`.
+        && answers[4] == 0
+        && answers[5] == 0
     {
         println!(
             "    linux memory   a Linux program mapped two anonymous pages at {:#x}, wrote and \
-             read 42 in the second (so the lazy commit reached it), unmapped them, and was \
-             told ENOMEM for discarding what it no longer had, as Linux answers",
+             read 42 in the second (so the lazy commit reached it), discarded them and read 0 \
+             where the 42 had been, unmapped them, and was told ENOMEM for discarding what it \
+             no longer had, as Linux answers",
             answers[0]
         );
         if drawn {
@@ -6900,9 +6920,14 @@ fn memory_self_test(hhdm_base: u64, cpus: u32) -> bool {
         true
     } else {
         println!(
-            "\x1b[91m    linux memory   FAILED: mmap {:#x}, read back {}, munmap {}, madvise \
-             {}\x1b[0m",
-            answers[0], answers[1], answers[2] as i64, answers[3] as i64
+            "\x1b[91m    linux memory   FAILED: mmap {:#x}, read back {}, discard {} then read {}, \
+             munmap {}, madvise {}\x1b[0m",
+            answers[0],
+            answers[1],
+            answers[4] as i64,
+            answers[5],
+            answers[2] as i64,
+            answers[3] as i64
         );
         // **What the kernel actually returned, beside what the probe stored.**
         // CI run 489 reported `mmap 0x1`, which `mmap` cannot answer — and
