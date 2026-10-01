@@ -54,6 +54,28 @@ pub fn init() {
 /// when the host is loaded.
 static TICKS_PER_CPU: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
 
+/// Where each CPU's last timer tick landed: the interrupted `rip` and `cs`.
+///
+/// **A sample of where a spinning thread is**, which nothing else here can
+/// take. `TRACKER.md` §3's hosted `recvfrom` row has a probe thread current
+/// on its CPU and gaining 93% of the cycles between two looks, and it cannot
+/// say whether that is ring 3 or a kernel path on the thread's behalf. The
+/// tick interrupts whatever is running, so its frame is the answer, two
+/// stores per tick.
+static LAST_TICK_RIP: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+/// See [`LAST_TICK_RIP`].
+static LAST_TICK_CS: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+
+/// The `rip` and `cs` `cpu`'s last timer tick interrupted, or zeros for a CPU
+/// that does not exist or has not ticked.
+#[must_use]
+pub fn last_tick_on(cpu: usize) -> (u64, u64) {
+    match (LAST_TICK_RIP.get(cpu), LAST_TICK_CS.get(cpu)) {
+        (Some(rip), Some(cs)) => (rip.load(Ordering::Relaxed), cs.load(Ordering::Relaxed)),
+        _ => (0, 0),
+    }
+}
+
 /// Timer ticks observed so far.
 #[must_use]
 pub fn ticks() -> u64 {
@@ -651,6 +673,12 @@ fn handle_interrupt(frame: &mut TrapFrame) {
                 .and_then(|cpu| TICKS_PER_CPU.get(cpu))
             {
                 count.fetch_add(1, Ordering::Relaxed);
+            }
+            if let Ok(cpu) = usize::try_from(percpu::cpu_id())
+                && let (Some(rip), Some(cs)) = (LAST_TICK_RIP.get(cpu), LAST_TICK_CS.get(cpu))
+            {
+                rip.store(frame.rip, Ordering::Relaxed);
+                cs.store(frame.cs, Ordering::Relaxed);
             }
             // **The only watchdog the pre-scheduler part of bring-up has** --
             // RFC 0078. Two atomic loads and a comparison, and it returns

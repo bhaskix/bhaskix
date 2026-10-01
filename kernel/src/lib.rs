@@ -12784,6 +12784,17 @@ fn socket_self_test(hhdm_base: u64, cpus: u32) -> bool {
         return false;
     }
 
+    // **The calls the kernel answered `-ENOSYS` because it could not reach the
+    // adapter**, across this probe's window. A full queue retried 1,024 times
+    // and given up is answered that way -- for `exit_group` too, which then
+    // returns to the probe's closing `jmp .` (`TRACKER.md` §3).
+    let unreached = || {
+        [
+            syscall::ADAPTER_GAVE_UP.load(core::sync::atomic::Ordering::Relaxed),
+            syscall::ADAPTER_REFUSED.load(core::sync::atomic::Ordering::Relaxed),
+        ]
+    };
+    let unreached_before = unreached();
     let Ok(realm) = domain::create("socketeer", domain::ResourceEnvelope::new()) else {
         println!("\x1b[91m    linux socket   FAILED: no domain\x1b[0m");
         return false;
@@ -12842,8 +12853,14 @@ fn socket_self_test(hhdm_base: u64, cpus: u32) -> bool {
             // Sampled twice, 10 ms apart: a `Running` thread that gains
             // cycles is being run, and one that gains none is not.
             let first = sched::run_facts(thread);
+            let tick_first = first
+                .as_ref()
+                .map(|facts| (trap::last_tick_on(facts.cpu), facts.current));
             wait_millis(10);
             let second = sched::run_facts(thread);
+            let tick_second = second
+                .as_ref()
+                .map(|facts| (trap::last_tick_on(facts.cpu), facts.current));
             (
                 thread,
                 state,
@@ -12852,6 +12869,7 @@ fn socket_self_test(hhdm_base: u64, cpus: u32) -> bool {
                 ipc::where_queued(thread),
                 first,
                 second,
+                (tick_first, tick_second),
             )
         })
     };
@@ -12879,7 +12897,7 @@ fn socket_self_test(hhdm_base: u64, cpus: u32) -> bool {
              recvfrom should have given up rather than hanging\x1b[0m"
         );
         match stuck {
-            Some((thread, state, parked, held, queued, first, second)) => {
+            Some((thread, state, parked, held, queued, first, second, ticks)) => {
                 println!(
                     "\x1b[91m                   its thread {thread} is {state:?}, parked on \
                  notification {}, which holds {}; queued {}; the adapter's last call {last}, \
@@ -12923,6 +12941,52 @@ fn socket_self_test(hhdm_base: u64, cpus: u32) -> bool {
                         "\x1b[91m                   and no run queue held it when asked where it runs\x1b[0m"
                     ),
                 }
+                // **Ring 3 or a kernel path, the question the fourth sighting
+                // left.** Where the thread's CPU was when its timer last
+                // ticked, at each look -- an offset into the probe's own code
+                // when that is where it was. The probe's last instruction is
+                // the `jmp .` after `exit_group`, which only an `exit_group`
+                // that returned could reach.
+                // **The sample is the CPU's, not the thread's**, and is the
+                // thread's only while it is current: a forced boot read a
+                // blocked probe's CPU in another program's ring 3. So each
+                // look says which it was.
+                let place = |tick: Option<((u64, u64), bool)>| {
+                    let Some(((rip, cs), current)) = tick else {
+                        return alloc::string::String::from("nowhere a run queue could say");
+                    };
+                    let whose = if current {
+                        "the probe current"
+                    } else {
+                        "the probe not current, so another's"
+                    };
+                    if cs & 3 != 3 {
+                        return alloc::format!("ring {} at {rip:#x}, {whose}", cs & 3);
+                    }
+                    match rip.checked_sub(SOCKET_PROBE_CODE_AT) {
+                        Some(offset) if offset < SOCKET_PROBE_CODE.len() as u64 => {
+                            alloc::format!("ring 3 at offset {offset:#x} of the probe, {whose}")
+                        }
+                        _ => {
+                            alloc::format!("ring 3 at {rip:#x}, outside the probe's code, {whose}")
+                        }
+                    }
+                };
+                println!(
+                    "\x1b[91m                   its CPU's last timer tick, at each look: {}; then \
+                     {} (the probe's closing `jmp .` is at offset {:#x})\x1b[0m",
+                    place(ticks.0),
+                    place(ticks.1),
+                    SOCKET_PROBE_CODE.len().saturating_sub(2),
+                );
+                let unreached_after = unreached();
+                println!(
+                    "\x1b[91m                   while it ran, machine-wide, {} call(s) gave up on a full adapter \
+                     queue and {} were refused by its endpoint -- each answered -ENOSYS without \
+                     the adapter seeing it\x1b[0m",
+                    unreached_after[0] - unreached_before[0],
+                    unreached_after[1] - unreached_before[1],
+                );
             }
             None => println!(
                 "\x1b[91m                   and no thread of it was left to ask; the adapter's \
