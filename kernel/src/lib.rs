@@ -13564,6 +13564,20 @@ fn personality_self_test(hhdm_base: u64, cpus: u32) -> bool {
         }
         outcome
     });
+    // **The count again, once the question has been answered** -- and the
+    // classification below reads *this* one. `calls_at_probe` is taken before
+    // the question, and the probe's eighth call is its own `exit`: an `exit`
+    // landing between that read and the question leaves no thread, so `Ok` is
+    // right while the earlier count still says seven. One boot on 2026-10-02
+    // printed exactly that, `asked after 7 of 8`, and it was read as a live
+    // thread going uncounted; the order of these reads says it may not have
+    // been. Only a count still below eight *after* the question proves the
+    // `exit` had not even been entered while the question was asked.
+    //
+    // `FOREIGN_CALLS` is machine-wide, so another domain's call could lift this
+    // and hide a real case -- a false negative, never a false alarm. Nothing
+    // else makes foreign calls this early in bring-up.
+    let calls_after = syscall::FOREIGN_CALLS.load(Ordering::Relaxed) - calls_before;
 
     // And *then* wait for all eight, which is what the destroy below needs: the
     // probe's own exit is its last call, so tearing the domain down earlier
@@ -13644,8 +13658,14 @@ fn personality_self_test(hhdm_base: u64, cpus: u32) -> bool {
         Some(Ok(())) if calls_at_probe >= 8 => {
             "the probe had already made all eight calls and gone, so there was no tag to refuse"
         }
-        Some(Ok(())) => {
+        // Certain: the `exit` had not been entered even after the answer.
+        Some(Ok(())) if calls_after < 8 => {
             "A TAG CHANGE WON WHILE THE PROBE WAS MID-SEQUENCE -- a live thread went uncounted"
+        }
+        // The `exit` landed inside the window: allowed, and not proof either way.
+        Some(Ok(())) => {
+            "the tag change was allowed while the probe's own exit raced it, which proves \
+             nothing either way"
         }
         // (the blinded-scan count for this window is printed beside the note)
         None => "the domain had already ended, so no tag change was refused",
@@ -13774,7 +13794,8 @@ fn personality_self_test(hhdm_base: u64, cpus: u32) -> bool {
              answered, the bad descriptor refused EBADF, and exit never came back; it then \
              asked for all five of this kernel's own syscall kinds by number and got a Linux \
              errno five times, surviving the one that is Exit natively; 8 foreign calls logged \
-             in order, {late_note} (asked after {calls_at_probe} of 8 calls, \
+             in order, {late_note} (asked between {calls_at_probe} and {calls_after} of 8 \
+             calls, \
              {} run-queue scans blinded), and the tag cleared when the domain ended",
             sched::domain_scan_skips().saturating_sub(skips_before)
         );

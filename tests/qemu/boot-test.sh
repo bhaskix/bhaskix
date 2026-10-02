@@ -125,6 +125,11 @@ FAILURE_MARKERS=("KERNEL PANIC" "FATAL:" "WARNING: the memory map was truncated"
                  # needs the bug back and one boot in twenty of patience, and a
                  # marker for a fact that is a bug by construction does not need
                  # the bug to be worth having.
+                 #
+                 # **Classified on the count read *after* the question since
+                 # 2026-10-02.** It was read before, and the probe's eighth call
+                 # is its own `exit`, so one boot printed this for a thread that
+                 # may already have gone. Watched red with the guard disabled.
                  "A TAG CHANGE WON WHILE THE PROBE WAS MID-SEQUENCE")
 # Note: "timed out" is deliberately NOT a marker. The success message reads
 # "none timed out" and a substring match on it fails every passing run --
