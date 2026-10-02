@@ -11,7 +11,7 @@
 | | |
 |---|---|
 | RFCs accepted | **52** |
-| RFCs open | 33 |
+| RFCs open | 34 |
 | RFCs closed without shipping | 2 |
 | Milestone rows done | **92 of 95** |
 | Phase 2 bullets done | **12 of 13** |
@@ -30,6 +30,7 @@ gantt
     section Boot & firmware
     RFC 0025 Four-level paging on purpose :done, r0025, 2026-08-15, 2026-08-16
     RFC 0028 bhaskixboot.efi — the machine enters through our... :done, r0028, 2026-08-17, 2026-08-18
+    RFC 0088 A clock a process reads itself :active, r0088, 2026-10-02, 2026-10-02
     section Filesystem & storage
     RFC 0003 Storage architecture :active, r0003, 2026-08-03, 2026-10-02
     RFC 0006 Kosh — unified storage from one node to many :active, r0006, 2026-08-03, 2026-10-02
@@ -198,6 +199,7 @@ gantt
 | 0085 | A futex sleeper comes back for its answer | 2026-09-29 |
 | 0086 | The motivating workload — a Go HTTP server under load | 2026-09-30 |
 | 0087 | A holder that survives its lender | 2026-09-30 |
+| 0088 | A clock a process reads itself | 2026-10-02 |
 
 ## Annexes
 
