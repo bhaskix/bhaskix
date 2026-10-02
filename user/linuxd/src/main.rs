@@ -5913,12 +5913,26 @@ fn answer_ioctl(request: &PersonalityCall) -> Answer {
         return Answer::error(-9);
     };
     match plan_ioctl(request.second(), entry.kind) {
-        // **Nothing is written back for `TCGETS`**, and that is deliberate:
+        // ~~**Nothing is written back for `TCGETS`**, and that is deliberate:
         // `isatty` reads the *return value*, not the `termios` it passed, and
-        // this adapter has no terminal settings it could honestly report.
-        // Filling the caller's buffer with plausible ones would be inventing
-        // a baud rate and a line discipline.
-        Ok(Ioctl::AskIfTerminal) => Answer::ok(0),
+        // this adapter has no terminal settings it could honestly report.~~
+        // **Wrong, found 2026-10-02: a success that writes nothing is not
+        // silence, it is a promise the buffer was filled.** `isatty` reads only
+        // the return value; `tcgetattr` reads the buffer, and BusyBox's line
+        // editor took the stack bytes it found there as its interrupt and
+        // end-of-file keys -- a typed `p` was discarded on every boot, and
+        // under load a typed space ended the line (`TRACKER.md` §3).
+        //
+        // The settings written are all zero, which is this console's truth
+        // rather than an invented one: see `console_termios`. A buffer the
+        // caller cannot have is `EFAULT`, as Linux answers.
+        Ok(Ioctl::AskIfTerminal) => {
+            let termios = bhaskix_personality::file::console_termios();
+            if !copy_out(request.domain, request.third(), &termios) {
+                return Answer::error(-14); // EFAULT
+            }
+            Answer::ok(0)
+        }
         Ok(Ioctl::WindowSize) => {
             // Four `u16`s: rows, columns, and two pixel counts. Zeroes,
             // because this console's size is not something the adapter knows

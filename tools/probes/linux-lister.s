@@ -104,10 +104,13 @@ _start:
         syscall
 
         # 7. ioctl(1, TCGETS) -- the console *is* a terminal, so this answers
-        #    zero, and `isatty` reads exactly this.
+        #    zero, and `isatty` reads exactly this. **Into a real buffer**:
+        #    until 2026-10-02 this passed a null one, which Linux refuses
+        #    `EFAULT` and the adapter only accepted because it wrote nothing
+        #    -- the bug that fed BusyBox garbage settings (TRACKER §3).
         mov     $1, %edi
         mov     $0x5401, %esi
-        xor     %edx, %edx
+        lea     2048(%r12), %rdx
         mov     $16, %eax               # ioctl
         syscall
         test    %rax, %rax
@@ -119,7 +122,7 @@ _start:
         #    than twice is an adapter calling every descriptor a terminal.
         mov     %r13, %rdi
         mov     $0x5401, %esi
-        xor     %edx, %edx
+        lea     2048(%r12), %rdx
         mov     $16, %eax
         syscall
         test    %rax, %rax

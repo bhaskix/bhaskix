@@ -696,6 +696,10 @@ to a caller's buffer at a length only the request number implies. The refusal
 is `ENOTTY` and not `EINVAL` because `ENOTTY` is what `isatty` turns into
 "no" — every program that redirects its output asks this on every run, and a
 different errno makes each of them believe its pipe is a terminal.
+**`TCGETS` writes the settings it reports since 2026-10-02** — all zero, this
+console's truth (`personality::file::console_termios`). Before that it answered
+success and wrote nothing, and BusyBox read its buffer's garbage as interrupt
+and end-of-file keys (`TRACKER.md` §3).
 
 Two more, smaller but worth stating. **`F_SETFL` is accepted and does
 nothing**: the flags it can change are `O_APPEND`, `O_NONBLOCK` and `O_ASYNC`,

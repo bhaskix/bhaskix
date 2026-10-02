@@ -201,8 +201,12 @@ it was attributed: the nucleus was instrumented to log every byte `POLL_INPUT`
 hands out and logged all five `p`s of `echo ppqpprp busybox`; no park and no
 refused copy happened for any of them; and substituting `0x71` for `0x70` in the
 adapter made every one land, echo, and print. The delivery path is therefore
-proved correct and the discard is in the program. The lane types a phrase with
-no `p` in it and says why.
+proved correct ~~and the discard is in the program. The lane types a phrase with
+no `p` in it and says why.~~ **Corrected 2026-10-02: the discard was the
+adapter's.** It answered `TCGETS` with success and wrote nothing, so BusyBox's
+terminal settings were an uninitialised buffer holding `0x70` in `VEOF`, and `p`
+was Ctrl-D. The adapter reports all-zero settings now, and the lane types `p`
+again (`TRACKER.md` §3).
 
 ## Unresolved questions
 

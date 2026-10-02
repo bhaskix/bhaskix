@@ -803,6 +803,32 @@ pub mod ioctl {
     pub const TIOCGWINSZ: u64 = 0x5413;
 }
 
+/// Bytes in the `termios` a `TCGETS` fills: the kernel's own layout, four
+/// 32-bit flag words, the line discipline, and nineteen control characters
+/// (`asm-generic/termbits.h` on the build host, read 2026-10-02).
+pub const TERMIOS_BYTES: usize = 36;
+
+/// The terminal settings this adapter reports for a console: **all zero**.
+///
+/// The project lead's choice of 2026-10-02, and it describes this console
+/// rather than inventing one. Bytes arrive one at a time and are not
+/// assembled into lines (`ICANON` clear); nothing echoes them but the program
+/// (`ECHO` clear); no key is turned into a signal, so there is no interrupt,
+/// end-of-file or any other special character (`c_cc` all zero, which Linux
+/// reads as "disabled"). The baud field reads `B0`, which Linux uses for a
+/// line that has hung up: an odd figure for a program that prints its speed,
+/// and still not an invented one.
+///
+/// **Until this existed the adapter answered `TCGETS` and wrote nothing**,
+/// and a program's C library then read whatever its own buffer held as the
+/// settings. BusyBox's line editor treated a stray byte in the `VINTR` slot as
+/// Ctrl-C and one in `VEOF` as Ctrl-D: a typed space dropped the whole line
+/// under load, and a `p` was discarded on every boot (`TRACKER.md` §3).
+#[must_use]
+pub const fn console_termios() -> [u8; TERMIOS_BYTES] {
+    [0; TERMIOS_BYTES]
+}
+
 /// What an `ioctl` asks for, if this adapter answers it at all.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Ioctl {
@@ -1056,6 +1082,17 @@ pub fn stat_of(entry: &Entry) -> StatFields {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_console_reports_no_special_characters() {
+        let termios = console_termios();
+        assert_eq!(termios.len(), 36, "the kernel's struct termios");
+        // Four flag words, then `c_line`, then `c_cc`: VINTR is c_cc[0] and
+        // VEOF is c_cc[4]. A nonzero byte in either is a key that ends a line.
+        assert_eq!(termios[17], 0, "VINTR");
+        assert_eq!(termios[21], 0, "VEOF");
+        assert!(termios.iter().all(|byte| *byte == 0));
+    }
     use super::*;
 
     #[test]

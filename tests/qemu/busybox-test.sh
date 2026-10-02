@@ -162,16 +162,21 @@ fi
 # So the reply must arrive **while BusyBox still holds the console**, which is
 # before the corpus prints its summary and long before the Bhaskix shell greets
 # anybody. Position is what tells the two apart, and nothing else here can.
-# **No `p` in this line, and that is a measured working-around of the program
+# ~~**No `p` in this line, and that is a measured working-around of the program
 # rather than a stylistic choice.** This BusyBox binary does not put byte 0x70
-# from its standard input into the line it is building: `p` alone, of every
-# byte in a-z, A-Z and 0-9, is read and discarded. The delivery path was proved
-# correct before the phrase was changed -- the nucleus was instrumented to log
-# every byte `POLL_INPUT` hands out (all five `p`s of `echo ppqpprp busybox`
-# appeared), no park and no refused copy occurred, and substituting 0x71 for
-# 0x70 in the adapter made every one of them land and print. See TRACKER's
-# entry for 2026-08-28. Typing a `p` here would fail this lane for a fault
-# that is not the machine's.
+# from its standard input into the line it is building~~ -- **wrong about whose
+# fault it was, found 2026-10-02.** The delivery path was proved correct then
+# and still is; what dropped the `p` was the adapter. It answered `TCGETS`
+# with success and wrote nothing, so glibc's `tcgetattr` handed BusyBox
+# whatever its own buffer held as the terminal settings, and that buffer had
+# 0x70 in `VEOF`: a typed `p` was Ctrl-D. The same garbage with a space in
+# `VINTR` made a typed space Ctrl-C under load, which is TRACKER §3's "typed
+# keystroke never reached BusyBox". The adapter now reports all-zero settings
+# (`personality::file::console_termios`).
+#
+# **So the line carries `p`s on purpose.** Any byte in a special-character
+# slot drops one of them deterministically, which makes this lane the guard
+# against that coming back.
 # **Answer the cursor-position report first, because this harness is the
 # terminal.** Once `poll` was answered (RFC 0055), BusyBox's line editor began
 # doing the handshake a terminal is expected to complete: it writes `ESC [ 6 n`
@@ -188,9 +193,9 @@ if await_quiet $'\033\[6n'; then
     sleep 1
 fi
 
-printf 'echo keyed at busybox\r' >&3
-if await "keyed at busybox"; then
-    replied=$(grep -an 'keyed at busybox' "$LOG" | head -1 | cut -d: -f1)
+printf 'echo keyed at busybox pqp\r' >&3
+if await "keyed at busybox pqp"; then
+    replied=$(grep -an 'keyed at busybox pqp' "$LOG" | head -1 | cut -d: -f1)
     # **Nothing had prompted `bhaskix` yet**, which is what says BusyBox
     # answered and not the shell that starts after it.
     #
