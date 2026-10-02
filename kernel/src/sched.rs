@@ -1567,6 +1567,53 @@ pub fn set_fs_base(thread: u32, base: u64) -> bool {
     false
 }
 
+/// Bases put in the register on the way back from a foreign call, because the
+/// caller's record and this CPU's register disagreed.
+static FS_BASES_LOADED_ON_RETURN: AtomicU64 = AtomicU64::new(0);
+
+/// How many times [`sync_fs_base_on_return`] had to load a base.
+#[must_use]
+pub fn fs_bases_loaded_on_return() -> u64 {
+    FS_BASES_LOADED_ON_RETURN.load(Ordering::Relaxed)
+}
+
+/// Makes this CPU's `IA32_FS_BASE` equal the calling thread's record, on the
+/// way back to user mode from a foreign call.
+///
+/// **The case RFC 0062 left open, closed where it can be closed for certain.**
+/// `set_fs_base` cannot write another CPU's register; for a target current
+/// there it sends an IPI whose handler takes that CPU's queue with `try_lock`
+/// -- and on a miss does nothing, trusting "the next switch". A thread that
+/// returns to user mode without one keeps its old base. 2026-10-02's BusyBox
+/// specimen is that: `arch_prctl(ARCH_SET_FS)`, then `mov %eax,%fs:0x48`
+/// faulting at `0x48`, on a boot reading `1 FS base(s) set for a thread
+/// running on another cpu; 0 loaded there by RFC 0062's IPI`.
+///
+/// The thread that asked is the one returning from that very call, on its own
+/// CPU, so the check belongs here: lock this CPU's queue -- which also keeps
+/// the caller from moving, as [`load_fs_base`] requires -- and load the record
+/// if the register differs. Only foreign calls come here, so the native path
+/// pays nothing; a foreign call has already paid an adapter round trip, beside
+/// which one more lock is noise. The IPI stays, for a thread interrupted in
+/// user mode rather than returning from a call.
+pub fn sync_fs_base_on_return() {
+    let Some((_, queue)) = lock_own_queue() else {
+        return;
+    };
+    let Some(thread) = queue.threads[queue.current].as_ref() else {
+        return;
+    };
+    let base = thread.fs_base;
+    if base != fs_base_loaded() {
+        // SAFETY: as `load_fs_base` -- the caller's own base, loaded with this
+        // CPU's queue lock held, so the caller cannot move between the write
+        // and the record of it.
+        unsafe { load_fs_base(base) };
+        FS_BASES_LOADED_ON_RETURN.fetch_add(1, Ordering::Relaxed);
+    }
+    drop(queue);
+}
+
 /// Loads this CPU's current thread's recorded FS base into the register.
 ///
 /// **The receiving half of RFC 0062.** `set_fs_base` cannot write another CPU's
@@ -1577,9 +1624,12 @@ pub fn set_fs_base(thread: u32, base: u64) -> bool {
 /// base and the window would be exactly as open as before.
 ///
 /// `try_lock`, because this is reachable from an interrupt on a CPU that may
-/// have been interrupted holding this very lock. A miss is not a failure: the
+/// have been interrupted holding this very lock. ~~A miss is not a failure: the
 /// base still arrives at the next switch, which is what happened before this
-/// existed.
+/// existed.~~ **A miss was a failure for a thread that returned to user mode
+/// without a switch** (2026-10-02, a BusyBox `%fs:0x48` fault); the caller of
+/// a foreign call is now made whole by [`sync_fs_base_on_return`] instead, and
+/// a miss here matters only for a thread interrupted in user mode.
 pub(crate) fn refresh_fs_base_here() {
     // CPU: interrupt -- runs from the FS-base IPI handler.
     let cpu = percpu::cpu_id() as usize;

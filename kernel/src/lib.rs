@@ -4998,7 +4998,8 @@ fn personality_boundary_report() {
     // soak that never opens the window says so by silence rather than by a line
     // of zeroes nobody reads.
     let elsewhere = sched::FS_BASE_SET_ELSEWHERE.load(core::sync::atomic::Ordering::Relaxed);
-    if elsewhere > 0 {
+    let on_return = sched::fs_bases_loaded_on_return();
+    if elsewhere > 0 || on_return > 0 {
         // **Both numbers, because one of them is the fix working.** `elsewhere`
         // counts a base set for a thread running on another CPU -- the window
         // itself, which RFC 0062 does not remove and cannot: the register is
@@ -5026,7 +5027,8 @@ fn personality_boundary_report() {
         println!(
             "    linux tls      {elsewhere} FS base(s) set for a thread running on another cpu; \
              {by_ipi} loaded there by RFC 0062's IPI rather than waiting for a switch \
-             ({contended} lost the queue lock, {idle} had nothing to load)"
+             ({contended} lost the queue lock, {idle} had nothing to load); {on_return} \
+             loaded on the way back from a foreign call because the register disagreed"
         );
     }
     // **And every park that did not happen** — RFC 0054. A refused park loses a

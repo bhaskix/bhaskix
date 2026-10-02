@@ -165,3 +165,22 @@ this RFC closes. And the obvious check is not free: `current_thread_id()` takes 
 too, so the step needs a lock-free per-CPU record of who is running, which is a **second source of
 truth for a fact the runqueue already owns**. That is the real cost of this step, and it is a design
 question rather than an implementation detail.
+
+## The miss this RFC called a bug, closed at the caller (2026-10-02)
+
+This RFC said a boot with `elsewhere` above zero and `by_ipi` at zero would be
+"a bug in this RFC rather than a mystery". One arrived: a BusyBox boot reading
+`1 FS base(s) set for a thread running on another cpu; 0 loaded there by
+RFC 0062's IPI` (with 346 lost locks machine-wide) faulted on
+`mov %eax,%fs:0x48` right after `arch_prctl(ARCH_SET_FS)` — a store through
+the zero base the IPI did not replace. The handler's `try_lock` miss was
+documented as "not a failure: the base still arrives at the next switch",
+which is untrue for a thread that returns to user mode without one.
+
+The fix does not try to make the IPI win. The thread that sets its own base
+does so through a foreign call and is the thread returning from it, on its own
+CPU — so `sched::sync_fs_base_on_return`, on the foreign-call return path,
+locks that CPU's queue and loads the record if the register differs. The IPI
+remains for a thread interrupted in user mode. **Likely fixed, not proven**:
+the window did not open in 30 boots, ten of them with the IPI handler disabled
+outright, so the claim rests on the reading (`TRACKER.md` §3).

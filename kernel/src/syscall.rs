@@ -2462,7 +2462,13 @@ fn foreign_call(frame: &mut SyscallFrame, domain: u32) {
     if let Some(domain) = crate::sched::current_domain() {
         crate::domain::note_hosted_call(domain, call.number, call.args[0]);
     }
-    if let Some(value) = adapter_call(frame, &call) {
+    let answered = adapter_call(frame, &call);
+    // **The register equal to the record before user mode sees it** -- the
+    // caller may have just set its own `FS` base through the adapter, and the
+    // IPI that should have loaded it can lose its lock. See
+    // `sched::sync_fs_base_on_return`.
+    crate::sched::sync_fs_base_on_return();
+    if let Some(value) = answered {
         frame.kind = value;
         note_return(number, value);
         note_refused(call.domain, number, value);
