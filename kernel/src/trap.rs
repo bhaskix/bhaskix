@@ -349,6 +349,15 @@ fn handle(frame: &mut TrapFrame) {
         // used to do -- so a report could name an address that was not the
         // fault's, which is the one value a fault report exists to carry.
         let faulted_at = read_cr2();
+        // **And the FS base the CPU held at the fault, read here for the same
+        // reason.** `hand_over` blocks in the adapter, so this thread is
+        // switched out and back -- and the switch reloads `IA32_FS_BASE` from
+        // the thread's record. Read after it, as until 2026-10-02, the register
+        // always agreed with the record and the report's first rule below could
+        // never fire: a BusyBox specimen faulting on `mov %eax,%fs:0x48` with
+        // `cr2 0x48`, a base of zero, printed the right base beside it.
+        // SAFETY: `IA32_FS_BASE` is architectural on every x86-64 CPU.
+        let register = unsafe { bhaskix_arch::msr::read(bhaskix_arch::msr::IA32_FS_BASE) };
         if crate::fault::hand_over(frame, faulted_at) {
             crate::sched::check_user_space(3);
             return;
@@ -410,12 +419,11 @@ fn handle(frame: &mut TrapFrame) {
         //   are sound, so the handler word at `rax+0x18` is what changed.
         //
         // The register is read, not the per-CPU record of it, because the
-        // record matching the register is the assumption under test.
-        // SAFETY: `IA32_FS_BASE` is architectural on every x86-64 CPU.
-        let register = unsafe { bhaskix_arch::msr::read(bhaskix_arch::msr::IA32_FS_BASE) };
+        // record matching the register is the assumption under test -- and it
+        // is read **at the fault**, above, before `hand_over` reloads it.
         let asked = Word(crate::sched::current_fs_base());
         println!(
-            "                   its fs base: register {register:#x}, thread asked for {asked}; \
+            "                   its fs base: register at the fault {register:#x}, thread asked for {asked}; \
              fs+0x28 {} fs+0x30 {}; rax {:#x}, its +0x18 {}",
             word(register.wrapping_add(0x28)),
             word(register.wrapping_add(0x30)),
