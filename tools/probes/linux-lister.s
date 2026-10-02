@@ -129,6 +129,69 @@ _start:
         jns     done                    # succeeded, which is the bug
         call    machine
 
+        # 9-11. **Outputs a call promises to write** -- the class `TCGETS`
+        #    was (TRACKER §3, 2026-10-02). Each buffer is filled with 0xAA
+        #    first, so a call that answers success and writes nothing cannot
+        #    pass; each check that holds prints `sigok`, and the first that
+        #    does not ends the probe, so the count says which one failed.
+        movabs  $0xaaaaaaaaaaaaaaaa, %rbx
+
+        # 9. rt_sigaction(SIGUSR1, NULL, &old, 8) -- a query. Nothing was
+        #    installed, so the answer is SIG_DFL: all 32 bytes zero.
+        mov     %rbx, 2560(%r12)
+        mov     %rbx, 2568(%r12)
+        mov     %rbx, 2576(%r12)
+        mov     %rbx, 2584(%r12)
+        mov     $10, %edi
+        xor     %esi, %esi
+        lea     2560(%r12), %rdx
+        mov     $8, %r10d
+        mov     $13, %eax
+        syscall
+        test    %rax, %rax
+        jnz     done
+        mov     2560(%r12), %rax
+        or      2568(%r12), %rax
+        or      2576(%r12), %rax
+        or      2584(%r12), %rax
+        jnz     done
+        call    sigok
+
+        # 10. sigaltstack(NULL, &old) -- none was set, so Linux answers
+        #     {0, SS_DISABLE, 0}. The flags are an int; only those four bytes
+        #     are compared.
+        mov     %rbx, 2560(%r12)
+        mov     %rbx, 2568(%r12)
+        mov     %rbx, 2576(%r12)
+        xor     %edi, %edi
+        lea     2560(%r12), %rsi
+        mov     $131, %eax
+        syscall
+        test    %rax, %rax
+        jnz     done
+        cmpq    $0, 2560(%r12)
+        jne     done
+        cmpl    $2, 2568(%r12)
+        jne     done
+        cmpq    $0, 2576(%r12)
+        jne     done
+        call    sigok
+
+        # 11. rt_sigprocmask(SIG_BLOCK, NULL, &old, 8) -- nothing is blocked
+        #     in a process that never blocked anything.
+        mov     %rbx, 2560(%r12)
+        xor     %edi, %edi
+        xor     %esi, %esi
+        lea     2560(%r12), %rdx
+        mov     $8, %r10d
+        mov     $14, %eax
+        syscall
+        test    %rax, %rax
+        jnz     done
+        cmpq    $0, 2560(%r12)
+        jne     done
+        call    sigok
+
 done:
         xor     %edi, %edi
         mov     $231, %eax              # exit_group
@@ -140,6 +203,16 @@ done:
 machine:
         lea     1284(%r12), %rsi
         mov     $6, %edx
+        mov     $1, %edi
+        mov     $1, %eax
+        syscall
+        ret
+
+        # write(1, names + 8, 5) -- "sigok", which the kernel puts beside
+        # the names; one per output that came back written.
+sigok:
+        lea     8(%r14), %rsi
+        mov     $5, %edx
         mov     $1, %edi
         mov     $1, %eax
         syscall

@@ -3345,8 +3345,18 @@ reached the console; two hosted programs read a file and both must"
         #                every program that redirects its output asks this.
         fail "uname or the ioctl allow-list did not answer: $(grep -aoE 'Linux[a-z0-9_]*' "$LOG" | head -1)"
         status=1
+    elif ! grep -qF "sigoksigoksigok" "$LOG"; then
+        # **Outputs a call promises to write** -- `rt_sigaction`'s `oldact`,
+        # `sigaltstack`'s `old_ss`, `rt_sigprocmask`'s `oldset`, each asked
+        # into a buffer of 0xAA and checked for the value Linux answers. One
+        # `sigok` per output that came back written, in that order, and the
+        # probe stops at the first that did not: the count says which. The
+        # class `TCGETS` was (TRACKER §3, 2026-10-02) -- a success that
+        # writes nothing leaves the caller its own garbage.
+        fail "a call answered success without writing its output: $(( $(grep -aoE '(sigok)+' "$LOG" | head -1 | tr -d '\n' | wc -c) / 5 )) of 3 came back written (rt_sigaction, sigaltstack, rt_sigprocmask, in that order)"
+        status=1
     else
-        pass "a hosted program read a second file, asked uname, and found only its console is a terminal"
+        pass "a hosted program read a second file, asked uname, found only its console is a terminal, and every signal output it asked for came back written"
     fi
 elif grep -qF "linux dir      skipped" "$LOG"; then
     pass "no filesystem service on this machine, so hosted programs have no directory to list"

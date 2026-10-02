@@ -233,6 +233,19 @@ no longer what makes the delivery possible. What is written above stays as the
 record of how it was found — the adapter's *"could not build"* counter is still
 the thing that would say so if it came back.
 
+## What the old values report (2026-10-02)
+
+`rt_sigaction`'s `oldact`, `sigaltstack`'s `old_ss` and `rt_sigprocmask`'s
+`oldset` were never written until 2026-10-02 — a success that leaves the
+caller's buffer alone, which glibc reads back as the answer (`TRACKER.md` §3,
+the class `TCGETS` was). They now report the handler in force before the call
+(all zero, `SIG_DFL`, when none), the recorded alternate stack or
+`{0, SS_DISABLE, 0}`, and the blocked set. **`rt_sigprocmask` still does not
+apply the set it is given**: the blocked set here belongs to a domain, Linux's
+to a thread, and which this personality should honour is not settled by
+reporting it. An interrupted sleep also writes `rem` now, which this RFC's
+`EINTR` made necessary.
+
 ## Alternatives considered
 
 | Alternative | Why rejected | Would reconsider if |

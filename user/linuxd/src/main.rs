@@ -2006,7 +2006,7 @@ fn answer(request: &PersonalityCall) -> (u64, Answer) {
         // editor sleeps between retries once it believes `poll` works, and a
         // sleep refused with `ENOSYS` is what made it give up and exit.
         CLOCK_NANOSLEEP => return answer_nanosleep(request),
-        NANOSLEEP => return answer_nanosleep_relative(request, request.first()),
+        NANOSLEEP => return answer_nanosleep_relative(request, request.first(), request.second()),
         TGKILL => return answer_tgkill(request),
         // **In this dispatcher and not the one below**, for the reason
         // `exit_group` is: a caller may name itself, and only this one can
@@ -2258,7 +2258,25 @@ fn answer_from_message(request: &PersonalityCall) -> Answer {
         // rather than `-ENOSYS`, because a runtime told it cannot mask signals
         // takes a slower path for a promise nothing here breaks: no signal is
         // delivered asynchronously, so a mask has nothing to hide from.
-        RT_SIGPROCMASK => Answer::ok(0),
+        // **`oldset` is written when asked for** -- the blocked set as it
+        // stands, which is what Linux answers. Until 2026-10-02 this was a bare
+        // success and the caller kept its own garbage (`TRACKER.md` §3).
+        //
+        // **The new set is still not applied**, as before: masks here belong
+        // to a domain and Linux's to a thread, so honouring one is a design
+        // question this answer does not settle. A size other than the kernel's
+        // eight bytes is refused, as Linux refuses it.
+        RT_SIGPROCMASK => {
+            if request.fourth() != 8 {
+                return Answer::error(memory::errno::EINVAL);
+            }
+            let old = request.third();
+            let blocked = dispositions_of(request.domain).blocked();
+            if old != 0 && !copy_out(request.domain, old, &blocked.to_le_bytes()) {
+                return Answer::error(bhaskix_personality::socket::errno::EFAULT);
+            }
+            Answer::ok(0)
+        }
         // A thread id a hosted program can tell apart from its neighbours,
         // and stable for the life of the thread. **It arrives in the badge**,
         // whose high half the kernel stamps with the calling thread — a
@@ -2441,55 +2459,53 @@ fn answer_from_message(request: &PersonalityCall) -> Answer {
         // **Querying is answered as success with nothing written.** A caller
         // asking about an unset handler would see exactly that anyway, and
         // pretending to write the old one would be worse than not.
+        // **`oldact` is written whenever it is asked for** -- a query (`act`
+        // null) included. Until 2026-10-02 it never was, and glibc's
+        // `sigaction` then read its own uninitialised buffer back as the
+        // answer: the class `TCGETS` was (`TRACKER.md` §3). The answer is the
+        // handler in force before this call; nothing installed is `SIG_DFL`,
+        // all zero.
         RT_SIGACTION => {
-            let (number, act) = (request.first(), request.second());
-            if act == 0 {
-                return Answer::ok(0);
-            }
-            let mut bytes = [0u8; 32];
-            if !copy_in(request.domain, act, &mut bytes) {
-                return Answer::error(bhaskix_personality::socket::errno::EFAULT);
-            }
-            let word = |index: usize| -> u64 {
-                let mut eight = [0u8; 8];
-                eight.copy_from_slice(&bytes[index * 8..index * 8 + 8]);
-                u64::from_le_bytes(eight)
-            };
-            // The x86-64 order, and `sa_restorer` between the flags and the
-            // mask is the part a translator gets wrong from memory.
-            let handler = signal::Handler {
-                entry: word(0),
-                flags: word(1),
-                restorer: word(2),
-                mask: word(3),
-            };
-            if dispositions_of(request.domain)
-                .install(number, handler)
-                .is_err()
-            {
+            let (number, act, old) = (request.first(), request.second(), request.third());
+            if !(1..signal::number::MAX as u64).contains(&number) {
                 return Answer::error(memory::errno::EINVAL);
+            }
+            let previous = if act == 0 {
+                dispositions_of(request.domain)
+                    .handler(number)
+                    .unwrap_or_default()
+            } else {
+                let mut bytes = [0u8; signal::SIGACTION_BYTES];
+                if !copy_in(request.domain, act, &mut bytes) {
+                    return Answer::error(bhaskix_personality::socket::errno::EFAULT);
+                }
+                match dispositions_of(request.domain).install(number, Handler::from_bytes(&bytes)) {
+                    Ok(previous) => previous,
+                    Err(_) => return Answer::error(memory::errno::EINVAL),
+                }
+            };
+            if old != 0 && !copy_out(request.domain, old, &previous.to_bytes()) {
+                return Answer::error(bhaskix_personality::socket::errno::EFAULT);
             }
             Answer::ok(0)
         }
+        // `old_ss` likewise: the stack recorded before this call, and
+        // `SS_DISABLE` when there is none -- what Linux reports and what Go
+        // checks before installing its own.
         SIGALTSTACK => {
-            let new = request.first();
-            if new == 0 {
-                return Answer::ok(0);
-            }
-            let mut bytes = [0u8; 24];
-            if !copy_in(request.domain, new, &mut bytes) {
+            let (new, old) = (request.first(), request.second());
+            let previous = if new == 0 {
+                dispositions_of(request.domain).alt_stack()
+            } else {
+                let mut bytes = [0u8; signal::STACK_BYTES];
+                if !copy_in(request.domain, new, &mut bytes) {
+                    return Answer::error(bhaskix_personality::socket::errno::EFAULT);
+                }
+                dispositions_of(request.domain).set_alt_stack(signal::AltStack::from_bytes(&bytes))
+            };
+            if old != 0 && !copy_out(request.domain, old, &previous.to_bytes()) {
                 return Answer::error(bhaskix_personality::socket::errno::EFAULT);
             }
-            let word = |index: usize| -> u64 {
-                let mut eight = [0u8; 8];
-                eight.copy_from_slice(&bytes[index * 8..index * 8 + 8]);
-                u64::from_le_bytes(eight)
-            };
-            dispositions_of(request.domain).set_alt_stack(signal::AltStack {
-                base: word(0),
-                flags: word(1),
-                size: word(2),
-            });
             Answer::ok(0)
         }
         // The affinity mask, written into the caller's own memory through the
@@ -3219,23 +3235,27 @@ fn answer_nanosleep(request: &PersonalityCall) -> (u64, Answer) {
     if request.second() & TIMER_ABSTIME != 0 {
         return (REPLY_VALUE, Answer::error(-22)); // EINVAL
     }
-    answer_nanosleep_relative(request, request.third())
+    answer_nanosleep_relative(request, request.third(), request.fourth())
 }
 
 /// The sleep both spellings share, given where each keeps its `timespec`.
 ///
-/// # What it does not do
+/// # The remaining time
 ///
-/// **It does not report the remaining time** in the caller's `remain` buffer.
+/// ~~**It does not report the remaining time** in the caller's `remain` buffer.
 /// Nothing here interrupts a sleep — there are no signals delivered to a parked
 /// hosted thread — so a sleep either completes or its domain ends, and a
-/// remainder would always be zero. Writing a zero would be indistinguishable
-/// from a real short sleep, so nothing is written at all.
-fn answer_nanosleep_relative(request: &PersonalityCall, at: u64) -> (u64, Answer) {
+/// remainder would always be zero.~~ **False since RFC 0083, found
+/// 2026-10-02:** a signal does cut a sleep short and the answer is `EINTR` —
+/// and a caller that sleeps again for `remain` then slept for whatever its own
+/// buffer held. Every `EINTR` here now writes `remain` when one is given: the
+/// time left before the deadline, or the whole request when nothing slept.
+fn answer_nanosleep_relative(request: &PersonalityCall, at: u64, remain: u64) -> (u64, Answer) {
     // Already slept: this is the retry after the park was woken. **Not
     // necessarily by the deadline** -- see `EARLY_RELEASES`. An early wake with
     // no signal pending is counted, and answered as it always was, so this
     // change measures the suspected fault without altering it.
+    let left = timed_wait_remaining(request.domain, request.thread);
     if let Some(early) = took_timed_wait(request.domain, request.thread) {
         if early {
             // **Interrupted, and said so.** Linux returns `EINTR` from a sleep a
@@ -3243,6 +3263,16 @@ fn answer_nanosleep_relative(request: &PersonalityCall, at: u64) -> (u64, Answer
             // the retry never asked why it woke. The delivery arm carries this
             // value through the signal frame to the handler's return.
             if dispositions_of(request.domain).has_pending() {
+                let nanos = bhaskix_personality::clock::nanos(left.unwrap_or(0), hertz());
+                if remain != 0
+                    && !copy_out(
+                        request.domain,
+                        remain,
+                        &bhaskix_personality::clock::timespec(nanos),
+                    )
+                {
+                    return (REPLY_VALUE, Answer::error(-14)); // EFAULT
+                }
                 return (REPLY_VALUE, Answer::error(-4)); // EINTR
             }
             SPURIOUS_SLEEPS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -3266,8 +3296,14 @@ fn answer_nanosleep_relative(request: &PersonalityCall, at: u64) -> (u64, Answer
         Some(slot) => (REPLY_BLOCK_ON_RETRY, Answer::ok(slot)),
         // No clock, or no slot left. Answering success without sleeping would
         // be a lie a caller cannot detect; `EINTR` is the honest one -- the
-        // sleep did not complete, and a caller that cares retries.
-        None => (REPLY_VALUE, Answer::error(-4)), // EINTR
+        // sleep did not complete, and a caller that cares retries. **Nothing
+        // slept, so all of it remains**, and `remain` says so.
+        None => {
+            if remain != 0 && !copy_out(request.domain, remain, &spec) {
+                return (REPLY_VALUE, Answer::error(-14)); // EFAULT
+            }
+            (REPLY_VALUE, Answer::error(-4)) // EINTR
+        }
     }
 }
 
@@ -6985,6 +7021,20 @@ fn answer_wait(request: &PersonalityCall) -> (u64, Answer) {
             if status_at != 0 && !copy_out(request.domain, status_at, &status.to_le_bytes()) {
                 return (REPLY_VALUE, Answer::error(-14)); // EFAULT
             }
+            // **And `rusage`, which was never written** until 2026-10-02 -- the
+            // class `TCGETS` was (`TRACKER.md` §3). Nothing here accounts a
+            // process's time, so the honest figure is zero, as `TCGETS`'s
+            // all-zero settings are.
+            let usage_at = request.fourth();
+            if usage_at != 0
+                && !copy_out(
+                    request.domain,
+                    usage_at,
+                    &[0u8; bhaskix_personality::signal::RUSAGE_BYTES],
+                )
+            {
+                return (REPLY_VALUE, Answer::error(-14)); // EFAULT
+            }
             (REPLY_VALUE, Answer::ok(u64::from(child)))
         }
         Ok(WaitOutcome::WouldBlock) if options & WNOHANG != 0 => {
@@ -8295,6 +8345,16 @@ const fn waiter_key(domain: u32, thread: u32) -> u64 {
 fn timed() -> &'static mut [(u64, u32, u64); WAKES] {
     // SAFETY: single-threaded by construction, as `dispositions_of`.
     unsafe { &mut *core::ptr::addr_of_mut!(TIMED) }
+}
+
+/// Cycles left before this thread's timed wait would have expired, without
+/// giving the wait back -- zero once the deadline has passed, `None` if the
+/// thread holds no timed wait. Read before [`took_timed_wait`] consumes the
+/// entry, so an interrupted sleep can tell its caller what it did not sleep.
+fn timed_wait_remaining(domain: u32, thread: u32) -> Option<u64> {
+    let key = waiter_key(domain, thread);
+    let entry = timed().iter().find(|entry| entry.0 == key)?;
+    Some(entry.2.saturating_sub(bhaskix_sock::time::now()))
 }
 
 /// Takes this domain's finished timed wait, if it has one, answering whether

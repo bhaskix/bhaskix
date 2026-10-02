@@ -76,6 +76,94 @@ pub struct AltStack {
     pub flags: u64,
 }
 
+/// Bytes in the kernel's `struct sigaction` on x86-64: handler, flags,
+/// restorer, mask — `sa_restorer` between the flags and the mask, which is the
+/// part a translator gets wrong from memory.
+pub const SIGACTION_BYTES: usize = 32;
+
+/// Bytes in a `stack_t`: the base, the flags (an `int`, padded), the size —
+/// the build host's `bits/types/stack_t.h`, read 2026-10-02.
+pub const STACK_BYTES: usize = 24;
+
+/// `SS_DISABLE`: no alternate stack — `bits/ss_flags.h`, read 2026-10-02.
+pub const SS_DISABLE: u64 = 2;
+
+/// Bytes in a `struct rusage` on x86-64: two `timeval`s and fourteen `long`s,
+/// 144 by `sizeof` compiled on the build host, 2026-10-02.
+pub const RUSAGE_BYTES: usize = 144;
+
+impl Handler {
+    /// Reads the kernel's `struct sigaction`, in its own order.
+    #[must_use]
+    pub fn from_bytes(bytes: &[u8; SIGACTION_BYTES]) -> Self {
+        let word = |index: usize| {
+            let mut eight = [0u8; 8];
+            eight.copy_from_slice(&bytes[index * 8..index * 8 + 8]);
+            u64::from_le_bytes(eight)
+        };
+        Self {
+            entry: word(0),
+            flags: word(1),
+            restorer: word(2),
+            mask: word(3),
+        }
+    }
+
+    /// The same, written back — what `rt_sigaction`'s `oldact` receives.
+    ///
+    /// **Written whenever a caller passes one**, a query included. Until
+    /// 2026-10-02 it never was, and glibc's `sigaction` reads its own
+    /// uninitialised kernel-format buffer back as the answer — the class of
+    /// bug `TCGETS` was (`TRACKER.md` §3).
+    #[must_use]
+    pub fn to_bytes(&self) -> [u8; SIGACTION_BYTES] {
+        let mut out = [0u8; SIGACTION_BYTES];
+        for (index, word) in [self.entry, self.flags, self.restorer, self.mask]
+            .iter()
+            .enumerate()
+        {
+            out[index * 8..index * 8 + 8].copy_from_slice(&word.to_le_bytes());
+        }
+        out
+    }
+}
+
+impl AltStack {
+    /// Reads a `stack_t`.
+    #[must_use]
+    pub fn from_bytes(bytes: &[u8; STACK_BYTES]) -> Self {
+        let word = |index: usize| {
+            let mut eight = [0u8; 8];
+            eight.copy_from_slice(&bytes[index * 8..index * 8 + 8]);
+            u64::from_le_bytes(eight)
+        };
+        Self {
+            base: word(0),
+            flags: word(1) & 0xffff_ffff,
+            size: word(2),
+        }
+    }
+
+    /// The same, written back — what `sigaltstack`'s `old_ss` receives.
+    ///
+    /// **No stack recorded reads as `SS_DISABLE`**, which is what Linux
+    /// reports for a thread that never set one, and what Go's runtime checks
+    /// before deciding whether to install its own.
+    #[must_use]
+    pub fn to_bytes(&self) -> [u8; STACK_BYTES] {
+        let flags = if self.size == 0 && self.base == 0 {
+            SS_DISABLE
+        } else {
+            self.flags & 0xffff_ffff
+        };
+        let mut out = [0u8; STACK_BYTES];
+        out[0..8].copy_from_slice(&self.base.to_le_bytes());
+        out[8..16].copy_from_slice(&flags.to_le_bytes());
+        out[16..24].copy_from_slice(&self.size.to_le_bytes());
+        out
+    }
+}
+
 /// Every signal's disposition for one hosted process.
 ///
 /// A fixed table, because this crate does not allocate and because sixty-four
@@ -520,6 +608,45 @@ impl Registers {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_sigaction_reads_back_as_it_was_written() {
+        let handler = Handler {
+            entry: 0x40_1000,
+            flags: flags::SIGINFO | flags::RESTORER,
+            restorer: 0x40_2000,
+            mask: 1 << 10,
+        };
+        let bytes = handler.to_bytes();
+        assert_eq!(Handler::from_bytes(&bytes), handler);
+        // The x86-64 order: restorer third, mask last.
+        assert_eq!(&bytes[16..24], &0x40_2000u64.to_le_bytes());
+        assert_eq!(&bytes[24..32], &(1u64 << 10).to_le_bytes());
+    }
+
+    #[test]
+    fn a_signal_never_installed_answers_sig_dfl_and_nothing_else() {
+        let none = Dispositions::new().handler(10).unwrap_or_default();
+        assert_eq!(none.to_bytes(), [0u8; SIGACTION_BYTES]);
+    }
+
+    #[test]
+    fn no_alternate_stack_reads_as_disabled() {
+        let bytes = Dispositions::new().alt_stack().to_bytes();
+        assert_eq!(&bytes[0..8], &[0u8; 8], "no base");
+        assert_eq!(&bytes[8..16], &SS_DISABLE.to_le_bytes());
+        assert_eq!(&bytes[16..24], &[0u8; 8], "no size");
+    }
+
+    #[test]
+    fn a_recorded_alternate_stack_reads_back() {
+        let alt = AltStack {
+            base: 0x7000_0000,
+            size: 32 * 1024,
+            flags: 0,
+        };
+        assert_eq!(AltStack::from_bytes(&alt.to_bytes()), alt);
+    }
     use super::*;
 
     fn registers() -> Registers {
