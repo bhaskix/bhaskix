@@ -57,11 +57,24 @@
 # race -- which is what `boot-test.sh`'s diagnostic already describes. Reserving
 # a port by binding it here is not open to us: it would have to be handed to
 # QEMU still bound.
+#
+# **Below the kernel's ephemeral range, and free in every state -- 2026-10-03.**
+# The pick was 20000-59999 and the check asked only for a *listener*. But the
+# local end of every outgoing connection on this host holds a port from the
+# ephemeral range (`ip_local_port_range`, 32768-60999 here), and a port held by a
+# merely *connected* socket refuses QEMU's `hostfwd` bind just the same:
+# measured, a QEMU forwarding `127.0.0.1:P` while a connected socket held `P`
+# exited at once with `Could not set up host forwarding rule`. On a host whose
+# other tenants keep connections open, six picks per boot from that range meant
+# an occasional boot dying in a quarter of a second with an empty serial log.
+# So the pick stays under the range's floor, and the check counts any socket.
 bhaskix_pick_free_port() {
-    local port
+    local port floor
+    floor=$(cut -f1 /proc/sys/net/ipv4/ip_local_port_range 2>/dev/null)
+    [[ "$floor" =~ ^[0-9]+$ && $floor -gt 21000 ]] || floor=32768
     for _ in $(seq 1 64); do
-        port=$(( 20000 + RANDOM % 40000 ))
-        if ! ss -ltn "sport = :$port" 2>/dev/null | grep -q LISTEN; then
+        port=$(( 20000 + RANDOM % (floor - 20000) ))
+        if [[ -z "$(ss -tanH "sport = :$port" 2>/dev/null)" ]]; then
             printf '%s' "$port"
             return 0
         fi

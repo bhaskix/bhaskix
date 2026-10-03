@@ -51,7 +51,7 @@ cleanup() {
     elif [[ $outcome -ne 0 ]]; then
         printf '\033[2mnote\033[0m  the serial log of this failing run is kept at %s\n' "$LOG" >&2
     else
-        rm -f "$LOG"
+        rm -f "$LOG" "$LOG.qemu"
     fi
 }
 trap cleanup EXIT
@@ -158,7 +158,10 @@ run_until() {
     : > "$logfile"
     local started; started=$(date +%s%3N)
     BOOT_ELAPSED_MS=0
-    timeout "$limit" qemu-system-x86_64 "$@" >/dev/null 2>&1 &
+    # QEMU's own complaints are kept beside the serial log: a QEMU that will
+    # not start says why on stderr and nowhere else, and that was being thrown
+    # away -- see the empty-log diagnostic below.
+    timeout "$limit" qemu-system-x86_64 "$@" >/dev/null 2>"$logfile.qemu" &
     local pid=$! waited=0
     while kill -0 "$pid" 2>/dev/null; do
         if grep -qF -- "$marker" "$logfile" 2>/dev/null; then
@@ -818,6 +821,12 @@ if ! grep -qF "Nothing left to do at this milestone" "$LOG"; then
     fail "the machine did not finish booting within ${TIMEOUT}s (gave up after $((BOOT_ELAPSED_MS / 1000)).$(printf '%03d' $((BOOT_ELAPSED_MS % 1000)))s)"
     if [[ ! -s "$LOG" ]]; then
         echo "        the serial log is empty -- qemu may not have started at all" >&2
+        # **QEMU's own words first**, when it left any: they name the cause
+        # rather than the guesses below, which on 2026-10-02 were both wrong.
+        if [[ -s "$LOG.qemu" ]]; then
+            echo "        qemu said:" >&2
+            sed 's/^/          /' "$LOG.qemu" >&2
+        fi
         # **The usual cause, named rather than guessed at.** `devices.sh` fixes
         # the two `hostfwd` host ports because the driver below must know them,
         # and says a second QEMU with the same profile "would fail to start,
