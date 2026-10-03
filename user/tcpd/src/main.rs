@@ -1304,6 +1304,33 @@ static LAST_METHOD: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU6
 /// armed ring pair was free. The peer retransmits and the cookie stays valid.
 static ACK_WHILE_BUSY: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
+/// **Why** a verified `ACK` was refused, and for which listener, packed in
+/// one report word: bits 0–15 count refusals with **no armed ring pair** on
+/// the listener, 16–31 with **no free table slot**, 32–47 with a pair armed and
+/// never registered (this program's own bug), and 48–63 hold the **port** of
+/// the listener last refused.
+///
+/// [`ACK_WHILE_BUSY`] lumps the three together, and §3's step-4 row has a
+/// specimen whose boot refused 19 where healthy boots refuse 0–2: whether that
+/// was the loopback twin's listener running out of pairs, or the table filling,
+/// is the question its hypothesis turns on, and the lumped count cannot answer
+/// it (2026-10-03).
+static ACK_REFUSAL_WHY: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Adds one refusal of `kind` (0 no pair, 1 no slot, 2 unregistered pair) for
+/// the listener on `port` to [`ACK_REFUSAL_WHY`]. Each count saturates at
+/// 0xffff rather than carrying into its neighbour.
+fn note_refusal(kind: u32, port: u16) {
+    use core::sync::atomic::Ordering;
+    let shift = 16 * kind;
+    let old = ACK_REFUSAL_WHY.load(Ordering::Relaxed);
+    let count = ((old >> shift) & 0xffff).saturating_add(1).min(0xffff);
+    let mut new = old & !(0xffff << shift) & !(0xffff << 48);
+    new |= count << shift;
+    new |= u64::from(port) << 48;
+    ACK_REFUSAL_WHY.store(new, Ordering::Relaxed);
+}
+
 /// Cookies counted as offered whose `SYN`/`ACK` never reached the back ring.
 ///
 /// **`cookies_offered` is incremented before the segment is built, written or
@@ -1383,14 +1410,19 @@ fn accept_cookie(
     // refusal is only worth counting for a peer that proved it is there.
     // Finished connections go first, returning their slots and pairs.
     retire_finished(service);
+    let listener_port = service.listeners[listening]
+        .as_ref()
+        .map_or(0, |listener| listener.port);
     let Some(pair) = service.listeners[listening]
         .as_mut()
         .and_then(|listener| listener.armed.take())
     else {
         // Every pair is held by a live connection. The peer retransmits its
         // `ACK` and the cookie stays valid for its whole window, so this is a
-        // handshake delayed, not lost.
+        // handshake delayed, not lost -- **provided a pair frees**, which is
+        // what `ACK_REFUSAL_WHY` now lets a specimen check.
         ACK_WHILE_BUSY.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        note_refusal(0, listener_port);
         return None;
     };
     let Some(Pair {
@@ -1403,6 +1435,7 @@ fn accept_cookie(
             let _ = listener.armed.arm(pair);
         }
         ACK_WHILE_BUSY.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        note_refusal(2, listener_port);
         return None;
     };
     let notify_slot = service.listeners[listening]
@@ -1442,6 +1475,7 @@ fn accept_cookie(
         // No free slot: every one is a live connection. The pair goes back.
         service.rearm(pair);
         ACK_WHILE_BUSY.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        note_refusal(1, listener_port);
         return None;
     };
     if let Some(born) = service.connections.get_mut(index as usize) {
@@ -2240,6 +2274,9 @@ fn report(
         // `SEND_HELD`.
         SEND_HELD.load(core::sync::atomic::Ordering::Relaxed),
         SEND_WINDOW.load(core::sync::atomic::Ordering::Relaxed),
+        // Twenty-two: why the refused `ACK`s were refused, and whose -- see
+        // `ACK_REFUSAL_WHY`.
+        ACK_REFUSAL_WHY.load(core::sync::atomic::Ordering::Relaxed),
     ];
 
     // SAFETY: the page this program mapped writable, which nothing else

@@ -22965,6 +22965,20 @@ fn report_tcp_domain(hhdm: u64) {
          verify, {} repeated by a peer already connected (a table lookup answers those first now)",
         words[11], words[12], words[13]
     );
+    // **Why, and whose** -- the word `bin/tcpd` added on 2026-10-03, so a
+    // specimen can say whether the refusals were one listener short of ring
+    // pairs or the whole table full (§3's step-4 row turns on it).
+    let why = words[21];
+    if words[11] > 0 {
+        println!(
+            "    tcpd ack why   {} with no armed ring pair, {} with no free table slot, {} with a \
+             pair never registered; the last refused was the listener on port {}",
+            why & 0xffff,
+            (why >> 16) & 0xffff,
+            (why >> 32) & 0xffff,
+            why >> 48
+        );
+    }
     // **A cookie counted as offered whose answer never left.** `offered` is
     // incremented before the segment is built and sent, and both failure paths
     // after it were silent, so a peer that was never asked looked exactly like

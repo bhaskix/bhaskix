@@ -1421,7 +1421,11 @@ pub mod tcp {
     /// past its own slice and *the boot died before printing anything at all* --
     /// the comment beside that count still records it. One constant, used by the
     /// writer's array and the reader's slice, cannot drift.
-    pub const REPORT_WORDS: usize = 21;
+    ///
+    /// **22 since 2026-10-03**: the twenty-second word says *why* a verified
+    /// `ACK` was refused and for which listener -- see `bin/tcpd`'s
+    /// `ACK_REFUSAL_WHY`.
+    pub const REPORT_WORDS: usize = 22;
 
     /// What `bin/tcpc` puts in its detail word on reaching the stream wait,
     /// before it has asked the service anything.
