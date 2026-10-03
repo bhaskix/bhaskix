@@ -168,6 +168,13 @@ mod outcome {
     /// bytes read out of this program's ring and sent back — and the peer's
     /// close arrived, which only happens after the reply reached it.
     pub const SERVED: u64 = 9;
+    /// Step 16 accepted a connection, and its peer is not this program's own
+    /// `[::1]` client: the detail word is the peer as `family << 16 | port`,
+    /// or zero when the service would not name one. **A defect of its own if
+    /// it ever fires**, recorded 2026-10-03: §3's step-4 row has a specimen
+    /// whose v6 twin's handshake looks refused for want of a ring pair while
+    /// step 16 still said it accepted, and this is what tells those apart.
+    pub const MISDIRECTED: u64 = 13;
     /// RFC 0029 step 5: a v6 connection opened to `[::1]`, accepted by
     /// this program's own listener, sixteen bytes echoed by its own serve
     /// path and read back byte-for-byte on the client side — the whole TCP
@@ -868,6 +875,20 @@ extern "C" fn tcpc_main(hertz: u64) -> ! {
     if !accepted6 {
         report(16, outcome::NOBODY, 0);
         exit();
+    }
+    // **That it is the twin**, asked rather than assumed: the listener may hold
+    // other pending connections, and step 17 trusts this one to be the client
+    // this program just opened to `[::1]`.
+    match tcp::peer(INBOUND6) {
+        Some(tcp::Peer::Loopback6 { .. }) => {}
+        Some(tcp::Peer::V4 { port, .. }) => {
+            report(16, outcome::MISDIRECTED, 4 << 16 | u64::from(port));
+            exit();
+        }
+        None => {
+            report(16, outcome::MISDIRECTED, 0);
+            exit();
+        }
     }
 
     // RFC 0029 steps 5 and 6 together: the echo, measured. Eight sixteen-

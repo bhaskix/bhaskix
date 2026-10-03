@@ -22279,6 +22279,10 @@ fn report_tcp_client(hhdm: u64) {
              loopback -- the whole TCP machine, both roles, second family, one program \
              (RFC 0029 steps 5 and 6)"
         }
+        13 => {
+            "accepted a v6 connection that is not its own [::1] client (detail: the peer as \
+             family << 16 | port, or 0 if none was named)"
+        }
         _ => "an outcome this kernel does not know",
     };
     // RFC 0020 step 6: the numbers, converted here because the client only
