@@ -465,6 +465,14 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
             // and a hang reports nothing.
             HTTPD_SECONDS.store(seconds.min(3600), core::sync::atomic::Ordering::Relaxed);
         }
+        // `bhaskix.framehunt=<runs>` — see `FRAME_HUNT_RUNS`.
+        if let Some(value) = word
+            .strip_prefix("bhaskix.framehunt=")
+            .or_else(|| word.strip_prefix("framehunt="))
+            && let Ok(runs) = value.parse::<u64>()
+        {
+            FRAME_HUNT_RUNS.store(runs.min(200), core::sync::atomic::Ordering::Relaxed);
+        }
         // `bhaskix.clients` — RFC 0086 step 4. See `HOST_CLIENTS`.
         if word == "clients" || word == "bhaskix.clients" {
             HOST_CLIENTS.store(true, core::sync::atomic::Ordering::Relaxed);
@@ -18417,6 +18425,18 @@ const HOSTED_PROGRAM: &[u8] = b"bin/hosted";
 /// it on every lane is not this file's decision to make.
 static STAGE_BUSYBOX: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
+/// How many extra times to run the migration and wait-queue self-tests --
+/// `bhaskix.framehunt=<runs>`, off unless given, at most 200.
+///
+/// **A reproducer for §3's interrupt-frame fault, built because rate is what
+/// that row lacks.** Every specimen strikes in the same place, the line after
+/// `wait queues N stations spawned`, at about one boot in thirty even at eight
+/// CPUs -- too rare to test anything against. Repeating the phase gives the
+/// fault that many more chances per boot, the way `tearprobe=<runs>` did for
+/// the console tear. Each repeat spawns fresh threads, and stacks are never
+/// reclaimed, so the cap bounds what a typo can cost (2026-10-03).
+static FRAME_HUNT_RUNS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 /// Whether this boot's harness will connect a host client to the hosted
 /// server probes — `bhaskix.clients` on the command line. RFC 0086 step 4.
 ///
@@ -33288,6 +33308,12 @@ fn migration_self_test(hhdm_base: u64, cpus: u32) -> bool {
         println!("\x1b[93m    migration      skipped, only one cpu online\x1b[0m");
         return true;
     }
+    // **Fresh for this run.** The masks are statics and outlive a run, so a
+    // second run -- `FRAME_HUNT_RUNS` makes them -- counted every earlier run's
+    // moves against only this run's steals and failed `moved > steals`.
+    for seen in &MIGRANT_CPUS {
+        seen.store(0, Ordering::Relaxed);
+    }
 
     // Sampled before the spawns, not after. Balancing is not deferred to the
     // wait below: the other CPUs are idle and their timers are running, so
@@ -33546,6 +33572,21 @@ fn scheduling_self_test(hhdm_base: u64) -> bool {
     PHASE.store(PHASE_WAIT, Ordering::Release);
 
     ok &= wait_queue_self_test(hhdm_base);
+
+    // **The phase again, as many times as asked** -- see `FRAME_HUNT_RUNS`.
+    let hunts = FRAME_HUNT_RUNS.load(Ordering::Relaxed);
+    for _ in 0..hunts {
+        PHASE.store(PHASE_MIGRATION, Ordering::Release);
+        ok &= migration_self_test(hhdm_base, cpus);
+        PHASE.store(PHASE_WAIT, Ordering::Release);
+        ok &= wait_queue_self_test(hhdm_base);
+    }
+    if hunts > 0 {
+        println!(
+            "    frame hunt     the migration and wait-queue phase ran {} more time(s)",
+            hunts
+        );
+    }
 
     // The ring is retired **by the test that spawned it**, which waits for its
     // stations rather than sleeping over them -- see the note there. The store
