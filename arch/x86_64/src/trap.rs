@@ -227,9 +227,16 @@ unsafe extern "C" fn bhaskix_trap_dispatch(frame: *mut TrapFrame) {
                 slot.store(value, Ordering::Relaxed);
             }
             FRAME_ON_ENTRY.store(arrived.is_some(), Ordering::Relaxed);
-            let (phase, vector) = phase_of(address).unwrap_or((0, u64::MAX));
+            // **The entry vector from this dispatch's own local, not the
+            // table**, and a lost record told apart from an empty one
+            // (2026-10-04). The slot is keyed by frame address in a table of
+            // 256, so another dispatch can take it; the lookup then failed and
+            // fell back to "phase 0, vector unrecorded" -- which the report
+            // reads as *no checkpoint reached* and *an unrecorded dispatch*.
+            // Neither was known. A specimen of §3's frame fault printed both.
+            let phase = phase_of(address).map_or(PHASE_RECORD_LOST, |(phase, _)| phase);
             FRAME_LAST_GOOD.store(phase, Ordering::Relaxed);
-            FRAME_WITNESS_VECTOR.store(vector, Ordering::Relaxed);
+            FRAME_WITNESS_VECTOR.store(entry_vector, Ordering::Relaxed);
         }
     }
 }
@@ -283,6 +290,11 @@ fn phase_of(frame: u64) -> Option<(u64, u64)> {
     let packed = PHASE_VALUE[slot].load(Ordering::Relaxed);
     Some((packed & 0xffff_ffff, packed >> 32))
 }
+
+/// The phase recorded when the first implausible frame's own record had
+/// been taken by another dispatch, so how far it got is unknown -- which is
+/// not the same as having reached no checkpoint at all.
+pub const PHASE_RECORD_LOST: u64 = u64::MAX;
 
 /// The phase the first implausible frame had last been good at.
 static FRAME_LAST_GOOD: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);

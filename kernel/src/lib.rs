@@ -33587,6 +33587,27 @@ fn scheduling_self_test(hhdm_base: u64) -> bool {
             hunts
         );
     }
+    // **Whether any thread ran on two CPUs at once** -- see
+    // `sched::RUNNING_ON`. Printed on every boot, so a boot that did not fault
+    // still says whether the race it is suspected of happened.
+    let (doubles, thread, other, this) = sched::double_runs();
+    if doubles > 0 {
+        println!(
+            "\x1b[91m    double run     {doubles} switch-in(s) found the thread still running on another cpu; \
+             the last, thread {thread} on cpu {this} while cpu {other} still ran it\x1b[0m"
+        );
+    } else {
+        println!("    double run     no thread was switched in while another cpu still ran it");
+    }
+    let (stolen, thread, victim, thief) = sched::stole_current();
+    if stolen > 0 {
+        println!(
+            "\x1b[91m    double run     {stolen} steal(s) took the thread a cpu was executing; the \
+             last, thread {thread} taken by cpu {thief} from cpu {victim}\x1b[0m"
+        );
+    } else {
+        println!("    double run     no steal took the thread a cpu was executing");
+    }
 
     // The ring is retired **by the test that spawned it**, which waits for its
     // stations rather than sleeping over them -- see the note there. The store

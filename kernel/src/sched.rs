@@ -541,12 +541,24 @@ impl RunQueue {
             return None;
         }
 
-        self.threads.iter().position(|slot| {
-            slot.as_ref().is_some_and(|thread| {
-                // Rule 1: `Running` is the stack the victim is executing on.
-                // `Finished` is not worth moving and would confuse the load
-                // figure at the far end.
-                thread.state == State::Ready
+        let current = self.current;
+        self.threads.iter().enumerate().position(|(index, slot)| {
+            // Rule 5: **never the slot the victim is executing**, whatever
+            // its state says -- added 2026-10-04 for §3's interrupt-frame
+            // fault. Rule 1 below assumed the thread a CPU executes is always
+            // `Running`, and it is not: `block_self` with nothing else to run
+            // halts *in place*, still `current`, marked `Blocked`, with
+            // `switching` low -- and a wake from another CPU makes it `Ready`
+            // there. Stolen then, it resumed from its stale saved context on
+            // the stack the victim was still using, and the victim's next
+            // interrupt frame was overwritten by `block_self`'s own locals,
+            // which is what a symbolized specimen showed.
+            index != current
+                && slot.as_ref().is_some_and(|thread| {
+                    // Rule 1: `Running` is the stack the victim is executing on.
+                    // `Finished` is not worth moving and would confuse the load
+                    // figure at the far end.
+                    thread.state == State::Ready
                     // Rule 3: the thread a CPU booted on runs on the stack
                     // that CPU was given, and on a secondary it is also the
                     // only thing left to run when the queue drains.
@@ -558,7 +570,7 @@ impl RunQueue {
                     // work it never counted. A latency guarantee that a
                     // background balancer can quietly overcommit is not one.
                     && !matches!(thread.policy, Policy::RealTime { .. })
-            })
+                })
         })
     }
 
@@ -2575,6 +2587,16 @@ fn try_steal(cpu: usize, mine: &mut RunQueue) -> Option<usize> {
         let Some(slot) = theirs.steal_candidate(my_load) else {
             continue;
         };
+        // **Counted at the steal, not at the switch-in** -- see
+        // `STOLE_CURRENT`.
+        if slot == theirs.current {
+            STOLE_CURRENT.fetch_add(1, Ordering::Relaxed);
+            let id = theirs.threads[slot].as_ref().map_or(0, |thread| thread.id);
+            LAST_STOLE_CURRENT.store(
+                (u64::from(id) << 16) | ((victim as u64) << 8) | cpu as u64,
+                Ordering::Relaxed,
+            );
+        }
         let Some(mut thread) = theirs.threads[slot].take() else {
             continue;
         };
@@ -2603,6 +2625,113 @@ static SWITCH_TRACE: [core::sync::atomic::AtomicU64; SWITCH_TRACE_LEN] =
     [const { core::sync::atomic::AtomicU64::new(u64::MAX) }; SWITCH_TRACE_LEN];
 static SWITCH_AT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 const SWITCH_TRACE_LEN: usize = 16;
+
+/// Which thread each CPU last switched in, as `id + 1` (`0` for none) -- the
+/// double-run check's record.
+///
+/// **Why it exists (2026-10-04).** A specimen of §3's interrupt-frame fault,
+/// symbolized against the binary that produced it, had its frame overwritten
+/// by `block_self`'s own locals and return addresses -- the scheduler's
+/// blocking path running on that thread's stack while CPU 0 was still handling
+/// an interrupt on it. Stacks are per thread, so the direct reading is one
+/// thread running on two CPUs at once. Every switch-in passes through
+/// [`finish_switch`], so that is where a CPU says what it now runs and asks
+/// whether another CPU says the same.
+///
+/// **Blind to the case it was written for -- found the same day.** A thread
+/// stolen while its CPU still executes it dies inside the context switch,
+/// before reaching here; a build forced into that state reproduced the fault
+/// with this check reading zero. It would still catch a double run that
+/// survives the switch -- none has been seen; the stolen-current case is
+/// counted where it happens, in [`STOLE_CURRENT`].
+static RUNNING_ON: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+
+/// Steals that took the slot the victim CPU was **executing** -- rule 5's
+/// violation, counted where it happens.
+///
+/// **Here and not only in [`finish_switch`], because there it is blind
+/// (2026-10-04).** A thread stolen while its victim still runs it is resumed
+/// from a saved stack pointer into a stack the victim has since written over,
+/// so the thief pops garbage and dies *inside* the context switch, before
+/// `finish_switch`
+/// can count anything: a build forced into exactly this reproduced §3's frame
+/// fault and its report read `no thread was ever switched in while another cpu
+/// still ran it`. The steal itself is the last moment anything can see it.
+/// Rule 5 makes it impossible, so a non-zero count is a regression.
+static STOLE_CURRENT: AtomicU64 = AtomicU64::new(0);
+
+/// The last such: `thread << 16 | victim cpu << 8 | thief cpu`.
+static LAST_STOLE_CURRENT: AtomicU64 = AtomicU64::new(0);
+
+/// `(count, thread, victim cpu, thief cpu)` of steals that took a victim's
+/// current slot. Lock-free, for the fault report.
+#[must_use]
+pub fn stole_current() -> (u64, u64, u64, u64) {
+    let last = LAST_STOLE_CURRENT.load(Ordering::Relaxed);
+    (
+        STOLE_CURRENT.load(Ordering::Relaxed),
+        last >> 16,
+        (last >> 8) & 0xff,
+        last & 0xff,
+    )
+}
+
+/// Switch-ins of a thread another CPU's [`RUNNING_ON`] still named.
+static DOUBLE_RUNS: AtomicU64 = AtomicU64::new(0);
+
+/// The last such: `thread << 16 | other cpu << 8 | this cpu`.
+static LAST_DOUBLE_RUN: AtomicU64 = AtomicU64::new(0);
+
+/// The CPU, other than `cpu`, whose slot already holds `mark` -- the pure half
+/// of the double-run check, so it runs on the host.
+fn double_run(slots: &[u64], cpu: usize, mark: u64) -> Option<usize> {
+    if mark == 0 {
+        return None;
+    }
+    slots
+        .iter()
+        .enumerate()
+        .find(|(other, held)| *other != cpu && **held == mark)
+        .map(|(other, _)| other)
+}
+
+/// Records that `cpu` now runs `who`, counting it if another CPU still does.
+///
+/// Called from [`finish_switch`] with that CPU's queue lock held and **before**
+/// `switching` is lowered: until then no other CPU may steal from this one
+/// (rule 2), so a thread leaving here cannot yet be switched in elsewhere, and
+/// a match is a real double run rather than this record lagging.
+fn note_running(cpu: usize, who: Option<u32>) {
+    let mark = who.map_or(0, |id| u64::from(id) + 1);
+    if let Some(slot) = RUNNING_ON.get(cpu) {
+        slot.store(mark, Ordering::SeqCst);
+    }
+    let mut seen = [0u64; MAX_CPUS];
+    for (copy, slot) in seen.iter_mut().zip(RUNNING_ON.iter()) {
+        *copy = slot.load(Ordering::SeqCst);
+    }
+    let online = (percpu::online_count() as usize).min(MAX_CPUS);
+    if let Some(other) = double_run(&seen[..online], cpu, mark) {
+        DOUBLE_RUNS.fetch_add(1, Ordering::Relaxed);
+        LAST_DOUBLE_RUN.store(
+            ((mark - 1) << 16) | ((other as u64) << 8) | cpu as u64,
+            Ordering::Relaxed,
+        );
+    }
+}
+
+/// `(count, thread, other cpu, this cpu)` of switch-ins that found the thread
+/// still named as running elsewhere. Lock-free, for the fault report.
+#[must_use]
+pub fn double_runs() -> (u64, u64, u64, u64) {
+    let last = LAST_DOUBLE_RUN.load(Ordering::Relaxed);
+    (
+        DOUBLE_RUNS.load(Ordering::Relaxed),
+        last >> 16,
+        (last >> 8) & 0xff,
+        last & 0xff,
+    )
+}
 
 /// Switches that resumed a thread with **no address space to load**.
 ///
@@ -2804,7 +2933,6 @@ fn finish_switch() {
     let mut found = false;
     if cpu < MAX_CPUS {
         let mut queue = QUEUES[cpu].lock();
-        queue.switching = false;
         if let Some(thread) = queue
             .threads
             .get(queue.current)
@@ -2814,6 +2942,9 @@ fn finish_switch() {
             who = thread.id;
             root = thread.space_root;
         }
+        // Before `switching` is lowered -- see `note_running`.
+        note_running(cpu, found.then_some(who));
+        queue.switching = false;
     }
 
     // **Recorded before the space is loaded**, so a fault afterwards can say
@@ -6578,6 +6709,35 @@ mod tests {
         // Its context is not stale -- it is the stack the victim is on.
         let queue = with(&[State::Ready, State::Running, State::Running]);
         assert_eq!(queue.steal_candidate(0), None);
+    }
+
+    #[test]
+    fn a_thread_named_on_another_cpu_is_a_double_run() {
+        assert_eq!(double_run(&[5, 0, 7, 0], 1, 7), Some(2));
+        assert_eq!(
+            double_run(&[5, 0, 7, 0], 2, 7),
+            None,
+            "its own slot is not another"
+        );
+        assert_eq!(double_run(&[5, 0, 7, 0], 1, 9), None);
+        assert_eq!(
+            double_run(&[0, 0, 0, 0], 1, 0),
+            None,
+            "nobody running is never a match"
+        );
+    }
+
+    #[test]
+    fn the_thread_a_cpu_is_executing_is_never_stolen_even_when_ready() {
+        // `block_self` with nothing else to run halts in place, still current;
+        // a wake from another CPU marks it `Ready` while this CPU executes it.
+        // Slot 0 is pinned (as `with` builds it), so slot 1 -- current, and
+        // `Ready` -- was the first candidate, and taking it ran one thread on
+        // two CPUs (§3, 2026-10-04).
+        let mut queue = with(&[State::Ready, State::Ready, State::Ready, State::Ready]);
+        queue.current = 1;
+        assert_ne!(queue.steal_candidate(0), Some(1));
+        assert_eq!(queue.steal_candidate(0), Some(2));
     }
 
     #[test]

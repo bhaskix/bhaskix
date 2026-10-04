@@ -496,22 +496,51 @@ fn handle(frame: &mut TrapFrame) {
     // right and is how this was found.
     if count > 0 || changed {
         let reached = bhaskix_arch::trap::frame_last_good_phase();
-        let arm = match bhaskix_arch::trap::frame_entry_vector() {
-            v if v == u64::from(bhaskix_arch::apic::TIMER_VECTOR) => "the timer",
-            v if v == u64::from(crate::sched::RESCHEDULE_VECTOR) => "a reschedule IPI",
-            u64::MAX => "an unrecorded dispatch",
-            _ => "another vector",
+        let entry = bhaskix_arch::trap::frame_entry_vector();
+        // **No allocation here**: this runs while the kernel halts on a fault,
+        // possibly with the heap's lock held, so "another vector" carries its
+        // number through the format arguments rather than a built string.
+        let (arm, number) = match entry {
+            v if v == u64::from(bhaskix_arch::apic::TIMER_VECTOR) => ("the timer", None),
+            v if v == u64::from(crate::sched::RESCHEDULE_VECTOR) => ("a reschedule IPI", None),
+            u64::MAX => ("an unrecorded dispatch", None),
+            _ => ("vector", Some(entry)),
         };
-        println!(
-            "    last intact at {}, dispatched from {arm}",
-            match reached {
-                phase::NONE => "no checkpoint -- it arrived wrong, or went wrong before the first",
-                phase::BEFORE_PREEMPT => "the tick's work done, entering the switch",
-                phase::AFTER_PREEMPT => "the switch returned, so it survived being descheduled",
-                phase::AFTER_INTERRUPT => "the interrupt handler returned",
-                _ => "the address-space check on the way out",
+        let at = match reached {
+            phase::NONE => "no checkpoint -- it arrived wrong, or went wrong before the first",
+            bhaskix_arch::trap::PHASE_RECORD_LOST => {
+                "unknown -- its record was taken by another dispatch before it was read"
             }
+            phase::BEFORE_PREEMPT => "the tick's work done, entering the switch",
+            phase::AFTER_PREEMPT => "the switch returned, so it survived being descheduled",
+            phase::AFTER_INTERRUPT => "the interrupt handler returned",
+            _ => "the address-space check on the way out",
+        };
+        match number {
+            Some(vector) => println!("    last intact at {at}, dispatched from {arm} {vector}"),
+            None => println!("    last intact at {at}, dispatched from {arm}"),
+        }
+    }
+
+    // **Whether a thread was running on two CPUs at once** -- see
+    // `sched::RUNNING_ON` for why it is asked. Atomics only, as everything here.
+    let (doubles, thread, other, this) = crate::sched::double_runs();
+    if doubles > 0 {
+        println!(
+            "  {doubles} switch-in(s) found the thread still running on another cpu; the last, \
+             thread {thread} switched in on cpu {this} while cpu {other} still ran it"
         );
+    } else {
+        println!("  no thread was ever switched in while another cpu still ran it");
+    }
+    let (stolen, thread, victim, thief) = crate::sched::stole_current();
+    if stolen > 0 {
+        println!(
+            "  {stolen} steal(s) took the thread a cpu was executing; the last, thread {thread} \
+             taken by cpu {thief} from cpu {victim}"
+        );
+    } else {
+        println!("  no steal took the thread a cpu was executing");
     }
 
     println!("  Halting. A fault in the kernel is the kernel's own bug: there is");
