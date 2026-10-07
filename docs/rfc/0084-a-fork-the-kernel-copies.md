@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | 🔨 **Draft 2026-09-22 — built and gated; the boot property holds and every assertion was armed red before it was believed.** A domain can be given a copy of another domain's address space by a single nucleus method, and `bin/linuxd`'s `fork` uses it. The acceptance call is the project lead's. |
+| **Status** | ✅ **ACCEPTED 2026-10-04 by the project lead.** Drafted 2026-09-22 — **built and gated; the boot property holds and every assertion was armed red before it was believed.** A domain can be given a copy of another domain's address space by a single nucleus method, and `bin/linuxd`'s `fork` uses it. ~~The acceptance call is the project lead's.~~ |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | kernel (`vm`, `syscall`), userspace (`bin/linuxd`) |
 | **Milestone** | Phase 2 — core operating system |

@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | 🔨 **Draft 2026-10-02 — proposed, not built.** Nothing here is implemented; the acceptance call, and whether to build it at all, is the project lead's. |
+| **Status** | ⏸️ **DEFERRED 2026-10-04 by the project lead — proposed, not built.** Kept as a proposal, to be built when the Go server's per-response cost makes clock reads the bottleneck. Drafted 2026-10-02; nothing here is implemented. ~~The acceptance call, and whether to build it at all, is the project lead's.~~ |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | userspace (`bhaskix-personality`, `bin/linuxd`), kernel (boot loader for hosted programs, `time`) |
 | **Milestone** | Phase 2 — after [RFC 0086](0086-the-motivating-workload.md), whose measurements motivate it |

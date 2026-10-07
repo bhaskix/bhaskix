@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | 🔨 **Draft 2026-09-19 — all six steps built and gated; `make test` green on every lane, and the acceptance call is the project lead's.** A domain's own memory is charged to its envelope and refused past it, on three allocation paths. Six assertions, every one armed red before being believed. Two things the measurement changed are recorded in *What the boot measured* below, and one of them corrects this document's own argument. |
+| **Status** | ✅ **ACCEPTED 2026-10-04 by the project lead.** Drafted 2026-09-19 — **all six steps built and gated; `make test` green on every lane~~, and the acceptance call is the project lead's~~.** A domain's own memory is charged to its envelope and refused past it, on three allocation paths. Six assertions, every one armed red before being believed. Two things the measurement changed are recorded in *What the boot measured* below, and one of them corrects this document's own argument. |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | kernel (`vm`, `domain`) |
 | **Milestone** | Phase 2 — core operating system |

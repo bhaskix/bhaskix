@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | 🔨 **Draft 2026-09-30 — built and gated, armed red both ways.** A space its builder opts in turns a revoked shared region into scratch memory instead of a refusal; `bin/tcpd` is opted in, and stops dying when a program whose rings it holds exits. The acceptance call is the project lead's. |
+| **Status** | ✅ **ACCEPTED 2026-10-04 by the project lead.** Drafted 2026-09-30 — **built and gated, armed red both ways.** A space its builder opts in turns a revoked shared region into scratch memory instead of a refusal; `bin/tcpd` is opted in, and stops dying when a program whose rings it holds exits. ~~The acceptance call is the project lead's.~~ |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | kernel (`vm`, `shared`), mm |
 | **Milestone** | Phase 2 — [RFC 0086](0086-the-motivating-workload.md)'s services under load |

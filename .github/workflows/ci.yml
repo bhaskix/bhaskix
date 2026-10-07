@@ -10,6 +10,12 @@
 #
 # Ordered cheapest-first, so a formatting mistake fails in seconds rather than
 # after a QEMU boot.
+#
+# **Every job stops at 30 minutes** (2026-10-04). Without a limit a job runs for
+# GitHub's default six hours, so a QEMU that hangs holds a runner and hides the
+# result that long. Over runs 781-820 the slowest green job took 13.0 minutes
+# (fault injection, run 806) and the medians were 0.6-4.4, so 30 is more than
+# twice the worst seen. Raise it with a measurement, not a guess.
 
 name: ci
 
@@ -28,6 +34,7 @@ jobs:
   format:
     name: rustfmt
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
       - run: rustup show active-toolchain   # honours rust-toolchain.toml
@@ -36,6 +43,7 @@ jobs:
   gates:
     name: project invariants
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       # **Full history, on purpose.** `make gates` checks that
       # `docs/progress.md` still matches the tracker, and that chart dates each
@@ -54,6 +62,7 @@ jobs:
   lint:
     name: clippy
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
       - run: rustup show active-toolchain
@@ -62,6 +71,7 @@ jobs:
   test-host:
     name: host unit tests
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
       - run: rustup show active-toolchain
@@ -72,6 +82,7 @@ jobs:
   boot:
     name: boot (${{ matrix.firmware }}, ${{ matrix.cpu }})
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -199,6 +210,7 @@ jobs:
   shell:
     name: interactive shell
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
       - run: rustup show active-toolchain
@@ -290,6 +302,7 @@ jobs:
   boot-iommu:
     name: boot (iommu)
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
       - run: rustup show active-toolchain
@@ -393,6 +406,7 @@ jobs:
   http:
     name: http (go server under load)
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
       - run: rustup show active-toolchain
@@ -452,6 +466,7 @@ jobs:
   faults:
     name: fault injection
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
       - run: rustup show active-toolchain

@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | 🔨 **Draft 2026-09-29 — both steps built and gated, each armed red.** A woken futex sleeper comes back to the adapter for its answer, its wake slot is no longer given back before it has taken the wake, and a signal sent to a futex sleeper is delivered when it wakes — RFC 0083's fourth limit, closed. The acceptance call is the project lead's. |
+| **Status** | ✅ **ACCEPTED 2026-10-04 by the project lead.** Drafted 2026-09-29 — **both steps built and gated, each armed red.** A woken futex sleeper comes back to the adapter for its answer, its wake slot is no longer given back before it has taken the wake, and a signal sent to a futex sleeper is delivered when it wakes — RFC 0083's fourth limit, closed. ~~The acceptance call is the project lead's.~~ |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | userspace (`bin/linuxd`) |
 | **Milestone** | Phase 2 — the Linux personality ([RFC 0005](0005-linux-abi-compatibility.md)) |

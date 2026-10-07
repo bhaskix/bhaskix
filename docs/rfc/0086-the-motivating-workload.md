@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | 🔨 **Draft 2026-09-30 — ~~steps 1, 2, 3a and 3b done~~ ~~steps 1–4 done, step 5 built and not yet passing~~ ~~steps 1–5 done~~ all six steps done** (this cell read "3b" through step 4's landing; corrected 2026-10-01; steps 5 and 6 the same day). The workload RFC 0005 was owed from outside is named, its gate defined, its size measured and its system calls traced; `bin/tcpd` holds a table of thirty-two connections and a listener arms ring pairs, gated by four host clients held at once. `tcpd` serves a second listener opened by any program, and names a connection's peer; a hosted Linux program listens, accepts and echoes a host client through `bin/linuxd`; `epoll` works edge-triggered; and **the Go server serves sixteen keep-alive clients for five minutes, every body checked, zero errors** — thirty seconds on every push, three hundred nightly. ~~It corrupted its own memory on longer runs~~ — found and fixed 2026-10-01: the kernel refused every `MADV_DONTNEED`. Step 6's record says the gate is met, against RFC 0005 step 10. The acceptance call is the project lead's. |
+| **Status** | ✅ **ACCEPTED 2026-10-04 by the project lead.** Drafted 2026-09-30 — **~~steps 1, 2, 3a and 3b done~~ ~~steps 1–4 done, step 5 built and not yet passing~~ ~~steps 1–5 done~~ all six steps done** (this cell read "3b" through step 4's landing; corrected 2026-10-01; steps 5 and 6 the same day). The workload RFC 0005 was owed from outside is named, its gate defined, its size measured and its system calls traced; `bin/tcpd` holds a table of thirty-two connections and a listener arms ring pairs, gated by four host clients held at once. `tcpd` serves a second listener opened by any program, and names a connection's peer; a hosted Linux program listens, accepts and echoes a host client through `bin/linuxd`; `epoll` works edge-triggered; and **the Go server serves sixteen keep-alive clients for five minutes, every body checked, zero errors** — thirty seconds on every push, three hundred nightly. ~~It corrupted its own memory on longer runs~~ — found and fixed 2026-10-01: the kernel refused every `MADV_DONTNEED`. Step 6's record says the gate is met, against RFC 0005 step 10. ~~The acceptance call is the project lead's.~~ |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | userspace (`bin/linuxd`, `bin/tcpd`), `personality`, tools |
 | **Milestone** | Phase 2 — the Linux personality ([RFC 0005](0005-linux-abi-compatibility.md)) |
@@ -631,7 +631,10 @@ the code that reads it — a vDSO, which Go finds through `AT_SYSINFO_EHDR` (rea
 would answer these without a call. Answering them in the nucleus instead is
 ruled out by RFC 0031's count of Linux numbers interpreted there, which is 0.
 Either would want its own RFC and the lead's word, and these figures are what
-it would be measured against.
+it would be measured against. **The word, 2026-10-04:** the vDSO was proposed
+as [RFC 0088](0088-a-clock-a-process-reads-itself.md) and **deferred** by the
+lead — kept as a proposal, to be built when the Go server's per-response cost
+makes clock reads the bottleneck.
 
 ## Design
 

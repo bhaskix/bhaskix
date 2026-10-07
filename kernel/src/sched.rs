@@ -2611,12 +2611,6 @@ fn try_steal(cpu: usize, mine: &mut RunQueue) -> Option<usize> {
     None
 }
 
-/// Records that the switch this CPU began has finished.
-///
-/// Called on the way out of every switch: from [`preempt`] for a thread that
-/// has run before, and from the trampoline via `bhaskix_thread_entered` for
-/// one that has not. Until it runs, no other CPU will steal from here — so
-/// missing a path does not corrupt anything, it quietly stops balancing.
 /// The last few switches, so the fault path can say what led to one.
 ///
 /// Packed as `thread << 32 | root >> 12`: a thread identifier and the frame
@@ -2923,6 +2917,12 @@ pub fn switch_gaps() -> (u64, u64) {
     )
 }
 
+/// Records that the switch this CPU began has finished.
+///
+/// Called on the way out of every switch: from [`preempt`] for a thread that
+/// has run before, and from the trampoline via `bhaskix_thread_entered` for
+/// one that has not. Until it runs, no other CPU will steal from here — so
+/// missing a path does not corrupt anything, it quietly stops balancing.
 fn finish_switch() {
     use core::sync::atomic::Ordering;
 
