@@ -37,8 +37,9 @@ The `-ix` is the Unix lineage, the same suffix Minix and Linux carry.
 
 **Created and developed by [Tarun Kumar Kushwaha](AUTHORS.md)** — original author and project lead.
 
-> **Status: Phase 2 — core operating system.** Phase 1 is complete: M1 through M6, and M7 through
-> M9 on top of them.
+> **Status: Phase 3 — enterprise features, from 2026-10-07.** Phases 1 and 2 are complete: M1
+> through M6, M7 through M9 on top of them, and every Phase 2 bullet — Phase 2's self-hosting clause
+> was moved to L2 rather than met, and stays in the gaps below.
 >
 > Boots on UEFI and BIOS. Every CPU exception produces a decoded diagnostic instead of a triple
 > fault. A buddy physical allocator and a slab heap; address spaces with W^X by construction;
