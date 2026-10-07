@@ -571,12 +571,19 @@ is argued:
    is administrative *within its grants* and nothing more.
 4. **Native software never pays.** A domain that did not ask for a personality does not carry one.
 
-> **Partly built, and one part is in the wrong place.** The tag, the dispatch and eight of
+> ~~**Partly built, and one part is in the wrong place.** The tag, the dispatch and eight of
 > [RFC 0005](rfc/0005-linux-abi-compatibility.md)'s steps run: a real static Go binary loads,
 > makes system calls, prints through the adapter and stops in its own allocator. But the
 > translation itself is currently **inside the nucleus** rather than in a service domain, which is
 > what RFC 0005 requires and what rule 1 above states. [security.md](security.md) §1's **T11** row
-> says what that costs while it lasts, and RFC 0031 §5 carries the correction and its trigger.
+> says what that costs while it lasts, and RFC 0031 §5 carries the correction and its trigger.~~
+>
+> **Stale since 2026-08-20, corrected 2026-10-07.** The translation moved out of the nucleus into
+> `bin/linuxd`, a service domain in ring 3 ([RFC 0032](rfc/0032-a-supervisor-interface.md)): the
+> nucleus interprets **no** Linux system-call number, gated on every boot, and T11 is mitigated.
+> A go 1.27.1 `net/http` server serves sixteen clients under load
+> ([RFC 0086](rfc/0086-the-motivating-workload.md)), which is RFC 0005's step 10; RFC 0005 was
+> amended and accepted on 2026-10-07, with what it did not finish carried out in `TRACKER.md` §4.
 
 ---
 

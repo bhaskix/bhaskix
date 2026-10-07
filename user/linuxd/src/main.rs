@@ -1555,11 +1555,17 @@ fn answer_writev(request: &PersonalityCall) -> Answer {
 
 /// `tgkill(tgid, tid, signal)` — a libc raising a signal at itself.
 ///
-/// **Only at itself, and only the ones that end it.** This personality has no
+/// **Only at itself, and only the ones that end it.** ~~This personality has no
 /// signal delivery: RFC 0033 gave hosted processes `rt_sigaction` so a runtime
 /// can install handlers it will never be called with, and that gap is written
-/// down rather than papered over. What `abort()` needs is not delivery -- it
-/// needs the process to *stop*, which this can do honestly.
+/// down rather than papered over.~~ **Stale since RFC 0083 (2026-09-19),
+/// corrected 2026-10-07:** handlers are called now -- [`deliver_signal`], and
+/// [`deliver_signal_after_call`] on the way back from a call -- yet every other
+/// `tgkill` is still answered `ENOSYS`: a signal for another thread, or a
+/// non-fatal one for this thread, Go's `SIGURG` preemption among them. That is
+/// carried out of RFC 0005 with RFC 0083's limit (`TRACKER.md` §4). What
+/// `abort()` needs is not delivery -- it needs the process to *stop*, which
+/// this can do honestly.
 ///
 /// So a fatal signal aimed at the caller's own thread ends its domain, with the
 /// signal recorded as the reason. Anything else is refused: a program that

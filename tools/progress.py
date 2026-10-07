@@ -287,8 +287,20 @@ def read_phase_bullets(text: str) -> list[tuple[str, bool, str | None]]:
     if len(section) < 2:
         return bullets
     body = section[1].split("\n## ", 1)[0]
+    # **The Phase 2 table only, header to its first non-table line.** This read
+    # every `|` line in §4 until 2026-10-07, when a second table there -- what
+    # RFC 0005 carried out at its amendment -- was counted as Phase 2 work and
+    # the chart read "13 of 25" against a true 13 of 13.
+    in_table = False
     for line in body.split("\n"):
-        if not line.startswith("|") or line.startswith("|---") or "Phase 2 bullet" in line:
+        if "Phase 2 bullet" in line:
+            in_table = True
+            continue
+        if not in_table:
+            continue
+        if not line.startswith("|"):
+            break
+        if line.startswith("|---"):
             continue
         cells = line.split("|")
         if len(cells) < 4:

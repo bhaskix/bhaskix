@@ -100,7 +100,9 @@ The `-ix` is the Unix lineage, the same suffix Minix and Linux carry.
 > through rings the connecting *program* owns and hands over as capabilities, with the cost measured
 > rather than argued about.
 >
-> What is genuinely not here: **no libc and no self-hosting** — the Linux personality runs Go
+> What is genuinely not here: **no libc and no self-hosting** — no libc by design, since the roadmap's libc item
+> was resolved into the Linux personality ([RFC 0005](docs/rfc/0005-linux-abi-compatibility.md), accepted as amended
+> 2026-10-07), which runs Go
 > binaries in ring 3 ~~but its file and socket tiers are not started~~ *(stale, corrected
 > 2026-09-30: files and directories have been served since 2026-08-23 and UDP sockets since the
 > same day)* — and ~~**TCP and `epoll` for hosted programs are not built**~~ *(TCP's server side

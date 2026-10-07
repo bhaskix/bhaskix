@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | **Draft — revised for implementation 2026-08-19** (drafted before M5 existed; see "The machine this now lands on" below for what two phases changed) |
+| **Status** | ✅ **ACCEPTED 2026-10-07 by the project lead, as amended** — steps 1–5 and 10 done, 6, 8 and 9 part-done, 7 superseded by 10, the remainder carried out in `TRACKER.md` §4. Revised for implementation 2026-08-19; amended 2026-10-07 to be judged against what it now is; ~~the acceptance call is the project lead's~~. Drafted before M5 existed: see "The machine this now lands on" for what two phases changed, and "What it is judged against" for the amendment |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | kernel (dispatch tag only), userspace; new subsystem `personality` |
 | **Milestone** | Phase 2's last bullet — the roadmap's `libc` item, which this RFC resolves into a personality rather than a library |
@@ -40,6 +40,57 @@ binary's histogram exists, and the public corpus is the work queue in the meanti
 **Owed no longer, 2026-09-30:** the project lead named the workload — a static Go `net/http`
 server under sixteen concurrent clients for five minutes — and its trace under that load is
 published in [RFC 0086](0086-the-motivating-workload.md), which carries step 10 from here.
+
+---
+
+## What it is judged against (amendment of 2026-10-07)
+
+Step 10, the gate this RFC said mattered most, was met on 2026-10-01. An audit of every step
+against its own wording on 2026-10-07 found four short of it, and much of this document and
+`TRACKER.md` still describing the machine of August. This section is what the RFC is judged
+against; the project lead chose to amend it rather than build the remainder first, ~~and the
+acceptance call stays theirs~~ **and accepted it as amended the same day.**
+
+| Step | As the plan words it | Where it stands |
+|---|---|---|
+| 1 | Trace the target, publish the histogram | ✅ Under Linux in [RFC 0086](0086-the-motivating-workload.md) (go 1.13.8, `strace -c`), and on this machine under load in its *Which calls* table (go 1.27.1, per response) |
+| 2 | Dispatch, `-ENOSYS`, telemetry | ✅ The nucleus interprets **no** Linux number ([RFC 0032](0032-a-supervisor-interface.md)), gated every boot |
+| 3 | Initial process image | ✅ The `AT_RANDOM` gate |
+| 4 | Signals | ✅ [RFC 0083](0083-a-signal-a-process-can-catch.md) — delivered at a call or a fault, and nowhere else |
+| 5 | Memory | ✅ Including RFC 0086 step 5's `MADV_DONTNEED` that really discards |
+| 6 | Threads and futex, with a contention stress test | **Part** — `clone`, `gettid`, `exit_group` and `futex` gated; `tgkill` delivers only a fatal signal a thread sends itself; **no contention stress test exists** |
+| 7 | Tier 0: corpus programs 1–5 pass | **Superseded by step 10** — below |
+| 8 | Tier 1, with its fuzz target | **Part** — all but `readlinkat` and `/proc/self/exe`, left out on purpose (step 8's record) |
+| 9 | Tier 2: sockets and `epoll` | **Part** — UDP, server-side TCP and edge-triggered `epoll` gated; **no `connect`**, so hosted TCP is server-only, and IPv4 UDP loopback was never shown |
+| 10 | The motivating workload under load | ✅ **Met 2026-10-01**, [RFC 0086](0086-the-motivating-workload.md) |
+
+**Step 10 supersedes step 7's corpus.** The corpus was the work queue while no workload was
+named — the 2026-08-19 revision above says so — and the workload has been named and run since.
+What programs 1–5 were meant to prove is covered as follows, and not more than this: *1*
+(`write`, `exit_group`) and *3* (`clone`, `futex`) by the Go server's own run, at its scale and
+not at 10,000 goroutines; *2* (`mmap`, `madvise`, the heap) by the same run, not at 1 GiB, which
+a 256 MiB machine cannot hold; *4* (`SIGSEGV` delivery) by step 4's gate, a hand-written probe
+rather than a recovered Go panic. **Program 5 — `SIGURG` asynchronous preemption — is covered by
+nothing**, and goes below. The corpus stays defined, as the testing plan says, for contributors
+without the workload; it is no longer an acceptance gate.
+
+**Carried out, each with its home** — tracked in `TRACKER.md` §4 under *Carried out of RFC 0005*:
+
+- **`connect`, and IPv4 UDP loopback** → roadmap **L1**, whose `curl` and OpenSSH need a client.
+- **`readlinkat` and `/proc/self/exe`** → **L1**, with step 8's trigger: the first program that
+  needs its own path.
+- **Asynchronous signal delivery** — `SIGURG`, and `tgkill` beyond a fatal signal to oneself —
+  is [RFC 0083](0083-a-signal-a-process-can-catch.md)'s recorded limit, under its trigger.
+- **A futex contention stress test** (step 6), **a fuzz target over the argument decoder** (the
+  testing plan; the two targets that exist cover the `dirent` encoder and `sockaddr` parsing),
+  **rule 2's negative test restated for the adapter** (the capabilities are the adapter's, not
+  the hosted domain's, so "a domain holding no filesystem capability" is not the shape any
+  more), and **the 2× comparison with Linux** (Performance implications) → `TRACKER.md` rows.
+- **The confused-deputy rule is not met, by design, and that is accepted with its price**: one
+  `bin/linuxd` holds directory, network and `tcpd` authority for every hosted process —
+  [RFC 0031](0031-linux-compatibility-as-an-adapter.md)'s I5 departure, priced by
+  [security.md](../security.md) §1's notes under T11: a compromise of the adapter reaches every
+  hosted process's files, and the network on top of them.
 
 ---
 
@@ -295,10 +346,11 @@ first runtime that reads `fs:` before making a call; the per-CPU domain note was
 whenever the *outgoing* thread's slot was already empty, so a thread following an exited
 one on the same CPU was judged by its predecessor's dialect (the memory probe caught it,
 answered `BadSyscall`); and the probe's own flag constant omitted three shares, which the
-decoder refused exactly as designed. What remains stated: `clone` returns zero in the child
+decoder refused exactly as designed. ~~What remains stated: `clone` returns zero in the child
 by construction rather than by writing a register, because the child never returns through
 the syscall path at all — a runtime expecting Linux's resume-after-the-syscall shape needs a
-register-file copy this does not do.
+register-file copy this does not do.~~ **Superseded, recorded 2026-10-07:** RFC 0086's trampoline
+gives the child Linux's resume-after-the-syscall shape — `user/linuxd/src/clone.rs`.
 
 **The original refusal, kept for its reasoning.** `clone` was **refused with `ENOSYS`**. The flag decoding is complete and host-tested (Go's exact set is recognised, a
 partial share is refused rather than approximated, `CLONE_NEWPID` is refused because a
@@ -360,7 +412,8 @@ for the `/sys` probes, then `nanosleep`.
 > left alone so the commits and the tracker still match it.** Its content —
 > `mprotect` and `mmap` hints — is **step 5's**, finished late because step 7
 > was what revealed it was unfinished. The implementation plan's step 8 is
-> *Tier 1*: files, directories, synthetic `/proc`. That has not started. The
+> *Tier 1*: files, directories, synthetic `/proc`. ~~That has not started.~~
+> **It started 2026-08-23 and is all but done — see "What it is judged against".** The
 > plan below is the authority on what a step number means; these record
 > sections are numbered by the order the work happened.
 
@@ -464,10 +517,12 @@ demands `woke 1`, because that is the only word in its sentence that says the pa
 is step 6's instrument, not step 9's, and it is written down here because this is where it was
 found.
 
-**What is not done, stated as plainly as what is:** no hosted program has opened
+~~**What is not done, stated as plainly as what is:** no hosted program has opened
 a file, made a socket or waited on an `epoll` set. Nothing above is reachable
 from ring 3 yet, and it will not be until the personality is where this RFC has
-always said it belongs.
+always said it belongs.~~ **Superseded, recorded 2026-10-07:** the personality moved to
+`bin/linuxd` in ring 3 on 2026-08-20 (RFC 0032), and hosted programs have opened files since
+2026-08-23, made sockets since the same day and waited on `epoll` since 2026-09-30.
 
 ## Step 8's record, the real one (2026-08-23): directories are readable, and reading a file twice is not
 
@@ -732,8 +787,11 @@ bit, and the allow-list opened to everything.
   same day, and the probe reads the file it stats. The gate no longer looks
   for the file's line, it *counts* it — twice, once per hosted program —
   because a single match is what the bug produced.
-- **`readlinkat`, `unlinkat`, `mkdirat`, `fcntl`, `ioctl`, `uname`** are named
-  in Tier 1 and are not here. `getdents64` and `fstat` were chosen because
+- ~~**`readlinkat`, `unlinkat`, `mkdirat`, `fcntl`, `ioctl`, `uname`** are named
+  in Tier 1 and are not here.~~ **Superseded the same day, recorded 2026-10-07:** all but
+  `readlinkat` landed in this step's second pass (the note at its head), and `mkdirat` and
+  `unlinkat` succeed under `/tmp` since [RFC 0060](0060-a-writable-path-for-a-hosted-process.md).
+  The rest of this bullet is the reasoning of the moment, kept. `getdents64` and `fstat` were chosen because
   directories were the part of Tier 1 with *nothing* behind them; the rest
   have arithmetic or an obvious shape and no discoveries left in them.
 - **`st_ino` on the root is zero**, and it is a gap rather than a value: the
@@ -861,6 +919,13 @@ called as though it had one — the same shape as
 [RFC 0044](0044-revocation-that-reaches-the-mapping.md)'s.
 
 ### What this does not do
+
+> **Superseded in part, recorded 2026-10-07:** server-side TCP, `listen`, `accept4`,
+> `getsockname`, `setsockopt` and edge-triggered `epoll` all landed with
+> [RFC 0086](0086-the-motivating-workload.md) (2026-09-30). Still true: `recvfrom` on a
+> datagram socket answers `EAGAIN` rather than waiting (`answer_recvfrom` in `bin/linuxd`), and
+> **`connect` is still not here**, so hosted TCP is server-only; it is carried to L1 by "What it is judged
+> against". The list below is the state of 2026-08-23.
 
 - **No TCP.** `socket()` refuses `SOCK_STREAM` with `EPROTONOSUPPORT` rather
   than handing back a descriptor that would fail at `connect` saying nothing.
@@ -1039,6 +1104,12 @@ one, because the Go runtime reads that state directly:
   > here: mapping a user-executable page in the kernel half touches the shared
   > higher-half tables every address space copies, which is a decision with a
   > security dimension and deserves its own RFC rather than a paragraph.
+  >
+  > **And for the Go this now runs, recorded 2026-10-07:** go 1.27.1 makes the
+  > `clock_gettime` system call where 1.13.8 reached for the vsyscall page (RFC 0086 step 5), so
+  > nothing faults there today. The vDSO that would answer the call without one is
+  > [RFC 0088](0088-a-clock-a-process-reads-itself.md), deferred by the project lead on
+  > 2026-10-04.
 
 ### The system-call surface, in tiers
 
@@ -1064,8 +1135,8 @@ covering `self/exe`, `self/maps`, and `self/status`.
 > **Whose descriptor table, whose pid — 2026-08-20.** Every call in that
 > paragraph assumes a process with a descriptor table, and this RFC never said
 > where either lives.
-> [RFC 0033](0033-what-a-hosted-process-is.md) proposes the answer and is a
-> draft: a hosted process is a **record in `bin/linuxd`** bound one-to-one to a
+> [RFC 0033](0033-what-a-hosted-process-is.md) proposes the answer and ~~is a
+> draft~~ **was accepted 2026-08-20**: a hosted process is a **record in `bin/linuxd`** bound one-to-one to a
 > domain; a descriptor is a capability the *adapter* holds and the process names
 > by an integer; the pid is invented in ring 3 and survives `execve`, which must
 > build a new domain because `START` refuses one that has threads. Read that
@@ -1276,19 +1347,32 @@ which is why it is defined as programs rather than as one binary.
    between releases — async preemption arrived in 1.14, and the transparent
    hugepage probing in 1.21 reads `/sys`. Pinning a minimum version is
    necessary; which one is not yet decided. *Decided by: whoever traces the
-   target workload first.*
+   target workload first.* **Answered 2026-10-01 by the project lead**, under RFC 0086's question 1:
+   go 1.27.1, pinned and checksummed by `tools/fetch-go.sh` — one pinned toolchain rather than a
+   declared minimum, and the one the gate runs.
 2. **`CGO_ENABLED=1` ever?** It requires dynamic linking and a real `libc`,
    which is most of the cost this RFC avoids. Probably never, but it should be
-   an explicit decision rather than a drift.
+   an explicit decision rather than a drift. **Placed 2026-10-07:** it needs the dynamic linker,
+   which [RFC 0031](0031-linux-compatibility-as-an-adapter.md) puts under **L2**; nothing before
+   L2 offers it.
 3. **How much `/proc`?** Go touches a handful of paths. A synthetic, read-only,
    per-domain `/proc` with a fixed set of entries is proposed; the set is
-   undecided, and it should be an allow-list that grows on evidence.
+   undecided, and it should be an allow-list that grows on evidence. **Answered by
+   [RFC 0033](0033-what-a-hosted-process-is.md):** `/proc/self/status` and `/proc/self/maps`,
+   the caller's own process only; `self/exe` waits on step 8's trigger. The reason given for
+   leaving out `cmdline` and `environ` — no `execve` that carries arguments — went with
+   [RFC 0059](0059-an-execve-that-runs-a-program.md), so they are an allow-list entry away.
 4. **Personality in one domain or one per process?** Per-process is stronger
    isolation and more expensive. Undecided, and it depends on how heavy domains
-   turn out to be after M5.
+   turn out to be after M5. **Half answered by [RFC 0033](0033-what-a-hosted-process-is.md):**
+   every hosted process has a domain of its own, and one adapter, `bin/linuxd`, serves them all;
+   whether there should be more than one adapter is RFC 0033's own open question 3.
 5. **Does `execve` mean anything here?** A Linux process exec'ing another
    binary is common; it implies process creation semantics that do not map onto
-   domains cleanly. It may belong in Tier 1, or it may be out of scope entirely.
+   domains cleanly. It may belong in Tier 1, or it may be out of scope entirely. **Answered:**
+   [RFC 0033](0033-what-a-hosted-process-is.md) gave a hosted process a pid that survives an
+   `execve`, and [RFC 0059](0059-an-execve-that-runs-a-program.md) made it run a program off the
+   filesystem with `argv` and environment.
 
 ---
 
@@ -1299,24 +1383,27 @@ before M5 delivers user mode and M6 delivers the ELF loader.
 
 1. **Trace the target.** Run the motivating workload under Linux with syscall
    tracing and publish the actual histogram. Every tier below is provisional
-   until this exists.
+   until this exists. ✅ **Done** — [RFC 0086](0086-the-motivating-workload.md).
 2. **Personality dispatch.** Per-domain personality tag, syscall entry routing,
    `-ENOSYS` for everything, telemetry on unimplemented calls. Merges with no
-   syscalls implemented at all — the observability is the deliverable.
+   syscalls implemented at all — the observability is the deliverable. ✅ **Done.**
 3. **Initial process image.** Static ELF load, initial stack, auxv. Host-tested
    byte-exact. Gate: a hand-written assembly binary that reads `AT_RANDOM` and
-   exits with a known code.
+   exits with a known code. ✅ **Done.**
 4. **Signals.** `rt_sigaction`, `sigaltstack`, delivery with a correct
    `ucontext`, `rt_sigreturn`. Before threading, because it is the part most
-   likely to invalidate the design.
+   likely to invalidate the design. ✅ **Done**, delivery at a call or a fault.
 5. **Memory.** `mmap`, `munmap`, `mprotect`, `madvise` over the existing
-   region map, which already makes `W^X` unrepresentable.
+   region map, which already makes `W^X` unrepresentable. ✅ **Done.**
 6. **Threads and futex.** `clone`, `gettid`, `tgkill`, `exit_group`, `futex`,
-   with a dedicated contention stress test.
+   with a dedicated contention stress test. **Part** — no stress test, and `tgkill` only to
+   end oneself; both carried out by "What it is judged against".
 7. **Tier 0 gate.** Corpus programs 1–5 pass. This is the milestone worth
-   announcing: a real Go binary, unmodified, on Bhaskix.
+   announcing: a real Go binary, unmodified, on Bhaskix. **Superseded by step 10**, amendment
+   of 2026-10-07 — program 5 (`SIGURG`) carried out.
 8. **Tier 1.** Files, directories, synthetic `/proc`. Fuzz target mandatory
-   before merge.
-9. **Tier 2.** Sockets and `epoll`, after the Phase 2 network stack.
+   before merge. **Part** — `readlinkat` and `/proc/self/exe` carried out to L1.
+9. **Tier 2.** Sockets and `epoll`, after the Phase 2 network stack. **Part** — `connect` and
+   IPv4 UDP loopback carried out to L1.
 10. **The real gate.** The motivating workload runs under load. ✅ **Met
     2026-10-01** — [RFC 0086](0086-the-motivating-workload.md).

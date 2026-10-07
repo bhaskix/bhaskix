@@ -10,11 +10,11 @@
 
 | | |
 |---|---|
-| RFCs accepted | **58** |
-| RFCs open | 28 |
+| RFCs accepted | **59** |
+| RFCs open | 27 |
 | RFCs closed without shipping | 2 |
 | Milestone rows done | **92 of 95** |
-| Phase 2 bullets done | **12 of 13** |
+| Phase 2 bullets done | **13 of 13** |
 | Newest dated entry | 2026-10-07 |
 
 ## Timeline
@@ -89,7 +89,7 @@ gantt
     RFC 0062 a thread may not run with a TLS base it did not... :active, r0062, 2026-09-01, 2026-10-07
     RFC 0087 A holder that survives its lender :done, r0087, 2026-09-30, 2026-10-04
     section Userspace & personality
-    RFC 0005 Linux ABI compatibility as a domain personality :active, r0005, 2026-08-03, 2026-10-07
+    RFC 0005 Linux ABI compatibility as a domain personality :done, r0005, 2026-08-03, 2026-10-07
     RFC 0027 A sockets API worth the name :done, r0027, 2026-08-17, 1d
     RFC 0030 Packages — authority made reviewable :done, r0030, 2026-08-18, 2026-08-19
     RFC 0031 Linux compatibility as an adapter and the... :active, r0031, 2026-08-19, 2026-10-07
@@ -157,7 +157,7 @@ gantt
 | Networking — virtio-net Ethernet IPv4/IPv6 UDP TCP sockets | ✅ done | 2026-08-18 |
 | Package management and image building | ✅ done | 2026-08-19 |
 | Telemetry plane | ✅ done | 2026-08-17 |
-| libc — resolved into the Linux personality | ⬜ open | — |
+| libc — resolved into the Linux personality | ✅ done | 2026-10-07 |
 | A fuzz target for the filesystem — a hostile disk image | ✅ done | 2026-08-21 |
 | Three fuzz targets that reach nothing from an empty corpus — pkg_manifest pkg_package ustar_parse | ✅ done | 2026-08-21 |
 | A coverage-guided fuzz target for IPv6 and NDP | ✅ done | 2026-08-21 |
@@ -168,7 +168,6 @@ gantt
 |---|---|---|
 | 0003 | Storage architecture | 2026-08-03 |
 | 0004 | Operational technology as the first target deployment | 2026-08-03 |
-| 0005 | Linux ABI compatibility as a domain personality | 2026-08-03 |
 | 0006 | Kosh — unified storage from one node to many | 2026-08-03 |
 | 0007 | Live patching the nucleus | 2026-08-04 |
 | 0031 | Linux compatibility as an adapter and the containment it must inherit | 2026-08-19 |

@@ -72,6 +72,14 @@ one of the few places where "we built our own kernel" converts into a concrete
 technical advantage rather than a slogan**, which is exactly the standard
 [vision.md](../vision.md) sets for the project's claims.
 
+> **Coexisting with [RFC 0005](0005-linux-abi-compatibility.md) — added 2026-10-07, at that RFC's
+> request** (its impact table asked for this note). The critique above is of POSIX as the
+> *primitive*, and RFC 0005 does not bring it back as one: the Linux system-call ABI runs as a
+> personality, an adapter above Bhaskix's services and never inside the nucleus
+> ([RFC 0031](0031-linux-compatibility-as-an-adapter.md)). That is the "POSIX VFS" box in this
+> RFC's personalities row, reached from the system-call side — what this design anticipated, with
+> RFC 0005 as its counterpart.
+
 ### Why this matters for the mission specifically
 
 [vision.md](../vision.md) commits Bhaskix to serving "developers, enterprises,

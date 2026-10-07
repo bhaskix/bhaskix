@@ -353,7 +353,7 @@ meanings of one word, the application targets are **L1–L4** and are milestones
 
 | | Target | What it demands beyond the previous | Status |
 |---|---|---|---|
-| **L1** | Static ELF binaries, BusyBox, shell utilities, `curl`, OpenSSH | Tier 1's file surface, `execve`, pipes, a real `/proc` subset, terminal `ioctl`s | **not started**; a Go binary loads and runs 212 calls |
+| **L1** | Static ELF binaries, BusyBox, shell utilities, `curl`, OpenSSH | Tier 1's file surface, `execve`, pipes, a real `/proc` subset, terminal `ioctl`s | ~~**not started**; a Go binary loads and runs 212 calls~~ **started 2026-08-20** — corrected 2026-10-07; [roadmap.md](../roadmap.md)'s L1–L4 table carries the status now, and this one is the plan of 2026-08-19 |
 | **L2** | Python, GCC, Clang, Rust, Go toolchains | The dynamic linker and a real libc's expectations, `fork`, process groups, filesystem breadth | not started |
 | **L3** | nginx, Apache, PostgreSQL, MariaDB | Tier 2 sockets and `epoll`, `mmap`-heavy storage, `fsync` durability, users and permissions | not started |
 | **L4** | Larger server software, container workloads | Cgroup-shaped resource control mapped onto `ResourceEnvelope`, image formats, orchestration | not started |
