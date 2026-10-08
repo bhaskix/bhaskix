@@ -143,8 +143,12 @@ The `-ix` is the Unix lineage, the same suffix Minix and Linux carry.
 > 3.10**. Every register offset came from Intel's public C620 datasheet, cited to its table; no
 > driver source was read, so the licence question
 > [RFC 0071](docs/rfc/0071-drivers-for-hardware-that-already-exists.md) raises never had to be
-> answered. **No packet has moved.** A receive queue needs the device's Host Memory Cache
-> programmed first, and that is not written.
+> answered. ~~**No packet has moved.** A receive queue needs the device's Host Memory Cache
+> programmed first, and that is not written.~~ **Packets moved the next day** (this paragraph said
+> otherwise until 2026-10-08): the X722 transmits and receives from ring 3 since 2026-09-07, and on
+> 2026-09-13 a host on the machine's network pinged it and **it replied** — ARP and ICMP answered
+> on physical hardware. An address from DHCP, an exchange this machine starts, and TCP have not
+> run there yet.
 >
 > Nothing here should run anywhere that matters — see [SECURITY.md](SECURITY.md).
 >
@@ -273,8 +277,9 @@ Builds on **stable Rust** — no nightly, no `#![feature]` anywhere in the tree
 
 `make test` runs, cheapest first, so a trivial mistake fails in seconds rather
 than after a QEMU boot: `rustfmt`; `clippy` on both the freestanding and host
-targets; **1,010 host tests** (recounted 2026-08-24 from a `make test-host` run —
-this line said "346 host assertions" for months, carried forward uncounted,
+targets; **1,339 host tests** (recounted 2026-10-08 from a `make test` run; it read
+1,010, recounted 2026-08-24 from a `make test-host` run, for six weeks; before
+that this line said "346 host assertions" for months, carried forward uncounted,
 and then **949 for a day after that count went stale**, which is the same
 failure one recount later); the project-invariant gates (bootloader
 containment, `unsafe` budgets with mandatory `// SAFETY:` justifications,

@@ -22,7 +22,12 @@
 //! interface and `02` is a Serial Storage Bus, and driving either with AHCI's
 //! offsets is writing arbitrary values into a bus master's registers. RFC 0046
 //! names the trap on real hardware: `00:17.0` on the SR550 is class `01.04`,
-//! the same family of silicon in RAID mode, and it does not speak AHCI.
+//! the same family of silicon in RAID mode. **This said "and it does not speak
+//! AHCI" until 2026-10-08, and that was wrong**: Linux's `drivers/ata/ahci.c`
+//! binds `8086:2826` by its ID whatever its class, so it most likely presents
+//! AHCI's registers. The filter stands for its own reason -- a class byte that
+//! says RAID promises no register layout -- and taking such a controller would
+//! be a decision by device ID, made when a machine needs it.
 //!
 //! So the scan classifies before it records, [`classify`] is a pure function of
 //! three bytes, and no part of deciding what a function *is* needs a machine.

@@ -83,7 +83,13 @@ nothing about it needs a machine to test.
 
 1. **Find the controller** — PCI class `01`, subclass `06`, prog-if `01` (AHCI).
    Subclass alone is not enough: `00:17.0` on the SR550 is class `01.04`, the
-   same silicon in RAID mode, and it does not speak AHCI.
+   same silicon in RAID mode, ~~and it does not speak AHCI~~ — **that half was
+   wrong (corrected 2026-10-08)**: Linux's `drivers/ata/ahci.c` binds
+   `8086:2826` by its ID whatever its class, so it most likely *does* present
+   AHCI's registers. The rule stands for its own reason — a class byte that
+   says RAID promises no register layout — and the machine's disks are not on
+   that controller anyway: they are behind a RAID 530-8i adapter, read from the
+   machine's BMC on 2026-10-08.
 2. **Take ownership from the firmware** if `CAP2.BOH` says the BIOS has it —
    the BIOS/OS handoff. Skipping it on a machine that wants it means the
    firmware and this driver both think they own the controller.
