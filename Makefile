@@ -271,7 +271,7 @@ OVMF_CODE    := $(firstword $(wildcard $(OVMF_DIR)OVMF_CODE$(OVMF_SUFFIX).fd))
 OVMF_VARS    := $(firstword $(wildcard $(OVMF_DIR)OVMF_VARS$(OVMF_SUFFIX).fd))
 
 .PHONY: FORCE all kernel iso demo run run-uefi progress test test-host test-boot test-boot-uefi test-boot-uefi-qemu64 test-boot-iommu test-keyboard \
-        test-boot-iommu-off test-boot-qemu64 test-boot-native test-boot-native-full \
+        test-boot-iommu-off test-boot-qemu64 test-boot-native test-boot-native-full test-boot-native-tpm \
         test-placements mkfs test-shell test-faults test-usb-keyboard test-lacp test-bond test-http fmt clippy gates hooks clean distclean help
 
 all: iso
@@ -886,6 +886,13 @@ test-boot-native: $(BOOTEFI) $(ISO)
 # holds bhaskixboot to everything the incumbent is held to.
 test-boot-native-full: $(BOOTEFI) $(ISO)
 	tests/qemu/boot-test.sh native
+
+# RFC 0089 step 1: the native lane with a TPM 2.0 attached, through the
+# emulator `tools/swtpm.sh` runs in a container. **Not in `make test` yet**,
+# because it needs Docker on the machine running it; it joins when the loader
+# measures something this lane can assert (step 2), and CI runs it from step 7.
+test-boot-native-tpm: $(BOOTEFI) $(ISO)
+	BHASKIX_TPM=1 tests/qemu/native-boot-test.sh
 
 
 # Types at the machine over the serial line and asserts on the replies. The

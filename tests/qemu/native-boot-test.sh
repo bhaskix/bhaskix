@@ -73,6 +73,25 @@ fi
 # The ESP as a directory: QEMU's fat: driver serves it read-write, no image
 # tooling needed, and EFI/BOOT/BOOTX64.EFI is the removable-media path every
 # firmware falls back to.
+# **A TPM on request** -- `BHASKIX_TPM=1`, RFC 0089. The emulator runs in a
+# container from `tools/swtpm.sh`, and a fresh one is started before each boot:
+# a TPM is state, and the second boot below must not inherit the first's PCRs.
+TPM_ARGS=()
+TPM_DIR="$REPO_ROOT/build/swtpm-native"
+stop_tpm() { :; }
+start_tpm() { :; }
+if [[ "${BHASKIX_TPM:-0}" == 1 ]]; then
+    # shellcheck source=tests/qemu/devices.sh
+    source "$REPO_ROOT/tests/qemu/devices.sh"
+    stop_tpm() { "$REPO_ROOT/tools/swtpm.sh" stop "$TPM_DIR"; }
+    start_tpm() {
+        stop_tpm
+        "$REPO_ROOT/tools/swtpm.sh" start "$TPM_DIR" || { fail "the TPM emulator did not start"; exit 1; }
+    }
+    trap stop_tpm EXIT
+    qemu_tpm_args "$TPM_DIR/swtpm.sock"
+fi
+
 ESP="$REPO_ROOT/build/native-esp"
 rm -rf "$ESP"
 mkdir -p "$ESP/EFI/BOOT" "$ESP/bhaskix"
@@ -163,11 +182,13 @@ cp "$OVMF_VARS" "$WRITABLE_VARS"
 # default model has no entropy to draw from. The entropy-less path stays
 # legal (RFC 0021) but this lane's job is to prove the slid one.
 echo "booting the native loader under $(basename "$OVMF_CODE"), up to ${TIMEOUT}s..."
+start_tpm
 timeout "$TIMEOUT" qemu-system-x86_64 \
     -machine q35 -cpu max -smp 4 -m 256 -display none \
     -drive "if=pflash,unit=0,format=raw,readonly=on,file=$OVMF_CODE" \
     -drive "if=pflash,unit=1,format=raw,file=$WRITABLE_VARS" \
     -drive "format=raw,file=fat:rw:$ESP" \
+    "${TPM_ARGS[@]}" \
     -serial "file:$LOG" \
     >/dev/null 2>&1 &
 QEMU_PID=$!
@@ -361,14 +382,16 @@ printf 'XXXX' | dd of="$ESP/bhaskix/kernel" bs=1 count=4 conv=notrunc 2>/dev/nul
 # was right and the medium was wrong. A trap that only springs outside the
 # test that set it is the worst kind.
 restore_kernel() { cp "$KERNEL" "$ESP/bhaskix/kernel" 2>/dev/null; }
-trap restore_kernel EXIT
+trap 'restore_kernel; stop_tpm' EXIT
 cp "$OVMF_VARS" "$WRITABLE_VARS"
 NEGATIVE_LOG=$(mktemp)
+start_tpm
 timeout "$TIMEOUT" qemu-system-x86_64 \
     -machine q35 -m 256 -display none \
     -drive "if=pflash,unit=0,format=raw,readonly=on,file=$OVMF_CODE" \
     -drive "if=pflash,unit=1,format=raw,file=$WRITABLE_VARS" \
     -drive "format=raw,file=fat:rw:$ESP" \
+    "${TPM_ARGS[@]}" \
     -serial "file:$NEGATIVE_LOG" \
     >/dev/null 2>&1 &
 NEG_PID=$!

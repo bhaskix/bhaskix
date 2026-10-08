@@ -122,6 +122,19 @@ while [[ "$BHASKIX_HTTP_PORT" == "$BHASKIX_INBOUND_PORT" || "$BHASKIX_HTTP_PORT"
 done
 export BHASKIX_INBOUND_PORT BHASKIX_CLOSED_PORT BHASKIX_SECOND_PORT BHASKIX_HOSTED_PORT BHASKIX_EPOLL_PORT BHASKIX_HTTP_PORT
 
+# A TPM 2.0 for the measured-boot lanes (RFC 0089), reached through the emulator
+# `tools/swtpm.sh` runs, whose socket is the one argument. Sets `TPM_ARGS`.
+#
+# **Here, because the one-machine gate allows a `-device` line nowhere else.** A
+# lane with a TPM is the same machine plus one device, and saying so in this
+# file is what keeps it the same machine.
+qemu_tpm_args() {
+    local socket="$1"
+    TPM_ARGS=(-chardev "socket,id=chrtpm,path=$socket"
+        -tpmdev emulator,id=tpm0,chardev=chrtpm
+        -device tpm-crb,tpmdev=tpm0)
+}
+
 qemu_device_list() {
     local profile="$1"
     local translated="${2:-no}"

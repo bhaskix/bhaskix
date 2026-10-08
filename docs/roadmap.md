@@ -344,7 +344,7 @@ boot; and a host on the SR550's network pinged it on real hardware. *Its own boo
 
 **What it is not, as plainly, counted on the day:** no self-hosting, and no libc by design; what
 RFC 0005 carried out — `connect`, `/proc/self/exe`, asynchronous signals and eight more, in
-`TRACKER.md` §4; eleven open defects in `TRACKER.md` §3; R6, the design documents reviewed by two
+`TRACKER.md` §4; eleven open defects in `TRACKER.md` §3 when it closed — twelve by that evening, when the native loader's hang on the SR550 was filed; R6, the design documents reviewed by two
 people who did not write them, still unmet; and no cryptography, with a kernel the loader does not
 authenticate — [security.md](security.md) §1's top gap.
 
