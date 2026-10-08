@@ -385,6 +385,10 @@ struct Delivery {
     /// The global interrupt to mask, or `u32::MAX` for a message-signalled
     /// source, which masks differently.
     gsi: AtomicU32,
+    /// Deliveries to the claimed handler since the vector was last claimed.
+    delivered: AtomicU64,
+    /// Interrupts on this vector that found it not yet claimed, since then.
+    strays: AtomicU64,
 }
 
 impl Delivery {
@@ -395,6 +399,8 @@ impl Delivery {
             generation: AtomicU32::new(0),
             badge: AtomicU64::new(0),
             gsi: AtomicU32::new(u32::MAX),
+            delivered: AtomicU64::new(0),
+            strays: AtomicU64::new(0),
         }
     }
 }
@@ -518,6 +524,13 @@ pub unsafe fn claim_for(
         undo(index);
         return Err(ClaimError::NoVector);
     };
+
+    // Counted from here, so a read-back that finds the line masked can say
+    // whether this claim's interrupt has arrived (2026-10-08).
+    DELIVERY[vector as usize]
+        .delivered
+        .store(0, Ordering::Relaxed);
+    DELIVERY[vector as usize].strays.store(0, Ordering::Relaxed);
 
     // Route it, holding nothing.
     let routed = match source {
@@ -805,9 +818,11 @@ pub fn on_interrupt(vector: u8) {
 
     if entry.handler.load(Ordering::Acquire) == 0 {
         STRAYS.fetch_add(1, Ordering::Relaxed);
+        entry.strays.fetch_add(1, Ordering::Relaxed);
         return;
     }
     DELIVERED.fetch_add(1, Ordering::Relaxed);
+    entry.delivered.fetch_add(1, Ordering::Relaxed);
 
     let gsi = entry.gsi.load(Ordering::Relaxed);
     if gsi != u32::MAX
@@ -829,6 +844,15 @@ pub fn on_interrupt(vector: u8) {
         entry.generation.load(Ordering::Relaxed),
     );
     let _ = crate::notify::signal(id, entry.badge.load(Ordering::Relaxed));
+}
+
+/// `(delivered, strays)` on `vector` since it was last claimed — what a
+/// read-back that finds its line masked needs to say why.
+#[must_use]
+pub fn arrivals(vector: u8) -> (u64, u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    let entry = &DELIVERY[vector as usize];
+    (entry.delivered.load(Relaxed), entry.strays.load(Relaxed))
 }
 
 /// Interrupts delivered, strays, and deliveries with nothing bound.

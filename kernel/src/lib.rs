@@ -30324,8 +30324,16 @@ fn console_input(handoff: &Handoff) -> bool {
     let vector_ok = entry & 0xff == u32::from(vector);
     let unmasked = entry & (1 << 16) == 0;
     if !vector_ok || !unmasked {
+        // **Why it is masked, said** (2026-10-08). On the SR550 under the
+        // native loader this read back `0x100fd` -- the right vector, masked --
+        // on every boot, and the line is masked on purpose between a delivery
+        // and its acknowledge. The arrivals say which: delivered means masked
+        // by `irq::on_interrupt` and waiting, nothing means never unmasked.
+        let (delivered, strays) = irq::arrivals(vector);
         println!(
-            "\x1b[91m    io apic        FAILED: entry for gsi {gsi} reads back {entry:#x}\x1b[0m"
+            "\x1b[91m    io apic        FAILED: entry for gsi {gsi} reads back {entry:#x}; \
+             vector {vector:#04x} since its claim: {delivered} delivered, {strays} before the \
+             handler was published\x1b[0m"
         );
         return false;
     }
