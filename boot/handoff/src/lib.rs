@@ -296,6 +296,47 @@ pub fn overlaps_non_reserved(map: &[MemoryRegion], base: u64, length: u64) -> bo
     })
 }
 
+/// The most page-table frames a loader needs to build the world this handoff
+/// describes -- an upper bound, never an estimate.
+///
+/// The world is RFC 0028 step 5's: physical memory to `physical_top`, mapped
+/// twice -- identity and the higher-half direct map -- through **one** set of
+/// 2 MiB directories hung under both PML4 slots; the framebuffer's span the
+/// same way, wherever it sits; and the kernel image at 4 KiB, `kernel_span`
+/// bytes of it, under a slot of its own. Counted per level:
+///
+/// - the root, one frame;
+/// - a PDPT per 512 GiB and a directory per GiB of each direct-mapped span,
+///   plus one of each for a span that straddles a boundary;
+/// - for the kernel, a PDPT, a directory per GiB plus one, and a page table
+///   per 2 MiB plus one.
+///
+/// Spans that share tables are counted as if they did not, which is what
+/// makes it a bound. **Why it exists**: the loader's pool was a fixed 128
+/// frames, chosen on an emulator with 256 MiB, and on 2026-10-08 a machine
+/// with 192 GiB ran it dry after the exit, where nothing could be done about
+/// it. Sized from the map, the pool is as big as the machine says.
+#[must_use]
+pub const fn table_frames_bound(
+    physical_top: u64,
+    framebuffer: Option<(u64, u64)>,
+    kernel_span: u64,
+) -> u64 {
+    const GIB: u64 = 1 << 30;
+    const PDPT_REACH: u64 = 512 * GIB;
+    const LARGE: u64 = 1 << 21;
+    let mut frames = 1;
+    frames += physical_top.div_ceil(PDPT_REACH) + physical_top.div_ceil(GIB);
+    // Where the framebuffer sits does not matter to the bound: its span is
+    // rounded out to 2 MiB at both ends, so it may straddle one boundary more
+    // than its size alone would, and that is the trailing one.
+    if let Some((_, size)) = framebuffer {
+        frames += 1 + size.div_ceil(PDPT_REACH) + 1 + size.div_ceil(GIB) + 1;
+    }
+    frames += 1 + kernel_span.div_ceil(GIB) + 1 + kernel_span.div_ceil(LARGE) + 1;
+    frames
+}
+
 /// What the loader recorded in the TPM before handing over -- RFC 0089.
 ///
 /// **Three answers, never two.** A loader that does not measure and a loader
@@ -762,5 +803,106 @@ mod tests {
         // would land in padding, and at y >= height past the mapping.
         assert_eq!(fb.offset_of(1024, 0), None);
         assert_eq!(fb.offset_of(0, 768), None);
+    }
+
+    /// The loader's walk, re-counted: the distinct tables a build over these
+    /// spans touches, by the index arithmetic `bhaskixboot`'s `paging` uses --
+    /// 2 MiB pages for the direct maps, whose identity and higher-half views
+    /// share one PDPT, and 4 KiB pages for the kernel. Split in two so a
+    /// terabyte's direct map is walked once and not once per kernel placement.
+    struct Walk {
+        pdpts: std::collections::BTreeSet<u64>,
+        directories: std::collections::BTreeSet<(u64, u64)>,
+        tables: std::collections::BTreeSet<(u64, u64, u64)>,
+    }
+
+    extern crate std;
+
+    fn index(v: u64) -> (u64, u64, u64) {
+        ((v >> 39) & 511, (v >> 30) & 511, (v >> 21) & 511)
+    }
+
+    fn direct_walk(physical_top: u64, framebuffer: Option<(u64, u64)>) -> Walk {
+        const LARGE: u64 = 1 << 21;
+        let mut walk = Walk {
+            pdpts: std::collections::BTreeSet::new(),
+            directories: std::collections::BTreeSet::new(),
+            tables: std::collections::BTreeSet::new(),
+        };
+        let mut spans = std::vec![(0, physical_top.next_multiple_of(LARGE))];
+        if let Some((base, size)) = framebuffer {
+            spans.push((base & !(LARGE - 1), (base + size).next_multiple_of(LARGE)));
+        }
+        for (start, end) in spans {
+            let mut at = start;
+            while at < end {
+                let (l4, l3, _) = index(at);
+                walk.pdpts.insert(l4);
+                walk.directories.insert((l4, l3));
+                at += LARGE;
+            }
+        }
+        walk
+    }
+
+    fn walked(direct: &Walk, kernel_virt: u64, kernel_span: u64) -> u64 {
+        let mut pdpts = direct.pdpts.clone();
+        let mut directories = direct.directories.clone();
+        let mut tables = direct.tables.clone();
+        let mut virt = kernel_virt;
+        while virt < kernel_virt + kernel_span {
+            let (l4, l3, l2) = index(virt);
+            pdpts.insert(l4);
+            directories.insert((l4, l3));
+            tables.insert((l4, l3, l2));
+            virt += 4096;
+        }
+        1 + (pdpts.len() + directories.len() + tables.len()) as u64
+    }
+
+    #[test]
+    fn the_bound_is_never_below_what_the_walk_takes() {
+        const GIB: u64 = 1 << 30;
+        const KERNEL: u64 = 0xffff_ffff_8000_0000;
+        let tops = [256 << 20, 4 * GIB, 127 * GIB + 3, 194 * GIB, 1024 * GIB + 7];
+        let framebuffers = [
+            None,
+            Some((0xc000_0000, 8 << 20)),
+            Some((0x3f_ffff_f000, 3 << 20)),
+        ];
+        // Slides that put the image on a 2 MiB, a 1 GiB and no boundary at all.
+        let slides = [0, (1 << 21) - 4096, GIB - (6 << 20), 0x1234_5000];
+        for top in tops {
+            for framebuffer in framebuffers {
+                let direct = direct_walk(top, framebuffer);
+                for slide in slides {
+                    for span in [12_687_128u64.next_multiple_of(4096), 40 << 20] {
+                        let walk = walked(&direct, KERNEL + slide, span);
+                        let bound = table_frames_bound(top, framebuffer, span);
+                        assert!(
+                            bound >= walk,
+                            "top {top:#x} fb {framebuffer:?} slide {slide:#x} span {span}: bound {bound} < walk {walk}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_machine_that_found_it_needs_more_than_the_old_pool() {
+        // The SR550, 2026-10-08: 192 GiB, its top above the hole near 194 GiB.
+        let span = 12_687_128u64.next_multiple_of(4096);
+        let direct = direct_walk(194 << 30, Some((0xc000_0000, 3 << 20)));
+        let walk = walked(&direct, 0xffff_ffff_8000_0000, span);
+        assert!(walk > 128, "the walk takes {walk}");
+        assert!(table_frames_bound(194 << 30, Some((0xc000_0000, 3 << 20)), span) >= walk);
+    }
+
+    #[test]
+    fn a_small_machine_stays_small() {
+        // The emulator lanes: 256 MiB, a framebuffer, a 13 MiB kernel.
+        let bound = table_frames_bound(256 << 20, Some((0x8000_0000, 4 << 20)), 13 << 20);
+        assert!(bound <= 20, "bound {bound}");
     }
 }

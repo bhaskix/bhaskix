@@ -89,4 +89,9 @@ asm_budget = 5
 # entry), the copy into `LoaderCode` pages, and the handoff's slice over that
 # copy through the direct map, as the initrd's is. The arithmetic that sizes
 # the views is `bhaskix-tcglog`'s, fuzzed, at budget zero.
-unsafe_budget = 143
+# 144 on 2026-10-08: one line, the system table read by `peek_map` -- the
+# memory map taken before the exit to size the page-table pool from the
+# machine (an SR550 with 192 GiB ran the fixed 128-frame pool dry). The
+# firmware call itself moved into `take_map`, shared with the exit, and
+# was not counted twice; the bound is `bhaskix-boot`'s, at budget zero.
+unsafe_budget = 144

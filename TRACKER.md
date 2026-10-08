@@ -733,7 +733,7 @@ do is listed under "What M7 did not do" below — it is short, and none of it is
 
 | Defect | Evidence | Owner |
 |---|---|---|
-| **The native loader does not complete a boot on the SR550 (found 2026-08-22, never filed until 2026-10-07).** `bhaskixboot` prints its banner over serial-over-LAN and stops: four boots on 2026-08-22 narrowed the stop to two lines and did not explain it, and asking the firmware for its serial port (`EFI_SERIAL_IO_PROTOCOL`) instead of writing COM1 directly did not fix it (§7, 2026-08-22, four entries). No SR550 boot through `bhaskixboot` is recorded after 2026-08-22; the 2026-10-04 frame-fault images, for one, were built by `make iso` and boot through Limine. **Filed now because RFC 0089's hardware step waits on it**, and because a defect that lives only in a changelog is one nobody is looking at: neither RFC 0028's status nor this table mentioned it. <br><br>**2026-10-08 — a lead, not a finding.** The localisation to two lines was read off serial-over-LAN, and the next day (2026-08-23) showed that this machine's service processor carries **COM2**, not COM1. The loader wrote COM1 only — directly, or through the first `EFI_SERIAL_IO_PROTOCOL` the firmware offered — so the markers it looked for went to a port nobody read, and the screen the operator watched carried the console only. The kernel was changed to write both ports; the loader never was, until today: it now writes COM2 too, when COM2's scratch register answers, and never underneath the firmware's driver (gated on the native lane, armed red both ways). **The records of 2026-08-22 also disagree with each other** about which channel carried the banner, and one entry blamed the virtual CD's FAT image instead. So whether the loader stopped or only went unheard is **not known**, and the next native boot of the SR550 is what settles it — with `tools/native-iso.sh`, the image recipe that until today lived only in this file's changelog. | 🔍 `OPEN` | boot |
+| **The native loader does not complete a boot on the SR550 (found 2026-08-22, never filed until 2026-10-07; **ROOT-CAUSED 2026-10-08**: a page-table pool sized for an emulator).** `bhaskixboot` prints its banner over serial-over-LAN and stops: four boots on 2026-08-22 narrowed the stop to two lines and did not explain it, and asking the firmware for its serial port (`EFI_SERIAL_IO_PROTOCOL`) instead of writing COM1 directly did not fix it (§7, 2026-08-22, four entries). No SR550 boot through `bhaskixboot` is recorded after 2026-08-22; the 2026-10-04 frame-fault images, for one, were built by `make iso` and boot through Limine. **Filed now because RFC 0089's hardware step waits on it**, and because a defect that lives only in a changelog is one nobody is looking at: neither RFC 0028's status nor this table mentioned it. <br><br>**2026-10-08 — a lead, not a finding.** The localisation to two lines was read off serial-over-LAN, and the next day (2026-08-23) showed that this machine's service processor carries **COM2**, not COM1. The loader wrote COM1 only — directly, or through the first `EFI_SERIAL_IO_PROTOCOL` the firmware offered — so the markers it looked for went to a port nobody read, and the screen the operator watched carried the console only. The kernel was changed to write both ports; the loader never was, until today: it now writes COM2 too, when COM2's scratch register answers, and never underneath the firmware's driver (gated on the native lane, armed red both ways). **The records of 2026-08-22 also disagree with each other** about which channel carried the banner, and one entry blamed the virtual CD's FAT image instead. ~~So whether the loader stopped or only went unheard is **not known**, and the next native boot of the SR550 is what settles it~~ — **settled the same day.** <br><br>**2026-10-08, booted, with the lead's go-ahead, from `tools/native-iso.sh`'s image.** Over COM2 the machine said: the banner, every marker through the payload read, `memory map 47 descriptors, 200506588 KiB usable`, `boot services exited; the machine is ours` — and then **`the table pool ran dry`**, the loader's own refusal. The pool was a fixed **128 frames**, set on 2026-08-18 under an emulator with 256 MiB; the direct map costs a page directory per GiB, and this machine's RAM tops out near 194 GiB. The 2026-08-22 loader had the same constant on the same machine, so its stop was almost certainly this refusal, printed after the exit to COM1 alone — inferred, and not re-provable, since those images are gone. **Fixed**: the pool is now sized from a memory map read before the exit, to `bhaskix_boot::table_frames_bound` — an upper bound host-tested against a re-count of the builder's own walk, armed red. **Shown in QEMU at 130 GiB**: 146 frames set aside, 139 used, the jump made; the old 128 put back on the same guest ran dry with this machine's exact sentence. **Not yet confirmed on the SR550**, which takes another boot. | 🔧 **FIXED 2026-10-08 — shown in QEMU at 130 GiB, not yet on the SR550** | boot |
 | **Five more adapter answers succeeded without writing the caller's output — the class `TCGETS` was (found 2026-10-02 by auditing for it).** `rt_sigaction` never wrote `oldact`, a query included; `sigaltstack` never wrote `old_ss`; `rt_sigprocmask` was a bare success and never wrote `oldset`; `wait4` never wrote `rusage`; and `nanosleep`/`clock_nanosleep` answered `EINTR` without writing `rem` — its doc comment said nothing interrupts a sleep, false since RFC 0083. glibc's `sigaction` and `sigprocmask` read kernel-format locals back as the answer, as `tcgetattr` did; Go survived only by zeroing its own. A caller re-sleeping for `rem` slept a garbage length. **Fixed:** each writes what Linux would — the previous handler (all zero when none), the recorded stack or `{0, SS_DISABLE, 0}`, the blocked set, a zero `rusage` (nothing accounts a process's time), the time left or the whole request. **Gated** for the three signal calls: the directory probe asks each into a buffer of `0xAA` and prints `sigok` per output that came back right; watched red against the old adapter (`0 of 3`), green after (`sigoksigoksigok`). **Built and not gated:** `rusage` and `rem` — the probes that sleep and wait pass null for both, and the timing-sensitive one that would exercise `rem` was not reshaped for it; the arithmetic is the host-tested `clock::nanos`/`timespec`. **Unchanged, and stated:** `rt_sigprocmask` still does not apply the new set — masks here are per domain, Linux's per thread, a design question. Clean in the same audit: `accept`/`accept4`, `recvfrom`, `prlimit64`, `clock_gettime`, `getsockname`, `sched_getaffinity`, `wait4`'s status. | ✅ **FIXED 2026-10-02** | linuxd |
 | **The hosted Go server corrupts its own memory on runs past about a minute (found 2026-10-01, RFC 0086 step 5).** Five runs, five deaths, each different: `fatal error: stopm holding locks`; a fault reading `0x8` in `internal/runtime/maps.(*Iter).Init` (a map pointer of 8); `fatal: bad g in signal handler`; a plain `GET` whose `MultipartForm` was not nil, faulting in `mime/multipart.(*Form).RemoveAll` from `net/http.(*response).finishRequest`; and with `GOMAXPROCS=1`, `fatal error: concurrent map read and map write` — which one P should make impossible unless memory is damaged or two OS threads run as one Go `m`. One 30 s run passed clean. In every failing run the server's own line read **0 parks refused, 0 out of retries**. **Ruled out**, each by reading the code or by a run, and listed in RFC 0086's step-5 record with why: `madvise` as a no-op, SSE state across switches, kernel stack overflow, an unzeroed frame on a supervisor write, a call delivered twice, the per-domain clone hand-off. **One real race fixed on the way, and it was not the whole answer:** a clone trampoline's slot was reused while the child was still executing it. Every step-5 change to the kernel and the adapter is a suspect until bisected; that is the next piece of work. <br><br>**Narrowed 2026-10-01, by boots** (RFC 0086's step-5 record has each): a pure-Go program with no networking corrupts its heap within seconds, so the adapter's I/O is not the cause; it still does with `GOMAXPROCS=1`, with work-stealing off and with all its threads on one CPU, while one goroutine's 16 MiB stays intact. Registers across calls, blocking calls and preemption, `X0`–`X14`, the `FS` base at every call, and 4 MiB of long-lived objects all tested intact. Backing out lazy zero-fill, the syscall-exit register restore, the reserve fallback and refused preemption changed nothing. **One claim here was wrong and is corrected in the RFC:** `madvise` as a no-op was listed as ruled out, but Go 1.27.1 does trust `MADV_DONTNEED` to zero memory. **Five real defects fixed on the way**, none the whole answer: the trampoline slot race; a race-lost not-present fault handed to the program as a bad access; `munmap` dropping its length; `MADV_DONTNEED` doing nothing; unmaps not invalidating other CPUs before freeing (the row below). <br><br>**FIXED 2026-10-01 — the cause found the same day.** A log of every call the Go program made showed `madvise(…, MADV_DONTNEED)` answered `ENOMEM` on memory it had mapped four calls earlier. `DISCARD_AT` had been added where supervisor methods are handled and not to the second whitelist that routes an `INVOKE` there — the same trap that list's own comment records from RFC 0053 — so every discard was refused, and Go 1.27.1, which treats released memory as zeroed, reused it with its old bytes. With the method listed, the five-minute run passes: 61,447 responses, 0 errors, 0 reconnects. **Guarded on every boot of every lane:** the memory probe discards its mapped range and must read 0 where it wrote 42; with the entry removed it fails `discard -12 then read 42`. Also cleared by boots that day: the emulator (KVM, baseline instructions) and concurrent collection. | ✅ **FIXED 2026-10-01** | linuxd, kernel |
 | **`tlb::shootdown` invalidates one page, and multi-page unmaps and replaces call it once (found 2026-10-01 by reading, while looking for the row above).** `MAP_AT` with replace and `UNMAP_AT` both end in `tlb::shootdown(address)` for the region's first page, and `shootdown` sends that one address to every other CPU. A thread on another CPU that had touched any later page of the range keeps a stale translation to a frame that has been freed. **Not shown to cause anything yet:** Go's traced calls never unmap or replace memory it has touched, which is why it is not the row above's explanation as far as is known. <br><br>**FIXED 2026-10-01**, and worse than this row said: `unmap_pages` shot down each page only when the space was loaded on the *calling* CPU (`is_active`, whose own note said that would stop sufficing once threads ran on several CPUs), so a supervisor's unmap of a hosted process's memory freed frames that process's threads on other CPUs could still reach. Every unmap now invalidates each page on every CPU before freeing its frame, and `UNMAP_AT` and the new `DISCARD_AT` go through it. | ✅ **FIXED 2026-10-01** | kernel |
@@ -1055,6 +1055,38 @@ the distinction is in the table rather than in somebody's head.
 ## 7. Changelog
 
 Newest first. One entry per meaningful change of project state.
+
+### 2026-10-08 (the SR550 told the native loader why it stops: a page-table pool sized for an emulator)
+
+**One native boot of the SR550, with the project lead's go-ahead, and the six-week-old defect named
+itself.** With COM2 written too, the console carried the loader through every step it had never
+been seen to reach — the payload read, the memory map (`47 descriptors, 200506588 KiB usable`), the
+exit — and then its own refusal: **`the table pool ran dry; the guess is now a measurement`.** The
+message was written for exactly this day, on 2026-08-18, and nobody could hear it.
+
+The pool was a fixed 128 frames, chosen under QEMU with 256 MiB. Mapping physical memory twice
+through shared 2 MiB directories costs a directory per GiB, and this machine's RAM tops out near
+194 GiB. The loader now reads the memory map **before** the exit, while the firmware still
+answers, and sizes the pool to `bhaskix_boot::table_frames_bound` — an upper bound that is
+host-tested against a re-count of the builder's own walk, from 256 MiB to a terabyte, with KASLR
+slides that straddle boundaries; dropping one term turns it red. The firmware call moved into one
+helper shared with the exit, so the loader's `unsafe` grew by one line, the system-table read,
+recorded in its manifest (143 → 144).
+
+**Reproduced and fixed in QEMU, not only reasoned about.** A guest with 130 GiB — file-backed and
+shared, so the host's overcommit rule allowed it and only the 63 MB it touched reached the disk —
+booted to the jump: 146 frames set aside, **139 used**. The old 128 put back on the same guest ran dry
+with this machine's exact sentence. The native lane now gates the pool line: what was used against
+what was set aside, and a small guest held to a small pool, armed red.
+
+**What this does not establish**: that the SR550 boots Bhaskix through its own loader. That takes
+another boot, which is the lead's to allow. The node was restored afterwards — unmounted, override
+cleared, restarted into its own OS, health `OK` and no fault-log entries — and the console log is
+kept as `sol-20261008-115736-native.txt` beside the August ones. TPM 1.2 was left as it is, by the
+lead's choice, so the loader correctly reported `no TCG2 protocol; nothing is measured`.
+
+The 2026-08-22 changelog entries that localised the stop are corrected where they stand, each with
+a dated note: their markers went to a port this machine does not carry.
 
 ### 2026-10-08 (the release note refreshed, and five weeks had made it wrong where a reader would act)
 
@@ -16437,6 +16469,13 @@ nothing after the banner would settle whether anything executes past it.
 **Not fixed.** Recorded at this length because the next attempt should start from
 four eliminated hypotheses rather than from the beginning.
 
+> **Corrected 2026-10-08.** "Only the first `serial::write` ever reaches the
+> console" was the wire, not the loader: everything after the banner went to
+> COM1, through the registers or through the first `EFI_SERIAL_IO` the firmware
+> offered, and this machine carries COM2. Of the two shapes left standing, the
+> second was the true one in kind. The loader was running, and it stopped
+> later, at the table pool, after the exit.
+
 ### 2026-08-22 (the loader hang, localised to two lines and not yet explained)
 
 Four boots of the SR550 spent narrowing where `bhaskixboot` stops. **It is not
@@ -16450,6 +16489,13 @@ table validated, console located, console banner written, opening the boot
 volume, allocating, reading — and on hardware **not one of them appears**. The
 serial banner comes out; the very next marker does not. That leaves
 `efi::validate`, which is a null check and one field read.
+
+> **Corrected 2026-10-08: this localisation was wrong, and so was the stop it
+> placed.** The markers went to COM1, and the next day showed this machine's
+> service processor carries COM2 — so "not one of them appears" measured the
+> wire, not the loader. Booted again with COM2 written too, the same machine
+> read its payload, exited boot services, and refused at the page-table pool:
+> 128 frames, against RAM topping out near 194 GiB. See the defect row.
 
 **Two explanations were tested and both are wrong.**
 
@@ -16508,6 +16554,12 @@ three possibilities the boot report was written to distinguish:
 The third is what commit `0087b87` addresses. This is still not the boot report's
 `serial` line read off a screen, so it is not proof — but the field of candidates
 is down to one, by measurement rather than by argument.
+
+> **Corrected 2026-10-08:** the table's first row was wrong. The banner reached
+> serial-over-LAN through the firmware's console, which this machine redirects
+> to COM2; the loader's own writes to `0x3f8` did not arrive, then or since. And
+> it did not hang between opening the volume and reading: it got past the exit
+> and refused at the page-table pool. See the defect row.
 
 **Then it hung.** After the banner, nothing. In QEMU the very next line is
 `payload kernel 7833304 bytes fnv …`; on the SR550 there is no payload line and

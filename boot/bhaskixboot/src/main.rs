@@ -47,11 +47,6 @@ const CONFIG_PATH: &str = "bhaskix\\boot.conf";
 const KERNEL_BUFFER_PAGES: usize = 4096;
 const INITRD_BUFFER_PAGES: usize = 1024;
 
-/// Frames pre-allocated for the page tables. The builder counts what it
-/// uses and refuses when the pool runs dry; the count is printed so the
-/// guess is checked by every boot.
-const TABLE_POOL_FRAMES: u64 = 128;
-
 /// FNV-1a, 64-bit — the same arithmetic the harness recomputes.
 struct Fnv(u64);
 
@@ -304,6 +299,20 @@ unsafe fn pages_as_slice(base: u64, pages: usize) -> &'static mut [u8] {
     unsafe { core::slice::from_raw_parts_mut(base as *mut u8, pages * PAGE_SIZE as usize) }
 }
 
+/// RAM's top: the highest end over the kinds that are memory. The device
+/// windows past it are not the direct map's business. One rule for the map
+/// read before the exit, which sizes the table pool, and the map taken at it,
+/// which the tables are built from.
+fn ram_top(map: &efi::MemoryMap) -> u64 {
+    let mut top = 0u64;
+    map.regions(|kind, base, bytes| {
+        if (1..=9).contains(&kind) {
+            top = top.max(base + bytes);
+        }
+    });
+    top
+}
+
 /// The entry point the UEFI firmware calls, by the target's convention.
 ///
 /// Not `pub`: the firmware finds it by the PE entry address, not by Rust
@@ -503,12 +512,8 @@ extern "efiapi" fn efi_main(image_handle: usize, system_table: *mut SystemTable)
     serial::write_dec((virt_end - virt_base) / 1024);
     serial::write(" KiB, W^X per segment\r\n");
 
-    // The scaffolding: the table pool and the handoff block, both
+    // The scaffolding: the handoff block here and the table pool below, both
     // `LoaderData` — `BootloaderReclaimable` in the kernel's map.
-    let pool_base = match efi::allocate_pages(table, efi::LOADER_DATA, TABLE_POOL_FRAMES as usize) {
-        Ok(base) => base,
-        Err(status) => refuse("the table pool would not allocate", status as u64),
-    };
     let block = match efi::allocate_pages(table, efi::LOADER_DATA, handoff::BLOCK_PAGES) {
         Ok(base) => base,
         Err(status) => refuse("the handoff block would not allocate", status as u64),
@@ -549,15 +554,41 @@ extern "efiapi" fn efi_main(image_handle: usize, system_table: *mut SystemTable)
     }
     let bsp_lapic_id = (core::arch::x86_64::__cpuid(1).ebx >> 24) & 0xff;
 
+    // **The table pool, sized from the machine** (2026-10-08). It was a
+    // fixed 128 frames, chosen under an emulator with 256 MiB, and an SR550
+    // with 192 GiB ran it dry after the exit -- where a refusal is all that
+    // is left. The tables cost a directory per GiB of the direct map, so the
+    // map read here, while the firmware still answers, sizes the pool to
+    // `bhaskix_boot::table_frames_bound`, a host-tested upper bound. The
+    // builder still counts and still refuses; the line below says what was
+    // set aside, and the `tables built` line what was used.
+    let top_before = match efi::peek_map(table) {
+        Ok(map) => ram_top(&map),
+        Err((status, _)) => refuse(
+            "the memory map would not read before the exit",
+            status as u64,
+        ),
+    };
+    let framebuffer_span = framebuffer
+        .map(|(_, height, stride, base, _)| (base, u64::from(height) * u64::from(stride) * 4));
+    let pool_frames =
+        bhaskix_boot::table_frames_bound(top_before, framebuffer_span, virt_end - virt_base);
+    let pool_base = match efi::allocate_pages(table, efi::LOADER_DATA, pool_frames as usize) {
+        Ok(base) => base,
+        Err(status) => refuse("the table pool would not allocate", status as u64),
+    };
+    serial::write("bhaskixboot: table pool ");
+    serial::write_dec(pool_frames);
+    serial::write(" frames for memory to ");
+    serial::write_hex(top_before);
+    serial::write("\r\n");
+
     // The exit: the map and the goodbye, in one held breath.
     let map = match efi::take_map_and_exit(table, image_handle) {
         Ok(map) if map.is_empty() => {
             // A firmware that exits successfully while handing over an
             // empty map is lying about something; park loudly.
-            serial::write(
-                "bhaskixboot: the exit succeeded with an empty memory map
-",
-            );
+            serial::write("bhaskixboot: the exit succeeded with an empty memory map\r\n");
             park()
         }
         Ok(map) => map,
@@ -583,17 +614,9 @@ extern "efiapi" fn efi_main(image_handle: usize, system_table: *mut SystemTable)
     serial::write("bhaskixboot: boot services exited; the machine is ours\r\n");
 
     // Step 5's second half, on a machine the loader owns: the tables, then
-    // the handoff. RAM's top is the highest end over the kinds that are
-    // memory; the device windows past it are not the direct map's business.
-    let mut physical_top = 0u64;
-    map.regions(|kind, base, bytes| {
-        if (1..=9).contains(&kind) {
-            physical_top = physical_top.max(base + bytes);
-        }
-    });
-    let mut pool = paging::TablePool::new(pool_base, TABLE_POOL_FRAMES);
-    let framebuffer_span = framebuffer
-        .map(|(_, height, stride, base, _)| (base, u64::from(height) * u64::from(stride) * 4));
+    // the handoff, over RAM's top as the exit's own map gives it.
+    let physical_top = ram_top(&map);
+    let mut pool = paging::TablePool::new(pool_base, pool_frames);
     let Some(world) = paging::build(
         &mut pool,
         physical_top,

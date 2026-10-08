@@ -345,6 +345,21 @@ else
     fail "table line missing or malformed"
     status=1
 fi
+# **The pool is sized from the machine** (2026-10-08). A fixed 128 frames ran
+# dry on an SR550 with 192 GiB, after the exit. The loader now sets aside the
+# bound `bhaskix-boot` computes from the map and says so; the gate holds what
+# it used to what it set aside, and a guest this size to a small pool -- a
+# bound that grew without reason would be caught here, not on a server.
+pool_line="$(grep -aE 'bhaskixboot: table pool [0-9]+ frames for memory to 0x[0-9a-f]{16}' "$LOG" | tr -d '\r' | head -1)"
+used_line="$(grep -aE 'bhaskixboot: tables built: [0-9]+ frames' "$LOG" | tr -d '\r' | head -1)"
+pool_frames="$(sed -E 's/.*table pool ([0-9]+) frames.*/\1/' <<< "$pool_line")"
+used_frames="$(sed -E 's/.*tables built: ([0-9]+) frames.*/\1/' <<< "$used_line")"
+if [[ -n "$pool_line" && -n "$used_line" ]] && (( used_frames <= pool_frames && pool_frames <= 32 )); then
+    pass "the table pool was sized from the map: $pool_frames frames set aside, $used_frames used"
+else
+    fail "the table pool: '${pool_line:-no pool line}', '${used_line:-no table line}'"
+    status=1
+fi
 INITRD_BYTES2=$(stat -c %s "$ESP/bhaskix/initrd.tar")
 if grep -qE "bhaskixboot: handoff assembled: version 3, [1-9][0-9]* regions, initrd $INITRD_BYTES2 bytes, stack top 0x[0-9a-f]{16}" "$LOG" 2>/dev/null; then
     pass "the handoff is assembled: version 3, the initrd whole"

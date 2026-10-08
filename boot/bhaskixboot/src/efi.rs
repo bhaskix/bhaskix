@@ -587,6 +587,15 @@ impl MemoryMap {
     /// stride, and the truncation counter says so if a machine defeats it.
     const BYTES: usize = 16 * 1024;
 
+    /// A map with nothing in it yet, for [`take_map`] to fill.
+    const fn empty() -> Self {
+        Self {
+            buffer: [0u8; Self::BYTES],
+            bytes_used: 0,
+            stride: 0,
+        }
+    }
+
     /// How many descriptors the map holds.
     #[must_use]
     pub fn len(&self) -> usize {
@@ -648,6 +657,67 @@ const BUFFER_TOO_SMALL: usize = (1 << 63) | 5;
 /// `EFI_INVALID_PARAMETER`, which a stale map key earns.
 const INVALID_PARAMETER: usize = (1 << 63) | 2;
 
+/// One `GetMemoryMap` into `map`, answering the map key -- or the firmware's
+/// status paired with how many descriptors a too-small buffer dropped, zero
+/// for every other failure, so a refusal over truncation names its size.
+///
+/// Shared by [`take_map_and_exit`] and [`peek_map`] so the call into the
+/// firmware is written once.
+fn take_map(services: *mut BootServices, map: &mut MemoryMap) -> Result<usize, (usize, usize)> {
+    let mut size = MemoryMap::BYTES;
+    let mut key = 0usize;
+    let mut stride = 0usize;
+    let mut version = 0u32;
+    // SAFETY: the call follows the specification's signature; the
+    // buffer is the loader's own and `size` bounds it.
+    let status = unsafe {
+        ((*services).get_memory_map)(
+            &raw mut size,
+            map.buffer.as_mut_ptr(),
+            &raw mut key,
+            &raw mut stride,
+            &raw mut version,
+        )
+    };
+    if status == BUFFER_TOO_SMALL {
+        // The map outgrew the buffer. Say how much was dropped and
+        // refuse to pretend otherwise; the caller decides whether a
+        // truncated map is a boot.
+        let dropped = size
+            .saturating_sub(MemoryMap::BYTES)
+            .checked_div(stride)
+            .unwrap_or(usize::MAX);
+        return Err((status, dropped));
+    }
+    if status != SUCCESS {
+        return Err((status, 0));
+    }
+    if stride < core::mem::size_of::<MemoryDescriptor>() {
+        return Err((usize::MAX, 0));
+    }
+    map.bytes_used = size;
+    map.stride = stride;
+    Ok(key)
+}
+
+/// The memory map as it stands while boot services still run, for sizing what
+/// the world built after the exit will need -- the page-table pool, since
+/// 2026-10-08. Its key is never presented: the exit takes a map of its own.
+///
+/// # Errors
+///
+/// As [`take_map`].
+pub fn peek_map(table: *mut SystemTable) -> Result<MemoryMap, (usize, usize)> {
+    // SAFETY: `table` passed `validate`.
+    let services = unsafe { (*table).boot_services };
+    if services.is_null() {
+        return Err((usize::MAX, 0));
+    }
+    let mut map = MemoryMap::empty();
+    take_map(services, &mut map)?;
+    Ok(map)
+}
+
 /// Takes the memory map and exits boot services in one held breath.
 ///
 /// The map key names a *moment*: anything that allocates — including a
@@ -671,45 +741,9 @@ pub fn take_map_and_exit(
     if services.is_null() {
         return Err((usize::MAX, 0));
     }
-    let mut map = MemoryMap {
-        buffer: [0u8; MemoryMap::BYTES],
-        bytes_used: 0,
-        stride: 0,
-    };
+    let mut map = MemoryMap::empty();
     for _ in 0..8 {
-        let mut size = MemoryMap::BYTES;
-        let mut key = 0usize;
-        let mut stride = 0usize;
-        let mut version = 0u32;
-        // SAFETY: the call follows the specification's signature; the
-        // buffer is the loader's own and `size` bounds it.
-        let status = unsafe {
-            ((*services).get_memory_map)(
-                &raw mut size,
-                map.buffer.as_mut_ptr(),
-                &raw mut key,
-                &raw mut stride,
-                &raw mut version,
-            )
-        };
-        if status == BUFFER_TOO_SMALL {
-            // The map outgrew the buffer. Say how much was dropped and
-            // refuse to pretend otherwise; the caller decides whether a
-            // truncated map is a boot.
-            let dropped = size
-                .saturating_sub(MemoryMap::BYTES)
-                .checked_div(stride)
-                .unwrap_or(usize::MAX);
-            return Err((status, dropped));
-        }
-        if status != SUCCESS {
-            return Err((status, 0));
-        }
-        if stride < core::mem::size_of::<MemoryDescriptor>() {
-            return Err((usize::MAX, 0));
-        }
-        map.bytes_used = size;
-        map.stride = stride;
+        let key = take_map(services, &mut map)?;
         // The firmware's serial port goes back before its boot services end:
         // the protocol's function pointers live in memory the firmware
         // reclaims here, and calling one afterwards is a jump into whatever
