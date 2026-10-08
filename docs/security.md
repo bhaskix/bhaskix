@@ -47,7 +47,7 @@ nothing in the tree implements it yet.
 | T3 | A compromised or malicious **device driver** | IOMMU-enforced DMA windows; per-device capabilities; relocatable-service isolation | ✅ **built**, under the three conditions the note below states — and on a machine with no IOMMU a domain-hosted driver is refused outright rather than run unprotected |
 | T4 | A malicious peripheral performing DMA (evil maid, malicious PCIe/Thunderbolt device) | IOMMU on by default; devices default-denied until enumerated and granted | ✅ **built**, same three conditions; interrupt remapping is on by default and gated |
 | T5 | A guest VM escaping to the host | Domain isolation is the same mechanism as containers; EPT/NPT; no shared hypervisor codebase to diverge | ⬜ **planned** — domains exist and are the mechanism; **VMX/SVM and EPT/NPT do not**. There are no guests yet, so nothing has escaped and nothing has been prevented. Phase 3 |
-| T6 | Persistence across reboot (bootkit, tampered kernel or initrd) | UEFI Secure Boot chain; measured boot into TPM PCRs; signed, immutable system image | ⬜ **planned, not built** — no Secure Boot chain, no TPM measurement, no signed image. The loader refuses a kernel that fails the ELF *parser*, which is corruption-detection, not authenticity. **Whoever can write the ESP owns ring 0.** Phase 3 |
+| T6 | Persistence across reboot (bootkit, tampered kernel or initrd) | UEFI Secure Boot chain; measured boot into TPM PCRs; signed, immutable system image | ⬜ **planned, not built** — no Secure Boot chain, ~~no TPM measurement,~~ no signed image. **Measured since 2026-10-08** on the native loader's path (RFC 0089): a replaced kernel now boots *recorded* in PCR 9, which detects and does not prevent. The loader refuses a kernel that fails the ELF *parser*, which is corruption-detection, not authenticity. **Whoever can write the ESP owns ring 0.** Phase 3 |
 | T7 | Tampering with an update in transit or at rest | Signed A/B images; rollback protection via monotonic counter; verified before switch | ⬜ **planned, not built** — no signing, no A/B slots, no rollback counter. There is no update mechanism at all yet, which is why nothing has been tampered with. Specified in §7; Phase 3 |
 | T8 | Undetected compromise | Tamper-evident audit log; remote attestation; the telemetry plane is the audit source | 🔨 **partial** — the telemetry plane is built ([RFC 0026](rfc/0026-telemetry-plane.md)); the `Audit` class in it is **reserved and refused**, not served — emitting it is counted and dropped, because a best-effort audit event is false assurance with a checksum (§8). The backpressure ring, the hash chain, and remote attestation are a future RFC and are Phase 3. **This cell claimed backpressure when it was first written, on 2026-08-20, and §8 four sections below already said otherwise** — an error introduced by the same edit that added this column to stop exactly that |
 | T9 | Memory-safety bugs in kernel code | Rust; `unsafe` budget tracked per crate; every `unsafe` block justified and reviewed | 🔨 **partial, and permanently so** — Rust, `forbid(unsafe_op_in_unsafe_fn)`, `deny(undocumented_unsafe_blocks)`, and a per-crate budget enforced by the build. **4,465 lines of `unsafe` in tree, 3,108 of them (70%) linked into the kernel binary** — `tools/check-unsafe-budget.py --share`, which derives the ring 0 set from `cargo tree` rather than a list somebody maintains. This cell read *"4,170 lines … 2,740 of them (66%) in ring 0"* until 2026-08-26, hand-computed once with an unstated set of crates and stale by then; a figure in a security document that nobody can reproduce is the same defect as a claim nobody checks. The discipline is built; the exposure is structural and does not go to zero |
@@ -532,18 +532,23 @@ nothing about roles, users, or organisations. This means:
 
 ## 3. Boot integrity
 
-> **None of this is built.** There is no TPM code, no PCR extension, no attestation and no
+> ~~**None of this is built.** There is no TPM code, no PCR extension, no attestation and no
 > signature verification anywhere in the tree — `grep -riE '\bpcr\b|attest|secure ?boot'` over
-> `*.rs` returns nothing on this subject. What follows is the intended chain, and it is written in
-> the present tense throughout, which is how one of its bullets came to describe a handoff field
-> that has never existed. Read it as a design.
+> `*.rs` returns nothing on this subject.~~ **Measurement is partly built since 2026-10-08**
+> ([RFC 0089](rfc/0089-a-boot-the-tpm-records.md), steps 1–3): the native loader measures the
+> kernel and initrd into PCR 9 and the command line into PCR 8 through the firmware's
+> `EFI_TCG2_PROTOCOL`, and the event log reaches the kernel in `Handoff.measurement`, which the boot
+> report reads. **Nothing verifies, attests, seals or refuses anything** — there is still no
+> signature verification and no TPM driver of this project's own. What follows is the intended
+> chain, written in the present tense throughout, which is how one of its bullets came to describe a
+> handoff field that had never existed. Read it as a design.
 
 ```
 UEFI firmware (Secure Boot)
    │  verifies signature  ─────────────────────────► PCR 0-7  (firmware, config)
    ▼
-Limine (signed, shim-loaded)
-   │  measures kernel + initrd before jumping ─────► PCR 8-9
+bhaskixboot.efi (signed, once key custody is decided)
+   │  measures kernel + initrd, then the cmdline ──► PCR 9, PCR 8
    ▼
 Bhaskix kernel (signed)
    │  measures the service set and boot policy ────► PCR 10-11
@@ -555,9 +560,11 @@ Domain 0 / init (measured)
 - **Measured boot** gives us an *attestable* chain: the TPM PCRs record what actually ran, and a
   remote verifier can check it. Verification prevents; measurement detects. We do both, because
   Secure Boot alone cannot tell you *which* signed thing ran.
-- The TPM event log has **no path into the kernel**. This document said until 2026-08-12 that it
-  "is passed through `Handoff.tpm_event_log`"; no such field has ever existed, and carrying one
-  will mean a new handoff field and a `HANDOFF_VERSION` bump.
+- ~~The TPM event log has **no path into the kernel**.~~ **It has one since 2026-10-08**:
+  `Handoff.measurement`, `HANDOFF_VERSION` 3 (RFC 0089 step 3). This document said until 2026-08-12
+  that it "is passed through `Handoff.tpm_event_log`", a field that never existed; and the diagram
+  above had **Limine** measuring PCRs 8–9 until 2026-10-08, which it never did and which is now the
+  wrong loader — Limine reports `NOT MEASURED` and the native loader is the one that measures.
 - **Sealing:** disk encryption keys are sealed to a PCR policy. A tampered boot chain cannot unseal
   them. The failure mode is "the disk does not decrypt", not "the disk decrypts for an attacker".
 

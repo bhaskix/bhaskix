@@ -101,6 +101,7 @@ static HANDOFF: BootCell<Handoff> = BootCell::new(Handoff {
     start_secondaries: None,
     regions_truncated: false,
     initrd: None,
+    measurement: bhaskix_boot::Measurement::NotAttempted,
 });
 
 /// Version string reported at boot.
@@ -31102,6 +31103,93 @@ fn verify_timer() {
     }
 }
 
+/// The `measured boot` line -- RFC 0089 step 3. Always printed, in one of
+/// three sentences that cannot be read as one another: a boot nobody measured
+/// must never look like a measured boot that found nothing wrong.
+///
+/// The log is untrusted -- firmware wrote it -- and is only read here, with
+/// the fuzzed parser; nothing is decided on it yet.
+fn report_measurement(measurement: bhaskix_boot::Measurement) {
+    use bhaskix_boot::Measurement;
+    use bhaskix_tcglog::{EV_EVENT_TAG, log, measured};
+    let (bytes, truncated) = match measurement {
+        Measurement::NotAttempted => {
+            println!("    measured boot   NOT MEASURED -- this loader does not measure");
+            return;
+        }
+        Measurement::NoTpm => {
+            println!(
+                "    measured boot   no TPM: the firmware has no TCG2 protocol, so nothing was recorded"
+            );
+            return;
+        }
+        Measurement::Measured { log, truncated } => (log, truncated),
+    };
+    let Ok(parsed) = log::Log::parse(bytes) else {
+        println!(
+            "\x1b[91m    measured boot   measured, but the event log ({} bytes) does not parse\x1b[0m",
+            bytes.len()
+        );
+        return;
+    };
+    // The loader's three events, found by tag and PCR; each one's SHA-256.
+    let ours = [measured::KERNEL, measured::INITRD, measured::CMDLINE];
+    let mut found: [Option<&[u8]>; 3] = [None; 3];
+    let mut events = 0usize;
+    let mut refused = None;
+    for event in parsed.events() {
+        let event = match event {
+            Ok(event) => event,
+            Err(error) => {
+                refused = Some(error);
+                break;
+            }
+        };
+        events += 1;
+        let tag = event
+            .data
+            .get(..4)
+            .map(|t| u32::from_le_bytes([t[0], t[1], t[2], t[3]]));
+        if event.event_type != EV_EVENT_TAG {
+            continue;
+        }
+        for (slot, &(pcr, want)) in found.iter_mut().zip(ours.iter()) {
+            if tag == Some(want) && event.pcr == pcr {
+                *slot = event.digest(log::alg::SHA256);
+            }
+        }
+    }
+    let show = |digest: Option<&[u8]>| -> [u8; 8] {
+        let mut text = *b"MISSING ";
+        if let Some(d) = digest.filter(|d| d.len() >= 4) {
+            const HEX: &[u8; 16] = b"0123456789abcdef";
+            for (i, byte) in d[..4].iter().enumerate() {
+                text[2 * i] = HEX[usize::from(byte >> 4)];
+                text[2 * i + 1] = HEX[usize::from(byte & 15)];
+            }
+        }
+        text
+    };
+    let [k, i, c] = [show(found[0]), show(found[1]), show(found[2])];
+    fn text(b: &[u8; 8]) -> &str {
+        core::str::from_utf8(b).unwrap_or("?").trim_end()
+    }
+    println!(
+        "    measured boot   kernel {} initrd {} cmdline {} (sha256, PCR 9/9/8); {} events, log {}",
+        text(&k),
+        text(&i),
+        text(&c),
+        events,
+        if truncated { "TRUNCATED" } else { "complete" }
+    );
+    if let Some(error) = refused {
+        println!(
+            "\x1b[91m    measured boot   the log stops parsing after {} events: {:?}\x1b[0m",
+            events, error
+        );
+    }
+}
+
 fn report_boot_state(
     handoff: &Handoff,
     serial: bhaskix_arch::Presence,
@@ -31111,6 +31199,7 @@ fn report_boot_state(
     println!("  boot");
     println!("    loader          {}", handoff.loader);
     println!("    handoff version {}", handoff.version);
+    report_measurement(handoff.measurement);
     println!(
         "    cmdline         {}",
         if handoff.cmdline.is_empty() {

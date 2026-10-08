@@ -42,6 +42,10 @@ bhaskix-i40e = { path = "../i40e" }
 # rather than with bytes laid out by hand here -- the same parsers, the same
 # fuzz targets, and one definition of what a frame looks like.
 bhaskix-net = { path = "../net" }
+# RFC 0089 step 3. The boot report reads the TPM event log the native loader
+# copied, with the same parser the loader sized it with and the fuzz target
+# drives -- one definition of what a log looks like.
+bhaskix-tcglog = { path = "../tcglog" }
 # RFC 0021. The kernel does not need unpredictability itself yet -- randomising
 # the heap base is that RFC's open question 2 -- but it is the thing that boots,
 # so it is where "the instruction actually works on this machine" is checked.

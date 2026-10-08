@@ -10,8 +10,8 @@
 //! the contract promises: the kernel's, until it has copied what it needs.
 
 use bhaskix_boot::{
-    Framebuffer, HANDOFF_VERSION, Handoff, MemoryKind, MemoryRegion, PhysAddr, PixelFormat,
-    VirtAddr,
+    Framebuffer, HANDOFF_VERSION, Handoff, Measurement, MemoryKind, MemoryRegion, PhysAddr,
+    PixelFormat, VirtAddr,
 };
 
 use crate::efi::MemoryMap;
@@ -71,8 +71,30 @@ pub struct Findings<'boot> {
     pub cmdline: &'boot str,
     /// The initrd's placement and size.
     pub initrd: (u64, usize),
+    /// What the loader recorded in the TPM -- RFC 0089.
+    pub recorded: Recorded,
     /// The bootstrap CPU's local APIC id, read by `cpuid`.
     pub bsp_lapic_id: u32,
+}
+
+/// What the loader recorded in the TPM, as [`assemble`] hands it on -- RFC 0089.
+#[derive(Clone, Copy)]
+pub enum Recorded {
+    /// The firmware offered no TCG2 protocol.
+    NoTpm,
+    /// The firmware's event log, copied into `LoaderCode` pages: placement,
+    /// length, and whether the firmware said it was truncated.
+    Log {
+        /// Where the copy is.
+        phys: u64,
+        /// Bytes in it.
+        len: usize,
+        /// The firmware's own truncation flag.
+        truncated: bool,
+    },
+    /// Measured, but the log could not be read whole; the kernel is told so as
+    /// an empty, truncated log rather than nothing.
+    Unreadable,
 }
 
 /// What [`assemble`] hands back: the two addresses the jump loads, and the
@@ -225,6 +247,24 @@ pub fn assemble(block: u64, findings: &Findings<'_>) -> Result<Assembled, usize>
             findings.initrd.1,
         )
     };
+    let measurement = match findings.recorded {
+        Recorded::NoTpm => Measurement::NoTpm,
+        Recorded::Unreadable => Measurement::Measured {
+            log: &[],
+            truncated: true,
+        },
+        Recorded::Log {
+            phys,
+            len,
+            truncated,
+        } => Measurement::Measured {
+            // SAFETY: as for the initrd -- `LoaderCode` pages, filled from the
+            // firmware's log, translated as KernelAndModules and never
+            // reclaimed.
+            log: unsafe { core::slice::from_raw_parts((HHDM_BASE + phys) as *const u8, len) },
+            truncated,
+        },
+    };
 
     let handoff = Handoff {
         version: HANDOFF_VERSION,
@@ -242,6 +282,7 @@ pub fn assemble(block: u64, findings: &Findings<'_>) -> Result<Assembled, usize>
         start_secondaries: None,
         regions_truncated: false,
         initrd: Some(initrd),
+        measurement,
     };
     // SAFETY: the block's first page, aligned far beyond the struct's
     // needs, written once and read by the kernel alone after the jump.

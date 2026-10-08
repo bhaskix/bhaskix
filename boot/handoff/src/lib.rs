@@ -40,7 +40,7 @@ use core::fmt;
 ///
 /// The shim writes it into [`Handoff::version`] and the kernel checks it. Bump
 /// this on any change to the layout or meaning of the structures below.
-pub const HANDOFF_VERSION: u32 = 2;
+pub const HANDOFF_VERSION: u32 = 3;
 
 /// What the native loader leaves in the second argument register at entry
 /// — `b"BHXBOOT1"`, little-endian.
@@ -274,6 +274,32 @@ impl Framebuffer {
 /// `entry` receives the CPU's local APIC identifier and must never return.
 pub type StartSecondaries = fn(entry: extern "C" fn(u32) -> !) -> &'static [u32];
 
+/// What the loader recorded in the TPM before handing over -- RFC 0089.
+///
+/// **Three answers, never two.** A loader that does not measure and a loader
+/// that found no TPM are different facts, and both are different from a
+/// measured boot: an unmeasured boot reported as "nothing found" would read,
+/// to anyone checking later, like a measured boot that found nothing wrong.
+#[derive(Clone, Copy, Debug)]
+pub enum Measurement {
+    /// The loader does not measure -- the Limine path.
+    NotAttempted,
+    /// The loader asked and the firmware offered no TCG2 protocol.
+    NoTpm,
+    /// The loader measured, and copied the firmware's event log.
+    Measured {
+        /// The log, crypto-agile format, in pages the kernel keeps.
+        ///
+        /// **Entirely untrusted**, as [`Handoff::initrd`] is: firmware wrote
+        /// it, and whoever controls the firmware or the boot medium chooses
+        /// every length in it. Empty when the firmware gave no log.
+        log: &'static [u8],
+        /// Whether the firmware said its log was truncated, or the loader
+        /// could not copy all of it. Either way the log is not the whole record.
+        truncated: bool,
+    },
+}
+
 /// Everything the kernel is given at entry.
 ///
 /// Constructed by the boot shim and consumed exactly once, by
@@ -319,6 +345,8 @@ pub struct Handoff {
     /// untrusted — they come from a file on disk that anyone able to write the
     /// boot medium controls — and every consumer must treat them that way.
     pub initrd: Option<&'static [u8]>,
+    /// What the loader measured into the TPM -- RFC 0089. Version 3.
+    pub measurement: Measurement,
 }
 
 impl Handoff {
@@ -499,6 +527,7 @@ mod tests {
             start_secondaries: None,
             regions_truncated: false,
             initrd: None,
+            measurement: Measurement::NotAttempted,
         }
     }
 

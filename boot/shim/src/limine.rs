@@ -692,6 +692,9 @@ pub unsafe fn collect_handoff() -> Handoff {
         start_secondaries: MP.response().map(|_| start_secondaries as _),
         regions_truncated: truncated,
         initrd: initrd(),
+        // Limine measures nothing, and says so: RFC 0089 measures on the
+        // native loader's path only.
+        measurement: bhaskix_boot::Measurement::NotAttempted,
     }
 }
 

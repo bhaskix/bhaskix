@@ -140,10 +140,19 @@ pub struct Handoff {
     pub start_secondaries: Option<StartSecondaries>,
     pub regions_truncated: bool,      // must be reported, never ignored
     pub initrd: Option<&'static [u8]>,
+    pub measurement: Measurement,     // RFC 0089, version 3: what the loader recorded in the TPM
 }
 
 /// Releases every secondary CPU, returning the local APIC identifier of each.
 pub type StartSecondaries = fn(entry: extern "C" fn(u32) -> !) -> &'static [u32];
+
+/// Three answers that must never read as one another: a boot nobody measured
+/// is not a measured boot that found nothing.
+pub enum Measurement {
+    NotAttempted,                                        // the Limine path
+    NoTpm,                                               // asked; no TCG2 protocol
+    Measured { log: &'static [u8], truncated: bool },    // untrusted, as `initrd` is
+}
 ```
 
 Three things are load-bearing and easy to read past. **Every variable-length payload is a borrowed

@@ -56,6 +56,7 @@ dependencies = [
  "bhaskix-service",
  "bhaskix-service-console",
  "bhaskix-service-vfs",
+ "bhaskix-tcglog",
  "bhaskix-telemetry",
  "bhaskix-usb",
  "bhaskix-xhci",
@@ -112,6 +113,10 @@ dependencies = [
  "bhaskix-service",
  "bhaskix-ustar",
 ]
+
+[[package]]
+name = "bhaskix-tcglog"
+version = "0.0.0"
 
 [[package]]
 name = "bhaskix-telemetry"

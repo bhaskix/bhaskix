@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | 🔨 **Draft 2026-10-07 — steps 1 and 2 done the same day: this host's OVMF offers `EFI_TCG2_PROTOCOL` when a TPM is attached, and the native loader measures the kernel, initrd and command line through it**, gated in `make test-boot-native-tpm` from an emulator `tools/swtpm.sh` runs. The log does not reach the kernel yet (step 3). The first of Phase 3's secure boot chain, sequenced by the project lead on 2026-10-07: *measured boot first*, signing after key custody is decided. The acceptance call is the project lead's |
+| **Status** | 🔨 **Draft 2026-10-07 — steps 1, 2 and 3 done by 2026-10-08, and step 4's parser: the native loader measures the kernel, initrd and command line through the firmware's `EFI_TCG2_PROTOCOL`, and the event log reaches the kernel in a version-3 handoff**, where the boot report reads the loader's three digests out of it — gated in `make test-boot-native-tpm`, including a kernel byte that changes the kernel's digest and nothing else's. Nothing reads a PCR or replays yet (steps 5 and 6). The first of Phase 3's secure boot chain, sequenced by the project lead on 2026-10-07: *measured boot first*, signing after key custody is decided. The acceptance call is the project lead's |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | boot (`bhaskixboot.efi`, `bhaskix_boot::Handoff`), arch (ACPI `TPM2`), kernel (boot report), userspace (a TPM service), tools, tests |
 | **Milestone** | Phase 3 — *Secure boot chain*, the roadmap's first row; [security.md](../security.md) §1 **T6** and gap 1 |
@@ -269,6 +269,26 @@ path after boot.
 3. **The handoff carries the log**: `HANDOFF_VERSION` 3, `Measurement`, the five literals and two
    gate literals, the Limine path's `NotAttempted`. **And the gate step 2 could not have**: the
    kernel's digest in the log changes when one byte of the kernel on the ESP does, armed red.
+   **Done 2026-10-08.** `GetEventLog` names where the log's last entry starts, not where it ends, so
+   the loader reads it **exactly**: the header and every earlier entry lie between the two
+   addresses the firmware gave, and the last entry's length comes from its own prefix, whose size
+   the header fixes (`SpecId::event2_prefix_len`, `event2_len_from_prefix`) — no view reaches a
+   byte past the log. The copy goes into `LoaderCode` pages, the discipline that already keeps the
+   kernel and initrd, so no new reclamation rule was needed. The kernel prints one `measured boot`
+   line on every path: `NOT MEASURED -- this loader does not measure` on Limine's, `no TPM: …` on
+   the native loader's without one, and with one the three SHA-256 prefixes it found in the log by
+   tag and PCR — `kernel 4f59f53a initrd 7f5281b1 cmdline bd478e3d (sha256, PCR 9/9/8); 31 events,
+   log complete` on the first boot. Then a third boot with one byte flipped inside the kernel ELF's
+   `.debug_info` (never loaded; the offset read from its own section headers) read `4f59f53a ->
+   c53da502` for the kernel and the same two others. Every new gate was armed red; one arming
+   taught something — looking the digests up in the SHA-384 bank instead of SHA-256 still passed,
+   because **this log declares a SHA-384 bank too** (inferred from that pass, not printed), so the
+   arm that held was a wrong tag. Three gates had matched `handoff version 2` or the loader's
+   `version 2` line, one more than the survey that planned this step found. The loader's `unsafe`
+   budget went 125 → 143, recorded line by line in its manifest. **Deferred, said here**: the
+   firmware's *final events table* — events logged after `GetEventLog`, its own
+   `ExitBootServices` actions in PCR 5 — is not copied. The loader's three events precede that
+   call, so nothing in this step needs it; a replay of PCR 5 would (step 6).
 4. **`tcglog`**: host-tested, fuzzed, a captured fixture; the kernel prints the events it found.
    **The parser landed 2026-10-08, before step 3**, which needs it: `GetEventLog` names where the
    log's last entry starts and nothing says where it ends, so the loader must size that entry.

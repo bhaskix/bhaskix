@@ -250,6 +250,7 @@ mod tests {
     fn handoff() -> Handoff {
         Handoff {
             initrd: None,
+            measurement: bhaskix_boot::Measurement::NotAttempted,
             version: HANDOFF_VERSION,
             memory_map: &MAP,
             hhdm_base: VirtAddr(0xffff_8000_0000_0000),

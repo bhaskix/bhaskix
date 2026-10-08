@@ -142,15 +142,105 @@ fn report_payload(name: &str, bytes: &[u8]) {
 /// RFC 0089. Nothing here refuses the boot: measurement is evidence, and a
 /// measurement the firmware refused is reported as refused, so the boot that
 /// follows is never mistaken for a measured one.
-fn measure(table: *mut SystemTable, kernel: &[u8], initrd: &[u8], cmdline: &str) {
+fn measure(
+    table: *mut SystemTable,
+    kernel: &[u8],
+    initrd: &[u8],
+    cmdline: &str,
+) -> Option<*mut efi::Tcg2> {
     use bhaskix_tcglog::measured;
     let Some(tcg2) = efi::tcg2(table) else {
         diag("bhaskixboot: no TCG2 protocol; nothing is measured\r\n");
-        return;
+        return None;
     };
     measure_one(tcg2, measured::KERNEL, "kernel", kernel);
     measure_one(tcg2, measured::INITRD, "initrd", initrd);
     measure_one(tcg2, measured::CMDLINE, "cmdline", cmdline.as_bytes());
+    Some(tcg2)
+}
+
+/// The most event log the loader copies. OVMF's are a few kilobytes; one
+/// past this is refused as unreadable rather than copied in part.
+const EVENT_LOG_MAX: usize = 256 * 1024;
+
+/// Copies the firmware's event log into pages the kernel keeps -- RFC 0089.
+///
+/// **Read exactly, never past.** `GetEventLog` names where the log starts and
+/// where its last entry starts, not where it ends. The header and every entry
+/// before the last lie between those two; the last entry's length is read
+/// from its own prefix, whose size the header fixes, and then the entry is
+/// validated whole. So every byte viewed here is one the firmware's answer
+/// places in its log.
+fn copy_event_log(table: *mut SystemTable, tcg2: *mut efi::Tcg2) -> handoff::Recorded {
+    use bhaskix_tcglog::log;
+    let unreadable = |why: &str| {
+        serial::write("bhaskixboot: the event log is unreadable: ");
+        serial::write(why);
+        serial::write("\r\n");
+        handoff::Recorded::Unreadable
+    };
+    let (location, last, truncated) = match efi::get_event_log(tcg2) {
+        Ok(answer) => answer,
+        Err(_) => return unreadable("GetEventLog refused"),
+    };
+    if location == 0 || last < location || (last - location) as usize > EVENT_LOG_MAX {
+        return unreadable("the firmware's answer is out of bounds");
+    }
+    let before_last = (last - location) as usize;
+    let len = if before_last == 0 {
+        // The header is the only entry: its fixed 32 bytes say its length.
+        // SAFETY: identity-mapped, and the firmware's answer places an entry
+        // at `location`; a header is at least its 32-byte fixed part.
+        let prefix = unsafe { core::slice::from_raw_parts(location as *const u8, 32) };
+        match log::header_len(prefix) {
+            Ok(len) => len,
+            Err(_) => return unreadable("the header's length"),
+        }
+    } else {
+        // SAFETY: identity-mapped, and the firmware's answer places the
+        // header and every entry before the last in these bytes.
+        let head = unsafe { core::slice::from_raw_parts(location as *const u8, before_last) };
+        let Ok(parsed) = log::Log::parse(head) else {
+            return unreadable("the header does not parse");
+        };
+        let spec = *parsed.spec();
+        // SAFETY: as above; an entry starts at `last`, and an entry is at
+        // least its fixed prefix, whose size the header fixes.
+        let prefix =
+            unsafe { core::slice::from_raw_parts(last as *const u8, spec.event2_prefix_len()) };
+        let Ok(last_len) = log::event2_len_from_prefix(prefix, &spec) else {
+            return unreadable("the last entry's length");
+        };
+        if before_last + last_len > EVENT_LOG_MAX {
+            return unreadable("larger than the loader copies");
+        }
+        // SAFETY: as above, now the whole entry its own prefix declares.
+        let entry = unsafe { core::slice::from_raw_parts(last as *const u8, last_len) };
+        if log::event2_len(entry, &spec) != Ok(last_len) {
+            return unreadable("the last entry does not parse");
+        }
+        before_last + last_len
+    };
+    let pages = len.div_ceil(PAGE_SIZE as usize);
+    let Ok(base) = efi::allocate_pages(table, efi::LOADER_CODE, pages) else {
+        return unreadable("no pages for the copy");
+    };
+    // SAFETY: just allocated, `pages` long; the source is the log as sized
+    // above, identity-mapped.
+    unsafe {
+        let copy = pages_as_slice(base, pages);
+        copy[..len].copy_from_slice(core::slice::from_raw_parts(location as *const u8, len));
+    }
+    serial::write("bhaskixboot: event log ");
+    serial::write_dec(len as u64);
+    serial::write(" bytes copied, truncated by the firmware: ");
+    serial::write(if truncated { "yes" } else { "no" });
+    serial::write("\r\n");
+    handoff::Recorded::Log {
+        phys: base,
+        len,
+        truncated,
+    }
 }
 
 /// One object into one PCR, logged as `bhaskix <name>`, and the outcome said.
@@ -319,12 +409,18 @@ extern "efiapi" fn efi_main(image_handle: usize, system_table: *mut SystemTable)
     // **Measured before anything interprets it** -- RFC 0089. The bytes as
     // read, before the parse, the placement and the slide, so a verifier can
     // predict the digest from the file alone.
-    measure(
+    let tcg2 = measure(
         table,
         &kernel_buffer[..kernel_len],
         &initrd_buffer[..initrd_len],
         cmdline,
     );
+    // And the log those measurements went into, copied while the protocol
+    // that names it still exists -- RFC 0089 step 3.
+    let recorded = match tcg2 {
+        Some(tcg2) => copy_event_log(table, tcg2),
+        None => handoff::Recorded::NoTpm,
+    };
 
     // The kernel, parsed by the crate the kernel itself loads with — told
     // it is validating for the high half, which is the only thing that
@@ -527,6 +623,7 @@ extern "efiapi" fn efi_main(image_handle: usize, system_table: *mut SystemTable)
         smbios,
         cmdline,
         initrd: (initrd_base, initrd_len),
+        recorded,
         bsp_lapic_id,
     };
     let built = match handoff::assemble(block, &findings) {

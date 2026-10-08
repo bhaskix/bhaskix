@@ -93,6 +93,21 @@ impl SpecId {
         &self.algorithms[..self.count]
     }
 
+    /// Bytes of an event before its data: `PCRIndex`, `EventType`, the count,
+    /// one `{hashAlg, digest}` per declared algorithm, and `EventSize` -- fixed
+    /// by the header, because every event carries each declared bank exactly
+    /// once. What lets a reader of the log's *last* entry learn its length
+    /// without reading a byte past it.
+    #[must_use]
+    pub fn event2_prefix_len(&self) -> usize {
+        12 + self
+            .algorithms()
+            .iter()
+            .map(|&(_, size)| 2 + usize::from(size))
+            .sum::<usize>()
+            + 4
+    }
+
     fn size_of(&self, algorithm: u16) -> Option<usize> {
         self.index_of(algorithm)
             .map(|index| usize::from(self.algorithms[index].1))
@@ -218,6 +233,35 @@ impl<'a> Iterator for Events<'a> {
 /// Any [`LogError`] the event earns.
 pub fn event2_len(bytes: &[u8], spec: &SpecId) -> Result<usize, LogError> {
     event2(bytes, spec).map(|(_, len)| len)
+}
+
+/// The whole header event's length, from its first 32 bytes -- the fixed part,
+/// whose last field is `EventSize`. For a log whose only entry is the header.
+///
+/// # Errors
+///
+/// [`LogError::Truncated`] when fewer than 32 bytes are given.
+pub fn header_len(prefix: &[u8]) -> Result<usize, LogError> {
+    32usize
+        .checked_add(u32_at(prefix, 28)? as usize)
+        .ok_or(LogError::Truncated)
+}
+
+/// An event's whole length, from its first [`SpecId::event2_prefix_len`]
+/// bytes. It reads only `EventSize`; [`event2_len`] over the whole event is
+/// what validates it.
+///
+/// # Errors
+///
+/// [`LogError::Truncated`] when the prefix is short.
+pub fn event2_len_from_prefix(prefix: &[u8], spec: &SpecId) -> Result<usize, LogError> {
+    let fixed = spec.event2_prefix_len();
+    if prefix.len() < fixed {
+        return Err(LogError::Truncated);
+    }
+    fixed
+        .checked_add(u32_at(prefix, fixed - 4)? as usize)
+        .ok_or(LogError::Truncated)
 }
 
 fn spec_id(data: &[u8]) -> Result<SpecId, LogError> {
@@ -388,6 +432,26 @@ mod tests {
         two.extend(event(8, 6, &BANKS, 0x33, b"x"));
         assert_eq!(event2_len(&one, &spec), Ok(one.len()));
         assert_eq!(event2_len(&two, &spec), Ok(one.len()));
+    }
+
+    #[test]
+    fn the_length_of_an_entry_is_known_from_its_prefix_alone() {
+        let head = header(&BANKS);
+        assert_eq!(header_len(&head[..32]), Ok(head.len()));
+        assert_eq!(header_len(&head[..31]), Err(LogError::Truncated));
+        let spec = *Log::parse(&head).unwrap().spec();
+        assert_eq!(spec.event2_prefix_len(), 12 + (2 + 20) + (2 + 32) + 4);
+        let one = event(9, 6, &BANKS, 0x22, b"bhaskix kernel");
+        let prefix = &one[..spec.event2_prefix_len()];
+        assert_eq!(event2_len_from_prefix(prefix, &spec), Ok(one.len()));
+        assert_eq!(
+            event2_len_from_prefix(prefix, &spec),
+            event2_len(&one, &spec)
+        );
+        assert_eq!(
+            event2_len_from_prefix(&prefix[..prefix.len() - 1], &spec),
+            Err(LogError::Truncated)
+        );
     }
 
     #[test]

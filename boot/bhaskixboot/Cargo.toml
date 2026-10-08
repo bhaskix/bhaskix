@@ -83,4 +83,10 @@ asm_budget = 5
 # The same shape and size as the serial protocol's eleven: firmware function
 # pointers the type system cannot describe. The event they log is built in
 # `bhaskix-tcglog` at budget zero.
-unsafe_budget = 125
+# 143 on 2026-10-08: eighteen lines for the event log, RFC 0089 step 3 -- the
+# `GetEventLog` call, four views of firmware memory sized exactly by the
+# firmware's own answer and the header it wrote (never a byte past the last
+# entry), the copy into `LoaderCode` pages, and the handoff's slice over that
+# copy through the direct map, as the initrd's is. The arithmetic that sizes
+# the views is `bhaskix-tcglog`'s, fuzzed, at budget zero.
+unsafe_budget = 143

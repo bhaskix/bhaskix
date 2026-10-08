@@ -189,14 +189,20 @@ struct SerialIo {
     mode: usize,
 }
 
-/// `EFI_TCG2_PROTOCOL`, down to the one call RFC 0089 step 2 makes.
+/// `EFI_TCG2_PROTOCOL`, down to the two calls RFC 0089 makes: the log
+/// (step 3) and the measurement (step 2).
 ///
-/// The two slots before `hash_log_extend_event` are named so the offset is
-/// right; the event log, `get_event_log`, is step 3's.
+/// `get_capability` is named so the offsets are right; nothing calls it.
 #[repr(C)]
 pub struct Tcg2 {
     get_capability: usize,
-    get_event_log: usize,
+    get_event_log: unsafe extern "efiapi" fn(
+        this: *mut Tcg2,
+        format: u32,
+        location: *mut u64,
+        last_entry: *mut u64,
+        truncated: *mut u8,
+    ) -> usize,
     hash_log_extend_event: unsafe extern "efiapi" fn(
         this: *mut Tcg2,
         flags: u64,
@@ -839,6 +845,33 @@ pub fn hash_log_extend_event(protocol: *mut Tcg2, bytes: &[u8], event: &[u8]) ->
     };
     if status == SUCCESS {
         Ok(())
+    } else {
+        Err(status)
+    }
+}
+
+/// `EFI_TCG2_EVENT_LOG_FORMAT_TCG_2` -- `Tcg2Protocol.h`, `2`: the
+/// crypto-agile log, every event carrying a digest per active bank.
+const EVENT_LOG_FORMAT_TCG_2: u32 = 2;
+
+/// Where the firmware's crypto-agile event log starts, where its **last
+/// entry** starts -- not where it ends -- and whether the firmware truncated
+/// it: `GetEventLog`, RFC 0089 step 3. Before `ExitBootServices` only.
+pub fn get_event_log(protocol: *mut Tcg2) -> Result<(u64, u64, bool), usize> {
+    let (mut location, mut last_entry, mut truncated) = (0u64, 0u64, 0u8);
+    // SAFETY: `protocol` came from `LocateProtocol` with the TCG2 GUID and is
+    // the firmware's; the three outputs are this frame's own.
+    let status = unsafe {
+        ((*protocol).get_event_log)(
+            protocol,
+            EVENT_LOG_FORMAT_TCG_2,
+            &raw mut location,
+            &raw mut last_entry,
+            &raw mut truncated,
+        )
+    };
+    if status == SUCCESS {
+        Ok((location, last_entry, truncated != 0))
     } else {
         Err(status)
     }

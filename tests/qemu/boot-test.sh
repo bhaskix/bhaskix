@@ -4886,10 +4886,26 @@ else
 fi
 
 # The handoff must have been validated, not skipped.
-if grep -qF "handoff version 2" "$LOG"; then
+if grep -qF "handoff version 3" "$LOG"; then
     pass "handoff accepted"
 else
     fail "handoff was not reported -- validation may have been skipped"
+    status=1
+fi
+
+# RFC 0089 step 3: **the kernel says whether this boot was measured**, and the
+# sentence depends on the path. Limine measures nothing; the native loader,
+# on a machine with no TPM -- which is every lane here -- finds none. The two
+# must never read the same, and neither may read like a measured boot.
+if [[ "$MODE" == "native" ]]; then
+    expected="measured boot   no TPM: the firmware has no TCG2 protocol"
+else
+    expected="measured boot   NOT MEASURED -- this loader does not measure"
+fi
+if grep -qF "$expected" "$LOG"; then
+    pass "the kernel said how this boot was measured: ${expected#measured boot   }"
+else
+    fail "the kernel did not say '${expected}': $(grep -aE 'measured boot' "$LOG" | tr -d '\r' | head -1)"
     status=1
 fi
 

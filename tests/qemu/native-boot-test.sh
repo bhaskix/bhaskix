@@ -334,8 +334,8 @@ else
     status=1
 fi
 INITRD_BYTES2=$(stat -c %s "$ESP/bhaskix/initrd.tar")
-if grep -qE "bhaskixboot: handoff assembled: version 2, [1-9][0-9]* regions, initrd $INITRD_BYTES2 bytes, stack top 0x[0-9a-f]{16}" "$LOG" 2>/dev/null; then
-    pass "the handoff is assembled: version 2, the initrd whole"
+if grep -qE "bhaskixboot: handoff assembled: version 3, [1-9][0-9]* regions, initrd $INITRD_BYTES2 bytes, stack top 0x[0-9a-f]{16}" "$LOG" 2>/dev/null; then
+    pass "the handoff is assembled: version 3, the initrd whole"
 else
     fail "handoff line missing or wrong"
     status=1
@@ -362,10 +362,33 @@ else
     fail "the kernel's loader line does not name bhaskixboot"
     status=1
 fi
-if grep -qF "handoff version 2" "$LOG" 2>/dev/null; then
+if grep -qF "handoff version 3" "$LOG" 2>/dev/null; then
     pass "the kernel validated and accepted the handoff the loader built"
 else
     fail "the kernel never reported the handoff"
+    status=1
+fi
+
+# RFC 0089 step 3: **the log reached the kernel, and the kernel read it.** With a
+# TPM, the loader copied the whole log and the kernel found the loader's three
+# events in it, by tag and PCR, each with a SHA-256; without one, the kernel
+# says nothing was recorded.
+MEASURED_DIGESTS=""
+if [[ "${BHASKIX_TPM:-0}" == 1 ]]; then
+    line="$(grep -aE 'measured boot   kernel' "$LOG" | tr -d '\r' | head -1)"
+    if [[ "$line" =~ kernel\ ([0-9a-f]{8})\ initrd\ ([0-9a-f]{8})\ cmdline\ ([0-9a-f]{8})\ \(sha256,\ PCR\ 9/9/8\)\;\ [1-9][0-9]*\ events,\ log\ complete ]] \
+        && grep -qE "bhaskixboot: event log [1-9][0-9]* bytes copied, truncated by the firmware: no" "$LOG" \
+        && ! grep -qF "the log stops parsing" "$LOG"; then
+        MEASURED_DIGESTS="${BASH_REMATCH[1]} ${BASH_REMATCH[2]} ${BASH_REMATCH[3]}"
+        pass "the kernel read the loader's three measurements out of the event log: ${line#*measured boot   }"
+    else
+        fail "the kernel did not read the three measurements from the log: ${line:-no measured boot line}"
+        status=1
+    fi
+elif grep -qF "measured boot   no TPM: the firmware has no TCG2 protocol" "$LOG" 2>/dev/null; then
+    pass "with no TPM the kernel said nothing was recorded"
+else
+    fail "with no TPM the kernel did not say nothing was recorded"
     status=1
 fi
 # The cross-check that makes the slide real: the kernel computes it
@@ -442,6 +465,71 @@ else
     status=1
     echo "--- negative-arm serial log ---"
     cat "$NEGATIVE_LOG" 2>/dev/null | head -20
+fi
+
+# RFC 0089 step 3's gate, the one step 2 could not have: **the kernel's digest
+# follows the kernel's bytes.** One byte flipped inside `.debug_info` -- in the
+# file, never loaded, so the kernel still boots -- must change the PCR 9 digest
+# the log carries for the kernel and leave the initrd's and the command line's
+# alone. The offset is the section's own, read from the ELF's section headers.
+if [[ "${BHASKIX_TPM:-0}" == 1 && -n "$MEASURED_DIGESTS" ]]; then
+    restore_kernel
+    if python3 - "$ESP/bhaskix/kernel" <<'PY'
+import struct, sys
+path = sys.argv[1]
+data = bytearray(open(path, "rb").read())
+shoff, = struct.unpack_from("<Q", data, 0x28)
+shentsize, shnum, shstrndx = struct.unpack_from("<HHH", data, 0x3A)
+def section(i):
+    base = shoff + i * shentsize
+    name, = struct.unpack_from("<I", data, base)
+    offset, size = struct.unpack_from("<QQ", data, base + 0x18)
+    return name, offset, size
+_, names_at, _ = section(shstrndx)
+for i in range(shnum):
+    name, offset, size = section(i)
+    end = data.index(b"\0", names_at + name)
+    if data[names_at + name:end] == b".debug_info" and size > 0:
+        data[offset + size // 2] ^= 0xFF
+        open(path, "wb").write(data)
+        sys.exit(0)
+sys.exit(1)
+PY
+    then
+        echo "the digest arm: one kernel byte flipped, up to ${TIMEOUT}s..."
+        FLIPPED_LOG=$(mktemp)
+        cp "$OVMF_VARS" "$WRITABLE_VARS"
+        start_tpm
+        timeout "$TIMEOUT" qemu-system-x86_64 \
+            -machine q35 -cpu max -smp 4 -m 256 -display none \
+            -drive "if=pflash,unit=0,format=raw,readonly=on,file=$OVMF_CODE" \
+            -drive "if=pflash,unit=1,format=raw,file=$WRITABLE_VARS" \
+            -drive "format=raw,file=fat:rw:$ESP" \
+            "${TPM_ARGS[@]}" \
+            -serial "file:$FLIPPED_LOG" \
+            >/dev/null 2>&1 &
+        FLIPPED_PID=$!
+        for _ in $(seq 1 "$TIMEOUT"); do
+            grep -qE "measured boot   kernel" "$FLIPPED_LOG" 2>/dev/null && break
+            kill -0 "$FLIPPED_PID" 2>/dev/null || break
+            sleep 1
+        done
+        kill "$FLIPPED_PID" 2>/dev/null
+        wait "$FLIPPED_PID" 2>/dev/null
+        restore_kernel
+        flipped="$(grep -aE 'measured boot   kernel' "$FLIPPED_LOG" | tr -d '\r' | head -1)"
+        read -r k0 i0 c0 <<< "$MEASURED_DIGESTS"
+        if [[ "$flipped" =~ kernel\ ([0-9a-f]{8})\ initrd\ ([0-9a-f]{8})\ cmdline\ ([0-9a-f]{8}) ]] \
+            && [[ "${BASH_REMATCH[1]}" != "$k0" && "${BASH_REMATCH[2]}" == "$i0" && "${BASH_REMATCH[3]}" == "$c0" ]]; then
+            pass "one flipped kernel byte changed its PCR 9 digest ($k0 -> ${BASH_REMATCH[1]}) and nothing else's"
+        else
+            fail "a flipped kernel byte gave '${flipped:-no measured line}' against $MEASURED_DIGESTS"
+            status=1
+        fi
+    else
+        fail "the kernel image has no .debug_info section to flip a byte in"
+        status=1
+    fi
 fi
 
 if [[ "$status" -ne 0 ]]; then
