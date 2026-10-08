@@ -1056,6 +1056,15 @@ the distinction is in the table rather than in somebody's head.
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-10-08 (RFC 0089 step 5b: the TPM's commands and interface, host-tested)
+
+`bhaskix-tpm`, a leaf crate with no `unsafe`, builds `TPM2_PCR_Read` byte for byte as EDK2 does,
+parses the response a TPM writes, and drives the CRB register page in EDK2's order through a
+trait whose implementation holds the mapping — every wait bounded, so a TPM that never answers is
+an error, not a hang. It builds no other command, so nothing linking it can extend or clear a PCR.
+Nine host tests against a mock TPM, two armed red; the response parser's fuzz target ran 60.8
+million executions clean and reached an accepted response from an empty corpus.
+
 ### 2026-10-08 (RFC 0089 step 5a: the kernel finds the TPM)
 
 The kernel reads the ACPI `TPM2` table — signature, length, checksum, the control area's address

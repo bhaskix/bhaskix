@@ -1,0 +1,24 @@
+[package]
+name = "bhaskix-tpm"
+version = "0.0.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "TPM 2.0 commands and the CRB interface as bytes and a state machine (RFC 0089). No TPM required."
+authors = ["Tarun Kumar Kushwaha"]
+publish = false
+
+[lib]
+name = "bhaskix_tpm"
+path = "src/lib.rs"
+
+# Nothing. A command is bytes a TPM reads and a response is bytes a TPM wrote;
+# the CRB conversation is register writes in an order. None of it needs a TPM
+# to be tested, and none of it should be able to reach one from here -- the
+# caller holds the mapping, through `crb::Registers`.
+[dependencies]
+
+[package.metadata.bhaskix]
+# Building commands, parsing a response a *device* wrote, and sequencing
+# registers through a trait. Arithmetic and untrusted input; there is no
+# `unsafe` that could be justified, and `forbid(unsafe_code)` says so.
+unsafe_budget = 0

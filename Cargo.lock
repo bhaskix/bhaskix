@@ -145,6 +145,10 @@ name = "bhaskix-telemetry"
 version = "0.0.0"
 
 [[package]]
+name = "bhaskix-tpm"
+version = "0.0.0"
+
+[[package]]
 name = "bhaskix-usb"
 version = "0.0.0"
 

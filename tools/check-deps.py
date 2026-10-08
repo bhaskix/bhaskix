@@ -109,6 +109,11 @@ LAYERS = {
     # crate that depends on nothing cannot be the thing that lets a log reach
     # anything else.
     "bhaskix-tcglog": -3,
+    # TPM 2.0 commands and the CRB interface, RFC 0089 step 5b. A leaf for the
+    # reason `bhaskix-ahci` is one: it parses bytes a *device* wrote and drives
+    # registers only through a trait its holder implements, so it holds no
+    # address and `forbid(unsafe_code)` is true of all of it.
+    "bhaskix-tpm": -3,
     # The X722's registers and rings, RFC 0075. A leaf for the same two
     # reasons as `bhaskix-ahci` and one more of its own: it reaches registers
     # only through a trait its holder implements, so it holds no address at

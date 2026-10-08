@@ -314,6 +314,17 @@ path after boot.
    0xfed40000 (ACPI TPM2, start method 7)` with the emulated TPM and `tpm  no TPM2 table` on every
    other lane, both gated and armed red. The native lane now waits for that line rather than the
    TLB shootdown report, which comes earlier in the boot: the lane had been stopping before it.
+   **5b, talking to it — done 2026-10-08**: a leaf crate, `bhaskix-tpm`, at `unsafe` budget zero.
+   `command` builds `TPM2_PCR_Read` — big-endian, byte-for-byte what EDK2's `Tpm2PcrRead` sends,
+   held by a test — and parses the response a device wrote: size against the bytes, the error code
+   returned as itself, the selection checked to be the one asked for, the digest the bank's size.
+   **It builds no other command**, so nothing that links it can extend, clear or reach a hierarchy.
+   `crb` is EDK2's `PtpCrbTpmCommand` order over a `Registers` trait — `bhaskix-ahci`'s shape, the
+   caller holding the mapping — with every wait bounded: a mock TPM that never finishes gives
+   `NeverFinished`, not a hang, and the TPM is sent idle either way. Nine host tests, two armed red;
+   `fuzz/fuzz_targets/tpm_response.rs` ran 60,820,063 executions in 121 s clean and reached an
+   accepted response from an empty corpus after about 2.1 million. Nothing runs it on a machine
+   yet; that is 5c.
 6. **Agreement**: replay with `pkg`'s SHA-256 in `bin/tpmd`; the report's verdict, each outcome gated.
 7. **CI**: the native-with-TPM job.
 8. **Hardware**: after the native loader boots the SR550 and the lead switches its TPM to 2.0.
