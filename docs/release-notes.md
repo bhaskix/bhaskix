@@ -57,7 +57,7 @@ document, release note or README may state or imply that it works."*
 
 | It does this | Proven by |
 |---|---|
-| Boots on BIOS, on UEFI, and on its own loader `bhaskixboot.efi` | the boot lanes; **162 passing checks** on the BIOS lane alone (`ok` lines, measured 2026-10-08; 119 on 2026-08-30). The native loader is proven in QEMU only — **CI runs no native-loader lane**, and on the one physical machine it has not yet completed a boot (see [the hardware](#what-the-one-piece-of-hardware-told-us)) |
+| Boots on BIOS, on UEFI, and on its own loader `bhaskixboot.efi` | the boot lanes; **162 passing checks** on the BIOS lane alone (`ok` lines, measured 2026-10-08; 119 on 2026-08-30). **CI runs no native-loader lane**; locally it runs three. On the one physical machine it **completed a boot on 2026-10-08**, with one CPU of sixteen and no shell (see [the hardware](#what-the-one-piece-of-hardware-told-us)) |
 | Starts its CPUs with its own INIT-SIPI and schedules across them | boot lanes, `threads`/`migration` gates — four CPUs in the lanes, eight in the soaks, and **16 of 16** on the SR550 |
 | Runs ring 3 programs holding capabilities and nothing else | boot lanes, `ring 3` and fault-injection gates |
 | Answers a user-mode shell from services in separate domains — block driver, console, filesystem | `shell-test.sh`; **22 gates** (`user` mode), **53** (`iommu` mode), measured 2026-08-30 and not re-counted since |
@@ -127,14 +127,16 @@ Stated as plainly as the list above, because that is what criterion R7 asks for.
 
 These are open, reproducible, and recorded in [TRACKER.md](../TRACKER.md)'s
 open-defects table with their specimens. They are listed here rather than left
-for a user to discover. **Counted 2026-10-08: twenty open rows** — nineteen by the evening, when the native loader's was fixed, and it stays listed until the machine it was found on confirms it; the table
+for a user to discover. **Counted 2026-10-08: twenty open rows**, then twenty-two by the evening — the native loader's row closed when the SR550 booted through it, and that boot filed three; the table
 groups the ones that are one family and leaves out one that is open in name
 only (the `uefi, qemu64` lane, restored to `make test` and failing only by
 other rows' defects).
 
 | Defect — what you would see | Rate, as TRACKER states it | Fix |
 |---|---|---|
-| The native loader stops on the SR550 after the exit: its page-table pool, sized under an emulator, runs dry on 192 GiB | four boots, 2026-08-22, unheard; named by a fifth, 2026-10-08 | **fixed 2026-10-08**, shown in QEMU at 130 GiB; not yet confirmed on the SR550 |
+| Through its own loader on the SR550, the kernel starts one CPU of sixteen: its bring-up tables land above 4 GiB | found 2026-10-08, every native boot of a machine with RAM above 4 GiB | cause read from the code; fix named, not built |
+| Through its own loader on the SR550, the serial line reads back masked, so there is no console input and no shell | found 2026-10-08, one boot | a lead, not a finding |
+| Through its own loader on the SR550, a copy-on-write write lands in the original frame | found 2026-10-08, one boot | a lead: a stale TLB entry with one CPU online |
 | A ring-station scheduler self-test halts with a station asleep on its own turn | 1 in 391 CI boots before a fix of 2026-09-28; **0 in 657 since** (2026-10-04) | fix landed; open until ~1,200 clean boots |
 | An outbound TCP demonstration stalls: `connected, stream still in flight` | 10 sightings, 1 in 773 boots (2026-09-28) | none |
 | A lock-order self-test fails: a wait queue taken while holding another lock | 4 in 7,681 boots; last 2026-09-23 | a cause fixed 2026-09-28; open until ~5,800 clean boots |
@@ -163,6 +165,7 @@ not yet absence.
 | A kernel fault: control transfers to an unmapped address beside a trap frame with a garbage vector (~1 boot in 2400) | **2026-10-07** — a thread stolen while its CPU still ran it; fixed 2026-10-04, 0 faults in 1,230 passes at eight CPUs since |
 | A socket reclaim returned the slot but not the port | **2026-09-01** — the gate raced its own precondition |
 | The TCP inbound gate failed at an environmental rate | **2026-08-31** — [RFC 0061](rfc/0061-a-connection-nobody-accepted.md): a connection nobody accepted held the only slot |
+| The native loader stopped on the SR550 after leaving the firmware | **2026-10-08** — its page-table pool was sized under an emulator; sized from the machine, it boots there |
 | Every boot showed a 442–447 ms worst wake | **2026-08-16** — one missing `resched()` on spawn; 446 ms → 345 µs. This note listed it as open two weeks later, which was wrong when written |
 
 ---
@@ -187,14 +190,16 @@ ping (2026-09-13).
   driver refuses by name~~ was this section's wording until then, and named the
   wrong controller. The drives belong to the machine's other job and are not
   this project's to write.
-- **Complete a boot through Bhaskix's own loader.** `bhaskixboot.efi` printed its
-  banner there and nothing after, on four boots of 2026-08-22 — because it wrote
-  everything else to the first UART, and this machine's service processor carries
-  the second. Writing both, a fifth boot on 2026-10-08 heard it read its payload,
-  leave the firmware, and refuse: its page-table pool was a fixed size chosen
-  under an emulator with 256 MiB, and this machine has 192 GiB. The pool is now
-  sized from the machine's own memory map, and a 130 GiB emulated guest boots
-  through it; **the SR550 itself has not been booted with the fix yet.**
+- **Boot fully through Bhaskix's own loader** — until 2026-10-08, and now with
+  three gaps. `bhaskixboot.efi` printed its banner there and nothing after on four
+  boots of 2026-08-22, because it wrote everything else to the first UART and this
+  machine's service processor carries the second. Writing both, a boot on
+  2026-10-08 heard it refuse after leaving the firmware: its page-table pool was
+  sized under an emulator with 256 MiB, and this machine has 192 GiB. Sized from
+  the machine, **a second boot the same day reached the kernel and its whole
+  report** — with **one CPU of sixteen** (the kernel's own CPU bring-up put its
+  tables above 4 GiB), **no shell** (the serial line read back masked), and a
+  failed copy-on-write check. Through Limine, the same machine runs all sixteen.
 - **Get an answer to `SET_ADDRESS` from whatever is on its xHCI's port 1.**
 - **Obtain an address, start an exchange, or carry TCP** on its network.
 
