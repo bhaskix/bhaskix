@@ -715,7 +715,7 @@ run-uefi: $(ISO)
 # fails for a reason that has nothing to do with the code is worse than a slow
 # one, and `gave up after 0.255s` says nothing about an image at all.
 test: fmt clippy test-host gates test-boot test-boot-uefi test-boot-iommu test-boot-iommu-off \
-      test-boot-qemu64 test-boot-uefi-qemu64 test-boot-native test-boot-native-full \
+      test-boot-qemu64 test-boot-uefi-qemu64 test-boot-native test-boot-native-full test-boot-native-tpm \
       test-placements test-shell \
       test-keyboard test-usb-keyboard test-busybox test-bond test-lacp test-faults test-http
 	@echo
@@ -887,10 +887,11 @@ test-boot-native: $(BOOTEFI) $(ISO)
 test-boot-native-full: $(BOOTEFI) $(ISO)
 	tests/qemu/boot-test.sh native
 
-# RFC 0089 step 1: the native lane with a TPM 2.0 attached, through the
-# emulator `tools/swtpm.sh` runs in a container. **Not in `make test` yet**,
-# because it needs Docker on the machine running it; it joins when the loader
-# measures something this lane can assert (step 2), and CI runs it from step 7.
+# RFC 0089: the native lane with a TPM 2.0 attached, through the emulator
+# `tools/swtpm.sh` runs in a container. In `make test` since step 2 gave it
+# something to assert -- the loader's measurements -- and it says `skip` on a
+# machine with no usable docker, as the native lanes do without OVMF. CI runs
+# it from step 7.
 test-boot-native-tpm: $(BOOTEFI) $(ISO)
 	BHASKIX_TPM=1 tests/qemu/native-boot-test.sh
 

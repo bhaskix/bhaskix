@@ -32,6 +32,9 @@ bhaskix-elf = { path = "../../elf" }
 # RFC 0021's draw, for the KASLR slide. A machine that cannot answer
 # boots unslid and says so -- the same policy every consumer holds.
 bhaskix-rand = { path = "../../rand" }
+# RFC 0089: the events the loader asks the firmware to log, built where a host
+# test holds their bytes.
+bhaskix-tcglog = { path = "../../tcglog" }
 
 [profile.release]
 panic = "abort"
@@ -75,4 +78,9 @@ asm_budget = 5
 # function pointer the type system cannot describe. They buy the removal of a
 # worse thing than `unsafe`: writing COM1's registers while the firmware still
 # owns the port, which UEFI §12 gives this protocol to avoid.
-unsafe_budget = 114
+# 125 on 2026-10-07: eleven lines for `EFI_TCG2_PROTOCOL`, RFC 0089 step 2 --
+# locating it and the one call that measures through it, `HashLogExtendEvent`.
+# The same shape and size as the serial protocol's eleven: firmware function
+# pointers the type system cannot describe. The event they log is built in
+# `bhaskix-tcglog` at budget zero.
+unsafe_budget = 125

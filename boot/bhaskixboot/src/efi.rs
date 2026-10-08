@@ -88,6 +88,16 @@ const SERIAL_IO: Guid = Guid(
     [0x9A, 0x0C, 0x00, 0x90, 0x27, 0x3F, 0xC1, 0xFD],
 );
 
+/// `EFI_TCG2_PROTOCOL_GUID` -- RFC 0089. Transcribed from EDK2's
+/// `MdePkg/Include/Protocol/Tcg2Protocol.h`, the TCG EFI Protocol
+/// Specification's reference implementation.
+const TCG2: Guid = Guid(
+    0x607F_766C,
+    0x7455,
+    0x42BE,
+    [0x93, 0x0B, 0xE4, 0xD7, 0x6D, 0xB2, 0x72, 0x0F],
+);
+
 /// `EFI_SIMPLE_FILE_SYSTEM_PROTOCOL_GUID`.
 const SIMPLE_FILE_SYSTEM: Guid = Guid(
     0x964E_5B22,
@@ -177,6 +187,23 @@ struct SerialIo {
     ) -> usize,
     read: usize,
     mode: usize,
+}
+
+/// `EFI_TCG2_PROTOCOL`, down to the one call RFC 0089 step 2 makes.
+///
+/// The two slots before `hash_log_extend_event` are named so the offset is
+/// right; the event log, `get_event_log`, is step 3's.
+#[repr(C)]
+pub struct Tcg2 {
+    get_capability: usize,
+    get_event_log: usize,
+    hash_log_extend_event: unsafe extern "efiapi" fn(
+        this: *mut Tcg2,
+        flags: u64,
+        data_to_hash: u64,
+        data_to_hash_len: u64,
+        event: *const u8,
+    ) -> usize,
 }
 
 /// The system table, down to the boot services.
@@ -764,6 +791,56 @@ pub fn serial_io(table: *mut SystemTable) -> Option<*mut core::ffi::c_void> {
         Some(interface)
     } else {
         None
+    }
+}
+
+/// The firmware's TCG2 protocol, if it offers one -- RFC 0089.
+///
+/// `None` is a fact the loader reports, not a refusal: measured boot is
+/// evidence, and a machine without a TPM still boots.
+#[must_use]
+pub fn tcg2(table: *mut SystemTable) -> Option<*mut Tcg2> {
+    // SAFETY: `table` passed `validate`.
+    let services = unsafe { (*table).boot_services };
+    if services.is_null() {
+        return None;
+    }
+    let mut interface: *mut core::ffi::c_void = core::ptr::null_mut();
+    // SAFETY: the boot services table is the firmware's, and this is the
+    // documented shape of `LocateProtocol`.
+    let status =
+        unsafe { ((*services).locate_protocol)(&TCG2, core::ptr::null_mut(), &raw mut interface) };
+    if status == SUCCESS && !interface.is_null() {
+        Some(interface.cast())
+    } else {
+        None
+    }
+}
+
+/// Asks the firmware to hash `bytes`, extend a PCR with the digest and log
+/// `event` -- `HashLogExtendEvent`, RFC 0089.
+///
+/// **No flags**: the kernel is an ELF, and `PE_COFF_IMAGE` would ask for a PE
+/// image's hash. Before `ExitBootServices` only, which is when the loader
+/// calls it: boot services identity-map memory, so the address of `bytes` is
+/// the physical address the call takes.
+pub fn hash_log_extend_event(protocol: *mut Tcg2, bytes: &[u8], event: &[u8]) -> Result<(), usize> {
+    // SAFETY: `protocol` came from `LocateProtocol` with the TCG2 GUID and is
+    // the firmware's; `event` is a whole `EFI_TCG2_EVENT` from
+    // `bhaskix_tcglog::tagged_event`; `bytes` is live for the call.
+    let status = unsafe {
+        ((*protocol).hash_log_extend_event)(
+            protocol,
+            0,
+            bytes.as_ptr() as u64,
+            bytes.len() as u64,
+            event.as_ptr(),
+        )
+    };
+    if status == SUCCESS {
+        Ok(())
+    } else {
+        Err(status)
     }
 }
 

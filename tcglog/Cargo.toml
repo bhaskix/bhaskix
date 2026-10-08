@@ -1,0 +1,23 @@
+[package]
+name = "bhaskix-tcglog"
+version = "0.0.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "The TCG event structures measured boot writes and reads (RFC 0089). No TPM required."
+authors = ["Tarun Kumar Kushwaha"]
+publish = false
+
+[lib]
+name = "bhaskix_tcglog"
+path = "src/lib.rs"
+
+# Nothing. The loader links it to build the events it asks the firmware to
+# log, and the event log the firmware hands back is read with it (RFC 0089
+# step 4) -- bytes at offsets both ways, testable with no TPM and no firmware.
+[dependencies]
+
+[package.metadata.bhaskix]
+# Writing a packed structure into a buffer and, from step 4, parsing a log the
+# firmware wrote. Arithmetic and untrusted input; `forbid(unsafe_code)` in the
+# source says there is no `unsafe` that could be justified for either.
+unsafe_budget = 0

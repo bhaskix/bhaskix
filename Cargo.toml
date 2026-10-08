@@ -36,6 +36,10 @@ members = [
     "usb",
     "ahci",
 
+    # RFC 0089 -- the TCG event structures measured boot writes and reads, a
+    # leaf so the loader and the host tests share one copy.
+    "tcglog",
+
     # RFC 0075 -- the X722's registers and rings, moved out of the kernel so
     # that the half of a NIC driver that touches a register can be tested at
     # all. It was in `kernel/src/i40e.rs`, where only its byte encoders had

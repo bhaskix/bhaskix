@@ -81,6 +81,13 @@ TPM_DIR="$REPO_ROOT/build/swtpm-native"
 stop_tpm() { :; }
 start_tpm() { :; }
 if [[ "${BHASKIX_TPM:-0}" == 1 ]]; then
+    # No container runtime, no emulator: said, as a missing OVMF is above,
+    # rather than failed -- the lane cannot run here, and that is a fact about
+    # the machine, not the loader.
+    if ! docker info >/dev/null 2>&1; then
+        printf '%sskip%s  native boot test with a TPM (no usable docker for tools/swtpm.sh)\n' "$YELLOW" "$RESET"
+        exit 0
+    fi
     # shellcheck source=tests/qemu/devices.sh
     source "$REPO_ROOT/tests/qemu/devices.sh"
     stop_tpm() { "$REPO_ROOT/tools/swtpm.sh" stop "$TPM_DIR"; }
@@ -226,6 +233,30 @@ do
         status=1
     fi
 done
+
+# RFC 0089 step 2: **measured, or saying it was not.** With a TPM the loader
+# must report all three objects measured and none refused; without one it must
+# say nothing was measured -- an unmeasured boot that kept quiet would read, to
+# anyone looking later, like a measured boot that found nothing wrong.
+if [[ "${BHASKIX_TPM:-0}" == 1 ]]; then
+    measured=0
+    for object in "kernel into PCR 9" "initrd into PCR 9" "cmdline into PCR 8"; do
+        grep -qF "bhaskixboot: measured $object" "$LOG" 2>/dev/null && measured=$((measured + 1))
+    done
+    if [[ $measured -eq 3 ]] && ! grep -qF "REFUSED, status" "$LOG"; then
+        pass "the loader measured the kernel, the initrd and the command line through the firmware's TPM"
+    else
+        fail "the loader measured $measured of 3 objects: $(grep -aE 'bhaskixboot: (measure|no TCG2)' "$LOG" | tr -d '\r' | tr '\n' ' ')"
+        status=1
+    fi
+else
+    if grep -qF "bhaskixboot: no TCG2 protocol; nothing is measured" "$LOG" 2>/dev/null; then
+        pass "with no TPM the loader said nothing was measured"
+    else
+        fail "with no TPM the loader did not say it measured nothing"
+        status=1
+    fi
+fi
 
 # Step 3: the machine's shape, and the exit. The values are the firmware's
 # to choose -- the gates demand the *lines*, well-formed, plus the two facts

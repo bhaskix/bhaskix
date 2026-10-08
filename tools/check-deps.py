@@ -103,6 +103,12 @@ LAYERS = {
     # device. Neither needs a controller to be tested, and a crate that cannot
     # reach one cannot be the thing that lets a disk reach memory.
     "bhaskix-ahci": -3,
+    # The TCG event structures, RFC 0089: the loader builds the events it asks
+    # the firmware to log with it, and the log the firmware hands back is read
+    # with it. A leaf because what it will parse was written by firmware, and a
+    # crate that depends on nothing cannot be the thing that lets a log reach
+    # anything else.
+    "bhaskix-tcglog": -3,
     # The X722's registers and rings, RFC 0075. A leaf for the same two
     # reasons as `bhaskix-ahci` and one more of its own: it reaches registers
     # only through a trait its holder implements, so it holds no address at

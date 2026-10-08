@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | 🔨 **Draft 2026-10-07 — step 1 done the same day: this host's OVMF offers `EFI_TCG2_PROTOCOL` when a TPM is attached**, and `make test-boot-native-tpm` boots the native lane with one, from an emulator `tools/swtpm.sh` runs; nothing is built in the loader or kernel yet. The first of Phase 3's secure boot chain, sequenced by the project lead on 2026-10-07: *measured boot first*, signing after key custody is decided. The acceptance call is the project lead's |
+| **Status** | 🔨 **Draft 2026-10-07 — steps 1 and 2 done the same day: this host's OVMF offers `EFI_TCG2_PROTOCOL` when a TPM is attached, and the native loader measures the kernel, initrd and command line through it**, gated in `make test-boot-native-tpm` from an emulator `tools/swtpm.sh` runs. The log does not reach the kernel yet (step 3). The first of Phase 3's secure boot chain, sequenced by the project lead on 2026-10-07: *measured boot first*, signing after key custody is decided. The acceptance call is the project lead's |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | boot (`bhaskixboot.efi`, `bhaskix_boot::Handoff`), arch (ACPI `TPM2`), kernel (boot report), userspace (a TPM service), tools, tests |
 | **Milestone** | Phase 3 — *Secure boot chain*, the roadmap's first row; [security.md](../security.md) §1 **T6** and gap 1 |
@@ -256,9 +256,19 @@ path after boot.
    drove the TPM rather than ignoring it. **Not in `make test`** until step 2 gives it something to
    assert, because it needs Docker. **Step 1 is done.**
 2. **The loader measures**: GUID, `locate_protocol`, three `HashLogExtendEvent` calls, a report
-   line from the loader. Gated: digest changes with the kernel byte, armed red.
+   line from the loader. ~~Gated: digest changes with the kernel byte, armed red.~~ **Done 2026-10-07**,
+   and the gate is not the one written here: `HashLogExtendEvent` returns no digest, so nothing a
+   step-2 boot prints can show one changing — that gate moves to step 3, where the log is read. What
+   step 2 gates is the loader's own account: with a TPM, `measured kernel into PCR 9`, `initrd into
+   PCR 9` and `cmdline into PCR 8` and no refusal; without one, `no TCG2 protocol; nothing is
+   measured`. Both armed red by a loader that skipped the call (*measured 0 of 3*, and the silence
+   the plain lane now refuses). The event bytes are built by `bhaskix-tcglog::tagged_event`, a leaf
+   at `unsafe` budget zero whose layout test was armed red by a one-byte header; the loader's budget
+   went from 114 to 125 for the protocol's lookup and call. `make test-boot-native-tpm` joined
+   `make test`, saying `skip` where there is no usable docker.
 3. **The handoff carries the log**: `HANDOFF_VERSION` 3, `Measurement`, the five literals and two
-   gate literals, the Limine path's `NotAttempted`.
+   gate literals, the Limine path's `NotAttempted`. **And the gate step 2 could not have**: the
+   kernel's digest in the log changes when one byte of the kernel on the ESP does, armed red.
 4. **`tcglog`**: host-tested, fuzzed, a captured fixture; the kernel prints the events it found.
 5. **ACPI `TPM2` and `bin/tpmd`**: PCR read only, closed request set, gated.
 6. **Agreement**: replay with `pkg`'s SHA-256 in `bin/tpmd`; the report's verdict, each outcome gated.

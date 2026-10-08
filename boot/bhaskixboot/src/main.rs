@@ -138,6 +138,51 @@ fn report_payload(name: &str, bytes: &[u8]) {
     serial::write("\r\n");
 }
 
+/// Measures the payload into the TPM through the firmware, or says why not --
+/// RFC 0089. Nothing here refuses the boot: measurement is evidence, and a
+/// measurement the firmware refused is reported as refused, so the boot that
+/// follows is never mistaken for a measured one.
+fn measure(table: *mut SystemTable, kernel: &[u8], initrd: &[u8], cmdline: &str) {
+    use bhaskix_tcglog::measured;
+    let Some(tcg2) = efi::tcg2(table) else {
+        diag("bhaskixboot: no TCG2 protocol; nothing is measured\r\n");
+        return;
+    };
+    measure_one(tcg2, measured::KERNEL, "kernel", kernel);
+    measure_one(tcg2, measured::INITRD, "initrd", initrd);
+    measure_one(tcg2, measured::CMDLINE, "cmdline", cmdline.as_bytes());
+}
+
+/// One object into one PCR, logged as `bhaskix <name>`, and the outcome said.
+fn measure_one(tcg2: *mut efi::Tcg2, (pcr, tag): (u32, u32), name: &str, bytes: &[u8]) {
+    let mut label = [0u8; 32];
+    let prefix = b"bhaskix ";
+    let label_len = prefix.len() + name.len();
+    label[..prefix.len()].copy_from_slice(prefix);
+    label[prefix.len()..label_len].copy_from_slice(name.as_bytes());
+    let mut event = [0u8; 64];
+    let Some(len) = bhaskix_tcglog::tagged_event(pcr, tag, &label[..label_len], &mut event) else {
+        diag("bhaskixboot: a measurement event did not fit its buffer\r\n");
+        return;
+    };
+    match efi::hash_log_extend_event(tcg2, bytes, &event[..len]) {
+        Ok(()) => {
+            serial::write("bhaskixboot: measured ");
+            serial::write(name);
+            serial::write(" into PCR ");
+            serial::write_dec(u64::from(pcr));
+            serial::write("\r\n");
+        }
+        Err(status) => {
+            serial::write("bhaskixboot: measurement of ");
+            serial::write(name);
+            serial::write(" REFUSED, status ");
+            serial::write_hex(status as u64);
+            serial::write("\r\n");
+        }
+    }
+}
+
 /// A refusal, printed with its status, and the park that follows every one
 /// of them: past the exit there is nowhere to return a status to, and
 /// before it an inconsistent loader has no business handing control back.
@@ -270,6 +315,16 @@ extern "efiapi" fn efi_main(image_handle: usize, system_table: *mut SystemTable)
         }
     };
     efi::close(root);
+
+    // **Measured before anything interprets it** -- RFC 0089. The bytes as
+    // read, before the parse, the placement and the slide, so a verifier can
+    // predict the digest from the file alone.
+    measure(
+        table,
+        &kernel_buffer[..kernel_len],
+        &initrd_buffer[..initrd_len],
+        cmdline,
+    );
 
     // The kernel, parsed by the crate the kernel itself loads with — told
     // it is validating for the high half, which is the only thing that

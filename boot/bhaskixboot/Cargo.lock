@@ -15,10 +15,15 @@ name = "bhaskix-rand"
 version = "0.0.0"
 
 [[package]]
+name = "bhaskix-tcglog"
+version = "0.0.0"
+
+[[package]]
 name = "bhaskixboot"
 version = "0.0.0"
 dependencies = [
  "bhaskix-boot",
  "bhaskix-elf",
  "bhaskix-rand",
+ "bhaskix-tcglog",
 ]
