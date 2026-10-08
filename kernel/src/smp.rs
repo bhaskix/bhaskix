@@ -62,6 +62,34 @@ static TRAMPOLINE_RESERVED: AtomicBool = AtomicBool::new(false);
 /// handoff's own count.
 static MADT_REPORTED: AtomicU32 = AtomicU32::new(0);
 
+/// CPUs that read back, from their own registers, `WP` and — where the
+/// processor has them — SMEP and SMAP. See [`note_protections`].
+static PROTECTED: AtomicU32 = AtomicU32::new(0);
+
+/// The bootstrap CPU's protections — `WP`, SMEP, SMAP — on a secondary too,
+/// before it runs anything but its own bring-up, and counted only if it reads
+/// them back. Called from `secondary_main` on both boot paths.
+fn protect_this_cpu() {
+    // SAFETY: init on this CPU; every deliberate access to user memory goes
+    // through `uaccess`, as on the bootstrap CPU, which enabled the same bits.
+    unsafe { bhaskix_arch::cpu::enable_supervisor_protections() };
+    note_protections();
+}
+
+/// Counts this CPU into [`PROTECTED`] if it has what
+/// `cpu::enable_supervisor_protections` asks for, **read back live** rather
+/// than assumed from the call: the call was missing on every secondary until
+/// 2026-10-08, and the report said `smep on  smap on` over a machine where one
+/// CPU in four had them.
+pub fn note_protections() {
+    let features = bhaskix_arch::msr::features();
+    // SAFETY: CPL 0, where the control registers mean something.
+    let (wp, smep, smap) = unsafe { bhaskix_arch::cpu::protections_live() };
+    if wp && smep == features.smep && smap == features.smap {
+        PROTECTED.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
 /// Records that `memory::init` reserved the trampoline page.
 pub fn note_trampoline_reserved() {
     TRAMPOLINE_RESERVED.store(true, Ordering::Release);
@@ -86,6 +114,7 @@ extern "C" fn secondary_main(lapic_id: u32) -> ! {
         // fault here cannot collide with one on another processor.
         gdt::init_cpu(cpu_id as usize);
         idt::load_on_secondary();
+        protect_this_cpu();
 
         // SSE, for this CPU too: the register file is per CPU, so the
         // enable is as well, and a thread migrated here would meet `#UD`
@@ -578,6 +607,28 @@ pub fn report(handoff: &bhaskix_boot::Handoff) {
         };
         println!("      cpu {cpu_id}  lapic {lapic_id}  {role}");
     });
+
+    // A CPU is counted online before it reaches `note_protections`, so give
+    // the last ones a bounded moment to arrive; a CPU that never does is the
+    // failure this line exists to name.
+    let online = percpu::online_count();
+    let mut protected = PROTECTED.load(Ordering::Acquire);
+    for _ in 0..1_000_000 {
+        if protected >= online {
+            break;
+        }
+        core::hint::spin_loop();
+        protected = PROTECTED.load(Ordering::Acquire);
+    }
+    if protected == online {
+        println!(
+            "    supervisor     wp, and smep and smap where the processor has them, live on {protected} of {online} cpus"
+        );
+    } else {
+        println!(
+            "\x1b[91m    supervisor     FAILED: wp, smep and smap live on {protected} of {online} cpus\x1b[0m"
+        );
+    }
 }
 
 /// Gives every online CPU a guarded stack for the syscall entry path.

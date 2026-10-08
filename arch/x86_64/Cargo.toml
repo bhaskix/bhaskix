@@ -29,7 +29,9 @@ workspace = true
 # 37 — **this is the home**, and the only crate where an instruction needs no
 # excuse. The number is here so that growth is visible and so that the day a
 # second architecture arrives, this is the size of the port.
-asm_budget = 37
+# 40 on 2026-10-08: three sites for write protection -- `CR0` read and
+# written in `enable_supervisor_protections`, and read in `protections_live`.
+asm_budget = 40
 # `arch` is one of the places `unsafe` is permitted (docs/coding-style.md §3):
 # port I/O and CPU control instructions cannot be expressed any other way.
 #
@@ -163,7 +165,12 @@ asm_budget = 37
 # 1180 on 2026-10-08: the `tpm2` finder's one line, RFC 0089 step 5a -- the
 # same call into the table walker `madt`, `dmar` and `mcfg` each make. The
 # parser it hands the table to, `parse_tpm2`, has none.
-unsafe_budget = 1180
+# 1189 on 2026-10-08: nine lines for write protection, read back. `CR0.WP` set
+# in `enable_supervisor_protections` (the read and the write of `CR0`), and
+# `protections_live`, which reads `CR0` and `CR4` so each CPU can say what it
+# actually has -- because the secondaries had SMEP and SMAP off, and WP off
+# under the native loader, while the report said otherwise.
+unsafe_budget = 1189
 # Raised from 1070 for ECAM -- one volatile read of configuration space as
 # memory -- and for counting the bytes the transmitter gives up on. The second
 # is two lines and bought a silent data loss becoming a visible number.

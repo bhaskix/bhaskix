@@ -284,6 +284,9 @@ pub fn kernel_main(handoff: &Handoff) -> ! {
             // SAFETY: init, and every deliberate access to user memory already
             // goes through `uaccess`.
             let (smep, smap) = unsafe { cpu::enable_supervisor_protections() };
+            // Counted only if this CPU reads them back -- the same check
+            // every secondary makes (`smp::note_protections`).
+            smp::note_protections();
             // SSE, on this CPU. See `cpu::enable_sse`: the ABI requires it,
             // nothing this kernel loaded had ever used it, and the first
             // real Linux binary died on `xorps` three instructions in.

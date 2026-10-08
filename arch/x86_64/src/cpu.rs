@@ -158,9 +158,20 @@ pub unsafe fn read_cr4() -> u64 {
     value
 }
 
-/// Enables SMEP and SMAP where the CPU supports them.
+/// Enables write protection, and SMEP and SMAP where the CPU supports them.
 ///
-/// Returns `(smep, smap)` — which were actually turned on.
+/// Returns `(smep, smap)` — which were actually turned on. `CR0.WP` is set
+/// unconditionally: every x86-64 processor has it.
+///
+/// **On every CPU, and that was the bug** (2026-10-08). This ran on the
+/// bootstrap processor only, and the boot report's `smep on  smap on` was true
+/// of that one CPU: read from QEMU's monitor, every secondary on both boot
+/// paths had SMEP and SMAP **off**, and under the native loader `WP` too —
+/// nothing here ever set it, so the bootstrap CPU had whatever the firmware
+/// left and the secondaries what INIT left. Without `WP` a ring 0 write goes
+/// straight through a read-only page: copy-on-write and the kernel's own W^X
+/// stop holding for anything the kernel writes. Now each CPU calls this for
+/// itself, and [`protections_live`] says what it actually got.
 ///
 /// SMEP stops the kernel executing user pages; SMAP stops it *reading or
 /// writing* them without deliberately lifting the restriction. Both convert a
@@ -173,6 +184,13 @@ pub unsafe fn read_cr4() -> u64 {
 /// user page fault, so any code that legitimately touches user memory must
 /// already go through `uaccess`.
 pub unsafe fn enable_supervisor_protections() -> (bool, bool) {
+    // SAFETY: `CR0` at CPL 0; `WP` is added and every other bit kept, since
+    // clearing paging or protection mid-flight would be immediately fatal.
+    unsafe {
+        let cr0: u64;
+        core::arch::asm!("mov {}, cr0", out(reg) cr0, options(nostack, preserves_flags));
+        core::arch::asm!("mov cr0, {}", in(reg) cr0 | CR0_WP, options(nostack, preserves_flags));
+    }
     let features = crate::msr::features();
 
     let mut bits = 0;
@@ -197,6 +215,28 @@ pub unsafe fn enable_supervisor_protections() -> (bool, bool) {
     (features.smep, features.smap)
 }
 
+/// What this CPU has live: `(wp, smep, smap)`, read from `CR0` and `CR4`.
+///
+/// For the check that every CPU got what [`enable_supervisor_protections`]
+/// asked for, rather than trusting that it was called.
+///
+/// # Safety
+///
+/// CPL 0, where the control registers mean something.
+#[must_use]
+pub unsafe fn protections_live() -> (bool, bool, bool) {
+    let cr0: u64;
+    // SAFETY: reading a control register at CPL 0 has no side effects.
+    unsafe {
+        core::arch::asm!("mov {}, cr0", out(reg) cr0, options(nomem, nostack, preserves_flags));
+    }
+    // SAFETY: as above.
+    let cr4 = unsafe { read_cr4() };
+    (cr0 & CR0_WP != 0, cr4 & CR4_SMEP != 0, cr4 & CR4_SMAP != 0)
+}
+
+/// `CR0.WP` — ring 0 honours read-only pages.
+const CR0_WP: u64 = 1 << 16;
 /// `CR4.OSFXSR` — the OS says it saves and restores SSE state.
 const CR4_OSFXSR: u64 = 1 << 9;
 /// `CR4.OSXMMEXCPT` — unmasked SSE exceptions arrive as `#XM`, not `#UD`.

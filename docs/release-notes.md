@@ -136,7 +136,7 @@ other rows' defects).
 |---|---|---|
 | Through its own loader on the SR550, the kernel starts one CPU of sixteen: its bring-up tables land above 4 GiB | found 2026-10-08, every native boot of a machine with RAM above 4 GiB | **fixed 2026-10-08**, shown under KVM at 8 GiB; not yet confirmed on the SR550 |
 | Through its own loader on the SR550, the serial line reads back masked, so there is no console input and no shell | found 2026-10-08, one boot | a lead, not a finding |
-| Through its own loader on the SR550, a copy-on-write write lands in the original frame | found 2026-10-08, one boot | a lead: a stale TLB entry with one CPU online |
+| Through its own loader on the SR550, a copy-on-write write lands in the original frame | found 2026-10-08, one boot | likely cause found: nothing set `CR0.WP`; set on every CPU since 2026-10-08, not yet confirmed there |
 | A ring-station scheduler self-test halts with a station asleep on its own turn | 1 in 391 CI boots before a fix of 2026-09-28; **0 in 657 since** (2026-10-04) | fix landed; open until ~1,200 clean boots |
 | An outbound TCP demonstration stalls: `connected, stream still in flight` | 10 sightings, 1 in 773 boots (2026-09-28) | none |
 | A lock-order self-test fails: a wait queue taken while holding another lock | 4 in 7,681 boots; last 2026-09-23 | a cause fixed 2026-09-28; open until ~5,800 clean boots |
@@ -165,6 +165,7 @@ not yet absence.
 | A kernel fault: control transfers to an unmapped address beside a trap frame with a garbage vector (~1 boot in 2400) | **2026-10-07** — a thread stolen while its CPU still ran it; fixed 2026-10-04, 0 faults in 1,230 passes at eight CPUs since |
 | A socket reclaim returned the slot but not the port | **2026-09-01** — the gate raced its own precondition |
 | The TCP inbound gate failed at an environmental rate | **2026-08-31** — [RFC 0061](rfc/0061-a-connection-nobody-accepted.md): a connection nobody accepted held the only slot |
+| SMEP and SMAP were enabled on one CPU of four (one of sixteen on the SR550), and under the native loader write protection on none the kernel started — while the report said "on" | **2026-10-08** — every CPU now enables and reads back all three, gated on every lane |
 | The native loader stopped on the SR550 after leaving the firmware | **2026-10-08** — its page-table pool was sized under an emulator; sized from the machine, it boots there |
 | Every boot showed a 442–447 ms worst wake | **2026-08-16** — one missing `resched()` on spawn; 446 ms → 345 µs. This note listed it as open two weeks later, which was wrong when written |
 

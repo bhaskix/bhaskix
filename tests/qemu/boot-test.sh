@@ -4839,6 +4839,24 @@ else
     status=1
 fi
 
+# **On every CPU, read back from its own registers** (2026-10-08). The line
+# above is the bootstrap CPU's, and it was the only thing anyone checked:
+# QEMU's monitor showed every secondary with SMEP and SMAP off on both boot
+# paths, and with WP off under the native loader, while that line said "on".
+# Each CPU now enables them for itself and counts itself only if it reads them
+# back; this holds the count to the CPUs online. On `-cpu qemu64`, which has
+# neither SMEP nor SMAP, WP is still required on every CPU.
+protections_line="$(grep -aE 'supervisor +(wp, and smep|FAILED: wp)' "$LOG" | tr -d '\r' | head -1)"
+online_cpus="$(grep -aE 'cpus +[0-9]+ online of' "$LOG" | tr -d '\r' | head -1 | sed -E 's/.*cpus +([0-9]+) online.*/\1/')"
+if [[ "$protections_line" =~ live\ on\ ([0-9]+)\ of\ ([0-9]+)\ cpus ]] \
+    && [[ "$protections_line" != *FAILED* ]] \
+    && [[ "${BASH_REMATCH[1]}" == "${BASH_REMATCH[2]}" && "${BASH_REMATCH[2]}" == "$online_cpus" ]]; then
+    pass "wp, smep and smap live on every cpu: ${BASH_REMATCH[1]} of $online_cpus"
+else
+    fail "supervisor protections on every cpu: '${protections_line:-no line}', ${online_cpus:-?} online"
+    status=1
+fi
+
 if grep -qE "exception-table (entry|entries)" "$LOG" \
    && ! grep -qF "(0 exception-table" "$LOG"; then
     pass "exception table populated (bad user pointers fault, not panic)"

@@ -912,7 +912,10 @@ asm_budget = 10
 # 2086 the same day: `tpm_domain_entry`'s two, RFC 0089 step 5c -- installing
 # the address space it built and entering ring 3, the two lines every domain
 # entry here has.
-unsafe_budget = 2086
+# 2089 on 2026-10-08: three lines for protections on every CPU -- the
+# secondary's enable in `smp::protect_this_cpu`, its call inside
+# `secondary_main`'s block, and the register read in `note_protections`.
+unsafe_budget = 2089
 # Up thirty-one for RFC 0005 step 9's socket probe -- `ring3_socketeer`, which
 # is `ring3_lister` with a `sockaddr_in6` copied in beside its code instead of
 # two filenames. The same two blocks every hosted probe has: one
