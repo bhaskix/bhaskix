@@ -1255,6 +1255,9 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
     // above establishes and nothing else: configuration space as memory. It
     // reports rather than decides, so nothing below depends on it.
     report_pci_inventory();
+    // RFC 0089 step 5a: whether the firmware describes a TPM 2.0, and how it
+    // is driven. Reports only; step 5c starts `bin/tpmd` from here.
+    tpm_discovery(handoff);
     if !journal_self_test() {
         println!("\x1b[91m    journal        FAILED\x1b[0m");
     }
@@ -14770,6 +14773,43 @@ fn configuration_page(address: bhaskix_arch::pci::Address) -> Option<u64> {
             + ((u64::from(address.device) & 0x1f) << 15)
             + ((u64::from(address.function) & 0x07) << 12),
     )
+}
+
+/// Finds the ACPI `TPM2` table and says what it describes -- RFC 0089 step 5a.
+///
+/// Three sentences: a CRB TPM at an address, a TPM whose interface this kernel
+/// does not drive (TIS and the platform-specific methods, for now), or no
+/// `TPM2` table at all. Each lane's gate holds the one it should print.
+fn tpm_discovery(handoff: &Handoff) -> Option<bhaskix_arch::acpi::Tpm2> {
+    let hhdm = handoff.hhdm_base.as_u64();
+    let Some(rsdp) = handoff.rsdp else {
+        println!("    tpm            no ACPI tables, so no TPM2 table");
+        return None;
+    };
+    // SAFETY: the handoff's address, and `mmio::map` is the same mapper the
+    // other table walkers here use.
+    let found = unsafe {
+        bhaskix_arch::acpi::tpm2(rsdp.as_u64(), hhdm, &mut |physical, length| {
+            crate::mmio::map(physical, length as u64, hhdm).is_some()
+        })
+    };
+    let Some(tpm) = found else {
+        println!("    tpm            no TPM2 table");
+        return None;
+    };
+    if tpm.start_method == bhaskix_arch::acpi::TPM2_START_CRB {
+        println!(
+            "    tpm            CRB at {:#x} (ACPI TPM2, start method {})",
+            tpm.control_area & !0xfff,
+            tpm.start_method
+        );
+    } else {
+        println!(
+            "    tpm            start method {} is not driven here (CRB only)",
+            tpm.start_method
+        );
+    }
+    Some(tpm)
 }
 
 /// Finds memory-mapped configuration space, maps it, and checks it agrees.

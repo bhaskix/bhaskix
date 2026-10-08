@@ -160,7 +160,10 @@ asm_budget = 37
 # which is the wrong direction for a kernel address to go. Counted one line
 # each on purpose: they are thirteen instructions on the most privileged path in
 # the system, and `tools/check-ring3-entry.py` holds them.
-unsafe_budget = 1179
+# 1180 on 2026-10-08: the `tpm2` finder's one line, RFC 0089 step 5a -- the
+# same call into the table walker `madt`, `dmar` and `mcfg` each make. The
+# parser it hands the table to, `parse_tpm2`, has none.
+unsafe_budget = 1180
 # Raised from 1070 for ECAM -- one volatile read of configuration space as
 # memory -- and for counting the bytes the transmitter gives up on. The second
 # is two lines and bought a silent data loss becoming a visible number.

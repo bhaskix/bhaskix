@@ -203,8 +203,11 @@ QEMU_PID=$!
 # Poll for the last expected line rather than waiting the whole timeout:
 # the loader returns to the firmware after speaking, and the firmware then
 # wanders into its own shell -- the output is the event, not the exit.
+# **The last expected line moved on 2026-10-08**, from the TLB shootdown
+# report to RFC 0089's `tpm` line, which the kernel prints after PCI comes
+# up: a lane that stopped at the shootdown never saw it.
 for _ in $(seq 1 "$TIMEOUT"); do
-    if grep -qE "tlb shootdown +[0-9]+ completed|bhaskixboot: (the exit was refused|the exit succeeded with an empty|the table pool ran dry|payload .* REFUSED|the kernel image failed)" "$LOG" 2>/dev/null; then
+    if grep -qE "tpm            (CRB at|no TPM2 table|start method|no ACPI)|bhaskixboot: (the exit was refused|the exit succeeded with an empty|the table pool ran dry|payload .* REFUSED|the kernel image failed)" "$LOG" 2>/dev/null; then
         break
     fi
     sleep 1
@@ -389,6 +392,23 @@ elif grep -qF "measured boot   no TPM: the firmware has no TCG2 protocol" "$LOG"
     pass "with no TPM the kernel said nothing was recorded"
 else
     fail "with no TPM the kernel did not say nothing was recorded"
+    status=1
+fi
+
+# RFC 0089 step 5a: **the TPM the firmware measured into is one the kernel can
+# find.** With the emulated TPM, the ACPI `TPM2` table names a CRB interface;
+# without it, there is no table.
+if [[ "${BHASKIX_TPM:-0}" == 1 ]]; then
+    if grep -qE "tpm            CRB at 0x[0-9a-f]+ \(ACPI TPM2, start method 7\)" "$LOG" 2>/dev/null; then
+        pass "the kernel found the TPM through ACPI: $(grep -aoE 'CRB at 0x[0-9a-f]+' "$LOG" | head -1)"
+    else
+        fail "the kernel did not find a CRB TPM through ACPI: $(grep -aE '^ *tpm  ' "$LOG" | tr -d '\r' | head -1)"
+        status=1
+    fi
+elif grep -qF "tpm            no TPM2 table" "$LOG" 2>/dev/null; then
+    pass "with no TPM the kernel found no TPM2 table"
+else
+    fail "with no TPM the kernel did not say there is no TPM2 table"
     status=1
 fi
 # The cross-check that makes the slide real: the kernel computes it

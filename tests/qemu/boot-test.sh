@@ -4909,6 +4909,16 @@ else
     status=1
 fi
 
+# RFC 0089 step 5a: **whether the firmware describes a TPM.** No lane in this
+# file attaches one, so every lane must say so -- and a lane that found one
+# would be a machine this file does not know it is booting.
+if grep -qF "tpm            no TPM2 table" "$LOG"; then
+    pass "the kernel looked for a TPM2 table and said there is none"
+else
+    fail "no 'tpm  no TPM2 table' line: $(grep -aE '^ *tpm  ' "$LOG" | tr -d '\r' | head -1)"
+    status=1
+fi
+
 # A boot that finished must not have been declared stopped on the way.
 #
 # **Nothing here noticed this, and it cost a bad commit.** The bring-up watchdog

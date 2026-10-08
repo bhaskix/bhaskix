@@ -223,3 +223,10 @@ path = "fuzz_targets/tcglog_parse.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "acpi_tpm2"
+path = "fuzz_targets/acpi_tpm2.rs"
+test = false
+doc = false
+bench = false

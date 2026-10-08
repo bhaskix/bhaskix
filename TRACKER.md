@@ -1056,6 +1056,15 @@ the distinction is in the table rather than in somebody's head.
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-10-08 (RFC 0089 step 5a: the kernel finds the TPM)
+
+The kernel reads the ACPI `TPM2` table — signature, length, checksum, the control area's address
+and the start method — and says what it found on every boot: `tpm  CRB at 0xfed40000 (ACPI TPM2,
+start method 7)` with the emulated TPM, `tpm  no TPM2 table` on every other lane. A zero address is
+refused in the parser, since what is built from it is a register window a domain will write to. A
+new fuzz target ran 33.9 million executions clean and reached an accepted table from an empty
+corpus. Nothing drives the TPM yet; that is 5b and 5c.
+
 ### 2026-10-08 (RFC 0089 step 3: the event log reaches the kernel)
 
 `HANDOFF_VERSION` is 3. The handoff carries a `Measurement` — `NotAttempted` on Limine's path,

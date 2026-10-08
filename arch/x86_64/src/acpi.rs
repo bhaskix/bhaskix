@@ -781,6 +781,71 @@ pub unsafe fn mcfg(rsdp: u64, hhdm: u64, ensure: EnsureMapped<'_>) -> Option<Mcf
     unsafe { tables(rsdp, hhdm, ensure, parse_mcfg) }
 }
 
+/// `StartMethod` for the command-response buffer interface, CRB --
+/// EDK2's `Tpm2Acpi.h`, `7`. The one RFC 0089 drives.
+pub const TPM2_START_CRB: u32 = 7;
+
+/// `StartMethod` for the FIFO interface, TIS -- `Tpm2Acpi.h`, `6`.
+pub const TPM2_START_TIS: u32 = 6;
+
+/// What the `TPM2` table says about the machine's TPM 2.0 -- RFC 0089 step 5.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Tpm2 {
+    /// How commands are started: [`TPM2_START_CRB`], [`TPM2_START_TIS`], or
+    /// one of the platform-specific methods nothing here drives.
+    pub start_method: u32,
+    /// Physical address of the control area -- for CRB, inside the
+    /// locality-0 register page.
+    pub control_area: u64,
+}
+
+/// Reads a `TPM2` table: its signature, length and checksum, and the two
+/// fields a driver needs -- `AddressOfControlArea` at 40 and `StartMethod` at
+/// 48, after the header and the 4-byte `Flags` (EDK2's `Tpm2Acpi.h`).
+///
+/// **The address is firmware's, and what is built from it is a register
+/// window a domain writes to**, so a zero address is refused here, as `DMAR`
+/// refuses a zero register base, and the kernel checks the page against the
+/// memory map before granting it. Revision 4 appends platform parameters and
+/// the log area; nothing here reads them, and a longer table is accepted.
+#[must_use]
+pub fn parse_tpm2(bytes: &[u8]) -> Option<Tpm2> {
+    /// Header, `Flags`, `AddressOfControlArea`, `StartMethod`.
+    const TPM2_MIN: usize = HEADER_LENGTH + 4 + 8 + 4;
+
+    if bytes.len() < TPM2_MIN || bytes.get(0..4)? != b"TPM2" {
+        return None;
+    }
+    let length = u32_at(bytes, 4)? as usize;
+    if length < TPM2_MIN || length > bytes.len() {
+        return None;
+    }
+    let bytes = bytes.get(..length)?;
+    if !checksum_ok(bytes) {
+        return None;
+    }
+    let control_area = u64_at(bytes, HEADER_LENGTH + 4)?;
+    let start_method = u32_at(bytes, HEADER_LENGTH + 12)?;
+    if control_area == 0 {
+        return None;
+    }
+    Some(Tpm2 {
+        start_method,
+        control_area,
+    })
+}
+
+/// Finds `TPM2` and reads it. `None` means the firmware describes no TPM 2.0,
+/// which the boot report says in those words.
+///
+/// # Safety
+///
+/// As [`tables`].
+pub unsafe fn tpm2(rsdp: u64, hhdm: u64, ensure: EnsureMapped<'_>) -> Option<Tpm2> {
+    // SAFETY: the caller's obligation, unchanged.
+    unsafe { tables(rsdp, hhdm, ensure, parse_tpm2) }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1108,6 +1173,105 @@ mod tests {
         let sum = bytes.iter().fold(0u8, |sum, byte| sum.wrapping_add(*byte));
         bytes[9] = sum.wrapping_neg();
         bytes
+    }
+
+    /// Builds a `TPM2` table, correctly checksummed, with `extra` bytes of
+    /// revision-4 tail after the three fields.
+    fn tpm2_bytes(control_area: u64, start_method: u32, extra: usize) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"TPM2");
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // length, filled in below
+        bytes.push(4); // revision
+        bytes.push(0); // checksum, filled in below
+        bytes.extend_from_slice(b"BHASKXBHASKIX  ");
+        bytes.resize(36, 0);
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // Flags
+        bytes.extend_from_slice(&control_area.to_le_bytes());
+        bytes.extend_from_slice(&start_method.to_le_bytes());
+        bytes.resize(bytes.len() + extra, 0);
+        let length = bytes.len() as u32;
+        bytes[4..8].copy_from_slice(&length.to_le_bytes());
+        let sum = bytes.iter().fold(0u8, |sum, byte| sum.wrapping_add(*byte));
+        bytes[9] = sum.wrapping_neg();
+        bytes
+    }
+
+    #[test]
+    fn a_tpm2_table_gives_its_control_area_and_start_method() {
+        let table = tpm2_bytes(0xfed4_0040, TPM2_START_CRB, 0);
+        assert_eq!(
+            parse_tpm2(&table),
+            Some(Tpm2 {
+                start_method: 7,
+                control_area: 0xfed4_0040
+            })
+        );
+        // Revision 4's tail -- platform parameters, LAML, LASA -- is skipped.
+        let longer = tpm2_bytes(0xfed4_0040, TPM2_START_TIS, 12 + 4 + 8);
+        assert_eq!(parse_tpm2(&longer).map(|t| t.start_method), Some(6));
+    }
+
+    #[test]
+    fn a_tpm2_table_is_refused_on_each_field() {
+        let good = tpm2_bytes(0xfed4_0040, TPM2_START_CRB, 0);
+        let mut wrong = good.clone();
+        wrong[0] = b'X';
+        assert_eq!(parse_tpm2(&wrong), None, "signature");
+        let mut wrong = good.clone();
+        wrong[9] = wrong[9].wrapping_add(1);
+        assert_eq!(parse_tpm2(&wrong), None, "checksum");
+        assert_eq!(parse_tpm2(&good[..51]), None, "shorter than its fields");
+        let mut wrong = good.clone();
+        wrong[4..8].copy_from_slice(&(good.len() as u32 + 1).to_le_bytes());
+        assert_eq!(parse_tpm2(&wrong), None, "length past the buffer");
+        assert_eq!(
+            parse_tpm2(&tpm2_bytes(0, TPM2_START_CRB, 0)),
+            None,
+            "a TPM at physical zero"
+        );
+    }
+
+    #[test]
+    fn a_mutation_harness_never_makes_the_tpm2_parser_panic() {
+        // What is built from a believed `TPM2` is a register window a domain
+        // writes to, so anything accepted must name a non-zero address, and
+        // nothing may panic. The edge values are seeded explicitly, as
+        // coding-style.md asks of a new harness: the length field's limits
+        // and the address's.
+        let iterations: usize = std::env::var("BHASKIX_FUZZ_ITERATIONS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(20_000);
+        let base = tpm2_bytes(0xfed4_0040, TPM2_START_CRB, 16);
+        for length in [0u32, 51, 52, 53, 76, u32::MAX] {
+            let mut bytes = base.clone();
+            bytes[4..8].copy_from_slice(&length.to_le_bytes());
+            let _ = parse_tpm2(&bytes);
+        }
+        for seed in 0..iterations as u64 {
+            let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15).wrapping_add(11));
+            let mut bytes = base.clone();
+            for _ in 0..1 + rng.below(4) {
+                match rng.below(3) {
+                    0 if !bytes.is_empty() => {
+                        let index = rng.below(bytes.len());
+                        bytes[index] = rng.next() as u8;
+                    }
+                    1 if bytes.len() >= 52 => {
+                        // The address and the method, aimed at.
+                        let index = 40 + rng.below(12);
+                        bytes[index] = [0u8, 1, 0x7f, 0x80, 0xff][rng.below(5)];
+                    }
+                    _ => {
+                        let length = rng.below(bytes.len().max(1));
+                        bytes.truncate(length);
+                    }
+                }
+            }
+            if let Some(tpm) = parse_tpm2(&bytes) {
+                assert!(tpm.control_area != 0, "seed {seed}");
+            }
+        }
     }
 
     /// Builds an `MCFG` with the given regions, correctly checksummed.

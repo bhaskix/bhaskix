@@ -907,7 +907,9 @@ asm_budget = 10
 # and one helper they all called would count it once; that is a refactor of
 # twenty-two entries (counted: that many `enter_ring3` calls in `lib.rs`), not
 # part of this step.
-unsafe_budget = 2083
+# 2084 on 2026-10-08: `tpm_discovery`'s walk of the ACPI tables for `TPM2`,
+# RFC 0089 step 5a -- one line, the same call `ecam_bringup` makes for `MCFG`.
+unsafe_budget = 2084
 # Up thirty-one for RFC 0005 step 9's socket probe -- `ring3_socketeer`, which
 # is `ring3_lister` with a `sockaddr_in6` copied in beside its code instead of
 # two filenames. The same two blocks every hosted probe has: one

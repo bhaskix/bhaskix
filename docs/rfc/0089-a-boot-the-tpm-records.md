@@ -303,7 +303,17 @@ path after boot.
    the right digest *count* could name one bank twice and omit another, which a replay would have
    met as a missing digest. It is refused now. The captured fixture and the kernel's printing
    remain.
-5. **ACPI `TPM2` and `bin/tpmd`**: PCR read only, closed request set, gated.
+5. **ACPI `TPM2` and `bin/tpmd`**: PCR read only, closed request set, gated. In three
+   checkpoints. **5a, finding it — done 2026-10-08**: `bhaskix_arch::acpi::parse_tpm2` reads the
+   table's signature, length, checksum, `AddressOfControlArea` (40) and `StartMethod` (48), and
+   refuses a zero address, because what is built from it is a register window a domain writes to.
+   Three host tests and a seeded mutation harness with its edge values explicit, one test armed red
+   by dropping the zero-address refusal; `fuzz/fuzz_targets/acpi_tpm2.rs`, which repairs signature,
+   length and checksum as `dmar_parse` does, ran 33,973,270 executions in 121 s clean and reached an
+   accepted CRB table from an empty corpus after about 8,000. The kernel prints `tpm  CRB at
+   0xfed40000 (ACPI TPM2, start method 7)` with the emulated TPM and `tpm  no TPM2 table` on every
+   other lane, both gated and armed red. The native lane now waits for that line rather than the
+   TLB shootdown report, which comes earlier in the boot: the lane had been stopping before it.
 6. **Agreement**: replay with `pkg`'s SHA-256 in `bin/tpmd`; the report's verdict, each outcome gated.
 7. **CI**: the native-with-TPM job.
 8. **Hardware**: after the native loader boots the SR550 and the lead switches its TPM to 2.0.
