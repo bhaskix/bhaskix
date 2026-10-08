@@ -127,16 +127,15 @@ Stated as plainly as the list above, because that is what criterion R7 asks for.
 
 These are open, reproducible, and recorded in [TRACKER.md](../TRACKER.md)'s
 open-defects table with their specimens. They are listed here rather than left
-for a user to discover. **Counted 2026-10-08: twenty open rows**, then twenty-two by the evening — the native loader's row closed when the SR550 booted through it, and that boot filed three; the table
+for a user to discover. **Counted 2026-10-08: twenty rows not closed**, and twenty-one by the evening — thirteen of them marked `OPEN`, the rest likely fixed, mitigated or waiting on a count. The SR550's boots through its own loader filed five that day and closed four, among them the native loader's own. The table
 groups the ones that are one family and leaves out one that is open in name
 only (the `uefi, qemu64` lane, restored to `make test` and failing only by
 other rows' defects).
 
 | Defect — what you would see | Rate, as TRACKER states it | Fix |
 |---|---|---|
-| Through its own loader on the SR550, the kernel starts one CPU of sixteen: its bring-up tables land above 4 GiB | found 2026-10-08, every native boot of a machine with RAM above 4 GiB | **fixed 2026-10-08**, shown under KVM at 8 GiB; not yet confirmed on the SR550 |
 | Through its own loader on the SR550, the serial line reads back masked, so there is no console input and no shell | found 2026-10-08, one boot | a lead, not a finding |
-| Through its own loader on the SR550, a copy-on-write write lands in the original frame | found 2026-10-08, one boot | likely cause found: nothing set `CR0.WP`; set on every CPU since 2026-10-08, not yet confirmed there |
+| Through its own loader on the SR550, a hosted program reading `/proc/self` never finishes | found 2026-10-08, one boot | unexplained |
 | A ring-station scheduler self-test halts with a station asleep on its own turn | 1 in 391 CI boots before a fix of 2026-09-28; **0 in 657 since** (2026-10-04) | fix landed; open until ~1,200 clean boots |
 | An outbound TCP demonstration stalls: `connected, stream still in flight` | 10 sightings, 1 in 773 boots (2026-09-28) | none |
 | A lock-order self-test fails: a wait queue taken while holding another lock | 4 in 7,681 boots; last 2026-09-23 | a cause fixed 2026-09-28; open until ~5,800 clean boots |
@@ -166,6 +165,8 @@ not yet absence.
 | A socket reclaim returned the slot but not the port | **2026-09-01** — the gate raced its own precondition |
 | The TCP inbound gate failed at an environmental rate | **2026-08-31** — [RFC 0061](rfc/0061-a-connection-nobody-accepted.md): a connection nobody accepted held the only slot |
 | SMEP and SMAP were enabled on one CPU of four (one of sixteen on the SR550), and under the native loader write protection on none the kernel started — while the report said "on" | **2026-10-08** — every CPU now enables and reads back all three, gated on every lane |
+| Through its own loader, the SR550 started one CPU of sixteen | **2026-10-08** — bring-up tables from below 4 GiB; sixteen of sixteen on the machine |
+| Through its own loader, a copy-on-write write on the SR550 landed in the original frame | **2026-10-08** — nothing set `CR0.WP`; set on every CPU, and the machine passes |
 | The native loader stopped on the SR550 after leaving the firmware | **2026-10-08** — its page-table pool was sized under an emulator; sized from the machine, it boots there |
 | Every boot showed a 442–447 ms worst wake | **2026-08-16** — one missing `resched()` on spawn; 446 ms → 345 µs. This note listed it as open two weeks later, which was wrong when written |
 
@@ -198,9 +199,11 @@ ping (2026-09-13).
   2026-10-08 heard it refuse after leaving the firmware: its page-table pool was
   sized under an emulator with 256 MiB, and this machine has 192 GiB. Sized from
   the machine, **a second boot the same day reached the kernel and its whole
-  report** — with **one CPU of sixteen** (the kernel's own CPU bring-up put its
-  tables above 4 GiB), **no shell** (the serial line read back masked), and a
-  failed copy-on-write check. Through Limine, the same machine runs all sixteen.
+  report** — with one CPU of sixteen and a failed copy-on-write check, both fixed
+  the same day: **a third boot ran all sixteen CPUs**, each with write protection,
+  SMEP and SMAP read back, and copy-on-write passing. What remains: **no shell**
+  (the serial line's interrupt entry reads back masked on this machine with this
+  loader) and one hosted self-test that did not finish.
 - **Get an answer to `SET_ADDRESS` from whatever is on its xHCI's port 1.**
 - **Obtain an address, start an exchange, or carry TCP** on its network.
 
