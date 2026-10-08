@@ -11,7 +11,7 @@
 | | |
 |---|---|
 | RFCs accepted | **59** |
-| RFCs open | 28 |
+| RFCs open | 29 |
 | RFCs closed without shipping | 2 |
 | Milestone rows done | **92 of 95** |
 | Phase 2 bullets done | **13 of 13** |
@@ -75,6 +75,7 @@ gantt
     RFC 0074 what a network interface is :active, r0074, 2026-09-06, 2026-10-08
     RFC 0075 a driver that is not in the kernel :active, r0075, 2026-09-07, 2026-10-08
     RFC 0076 a bond on hardware :active, r0076, 2026-09-08, 2026-10-08
+    RFC 0090 A hosted program that dials out :active, r0090, 2026-10-08, 2026-10-08
     section Drivers & IOMMU
     RFC 0011 IrqHandler — who may receive an interrupt :done, r0011, 2026-08-04, 1d
     RFC 0012 The IOMMU and what a device is allowed to reach :done, r0012, 2026-08-04, 1d
@@ -195,6 +196,7 @@ gantt
 | 0076 | a bond on hardware | 2026-09-08 |
 | 0088 | A clock a process reads itself | 2026-10-02 |
 | 0089 | A boot the TPM records | 2026-10-08 |
+| 0090 | A hosted program that dials out | 2026-10-08 |
 
 ## Annexes
 
