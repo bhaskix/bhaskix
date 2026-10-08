@@ -318,9 +318,16 @@ fn patch(hhdm: u64, offset: usize, bytes: &[u8]) {
 /// same reason the loader-parked path is: a secondary switches onto real
 /// tables at its first context switch, and every high-half entry it needs
 /// existed long before SMP start.
+///
+/// **From `Zone::Dma32`, because the trampoline loads CR3 in protected mode**
+/// (2026-10-08). They came from `Zone::Normal` until an SR550 with 192 GiB
+/// booted through the native loader -- the only path that runs this code --
+/// and the allocator handed out frames above 4 GiB; the check below refused
+/// them, as written, and fifteen CPUs stayed off. QEMU's 256 MiB had never
+/// had a frame up there to give.
 fn bringup_root(hhdm: u64) -> Option<u64> {
     let take = || {
-        crate::heap::with(|heap| heap.pmm_mut().allocate(0, bhaskix_mm::Zone::Normal).ok())
+        crate::heap::with(|heap| heap.pmm_mut().allocate(0, bhaskix_mm::Zone::Dma32).ok())
             .flatten()
             .map(|pfn| u64::from(pfn) * bhaskix_mm::FRAME_SIZE)
     };

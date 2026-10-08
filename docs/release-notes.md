@@ -134,7 +134,7 @@ other rows' defects).
 
 | Defect — what you would see | Rate, as TRACKER states it | Fix |
 |---|---|---|
-| Through its own loader on the SR550, the kernel starts one CPU of sixteen: its bring-up tables land above 4 GiB | found 2026-10-08, every native boot of a machine with RAM above 4 GiB | cause read from the code; fix named, not built |
+| Through its own loader on the SR550, the kernel starts one CPU of sixteen: its bring-up tables land above 4 GiB | found 2026-10-08, every native boot of a machine with RAM above 4 GiB | **fixed 2026-10-08**, shown under KVM at 8 GiB; not yet confirmed on the SR550 |
 | Through its own loader on the SR550, the serial line reads back masked, so there is no console input and no shell | found 2026-10-08, one boot | a lead, not a finding |
 | Through its own loader on the SR550, a copy-on-write write lands in the original frame | found 2026-10-08, one boot | a lead: a stale TLB entry with one CPU online |
 | A ring-station scheduler self-test halts with a station asleep on its own turn | 1 in 391 CI boots before a fix of 2026-09-28; **0 in 657 since** (2026-10-04) | fix landed; open until ~1,200 clean boots |
