@@ -1056,6 +1056,17 @@ the distinction is in the table rather than in somebody's head.
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-10-08 (RFC 0089: the event-log parser, fuzzed before there is a log to read)
+
+`bhaskix_tcglog::log` reads the firmware's crypto-agile event log — the spec-ID header, then
+`TCG_PCR_EVENT2`s — and refuses by name anything malformed, every length checked against what is
+left. It lands ahead of RFC 0089's step 3 because that step needs it: `GetEventLog` says where the
+log's last entry starts and not where it ends. Eleven host tests, one armed red; a fuzz target
+asserting four properties beyond not crashing ran 45,020,729 executions in 301 seconds clean, and
+three deep paths were each reached from an empty corpus by a deliberate panic. Writing the target
+found a gap the tests had not: an event could carry the right number of digests while naming one
+bank twice and omitting another. It is refused now.
+
 ### 2026-10-07 (RFC 0089 step 2: the loader measures what it loads)
 
 `bhaskixboot.efi` now asks the firmware's `EFI_TCG2_PROTOCOL` to hash, extend and log the kernel

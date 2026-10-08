@@ -10,6 +10,8 @@
 #![no_std]
 #![forbid(unsafe_code)]
 
+pub mod log;
+
 /// `EV_EVENT_TAG` -- `UefiTcgPlatform.h`, `0x00000006`.
 pub const EV_EVENT_TAG: u32 = 0x0000_0006;
 

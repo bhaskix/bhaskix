@@ -270,6 +270,19 @@ path after boot.
    gate literals, the Limine path's `NotAttempted`. **And the gate step 2 could not have**: the
    kernel's digest in the log changes when one byte of the kernel on the ESP does, armed red.
 4. **`tcglog`**: host-tested, fuzzed, a captured fixture; the kernel prints the events it found.
+   **The parser landed 2026-10-08, before step 3**, which needs it: `GetEventLog` names where the
+   log's last entry starts and nothing says where it ends, so the loader must size that entry.
+   `bhaskix_tcglog::log` reads the spec-ID header and walks `TCG_PCR_EVENT2`s, refusing by name
+   whatever is malformed — a truncation, a missing or repeated bank, an undeclared algorithm, an
+   implausible digest size — with every length checked against what is left. Eleven host tests,
+   one armed red by disabling the bank-count check. `fuzz/fuzz_targets/tcglog_parse.rs` asserts
+   four properties beyond not crashing; its first campaign ran **45,020,729 executions in 301 s**,
+   clean, and three deep paths — an accepted event, a repeated digest, a truncation inside the
+   digests — were each **reached from an empty corpus** by a deliberate panic, the standard the
+   filesystem's target set. Writing the target found one gap the tests had not: an event with
+   the right digest *count* could name one bank twice and omit another, which a replay would have
+   met as a missing digest. It is refused now. The captured fixture and the kernel's printing
+   remain.
 5. **ACPI `TPM2` and `bin/tpmd`**: PCR read only, closed request set, gated.
 6. **Agreement**: replay with `pkg`'s SHA-256 in `bin/tpmd`; the report's verdict, each outcome gated.
 7. **CI**: the native-with-TPM job.

@@ -40,6 +40,8 @@ bhaskix-ustar = { path = "../ustar", features = ["test-support"] }
 bhaskix-usb = { path = "../usb" }
 bhaskix-personality = { path = "../personality" }
 bhaskix-ahci = { path = "../ahci" }
+# RFC 0089: the TPM event log the firmware hands back.
+bhaskix-tcglog = { path = "../tcglog" }
 
 [[bin]]
 name = "elf_parse"
@@ -214,3 +216,10 @@ name = "usb_descriptors"
 path = "fuzz_targets/usb_descriptors.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "tcglog_parse"
+path = "fuzz_targets/tcglog_parse.rs"
+test = false
+doc = false
+bench = false

@@ -52,6 +52,7 @@ dependencies = [
  "bhaskix-personality",
  "bhaskix-pkg",
  "bhaskix-service-vfs",
+ "bhaskix-tcglog",
  "bhaskix-usb",
  "bhaskix-ustar",
  "libfuzzer-sys",
@@ -134,6 +135,10 @@ dependencies = [
  "bhaskix-service",
  "bhaskix-ustar",
 ]
+
+[[package]]
+name = "bhaskix-tcglog"
+version = "0.0.0"
 
 [[package]]
 name = "bhaskix-telemetry"
