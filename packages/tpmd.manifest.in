@@ -1,0 +1,14 @@
+# The TPM 2.0 service, in a domain -- RFC 0089 step 5c. One page of the TPM's
+# registers (locality 0, which the kernel checked is not RAM) and one endpoint,
+# on which it answers PCR reads and nothing else. No memory beyond its own and
+# no DMA window: a CRB TPM does no DMA. Its entry is the usual one, the TSC rate,
+# with the page's physical address as the second argument.
+package tpmd
+version 0.1.0
+
+program bin/tpmd
+entry hertz
+cap device-registers
+cap serve tpm
+
+payload bin/tpmd from user/tpmd/target/x86_64-unknown-none/release/tpmd

@@ -279,6 +279,9 @@ PLACEMENTS: dict[str, set[str]] = {
     # does reach, and the driver is the two volatile accesses that crate is
     # `forbid(unsafe_code)` precisely so it cannot perform.
     "bhaskix-user-ahcid": {"bhaskix-abi", "bhaskix-ahci"},
+    # RFC 0089 step 5c: the TPM service, which reaches the TPM only through
+    # `bhaskix-tpm` -- the crate that builds no command but `TPM2_PCR_Read`.
+    "bhaskix-user-tpmd": {"bhaskix-abi", "bhaskix-tpm"},
     # RFC 0075 step 2: the network driver shares `bhaskix-i40e` with the kernel
     # for exactly the reason above -- the register arithmetic belongs where
     # `cargo test --workspace` can reach it, and `bin/netd` is not a workspace

@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | 🔨 **Draft 2026-10-07 — steps 1, 2 and 3 done by 2026-10-08, and step 4's parser: the native loader measures the kernel, initrd and command line through the firmware's `EFI_TCG2_PROTOCOL`, and the event log reaches the kernel in a version-3 handoff**, where the boot report reads the loader's three digests out of it — gated in `make test-boot-native-tpm`, including a kernel byte that changes the kernel's digest and nothing else's. Nothing reads a PCR or replays yet (steps 5 and 6). The first of Phase 3's secure boot chain, sequenced by the project lead on 2026-10-07: *measured boot first*, signing after key custody is decided. The acceptance call is the project lead's |
+| **Status** | 🔨 **Draft 2026-10-07 — steps 1, 2, 3 and 5 done by 2026-10-08, and step 4's parser: the native loader measures the kernel, initrd and command line through the firmware's `EFI_TCG2_PROTOCOL`, and the event log reaches the kernel in a version-3 handoff**, where the boot report reads the loader's three digests out of it — gated in `make test-boot-native-tpm`, including a kernel byte that changes the kernel's digest and nothing else's. ~~Nothing reads a PCR or replays yet (steps 5 and 6).~~ **Step 5 since 2026-10-08:** `bin/tpmd`, in a domain holding the TPM's one CRB register page and nothing else, reads PCRs 8 and 9 and the boot report prints them — and a kernel byte flipped moves PCR 9 and not PCR 8. **Nothing replays the log against them yet (step 6)**, so nothing is verified and nothing enforced. The first of Phase 3's secure boot chain, sequenced by the project lead on 2026-10-07: *measured boot first*, signing after key custody is decided. The acceptance call is the project lead's |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | boot (`bhaskixboot.efi`, `bhaskix_boot::Handoff`), arch (ACPI `TPM2`), kernel (boot report), userspace (a TPM service), tools, tests |
 | **Milestone** | Phase 3 — *Secure boot chain*, the roadmap's first row; [security.md](../security.md) §1 **T6** and gap 1 |
@@ -157,7 +157,9 @@ One line, coloured as the report is (green, red FAILED), and always printed:
 The loader is single-threaded before `ExitBootServices`. The new `unsafe` is the protocol call
 through a firmware function pointer, the same kind as the loader's existing `handle_protocol` and
 `locate_protocol` calls, and the log copy out of firmware memory. In `tpmd`, MMIO through
-`Mmio<T>` as `bin/ahcid` does. A TPM that does not answer within a bounded poll is reported, not
+~~`Mmio<T>` as `bin/ahcid` does~~ a `Registers` trait whose one volatile read and one volatile
+write are the program's whole access to the device, `bin/ahcid`'s shape — **corrected 2026-10-08**:
+`bin/ahcid` does not use `Mmio<T>`, and this said it did. A TPM that does not answer within a bounded poll is reported, not
 waited on: the boot continues and the line says *TPM did not answer*.
 
 ## Alternatives considered
@@ -192,6 +194,14 @@ waited on: the boot continues and the line says *TPM did not answer*.
 - **New authority**: `bin/tpmd` holds the TPM's MMIO and answers PCR reads. PCR values are not secret
   — they are what a quote reports — but `tpmd` must not offer extend, clear, or any hierarchy
   command; the request set is closed and gated.
+- **A new kind of grant, and the check it needed (step 5c, 2026-10-08)**: `bin/tpmd` is the first
+  domain given a device the kernel found through **ACPI** rather than a PCI BAR. A BAR is assigned
+  by the kernel's own walk; an ACPI address is whatever firmware wrote, and a `Frame` over RAM would
+  be a capability to somebody's memory dressed as a device. So the kernel refuses the page if any
+  of it is memory the map describes as anything but reserved (`bhaskix_boot::overlaps_non_reserved`,
+  host-tested and armed red), and grants **one** page — locality 0 — read and write, with no
+  `GRANT` and no `DERIVE`, so the other localities are unreachable and the page cannot be handed on.
+  No DMA window: a CRB TPM does no DMA.
 - **New untrusted input**: the event log (firmware-provided, on the boot path) and the ACPI `TPM2`
   table. Both parsers are pure, host-tested, and fuzzed before merge.
 - **A lie the report must not tell**: *no TPM* and *not measured* are different sentences from *log
@@ -324,7 +334,23 @@ path after boot.
    `NeverFinished`, not a hang, and the TPM is sent idle either way. Nine host tests, two armed red;
    `fuzz/fuzz_targets/tpm_response.rs` ran 60,820,063 executions in 121 s clean and reached an
    accepted response from an empty corpus after about 2.1 million. Nothing runs it on a machine
-   yet; that is 5c.
+   yet; that is 5c. **5c, the service — done 2026-10-08**: `user/tpmd`, at `unsafe` 33 and `asm` 4,
+   both exact — the two system-call sequences, one volatile read and one volatile write that refuse
+   an offset outside the page, the `ud2` and the entry stub — answers one method, `tpm::PCR_READ`,
+   with the 32-byte value in the reply's four words. The kernel starts it beside the other domain
+   programs, then asks it for PCRs 8 and 9 from a domain of its own: `tpm  PCR 8 c9e4d6eb PCR 9
+   54a7c7d5 (sha256), read through bin/tpmd`. **PCR 8 checks by hand**: SHA-256 of thirty-two zero
+   bytes and the SHA-256 of `kaslr=show` — the command line, whose digest the log recorded as
+   `bd478e3d` — is `c9e4d6eb`, what the TPM holds, computed on the host apart from all of this.
+   And the boot with one kernel byte flipped moved **the TPM's** PCR 9 (`54a7c7d5 -> c70b5bc0`) and
+   not its PCR 8. Armed red: a wrong command code (the TPM answers its own error code, `0x184`, and
+   the line names it), and the RAM check disabled against its host test. **One arm did not hold,
+   said here**: a `tpmd` that skips the locality request still reads the PCRs under QEMU's CRB —
+   the firmware evidently leaves locality 0 usable — so the request stays, because the profile and
+   EDK2 make it, and nothing on this lane can see it go. Two of the wrong turns on the way are
+   worth one line each: the thread entering ring 3 has to be pinned, and the asker's spawn was
+   handed the endpoint where the direct-map base belongs — a kernel fault in `stack::allocate`
+   that was this step's bug, not the kernel's.
 6. **Agreement**: replay with `pkg`'s SHA-256 in `bin/tpmd`; the report's verdict, each outcome gated.
 7. **CI**: the native-with-TPM job.
 8. **Hardware**: after the native loader boots the SR550 and the lead switches its TPM to 2.0.

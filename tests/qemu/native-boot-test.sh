@@ -205,9 +205,11 @@ QEMU_PID=$!
 # wanders into its own shell -- the output is the event, not the exit.
 # **The last expected line moved on 2026-10-08**, from the TLB shootdown
 # report to RFC 0089's `tpm` line, which the kernel prints after PCI comes
-# up: a lane that stopped at the shootdown never saw it.
+# up: a lane that stopped at the shootdown never saw it. With a CRB TPM the
+# last line is `bin/tpmd`'s answer, or its failure -- not the discovery line
+# before it (step 5c).
 for _ in $(seq 1 "$TIMEOUT"); do
-    if grep -qE "tpm            (CRB at|no TPM2 table|start method|no ACPI)|bhaskixboot: (the exit was refused|the exit succeeded with an empty|the table pool ran dry|payload .* REFUSED|the kernel image failed)" "$LOG" 2>/dev/null; then
+    if grep -qE "tpm            (PCR 8|FAILED|no TPM2 table|start method|no ACPI)|bhaskixboot: (the exit was refused|the exit succeeded with an empty|the table pool ran dry|payload .* REFUSED|the kernel image failed)" "$LOG" 2>/dev/null; then
         break
     fi
     sleep 1
@@ -377,6 +379,7 @@ fi
 # events in it, by tag and PCR, each with a SHA-256; without one, the kernel
 # says nothing was recorded.
 MEASURED_DIGESTS=""
+PCRS=""
 if [[ "${BHASKIX_TPM:-0}" == 1 ]]; then
     line="$(grep -aE 'measured boot   kernel' "$LOG" | tr -d '\r' | head -1)"
     if [[ "$line" =~ kernel\ ([0-9a-f]{8})\ initrd\ ([0-9a-f]{8})\ cmdline\ ([0-9a-f]{8})\ \(sha256,\ PCR\ 9/9/8\)\;\ [1-9][0-9]*\ events,\ log\ complete ]] \
@@ -403,6 +406,17 @@ if [[ "${BHASKIX_TPM:-0}" == 1 ]]; then
         pass "the kernel found the TPM through ACPI: $(grep -aoE 'CRB at 0x[0-9a-f]+' "$LOG" | head -1)"
     else
         fail "the kernel did not find a CRB TPM through ACPI: $(grep -aE '^ *tpm  ' "$LOG" | tr -d '\r' | head -1)"
+        status=1
+    fi
+    # RFC 0089 step 5c: **the TPM itself, asked.** `bin/tpmd`, in a domain
+    # holding one register page, read PCRs 8 and 9 and the kernel printed them.
+    PCR_LINE="$(grep -aE 'tpm            PCR 8 ' "$LOG" | tr -d '\r' | head -1)"
+    if [[ "$PCR_LINE" =~ PCR\ 8\ ([0-9a-f]{8})\ PCR\ 9\ ([0-9a-f]{8})\ \(sha256\),\ read\ through\ bin/tpmd ]] \
+        && [[ "${BASH_REMATCH[1]}" != 00000000 && "${BASH_REMATCH[2]}" != 00000000 ]]; then
+        PCRS="${BASH_REMATCH[1]} ${BASH_REMATCH[2]}"
+        pass "bin/tpmd read the TPM's own PCRs: ${PCR_LINE#*tpm            }"
+    else
+        fail "bin/tpmd did not read PCRs 8 and 9: $(grep -aE '^ *tpm  ' "$LOG" | tr -d '\r' | tail -2 | tr '\n' ' ')"
         status=1
     fi
 elif grep -qF "tpm            no TPM2 table" "$LOG" 2>/dev/null; then
@@ -530,7 +544,7 @@ PY
             >/dev/null 2>&1 &
         FLIPPED_PID=$!
         for _ in $(seq 1 "$TIMEOUT"); do
-            grep -qE "measured boot   kernel" "$FLIPPED_LOG" 2>/dev/null && break
+            grep -qE "tpm            (PCR 8|FAILED)" "$FLIPPED_LOG" 2>/dev/null && break
             kill -0 "$FLIPPED_PID" 2>/dev/null || break
             sleep 1
         done
@@ -544,6 +558,16 @@ PY
             pass "one flipped kernel byte changed its PCR 9 digest ($k0 -> ${BASH_REMATCH[1]}) and nothing else's"
         else
             fail "a flipped kernel byte gave '${flipped:-no measured line}' against $MEASURED_DIGESTS"
+            status=1
+        fi
+        # And the TPM agrees: its PCR 9 moved and its PCR 8 did not.
+        flipped_pcrs="$(grep -aE 'tpm            PCR 8 ' "$FLIPPED_LOG" | tr -d '\r' | head -1)"
+        read -r p8 p9 <<< "${PCRS:-- -}"
+        if [[ "$flipped_pcrs" =~ PCR\ 8\ ([0-9a-f]{8})\ PCR\ 9\ ([0-9a-f]{8}) ]] \
+            && [[ "${BASH_REMATCH[1]}" == "$p8" && "${BASH_REMATCH[2]}" != "$p9" ]]; then
+            pass "the TPM agrees: PCR 9 moved ($p9 -> ${BASH_REMATCH[2]}) and PCR 8 did not"
+        else
+            fail "the TPM's PCRs after a flipped kernel byte: '${flipped_pcrs:-no PCR line}' against PCR 8 $p8, PCR 9 $p9"
             status=1
         fi
     else

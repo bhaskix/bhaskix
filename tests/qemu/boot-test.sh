@@ -1677,9 +1677,10 @@ fi
 # root under that bound. Hard-coding 19 here would fail every default build;
 # loosening it to a range would give up what this check is for, which is
 # noticing when `/bin` changes at all.
-bin_expected=18
+# 19 since 2026-10-08: `bin/tpmd`, RFC 0089 step 5c, in every image.
+bin_expected=19
 if tar tf "$REPO_ROOT/build/initrd.tar" 2>/dev/null | grep -q 'bin/go-hello'; then
-    bin_expected=19
+    bin_expected=20
 fi
 if grep -qE "vfs +[0-9]+ entries in /, $bin_expected in /bin; bin/probe is ELF64, entry 0x10000000, 3 segments" "$LOG"; then
     pass "paths resolve, bad paths are refused, and bin/probe parses as ELF64"

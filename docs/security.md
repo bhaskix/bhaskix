@@ -565,6 +565,11 @@ Domain 0 / init (measured)
   that it "is passed through `Handoff.tpm_event_log`", a field that never existed; and the diagram
   above had **Limine** measuring PCRs 8–9 until 2026-10-08, which it never did and which is now the
   wrong loader — Limine reports `NOT MEASURED` and the native loader is the one that measures.
+- **The TPM is read by a domain, and only read** (since 2026-10-08, RFC 0089 step 5c). `bin/tpmd`
+  holds one page of the TPM's registers — locality 0, which the kernel checked the memory map does
+  not describe as RAM before granting it, since the address is firmware's — and an endpoint on
+  which it answers PCR reads. It builds no other TPM command, so nothing reaching it can extend,
+  clear or touch a hierarchy. A compromise of it reads PCRs, which are not secret.
 - **Sealing:** disk encryption keys are sealed to a PCR policy. A tampered boot chain cannot unseal
   them. The failure mode is "the disk does not decrypt", not "the disk decrypts for an attacker".
 

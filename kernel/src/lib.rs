@@ -14775,6 +14775,220 @@ fn configuration_page(address: bhaskix_arch::pci::Address) -> Option<u64> {
     )
 }
 
+/// The control area of a CRB TPM `tpm_discovery` found, or zero.
+static TPM_FOUND: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Starts `bin/tpmd` on the CRB TPM `tpm_discovery` found, if it found one,
+/// and asks it for PCRs 8 and 9 -- RFC 0089 step 5c. Started here, beside the
+/// other domain programs, rather than at discovery, so that every ring 3
+/// program comes up at the same point in the boot.
+fn start_tpm_service(handoff: &Handoff) {
+    let control_area = TPM_FOUND.load(core::sync::atomic::Ordering::Acquire);
+    if control_area == 0 {
+        return;
+    }
+    let tpm = bhaskix_arch::acpi::Tpm2 {
+        start_method: bhaskix_arch::acpi::TPM2_START_CRB,
+        control_area,
+    };
+    match start_tpm_domain(handoff, tpm) {
+        Ok(()) => tpm_service_report(handoff.hhdm_base.as_u64()),
+        Err(why) => println!("\x1b[91m    tpm            FAILED to start bin/tpmd: {why}\x1b[0m"),
+    }
+}
+
+/// The TPM page's physical address, for `bin/tpmd`'s entry -- RFC 0089 step 5c.
+static TPM_PAGE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// `bin/tpmd`'s endpoint, once it is started.
+static TPM_ENDPOINT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// What `bin/tpmd` answered for PCR 8 and PCR 9: per PCR, the outcome and the
+/// four value words. `u64::MAX` in the outcome while the question is open.
+static TPM_ANSWERS: [core::sync::atomic::AtomicU64; 10] =
+    [const { core::sync::atomic::AtomicU64::new(u64::MAX) }; 10];
+
+/// Starts `bin/tpmd` on the CRB TPM `tpm` describes -- RFC 0089 step 5c.
+///
+/// **The first domain granted a device the kernel found through ACPI rather
+/// than a PCI BAR**, and so the first whose address is firmware's: the page is
+/// refused if any of it is memory the map calls anything but reserved. What
+/// is granted is one page -- locality 0 -- read and write, with no `GRANT` and
+/// no `DERIVE`, so the other localities are not reachable and the page cannot
+/// be handed on; and an endpoint. No memory beyond the program's own, and no
+/// DMA window: a CRB TPM does no DMA and has no requester ID to make one for.
+fn start_tpm_domain(handoff: &Handoff, tpm: bhaskix_arch::acpi::Tpm2) -> Result<(), &'static str> {
+    let page = tpm.control_area & !(bhaskix_mm::FRAME_SIZE - 1);
+    if bhaskix_boot::overlaps_non_reserved(handoff.memory_map, page, bhaskix_mm::FRAME_SIZE) {
+        return Err("the TPM2 table names a page the memory map does not reserve");
+    }
+    let realm = domain::create("tpm", domain::ResourceEnvelope::new())
+        .map_err(|_| "the tpm domain would not be created")?;
+    let registers = cap::with_arena(|arena| {
+        arena
+            .insert_root(
+                cap::ObjectRef::new(cap::ObjectKind::Frame, page),
+                cap::Rights::READ.union(cap::Rights::WRITE),
+                0,
+            )
+            .ok()
+    })
+    .ok_or("the tpm register page would not be created")?;
+    if domain::with(realm, |owner| owner.cspace.install_at(0, registers).is_ok()) != Some(true) {
+        return Err("the tpm register page would not install");
+    }
+    let served_on = ipc::create().map_err(|_| "no endpoint for the tpm service")?;
+    let served = cap::with_arena(|arena| {
+        arena
+            .insert_root(
+                cap::ObjectRef::new(cap::ObjectKind::Endpoint, u64::from(served_on.as_u32())),
+                cap::Rights::ALL,
+                0,
+            )
+            .ok()
+    })
+    .ok_or("the tpm endpoint capability would not be created")?;
+    if domain::with(realm, |owner| owner.cspace.install_at(1, served).is_ok()) != Some(true) {
+        return Err("the tpm endpoint capability would not install");
+    }
+    TPM_PAGE.store(page, core::sync::atomic::Ordering::Release);
+    let hhdm = handoff.hhdm_base.as_u64();
+    // Pinned, as every ring 3 thread must be: `enter_user` refuses one that
+    // could move CPUs under its kernel stack.
+    let options = sched::SpawnOptions::new()
+        .pinned()
+        .in_domain(realm.as_u32());
+    // On the CPU the other domain programs here run on.
+    let cpu = SHELL_CPU.min(bhaskix_arch::percpu::online_count().saturating_sub(1));
+    sched::spawn_on_with(cpu, "tpmd", tpm_domain_entry, hhdm, hhdm, options)
+        .map_err(|_| "the tpm domain would not spawn")?;
+    TPM_ENDPOINT.store(
+        u64::from(served_on.as_u32()),
+        core::sync::atomic::Ordering::Release,
+    );
+    println!(
+        "    tpm            bin/tpmd started: one register page at {page:#x}, read and write, \
+         no dma window"
+    );
+    Ok(())
+}
+
+extern "C" fn tpm_domain_entry(hhdm_base: u64) -> ! {
+    use bhaskix_boot::VirtAddr;
+    use bhaskix_mm::{Protection, VirtRange};
+    use vm::AddressSpace;
+
+    let stop = |why: &str| -> ! {
+        println!("\x1b[91m    tpm domain     FAILED: {why}\x1b[0m");
+        sched::exit()
+    };
+
+    let Ok(file) = vfs::open(TPMD_PROGRAM) else {
+        stop("bin/tpmd is not in the filesystem")
+    };
+    let Ok(image) = elf::parse(file.bytes()) else {
+        stop("bin/tpmd is not an ELF this kernel will load")
+    };
+    let Ok(mut space) = AddressSpace::new(hhdm_base) else {
+        stop("the address space would not be created")
+    };
+    let Some(stack) = VirtRange::from_pages(VirtAddr(TPMD_STACK), TPMD_STACK_PAGES) else {
+        stop("the stack range is not a range")
+    };
+    if space.map_anonymous(stack, Protection::ReadWrite).is_err() {
+        stop("the stack would not map")
+    }
+    let Ok(entry) = elf::load_into(&image, file.bytes(), &mut space, hhdm_base) else {
+        stop("bin/tpmd would not load")
+    };
+
+    // SAFETY: as every other domain entry here -- the space was built above and
+    // nothing else holds it.
+    unsafe { vm::install(space) };
+
+    let hertz = bhaskix_arch::tsc::hertz().unwrap_or(0);
+    let page = TPM_PAGE.load(core::sync::atomic::Ordering::Acquire);
+    let rsp = TPMD_STACK + TPMD_STACK_PAGES * bhaskix_mm::FRAME_SIZE;
+    // SAFETY: as every other domain entry here.
+    unsafe { enter_user("tpm domain", entry, rsp, [hertz, page]) }
+}
+
+/// Asks `bin/tpmd` for PCRs 8 and 9, from a domain of its own, and leaves the
+/// answers in [`TPM_ANSWERS`].
+extern "C" fn tpm_asks(endpoint: u64) -> ! {
+    use core::sync::atomic::Ordering;
+
+    const BADGE: u64 = 0x00b5_0000;
+    let endpoint = ipc::EndpointId::from_u32(endpoint as u32);
+    for (index, pcr) in [8u64, 9].into_iter().enumerate() {
+        let base = index * 5;
+        match ipc::call(endpoint, BADGE, bhaskix_abi::tpm::PCR_READ, [pcr, 0, 0, 0]) {
+            Ok(reply) => {
+                for (slot, word) in reply.args.iter().enumerate() {
+                    TPM_ANSWERS[base + 1 + slot].store(*word, Ordering::Release);
+                }
+                TPM_ANSWERS[base].store(reply.method, Ordering::Release);
+            }
+            Err(_) => TPM_ANSWERS[base].store(u64::MAX - 1, Ordering::Release),
+        }
+    }
+    sched::exit()
+}
+
+/// The `tpm  PCR 8 … PCR 9 …` line: what the TPM itself holds, read through
+/// `bin/tpmd`, beside what the log says was measured into it.
+fn tpm_service_report(hhdm: u64) {
+    use core::sync::atomic::Ordering;
+
+    let raw = TPM_ENDPOINT.load(Ordering::Acquire);
+    let Ok(asker) = domain::create("tpm-reader", domain::ResourceEnvelope::new()) else {
+        println!("\x1b[91m    tpm            FAILED to create a domain to ask from\x1b[0m");
+        return;
+    };
+    let options = sched::SpawnOptions::new().in_domain(asker.as_u32());
+    if sched::spawn_on_with(0, "tpm-ask", tpm_asks, raw, hhdm, options).is_err() {
+        println!("\x1b[91m    tpm            FAILED to spawn a caller\x1b[0m");
+        domain::destroy(asker);
+        return;
+    }
+    // Waited for the answer rather than for a duration: both outcomes set.
+    for _ in 0..100 {
+        if TPM_ANSWERS[5].load(Ordering::Acquire) != u64::MAX {
+            break;
+        }
+        wait_millis(50);
+    }
+    domain::destroy(asker);
+
+    let mut text = [[0u8; 8]; 2];
+    let mut failed = None;
+    for (index, (pcr, out)) in [8u64, 9].into_iter().zip(text.iter_mut()).enumerate() {
+        let base = index * 5;
+        let outcome = TPM_ANSWERS[base].load(Ordering::Acquire);
+        if outcome != bhaskix_abi::tpm::outcome::OK {
+            failed = Some((pcr, outcome, TPM_ANSWERS[base + 1].load(Ordering::Acquire)));
+            break;
+        }
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let first = TPM_ANSWERS[base + 1].load(Ordering::Acquire).to_be_bytes();
+        for (i, byte) in first[..4].iter().enumerate() {
+            out[2 * i] = HEX[usize::from(byte >> 4)];
+            out[2 * i + 1] = HEX[usize::from(byte & 15)];
+        }
+    }
+    match failed {
+        None => println!(
+            "    tpm            PCR 8 {} PCR 9 {} (sha256), read through bin/tpmd",
+            core::str::from_utf8(&text[0]).unwrap_or("?"),
+            core::str::from_utf8(&text[1]).unwrap_or("?")
+        ),
+        Some((pcr, u64::MAX, _)) => println!(
+            "\x1b[91m    tpm            FAILED: bin/tpmd never answered for PCR {pcr}\x1b[0m"
+        ),
+        Some((pcr, outcome, detail)) => println!(
+            "\x1b[91m    tpm            FAILED: PCR {pcr} answered outcome {outcome}, detail {detail:#x}\x1b[0m"
+        ),
+    }
+}
+
 /// Finds the ACPI `TPM2` table and says what it describes -- RFC 0089 step 5a.
 ///
 /// Three sentences: a CRB TPM at an address, a TPM whose interface this kernel
@@ -14803,6 +15017,9 @@ fn tpm_discovery(handoff: &Handoff) -> Option<bhaskix_arch::acpi::Tpm2> {
             tpm.control_area & !0xfff,
             tpm.start_method
         );
+        // RFC 0089 step 5c drives it -- later, where the other domain
+        // programs start; see `start_tpm_service`.
+        TPM_FOUND.store(tpm.control_area, core::sync::atomic::Ordering::Release);
     } else {
         println!(
             "    tpm            start method {} is not driven here (CRB only)",
@@ -14944,6 +15161,11 @@ const AHCID_STACK: u64 = 0x0000_0000_1200_0000;
 const AHCID_STACK_PAGES: u64 = 4;
 /// The program.
 const AHCID_PROGRAM: &[u8] = b"bin/ahcid";
+/// `bin/tpmd`, RFC 0089 step 5c: where it is, and where its stack goes in the
+/// address space it is given.
+const TPMD_PROGRAM: &[u8] = b"bin/tpmd";
+const TPMD_STACK: u64 = 0x0000_0000_1200_0000;
+const TPMD_STACK_PAGES: u64 = 4;
 
 /// Where the network driver's domain keeps its stack.
 const NETD_STACK: u64 = 0x0000_0000_1200_0000;
@@ -25728,6 +25950,10 @@ fn user_shell(handoff: &Handoff) -> Result<(), &'static str> {
         }
     }
 
+    // RFC 0089 step 5c: the TPM, driven from ring 3 by a program holding one
+    // page of it, beside the other domain programs.
+    start_tpm_service(handoff);
+
     // RFC 0018 step 2: the network device, driven from ring 3. Not gated on the
     // block path above -- a machine with no disk to delegate should still get a
     // network, and coupling them would make one failure look like two.
@@ -27855,7 +28081,8 @@ fn expected_bin_entries() -> usize {
     // Each optional program counted by its own presence, `bin/httpd` since
     // RFC 0086 step 5: only the HTTP lane's image carries it, and its first
     // boot failed this check exactly as the note in `vfs_self_test` promises.
-    18 + usize::from(vfs::open(GO_PROGRAM).is_ok()) + usize::from(vfs::open(HTTPD_PROGRAM).is_ok())
+    // 19 since 2026-10-08: `bin/tpmd`, RFC 0089 step 5c, in every image.
+    19 + usize::from(vfs::open(GO_PROGRAM).is_ok()) + usize::from(vfs::open(HTTPD_PROGRAM).is_ok())
 }
 
 /// Largest filesystem image this will read off a disk.

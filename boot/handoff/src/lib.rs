@@ -274,6 +274,28 @@ impl Framebuffer {
 /// `entry` receives the CPU's local APIC identifier and must never return.
 pub type StartSecondaries = fn(entry: extern "C" fn(u32) -> !) -> &'static [u32];
 
+/// Whether `[base, base + length)` touches any region of `map` that is not
+/// [`MemoryKind::Reserved`] -- RFC 0089 step 5c.
+///
+/// **For a device page whose address firmware supplied.** A PCI BAR is
+/// assigned by the kernel's own walk; an ACPI table's address is whatever the
+/// table says, and a capability to a page of RAM would be a capability to
+/// somebody's memory dressed as a device. Device registers sit in reserved
+/// ranges or outside the map altogether; anything else the map describes --
+/// usable, reclaimable, the kernel's own, ACPI's, bad, the framebuffer -- is
+/// refused.
+#[must_use]
+pub fn overlaps_non_reserved(map: &[MemoryRegion], base: u64, length: u64) -> bool {
+    let Some(end) = base.checked_add(length) else {
+        return true;
+    };
+    map.iter().any(|region| {
+        region.kind != MemoryKind::Reserved
+            && region.base.as_u64() < end
+            && base < region.base.as_u64().saturating_add(region.length)
+    })
+}
+
 /// What the loader recorded in the TPM before handing over -- RFC 0089.
 ///
 /// **Three answers, never two.** A loader that does not measure and a loader
@@ -529,6 +551,38 @@ mod tests {
             initrd: None,
             measurement: Measurement::NotAttempted,
         }
+    }
+
+    #[test]
+    fn a_device_page_may_sit_in_reserved_memory_or_outside_the_map_and_nowhere_else() {
+        let map = [
+            MemoryRegion {
+                base: PhysAddr(0x0),
+                length: 0x9_f000,
+                kind: MemoryKind::Usable,
+            },
+            MemoryRegion {
+                base: PhysAddr(0xfed0_0000),
+                length: 0x10_0000,
+                kind: MemoryKind::Reserved,
+            },
+            MemoryRegion {
+                base: PhysAddr(0x10_0000),
+                length: 0x1000,
+                kind: MemoryKind::AcpiNvs,
+            },
+        ];
+        // Inside a reserved range, and outside the map altogether.
+        assert!(!overlaps_non_reserved(&map, 0xfed4_0000, 0x1000));
+        assert!(!overlaps_non_reserved(&map, 0xfee0_0000, 0x1000));
+        // Usable RAM, ACPI's memory, and a page straddling RAM's last byte.
+        assert!(overlaps_non_reserved(&map, 0x5000, 0x1000));
+        assert!(overlaps_non_reserved(&map, 0x10_0000, 0x1000));
+        assert!(overlaps_non_reserved(&map, 0x9_e800, 0x1000));
+        // Touching but not overlapping: the page that starts where RAM ends.
+        assert!(!overlaps_non_reserved(&map, 0x9_f000, 0x1000));
+        // A range that wraps the address space is refused, not reasoned about.
+        assert!(overlaps_non_reserved(&map, u64::MAX - 0xfff, 0x2000));
     }
 
     #[test]

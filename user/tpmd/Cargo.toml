@@ -1,0 +1,50 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# The TPM 2.0 service, in a domain of its own -- RFC 0089 step 5c.
+#
+# Not a member of the root workspace, for the reason `user/ahcid/Cargo.toml`
+# gives: its own code model and its own linker script. And, as there, **almost
+# nothing is here**: the command bytes, the response parser and the order of
+# the CRB conversation are `bhaskix-tpm`'s, which the suite reaches; this
+# program is the two register accesses that crate deliberately cannot make.
+[workspace]
+
+[package]
+name = "bhaskix-user-tpmd"
+description = "The TPM 2.0 service in a domain of its own: it reads PCRs and nothing else."
+version = "0.0.0"
+edition = "2024"
+authors = ["Tarun Kumar Kushwaha"]
+repository = "https://github.com/bhaskix/bhaskix"
+license = "Apache-2.0"
+
+[[bin]]
+name = "tpmd"
+path = "src/main.rs"
+
+[dependencies]
+bhaskix-abi = { path = "../../abi" }
+bhaskix-tpm = { path = "../../tpm" }
+
+[profile.release]
+panic = "abort"
+opt-level = "s"
+
+[package.metadata.bhaskix]
+# 4 -- the `_start` stub the ABI requires, the two `syscall` sequences (`call`
+# returns a status and a value, `receive` a method and four arguments, as in
+# `bin/ahcid`), and the `ud2` that stops a panic where the kernel can see it.
+# One fewer than `bin/ahcid`: no `rdtsc`, because every wait is bounded by a
+# count in `bhaskix-tpm` rather than a deadline here.
+asm_budget = 4
+# **33, measured at the first build, 2026-10-08, and `exact`.** The two system
+# call sequences are most of it -- every argument register is an output because
+# the kernel writes the whole frame back -- then the one volatile read and the
+# one volatile write that are this program's whole access to the TPM, each
+# refusing an offset outside the page before it is used, and the `ud2`.
+# Nothing here decides an offset, an order or a bound: the command bytes, the
+# response parser and the CRB conversation are `bhaskix-tpm`'s, at budget zero,
+# host-tested and fuzzed. If this number climbs, logic has moved out of the
+# crate the tests reach.
+unsafe_budget = 33
+unsafe_budget_exact = true

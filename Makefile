@@ -62,6 +62,7 @@ VFSD_DIR     := user/vfsd
 CONSOLED_DIR := user/consoled
 BLKD_DIR     := user/blkd
 AHCID_DIR    := user/ahcid
+TPMD_DIR     := user/tpmd
 NETD_DIR     := user/netd
 IPD_DIR      := user/ipd
 DHCPD_DIR    := user/dhcp
@@ -169,6 +170,7 @@ USER_VFSD    := $(VFSD_DIR)/target/$(TARGET)/release/vfsd
 USER_CONSOLED := $(CONSOLED_DIR)/target/$(TARGET)/release/consoled
 USER_BLKD    := $(BLKD_DIR)/target/$(TARGET)/release/blkd
 USER_AHCID   := $(AHCID_DIR)/target/$(TARGET)/release/ahcid
+USER_TPMD    := $(TPMD_DIR)/target/$(TARGET)/release/tpmd
 USER_NETD    := $(NETD_DIR)/target/$(TARGET)/release/netd
 USER_IPD     := $(IPD_DIR)/target/$(TARGET)/release/ipd
 USER_DHCPD   := $(DHCPD_DIR)/target/$(TARGET)/release/dhcp
@@ -202,6 +204,8 @@ BLKD_FLAGS   := -C relocation-model=static -C code-model=small \
                 -C link-arg=-T$(CURDIR)/$(BLKD_DIR)/link.ld
 AHCID_FLAGS  := -C relocation-model=static -C code-model=small \
                 -C link-arg=-T$(CURDIR)/$(AHCID_DIR)/link.ld
+TPMD_FLAGS   := -C relocation-model=static -C code-model=small \
+                -C link-arg=-T$(CURDIR)/$(TPMD_DIR)/link.ld
 NETD_FLAGS   := -C relocation-model=static -C code-model=small \
                 -C link-arg=-T$(CURDIR)/$(NETD_DIR)/link.ld
 IPD_FLAGS    := -C relocation-model=static -C code-model=small \
@@ -365,7 +369,7 @@ FORCE:
 # and mkimage stages, hashes, verifies with the machine's own parsers, and
 # drives the same tar flags this rule always trusted. Assembled twice and
 # byte-compared every build: determinism is a gate, not a hope.
-$(INITRD): $(MKIMAGE) $(shell find $(INITRD_DIR) packages -type f 2>/dev/null | sort) $(PROBE) $(USER_SHELL) $(USER_VFSD) $(USER_CONSOLED) $(USER_BLKD) $(USER_AHCID) $(USER_NETD) $(USER_IPD) $(USER_DHCPD) $(USER_UDP6) $(USER_TCPD) $(USER_LINUXD) $(USER_TCPC) $(USER_TRACED) $(USER_FSD) $(USER_SUP) $(FS_IMAGE) $(HELLO_BPK) $(GREEDY_BPK) $(BUSYBOX) $(GO_CORPUS_DEP) $(HOSTED) $(GO_CORPUS_STAMP) $(HTTPD_DEP) $(HTTPD_STAMP)
+$(INITRD): $(MKIMAGE) $(shell find $(INITRD_DIR) packages -type f 2>/dev/null | sort) $(PROBE) $(USER_SHELL) $(USER_VFSD) $(USER_CONSOLED) $(USER_BLKD) $(USER_AHCID) $(USER_TPMD) $(USER_NETD) $(USER_IPD) $(USER_DHCPD) $(USER_UDP6) $(USER_TCPD) $(USER_LINUXD) $(USER_TCPC) $(USER_TRACED) $(USER_FSD) $(USER_SUP) $(FS_IMAGE) $(HELLO_BPK) $(GREEDY_BPK) $(BUSYBOX) $(GO_CORPUS_DEP) $(HOSTED) $(GO_CORPUS_STAMP) $(HTTPD_DEP) $(HTTPD_STAMP)
 	@mkdir -p $(dir $@)
 	./$(MKIMAGE) $@ $(INITRD_ROOT) --root . --static $(INITRD_DIR) \
 	    --file fs.img=$(FS_IMAGE) \
@@ -505,6 +509,15 @@ $(USER_BLKD): $(BLKD_DIR)/src/main.rs $(BLKD_DIR)/link.ld $(BLKD_DIR)/Cargo.toml
 $(USER_AHCID): $(AHCID_DIR)/src/main.rs $(AHCID_DIR)/link.ld $(AHCID_DIR)/Cargo.toml \
                $(wildcard abi/src/*.rs) $(wildcard ahci/src/*.rs)
 	cd $(AHCID_DIR) && RUSTFLAGS="$(AHCID_FLAGS)" \
+	    $(CARGO) build --release --target $(TARGET)
+	@echo "built $@"
+
+# The TPM 2.0 service as a program, RFC 0089 step 5c -- `bin/ahcid`'s shape:
+# the command bytes, the response parser and the CRB order live in
+# `bhaskix-tpm`, which the host tests reach, and this is the register access.
+$(USER_TPMD): $(TPMD_DIR)/src/main.rs $(TPMD_DIR)/link.ld $(TPMD_DIR)/Cargo.toml \
+              $(wildcard abi/src/*.rs) $(wildcard tpm/src/*.rs)
+	cd $(TPMD_DIR) && RUSTFLAGS="$(TPMD_FLAGS)" \
 	    $(CARGO) build --release --target $(TARGET)
 	@echo "built $@"
 
@@ -958,6 +971,7 @@ fmt:
 	cd $(CONSOLED_DIR) && $(CARGO) fmt --all --check
 	cd $(BLKD_DIR) && $(CARGO) fmt --all --check
 	cd $(AHCID_DIR) && $(CARGO) fmt --all --check
+	cd $(TPMD_DIR) && $(CARGO) fmt --all --check
 	cd $(NETD_DIR) && $(CARGO) fmt --all --check
 	cd $(IPD_DIR) && $(CARGO) fmt --all --check
 	cd $(DHCPD_DIR) && $(CARGO) fmt --all --check
@@ -988,6 +1002,8 @@ clippy:
 	cd $(BLKD_DIR) && RUSTFLAGS="$(BLKD_FLAGS)" \
 	    $(CARGO) clippy --release --target $(TARGET) -- -D warnings
 	cd $(AHCID_DIR) && RUSTFLAGS="$(AHCID_FLAGS)" \
+	    $(CARGO) clippy --release --target $(TARGET) -- -D warnings
+	cd $(TPMD_DIR) && RUSTFLAGS="$(TPMD_FLAGS)" \
 	    $(CARGO) clippy --release --target $(TARGET) -- -D warnings
 	cd $(NETD_DIR) && RUSTFLAGS="$(NETD_FLAGS)" \
 	    $(CARGO) clippy --release --target $(TARGET) -- -D warnings
@@ -1226,6 +1242,7 @@ clean:
 	cd $(CONSOLED_DIR) && $(CARGO) clean
 	cd $(BLKD_DIR) && $(CARGO) clean
 	cd $(AHCID_DIR) && $(CARGO) clean
+	cd $(TPMD_DIR) && $(CARGO) clean
 	cd $(NETD_DIR) && $(CARGO) clean
 	cd $(IPD_DIR) && $(CARGO) clean
 	cd $(DHCPD_DIR) && $(CARGO) clean

@@ -1945,6 +1945,36 @@ pub mod net_ring {
     const _: () = assert!(WORDS * 8 <= 4096);
 }
 
+/// The TPM service's protocol -- RFC 0089 step 5c, `bin/tpmd`.
+///
+/// **One method, on purpose.** The service builds no command but
+/// `TPM2_PCR_Read`, so an extend, a clear or a hierarchy command is not
+/// reachable through it; a second method here would be the place that stopped
+/// being true.
+pub mod tpm {
+    /// Read one PCR in the SHA-256 bank. `args[0]` = the PCR, below 24.
+    ///
+    /// The reply's `method` word is an [`outcome`]; on [`outcome::OK`] its four
+    /// argument words are the 32-byte value, each word the next eight bytes
+    /// big-endian, so the bytes read in order.
+    pub const PCR_READ: u64 = 1;
+
+    /// What a [`PCR_READ`] reply's `method` word says.
+    pub mod outcome {
+        /// The value is in the argument words.
+        pub const OK: u64 = 0;
+        /// Not a method this service answers, or a PCR past 23.
+        pub const BAD_REQUEST: u64 = 1;
+        /// The CRB interface did not complete the command; `args[0]` says
+        /// where it stopped.
+        pub const DEVICE: u64 = 2;
+        /// The TPM answered with an error; `args[0]` is its response code.
+        pub const TPM: u64 = 3;
+        /// The TPM's answer was refused by the parser; `args[0]` says why.
+        pub const RESPONSE: u64 = 4;
+    }
+}
+
 /// Where each structure sits inside the block service's ring pages.
 ///
 /// **In the ABI because both rings read it, and they were deriving it

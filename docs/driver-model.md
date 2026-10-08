@@ -304,7 +304,9 @@ Ordered by "what makes the system useful soonest", not by interest.
     a window of its own and serves `block::READ`/`WRITE`. Not on the SR550 yet — translation is
     off there pending [RFC 0043](rfc/0043-an-iommu-on-a-machine-with-no-virtio.md), and the
     driver refuses an uncontained controller by design
-12. TPM 2.0 (CRB/TIS) — required for [security.md](security.md) §3
+12. TPM 2.0 (CRB/TIS) — required for [security.md](security.md) §3. **CRB driven since 2026-10-08** by
+    `bin/tpmd` in a domain ([RFC 0089](rfc/0089-a-boot-the-tpm-records.md) step 5c), PCR reads only; TIS
+    is not driven yet
 
 **Later:** GPU (`domain` placement, mandatory), WiFi, audio, media.
 
