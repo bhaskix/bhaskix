@@ -50,6 +50,44 @@ const TRIGGER_LEVEL: u32 = 1 << 15;
 /// The input is masked: nothing is delivered.
 const MASKED: u32 = 1 << 16;
 
+/// What reading back an entry routed to a vector says about it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Readback {
+    /// The vector is there and the input is live.
+    Live,
+    /// The vector is there, and the input is masked **because its interrupt
+    /// arrived**: the delivery path masks a line until its driver acknowledges
+    /// it, which is flow control and not a fault.
+    MaskedAwaitingAck,
+    /// The vector is there and the input is masked with nothing delivered:
+    /// it was never unmasked.
+    NeverUnmasked,
+    /// Another vector: the write went somewhere else, or nowhere.
+    WrongVector,
+}
+
+/// Judges a read-back of an entry routed to `vector`, given how many of its
+/// interrupts were `delivered` since it was claimed.
+///
+/// **Masked is not wrong on its own** (2026-10-08). The SR550, booted through
+/// `bhaskixboot`, read back `0x100fd` for the serial line on every boot — the
+/// right vector, masked — and the check that read it treated that as a write
+/// gone astray, refused console input, and ended every such boot without a
+/// shell. Counting arrivals showed `1 delivered`: the serial interrupt had
+/// come, and the line was waiting for its acknowledge.
+#[must_use]
+pub const fn readback(entry: u32, vector: u8, delivered: u64) -> Readback {
+    if entry & 0xff != vector as u32 {
+        Readback::WrongVector
+    } else if entry & MASKED == 0 {
+        Readback::Live
+    } else if delivered > 0 {
+        Readback::MaskedAwaitingAck
+    } else {
+        Readback::NeverUnmasked
+    }
+}
+
 /// Lowest vector this will program.
 ///
 /// Vectors below 32 are the CPU's own exceptions. Programming a device to
@@ -316,6 +354,20 @@ impl IoApic {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_masked_line_is_wrong_only_if_nothing_arrived() {
+        // The SR550's read-back, both ways: masked with one delivery is a line
+        // waiting for its acknowledge; masked with none was never unmasked.
+        assert_eq!(readback(0x100fd, 0xfd, 1), Readback::MaskedAwaitingAck);
+        assert_eq!(readback(0x100fd, 0xfd, 0), Readback::NeverUnmasked);
+        assert_eq!(readback(0xfd, 0xfd, 0), Readback::Live);
+        assert_eq!(readback(0xfd, 0xfd, 5), Readback::Live);
+        // The vector is checked before anything else: arrivals cannot excuse a
+        // write that landed with another number.
+        assert_eq!(readback(0x100fe, 0xfd, 3), Readback::WrongVector);
+        assert_eq!(readback(0xfe, 0xfd, 0), Readback::WrongVector);
+    }
 
     /// The register layout is what the tests can check without a chip: the
     /// bits a routing decision turns into, and the arithmetic that turns a

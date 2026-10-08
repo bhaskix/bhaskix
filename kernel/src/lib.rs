@@ -30321,15 +30321,16 @@ fn console_input(handoff: &Handoff) -> bool {
     // interrupts, which looks like a hardware problem for a long time.
     let gsi = irq::isa_to_gsi(handoff.rsdp, hhdm, input::SERIAL_IRQ);
     let entry = irq::redirection(gsi).unwrap_or(0);
-    let vector_ok = entry & 0xff == u32::from(vector);
-    let unmasked = entry & (1 << 16) == 0;
-    if !vector_ok || !unmasked {
-        // **Why it is masked, said** (2026-10-08). On the SR550 under the
-        // native loader this read back `0x100fd` -- the right vector, masked --
-        // on every boot, and the line is masked on purpose between a delivery
-        // and its acknowledge. The arrivals say which: delivered means masked
-        // by `irq::on_interrupt` and waiting, nothing means never unmasked.
-        let (delivered, strays) = irq::arrivals(vector);
+    // **Masked is judged by its arrivals** (2026-10-08). The delivery path
+    // masks a line until its driver acknowledges it, so a read-back can find
+    // a working line masked; on the SR550 under the native loader it always
+    // did, and every such boot ended with no shell. `readback` decides.
+    let (delivered, strays) = irq::arrivals(vector);
+    let verdict = bhaskix_arch::ioapic::readback(entry, vector, delivered);
+    if matches!(
+        verdict,
+        bhaskix_arch::ioapic::Readback::NeverUnmasked | bhaskix_arch::ioapic::Readback::WrongVector
+    ) {
         println!(
             "\x1b[91m    io apic        FAILED: entry for gsi {gsi} reads back {entry:#x}; \
              vector {vector:#04x} since its claim: {delivered} delivered, {strays} before the \
@@ -30351,6 +30352,12 @@ fn console_input(handoff: &Handoff) -> bool {
         },
         input::SERIAL_IRQ,
     );
+    if verdict == bhaskix_arch::ioapic::Readback::MaskedAwaitingAck {
+        println!(
+            "    io apic        the serial line reads back masked: {delivered} interrupt(s) \
+             arrived since its claim and wait for the console to acknowledge them"
+        );
+    }
     println!("    vectors        {taken} of {total} allocatable in use:");
     vectors::for_each(|vector, owner| println!("      {vector:#04x}  {owner}"));
 

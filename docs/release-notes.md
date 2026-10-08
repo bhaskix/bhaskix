@@ -134,8 +134,8 @@ other rows' defects).
 
 | Defect — what you would see | Rate, as TRACKER states it | Fix |
 |---|---|---|
-| Through its own loader on the SR550, the serial line reads back masked, so there is no console input and no shell | found 2026-10-08, one boot | a lead, not a finding |
-| Through its own loader on the SR550, a hosted program reading `/proc/self` never finishes | found 2026-10-08, one boot | unexplained |
+| Through its own loader on the SR550, the serial line reads back masked, so there is no console input and no shell | found 2026-10-08, every native boot there | **root-caused and fixed 2026-10-08**: the line was waiting for an acknowledge, and the check misread it; not yet confirmed on the SR550 |
+| Through its own loader on the SR550, a hosted program reading `/proc/self` never finishes | found 2026-10-08, two of two sixteen-CPU boots | unexplained |
 | A ring-station scheduler self-test halts with a station asleep on its own turn | 1 in 391 CI boots before a fix of 2026-09-28; **0 in 657 since** (2026-10-04) | fix landed; open until ~1,200 clean boots |
 | An outbound TCP demonstration stalls: `connected, stream still in flight` | 10 sightings, 1 in 773 boots (2026-09-28) | none |
 | A lock-order self-test fails: a wait queue taken while holding another lock | 4 in 7,681 boots; last 2026-09-23 | a cause fixed 2026-09-28; open until ~5,800 clean boots |
