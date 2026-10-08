@@ -608,7 +608,17 @@ $(USER_TRACED): $(TRACED_DIR)/src/main.rs $(TRACED_DIR)/link.ld $(TRACED_DIR)/Ca
 # The native UEFI loader -- RFC 0028 step 1. Its own target and its own
 # linker convention (PE, efi_main), so its own cargo invocation; no RUSTFLAGS
 # because the uefi target's defaults are the convention.
-$(BOOTEFI): $(BOOTEFI_DIR)/src/main.rs $(BOOTEFI_DIR)/Cargo.toml
+#
+# **Every source it is built from, not just `main.rs`** (2026-10-08). This rule
+# was written when the loader was one file, and kept naming only that file
+# after it grew four modules and four path dependencies -- so a change to
+# `serial.rs`, or to the ELF parser it shares with the kernel, left `make`
+# booting the previous loader. Found when a new gate failed against a binary
+# older than the source it was testing. CI builds from nothing and was never
+# affected; a local `make test` could be.
+$(BOOTEFI): $(wildcard $(BOOTEFI_DIR)/src/*.rs) $(BOOTEFI_DIR)/Cargo.toml \
+            $(wildcard boot/handoff/src/*.rs) $(wildcard elf/src/*.rs) \
+            $(wildcard rand/src/*.rs) $(wildcard tcglog/src/*.rs)
 	cd $(BOOTEFI_DIR) && $(CARGO) build --release --target x86_64-unknown-uefi
 	@echo "built $@"
 

@@ -22,6 +22,12 @@ LOADER="$REPO_ROOT/boot/bhaskixboot/target/x86_64-unknown-uefi/release/bhaskixbo
 KERNEL="$REPO_ROOT/target/x86_64-unknown-none/release/bhaskix"
 INITRD="$REPO_ROOT/build/initrd.tar"
 LOG="${BHASKIX_NATIVE_BOOT_LOG:-$(mktemp)}"
+# The second UART's log. **The SR550's service processor carries COM2, not
+# COM1** -- found by the kernel on 2026-08-23 -- and the loader wrote COM1 only
+# until 2026-10-08, so on that machine everything it wrote after its banner went
+# to a port nobody read. The main boot gives QEMU a COM2 so the gates below can
+# ask it what the loader said.
+COM2_LOG="$(mktemp)"
 TIMEOUT=60
 
 RED=$'\033[1;31m'
@@ -197,6 +203,7 @@ timeout "$TIMEOUT" qemu-system-x86_64 \
     -drive "format=raw,file=fat:rw:$ESP" \
     "${TPM_ARGS[@]}" \
     -serial "file:$LOG" \
+    -serial "file:$COM2_LOG" \
     >/dev/null 2>&1 &
 QEMU_PID=$!
 
@@ -372,6 +379,37 @@ if grep -qF "handoff version 3" "$LOG" 2>/dev/null; then
 else
     fail "the kernel never reported the handoff"
     status=1
+fi
+
+# **COM2 carries the loader too** (2026-10-08). The banner is written before
+# the firmware's serial port is adopted, and the lines from the exit on after
+# it is released; both go to every UART that answers. The lines between go
+# through the firmware's own port -- COM1 under OVMF -- and **must not** reach
+# COM2, because writing a UART's registers underneath the firmware's driver is
+# what UEFI §12 provides a protocol to avoid: a payload line here would mean the
+# loader bypassed it. The kernel's report follows, as it does on the SR550.
+com2_missing=""
+for want in "bhaskixboot 0.0.0: the machine entered through our own door" \
+            "bhaskixboot: boot services exited; the machine is ours" \
+            "bhaskixboot: the world is built; jumping" \
+            "An open-source, AI-native, enterprise operating system"; do
+    grep -qF "$want" "$COM2_LOG" 2>/dev/null || com2_missing="${com2_missing:+$com2_missing; }$want"
+done
+if [[ -z "$com2_missing" ]]; then
+    pass "COM2 carries the loader's banner, its lines after the exit, and the kernel's report"
+else
+    fail "COM2 is missing: $com2_missing"
+    status=1
+fi
+# The kernel's checksum too: until 2026-10-08 the number writers wrote the
+# registers directly while the text around them went through the protocol, so a
+# bypass shows as a bare number with no words beside it.
+if grep -qF "bhaskixboot: payload kernel" "$COM2_LOG" 2>/dev/null \
+    || grep -qF "$KERNEL_FNV" "$COM2_LOG" 2>/dev/null; then
+    fail "COM2 carries a line or a number from inside boot services: the loader wrote under the firmware's driver"
+    status=1
+else
+    pass "nothing from inside boot services reached COM2 directly"
 fi
 
 # RFC 0089 step 3: **the log reached the kernel, and the kernel read it.** With a
@@ -579,5 +617,8 @@ fi
 if [[ "$status" -ne 0 ]]; then
     echo "--- serial log ---"
     cat "$LOG" 2>/dev/null | head -60
+    echo "--- COM2 log ---"
+    head -20 "$COM2_LOG" 2>/dev/null
 fi
+rm -f "$COM2_LOG"
 exit "$status"
