@@ -27190,6 +27190,18 @@ fn user_shell(handoff: &Handoff) -> Result<(), &'static str> {
         // behind two open defects, asked where the value is produced rather than by
         // a gate reading a probe's report much later. Zero on a healthy boot, and a
         // non-zero value names the first offender.
+        // **A Linux call the native dispatcher answered** (2026-10-10) — the
+        // dialect is chosen from a per-CPU note, and native `BadSyscall` is
+        // the `1` a Linux memory probe died holding. Zero on a healthy boot.
+        match crate::syscall::dialect_misses() {
+            (0, _) | (_, None) => {
+                println!("    syscall dialect no Linux call was answered by the native dispatcher");
+            }
+            (misses, Some((number, real, hint))) => println!(
+                "\x1b[91m    syscall dialect FAILED: {misses} Linux call(s) answered natively; the first was \
+                 number {number} from domain {real}, with the cpu's note naming domain {hint}\x1b[0m"
+            ),
+        }
         let (impossible, first) = crate::syscall::impossible_returns();
         if impossible == 0 {
             println!("    syscall returns no call answered what its contract forbids");

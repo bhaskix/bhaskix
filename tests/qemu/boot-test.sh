@@ -3709,6 +3709,21 @@ else
     status=1
 fi
 
+# **No Linux call answered by the native dispatcher** (2026-10-10). The dialect
+# is chosen from a per-CPU note, and a native `BadSyscall` is `1` -- the value a
+# Linux memory probe died holding on 2026-10-09 with no foreign answer of `1`
+# on record. The kernel asks the scheduler whenever a native dispatch answers
+# `BadSyscall`, and counts a caller that was really in a Linux domain.
+if grep -qF "syscall dialect no Linux call was answered by the native dispatcher" "$LOG"; then
+    pass "no Linux call was answered by the native dispatcher"
+elif grep -qF "syscall dialect FAILED" "$LOG"; then
+    fail "a Linux call went to the native dispatcher: $(grep -aoE 'syscall dialect FAILED.*' "$LOG" | head -1)"
+    status=1
+else
+    fail "the boot did not say whether a Linux call was answered natively"
+    status=1
+fi
+
 # **The console must not still be on its fatal path when the boot report runs.**
 # This is the assertion the tear below went six investigations without. Once
 # `enter_fatal` is set, `console::put_run` returns early into `write_fatal`,

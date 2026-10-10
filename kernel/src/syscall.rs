@@ -2251,12 +2251,99 @@ static RETURN_NR: [core::sync::atomic::AtomicU32; 16] =
 static RETURN_VALUE: [AtomicU64; 16] = [const { AtomicU64::new(0) }; 16];
 static RETURN_AT: AtomicU64 = AtomicU64::new(0);
 
+/// The last foreign answer each thread was given, so a ring 3 fault report
+/// can say what **this** thread's `rax` was set to.
+///
+/// The ring above is global, and on 2026-10-09 that cost a diagnosis: a probe
+/// faulted holding `1` straight after an `mmap`, beside a ring whose one `mmap`
+/// answer may have been another program's. Keyed by thread id modulo the
+/// table's size, with the id stored beside the answer so a collision reads as
+/// no answer rather than as somebody else's.
+const LAST_ANSWERS: usize = 256;
+static LAST_TID: [AtomicU64; LAST_ANSWERS] = [const { AtomicU64::new(u64::MAX) }; LAST_ANSWERS];
+static LAST_NR: [core::sync::atomic::AtomicU32; LAST_ANSWERS] =
+    [const { core::sync::atomic::AtomicU32::new(u32::MAX) }; LAST_ANSWERS];
+static LAST_VALUE: [AtomicU64; LAST_ANSWERS] = [const { AtomicU64::new(0) }; LAST_ANSWERS];
+
+/// Records `(number, value)` as the calling thread's last foreign answer.
+fn note_thread_answer(number: u64, value: u64) {
+    let Some(thread) = crate::sched::current_thread_id() else {
+        return;
+    };
+    let slot = thread as usize % LAST_ANSWERS;
+    // Invalidated first, so a reader racing this write sees no answer rather
+    // than one thread's number beside another's value.
+    LAST_TID[slot].store(u64::MAX, Ordering::Release);
+    LAST_NR[slot].store(number as u32, Ordering::Relaxed);
+    LAST_VALUE[slot].store(value, Ordering::Relaxed);
+    LAST_TID[slot].store(u64::from(thread), Ordering::Release);
+}
+
+/// The last foreign answer `thread` was given, if the table still holds it:
+/// `(syscall number, value that went to rax)`.
+#[must_use]
+pub fn last_answer_of(thread: u32) -> Option<(u32, u64)> {
+    let slot = thread as usize % LAST_ANSWERS;
+    if LAST_TID[slot].load(Ordering::Acquire) != u64::from(thread) {
+        return None;
+    }
+    let number = LAST_NR[slot].load(Ordering::Relaxed);
+    let value = LAST_VALUE[slot].load(Ordering::Relaxed);
+    (LAST_TID[slot].load(Ordering::Acquire) == u64::from(thread)).then_some((number, value))
+}
+
+/// Linux-tagged callers answered by the **native** dispatcher: the dialect,
+/// chosen from the per-CPU domain note, disagreeing with the thread's own
+/// domain (2026-10-10).
+///
+/// The candidate for the Linux-memory specimens: native `BadSyscall` is `1`,
+/// and a probe died holding exactly `1` after an `mmap`, with no foreign answer
+/// of `1` on record. Checked only where the healthy path pays nothing — after
+/// a native dispatch answers `BadSyscall`, which a native program sees only
+/// for a number it has no business sending — and then by asking the
+/// scheduler, which is the slow and correct question the note exists to
+/// avoid on every call.
+static DIALECT_MISSES: AtomicU64 = AtomicU64::new(0);
+/// The first miss: the number, the thread's own domain, and what the note named.
+static FIRST_DIALECT_MISS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// Counts a native `BadSyscall` whose caller is really in a Linux domain.
+fn check_dialect(number: u64, hint: u32) {
+    let Some(domain) = crate::sched::current_domain() else {
+        return;
+    };
+    let real = domain.as_u32();
+    let linux = (real as usize) < crate::domain::MAX_DOMAINS
+        && crate::domain::LINUX_DOMAINS.load(Ordering::Relaxed) & (1u64 << real) != 0;
+    if linux && DIALECT_MISSES.fetch_add(1, Ordering::AcqRel) == 0 {
+        FIRST_DIALECT_MISS[0].store(number, Ordering::Relaxed);
+        FIRST_DIALECT_MISS[1].store(u64::from(real), Ordering::Relaxed);
+        FIRST_DIALECT_MISS[2].store(u64::from(hint), Ordering::Release);
+    }
+}
+
+/// How many Linux calls the native dispatcher answered, and the first one:
+/// `(number, the thread's domain, the domain the CPU's note named)`.
+#[must_use]
+pub fn dialect_misses() -> (u64, Option<(u64, u64, u64)>) {
+    let misses = DIALECT_MISSES.load(Ordering::Acquire);
+    let first = (misses > 0).then(|| {
+        (
+            FIRST_DIALECT_MISS[0].load(Ordering::Relaxed),
+            FIRST_DIALECT_MISS[1].load(Ordering::Relaxed),
+            FIRST_DIALECT_MISS[2].load(Ordering::Acquire),
+        )
+    });
+    (misses, first)
+}
+
 /// Remembers what a foreign call was answered.
 fn note_return(number: u64, value: u64) {
     let at = RETURN_AT.fetch_add(1, Ordering::Relaxed) as usize % RETURN_NR.len();
     RETURN_VALUE[at].store(value, Ordering::Relaxed);
     // The number last, so a reader that sees a number sees the value with it.
     RETURN_NR[at].store(number as u32, Ordering::Release);
+    note_thread_answer(number, value);
     check_impossible(number, value);
 }
 
@@ -3531,11 +3618,16 @@ pub unsafe extern "C" fn bhaskix_syscall_dispatch(frame: *mut SyscallFrame) {
         && crate::domain::LINUX_DOMAINS.load(core::sync::atomic::Ordering::Relaxed)
             & (1u64 << hint)
             != 0;
+    // The number, before an answer overwrites the register it arrived in.
+    let number = frame.kind;
     if foreign {
         foreign_call(frame, hint);
     }
 
     let outcome = if foreign { None } else { Some(dispatch(frame)) };
+    if outcome.is_some_and(|outcome| outcome.status == Status::BadSyscall) {
+        check_dialect(number, hint);
+    }
 
     // Every system call returns to ring 3, so this needs no condition. See
     // `sched::check_user_space`: the switch instrumentation proved some return

@@ -655,6 +655,17 @@ fn end_faulting_domain() -> ! {
                 Some(id) => println!("  Thread {id} stopped."),
                 None => println!("  The faulting thread could not be identified."),
             }
+            // **What this thread's `rax` was last set to by a foreign call**
+            // (2026-10-09). A probe died holding `1` after an `mmap`, and the
+            // only answers on record were global; this one is its own.
+            if let Some(id) = thread {
+                match crate::syscall::last_answer_of(id) {
+                    Some((number, value)) => println!(
+                        "  Its last foreign call was syscall {number}, answered {value:#x}."
+                    ),
+                    None => println!("  No foreign call of its is remembered."),
+                }
+            }
             println!("==================================================================");
 
             // **The report is over and the machine lives, so the console goes
