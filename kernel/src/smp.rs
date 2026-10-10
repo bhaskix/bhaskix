@@ -72,9 +72,18 @@ static PROTECTED: AtomicU32 = AtomicU32::new(0);
 fn protect_this_cpu() {
     // SAFETY: init on this CPU; every deliberate access to user memory goes
     // through `uaccess`, as on the bootstrap CPU, which enabled the same bits.
+    // Caches first: everything after runs at the speed they give it.
+    if unsafe { bhaskix_arch::cpu::enable_caching() } {
+        UNCACHED_ON_ARRIVAL.fetch_add(1, Ordering::AcqRel);
+    }
+    // SAFETY: as above.
     unsafe { bhaskix_arch::cpu::enable_supervisor_protections() };
     note_protections();
 }
+
+/// CPUs that arrived with caching disabled (`CR0.CD` or `NW`), and were turned
+/// on. See `cpu::enable_caching`.
+static UNCACHED_ON_ARRIVAL: AtomicU32 = AtomicU32::new(0);
 
 /// Counts this CPU into [`PROTECTED`] if it has what
 /// `cpu::enable_supervisor_protections` asks for, **read back live** rather
@@ -620,6 +629,13 @@ pub fn report(handoff: &bhaskix_boot::Handoff) {
         core::hint::spin_loop();
         protected = PROTECTED.load(Ordering::Acquire);
     }
+    // Said every boot, zero included: a machine's INIT leaving caches off is a
+    // fact about it worth one line, and the line is how the SR550 answers.
+    println!(
+        "    caching        {} of {} secondaries arrived with it off, and were turned on",
+        UNCACHED_ON_ARRIVAL.load(Ordering::Acquire),
+        online.saturating_sub(1)
+    );
     if protected == online {
         println!(
             "    supervisor     wp, and smep and smap where the processor has them, live on {protected} of {online} cpus"

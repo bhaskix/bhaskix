@@ -3709,6 +3709,19 @@ else
     status=1
 fi
 
+# **Whether a started CPU arrived with its caches off** (2026-10-10). A fact
+# about the machine rather than a pass or fail: each secondary clears `CR0.CD`
+# and `NW` if INIT left them set, and the report counts how many did. The gate
+# only holds that the line is there, with a count no larger than the CPUs.
+caching_line="$(grep -aE 'caching +[0-9]+ of [0-9]+ secondaries arrived' "$LOG" | tr -d '\r' | head -1)"
+if [[ "$caching_line" =~ caching\ +([0-9]+)\ of\ ([0-9]+)\ secondaries ]] \
+    && (( BASH_REMATCH[1] <= BASH_REMATCH[2] )); then
+    pass "caching on every secondary: ${BASH_REMATCH[1]} of ${BASH_REMATCH[2]} arrived with it off"
+else
+    fail "no caching line, or a count past the CPUs: '${caching_line:-none}'"
+    status=1
+fi
+
 # **No Linux call answered by the native dispatcher** (2026-10-10). The dialect
 # is chosen from a per-CPU note, and a native `BadSyscall` is `1` -- the value a
 # Linux memory probe died holding on 2026-10-09 with no foreign answer of `1`

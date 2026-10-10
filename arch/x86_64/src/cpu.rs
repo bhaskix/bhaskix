@@ -237,6 +237,42 @@ pub unsafe fn protections_live() -> (bool, bool, bool) {
 
 /// `CR0.WP` — ring 0 honours read-only pages.
 const CR0_WP: u64 = 1 << 16;
+/// `CR0.NW` — not write-through.
+const CR0_NW: u64 = 1 << 29;
+/// `CR0.CD` — cache disable.
+const CR0_CD: u64 = 1 << 30;
+
+/// Turns this CPU's caches on if they arrived off; answers whether they had.
+///
+/// **A CPU the kernel starts itself takes CR0 from INIT** (2026-10-10), and
+/// the trampoline only adds paging and protection to it. Whether INIT leaves
+/// `CD` and `NW` set on real hardware is recalled, not read — and under KVM the
+/// secondaries read them clear — so this does not assume either: it clears
+/// them where found and says so, and the boot report counts the CPUs it found
+/// that way. The candidate it tests: a secondary on the SR550 running uncached,
+/// which would be slow enough to miss a two-second bound that the same machine
+/// meets when its loader starts the CPUs instead.
+///
+/// # Safety
+///
+/// Init on this CPU, CPL 0.
+pub unsafe fn enable_caching() -> bool {
+    let cr0: u64;
+    // SAFETY: reading a control register at CPL 0 has no side effects.
+    unsafe {
+        core::arch::asm!("mov {}, cr0", out(reg) cr0, options(nomem, nostack, preserves_flags));
+    }
+    if cr0 & (CR0_CD | CR0_NW) == 0 {
+        return false;
+    }
+    // SAFETY: CPL 0; only `CD` and `NW` change, everything else is kept. The
+    // write-back afterwards empties whatever the uncached period left behind.
+    unsafe {
+        core::arch::asm!("mov cr0, {}", in(reg) cr0 & !(CR0_CD | CR0_NW), options(nostack, preserves_flags));
+        core::arch::asm!("wbinvd", options(nostack, preserves_flags));
+    }
+    true
+}
 /// `CR4.OSFXSR` — the OS says it saves and restores SSE state.
 const CR4_OSFXSR: u64 = 1 << 9;
 /// `CR4.OSXMMEXCPT` — unmasked SSE exceptions arrive as `#XM`, not `#UD`.

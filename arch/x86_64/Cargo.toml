@@ -31,7 +31,8 @@ workspace = true
 # second architecture arrives, this is the size of the port.
 # 40 on 2026-10-08: three sites for write protection -- `CR0` read and
 # written in `enable_supervisor_protections`, and read in `protections_live`.
-asm_budget = 40
+# 43 on 2026-10-10: `enable_caching`'s `CR0` read and write and its `wbinvd`.
+asm_budget = 43
 # `arch` is one of the places `unsafe` is permitted (docs/coding-style.md §3):
 # port I/O and CPU control instructions cannot be expressed any other way.
 #
@@ -170,7 +171,10 @@ asm_budget = 40
 # `protections_live`, which reads `CR0` and `CR4` so each CPU can say what it
 # actually has -- because the secondaries had SMEP and SMAP off, and WP off
 # under the native loader, while the report said otherwise.
-unsafe_budget = 1189
+# 1196 on 2026-10-10: seven lines for `enable_caching` -- reading `CR0`, and
+# clearing `CD`/`NW` with a `wbinvd` after -- so a CPU the kernel starts says
+# whether INIT left its caches off, rather than this being assumed either way.
+unsafe_budget = 1196
 # Raised from 1070 for ECAM -- one volatile read of configuration space as
 # memory -- and for counting the bytes the transmitter gives up on. The second
 # is two lines and bought a silent data loss becoming a visible number.
