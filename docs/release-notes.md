@@ -134,8 +134,7 @@ other rows' defects).
 
 | Defect — what you would see | Rate, as TRACKER states it | Fix |
 |---|---|---|
-| Through its own loader on the SR550, the serial line reads back masked, so there is no console input and no shell | found 2026-10-08, every native boot there | **root-caused and fixed 2026-10-08**: the line was waiting for an acknowledge, and the check misread it; not yet confirmed on the SR550 |
-| Through its own loader on the SR550, a hosted program reading `/proc/self` never finishes | found 2026-10-08, two of two sixteen-CPU boots | unexplained |
+| Through its own loader on the SR550, a hosted program reading `/proc/self` never finishes | found 2026-10-08, three of three sixteen-CPU boots | unexplained |
 | A ring-station scheduler self-test halts with a station asleep on its own turn | 1 in 391 CI boots before a fix of 2026-09-28; **0 in 657 since** (2026-10-04) | fix landed; open until ~1,200 clean boots |
 | An outbound TCP demonstration stalls: `connected, stream still in flight` | 10 sightings, 1 in 773 boots (2026-09-28) | none |
 | A lock-order self-test fails: a wait queue taken while holding another lock | 4 in 7,681 boots; last 2026-09-23 | a cause fixed 2026-09-28; open until ~5,800 clean boots |
@@ -165,6 +164,7 @@ not yet absence.
 | A socket reclaim returned the slot but not the port | **2026-09-01** — the gate raced its own precondition |
 | The TCP inbound gate failed at an environmental rate | **2026-08-31** — [RFC 0061](rfc/0061-a-connection-nobody-accepted.md): a connection nobody accepted held the only slot |
 | SMEP and SMAP were enabled on one CPU of four (one of sixteen on the SR550), and under the native loader write protection on none the kernel started — while the report said "on" | **2026-10-08** — every CPU now enables and reads back all three, gated on every lane |
+| Through its own loader, the SR550 ended every boot with no shell: the serial line read back masked | **2026-10-08** — the line was waiting for an acknowledge and the check misread it; the machine reached its shell on 2026-10-10 |
 | Through its own loader, the SR550 started one CPU of sixteen | **2026-10-08** — bring-up tables from below 4 GiB; sixteen of sixteen on the machine |
 | Through its own loader, a copy-on-write write on the SR550 landed in the original frame | **2026-10-08** — nothing set `CR0.WP`; set on every CPU, and the machine passes |
 | The native loader stopped on the SR550 after leaving the firmware | **2026-10-08** — its page-table pool was sized under an emulator; sized from the machine, it boots there |
@@ -201,9 +201,11 @@ ping (2026-09-13).
   the machine, **a second boot the same day reached the kernel and its whole
   report** — with one CPU of sixteen and a failed copy-on-write check, both fixed
   the same day: **a third boot ran all sixteen CPUs**, each with write protection,
-  SMEP and SMAP read back, and copy-on-write passing. What remains: **no shell**
-  (the serial line's interrupt entry reads back masked on this machine with this
-  loader) and one hosted self-test that did not finish.
+  SMEP and SMAP read back, and copy-on-write passing. ~~What remains: **no shell**~~
+  **On 2026-10-10 it reached the shell** — the same kernel shell the machine reaches
+  through Limine — after a check that misread a waiting serial line as a dead one
+  was fixed. What remains is one hosted self-test (`/proc/self`) that has not
+  finished on any of three sixteen-CPU boots there.
 - **Get an answer to `SET_ADDRESS` from whatever is on its xHCI's port 1.**
 - **Obtain an address, start an exchange, or carry TCP** on its network.
 
