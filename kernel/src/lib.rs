@@ -31688,7 +31688,7 @@ fn verify_timer() {
 ///
 /// The log is untrusted -- firmware wrote it -- and is only read here, with
 /// the fuzzed parser; nothing is decided on it yet.
-fn report_measurement(measurement: bhaskix_boot::Measurement) {
+fn report_measurement(measurement: bhaskix_boot::Measurement, cmdline_empty: bool) {
     use bhaskix_boot::Measurement;
     use bhaskix_tcglog::{EV_EVENT_TAG, log, measured};
     let (bytes, truncated) = match measurement {
@@ -31753,11 +31753,18 @@ fn report_measurement(measurement: bhaskix_boot::Measurement) {
     fn text(b: &[u8; 8]) -> &str {
         core::str::from_utf8(b).unwrap_or("?").trim_end()
     }
+    // An empty command line is not measured (RFC 0089 step 8): said as that,
+    // never as `MISSING`, and only when the log indeed has no event for it.
+    let cmdline = if cmdline_empty && found[2].is_none() {
+        "empty, not measured"
+    } else {
+        text(&c)
+    };
     println!(
         "    measured boot   kernel {} initrd {} cmdline {} (sha256, PCR 9/9/8); {} events, log {}",
         text(&k),
         text(&i),
-        text(&c),
+        cmdline,
         events,
         if truncated { "TRUNCATED" } else { "complete" }
     );
@@ -31778,7 +31785,7 @@ fn report_boot_state(
     println!("  boot");
     println!("    loader          {}", handoff.loader);
     println!("    handoff version {}", handoff.version);
-    report_measurement(handoff.measurement);
+    report_measurement(handoff.measurement, handoff.cmdline.is_empty());
     println!(
         "    cmdline         {}",
         if handoff.cmdline.is_empty() {

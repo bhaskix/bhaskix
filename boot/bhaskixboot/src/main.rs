@@ -137,20 +137,39 @@ fn report_payload(name: &str, bytes: &[u8]) {
 /// RFC 0089. Nothing here refuses the boot: measurement is evidence, and a
 /// measurement the firmware refused is reported as refused, so the boot that
 /// follows is never mistaken for a measured one.
+///
+/// **An empty command line is not measured** (the lead's decision, RFC 0089
+/// step 8): asked to hash zero bytes, the SR550's firmware logged the previous
+/// measurement's digest, where OVMF logs SHA-256 of nothing. A zero-length
+/// measurement is not one every firmware makes, so none is asked for; PCR 8
+/// is then left as the firmware left it, and the boot report says so.
+///
+/// `early_event_log` is a test option (`boot.conf`, step 8): ask for the log
+/// once before measuring, as the SR550's firmware evidently does, so that the
+/// loader's own `GetEventLog` is not the first.
 fn measure(
     table: *mut SystemTable,
     kernel: &[u8],
     initrd: &[u8],
     cmdline: &str,
+    early_event_log: bool,
 ) -> Option<*mut efi::Tcg2> {
     use bhaskix_tcglog::measured;
     let Some(tcg2) = efi::tcg2(table) else {
         diag("bhaskixboot: no TCG2 protocol; nothing is measured\r\n");
         return None;
     };
+    if early_event_log {
+        let _ = efi::get_event_log(tcg2);
+        diag("bhaskixboot: GetEventLog asked early (test option early-event-log)\r\n");
+    }
     measure_one(tcg2, measured::KERNEL, "kernel", kernel);
     measure_one(tcg2, measured::INITRD, "initrd", initrd);
-    measure_one(tcg2, measured::CMDLINE, "cmdline", cmdline.as_bytes());
+    if cmdline.is_empty() {
+        diag("bhaskixboot: the command line is empty; not measured\r\n");
+    } else {
+        measure_one(tcg2, measured::CMDLINE, "cmdline", cmdline.as_bytes());
+    }
     Some(tcg2)
 }
 
@@ -190,6 +209,14 @@ fn copy_event_log(table: *mut SystemTable, tcg2: *mut efi::Tcg2) -> handoff::Rec
         Ok(answer) => answer,
         Err(_) => return unreadable("GetEventLog refused"),
     };
+    // What the final events table already holds at this call -- RFC 0089
+    // step 8. The table keeps every event since the *first* `GetEventLog`,
+    // whoever asked; events in it now are in the log just returned as well.
+    // Only what comes after them is appended after the exit, as Linux skips
+    // its `final_events_preboot_size`.
+    let preboot = efi::find_tables(table)
+        .final_events
+        .map_or(0, |at| final_events_header(at).1);
     if location == 0 || last < location || (last - location) as usize > EVENT_LOG_MAX {
         return unreadable("the firmware's answer is out of bounds");
     }
@@ -247,8 +274,23 @@ fn copy_event_log(table: *mut SystemTable, tcg2: *mut efi::Tcg2) -> handoff::Rec
         phys: base,
         len,
         room: pages * PAGE_SIZE as usize,
+        preboot,
         truncated,
     }
+}
+
+/// The final events table's fixed part: its version and its count of events.
+/// Read at the loader's `GetEventLog` and again after the exit.
+fn final_events_header(table: u64) -> (u64, u64) {
+    // SAFETY: the table's fixed part, at the address its configuration entry
+    // gives; ACPI NVS, identity-mapped before the exit and after it.
+    let fixed = unsafe { core::slice::from_raw_parts(table as *const u8, 16) };
+    let word = |at: usize| {
+        let mut eight = [0u8; 8];
+        eight.copy_from_slice(&fixed[at..at + 8]);
+        u64::from_le_bytes(eight)
+    };
+    (word(0), word(8))
 }
 
 /// Appends the firmware's final events to the copy -- RFC 0089 step 6.
@@ -269,6 +311,7 @@ fn append_final_events(recorded: handoff::Recorded, table: Option<u64>) -> hando
         phys,
         len,
         room,
+        preboot,
         truncated,
     } = recorded
     else {
@@ -282,6 +325,7 @@ fn append_final_events(recorded: handoff::Recorded, table: Option<u64>) -> hando
             phys,
             len: end,
             room,
+            preboot,
             truncated: true,
         }
     };
@@ -295,24 +339,22 @@ fn append_final_events(recorded: handoff::Recorded, table: Option<u64>) -> hando
         return short(len, "the copy's header does not parse");
     };
     let spec = *parsed.spec();
-    // SAFETY: the table's fixed part, a version and a count, at the address
-    // its configuration entry gives; ACPI NVS, identity-mapped.
-    let fixed = unsafe { core::slice::from_raw_parts(table as *const u8, 16) };
-    let word = |at: usize| {
-        let mut eight = [0u8; 8];
-        eight.copy_from_slice(&fixed[at..at + 8]);
-        u64::from_le_bytes(eight)
-    };
-    let (version, count) = (word(0), word(8));
+    let (version, count) = final_events_header(table);
     if version != FINAL_EVENTS_VERSION {
         return short(len, "the table's version is not 1");
     }
     if count > FINAL_EVENTS_MAX {
         return short(len, "the table's count is not believable");
     }
+    if preboot > count {
+        return short(
+            len,
+            "the table holds fewer events than it did at GetEventLog",
+        );
+    }
     let mut at = table + 16;
     let mut end = len;
-    for _ in 0..count {
+    for index in 0..count {
         // SAFETY: the table's count places an entry at `at`, and an entry is
         // at least its fixed prefix, whose size the header fixes.
         let prefix =
@@ -320,27 +362,34 @@ fn append_final_events(recorded: handoff::Recorded, table: Option<u64>) -> hando
         let Ok(entry_len) = log::event2_len_from_prefix(prefix, &spec) else {
             return short(end, "an entry's length");
         };
-        if entry_len > room - end {
-            return short(end, "more than the room the copy kept");
-        }
         // SAFETY: as above, now the whole entry its own prefix declares.
         let entry = unsafe { core::slice::from_raw_parts(at as *const u8, entry_len) };
         if log::event2_len(entry, &spec) != Ok(entry_len) {
             return short(end, "an entry does not parse");
         }
+        at += entry_len as u64;
+        // Already in the copy: logged before the loader's own `GetEventLog`.
+        if index < preboot {
+            continue;
+        }
+        if entry_len > room - end {
+            return short(end, "more than the room the copy kept");
+        }
         copy[end..end + entry_len].copy_from_slice(entry);
         end += entry_len;
-        at += entry_len as u64;
     }
     serial::write("bhaskixboot: final events ");
-    serial::write_dec(count);
+    serial::write_dec(count - preboot);
     serial::write(" (");
     serial::write_dec((end - len) as u64);
-    serial::write(" bytes) appended after the exit\r\n");
+    serial::write(" bytes) appended after the exit; ");
+    serial::write_dec(preboot);
+    serial::write(" already in the log at GetEventLog, not appended twice\r\n");
     handoff::Recorded::Log {
         phys,
         len: end,
         room,
+        preboot,
         truncated,
     }
 }
@@ -503,23 +552,28 @@ extern "efiapi" fn efi_main(image_handle: usize, system_table: *mut SystemTable)
     report_payload("initrd", &initrd_buffer[..initrd_len]);
 
     let mut conf = [0u8; 4096];
-    let cmdline: &str = match read_fully(root, CONFIG_PATH, &mut conf) {
+    let conf_text: &str = match read_fully(root, CONFIG_PATH, &mut conf) {
         Ok(len) => {
             report_payload("conf", &conf[..len]);
-            // One line, `cmdline=<rest>`; anything else is an empty
-            // command line, from the shape of the parse rather than a
-            // guess.
-            core::str::from_utf8(&conf[..len])
-                .ok()
-                .and_then(|text| text.lines().next())
-                .and_then(|line| line.strip_prefix("cmdline="))
-                .unwrap_or("")
+            core::str::from_utf8(&conf[..len]).unwrap_or("")
         }
         Err(_) => {
             serial::write("bhaskixboot: payload conf absent; the command line is empty\r\n");
             ""
         }
     };
+    // The first line, `cmdline=<rest>`; anything else is an empty command
+    // line, from the shape of the parse rather than a guess. Later lines are
+    // options; one exists, a test option (RFC 0089 step 8).
+    let cmdline = conf_text
+        .lines()
+        .next()
+        .and_then(|line| line.strip_prefix("cmdline="))
+        .unwrap_or("");
+    let early_event_log = conf_text
+        .lines()
+        .skip(1)
+        .any(|line| line.trim() == "early-event-log");
     efi::close(root);
 
     // **Measured before anything interprets it** -- RFC 0089. The bytes as
@@ -530,6 +584,7 @@ extern "efiapi" fn efi_main(image_handle: usize, system_table: *mut SystemTable)
         &kernel_buffer[..kernel_len],
         &initrd_buffer[..initrd_len],
         cmdline,
+        early_event_log,
     );
     // And the log those measurements went into, copied while the protocol
     // that names it still exists -- RFC 0089 step 3.

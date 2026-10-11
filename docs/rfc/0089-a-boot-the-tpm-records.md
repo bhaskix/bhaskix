@@ -55,6 +55,13 @@ protocol does not survive it:
 | initrd, as read from `bhaskix\initrd.tar` | 9 | `EV_EVENT_TAG` | tag + `"bhaskix initrd"` |
 | command line, after `cmdline=` is stripped | 8 | `EV_EVENT_TAG` | tag + `"bhaskix cmdline"` |
 
+**An empty command line is not measured** — the lead's decision, 2026-10-11, step 8. Asked to hash
+zero bytes, the SR550's firmware logged the *previous* measurement's digest (the initrd's), where
+OVMF logs SHA-256 of nothing; a zero-length measurement is not one every firmware makes. So none is
+asked for: the loader says `the command line is empty; not measured`, PCR 8 is left as the firmware
+left it, and the boot report reads `cmdline empty, not measured`. A non-empty command line is
+measured exactly as before.
+
 **PCRs 8 and 9 because the platform firmware profile gives the OS PCRs 8–15** and grub's practice is
 8 for commands and the command line, 9 for files read — recorded in the UAPI group's Linux TPM PCR
 Registry, which also lists 10–15 as taken by IMA, `systemd-stub`, shim and cryptsetup. Following an
@@ -91,7 +98,13 @@ loader's call is the first and the table is empty at it, so every gate passed; o
 verdict was `disagree on PCRs 0-6, 8-9` while the TPM's own PCR 9 matched QEMU's for the same
 payload. Linux's EFI stub, read the same day, counts the events already in the table at its own
 call (`final_events_preboot_size`, `libstub/tpm.c`) and its driver appends only those after
-(`eventlog/efi.c`). The loader must do the same. The loader keeps 32 KiB of room past
+(`eventlog/efi.c`). The loader must do the same. **And does, since the same evening**: it reads the
+table's count right after its own `GetEventLog`, carries it in the record, and after the exit walks
+every entry but appends only those past that count, saying how many it did not append twice. A
+QEMU boot with the test option `early-event-log` — the loader asks once before measuring, as the
+SR550's firmware evidently does — holds it: `2 final event(s) not appended twice`, and the verdict
+agrees; with the skip removed, the same boot reads `disagree on PCR 9 (agree on 0-7)`, the SR550's
+failure reproduced on an emulator. The loader keeps 32 KiB of room past
 its copy (EDK2's `PcdTcg2FinalLogAreaLen`) and appends the table's events after
 `ExitBootServices` -- whose own two `EV_EFI_ACTION` events into PCR 5 are the reason this matters.
 
@@ -477,4 +490,8 @@ path after boot.
    0-6, 8-9 (agree on 7)` — the log side, not the TPM's, because of the 6a defect stated under *The
    protocol*. A second finding: with an empty command line this firmware logged the cmdline event
    with the **initrd's** digest; OVMF, given the same zero-length buffer, logs `e3b0c442`, SHA-256
-   of nothing. So on this machine an empty command line is not measured at all. Both are open.
+   of nothing. So on this machine an empty command line is not measured at all. ~~Both are
+   open.~~ **Both fixed the same evening** (see *The protocol* and *What is measured*): the final
+   events are counted at the loader's own call, and an empty command line is no longer measured,
+   by the lead's decision. A CRB-lane boot with an early `GetEventLog` and no command line holds
+   both, armed red each way. The second SR550 boot is pending the lead's word.

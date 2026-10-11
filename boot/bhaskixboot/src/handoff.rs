@@ -103,6 +103,10 @@ pub enum Recorded {
         /// Bytes allocated for it: the log, and room past it for the final
         /// events appended after the exit.
         room: usize,
+        /// Events the final events table already held at the loader's
+        /// `GetEventLog`, which the copy holds too and are not appended
+        /// again (RFC 0089 step 8).
+        preboot: u64,
         /// The firmware's own truncation flag, or the loader's when the final
         /// events could not all be carried.
         truncated: bool,

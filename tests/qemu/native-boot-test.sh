@@ -771,6 +771,39 @@ PY
             status=1
         fi
         rm -f "$LYING_LOG"
+
+        # RFC 0089 step 8's case, on QEMU: **the loader's `GetEventLog` is not
+        # the first.** On the SR550 something asked before it, the final
+        # events table already held events the copy held too, and appending
+        # them all replayed them twice: `disagree on PCRs 0-6, 8-9` while the
+        # TPM's own PCR 9 was right. The test option `early-event-log` asks
+        # once before the loader measures, which makes OVMF behave the same
+        # way; the fix counts what the table holds at the loader's own call
+        # and appends only what follows. The same boot has no command line,
+        # which since the same day is not measured at all -- so the verdict
+        # must agree on PCRs 5 and 9 and name no PCR 8. The CRB lane only: the
+        # firmware's log is the same whichever interface the TPM speaks.
+        if [[ "$TPM_INTERFACE" == crb ]]; then
+            echo "the early-log arm: GetEventLog asked early, no command line, up to ${TIMEOUT}s..."
+            EARLY_LOG=$(mktemp)
+            printf 'cmdline=\nearly-event-log\n' > "$ESP/bhaskix/boot.conf"
+            tpm_boot "$EARLY_LOG"
+            printf 'cmdline=kaslr=show\n' > "$ESP/bhaskix/boot.conf"
+            early="$(verdict_of "$EARLY_LOG")"
+            preboot=$(grep -aoE "appended after the exit; [0-9]+ already in the log at GetEventLog" "$EARLY_LOG" \
+                | grep -oE '[0-9]+' | head -1)
+            if grep -qF "bhaskixboot: GetEventLog asked early (test option early-event-log)" "$EARLY_LOG" \
+                && [[ "${preboot:-0}" -ge 2 ]] \
+                && grep -qF "bhaskixboot: the command line is empty; not measured" "$EARLY_LOG" \
+                && grep -qE "measured boot   kernel [0-9a-f]{8} initrd [0-9a-f]{8} cmdline empty, not measured" "$EARLY_LOG" \
+                && agrees_on "$early" 5 9 && ! agrees_on "$early" 8; then
+                pass "an early GetEventLog and an empty command line: $preboot final event(s) not appended twice, and $early"
+            else
+                fail "the early-log arm: '${early:-no verdict}', $(grep -aE 'bhaskixboot: (final events|GetEventLog asked|the command line)|measured boot' "$EARLY_LOG" | tr -d '\r' | tr '\n' ' ')"
+                status=1
+            fi
+            rm -f "$EARLY_LOG"
+        fi
     else
         fail "the kernel image has no .debug_info section to flip a byte in"
         status=1
