@@ -26,10 +26,21 @@ const REGIONS_AT: u64 = 0x1000;
 const CMDLINE_AT: u64 = 0x4000;
 const STACK_TOP: u64 = 0x2_0000;
 
-/// The most regions the block's array holds. A firmware map larger than
-/// this is refused loudly by the caller, not truncated quietly — the shim's
-/// rule, kept.
-pub const MAX_REGIONS: usize = 128;
+/// The most regions the block's array holds: every slot between its offset and
+/// the command line's. A firmware map larger than this is refused loudly by the
+/// caller, not truncated quietly — the shim's rule, kept.
+///
+/// **Derived from the layout, not chosen** (2026-10-11). It was a flat 128, a
+/// quarter of what the space holds, and CI's 2024 OVMF with a TPM attached
+/// handed over **132** descriptors: the loader refused, as written, with
+/// `status 0x84` — the count. This machine's firmware gives fewer and the SR550
+/// 47, so nothing here had come near it.
+pub const MAX_REGIONS: usize =
+    (CMDLINE_AT - REGIONS_AT) as usize / core::mem::size_of::<MemoryRegion>();
+const _: () = assert!(
+    MAX_REGIONS >= 256,
+    "the region array is smaller than intended"
+);
 
 /// One UEFI memory type, in the handoff's vocabulary.
 ///
