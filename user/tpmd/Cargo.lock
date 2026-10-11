@@ -7,6 +7,17 @@ name = "bhaskix-abi"
 version = "0.0.0"
 
 [[package]]
+name = "bhaskix-pkg"
+version = "0.0.0"
+dependencies = [
+ "bhaskix-ustar",
+]
+
+[[package]]
+name = "bhaskix-tcglog"
+version = "0.0.0"
+
+[[package]]
 name = "bhaskix-tpm"
 version = "0.0.0"
 
@@ -15,5 +26,11 @@ name = "bhaskix-user-tpmd"
 version = "0.0.0"
 dependencies = [
  "bhaskix-abi",
+ "bhaskix-pkg",
+ "bhaskix-tcglog",
  "bhaskix-tpm",
 ]
+
+[[package]]
+name = "bhaskix-ustar"
+version = "0.0.0"

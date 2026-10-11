@@ -1945,12 +1945,13 @@ pub mod net_ring {
     const _: () = assert!(WORDS * 8 <= 4096);
 }
 
-/// The TPM service's protocol -- RFC 0089 step 5c, `bin/tpmd`.
+/// The TPM service's protocol -- RFC 0089 steps 5c and 6, `bin/tpmd`.
 ///
-/// **One method, on purpose.** The service builds no command but
+/// **Two methods, both reads, on purpose.** The service builds no command but
 /// `TPM2_PCR_Read`, so an extend, a clear or a hierarchy command is not
-/// reachable through it; a second method here would be the place that stopped
-/// being true.
+/// reachable through it; [`REPLAY`] reads PCRs the same way and compares them
+/// with the log. A method here that built any other command would be the
+/// place that stopped being true.
 pub mod tpm {
     /// Read one PCR in the SHA-256 bank. `args[0]` = the PCR, below 24.
     ///
@@ -1959,7 +1960,26 @@ pub mod tpm {
     /// big-endian, so the bytes read in order.
     pub const PCR_READ: u64 = 1;
 
-    /// What a [`PCR_READ`] reply's `method` word says.
+    /// Replay the event log the kernel copied into this service's space at
+    /// [`LOG_AT`] with the tree's SHA-256, read every PCR it touched, and
+    /// compare -- RFC 0089 step 6. No arguments.
+    ///
+    /// On [`outcome::OK`] the reply's words are: a bit per PCR the log
+    /// touched, a bit per PCR whose value the TPM agrees with, the events
+    /// folded, and zero. On [`outcome::NOT_CHECKED`], `args[0]` is a
+    /// [`not_checked`] reason and `args[1]` its detail. A PCR read that fails
+    /// is answered as [`PCR_READ`] answers it.
+    pub const REPLAY: u64 = 2;
+
+    /// Where the kernel puts the log in `bin/tpmd`'s space, read-only, before
+    /// the program starts; its length is the program's first entry argument.
+    pub const LOG_AT: u64 = 0x0000_0000_3000_0000;
+
+    /// The most log the kernel copies there: the loader's largest copy, a
+    /// 256 KiB log and 32 KiB of final events.
+    pub const LOG_MAX: u64 = 288 * 1024;
+
+    /// What a [`PCR_READ`] or [`REPLAY`] reply's `method` word says.
     pub mod outcome {
         /// The value is in the argument words.
         pub const OK: u64 = 0;
@@ -1972,6 +1992,28 @@ pub mod tpm {
         pub const TPM: u64 = 3;
         /// The TPM's answer was refused by the parser; `args[0]` says why.
         pub const RESPONSE: u64 = 4;
+        /// [`super::REPLAY`] could not replay the log; `args[0]` is a
+        /// [`super::not_checked`] reason.
+        pub const NOT_CHECKED: u64 = 5;
+    }
+
+    /// Why a [`REPLAY`] did not check, in `args[0]` of a
+    /// [`outcome::NOT_CHECKED`] reply; `args[1]` is the detail named.
+    pub mod not_checked {
+        /// The service was given no log.
+        pub const NO_LOG: u64 = 1;
+        /// The log's header does not parse.
+        pub const HEADER: u64 = 2;
+        /// The header declares no SHA-256 bank.
+        pub const NO_SHA256: u64 = 3;
+        /// The header declares SHA-256 at another size; the detail is it.
+        pub const SHA256_SIZE: u64 = 4;
+        /// An event names a PCR past 23; the detail is the PCR.
+        pub const PCR: u64 = 5;
+        /// PCR 0's start value is stated after PCR 0 was extended.
+        pub const LATE_START: u64 = 6;
+        /// The walk stopped at a malformed event.
+        pub const WALK: u64 = 7;
     }
 }
 

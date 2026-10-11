@@ -570,6 +570,13 @@ Domain 0 / init (measured)
   not describe as RAM before granting it, since the address is firmware's — and an endpoint on
   which it answers PCR reads. It builds no other TPM command, so nothing reaching it can extend,
   clear or touch a hierarchy. A compromise of it reads PCRs, which are not secret.
+  **Since 2026-10-11 (step 6)** it also replays the event log, which the kernel copies read-only
+  into its own memory before it starts, and answers whether the log and the TPM agree. That added
+  no capability -- the log is public bytes -- but it does mean **the verdict is only as good as
+  `bin/tpmd`**: a compromise of it could print agreement that is not there. So the line is a boot
+  report, not evidence a remote party should accept; attestation (§10) quotes the TPM, it does not
+  ask `tpmd`. The `bhaskix.fault=tpm-log` boot option that tests the red line changes the copy
+  `tpmd` replays and nothing the TPM holds, so it can turn the verdict red and never green.
 - **Sealing:** disk encryption keys are sealed to a PCR policy. A tampered boot chain cannot unseal
   them. The failure mode is "the disk does not decrypt", not "the disk decrypts for an attacker".
 

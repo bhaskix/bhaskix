@@ -225,9 +225,42 @@ QEMU_PID=$!
 # report to RFC 0089's `tpm` line, which the kernel prints after PCI comes
 # up: a lane that stopped at the shootdown never saw it. With a CRB TPM the
 # last line is `bin/tpmd`'s answer, or its failure -- not the discovery line
-# before it (step 5c).
+# before it (step 5c). **And again on 2026-10-11** (step 6): the replay's
+# verdict follows the PCR line, so a lane that stopped at the PCR line could
+# miss it. The verdict is printed after every PCR outcome, failures included;
+# only a `bin/tpmd` that never started has no verdict, and says `FAILED to`.
+# The replay's verdict line, colour stripped -- RFC 0089 step 6.
+verdict_of() {
+    grep -aE "tpm            (log and TPM agree|log not checked|FAILED: the log|FAILED: bin/tpmd never answered the replay|FAILED: the replay)" "$1" 2>/dev/null \
+        | tr -d '\r' | sed 's/\x1b\[[0-9;]*m//g; s/^ *tpm *//' | head -1
+}
+# The PCRs a set names, one per line: `0-4, 6-9` -> 0 1 2 3 4 6 7 8 9.
+pcrs_in() {
+    local part parts
+    IFS=',' read -ra parts <<< "$1"
+    for part in "${parts[@]}"; do
+        part="${part// /}"
+        if [[ "$part" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+            seq "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"
+        elif [[ "$part" =~ ^[0-9]+$ ]]; then
+            echo "$part"
+        fi
+    done
+}
+# Whether verdict "$1" is an agreement naming every PCR after it.
+agrees_on() {
+    local re='^log and TPM agree on PCRs? ([0-9, -]+): ([1-9][0-9]*) events replayed \(sha256\), in bin/tpmd$'
+    [[ "$1" =~ $re ]] || return 1
+    local named pcr
+    named=" $(pcrs_in "${BASH_REMATCH[1]}" | tr '\n' ' ')"
+    shift
+    for pcr in "$@"; do
+        [[ "$named" == *" $pcr "* ]] || return 1
+    done
+}
+TPM_LAST="tpm            (log and TPM agree|log not checked|FAILED: the log|FAILED: bin/tpmd never answered the replay|FAILED: the replay|FAILED to |no TPM2 table|start method|no ACPI)"
 for _ in $(seq 1 "$TIMEOUT"); do
-    if grep -qE "tpm            (PCR 8|FAILED|no TPM2 table|start method|no ACPI)|bhaskixboot: (the exit was refused|the exit succeeded with an empty|the table pool ran dry|payload .* REFUSED|the kernel image failed)" "$LOG" 2>/dev/null; then
+    if grep -qE "$TPM_LAST|bhaskixboot: (the exit was refused|the exit succeeded with an empty|the table pool ran dry|payload .* REFUSED|the kernel image failed)" "$LOG" 2>/dev/null; then
         break
     fi
     sleep 1
@@ -521,8 +554,24 @@ if [[ "${BHASKIX_TPM:-0}" == 1 ]]; then
         fail "bin/tpmd did not read PCRs 8 and 9: $(grep -aE '^ *tpm  ' "$LOG" | tr -d '\r' | tail -2 | tr '\n' ' ')"
         status=1
     fi
+    # RFC 0089 step 6: **the log and the TPM agree.** `bin/tpmd` replayed the
+    # whole log with the tree's SHA-256 and read every PCR it touched. Which
+    # PCRs the firmware extends is the firmware's business; the gate demands 5
+    # -- `ExitBootServices`' own, carried only in the final events table --
+    # and 8 and 9, the loader's.
+    if agrees_on "$(verdict_of "$LOG")" 5 8 9; then
+        pass "the log, replayed, agrees with the TPM: $(verdict_of "$LOG")"
+    else
+        fail "the log and the TPM were not shown to agree: '$(verdict_of "$LOG")'"
+        status=1
+    fi
 elif grep -qF "tpm            no TPM2 table" "$LOG" 2>/dev/null; then
-    pass "with no TPM the kernel found no TPM2 table"
+    if grep -qF "log and TPM agree" "$LOG"; then
+        fail "with no TPM the kernel still claimed the log and a TPM agree"
+        status=1
+    else
+        pass "with no TPM the kernel found no TPM2 table, and claimed no agreement"
+    fi
 else
     fail "with no TPM the kernel did not say there is no TPM2 table"
     status=1
@@ -572,6 +621,28 @@ printf 'XXXX' | dd of="$ESP/bhaskix/kernel" bs=1 count=4 conv=notrunc 2>/dev/nul
 # was right and the medium was wrong. A trap that only springs outside the
 # test that set it is the worst kind.
 restore_kernel() { cp "$KERNEL" "$ESP/bhaskix/kernel" 2>/dev/null; }
+# One more boot of the ESP as it now stands, with a fresh TPM, to the verdict
+# line or the timeout; its serial output goes to "$1".
+tpm_boot() {
+    cp "$OVMF_VARS" "$WRITABLE_VARS"
+    start_tpm
+    timeout "$TIMEOUT" qemu-system-x86_64 \
+        -machine q35 -cpu max -smp 4 -m 256 -display none \
+        -drive "if=pflash,unit=0,format=raw,readonly=on,file=$OVMF_CODE" \
+        -drive "if=pflash,unit=1,format=raw,file=$WRITABLE_VARS" \
+        -drive "format=raw,file=fat:rw:$ESP" \
+        "${TPM_ARGS[@]}" \
+        -serial "file:$1" \
+        >/dev/null 2>&1 &
+    local pid=$!
+    for _ in $(seq 1 "$TIMEOUT"); do
+        grep -qE "$TPM_LAST" "$1" 2>/dev/null && break
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 1
+    done
+    kill "$pid" 2>/dev/null
+    wait "$pid" 2>/dev/null
+}
 trap 'restore_kernel; stop_tpm' EXIT
 cp "$OVMF_VARS" "$WRITABLE_VARS"
 NEGATIVE_LOG=$(mktemp)
@@ -634,24 +705,7 @@ PY
     then
         echo "the digest arm: one kernel byte flipped, up to ${TIMEOUT}s..."
         FLIPPED_LOG=$(mktemp)
-        cp "$OVMF_VARS" "$WRITABLE_VARS"
-        start_tpm
-        timeout "$TIMEOUT" qemu-system-x86_64 \
-            -machine q35 -cpu max -smp 4 -m 256 -display none \
-            -drive "if=pflash,unit=0,format=raw,readonly=on,file=$OVMF_CODE" \
-            -drive "if=pflash,unit=1,format=raw,file=$WRITABLE_VARS" \
-            -drive "format=raw,file=fat:rw:$ESP" \
-            "${TPM_ARGS[@]}" \
-            -serial "file:$FLIPPED_LOG" \
-            >/dev/null 2>&1 &
-        FLIPPED_PID=$!
-        for _ in $(seq 1 "$TIMEOUT"); do
-            grep -qE "tpm            (PCR 8|FAILED)" "$FLIPPED_LOG" 2>/dev/null && break
-            kill -0 "$FLIPPED_PID" 2>/dev/null || break
-            sleep 1
-        done
-        kill "$FLIPPED_PID" 2>/dev/null
-        wait "$FLIPPED_PID" 2>/dev/null
+        tpm_boot "$FLIPPED_LOG"
         restore_kernel
         flipped="$(grep -aE 'measured boot   kernel' "$FLIPPED_LOG" | tr -d '\r' | head -1)"
         read -r k0 i0 c0 <<< "$MEASURED_DIGESTS"
@@ -672,6 +726,36 @@ PY
             fail "the TPM's PCRs after a flipped kernel byte: '${flipped_pcrs:-no PCR line}' against PCR 8 $p8, PCR 9 $p9"
             status=1
         fi
+        # Step 6: and the log still agrees with it -- a changed kernel boots
+        # *recorded*, which is the whole of what this RFC promises.
+        if agrees_on "$(verdict_of "$FLIPPED_LOG")" 5 8 9; then
+            pass "with the kernel changed, the log still agrees with the TPM: it recorded the change"
+        else
+            fail "after a flipped kernel byte the verdict was '$(verdict_of "$FLIPPED_LOG")'"
+            status=1
+        fi
+
+        # Step 6's red line, which needs a boot where the two do not agree:
+        # `bhaskix.fault=tpm-log` flips one byte of the kernel's digest in the
+        # copy `bin/tpmd` replays, and nothing the TPM holds. The disagreement
+        # must be named, and be PCR 9's alone -- the command line's extra word
+        # moves PCR 8, but in the log as well as the TPM.
+        echo "the replay arm: a log that lies about the kernel, up to ${TIMEOUT}s..."
+        LYING_LOG=$(mktemp)
+        printf 'cmdline=kaslr=show bhaskix.fault=tpm-log\n' > "$ESP/bhaskix/boot.conf"
+        tpm_boot "$LYING_LOG"
+        printf 'cmdline=kaslr=show\n' > "$ESP/bhaskix/boot.conf"
+        lying="$(verdict_of "$LYING_LOG")"
+        lying_re='^FAILED: the log and the TPM disagree on PCR 9 \(agree on ([0-9, -]+)\)$'
+        if grep -qF "fault injection: one byte of the kernel's digest flipped" "$LYING_LOG" \
+            && [[ "$lying" =~ $lying_re ]] \
+            && [[ " $(pcrs_in "${BASH_REMATCH[1]}" | tr '\n' ' ')" == *" 5 "*" 8 "* ]]; then
+            pass "a log that lies about the kernel is caught: $lying"
+        else
+            fail "a log with the kernel's digest flipped gave '${lying:-no verdict}'"
+            status=1
+        fi
+        rm -f "$LYING_LOG"
     else
         fail "the kernel image has no .debug_info section to flip a byte in"
         status=1
@@ -681,7 +765,9 @@ fi
 if [[ "$status" -ne 0 ]]; then
     echo "--- serial log ---"
     cat "$LOG" 2>/dev/null | head -60
-    echo "--- COM2 log ---"
+    # The byte count first: an empty file and one missing a line are different
+    # failures, and the head of an empty file looks like no output at all.
+    echo "--- COM2 log ($(wc -c < "$COM2_LOG" 2>/dev/null || echo 'no file,') bytes) ---"
     head -20 "$COM2_LOG" 2>/dev/null
 fi
 rm -f "$COM2_LOG"

@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | 🔨 **Draft 2026-10-07 — steps 1, 2, 3 and 5 done by 2026-10-08, step 7 on 2026-10-11, and step 4's parser: the native loader measures the kernel, initrd and command line through the firmware's `EFI_TCG2_PROTOCOL`, and the event log reaches the kernel in a version-3 handoff**, where the boot report reads the loader's three digests out of it — gated in `make test-boot-native-tpm`, including a kernel byte that changes the kernel's digest and nothing else's. ~~Nothing reads a PCR or replays yet (steps 5 and 6).~~ **Step 5 since 2026-10-08:** `bin/tpmd`, in a domain holding the TPM's one CRB register page and nothing else, reads PCRs 8 and 9 and the boot report prints them — and a kernel byte flipped moves PCR 9 and not PCR 8. **Nothing replays the log against them yet (step 6)**, so nothing is verified and nothing enforced. The first of Phase 3's secure boot chain, sequenced by the project lead on 2026-10-07: *measured boot first*, signing after key custody is decided. The acceptance call is the project lead's |
+| **Status** | 🔨 **Draft 2026-10-07 — steps 1, 2, 3 and 5 done by 2026-10-08, steps 6 and 7 on 2026-10-11, and step 4's parser: the native loader measures the kernel, initrd and command line through the firmware's `EFI_TCG2_PROTOCOL`, and the event log reaches the kernel in a version-3 handoff**, where the boot report reads the loader's three digests out of it — gated in `make test-boot-native-tpm`, including a kernel byte that changes the kernel's digest and nothing else's. ~~Nothing reads a PCR or replays yet (steps 5 and 6).~~ **Step 5 since 2026-10-08:** `bin/tpmd`, in a domain holding the TPM's one CRB register page and nothing else, reads PCRs 8 and 9 and the boot report prints them — and a kernel byte flipped moves PCR 9 and not PCR 8. **Nothing replays the log against them yet (step 6)**, so nothing is verified and nothing enforced. The first of Phase 3's secure boot chain, sequenced by the project lead on 2026-10-07: *measured boot first*, signing after key custody is decided. The acceptance call is the project lead's |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | boot (`bhaskixboot.efi`, `bhaskix_boot::Handoff`), arch (ACPI `TPM2`), kernel (boot report), userspace (a TPM service), tools, tests |
 | **Milestone** | Phase 3 — *Secure boot chain*, the roadmap's first row; [security.md](../security.md) §1 **T6** and gap 1 |
@@ -162,6 +162,16 @@ One line, coloured as the report is (green, red FAILED), and always printed:
     measured boot  no TPM: the firmware has no TCG2 protocol, so nothing was recorded
 ```
 
+**Corrected 2026-10-11 (step 6)**: the verdict is not on the `measured boot` line. That line is
+printed early in the report, from the log alone, before `bin/tpmd` exists; the verdict needs the
+TPM, so it is a line of its own after `tpmd`'s PCR line, and it names the PCRs it checked:
+
+```
+    tpm            log and TPM agree on PCRs 0-9: 33 events replayed (sha256), in bin/tpmd
+    tpm            FAILED: the log and the TPM disagree on PCR 9 (agree on 0-8)
+    tpm            log not checked: the log is truncated -- by the firmware, or past the final events the loader carried
+```
+
 ### Concurrency, failure and `unsafe`
 
 The loader is single-threaded before `ExitBootServices`. The new `unsafe` is the protocol call
@@ -252,7 +262,9 @@ path after boot.
    `pkg`'s SHA-256 to replay; the report then says *not checked* and why, and whether to add a hash
    for it is a decision for the day a machine needs it.
 3. **Which banks** — SHA-256 only, or whatever the firmware has active; the log says which, and the
-   report should say which it checked.
+   report should say which it checked. **Answered 2026-10-11 (step 6)**: SHA-256 only, the one hash
+   the tree has; the line says `(sha256)` and names the PCRs, and a log without the bank is *not
+   checked*, by name.
 4. **Attestation format** (security.md §10: DICE or RATS/EAT) — out of scope here; this RFC only
    produces what any of them would consume.
 
@@ -311,8 +323,9 @@ path after boot.
    call, so nothing in this step needs it; a replay of PCR 5 would (step 6).~~ **Carried since
    2026-10-11, step 6**: the loader appends the table's events to its copy after the exit — two
    on OVMF with swtpm, 445 bytes — the size of EDK2's two `ExitBootServices` actions (29 and
-   40 bytes of text) in four banks, which is inferred from the size; step 6's replay of PCR 5 is
-   what checks it.
+   40 bytes of text) in four banks, ~~which is inferred from the size; step 6's replay of PCR 5 is
+   what checks it~~ **and checked the same day by step 6's replay**: a loader built without them
+   gives `disagree on PCR 5 (agree on 0-4, 6-9)`, PCR 5 alone.
 4. **`tcglog`**: host-tested, fuzzed, a captured fixture; the kernel prints the events it found.
    **The parser landed 2026-10-08, before step 3**, which needs it: `GetEventLog` names where the
    log's last entry starts and nothing says where it ends, so the loader must size that entry.
@@ -382,5 +395,22 @@ path after boot.
    13,838,500 executions in 301 s clean. **Said here**: a replay that folds an event was **not**
    reached from an empty corpus in 601 s (67 million executions) — it needs a header declaring
    `0x000B` at size 32 — and was reached from the corpus step 4's campaigns left.
+   **6c, the verdict — done 2026-10-11**: the kernel copies the whole log read-only into
+   `bin/tpmd`'s own memory at `tpm::LOG_AT` before it starts, and passes its length as the first
+   entry word; no capability is added. `tpm::REPLAY` replays it and reads every PCR it touched
+   through the same `TPM2_PCR_Read` path — still the only command the service builds — and the
+   kernel prints `tpm  log and TPM agree on PCRs 0-9: 33 events replayed (sha256), in bin/tpmd`
+   under OVMF and swtpm. A truncated log is not given, and the line says *not checked* and why.
+   Gated three ways on the TPM lane: agreement naming PCRs 5, 8 and 9; agreement again after the
+   flipped kernel byte, because the log recorded it; and a boot with `bhaskix.fault=tpm-log`, which
+   flips one byte of the kernel's digest in `tpmd`'s copy and nothing the TPM holds, reading
+   `FAILED: the log and the TPM disagree on PCR 9 (agree on 0-8)`. Lanes with no TPM must claim no
+   agreement. `unsafe`: kernel 2092 → 2095, `tpmd` 33 → 34, each recorded. **Armed**: a loader
+   without 6a's final events turns the agreement gates red with `disagree on PCR 5 (agree on 0-4,
+   6-9)` — PCR 5 alone, which is the measurement 6a's size argument stood in for — and a kernel
+   that ignores the fault option turns only the third boot's gate red, reading `agree`. The third
+   arm planned, `EV_NO_ACTION` extended, cannot show on this firmware: OVMF's log has no
+   `EV_NO_ACTION` event after its header (33 events, 33 folded), so that rule is held by the host
+   test that went red in 6b, and by nothing on a machine yet.
 7. **CI**: the native-with-TPM job. **Added 2026-10-11** — `boot (native loader)`, all three native lanes, the TPM through `tools/swtpm.sh`, a skip refused by `BHASKIX_REQUIRE=1`. **Green on CI 2026-10-11, run 840 (`996a77f`), the TPM lane included** — after three runs that each found something real: a kernel-half page-table slot built after address spaces had copied the top level (837), an emulator that could not open swtpm's socket (838), and a memory map of 132 descriptors against a 128-slot array (839).
 8. **Hardware**: after the native loader boots the SR550 and the lead switches its TPM to 2.0.

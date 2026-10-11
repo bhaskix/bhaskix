@@ -11,7 +11,7 @@
 
 [package]
 name = "bhaskix-user-tpmd"
-description = "The TPM 2.0 service in a domain of its own: it reads PCRs and nothing else."
+description = "The TPM 2.0 service in a domain of its own: it reads PCRs, replays the log against them, and nothing else."
 version = "0.0.0"
 edition = "2024"
 authors = ["Tarun Kumar Kushwaha"]
@@ -25,6 +25,9 @@ path = "src/main.rs"
 [dependencies]
 bhaskix-abi = { path = "../../abi" }
 bhaskix-tpm = { path = "../../tpm" }
+# RFC 0089 step 6: the log's walk and replay, and the SHA-256 it folds with.
+bhaskix-tcglog = { path = "../../tcglog" }
+bhaskix-pkg = { path = "../../pkg" }
 
 [profile.release]
 panic = "abort"
@@ -46,5 +49,9 @@ asm_budget = 4
 # response parser and the CRB conversation are `bhaskix-tpm`'s, at budget zero,
 # host-tested and fuzzed. If this number climbs, logic has moved out of the
 # crate the tests reach.
-unsafe_budget = 33
+# **34 on 2026-10-11, RFC 0089 step 6**: one line, the view of the log the
+# kernel left at `tpm::LOG_AT`, bounded by `tpm::LOG_MAX`. Logic did not move:
+# the walk and the replay are `bhaskix-tcglog`'s and the hash `bhaskix-pkg`'s,
+# both at budget zero.
+unsafe_budget = 34
 unsafe_budget_exact = true

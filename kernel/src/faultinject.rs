@@ -84,6 +84,15 @@ pub enum Fault {
     /// whole claim is that a stall will not be silent needs a stall, or the
     /// claim has nothing that can falsify it.
     StallEarly,
+    /// One byte of the kernel's digest flipped in the copy of the event log
+    /// `bin/tpmd` is given -- RFC 0089 step 6.
+    ///
+    /// Not a fault at all, and raised nowhere in this module: the kernel acts
+    /// on it where it gives `bin/tpmd` the log. It exists because the boot
+    /// report's claim that the log and the TPM agree needs a boot where they do
+    /// not. **It can only turn that line red, never green**: it changes the
+    /// copy the replay reads and nothing the TPM holds.
+    TpmLog,
 }
 
 impl Fault {
@@ -100,6 +109,7 @@ impl Fault {
             "user" => Self::UserMode,
             "gp-held" => Self::GeneralProtectionHoldingRunqueue,
             "stall-early" => Self::StallEarly,
+            "tpm-log" => Self::TpmLog,
             _ => return None,
         })
     }
@@ -163,6 +173,10 @@ pub fn trigger(fault: Fault) -> bool {
         // Handled by the kernel proper: it needs a domain, a loader and a
         // scheduler, none of which belong in this module.
         Fault::UserMode => return true,
+        // Never reached: the only caller filters it out, because it raises
+        // nothing -- it is acted on where `bin/tpmd` is given the log. Loud if
+        // that filter is ever lost, rather than a user-mode test run for it.
+        Fault::TpmLog => unreachable!("tpm-log is not raised by trigger"),
     }
     false
 }

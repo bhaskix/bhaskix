@@ -114,6 +114,8 @@ Nothing left to do at this milestone'
 )
 
 FAULTS=("$@")
+# Not `tpm-log` (RFC 0089 step 6): it raises no exception and needs a TPM, so
+# `tests/qemu/native-boot-test.sh`'s TPM lane boots it and gates its red line.
 [[ ${#FAULTS[@]} -eq 0 ]] && FAULTS=(de ud bp gp gp-held pf df user stall-early)
 
 # Anything here means the machine did not survive to report cleanly.

@@ -1415,7 +1415,11 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
         println!();
     }
 
-    if let Some(fault) = faultinject::from_cmdline(handoff.cmdline) {
+    // `tpm-log` raises nothing here: it is acted on where `bin/tpmd` is given
+    // the log (RFC 0089 step 6).
+    if let Some(fault) = faultinject::from_cmdline(handoff.cmdline)
+        .filter(|&fault| fault != faultinject::Fault::TpmLog)
+    {
         if faultinject::trigger(fault) {
             // Survivable by design: a fault in ring 3 ends one domain. The
             // machine carrying on from here *is* the assertion -- every line
@@ -14832,10 +14836,127 @@ fn start_tpm_service(handoff: &Handoff) {
 static TPM_PAGE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// `bin/tpmd`'s endpoint, once it is started.
 static TPM_ENDPOINT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-/// What `bin/tpmd` answered for PCR 8 and PCR 9: per PCR, the outcome and the
-/// four value words. `u64::MAX` in the outcome while the question is open.
-static TPM_ANSWERS: [core::sync::atomic::AtomicU64; 10] =
-    [const { core::sync::atomic::AtomicU64::new(u64::MAX) }; 10];
+/// What `bin/tpmd` answered for PCR 8, PCR 9 and the replay: per question,
+/// the outcome and the four words. `u64::MAX` in the outcome while the
+/// question is open.
+static TPM_ANSWERS: [core::sync::atomic::AtomicU64; 15] =
+    [const { core::sync::atomic::AtomicU64::new(u64::MAX) }; 15];
+
+/// The event log `bin/tpmd` is given -- RFC 0089 step 6: its direct-map
+/// address and its length. Two words rather than the `&'static [u8]` it is,
+/// because a static cannot hold that reference without a lock; they are
+/// written before the program is spawned and read by its entry.
+static TPM_LOG_AT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// See [`TPM_LOG_AT`]; zero when no log is given, and [`TPM_LOG_WHY`] says why.
+static TPM_LOG_LEN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// The byte of `bin/tpmd`'s copy that `bhaskix.fault=tpm-log` flips, or
+/// `u64::MAX` -- a byte of the kernel's own digest, so the replay of PCR 9 and
+/// the TPM must disagree.
+static TPM_LOG_FLIP: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
+/// Why no log was given to `bin/tpmd`, as an index into [`TPM_LOG_WHY_TEXT`];
+/// zero when one was.
+static TPM_LOG_WHY: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+/// The sentences [`TPM_LOG_WHY`] indexes, each finishing `log not checked: `.
+const TPM_LOG_WHY_TEXT: [&str; 6] = [
+    "",
+    "this loader does not measure, so there is no log",
+    "the firmware has no TCG2 protocol, so nothing was logged",
+    "the log is truncated -- by the firmware, or past the final events the loader carried",
+    "the loader could not read the log",
+    "the log is larger than bin/tpmd is given",
+];
+
+/// Decides what log `bin/tpmd` is given, from what the loader handed over --
+/// RFC 0089 step 6. A truncated log is not given: replaying part of a log
+/// against the whole of a TPM would report a disagreement that is only a
+/// missing tail.
+fn give_tpm_log(handoff: &Handoff) {
+    use bhaskix_boot::Measurement;
+    use core::sync::atomic::Ordering;
+    let why = match handoff.measurement {
+        Measurement::NotAttempted => 1,
+        Measurement::NoTpm => 2,
+        Measurement::Measured {
+            truncated: true, ..
+        } => 3,
+        Measurement::Measured { log: [], .. } => 4,
+        Measurement::Measured { log, .. } if log.len() as u64 > bhaskix_abi::tpm::LOG_MAX => 5,
+        Measurement::Measured { log, .. } => {
+            TPM_LOG_AT.store(log.as_ptr() as u64, Ordering::Release);
+            TPM_LOG_LEN.store(log.len() as u64, Ordering::Release);
+            if faultinject::from_cmdline(handoff.cmdline) == Some(faultinject::Fault::TpmLog)
+                && let Some(at) = kernel_digest_offset(log)
+            {
+                TPM_LOG_FLIP.store(at as u64, Ordering::Release);
+                println!(
+                    "    tpm            fault injection: one byte of the kernel's digest flipped \
+                     in the log bin/tpmd is given (bhaskix.fault=tpm-log)"
+                );
+            }
+            0
+        }
+    };
+    TPM_LOG_WHY.store(why, Ordering::Release);
+}
+
+/// Where in `log` the loader's SHA-256 digest of the kernel sits -- the byte
+/// `bhaskix.fault=tpm-log` flips -- or `None` when the log has no such event.
+fn kernel_digest_offset(log: &[u8]) -> Option<usize> {
+    use bhaskix_tcglog::{EV_EVENT_TAG, log as tcg, measured};
+    let parsed = tcg::Log::parse(log).ok()?;
+    parsed.events().map_while(Result::ok).find_map(|event| {
+        let tag = event.data.get(..4)?;
+        let tag = u32::from_le_bytes([tag[0], tag[1], tag[2], tag[3]]);
+        if event.event_type != EV_EVENT_TAG || (event.pcr, tag) != measured::KERNEL {
+            return None;
+        }
+        let digest = event.digest(tcg::alg::SHA256)?;
+        Some(digest.as_ptr() as usize - log.as_ptr() as usize)
+    })
+}
+
+/// A set of PCRs as a person reads it: `0-9`, or `0-4, 6-9`, or `none`.
+struct Pcrs(u32);
+
+impl core::fmt::Display for Pcrs {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let mut first = true;
+        let mut pcr = 0u32;
+        while pcr < 32 {
+            if self.0 & (1 << pcr) == 0 {
+                pcr += 1;
+                continue;
+            }
+            let start = pcr;
+            while pcr + 1 < 32 && self.0 & (1 << (pcr + 1)) != 0 {
+                pcr += 1;
+            }
+            if !first {
+                f.write_str(", ")?;
+            }
+            first = false;
+            if start == pcr {
+                write!(f, "{start}")?;
+            } else {
+                write!(f, "{start}-{pcr}")?;
+            }
+            pcr += 1;
+        }
+        if first {
+            f.write_str("none")?;
+        }
+        Ok(())
+    }
+}
+
+/// `PCR` or `PCRs`, as `mask` needs.
+fn pcr_noun(mask: u32) -> &'static str {
+    if mask.count_ones() == 1 {
+        "PCR"
+    } else {
+        "PCRs"
+    }
+}
 
 /// Starts `bin/tpmd` on the CRB TPM `tpm` describes -- RFC 0089 step 5c.
 ///
@@ -14881,6 +15002,7 @@ fn start_tpm_domain(handoff: &Handoff, tpm: bhaskix_arch::acpi::Tpm2) -> Result<
         return Err("the tpm endpoint capability would not install");
     }
     TPM_PAGE.store(page, core::sync::atomic::Ordering::Release);
+    give_tpm_log(handoff);
     let hhdm = handoff.hhdm_base.as_u64();
     // Pinned, as every ring 3 thread must be: `enter_user` refuses one that
     // could move CPUs under its kernel stack.
@@ -14931,27 +15053,65 @@ extern "C" fn tpm_domain_entry(hhdm_base: u64) -> ! {
         stop("bin/tpmd would not load")
     };
 
+    // RFC 0089 step 6: the log, read-only at `LOG_AT`, for the replay -- copied
+    // page by page through the direct map, as `ring3_auxv` writes its pages,
+    // because the frames behind the range need not be contiguous.
+    let log_length = TPM_LOG_LEN.load(core::sync::atomic::Ordering::Acquire);
+    if log_length != 0 {
+        let Some(range) = VirtRange::from_pages(
+            VirtAddr(bhaskix_abi::tpm::LOG_AT),
+            log_length.div_ceil(bhaskix_mm::FRAME_SIZE),
+        ) else {
+            stop("the log's range is not a range")
+        };
+        if space.map_anonymous(range, Protection::ReadOnly).is_err() {
+            stop("the log would not map")
+        }
+        let at = TPM_LOG_AT.load(core::sync::atomic::Ordering::Acquire);
+        // SAFETY: the handoff's log, stored from a `&'static [u8]` over pages
+        // the kernel never reclaims, `log_length` long.
+        let log = unsafe { core::slice::from_raw_parts(at as *const u8, log_length as usize) };
+        let flip = TPM_LOG_FLIP.load(core::sync::atomic::Ordering::Acquire);
+        for (index, chunk) in log.chunks(bhaskix_mm::FRAME_SIZE as usize).enumerate() {
+            let start = index as u64 * bhaskix_mm::FRAME_SIZE;
+            let Some(frame) = space.translate(VirtAddr(bhaskix_abi::tpm::LOG_AT + start)) else {
+                stop("a page of the log has no frame")
+            };
+            let into = hhdm_base + frame;
+            // SAFETY: a frame this space owns, mapped just above and not yet
+            // installed, written through the direct map; a chunk is a page at most.
+            unsafe { core::ptr::copy_nonoverlapping(chunk.as_ptr(), into as *mut u8, chunk.len()) };
+            if (start..start + chunk.len() as u64).contains(&flip) {
+                // SAFETY: as above, one byte of the same page.
+                unsafe { *((into + flip - start) as *mut u8) ^= 0x01 };
+            }
+        }
+    }
+
     // SAFETY: as every other domain entry here -- the space was built above and
     // nothing else holds it.
     unsafe { vm::install(space) };
 
-    let hertz = bhaskix_arch::tsc::hertz().unwrap_or(0);
     let page = TPM_PAGE.load(core::sync::atomic::Ordering::Acquire);
     let rsp = TPMD_STACK + TPMD_STACK_PAGES * bhaskix_mm::FRAME_SIZE;
+    // Not the TSC rate first, as most programs here take it: `bin/tpmd` takes
+    // the log's length there (RFC 0089 step 6).
     // SAFETY: as every other domain entry here.
-    unsafe { enter_user("tpm domain", entry, rsp, [hertz, page]) }
+    unsafe { enter_user("tpm domain", entry, rsp, [log_length, page]) }
 }
 
-/// Asks `bin/tpmd` for PCRs 8 and 9, from a domain of its own, and leaves the
-/// answers in [`TPM_ANSWERS`].
+/// Asks `bin/tpmd` for PCRs 8 and 9 and then for the replay, from a domain of
+/// its own, and leaves the answers in [`TPM_ANSWERS`].
 extern "C" fn tpm_asks(endpoint: u64) -> ! {
+    use bhaskix_abi::tpm::{PCR_READ, REPLAY};
     use core::sync::atomic::Ordering;
 
     const BADGE: u64 = 0x00b5_0000;
     let endpoint = ipc::EndpointId::from_u32(endpoint as u32);
-    for (index, pcr) in [8u64, 9].into_iter().enumerate() {
+    let questions = [(PCR_READ, 8u64), (PCR_READ, 9), (REPLAY, 0)];
+    for (index, (asked, argument)) in questions.into_iter().enumerate() {
         let base = index * 5;
-        match ipc::call(endpoint, BADGE, bhaskix_abi::tpm::PCR_READ, [pcr, 0, 0, 0]) {
+        match ipc::call(endpoint, BADGE, asked, [argument, 0, 0, 0]) {
             Ok(reply) => {
                 for (slot, word) in reply.args.iter().enumerate() {
                     TPM_ANSWERS[base + 1 + slot].store(*word, Ordering::Release);
@@ -14980,9 +15140,10 @@ fn tpm_service_report(hhdm: u64) {
         domain::destroy(asker);
         return;
     }
-    // Waited for the answer rather than for a duration: both outcomes set.
+    // Waited for the answer rather than for a duration: every outcome set,
+    // the replay's last because it is asked last.
     for _ in 0..100 {
-        if TPM_ANSWERS[5].load(Ordering::Acquire) != u64::MAX {
+        if TPM_ANSWERS[10].load(Ordering::Acquire) != u64::MAX {
             break;
         }
         wait_millis(50);
@@ -15016,6 +15177,76 @@ fn tpm_service_report(hhdm: u64) {
         ),
         Some((pcr, outcome, detail)) => println!(
             "\x1b[91m    tpm            FAILED: PCR {pcr} answered outcome {outcome}, detail {detail:#x}\x1b[0m"
+        ),
+    }
+    tpm_verdict();
+}
+
+/// The `tpm  log and TPM agree …` line -- RFC 0089 step 6: whether the log,
+/// replayed, gives what the TPM holds in every PCR the log touched. **Only
+/// those**: a PCR nobody logged an extend into is outside what a log can
+/// vouch for, and the line does not claim it.
+fn tpm_verdict() {
+    use bhaskix_abi::tpm::{not_checked, outcome};
+    use core::sync::atomic::Ordering;
+
+    let why = usize::from(TPM_LOG_WHY.load(Ordering::Acquire));
+    if why != 0 {
+        let text = TPM_LOG_WHY_TEXT
+            .get(why)
+            .copied()
+            .unwrap_or("no log was given");
+        println!("\x1b[93m    tpm            log not checked: {text}\x1b[0m");
+        return;
+    }
+    let word = |slot: usize| TPM_ANSWERS[11 + slot].load(Ordering::Acquire);
+    match TPM_ANSWERS[10].load(Ordering::Acquire) {
+        outcome::OK => {
+            let (touched, agreeing, events) = (word(0) as u32, word(1) as u32, word(2));
+            if touched == 0 {
+                println!("\x1b[93m    tpm            log not checked: it extended no PCR\x1b[0m");
+            } else if agreeing == touched {
+                println!(
+                    "    tpm            log and TPM agree on {} {}: {events} events replayed \
+                     (sha256), in bin/tpmd",
+                    pcr_noun(touched),
+                    Pcrs(touched)
+                );
+            } else {
+                let differing = touched & !agreeing;
+                println!(
+                    "\x1b[91m    tpm            FAILED: the log and the TPM disagree on {} {} \
+                     (agree on {})\x1b[0m",
+                    pcr_noun(differing),
+                    Pcrs(differing),
+                    Pcrs(agreeing)
+                );
+            }
+        }
+        outcome::NOT_CHECKED => {
+            let text = match word(0) {
+                not_checked::NO_LOG => "bin/tpmd was given no log",
+                not_checked::HEADER => "its header does not parse",
+                not_checked::NO_SHA256 => "it has no sha256 bank, the one hash this tree has",
+                not_checked::SHA256_SIZE => "its sha256 bank has the wrong size",
+                not_checked::PCR => "an event names a PCR past 23",
+                not_checked::LATE_START => "PCR 0's start value comes after PCR 0 was extended",
+                not_checked::WALK => "the walk stopped at a malformed event",
+                _ => "a reason this kernel does not know",
+            };
+            println!(
+                "\x1b[93m    tpm            log not checked: {text} (detail {})\x1b[0m",
+                word(1)
+            );
+        }
+        u64::MAX => {
+            println!(
+                "\x1b[91m    tpm            FAILED: bin/tpmd never answered the replay\x1b[0m"
+            );
+        }
+        other => println!(
+            "\x1b[91m    tpm            FAILED: the replay answered outcome {other}, detail {:#x}\x1b[0m",
+            word(0)
         ),
     }
 }
@@ -34085,6 +34316,63 @@ fn scheduling_self_test(hhdm_base: u64) -> bool {
     });
 
     ok
+}
+
+#[cfg(test)]
+mod pcrs_tests {
+    use super::{Pcrs, pcr_noun};
+    use core::fmt::Write;
+
+    /// Writes into a fixed buffer, so the assertion needs no allocator.
+    struct Pad {
+        bytes: [u8; 32],
+        used: usize,
+    }
+
+    impl Write for Pad {
+        fn write_str(&mut self, s: &str) -> core::fmt::Result {
+            let end = self.used + s.len();
+            let room = self.bytes.get_mut(self.used..end).ok_or(core::fmt::Error)?;
+            room.copy_from_slice(s.as_bytes());
+            self.used = end;
+            Ok(())
+        }
+    }
+
+    fn shown(mask: u32) -> ([u8; 32], usize) {
+        let mut pad = Pad {
+            bytes: [0; 32],
+            used: 0,
+        };
+        write!(pad, "{}", Pcrs(mask)).expect("room");
+        (pad.bytes, pad.used)
+    }
+
+    fn reads(mask: u32, want: &str) {
+        let (bytes, used) = shown(mask);
+        assert_eq!(
+            core::str::from_utf8(&bytes[..used]),
+            Ok(want),
+            "mask {mask:#x}"
+        );
+    }
+
+    /// A run prints as a range, a gap splits it, and a single PCR is itself.
+    #[test]
+    fn a_set_of_pcrs_reads_as_ranges() {
+        reads(0x3ff, "0-9");
+        reads(0x3df, "0-4, 6-9");
+        reads(1 << 9, "9");
+        reads((1 << 0) | (1 << 2) | (1 << 23), "0, 2, 23");
+        reads(0, "none");
+    }
+
+    /// The noun agrees with the count, so the line reads `PCR 9`, not `PCRs 9`.
+    #[test]
+    fn the_noun_agrees_with_the_count() {
+        assert_eq!(pcr_noun(1 << 9), "PCR");
+        assert_eq!(pcr_noun(0x3ff), "PCRs");
+    }
 }
 
 #[cfg(test)]

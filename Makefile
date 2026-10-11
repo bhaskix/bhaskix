@@ -516,7 +516,8 @@ $(USER_AHCID): $(AHCID_DIR)/src/main.rs $(AHCID_DIR)/link.ld $(AHCID_DIR)/Cargo.
 # the command bytes, the response parser and the CRB order live in
 # `bhaskix-tpm`, which the host tests reach, and this is the register access.
 $(USER_TPMD): $(TPMD_DIR)/src/main.rs $(TPMD_DIR)/link.ld $(TPMD_DIR)/Cargo.toml \
-              $(wildcard abi/src/*.rs) $(wildcard tpm/src/*.rs)
+              $(wildcard abi/src/*.rs) $(wildcard tpm/src/*.rs) $(wildcard tcglog/src/*.rs) \
+              $(wildcard pkg/src/*.rs) $(wildcard ustar/src/*.rs)
 	cd $(TPMD_DIR) && RUSTFLAGS="$(TPMD_FLAGS)" \
 	    $(CARGO) build --release --target $(TARGET)
 	@echo "built $@"

@@ -7,9 +7,13 @@
 //!   found through the ACPI `TPM2` table and checked is not RAM before granting
 //!   it. Read and write, no `GRANT` and no `DERIVE`, so the other localities'
 //!   pages are not reachable and the page cannot be handed on;
-//! - **one endpoint**, on which it answers [`tpm::PCR_READ`] and nothing else.
+//! - **one endpoint**, on which it answers [`tpm::PCR_READ`] and
+//!   [`tpm::REPLAY`] and nothing else.
 //!
-//! No memory beyond its own, and no DMA window: a CRB TPM does no DMA.
+//! No memory beyond its own, and no DMA window: a CRB TPM does no DMA. Its
+//! own memory includes, since RFC 0089 step 6, a read-only copy of the event
+//! log at [`tpm::LOG_AT`], which the kernel put there before it started --
+//! public bytes, and no capability.
 //!
 //! # Why there is so little here
 //!
@@ -18,11 +22,16 @@
 //! response parser and the order of the CRB conversation are all
 //! `bhaskix-tpm`'s, host-tested and fuzzed; what is left is the register
 //! access that crate deliberately cannot perform. **And it builds no command
-//! but `TPM2_PCR_Read`**, so no request can reach an extend or a clear.
+//! but `TPM2_PCR_Read`**, so no request can reach an extend or a clear. The
+//! replay is `bhaskix-tcglog`'s, host-tested and fuzzed, folding with
+//! `bhaskix-pkg`'s SHA-256, which is held to the published vectors.
 #![no_std]
 #![no_main]
 
 use bhaskix_abi::{method, status, syscall, tpm};
+use bhaskix_pkg::sha256::Sha256;
+use bhaskix_tcglog::log::Log;
+use bhaskix_tcglog::replay::{self, ReplayError};
 use bhaskix_tpm::command::{self, ResponseError, SHA256_DIGEST, TPM_ALG_SHA256};
 use bhaskix_tpm::crb::{Crb, CrbError, Registers};
 
@@ -152,40 +161,112 @@ fn response_code(error: ResponseError) -> u64 {
     }
 }
 
-/// One PCR read, start to reply.
-fn answer(crb: &mut Crb<Page>, pcr: u8) {
-    let Some(request) = command::pcr_read_command(TPM_ALG_SHA256, pcr) else {
-        return reply(tpm::outcome::BAD_REQUEST, [0; 4]);
-    };
+/// One PCR read: its value, or the outcome and detail a reply would carry.
+fn read_pcr(crb: &mut Crb<Page>, pcr: u8) -> Result<[u8; SHA256_DIGEST], (u64, u64)> {
+    let request =
+        command::pcr_read_command(TPM_ALG_SHA256, pcr).ok_or((tpm::outcome::BAD_REQUEST, 0))?;
     let mut response = [0u8; 256];
-    let length = match crb.execute(&request, &mut response) {
-        Ok(length) => length,
-        Err(error) => return reply(tpm::outcome::DEVICE, [device_code(error), 0, 0, 0]),
-    };
+    let length = crb
+        .execute(&request, &mut response)
+        .map_err(|error| (tpm::outcome::DEVICE, device_code(error)))?;
     match command::parse_pcr_read_response(&response[..length], TPM_ALG_SHA256, pcr, SHA256_DIGEST)
     {
         Ok(digest) => {
+            let mut value = [0u8; SHA256_DIGEST];
+            value.copy_from_slice(digest);
+            Ok(value)
+        }
+        Err(ResponseError::Code(code)) => Err((tpm::outcome::TPM, u64::from(code))),
+        Err(error) => Err((tpm::outcome::RESPONSE, response_code(error))),
+    }
+}
+
+/// One PCR read, start to reply.
+fn answer(crb: &mut Crb<Page>, pcr: u8) {
+    match read_pcr(crb, pcr) {
+        Ok(value) => {
             let mut words = [0u64; 4];
-            for (word, bytes) in words.iter_mut().zip(digest.chunks(8)) {
+            for (word, bytes) in words.iter_mut().zip(value.chunks(8)) {
                 let mut eight = [0u8; 8];
                 eight.copy_from_slice(bytes);
                 *word = u64::from_be_bytes(eight);
             }
             reply(tpm::outcome::OK, words);
         }
-        Err(ResponseError::Code(code)) => reply(tpm::outcome::TPM, [u64::from(code), 0, 0, 0]),
-        Err(error) => reply(tpm::outcome::RESPONSE, [response_code(error), 0, 0, 0]),
+        Err((outcome, detail)) => reply(outcome, [detail, 0, 0, 0]),
     }
 }
 
-/// Attaches the page, asks for locality 0, and answers PCR reads for as long
-/// as anybody asks.
+/// `PCR = SHA-256(PCR ‖ digest)`: what the TPM does on an extend.
+fn extend(pcr: &[u8; SHA256_DIGEST], digest: &[u8; SHA256_DIGEST]) -> [u8; SHA256_DIGEST] {
+    let mut hash = Sha256::new();
+    hash.update(pcr);
+    hash.update(digest);
+    hash.finish()
+}
+
+/// Why a replay did not check, as the reply says it.
+fn not_checked(error: ReplayError) -> [u64; 4] {
+    use tpm::not_checked;
+    match error {
+        ReplayError::NoSha256Bank => [not_checked::NO_SHA256, 0, 0, 0],
+        ReplayError::Sha256Size(size) => [not_checked::SHA256_SIZE, u64::from(size), 0, 0],
+        ReplayError::Pcr(pcr) => [not_checked::PCR, u64::from(pcr), 0, 0],
+        ReplayError::LateStart => [not_checked::LATE_START, 0, 0, 0],
+        ReplayError::Log(_) => [not_checked::WALK, 0, 0, 0],
+    }
+}
+
+/// The log replayed and every PCR it touched read from the TPM, start to
+/// reply -- RFC 0089 step 6.
+fn answer_replay(crb: &mut Crb<Page>, log: &[u8]) {
+    if log.is_empty() {
+        return reply(
+            tpm::outcome::NOT_CHECKED,
+            [tpm::not_checked::NO_LOG, 0, 0, 0],
+        );
+    }
+    let Ok(parsed) = Log::parse(log) else {
+        return reply(
+            tpm::outcome::NOT_CHECKED,
+            [tpm::not_checked::HEADER, 0, 0, 0],
+        );
+    };
+    let replayed = match replay::replay(&parsed, extend) {
+        Ok(replayed) => replayed,
+        Err(error) => return reply(tpm::outcome::NOT_CHECKED, not_checked(error)),
+    };
+    let mut agreeing = 0u32;
+    for (pcr, value) in replayed.pcrs.iter().enumerate() {
+        if replayed.touched & (1 << pcr) == 0 {
+            continue;
+        }
+        match read_pcr(crb, pcr as u8) {
+            Ok(held) if &held == value => agreeing |= 1 << pcr,
+            Ok(_) => {}
+            Err((outcome, detail)) => return reply(outcome, [detail, 0, 0, 0]),
+        }
+    }
+    reply(
+        tpm::outcome::OK,
+        [
+            u64::from(replayed.touched),
+            u64::from(agreeing),
+            u64::from(replayed.extended),
+            0,
+        ],
+    );
+}
+
+/// Attaches the page, asks for locality 0, and answers PCR reads and replays
+/// for as long as anybody asks.
 ///
-/// The entry convention every program here has -- the TSC rate first, which
-/// this program does not need -- and the page's **physical** address second,
-/// which the CRB's command and response registers must hold.
+/// Not the entry convention most programs here have, the TSC rate first:
+/// this one does not need it, and takes the log's length there instead, which
+/// the kernel left at [`tpm::LOG_AT`]. The page's **physical** address is
+/// second, which the CRB's command and response registers must hold.
 #[unsafe(no_mangle)]
-extern "C" fn tpmd_main(_hertz: u64, page: u64) -> ! {
+extern "C" fn tpmd_main(log_length: u64, page: u64) -> ! {
     if call(
         syscall::INVOKE,
         PAGE,
@@ -196,6 +277,13 @@ extern "C" fn tpmd_main(_hertz: u64, page: u64) -> ! {
     {
         exit()
     }
+    let log: &[u8] = if log_length == 0 || log_length > tpm::LOG_MAX {
+        &[]
+    } else {
+        // SAFETY: the kernel mapped `log_length` bytes at `LOG_AT` read-only
+        // before this program started, and nothing unmaps them.
+        unsafe { core::slice::from_raw_parts(tpm::LOG_AT as *const u8, log_length as usize) }
+    };
     let mut crb = Crb::new(Page, page, POLLS);
     let locality = crb.request_locality();
     loop {
@@ -203,7 +291,9 @@ extern "C" fn tpmd_main(_hertz: u64, page: u64) -> ! {
         if received != status::OK {
             exit()
         }
-        if asked != tpm::PCR_READ || args[0] >= u64::from(command::PCRS) {
+        let known =
+            (asked == tpm::PCR_READ && args[0] < u64::from(command::PCRS)) || asked == tpm::REPLAY;
+        if !known {
             reply(tpm::outcome::BAD_REQUEST, [0; 4]);
             continue;
         }
@@ -211,7 +301,11 @@ extern "C" fn tpmd_main(_hertz: u64, page: u64) -> ! {
             reply(tpm::outcome::DEVICE, [device_code(error), 0, 0, 0]);
             continue;
         }
-        answer(&mut crb, args[0] as u8);
+        if asked == tpm::REPLAY {
+            answer_replay(&mut crb, log);
+        } else {
+            answer(&mut crb, args[0] as u8);
+        }
     }
 }
 
