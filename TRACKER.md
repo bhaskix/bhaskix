@@ -1063,6 +1063,17 @@ the distinction is in the table rather than in somebody's head.
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-10-11 (RFC 0089 step 6b: a replay of the log, host-tested)
+
+`bhaskix_tcglog::replay` folds the log into the PCRs it names, `PCR = H(PCR ‖ digest)` from zero,
+in the SHA-256 bank, with the hash passed in so the crate stays a leaf. The rules for what is folded
+were read from tpm2-tools' source today: `EV_NO_ACTION` never extends; a PCR 0 `StartupLocality`
+record, or an H-CRTM event, sets PCR 0's start value. Nine host tests against values Python's
+`hashlib` computed apart from the code, armed three ways. The fuzz target gained a fifth property
+and ran 13.8 million executions clean. **Not reached from an empty corpus** in 601 s: a replay that
+folds an event needs a SHA-256 bank at size 32, which the fuzzer did not find alone; step 4's local
+corpus reaches it. Nothing runs the replay on a machine yet — that is 6c.
+
 ### 2026-10-11 (RFC 0089 step 6a: the loader carries the whole event log)
 
 The loader's copy of the event log is taken at `GetEventLog`, and EDK2 logs every later event to its

@@ -360,13 +360,13 @@ fn u16_at(bytes: &[u8], at: usize) -> Result<u16, LogError> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     extern crate std;
     use super::*;
     use std::vec::Vec;
 
     /// A header event declaring `algorithms`.
-    fn header(algorithms: &[(u16, u16)]) -> Vec<u8> {
+    pub(crate) fn header(algorithms: &[(u16, u16)]) -> Vec<u8> {
         let mut data = Vec::new();
         data.extend_from_slice(&SPEC_ID_03);
         data.extend_from_slice(&0u32.to_le_bytes()); // platformClass
@@ -387,7 +387,13 @@ mod tests {
     }
 
     /// One event with a digest per `(algorithm, size)`, each filled with `fill`.
-    fn event(pcr: u32, kind: u32, algorithms: &[(u16, u16)], fill: u8, data: &[u8]) -> Vec<u8> {
+    pub(crate) fn event(
+        pcr: u32,
+        kind: u32,
+        algorithms: &[(u16, u16)],
+        fill: u8,
+        data: &[u8],
+    ) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(&pcr.to_le_bytes());
         out.extend_from_slice(&kind.to_le_bytes());
@@ -401,7 +407,7 @@ mod tests {
         out
     }
 
-    const BANKS: [(u16, u16); 2] = [(alg::SHA1, 20), (alg::SHA256, 32)];
+    pub(crate) const BANKS: [(u16, u16); 2] = [(alg::SHA1, 20), (alg::SHA256, 32)];
 
     fn sample() -> Vec<u8> {
         let mut log = header(&BANKS);

@@ -16,6 +16,11 @@ path = "src/lib.rs"
 # step 4) -- bytes at offsets both ways, testable with no TPM and no firmware.
 [dependencies]
 
+# The replay's tests fold with the tree's own SHA-256, as `bin/tpmd` does; the
+# crate itself takes the hash as a parameter and stays a leaf (RFC 0089 step 6).
+[dev-dependencies]
+bhaskix-pkg = { path = "../pkg" }
+
 [package.metadata.bhaskix]
 # Writing a packed structure into a buffer and, from step 4, parsing a log the
 # firmware wrote. Arithmetic and untrusted input; `forbid(unsafe_code)` in the

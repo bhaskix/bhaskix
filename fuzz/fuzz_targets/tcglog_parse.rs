@@ -8,7 +8,7 @@
 //!
 //! # What counts as a failure
 //!
-//! A panic, an abort or a hang -- and four properties beyond not crashing:
+//! A panic, an abort or a hang -- and five properties beyond not crashing:
 //!
 //! 1. **An accepted header declares a sane set**: one to `MAX_ALGORITHMS`
 //!    algorithms, each named once, each digest one to `MAX_DIGEST` bytes.
@@ -18,6 +18,12 @@
 //!    target computes itself rather than borrows from the parser.
 //! 4. **A walk that ends without an error has consumed every byte**: no event
 //!    may be skipped silently.
+//! 5. **A replay touches only PCRs that exist, and only what it says it
+//!    touched** (RFC 0089 step 6): an accepted replay names PCRs below 24,
+//!    leaves every PCR it does not name at zero, and folded exactly the
+//!    events that are not `EV_NO_ACTION`; a replay refused over the walk is
+//!    refused only when the walk itself fails. The fold here is a cheap mixer,
+//!    not SHA-256: these are properties of the bookkeeping, not the hash.
 //!
 //! Run with:
 //!
@@ -29,7 +35,8 @@
 
 use libfuzzer_sys::fuzz_target;
 
-use bhaskix_tcglog::log::{Log, MAX_ALGORITHMS, MAX_DIGEST, event2_len};
+use bhaskix_tcglog::log::{EV_NO_ACTION, Log, MAX_ALGORITHMS, MAX_DIGEST, event2_len};
+use bhaskix_tcglog::replay::{DIGEST, PCRS, ReplayError, replay};
 
 fuzz_target!(|data: &[u8]| {
     let Ok(log) = Log::parse(data) else {
@@ -45,6 +52,33 @@ fuzz_target!(|data: &[u8]| {
     // 32 and runs for the length at 28.
     let size = u32::from_le_bytes(data[28..32].try_into().unwrap()) as usize;
     let mut rest = &data[32 + size..];
+    let mix = |pcr: &[u8; DIGEST], digest: &[u8; DIGEST]| {
+        let mut out = [0u8; DIGEST];
+        for (index, byte) in out.iter_mut().enumerate() {
+            *byte = pcr[index].rotate_left(1) ^ digest[index] ^ 1;
+        }
+        out
+    };
+    let walked_clean = log.events().all(|event| event.is_ok());
+    let folds = log
+        .events()
+        .filter_map(Result::ok)
+        .filter(|event| event.event_type != EV_NO_ACTION)
+        .count();
+    match replay(&log, mix) {
+        Ok(replayed) => {
+            assert!(walked_clean);
+            assert!(replayed.touched < 1 << PCRS);
+            for (pcr, value) in replayed.pcrs.iter().enumerate() {
+                if replayed.touched & (1 << pcr) == 0 {
+                    assert_eq!(value, &[0u8; DIGEST]);
+                }
+            }
+            assert_eq!(replayed.extended as usize, folds);
+        }
+        Err(ReplayError::Log(_)) => assert!(!walked_clean),
+        Err(_) => {}
+    }
     for event in log.events() {
         let Ok(event) = event else {
             assert!(event2_len(rest, log.spec()).is_err());

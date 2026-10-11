@@ -365,6 +365,22 @@ path after boot.
    worth one line each: the thread entering ring 3 has to be pinned, and the asker's spawn was
    handed the endpoint where the direct-map base belongs — a kernel fault in `stack::allocate`
    that was this step's bug, not the kernel's.
-6. **Agreement**: replay with `pkg`'s SHA-256 in `bin/tpmd`; the report's verdict, each outcome gated.
+6. **Agreement**: replay with `pkg`'s SHA-256 in `bin/tpmd`; the report's verdict, each outcome gated. In three checkpoints.
+   **6a, the whole log — done 2026-10-11**: the loader appends the firmware's final events table
+   to its copy after the exit (see *The protocol*, corrected), 2 events and 445 bytes on OVMF with
+   swtpm; a gate on each native lane, armed against edited logs. **6b, the replay — done
+   2026-10-11**: `bhaskix_tcglog::replay` folds every event's SHA-256 digest into the PCR it names
+   with a hash the caller passes, so the crate stays a leaf. Three rules decide what is folded,
+   read from tpm2-tools' `tpm2_eventlog.c` rather than recalled: `EV_NO_ACTION` is never extended;
+   a PCR 0 `StartupLocality` record sets the start value's last byte to the locality; an
+   `EV_EFI_HCRTM_EVENT` sets it to 4. A start value stated after PCR 0 was extended, a PCR past 23,
+   and a log without a 32-byte SHA-256 bank are each refused by name. Nine host tests whose
+   expected values Python's `hashlib` computed apart from the code, folding with `bhaskix-pkg`'s
+   SHA-256 as a dev-dependency; armed three ways — `EV_NO_ACTION` extended, the order swapped to
+   `digest ‖ pcr`, the late-start refusal removed — each red. `tcglog_parse` gained a fifth
+   property (a replay touches only PCRs that exist and only what it says it touched) and ran
+   13,838,500 executions in 301 s clean. **Said here**: a replay that folds an event was **not**
+   reached from an empty corpus in 601 s (67 million executions) — it needs a header declaring
+   `0x000B` at size 32 — and was reached from the corpus step 4's campaigns left.
 7. **CI**: the native-with-TPM job. **Added 2026-10-11** — `boot (native loader)`, all three native lanes, the TPM through `tools/swtpm.sh`, a skip refused by `BHASKIX_REQUIRE=1`. **Green on CI 2026-10-11, run 840 (`996a77f`), the TPM lane included** — after three runs that each found something real: a kernel-half page-table slot built after address spaces had copied the top level (837), an emulator that could not open swtpm's socket (838), and a memory map of 132 descriptors against a 128-slot array (839).
 8. **Hardware**: after the native loader boots the SR550 and the lead switches its TPM to 2.0.
