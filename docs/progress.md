@@ -10,8 +10,8 @@
 
 | | |
 |---|---|
-| RFCs accepted | **59** |
-| RFCs open | 29 |
+| RFCs accepted | **60** |
+| RFCs open | 28 |
 | RFCs closed without shipping | 2 |
 | Milestone rows done | **92 of 95** |
 | Phase 2 bullets done | **13 of 13** |
@@ -31,7 +31,7 @@ gantt
     RFC 0025 Four-level paging on purpose :done, r0025, 2026-08-15, 2026-08-16
     RFC 0028 bhaskixboot.efi — the machine enters through our... :done, r0028, 2026-08-17, 2026-08-18
     RFC 0088 A clock a process reads itself :active, r0088, 2026-10-02, 2026-10-11
-    RFC 0089 A boot the TPM records :active, r0089, 2026-10-08, 2026-10-11
+    RFC 0089 A boot the TPM records :done, r0089, 2026-10-08, 2026-10-11
     section Filesystem & storage
     RFC 0003 Storage architecture :active, r0003, 2026-08-03, 2026-10-11
     RFC 0006 Kosh — unified storage from one node to many :active, r0006, 2026-08-03, 2026-10-11
@@ -195,7 +195,6 @@ gantt
 | 0075 | a driver that is not in the kernel | 2026-09-07 |
 | 0076 | a bond on hardware | 2026-09-08 |
 | 0088 | A clock a process reads itself | 2026-10-02 |
-| 0089 | A boot the TPM records | 2026-10-08 |
 | 0090 | A hosted program that dials out | 2026-10-08 |
 
 ## Annexes
