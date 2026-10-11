@@ -158,6 +158,18 @@ fn measure(
 /// past this is refused as unreadable rather than copied in part.
 const EVENT_LOG_MAX: usize = 256 * 1024;
 
+/// Room the copy keeps past the log for the firmware's final events -- those
+/// it logs after `GetEventLog`, `ExitBootServices`' own among them. EDK2's
+/// area is this size (`PcdTcg2FinalLogAreaLen`, 0x8000).
+const FINAL_EVENTS_ROOM: usize = 32 * 1024;
+
+/// The final events table's one version (`EFI_TCG2_FINAL_EVENTS_TABLE_VERSION`).
+const FINAL_EVENTS_VERSION: u64 = 1;
+
+/// More final events than any firmware logs between `GetEventLog` and the
+/// exit; a count past it is a firmware answer not believed.
+const FINAL_EVENTS_MAX: u64 = 1024;
+
 /// Copies the firmware's event log into pages the kernel keeps -- RFC 0089.
 ///
 /// **Read exactly, never past.** `GetEventLog` names where the log starts and
@@ -216,7 +228,7 @@ fn copy_event_log(table: *mut SystemTable, tcg2: *mut efi::Tcg2) -> handoff::Rec
         }
         before_last + last_len
     };
-    let pages = len.div_ceil(PAGE_SIZE as usize);
+    let pages = (len + FINAL_EVENTS_ROOM).div_ceil(PAGE_SIZE as usize);
     let Ok(base) = efi::allocate_pages(table, efi::LOADER_CODE, pages) else {
         return unreadable("no pages for the copy");
     };
@@ -234,6 +246,101 @@ fn copy_event_log(table: *mut SystemTable, tcg2: *mut efi::Tcg2) -> handoff::Rec
     handoff::Recorded::Log {
         phys: base,
         len,
+        room: pages * PAGE_SIZE as usize,
+        truncated,
+    }
+}
+
+/// Appends the firmware's final events to the copy -- RFC 0089 step 6.
+///
+/// Once `GetEventLog` has been called, the firmware logs every later event in
+/// its final events table as well as its main log, and the copy was taken at
+/// that call. `ExitBootServices` extends PCR 5 twice (EDK2's
+/// `OnExitBootServices`), so without these a replay of PCR 5 can never agree.
+/// The table is ACPI NVS memory, which survives the exit and is still
+/// identity-mapped here. Each entry is read as the log's last entry was: its
+/// prefix, then the length that prefix declares, validated whole. An entry
+/// that does not fit the room the copy kept is not cut: it and every later
+/// one are left out and the log is marked truncated, which a replay reports
+/// as such rather than as a disagreement.
+fn append_final_events(recorded: handoff::Recorded, table: Option<u64>) -> handoff::Recorded {
+    use bhaskix_tcglog::log;
+    let handoff::Recorded::Log {
+        phys,
+        len,
+        room,
+        truncated,
+    } = recorded
+    else {
+        return recorded;
+    };
+    let short = |end: usize, why: &str| {
+        serial::write("bhaskixboot: final events not all carried: ");
+        serial::write(why);
+        serial::write("; the log is marked truncated\r\n");
+        handoff::Recorded::Log {
+            phys,
+            len: end,
+            room,
+            truncated: true,
+        }
+    };
+    let Some(table) = table else {
+        return short(len, "the firmware has no final events table");
+    };
+    // SAFETY: the copy -- `LoaderCode` pages this image allocated, `room`
+    // long, identity-mapped, and nothing else holds them.
+    let copy = unsafe { core::slice::from_raw_parts_mut(phys as *mut u8, room) };
+    let Ok(parsed) = log::Log::parse(&copy[..len]) else {
+        return short(len, "the copy's header does not parse");
+    };
+    let spec = *parsed.spec();
+    // SAFETY: the table's fixed part, a version and a count, at the address
+    // its configuration entry gives; ACPI NVS, identity-mapped.
+    let fixed = unsafe { core::slice::from_raw_parts(table as *const u8, 16) };
+    let word = |at: usize| {
+        let mut eight = [0u8; 8];
+        eight.copy_from_slice(&fixed[at..at + 8]);
+        u64::from_le_bytes(eight)
+    };
+    let (version, count) = (word(0), word(8));
+    if version != FINAL_EVENTS_VERSION {
+        return short(len, "the table's version is not 1");
+    }
+    if count > FINAL_EVENTS_MAX {
+        return short(len, "the table's count is not believable");
+    }
+    let mut at = table + 16;
+    let mut end = len;
+    for _ in 0..count {
+        // SAFETY: the table's count places an entry at `at`, and an entry is
+        // at least its fixed prefix, whose size the header fixes.
+        let prefix =
+            unsafe { core::slice::from_raw_parts(at as *const u8, spec.event2_prefix_len()) };
+        let Ok(entry_len) = log::event2_len_from_prefix(prefix, &spec) else {
+            return short(end, "an entry's length");
+        };
+        if entry_len > room - end {
+            return short(end, "more than the room the copy kept");
+        }
+        // SAFETY: as above, now the whole entry its own prefix declares.
+        let entry = unsafe { core::slice::from_raw_parts(at as *const u8, entry_len) };
+        if log::event2_len(entry, &spec) != Ok(entry_len) {
+            return short(end, "an entry does not parse");
+        }
+        copy[end..end + entry_len].copy_from_slice(entry);
+        end += entry_len;
+        at += entry_len as u64;
+    }
+    serial::write("bhaskixboot: final events ");
+    serial::write_dec(count);
+    serial::write(" (");
+    serial::write_dec((end - len) as u64);
+    serial::write(" bytes) appended after the exit\r\n");
+    handoff::Recorded::Log {
+        phys,
+        len: end,
+        room,
         truncated,
     }
 }
@@ -520,7 +627,8 @@ extern "efiapi" fn efi_main(image_handle: usize, system_table: *mut SystemTable)
     };
 
     // The machine's shape, while the firmware still answers.
-    let (rsdp, smbios) = efi::find_tables(table);
+    let tables = efi::find_tables(table);
+    let (rsdp, smbios) = (tables.rsdp, tables.smbios);
     match rsdp {
         Some(address) => {
             serial::write("bhaskixboot: acpi rsdp ");
@@ -612,6 +720,9 @@ extern "efiapi" fn efi_main(image_handle: usize, system_table: *mut SystemTable)
     serial::write_dec(map.reclaimable_bytes() / 1024);
     serial::write(" KiB reclaimable; truncated: no\r\n");
     serial::write("bhaskixboot: boot services exited; the machine is ours\r\n");
+    // The events logged since the copy was taken, `ExitBootServices`' own
+    // among them -- RFC 0089 step 6.
+    let recorded = append_final_events(recorded, tables.final_events);
 
     // Step 5's second half, on a machine the loader owns: the tables, then
     // the handoff, over RAM's top as the exit's own map gives it.

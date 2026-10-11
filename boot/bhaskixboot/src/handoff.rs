@@ -100,7 +100,11 @@ pub enum Recorded {
         phys: u64,
         /// Bytes in it.
         len: usize,
-        /// The firmware's own truncation flag.
+        /// Bytes allocated for it: the log, and room past it for the final
+        /// events appended after the exit.
+        room: usize,
+        /// The firmware's own truncation flag, or the loader's when the final
+        /// events could not all be carried.
         truncated: bool,
     },
     /// Measured, but the log could not be read whole; the kernel is told so as
@@ -268,6 +272,7 @@ pub fn assemble(block: u64, findings: &Findings<'_>) -> Result<Assembled, usize>
             phys,
             len,
             truncated,
+            ..
         } => Measurement::Measured {
             // SAFETY: as for the initrd -- `LoaderCode` pages, filled from the
             // firmware's log, translated as KernelAndModules and never

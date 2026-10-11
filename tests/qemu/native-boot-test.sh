@@ -281,6 +281,27 @@ else
     fi
 fi
 
+# RFC 0089 step 6: **the log the kernel gets is the whole log.** The copy is
+# taken at `GetEventLog`; the firmware logs what comes after -- its own two
+# `ExitBootServices` events into PCR 5 -- in its final events table, which the
+# loader appends after the exit. Without them a replay of PCR 5 cannot agree.
+# With no TPM there is no log, and the line must not appear.
+if [[ "${BHASKIX_TPM:-0}" == 1 ]]; then
+    final=$(grep -aoE "bhaskixboot: final events [0-9]+ \([0-9]+ bytes\) appended after the exit" "$LOG" | head -1)
+    if [[ "$final" =~ final\ events\ ([0-9]+) ]] && [[ ${BASH_REMATCH[1]} -ge 2 ]] \
+        && ! grep -qF "final events not all carried" "$LOG"; then
+        pass "the loader appended the firmware's final events after the exit (${final#bhaskixboot: })"
+    else
+        fail "the final events were not carried: $(grep -aE 'bhaskixboot: final events' "$LOG" | tr -d '\r' | tr '\n' ' ')"
+        status=1
+    fi
+elif grep -qF "bhaskixboot: final events" "$LOG" 2>/dev/null; then
+    fail "with no TPM the loader still spoke of final events"
+    status=1
+else
+    pass "with no TPM the loader carried no final events"
+fi
+
 # Step 3: the machine's shape, and the exit. The values are the firmware's
 # to choose -- the gates demand the *lines*, well-formed, plus the two facts
 # that must be true on OVMF: an RSDP exists, and the map was not truncated.

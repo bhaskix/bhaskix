@@ -94,4 +94,9 @@ asm_budget = 5
 # machine (an SR550 with 192 GiB ran the fixed 128-frame pool dry). The
 # firmware call itself moved into `take_map`, shared with the exit, and
 # was not counted twice; the bound is `bhaskix-boot`'s, at budget zero.
-unsafe_budget = 144
+# 148 on 2026-10-11: four lines for the final events table, RFC 0089 step 6 --
+# the copy viewed whole to append to it, the table's 16-byte fixed part, and
+# each entry's prefix and then the entry its prefix declares, read after the
+# exit from ACPI NVS the firmware leaves behind. Sized as the log's last entry
+# is, by `bhaskix-tcglog`'s fuzzed arithmetic at budget zero.
+unsafe_budget = 148

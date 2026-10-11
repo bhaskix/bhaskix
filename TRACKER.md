@@ -1063,6 +1063,22 @@ the distinction is in the table rather than in somebody's head.
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-10-11 (RFC 0089 step 6a: the loader carries the whole event log)
+
+The loader's copy of the event log is taken at `GetEventLog`, and EDK2 logs every later event to its
+*final events table* as well as its main log — including the two `EV_EFI_ACTION` events
+`ExitBootServices` extends into PCR 5 (`Tcg2Dxe.c`, read today). So the log the kernel got could
+never replay to the TPM's PCR 5. The loader now finds the table by its GUID before the exit, keeps
+32 KiB of room past its copy (EDK2's default area), and appends the table's events after the exit —
+each sized by its own prefix and validated whole, as the log's last entry is. One that does not fit
+is not cut: the log is marked truncated. On OVMF with swtpm: **2 events, 445 bytes**, the size of
+EDK2's two `ExitBootServices` strings in four banks (inferred from the size; the PCR 5 replay in
+6c checks it), and the kernel's count went to 33 events, log complete. The handoff's format did not
+change — the slice is simply the whole log now — and the RFC's planned-but-never-added
+`final_events` field is corrected in place. A gate on each native lane, armed against edited logs
+(a count of 1, the line missing, the line on a lane without a TPM). The loader's `unsafe` went
+144 → 148, recorded line by line. Lanes: 32, 167 and 35 checks.
+
 ### 2026-10-11 (the native loader joins CI — RFC 0089 step 7)
 
 CI booted no native lane at all. `bhaskixboot.efi` had three local lanes, and the week's fixes found by

@@ -79,7 +79,13 @@ table of seven function pointers, `GetEventLog` second and `HashLogExtendEvent` 
 packed; `GetEventLog(This, Format, &Location, &LastEntry, &Truncated)` with
 `EFI_TCG2_EVENT_LOG_FORMAT_TCG_2 = 2`, the crypto-agile log. Events the firmware logs after
 `GetEventLog` go to the **final events table** (`{0x1e2ed096, 0x30e2, 0x4254, …}`), which the loader
-copies too.
+copies too. ~~(planned)~~ **Since 2026-10-11 (step 6), and by appending:** the table is
+`{u64 Version = 1, u64 NumberOfEvents, TCG_PCR_EVENT2…}` in ACPI NVS (EDK2 `Tcg2Protocol.h`), and
+EDK2 logs every event after the first `GetEventLog` to it as well as to the main log
+(`Tcg2Dxe.c`, read 2026-10-11). The copy is taken at that call, so the main log copied plus the
+table's events is the whole log, in order, with nothing twice. The loader keeps 32 KiB of room past
+its copy (EDK2's `PcdTcg2FinalLogAreaLen`) and appends the table's events after
+`ExitBootServices` -- whose own two `EV_EFI_ACTION` events into PCR 5 are the reason this matters.
 
 `efi.rs` gains the GUID as one more `const` beside the seven it has, and a `locate_protocol` helper
 (today it is called inline twice). **No protocol is not a failure**: the loader records *no TCG2
@@ -103,6 +109,10 @@ pub enum Measurement {
     Measured { log: &'static [u8], truncated: bool, final_events: &'static [u8] },
 }
 ```
+
+**Corrected 2026-10-11**: the `final_events` field above was planned and never added. Step 3
+shipped `Measured { log, truncated }`, and step 6 appends the final events to `log` instead, so
+the handoff carries one complete log and its format did not change.
 
 The log is **copied** into the handoff block before `ExitBootServices`, because the firmware's copy
 may sit in boot-services memory the kernel will reclaim. The block is 32 pages today with its stack top
@@ -295,10 +305,14 @@ path after boot.
    because **this log declares a SHA-384 bank too** (inferred from that pass, not printed), so the
    arm that held was a wrong tag. Three gates had matched `handoff version 2` or the loader's
    `version 2` line, one more than the survey that planned this step found. The loader's `unsafe`
-   budget went 125 → 143, recorded line by line in its manifest. **Deferred, said here**: the
+   budget went 125 → 143, recorded line by line in its manifest. ~~**Deferred, said here**: the
    firmware's *final events table* — events logged after `GetEventLog`, its own
    `ExitBootServices` actions in PCR 5 — is not copied. The loader's three events precede that
-   call, so nothing in this step needs it; a replay of PCR 5 would (step 6).
+   call, so nothing in this step needs it; a replay of PCR 5 would (step 6).~~ **Carried since
+   2026-10-11, step 6**: the loader appends the table's events to its copy after the exit — two
+   on OVMF with swtpm, 445 bytes — the size of EDK2's two `ExitBootServices` actions (29 and
+   40 bytes of text) in four banks, which is inferred from the size; step 6's replay of PCR 5 is
+   what checks it.
 4. **`tcglog`**: host-tested, fuzzed, a captured fixture; the kernel prints the events it found.
    **The parser landed 2026-10-08, before step 3**, which needs it: `GetEventLog` names where the
    log's last entry starts and nothing says where it ends, so the loader must size that entry.

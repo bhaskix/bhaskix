@@ -64,6 +64,15 @@ const SMBIOS_TABLE: Guid = Guid(
     [0x9A, 0x16, 0x00, 0x90, 0x27, 0x3F, 0xC1, 0x4D],
 );
 
+/// `EFI_TCG2_FINAL_EVENTS_TABLE_GUID` -- the events the firmware logs after
+/// `GetEventLog` is first called (EDK2 `Tcg2Protocol.h`), RFC 0089 step 6.
+const TCG2_FINAL_EVENTS_TABLE: Guid = Guid(
+    0x1E2E_D096,
+    0x30E2,
+    0x4254,
+    [0xBD, 0x89, 0x86, 0x3B, 0xBE, 0xF8, 0x23, 0x25],
+);
+
 /// `EFI_GRAPHICS_OUTPUT_PROTOCOL_GUID`.
 const GRAPHICS_OUTPUT: Guid = Guid(
     0x9042_A9DE,
@@ -434,13 +443,24 @@ pub fn close(file: *mut File) {
     let _ = unsafe { ((*file).close)(file) };
 }
 
+/// What [`find_tables`] found, each `None` when the walk did not find it.
+#[derive(Clone, Copy)]
+pub struct Tables {
+    /// The ACPI RSDP, the 2.0 table preferred.
+    pub rsdp: Option<u64>,
+    /// The SMBIOS entry point, the 64-bit one preferred.
+    pub smbios: Option<u64>,
+    /// The TCG2 final events table, which outlives the exit in ACPI NVS.
+    pub final_events: Option<u64>,
+}
+
 /// What the firmware's configuration tables say the machine is: the ACPI
 /// RSDP and the SMBIOS entry point, each preferring the newer table and
-/// falling back to the older, each `None` when the walk finds neither.
+/// falling back to the older, and the TCG2 final events table.
 /// The walk is bounded and every entry is a firmware answer: a count
 /// claiming more than a sane table is clamped rather than believed.
 #[must_use]
-pub fn find_tables(table: *mut SystemTable) -> (Option<u64>, Option<u64>) {
+pub fn find_tables(table: *mut SystemTable) -> Tables {
     // SAFETY: `table` passed `validate`.
     let (count, entries) = unsafe {
         (
@@ -449,9 +469,14 @@ pub fn find_tables(table: *mut SystemTable) -> (Option<u64>, Option<u64>) {
         )
     };
     if entries.is_null() {
-        return (None, None);
+        return Tables {
+            rsdp: None,
+            smbios: None,
+            final_events: None,
+        };
     }
     let count = count.min(256);
+    let mut final_events = None;
     let mut acpi_20 = None;
     let mut acpi_10 = None;
     let mut smbios3 = None;
@@ -469,9 +494,15 @@ pub fn find_tables(table: *mut SystemTable) -> (Option<u64>, Option<u64>) {
             smbios3 = Some(address);
         } else if entry.vendor_guid == SMBIOS_TABLE {
             smbios = Some(address);
+        } else if entry.vendor_guid == TCG2_FINAL_EVENTS_TABLE {
+            final_events = Some(address);
         }
     }
-    (acpi_20.or(acpi_10), smbios3.or(smbios))
+    Tables {
+        rsdp: acpi_20.or(acpi_10),
+        smbios: smbios3.or(smbios),
+        final_events,
+    }
 }
 
 /// The graphics-output protocol, down to its mode pointer.
