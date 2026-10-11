@@ -134,7 +134,7 @@ other rows' defects).
 
 | Defect — what you would see | Rate, as TRACKER states it | Fix |
 |---|---|---|
-| Through its own loader on the SR550, a hosted program reading `/proc/self` never finishes | found 2026-10-08, four of four sixteen-CPU boots | unexplained; uncached CPUs ruled out on the machine |
+| Through its own loader on the SR550, a hosted program reading `/proc/self` never finishes | found 2026-10-08, five of five sixteen-CPU boots | unexplained; uncached CPUs and native dispatch both ruled out on the machine |
 | A ring-station scheduler self-test halts with a station asleep on its own turn | 1 in 391 CI boots before a fix of 2026-09-28; **0 in 657 since** (2026-10-04) | fix landed; open until ~1,200 clean boots |
 | An outbound TCP demonstration stalls: `connected, stream still in flight` | 10 sightings, 1 in 773 boots (2026-09-28) | none |
 | A lock-order self-test fails: a wait queue taken while holding another lock | 4 in 7,681 boots; last 2026-09-23 | a cause fixed 2026-09-28; open until ~5,800 clean boots |
@@ -202,12 +202,12 @@ ping (2026-09-13).
   report** — with one CPU of sixteen and a failed copy-on-write check, both fixed
   the same day: **a third boot ran all sixteen CPUs**, each with write protection,
   SMEP and SMAP read back, and copy-on-write passing. ~~What remains: **no shell**~~
-  ~~**On 2026-10-10 it reached the shell**~~ — **corrected 2026-10-11: not observed.**
-  A check that misread a waiting serial line as a dead one was fixed, and the boot now
-  sets up console input and finds the keyboard; but the boots were stopped at a shell
-  *self-test's* banner, well before the report's end, so whether this path reaches
-  the shell has not been seen. One hosted self-test (`/proc/self`) has not finished
-  on any of four sixteen-CPU boots there.
+  ~~**On 2026-10-10 it reached the shell**~~ — corrected 2026-10-11: that was not
+  observed; the boots were stopped at a shell *self-test's* banner. **Observed the
+  same day on a boot run to its end: the user-mode shell starts** — sixteen CPUs,
+  each with write protection, SMEP and SMAP, the keyboard found, every self-test run.
+  Against the same machine through Limine, one self-test differs: a hosted program
+  reading `/proc/self` has not finished on any of five boots through this loader.
 - **Get an answer to `SET_ADDRESS` from whatever is on its xHCI's port 1.**
 - **Obtain an address, start an exchange, or carry TCP** on its network.
 
