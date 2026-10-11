@@ -35,7 +35,12 @@ case "$command" in
                    --build-arg SWTPM_VERSION="$SWTPM_VERSION" "$HERE/swtpm" >/dev/null
         mkdir -p "$dir/state"
         rm -f "$dir/swtpm.sock"
-        docker run -d --rm --name "$name" -v "$dir:/tpm" "$IMAGE" \
+        # **As the invoking user** (2026-10-11): run as the container's root,
+        # swtpm made its socket `srwxrwx--- root root`, and QEMU running as a
+        # CI runner's unprivileged user could not connect -- it exited before
+        # writing a byte, and the TPM lane failed with an empty log. Locally,
+        # as root, nothing showed.
+        docker run -d --rm --name "$name" --user "$(id -u):$(id -g)" -v "$dir:/tpm" "$IMAGE" \
             socket --tpm2 --tpmstate dir=/tpm/state \
             --ctrl type=unixio,path=/tpm/swtpm.sock --log level=1 >/dev/null
         # QEMU fails at once on a socket that is not there yet; wait for it.
