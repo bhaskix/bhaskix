@@ -1065,6 +1065,16 @@ the distinction is in the table rather than in somebody's head.
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-10-11 (RFC 0089 step 5d-2: the TIS conversation, host-tested)
+
+`bhaskix_tpm::tis` drives the FIFO interface in EDK2's `Tpm2TisTpmCommand` order, every wait
+bounded, and `bhaskix_tpm::interface` reads which interface a page speaks by EDK2's
+`Tpm2GetPtpInterface` conditions; `Tpm` drives either. Seven TIS tests against a mock that counts
+any FIFO access past the burst it offered, one detection test per condition, armed twice. One
+deliberate difference from EDK2, written where it lives: its header loop leaves its burst count one
+high; this one spends a count per byte. `tpmd` gains the byte pair the trait now requires (`unsafe`
+34 → 36) and still drives only CRB until 5d-3.
+
 ### 2026-10-11 (RFC 0089 step 5d-1: a TIS TPM is a TPM, and the full suite on step 6)
 
 **The full `make test` passed on `3627cc5`**, run on a quiet host (load 2.4–3.3) from 14:59 to

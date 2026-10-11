@@ -113,7 +113,8 @@ fn exit() -> ! {
 }
 
 /// The page, as `bhaskix-tpm` drives it. **The only access this program makes
-/// to the device**, and it stays inside the page: an offset the crate would
+/// to the device** -- a 32-bit read and write, and since RFC 0089 step 5d an
+/// 8-bit pair for TIS -- and it stays inside the page: an offset the crate would
 /// never produce is refused here rather than trusted.
 struct Page;
 
@@ -133,6 +134,24 @@ impl Registers for Page {
         }
         // SAFETY: as `read`.
         unsafe { core::ptr::write_volatile((PAGE_AT + offset) as *mut u32, value) }
+    }
+
+    /// TIS's registers are bytes (RFC 0089 step 5d). An offset outside the
+    /// page reads as all ones, which is what an absent TPM reads as.
+    fn read8(&self, offset: usize) -> u8 {
+        if offset >= PAGE_BYTES {
+            return 0xFF;
+        }
+        // SAFETY: as `read`, one byte.
+        unsafe { core::ptr::read_volatile((PAGE_AT + offset) as *const u8) }
+    }
+
+    fn write8(&mut self, offset: usize, value: u8) {
+        if offset >= PAGE_BYTES {
+            return;
+        }
+        // SAFETY: as `read`, one byte.
+        unsafe { core::ptr::write_volatile((PAGE_AT + offset) as *mut u8, value) }
     }
 }
 

@@ -401,6 +401,20 @@ path after boot.
    worth one line each: the thread entering ring 3 has to be pinned, and the asker's spawn was
    handed the endpoint where the direct-map base belongs — a kernel fault in `stack::allocate`
    that was this step's bug, not the kernel's.
+   **5d, TIS — begun 2026-10-11**, because the SR550's TPM, switched to 2.0, may present the FIFO
+   interface, and the design above always said `tpmd` speaks CRB or TIS. **5d-1**: a TIS TPM is
+   named, not missed (see 5a's correction). **5d-2, the conversation, host-tested**: `bhaskix_tpm::tis`
+   is EDK2's `Tpm2TisTpmCommand` — ready, the command a byte at a time within each burst, `expect`
+   clear, `tpmGo`, a cancel and a second wait if no data comes, the header and then the rest by its
+   size, ready again at the end — with every wait bounded. One difference, said in the source:
+   EDK2's header loop leaves by a `break` that skips the `for`'s decrement, so its burst count
+   stands one high; here every byte spends one. `bhaskix_tpm::interface` reads which interface a
+   page speaks by `Tpm2GetPtpInterface`'s conditions, and `Tpm` drives either. The register trait
+   gains byte access with no default, because a FIFO byte read inside a word takes its neighbours.
+   Seven TIS tests against a mock that counts every FIFO access past the burst it offered, and one
+   per detection condition; armed twice (the `expect` check dropped, the burst count's bytes
+   swapped), each red. `tpmd`'s byte pair: `unsafe` 34 → 36. Nothing drives TIS on a machine
+   until 5d-3.
 6. **Agreement**: replay with `pkg`'s SHA-256 in `bin/tpmd`; the report's verdict, each outcome gated. In three checkpoints.
    **6a, the whole log — done 2026-10-11**: the loader appends the firmware's final events table
    to its copy after the exit (see *The protocol*, corrected), 2 events and 445 bytes on OVMF with

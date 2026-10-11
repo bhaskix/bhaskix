@@ -53,5 +53,8 @@ asm_budget = 4
 # kernel left at `tpm::LOG_AT`, bounded by `tpm::LOG_MAX`. Logic did not move:
 # the walk and the replay are `bhaskix-tcglog`'s and the hash `bhaskix-pkg`'s,
 # both at budget zero.
-unsafe_budget = 34
+# **36 on 2026-10-11, RFC 0089 step 5d**: the 8-bit read and write TIS needs,
+# each bounded to the page as the 32-bit pair is. The conversation they carry
+# is `bhaskix-tpm`'s `tis`, host-tested at budget zero.
+unsafe_budget = 36
 unsafe_budget_exact = true

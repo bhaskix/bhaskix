@@ -54,15 +54,7 @@ pub mod bit {
     pub const START: u32 = 1 << 0;
 }
 
-/// The register page, as the caller maps it. The caller owns the mapping and
-/// the only `unsafe` there is; this crate holds no address -- `bhaskix-ahci`'s
-/// shape, for the same reason.
-pub trait Registers {
-    /// Reads the 32-bit register at `offset` from the page's start.
-    fn read(&self, offset: usize) -> u32;
-    /// Writes it.
-    fn write(&mut self, offset: usize, value: u32);
-}
+pub use crate::Registers;
 
 /// Why a command did not complete.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -215,6 +207,16 @@ mod tests {
     impl Registers for &mut Tpm {
         fn read(&self, offset: usize) -> u32 {
             self.page[offset / 4]
+        }
+
+        fn read8(&self, offset: usize) -> u8 {
+            self.page[offset / 4].to_le_bytes()[offset % 4]
+        }
+
+        fn write8(&mut self, offset: usize, value: u8) {
+            let mut bytes = self.page[offset / 4].to_le_bytes();
+            bytes[offset % 4] = value;
+            self.page[offset / 4] = u32::from_le_bytes(bytes);
         }
 
         fn write(&mut self, offset: usize, value: u32) {
