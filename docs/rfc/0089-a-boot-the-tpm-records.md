@@ -82,8 +82,16 @@ packed; `GetEventLog(This, Format, &Location, &LastEntry, &Truncated)` with
 copies too. ~~(planned)~~ **Since 2026-10-11 (step 6), and by appending:** the table is
 `{u64 Version = 1, u64 NumberOfEvents, TCG_PCR_EVENT2…}` in ACPI NVS (EDK2 `Tcg2Protocol.h`), and
 EDK2 logs every event after the first `GetEventLog` to it as well as to the main log
-(`Tcg2Dxe.c`, read 2026-10-11). The copy is taken at that call, so the main log copied plus the
-table's events is the whole log, in order, with nothing twice. The loader keeps 32 KiB of room past
+(`Tcg2Dxe.c`, read 2026-10-11). ~~The copy is taken at that call, so the main log copied plus the
+table's events is the whole log, in order, with nothing twice.~~ **Wrong whenever the loader's call
+is not the first — found on the SR550, 2026-10-11, step 8's first boot.** The table holds every
+event since the *first* call, whoever made it; an event logged between that call and the loader's
+is in both the copy and the table, and appending the whole table replays it twice. Under OVMF the
+loader's call is the first and the table is empty at it, so every gate passed; on the SR550 the
+verdict was `disagree on PCRs 0-6, 8-9` while the TPM's own PCR 9 matched QEMU's for the same
+payload. Linux's EFI stub, read the same day, counts the events already in the table at its own
+call (`final_events_preboot_size`, `libstub/tpm.c`) and its driver appends only those after
+(`eventlog/efi.c`). The loader must do the same. The loader keeps 32 KiB of room past
 its copy (EDK2's `PcdTcg2FinalLogAreaLen`) and appends the table's events after
 `ExitBootServices` -- whose own two `EV_EFI_ACTION` events into PCR 5 are the reason this matters.
 
@@ -460,3 +468,13 @@ path after boot.
    test that went red in 6b, and by nothing on a machine yet.
 7. **CI**: the native-with-TPM job. **Added 2026-10-11** — `boot (native loader)`, all three native lanes, the TPM through `tools/swtpm.sh`, a skip refused by `BHASKIX_REQUIRE=1`. **Green on CI 2026-10-11, run 840 (`996a77f`), the TPM lane included** — after three runs that each found something real: a kernel-half page-table slot built after address spaces had copied the top level (837), an emulator that could not open swtpm's socket (838), and a memory map of 132 descriptors against a 128-slot array (839).
 8. **Hardware**: after the native loader boots the SR550 and the lead switches its TPM to 2.0.
+   **The TPM was switched 2026-10-11 and the first boot ran that evening (19:25):** the loader
+   measured through the SR550's own firmware — kernel `15ae71b2` and initrd `94c50e28`, both
+   matching `sha256sum` of the files on the ISO — and appended 31 final events (9,772 bytes); the
+   kernel found **`TIS at 0xfed40000 (ACPI TPM2, start method 6)`**, `bin/tpmd` drove it over the
+   interface step 5d had added that afternoon, and the TPM's PCR 9 read `7f86ad3e`, the value
+   QEMU's TPM holds for the same two files. **The verdict was red, and rightly**: `disagree on PCRs
+   0-6, 8-9 (agree on 7)` — the log side, not the TPM's, because of the 6a defect stated under *The
+   protocol*. A second finding: with an empty command line this firmware logged the cmdline event
+   with the **initrd's** digest; OVMF, given the same zero-length buffer, logs `e3b0c442`, SHA-256
+   of nothing. So on this machine an empty command line is not measured at all. Both are open.
