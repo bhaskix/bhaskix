@@ -150,6 +150,16 @@ The `-ix` is the Unix lineage, the same suffix Minix and Linux carry.
 > on physical hardware. An address from DHCP, an exchange this machine starts, and TCP have not
 > run there yet.
 >
+> **And as of 2026-10-11 it boots there through its own loader with a measured boot the TPM
+> vouches for** ([RFC 0089](docs/rfc/0089-a-boot-the-tpm-records.md)). `bhaskixboot.efi` measures
+> the kernel and initrd through the firmware's TPM 2.0 and carries the event log to the kernel; the
+> kernel finds the TPM through ACPI and grants one register page to `bin/tpmd`, which reads the PCRs
+> itself and replays the log with the tree's own SHA-256. Read off the SR550: `log and TPM agree on
+> PCRs 0-7, 9: 47 events replayed (sha256), in bin/tpmd over FIFO`. It took a second boot — the
+> first was red, rightly, and found two defects, both fixed the same evening — and the TPM had to be
+> switched from 1.2 to 2.0 first. **It enforces nothing**: a changed kernel still boots, recorded;
+> signing waits on key custody.
+>
 > Nothing here should run anywhere that matters — see [SECURITY.md](SECURITY.md).
 >
 > **The design documents still have one author and no independent reviewers.** Phase 0's exit

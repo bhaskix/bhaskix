@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | 🔨 **Draft 2026-10-07 — steps 1, 2, 3 and 5 done by 2026-10-08, steps 6 and 7 on 2026-10-11 with step 5d (TIS), and step 4's parser: the native loader measures the kernel, initrd and command line through the firmware's `EFI_TCG2_PROTOCOL`, and the event log reaches the kernel in a version-3 handoff**, where the boot report reads the loader's three digests out of it — gated in `make test-boot-native-tpm`, including a kernel byte that changes the kernel's digest and nothing else's. ~~Nothing reads a PCR or replays yet (steps 5 and 6).~~ **Step 5 since 2026-10-08:** `bin/tpmd`, in a domain holding the TPM's one CRB register page and nothing else, reads PCRs 8 and 9 and the boot report prints them — and a kernel byte flipped moves PCR 9 and not PCR 8. **Nothing replays the log against them yet (step 6)**, so nothing is verified and nothing enforced. The first of Phase 3's secure boot chain, sequenced by the project lead on 2026-10-07: *measured boot first*, signing after key custody is decided. The acceptance call is the project lead's |
+| **Status** | 🔨 **Draft 2026-10-07 — every step of the plan done by 2026-10-11, awaiting the lead's acceptance** (1, 2, 3 and 5 by 2026-10-08; 4's fixture, 5d (TIS), 6, 7 and 8 on 2026-10-11, the last on the SR550: `log and TPM agree on PCRs 0-7, 9 ... over FIFO`). Steps 2–4: **the native loader measures the kernel, initrd and command line through the firmware's `EFI_TCG2_PROTOCOL`, and the event log reaches the kernel in a version-3 handoff**, where the boot report reads the loader's three digests out of it — gated in `make test-boot-native-tpm`, including a kernel byte that changes the kernel's digest and nothing else's. ~~Nothing reads a PCR or replays yet (steps 5 and 6).~~ **Step 5 since 2026-10-08:** `bin/tpmd`, in a domain holding the TPM's one CRB register page and nothing else, reads PCRs 8 and 9 and the boot report prints them — and a kernel byte flipped moves PCR 9 and not PCR 8. **Nothing replays the log against them yet (step 6)**, so nothing is verified and nothing enforced. The first of Phase 3's secure boot chain, sequenced by the project lead on 2026-10-07: *measured boot first*, signing after key custody is decided. The acceptance call is the project lead's |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | boot (`bhaskixboot.efi`, `bhaskix_boot::Handoff`), arch (ACPI `TPM2`), kernel (boot report), userspace (a TPM service), tools, tests |
 | **Milestone** | Phase 3 — *Secure boot chain*, the roadmap's first row; [security.md](../security.md) §1 **T6** and gap 1 |
@@ -494,4 +494,13 @@ path after boot.
    open.~~ **Both fixed the same evening** (see *The protocol* and *What is measured*): the final
    events are counted at the loader's own call, and an empty command line is no longer measured,
    by the lead's decision. A CRB-lane boot with an early `GetEventLog` and no command line holds
-   both, armed red each way. The second SR550 boot is pending the lead's word.
+   both, armed red each way. ~~The second SR550 boot is pending the lead's word.~~ **The second
+   SR550 boot, 2026-10-11 20:35, `c26fed2`, the same empty command line — green**: `final events 0
+   (0 bytes) appended after the exit; 30 already in the log at GetEventLog, not appended twice` —
+   the 30 the first boot appended a second time — then `cmdline empty, not measured`, 48 events, and
+   **`tpm  log and TPM agree on PCRs 0-7, 9: 47 events replayed (sha256), in bin/tpmd over FIFO`**,
+   with `PCR 8 00000000`, which nothing measured. The SR550's TPM is a PTP FIFO part; one of its
+   log's 48 events is an `EV_NO_ACTION` OVMF does not write, and PCR 0 agreed with it there. Which
+   kind it is, the console does not show. Its firmware logged nothing after the loader's call, so
+   no `ExitBootServices` event reaches its table, and PCR 5 agreed without one. **Step 8 is done.**
+   The machine was restored to its own OS, its TPM left at 2.0.
