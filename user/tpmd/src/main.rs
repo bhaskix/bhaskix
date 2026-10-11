@@ -5,7 +5,7 @@
 //!
 //! - **one `Frame`**: the TPM's locality-0 register page, which the kernel
 //!   found through the ACPI `TPM2` table and checked is not RAM before granting
-//!   it. Read and write, no `GRANT` and no `DERIVE`, so the other localities'
+//!   it. CRB or TIS, read from the page itself since RFC 0089 step 5d. Read and write, no `GRANT` and no `DERIVE`, so the other localities'
 //!   pages are not reachable and the page cannot be handed on;
 //! - **one endpoint**, on which it answers [`tpm::PCR_READ`] and
 //!   [`tpm::REPLAY`] and nothing else.
@@ -33,7 +33,9 @@ use bhaskix_pkg::sha256::Sha256;
 use bhaskix_tcglog::log::Log;
 use bhaskix_tcglog::replay::{self, ReplayError};
 use bhaskix_tpm::command::{self, ResponseError, SHA256_DIGEST, TPM_ALG_SHA256};
-use bhaskix_tpm::crb::{Crb, CrbError, Registers};
+use bhaskix_tpm::crb::CrbError;
+use bhaskix_tpm::tis::TisError;
+use bhaskix_tpm::{DeviceError, Interface, Registers, Tpm};
 
 /// Slot: the TPM's locality-0 register page.
 const PAGE: u64 = 0;
@@ -155,15 +157,42 @@ impl Registers for Page {
     }
 }
 
-/// Where a CRB command stopped, as the reply says it.
-fn device_code(error: CrbError) -> u64 {
+/// Where a command stopped, as the reply says it: CRB's from 1, TIS's from
+/// 11, and an interface this service does not drive from 21.
+fn device_code(error: DeviceError) -> u64 {
     match error {
-        CrbError::LocalityNotGranted => 1,
-        CrbError::NeverIdle => 2,
-        CrbError::NeverReady => 3,
-        CrbError::NeverFinished => 4,
-        CrbError::CommandTooLarge => 5,
-        CrbError::ResponseSize(_) => 6,
+        DeviceError::Crb(CrbError::LocalityNotGranted) => 1,
+        DeviceError::Crb(CrbError::NeverIdle) => 2,
+        DeviceError::Crb(CrbError::NeverReady) => 3,
+        DeviceError::Crb(CrbError::NeverFinished) => 4,
+        DeviceError::Crb(CrbError::CommandTooLarge) => 5,
+        DeviceError::Crb(CrbError::ResponseSize(_)) => 6,
+        DeviceError::Tis(TisError::Absent) => 11,
+        DeviceError::Tis(TisError::LocalityNotGranted) => 12,
+        DeviceError::Tis(TisError::NeverReady) => 13,
+        DeviceError::Tis(TisError::NoBurst) => 14,
+        DeviceError::Tis(TisError::StillExpecting) => 15,
+        DeviceError::Tis(TisError::NeverAnswered) => 16,
+        DeviceError::Tis(TisError::Tpm12Answer) => 17,
+        DeviceError::Tis(TisError::ResponseSize(_)) => 18,
+    }
+}
+
+/// An interface this service does not drive, as the reply says it.
+fn interface_code(found: Interface) -> u64 {
+    match found {
+        Interface::Absent => 21,
+        _ => 22,
+    }
+}
+
+/// The interface, as `REPLAY`'s fourth word says it.
+fn interface_word(found: Interface) -> u64 {
+    match found {
+        Interface::Crb => tpm::interface::CRB,
+        Interface::Fifo => tpm::interface::FIFO,
+        Interface::Tis => tpm::interface::TIS,
+        Interface::Absent | Interface::Unknown(_) => 0,
     }
 }
 
@@ -181,11 +210,11 @@ fn response_code(error: ResponseError) -> u64 {
 }
 
 /// One PCR read: its value, or the outcome and detail a reply would carry.
-fn read_pcr(crb: &mut Crb<Page>, pcr: u8) -> Result<[u8; SHA256_DIGEST], (u64, u64)> {
+fn read_pcr(device: &mut Tpm<Page>, pcr: u8) -> Result<[u8; SHA256_DIGEST], (u64, u64)> {
     let request =
         command::pcr_read_command(TPM_ALG_SHA256, pcr).ok_or((tpm::outcome::BAD_REQUEST, 0))?;
     let mut response = [0u8; 256];
-    let length = crb
+    let length = device
         .execute(&request, &mut response)
         .map_err(|error| (tpm::outcome::DEVICE, device_code(error)))?;
     match command::parse_pcr_read_response(&response[..length], TPM_ALG_SHA256, pcr, SHA256_DIGEST)
@@ -201,8 +230,8 @@ fn read_pcr(crb: &mut Crb<Page>, pcr: u8) -> Result<[u8; SHA256_DIGEST], (u64, u
 }
 
 /// One PCR read, start to reply.
-fn answer(crb: &mut Crb<Page>, pcr: u8) {
-    match read_pcr(crb, pcr) {
+fn answer(device: &mut Tpm<Page>, pcr: u8) {
+    match read_pcr(device, pcr) {
         Ok(value) => {
             let mut words = [0u64; 4];
             for (word, bytes) in words.iter_mut().zip(value.chunks(8)) {
@@ -238,7 +267,7 @@ fn not_checked(error: ReplayError) -> [u64; 4] {
 
 /// The log replayed and every PCR it touched read from the TPM, start to
 /// reply -- RFC 0089 step 6.
-fn answer_replay(crb: &mut Crb<Page>, log: &[u8]) {
+fn answer_replay(device: &mut Tpm<Page>, found: Interface, log: &[u8]) {
     if log.is_empty() {
         return reply(
             tpm::outcome::NOT_CHECKED,
@@ -260,7 +289,7 @@ fn answer_replay(crb: &mut Crb<Page>, log: &[u8]) {
         if replayed.touched & (1 << pcr) == 0 {
             continue;
         }
-        match read_pcr(crb, pcr as u8) {
+        match read_pcr(device, pcr as u8) {
             Ok(held) if &held == value => agreeing |= 1 << pcr,
             Ok(_) => {}
             Err((outcome, detail)) => return reply(outcome, [detail, 0, 0, 0]),
@@ -272,7 +301,7 @@ fn answer_replay(crb: &mut Crb<Page>, log: &[u8]) {
             u64::from(replayed.touched),
             u64::from(agreeing),
             u64::from(replayed.extended),
-            0,
+            interface_word(found),
         ],
     );
 }
@@ -303,8 +332,14 @@ extern "C" fn tpmd_main(log_length: u64, page: u64) -> ! {
         // before this program started, and nothing unmaps them.
         unsafe { core::slice::from_raw_parts(tpm::LOG_AT as *const u8, log_length as usize) }
     };
-    let mut crb = Crb::new(Page, page, POLLS);
-    let locality = crb.request_locality();
+    // Which interface the page speaks, read from the page as EDK2 reads it;
+    // the kernel granted the page for either.
+    let found = bhaskix_tpm::interface(&Page);
+    let mut device = Tpm::new(Page, page, POLLS);
+    let locality = match device.as_mut() {
+        Ok(device) => device.request_locality().map_err(device_code),
+        Err(found) => Err(interface_code(*found)),
+    };
     loop {
         let (received, asked, args) = receive();
         if received != status::OK {
@@ -316,14 +351,15 @@ extern "C" fn tpmd_main(log_length: u64, page: u64) -> ! {
             reply(tpm::outcome::BAD_REQUEST, [0; 4]);
             continue;
         }
-        if let Err(error) = locality {
-            reply(tpm::outcome::DEVICE, [device_code(error), 0, 0, 0]);
+        let (Ok(device), Ok(())) = (device.as_mut(), locality) else {
+            let code = locality.err().unwrap_or(0);
+            reply(tpm::outcome::DEVICE, [code, 0, 0, 0]);
             continue;
-        }
+        };
         if asked == tpm::REPLAY {
-            answer_replay(&mut crb, log);
+            answer_replay(device, found, log);
         } else {
-            answer(&mut crb, args[0] as u8);
+            answer(device, args[0] as u8);
         }
     }
 }

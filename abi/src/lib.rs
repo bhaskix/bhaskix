@@ -1966,7 +1966,7 @@ pub mod tpm {
     ///
     /// On [`outcome::OK`] the reply's words are: a bit per PCR the log
     /// touched, a bit per PCR whose value the TPM agrees with, the events
-    /// folded, and zero. On [`outcome::NOT_CHECKED`], `args[0]` is a
+    /// folded, and the [`interface`] the service drove (RFC 0089 step 5d). On [`outcome::NOT_CHECKED`], `args[0]` is a
     /// [`not_checked`] reason and `args[1]` its detail. A PCR read that fails
     /// is answered as [`PCR_READ`] answers it.
     pub const REPLAY: u64 = 2;
@@ -1995,6 +1995,17 @@ pub mod tpm {
         /// [`super::REPLAY`] could not replay the log; `args[0]` is a
         /// [`super::not_checked`] reason.
         pub const NOT_CHECKED: u64 = 5;
+    }
+
+    /// Which register interface `bin/tpmd` found the TPM speaking -- read
+    /// from the page itself, as EDK2's `Tpm2GetPtpInterface` reads it.
+    pub mod interface {
+        /// The command-response buffer.
+        pub const CRB: u64 = 1;
+        /// PTP's FIFO, driven as TIS.
+        pub const FIFO: u64 = 2;
+        /// TIS 1.3.
+        pub const TIS: u64 = 3;
     }
 
     /// Why a [`REPLAY`] did not check, in `args[0]` of a

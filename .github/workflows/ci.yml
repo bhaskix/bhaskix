@@ -277,6 +277,11 @@ jobs:
           BHASKIX_REQUIRE: 1
           BHASKIX_NATIVE_BOOT_LOG: native-tpm.log
         run: make test-boot-native-tpm
+      - name: Boot through the native loader with a TIS TPM 2.0 (swtpm)
+        env:
+          BHASKIX_REQUIRE: 1
+          BHASKIX_NATIVE_BOOT_LOG: native-tpm-tis.log
+        run: make test-boot-native-tpm-tis
 
       - name: Upload the logs on failure
         if: failure()
@@ -287,6 +292,7 @@ jobs:
             native-plain.log
             native-full.log
             native-tpm.log
+            native-tpm-tis.log
             ci-env-native.txt
           retention-days: 7
 

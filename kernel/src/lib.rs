@@ -14810,23 +14810,21 @@ fn configuration_page(address: bhaskix_arch::pci::Address) -> Option<u64> {
     )
 }
 
-/// The control area of a CRB TPM `tpm_discovery` found, or zero.
+/// The locality-0 register page of the TPM `tpm_discovery` found -- CRB's or
+/// TIS's -- or zero.
 static TPM_FOUND: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
-/// Starts `bin/tpmd` on the CRB TPM `tpm_discovery` found, if it found one,
-/// and asks it for PCRs 8 and 9 -- RFC 0089 step 5c. Started here, beside the
+/// Starts `bin/tpmd` on the TPM `tpm_discovery` found, if it found one, and
+/// asks it for PCRs 8 and 9 -- RFC 0089 step 5c; CRB or TIS since step 5d,
+/// the page the same kind of grant either way. Started here, beside the
 /// other domain programs, rather than at discovery, so that every ring 3
 /// program comes up at the same point in the boot.
 fn start_tpm_service(handoff: &Handoff) {
-    let control_area = TPM_FOUND.load(core::sync::atomic::Ordering::Acquire);
-    if control_area == 0 {
+    let page = TPM_FOUND.load(core::sync::atomic::Ordering::Acquire);
+    if page == 0 {
         return;
     }
-    let tpm = bhaskix_arch::acpi::Tpm2 {
-        start_method: bhaskix_arch::acpi::TPM2_START_CRB,
-        control_area,
-    };
-    match start_tpm_domain(handoff, tpm) {
+    match start_tpm_domain(handoff, page) {
         Ok(()) => tpm_service_report(handoff.hhdm_base.as_u64()),
         Err(why) => println!("\x1b[91m    tpm            FAILED to start bin/tpmd: {why}\x1b[0m"),
     }
@@ -14958,7 +14956,8 @@ fn pcr_noun(mask: u32) -> &'static str {
     }
 }
 
-/// Starts `bin/tpmd` on the CRB TPM `tpm` describes -- RFC 0089 step 5c.
+/// Starts `bin/tpmd` on the TPM whose locality-0 register `page` is -- RFC
+/// 0089 step 5c, CRB's page or, since step 5d, TIS's at the platform's base.
 ///
 /// **The first domain granted a device the kernel found through ACPI rather
 /// than a PCI BAR**, and so the first whose address is firmware's: the page is
@@ -14966,9 +14965,9 @@ fn pcr_noun(mask: u32) -> &'static str {
 /// is granted is one page -- locality 0 -- read and write, with no `GRANT` and
 /// no `DERIVE`, so the other localities are not reachable and the page cannot
 /// be handed on; and an endpoint. No memory beyond the program's own, and no
-/// DMA window: a CRB TPM does no DMA and has no requester ID to make one for.
-fn start_tpm_domain(handoff: &Handoff, tpm: bhaskix_arch::acpi::Tpm2) -> Result<(), &'static str> {
-    let page = tpm.control_area & !(bhaskix_mm::FRAME_SIZE - 1);
+/// DMA window: a CRB or TIS TPM does no DMA and has no requester ID to make
+/// one for.
+fn start_tpm_domain(handoff: &Handoff, page: u64) -> Result<(), &'static str> {
     if bhaskix_boot::overlaps_non_reserved(handoff.memory_map, page, bhaskix_mm::FRAME_SIZE) {
         return Err("the TPM2 table names a page the memory map does not reserve");
     }
@@ -15206,9 +15205,15 @@ fn tpm_verdict() {
             if touched == 0 {
                 println!("\x1b[93m    tpm            log not checked: it extended no PCR\x1b[0m");
             } else if agreeing == touched {
+                let over = match word(3) {
+                    bhaskix_abi::tpm::interface::CRB => "CRB",
+                    bhaskix_abi::tpm::interface::FIFO => "FIFO",
+                    bhaskix_abi::tpm::interface::TIS => "TIS",
+                    _ => "an interface it did not name",
+                };
                 println!(
                     "    tpm            log and TPM agree on {} {}: {events} events replayed \
-                     (sha256), in bin/tpmd",
+                     (sha256), in bin/tpmd over {over}",
                     pcr_noun(touched),
                     Pcrs(touched)
                 );
@@ -15285,12 +15290,20 @@ fn tpm_discovery(handoff: &Handoff) -> Option<bhaskix_arch::acpi::Tpm2> {
         );
         // RFC 0089 step 5c drives it -- later, where the other domain
         // programs start; see `start_tpm_service`.
-        TPM_FOUND.store(tpm.control_area, core::sync::atomic::Ordering::Release);
+        TPM_FOUND.store(
+            tpm.control_area & !(bhaskix_mm::FRAME_SIZE - 1),
+            core::sync::atomic::Ordering::Release,
+        );
     } else if tpm.start_method == bhaskix_arch::acpi::TPM2_START_TIS {
         println!(
-            "    tpm            TIS at {:#x} (ACPI TPM2, start method {}); not driven yet",
+            "    tpm            TIS at {:#x} (ACPI TPM2, start method {})",
             bhaskix_arch::acpi::TPM_BASE,
             tpm.start_method
+        );
+        // Step 5d: the same service, the same one-page grant.
+        TPM_FOUND.store(
+            bhaskix_arch::acpi::TPM_BASE,
+            core::sync::atomic::Ordering::Release,
         );
     } else {
         println!(

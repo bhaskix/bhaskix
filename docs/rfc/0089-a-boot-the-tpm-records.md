@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | 🔨 **Draft 2026-10-07 — steps 1, 2, 3 and 5 done by 2026-10-08, steps 6 and 7 on 2026-10-11, and step 4's parser: the native loader measures the kernel, initrd and command line through the firmware's `EFI_TCG2_PROTOCOL`, and the event log reaches the kernel in a version-3 handoff**, where the boot report reads the loader's three digests out of it — gated in `make test-boot-native-tpm`, including a kernel byte that changes the kernel's digest and nothing else's. ~~Nothing reads a PCR or replays yet (steps 5 and 6).~~ **Step 5 since 2026-10-08:** `bin/tpmd`, in a domain holding the TPM's one CRB register page and nothing else, reads PCRs 8 and 9 and the boot report prints them — and a kernel byte flipped moves PCR 9 and not PCR 8. **Nothing replays the log against them yet (step 6)**, so nothing is verified and nothing enforced. The first of Phase 3's secure boot chain, sequenced by the project lead on 2026-10-07: *measured boot first*, signing after key custody is decided. The acceptance call is the project lead's |
+| **Status** | 🔨 **Draft 2026-10-07 — steps 1, 2, 3 and 5 done by 2026-10-08, steps 6 and 7 on 2026-10-11 with step 5d (TIS), and step 4's parser: the native loader measures the kernel, initrd and command line through the firmware's `EFI_TCG2_PROTOCOL`, and the event log reaches the kernel in a version-3 handoff**, where the boot report reads the loader's three digests out of it — gated in `make test-boot-native-tpm`, including a kernel byte that changes the kernel's digest and nothing else's. ~~Nothing reads a PCR or replays yet (steps 5 and 6).~~ **Step 5 since 2026-10-08:** `bin/tpmd`, in a domain holding the TPM's one CRB register page and nothing else, reads PCRs 8 and 9 and the boot report prints them — and a kernel byte flipped moves PCR 9 and not PCR 8. **Nothing replays the log against them yet (step 6)**, so nothing is verified and nothing enforced. The first of Phase 3's secure boot chain, sequenced by the project lead on 2026-10-07: *measured boot first*, signing after key custody is decided. The acceptance call is the project lead's |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | boot (`bhaskixboot.efi`, `bhaskix_boot::Handoff`), arch (ACPI `TPM2`), kernel (boot report), userspace (a TPM service), tools, tests |
 | **Milestone** | Phase 3 — *Secure boot chain*, the roadmap's first row; [security.md](../security.md) §1 **T6** and gap 1 |
@@ -414,7 +414,16 @@ path after boot.
    Seven TIS tests against a mock that counts every FIFO access past the burst it offered, and one
    per detection condition; armed twice (the `expect` check dropped, the burst count's bytes
    swapped), each red. `tpmd`'s byte pair: `unsafe` 34 → 36. Nothing drives TIS on a machine
-   until 5d-3.
+   until 5d-3. **5d-3, driven — done 2026-10-11**: the kernel grants the TIS page at `0xFED40000`
+   exactly as it grants CRB's — one Frame, read and write, refused if any of it is RAM — and
+   `tpmd` reads the interface from the page as EDK2 does and drives it, naming it in `REPLAY`'s
+   spare word. A lane with QEMU's `tpm-tis`, `make test-boot-native-tpm-tis`, in `make test` and
+   as a fourth step of CI's native job, holds every TPM gate the CRB lane does: `tpm  log and TPM
+   agree on PCRs 0-9: 33 events replayed (sha256), in bin/tpmd over FIFO` — QEMU's TIS device
+   identifies as PTP's FIFO — the flipped kernel byte still agreeing, and the lying log caught
+   on PCR 9. The CRB lane now reads `over CRB`, found the same way. Armed against saved logs: each
+   lane's verdict refused with the other's interface, and the TIS discovery gate red on a log
+   edited back to the old `no TPM2 table`. No kernel `unsafe`; `tpmd`'s stays 36.
 6. **Agreement**: replay with `pkg`'s SHA-256 in `bin/tpmd`; the report's verdict, each outcome gated. In three checkpoints.
    **6a, the whole log — done 2026-10-11**: the loader appends the firmware's final events table
    to its copy after the exit (see *The protocol*, corrected), 2 events and 445 bytes on OVMF with

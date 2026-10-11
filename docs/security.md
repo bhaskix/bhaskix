@@ -577,6 +577,9 @@ Domain 0 / init (measured)
   report, not evidence a remote party should accept; attestation (§10) quotes the TPM, it does not
   ask `tpmd`. The `bhaskix.fault=tpm-log` boot option that tests the red line changes the copy
   `tpmd` replays and nothing the TPM holds, so it can turn the verdict red and never green.
+  **And since step 5d it speaks TIS as well as CRB**, with the same grant: one locality-0 page —
+  for TIS the platform's fixed base, `0xFED40000`, still refused if any of it is RAM — read and
+  write, no `GRANT`, no `DERIVE`. Which interface it is, `tpmd` reads from the page itself.
 - **Sealing:** disk encryption keys are sealed to a PCR policy. A tampered boot chain cannot unseal
   them. The failure mode is "the disk does not decrypt", not "the disk decrypts for an attacker".
 

@@ -276,7 +276,7 @@ OVMF_VARS    := $(firstword $(wildcard $(OVMF_DIR)OVMF_VARS$(OVMF_SUFFIX).fd))
 
 .PHONY: FORCE all kernel iso demo run run-uefi progress test test-host test-boot test-boot-uefi test-boot-uefi-qemu64 test-boot-iommu test-keyboard \
         test-boot-iommu-off test-boot-qemu64 test-boot-native test-boot-native-full test-boot-native-tpm \
-        test-placements mkfs test-shell test-faults test-usb-keyboard test-lacp test-bond test-http fmt clippy gates hooks clean distclean help
+        test-boot-native-tpm-tis test-placements mkfs test-shell test-faults test-usb-keyboard test-lacp test-bond test-http fmt clippy gates hooks clean distclean help
 
 all: iso
 
@@ -740,7 +740,7 @@ run-uefi: $(ISO)
 # one, and `gave up after 0.255s` says nothing about an image at all.
 test: fmt clippy test-host gates test-boot test-boot-uefi test-boot-iommu test-boot-iommu-off \
       test-boot-qemu64 test-boot-uefi-qemu64 test-boot-native test-boot-native-full test-boot-native-tpm \
-      test-placements test-shell \
+      test-boot-native-tpm-tis test-placements test-shell \
       test-keyboard test-usb-keyboard test-busybox test-bond test-lacp test-faults test-http
 	@echo
 	@echo "  all checks passed"
@@ -918,6 +918,12 @@ test-boot-native-full: $(BOOTEFI) $(ISO)
 # it from step 7.
 test-boot-native-tpm: $(BOOTEFI) $(ISO)
 	BHASKIX_TPM=1 tests/qemu/native-boot-test.sh
+
+# The same lane with the TPM on the FIFO interface, TIS -- RFC 0089 step 5d,
+# because a discrete TPM, such as a server's, usually speaks it. Every TPM
+# gate the CRB lane holds, plus the interface `bin/tpmd` found.
+test-boot-native-tpm-tis: $(BOOTEFI) $(ISO)
+	BHASKIX_TPM=1 BHASKIX_TPM_INTERFACE=tis tests/qemu/native-boot-test.sh
 
 
 # Types at the machine over the serial line and asserts on the replies. The

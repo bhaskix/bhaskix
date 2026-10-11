@@ -91,6 +91,15 @@ fi
 # a TPM is state, and the second boot below must not inherit the first's PCRs.
 TPM_ARGS=()
 TPM_DIR="$REPO_ROOT/build/swtpm-native"
+# Which interface the emulated TPM speaks -- `crb`, or `tis` for RFC 0089 step
+# 5d's lane -- and what `bin/tpmd` must then say it drove: QEMU's TIS device
+# may identify as PTP's FIFO or as TIS 1.3, and both are driven as TIS.
+TPM_INTERFACE="${BHASKIX_TPM_INTERFACE:-crb}"
+case "$TPM_INTERFACE" in
+    crb) TPM_OVER="CRB" ;;
+    tis) TPM_OVER="(FIFO|TIS)" ;;
+    *) echo "BHASKIX_TPM_INTERFACE is crb or tis, not '$TPM_INTERFACE'" >&2; exit 2 ;;
+esac
 stop_tpm() { :; }
 start_tpm() { :; }
 if [[ "${BHASKIX_TPM:-0}" == 1 ]]; then
@@ -113,7 +122,7 @@ if [[ "${BHASKIX_TPM:-0}" == 1 ]]; then
         "$REPO_ROOT/tools/swtpm.sh" start "$TPM_DIR" || { fail "the TPM emulator did not start"; exit 1; }
     }
     trap stop_tpm EXIT
-    qemu_tpm_args "$TPM_DIR/swtpm.sock"
+    qemu_tpm_args "$TPM_DIR/swtpm.sock" "$TPM_INTERFACE"
 fi
 
 ESP="$REPO_ROOT/build/native-esp"
@@ -249,7 +258,7 @@ pcrs_in() {
 }
 # Whether verdict "$1" is an agreement naming every PCR after it.
 agrees_on() {
-    local re='^log and TPM agree on PCRs? ([0-9, -]+): ([1-9][0-9]*) events replayed \(sha256\), in bin/tpmd$'
+    local re='^log and TPM agree on PCRs? ([0-9, -]+): ([1-9][0-9]*) events replayed \(sha256\), in bin/tpmd over '"$TPM_OVER"'$'
     [[ "$1" =~ $re ]] || return 1
     local named pcr
     named=" $(pcrs_in "${BASH_REMATCH[1]}" | tr '\n' ' ')"
@@ -534,13 +543,19 @@ else
 fi
 
 # RFC 0089 step 5a: **the TPM the firmware measured into is one the kernel can
-# find.** With the emulated TPM, the ACPI `TPM2` table names a CRB interface;
-# without it, there is no table.
+# find.** With the emulated TPM, the ACPI `TPM2` table names a CRB interface --
+# or, on step 5d's lane, TIS at the platform's fixed base, its table carrying no
+# control area; without it, there is no table.
+if [[ "$TPM_INTERFACE" == tis ]]; then
+    FOUND_RE="tpm            TIS at 0xfed40000 \(ACPI TPM2, start method 6\)"
+else
+    FOUND_RE="tpm            CRB at 0x[0-9a-f]+ \(ACPI TPM2, start method 7\)"
+fi
 if [[ "${BHASKIX_TPM:-0}" == 1 ]]; then
-    if grep -qE "tpm            CRB at 0x[0-9a-f]+ \(ACPI TPM2, start method 7\)" "$LOG" 2>/dev/null; then
-        pass "the kernel found the TPM through ACPI: $(grep -aoE 'CRB at 0x[0-9a-f]+' "$LOG" | head -1)"
+    if grep -qE "$FOUND_RE" "$LOG" 2>/dev/null; then
+        pass "the kernel found the TPM through ACPI: $(grep -aoE '(CRB|TIS) at 0x[0-9a-f]+' "$LOG" | head -1)"
     else
-        fail "the kernel did not find a CRB TPM through ACPI: $(grep -aE '^ *tpm  ' "$LOG" | tr -d '\r' | head -1)"
+        fail "the kernel did not find a ${TPM_INTERFACE^^} TPM through ACPI: $(grep -aE '^ *tpm  ' "$LOG" | tr -d '\r' | head -1)"
         status=1
     fi
     # RFC 0089 step 5c: **the TPM itself, asked.** `bin/tpmd`, in a domain
