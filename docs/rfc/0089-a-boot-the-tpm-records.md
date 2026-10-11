@@ -237,7 +237,8 @@ path after boot.
 
 ## Testing plan
 
-- **Host**: `tcglog` against a log captured from OVMF + swtpm (checked in as a fixture), plus
+- **Host**: `tcglog` against a log captured from OVMF + swtpm (checked in as a fixture — done
+  2026-10-11, `tcglog/fixtures/ovmf-swtpm.eventlog`), plus
   hand-built logs for every refusal; the `TPM2` table parser the same way; the `Handoff` validation
   for version 3; the request-set closure of `tpmd`'s protocol. A fuzz target over `tcglog`.
 - **QEMU**: a native lane with `-tpmdev emulator` (verified present in this QEMU, 4.2.1) and
@@ -338,8 +339,21 @@ path after boot.
    digests — were each **reached from an empty corpus** by a deliberate panic, the standard the
    filesystem's target set. Writing the target found one gap the tests had not: an event with
    the right digest *count* could name one bank twice and omit another, which a replay would have
-   met as a missing digest. It is refused now. The captured fixture and the kernel's printing
-   remain.
+   met as a missing digest. It is refused now. ~~The captured fixture and the kernel's printing
+   remain.~~ **Both done.** The kernel's printing is what step 3 shipped — the event count and
+   the loader's three digests, not every firmware event, which would bury the report. **The
+   captured fixture landed 2026-10-11**: `tools/capture-event-log.sh` boots the native loader
+   under OVMF with swtpm, dumps guest memory over QMP after the replay's verdict, and writes the
+   loader's copy — chosen by the length the loader printed, every copy of that length required to
+   be identical — then replays it with its own walker and Python's `hashlib`.
+   `tcglog/fixtures/ovmf-swtpm.eventlog`, 8,103 bytes, 33 events in four banks; two host tests hold it
+   to PCRs 0-9 as Python computed them (PCR 8 and 9 also as the TPM itself answered in that boot),
+   and to its last five events being the loader's three tagged ones and the two `ExitBootServices`
+   actions in PCR 5 — read from the bytes, which settles what step 6a had inferred from a size.
+   Armed: the fixture cut back to the 7,658 bytes `GetEventLog` gave fails both. Two wrong turns
+   on the way, each one line: QEMU 4.2.1 here segfaulted around the human monitor's `stop` and
+   `quit` with the TPM emulator attached, and the human monitor dropped a command whose socket
+   closed while it was still echoing; QMP answers when the dump is done.
 5. **ACPI `TPM2` and `bin/tpmd`**: PCR read only, closed request set, gated. In three
    checkpoints. **5a, finding it — done 2026-10-08**: `bhaskix_arch::acpi::parse_tpm2` reads the
    table's signature, length, checksum, `AddressOfControlArea` (40) and `StartMethod` (48), and

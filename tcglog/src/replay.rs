@@ -266,6 +266,88 @@ mod tests {
         assert_eq!(replayed(&log), Err(ReplayError::Pcr(24)));
     }
 
+    /// **A log a firmware wrote**, not one these tests built: OVMF
+    /// (`OVMF_CODE_4M.fd`, Ubuntu 20.04) with swtpm, booting `bhaskixboot.efi`
+    /// at `69a1fa5` with `kaslr=show`, captured on 2026-10-11 by
+    /// `tools/capture-event-log.sh` out of the guest's memory -- the loader's
+    /// copy, 7,658 bytes from `GetEventLog` and 445 of final events appended.
+    const OVMF_SWTPM: &[u8] = include_bytes!("../fixtures/ovmf-swtpm.eventlog");
+
+    /// What PCRs 0 to 9 must replay to. Computed by the capture tool's own
+    /// walker and Python's `hashlib`, apart from this crate and `bhaskix-pkg`;
+    /// and the boot that wrote the log printed, from the TPM itself through
+    /// `bin/tpmd`, `PCR 8 c9e4d6eb PCR 9 29535236` and `log and TPM agree on
+    /// PCRs 0-9`.
+    const OVMF_SWTPM_PCRS: [&str; 10] = [
+        "b78bf8a2485e4f682e05598aa007d5da9d144cdfc6826bba9e5292457925b8c6",
+        "33d454dfcf5e46c0b7afd332272e72adc3d1a86ccae25aa98dd475c9fca36cfc",
+        "7842c772a64365b48ac733edee9b131df5f0e71ea95074f80e32450995c5773d",
+        "3d458cfe55cc03ea1f443f1562beec8df51c75e14a9fcf9a7234a13f198e7969",
+        "2dcf234afe5bca5526f13fa84fac7d04c0d92803edb86033ce9d2c9039a68cdb",
+        "a5ceb755d043f32431d63e39f5161464620a3437280494b5850dc1b47cc074e0",
+        "3d458cfe55cc03ea1f443f1562beec8df51c75e14a9fcf9a7234a13f198e7969",
+        "65caf8dd1e0ea7a6347b635d2b379c93b9a1351edc2afc3ecda700e534eb3068",
+        "c9e4d6eb33bfd9759b9c9a98a3f3630e0ee2bdc8f41fedc570e299ba7dc65428",
+        "2953523650b3de8d928acc20433032fde492c64d8528092e80c80d1847285e9c",
+    ];
+
+    #[test]
+    fn a_log_ovmf_wrote_replays_to_what_its_tpm_held() {
+        let log = Log::parse(OVMF_SWTPM).unwrap();
+        assert_eq!(
+            log.spec().algorithms(),
+            &[
+                (alg::SHA1, 20),
+                (alg::SHA256, 32),
+                (alg::SHA384, 48),
+                (alg::SHA512, 64)
+            ]
+        );
+        let replay = replay(&log, sha256_extend).unwrap();
+        assert_eq!((replay.touched, replay.extended), (0x3ff, 33));
+        for (pcr, want) in OVMF_SWTPM_PCRS.iter().enumerate() {
+            assert_eq!(replay.pcrs[pcr], hex(want), "PCR {pcr}");
+        }
+        // What the TPM itself answered in that boot, as far as it was printed.
+        assert_eq!(replay.pcrs[8][..4], [0xc9, 0xe4, 0xd6, 0xeb]);
+        assert_eq!(replay.pcrs[9][..4], [0x29, 0x53, 0x52, 0x36]);
+    }
+
+    /// The walk reads every byte of it, and the events RFC 0089 is about are
+    /// where they should be: the loader's three tagged events, then the two
+    /// `EV_EFI_ACTION`s `ExitBootServices` extends into PCR 5 -- which reached
+    /// the copy only through the final events table (step 6a).
+    #[test]
+    fn the_loader_s_events_and_the_exit_s_are_in_the_log_ovmf_wrote() {
+        let log = Log::parse(OVMF_SWTPM).unwrap();
+        let events: Vec<_> = log.events().collect::<Result<_, _>>().unwrap();
+        assert_eq!(events.len(), 33);
+        let last: Vec<_> = events[28..]
+            .iter()
+            .map(|event| (event.pcr, event.event_type, event.data))
+            .collect();
+        assert_eq!(last[0].0, 9);
+        assert!(last[0].2.ends_with(b"bhaskix kernel"));
+        assert_eq!(last[1].0, 9);
+        assert!(last[1].2.ends_with(b"bhaskix initrd"));
+        assert_eq!(last[2].0, 8);
+        assert!(last[2].2.ends_with(b"bhaskix cmdline"));
+        const EV_EFI_ACTION: u32 = 0x8000_0007;
+        assert_eq!(
+            (last[3].0, last[3].1, last[3].2),
+            (5, EV_EFI_ACTION, &b"Exit Boot Services Invocation"[..])
+        );
+        assert_eq!(
+            (last[4].0, last[4].1, last[4].2),
+            (
+                5,
+                EV_EFI_ACTION,
+                &b"Exit Boot Services Returned with Success"[..]
+            )
+        );
+        assert!(events.iter().all(|event| event.event_type != EV_NO_ACTION));
+    }
+
     #[test]
     fn a_walk_that_fails_ends_the_replay_with_its_error() {
         let mut log = header(&BANKS);
