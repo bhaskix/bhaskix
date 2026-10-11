@@ -207,6 +207,89 @@ jobs:
             target/x86_64-unknown-none/release/bhaskix
           retention-days: 7
 
+  # **The native loader, which no CI job booted until 2026-10-11.** RFC 0089
+  # step 7. `bhaskixboot.efi` had three local lanes and none here, so a week of
+  # fixes found by booting an SR550 through it -- a page-table pool sized for an
+  # emulator, start-up tables above 4 GiB, protections missing on every
+  # secondary CPU, a misread I/O APIC read-back -- were held only by whoever ran
+  # `make test`. Three steps, one per lane, so a red one names itself.
+  # `BHASKIX_REQUIRE=1` turns the lanes' "skip" into a failure: a job that exists
+  # to run them must not pass by not running them.
+  boot-native:
+    name: boot (native loader)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - run: rustup show active-toolchain
+
+      - name: Cache apt archives
+        uses: actions/cache@v4
+        with:
+          path: .aptcache
+          key: apt-${{ runner.os }}-qemu-xorriso-mtools-ovmf-v1
+      - name: Install QEMU, xorriso, OVMF
+        run: |
+          mkdir -p .aptcache
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq -o Dir::Cache::archives="$PWD/.aptcache" qemu-system-x86 xorriso mtools ovmf
+
+      - name: Record the environment
+        run: |
+          {
+            qemu-system-x86_64 --version
+            docker --version
+            echo "--- OVMF images present ---"
+            ls -la /usr/share/OVMF/ 2>/dev/null || echo "no /usr/share/OVMF"
+          } | tee ci-env-native.txt
+
+      - name: Cache Limine
+        uses: actions/cache@v4
+        with:
+          path: boot/limine/limine
+          key: limine-v8.x-binary-${{ runner.os }}-v1
+      - name: Fetch Limine
+        # The native lanes boot `bhaskixboot.efi`, but the kernel and initrd
+        # they load are built by the same `make iso` the Limine lanes use.
+        run: |
+          if [ ! -d boot/limine/limine/.git ]; then
+            git clone --branch v8.x-binary --depth 1 \
+              https://github.com/limine-bootloader/limine.git boot/limine/limine
+          fi
+          make -C boot/limine/limine
+
+      - name: Build the image and the native loader
+        run: make iso boot/bhaskixboot/target/x86_64-unknown-uefi/release/bhaskixboot.efi
+
+      - name: Boot through the native loader
+        env:
+          BHASKIX_REQUIRE: 1
+          BHASKIX_NATIVE_BOOT_LOG: native-plain.log
+        run: make test-boot-native
+      - name: Boot through the native loader, held to every Limine gate
+        env:
+          BHASKIX_REQUIRE: 1
+          BOOT_TEST_TIMEOUT: 300
+          BHASKIX_BOOT_LOG: native-full.log
+        run: make test-boot-native-full
+      - name: Boot through the native loader with a TPM 2.0 (swtpm)
+        env:
+          BHASKIX_REQUIRE: 1
+          BHASKIX_NATIVE_BOOT_LOG: native-tpm.log
+        run: make test-boot-native-tpm
+
+      - name: Upload the logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: bhaskix-native-failed
+          path: |
+            native-plain.log
+            native-full.log
+            native-tpm.log
+            ci-env-native.txt
+          retention-days: 7
+
   shell:
     name: interactive shell
     runs-on: ubuntu-latest

@@ -72,6 +72,13 @@ if [[ -z "$OVMF_CODE" ]]; then
         fail "OVMF is installed but no complete CODE/VARS pair was found"
         exit 1
     fi
+    # **Unless a skip would be a lie** (2026-10-11): CI sets `BHASKIX_REQUIRE=1`,
+    # because a job that exists to run this lane and skips it is green while
+    # testing nothing.
+    if [[ "${BHASKIX_REQUIRE:-0}" == 1 ]]; then
+        fail "OVMF is not installed, and this run requires the native lane"
+        exit 1
+    fi
     printf '%sskip%s  native boot test (OVMF not installed)\n' "$YELLOW" "$RESET"
     exit 0
 fi
@@ -91,6 +98,10 @@ if [[ "${BHASKIX_TPM:-0}" == 1 ]]; then
     # rather than failed -- the lane cannot run here, and that is a fact about
     # the machine, not the loader.
     if ! docker info >/dev/null 2>&1; then
+        if [[ "${BHASKIX_REQUIRE:-0}" == 1 ]]; then
+            fail "no usable docker for tools/swtpm.sh, and this run requires the TPM lane"
+            exit 1
+        fi
         printf '%sskip%s  native boot test with a TPM (no usable docker for tools/swtpm.sh)\n' "$YELLOW" "$RESET"
         exit 0
     fi

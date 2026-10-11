@@ -352,5 +352,5 @@ path after boot.
    handed the endpoint where the direct-map base belongs — a kernel fault in `stack::allocate`
    that was this step's bug, not the kernel's.
 6. **Agreement**: replay with `pkg`'s SHA-256 in `bin/tpmd`; the report's verdict, each outcome gated.
-7. **CI**: the native-with-TPM job.
+7. **CI**: the native-with-TPM job. **Added 2026-10-11** — `boot (native loader)`, all three native lanes, the TPM through `tools/swtpm.sh`, a skip refused by `BHASKIX_REQUIRE=1`.
 8. **Hardware**: after the native loader boots the SR550 and the lead switches its TPM to 2.0.

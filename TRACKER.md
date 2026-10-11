@@ -1062,6 +1062,18 @@ the distinction is in the table rather than in somebody's head.
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-10-11 (the native loader joins CI — RFC 0089 step 7)
+
+CI booted no native lane at all. `bhaskixboot.efi` had three local lanes, and the week's fixes found by
+booting an SR550 through it — a page-table pool sized for an emulator, start-up tables above 4 GiB,
+protections missing on every secondary, a misread I/O APIC read-back — were held only by whoever ran
+`make test`. A new job, `boot (native loader)`, runs all three: the loader's own lane, the same lane
+held to every Limine gate, and the lane with a TPM 2.0 through `tools/swtpm.sh`'s pinned container —
+one step each, logs uploaded on failure. **`BHASKIX_REQUIRE=1`** turns the lanes' `skip` (no OVMF, no
+Docker) into a failure, armed with a `docker` that always fails: `skip`, exit 0 without it; `FAIL`,
+exit 1 with it — because a job that exists to run a lane must not pass by not running it. Run here
+exactly as CI invokes them: 31, 166 and 34 checks, no skips. **Its first CI run is pending.**
+
 ### 2026-10-11 (the SR550 reaches its user-mode shell through Bhaskix's own loader — observed)
 
 **The seventh native boot, run to the report's real end this time: `a user-mode shell. 'help' lists
