@@ -266,6 +266,34 @@ pub fn kernel_main(handoff: &Handoff) -> ! {
             // first demand-paged access happens.
             frames::refill();
 
+            // **Every top-level slot of the kernel half, before the first
+            // address space copies it** (2026-10-11). A slot built later
+            // exists only in the table active when it was built; CI's
+            // emulator put a device window at 768 GiB and a thread on another
+            // space faulted on it. See `paging::populate_kernel_half`.
+            let hhdm = handoff.hhdm_base.as_u64();
+            // SAFETY: bootstrap CPU, before the first address space exists;
+            // the active table is the one every space will be copied from.
+            let root = unsafe { bhaskix_arch::paging::active_page_table() };
+            let built = heap::with(|heap| {
+                let pmm = heap.pmm_mut();
+                let mut frame = || {
+                    pmm.allocate(0, bhaskix_mm::Zone::Normal)
+                        .ok()
+                        .map(|pfn| u64::from(pfn) * bhaskix_mm::FRAME_SIZE)
+                };
+                // SAFETY: as above -- one CPU, no copy taken yet.
+                unsafe { bhaskix_arch::paging::populate_kernel_half(root, hhdm, &mut frame) }
+            });
+            match built {
+                Some(Ok(built)) => println!(
+                    "    kernel half    {built} top-level slot(s) built, so every address space shares all 256"
+                ),
+                _ => println!(
+                    "\x1b[91m    kernel half    FAILED: no frames for the shared top-level slots\x1b[0m"
+                ),
+            }
+
             // No-execute must be on before any mapping carrying the NX bit is
             // created, or the CPU treats bit 63 as reserved and the mapping
             // faults instead of being non-executable.

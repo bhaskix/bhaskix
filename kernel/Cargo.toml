@@ -916,7 +916,9 @@ asm_budget = 10
 # secondary's enable in `smp::protect_this_cpu`, its call inside
 # `secondary_main`'s block, and the register read in `note_protections`.
 # 2090 on 2026-10-10: `protect_this_cpu`'s call to `enable_caching`.
-unsafe_budget = 2090
+# 2092 on 2026-10-11: reading the boot root and building its kernel half
+# (`paging::populate_kernel_half`), two lines.
+unsafe_budget = 2092
 # Up thirty-one for RFC 0005 step 9's socket probe -- `ring3_socketeer`, which
 # is `ring3_lister` with a `sockaddr_in6` copied in beside its code instead of
 # two filenames. The same two blocks every hosted probe has: one

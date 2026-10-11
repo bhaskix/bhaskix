@@ -3709,6 +3709,18 @@ else
     status=1
 fi
 
+# **Every kernel-half top-level slot built before the first address space**
+# (2026-10-11). Without it a slot built later -- a device window above 512 GiB
+# -- exists only in the table active then, and CI's emulator faulted on one in
+# the native lane. The line says the slots exist; the native lane on CI's
+# emulator is what showed the fault and its fix.
+if grep -qaE "kernel half +[0-9]+ top-level slot\(s\) built, so every address space shares all 256" "$LOG"; then
+    pass "every kernel-half top-level slot exists before the first address space"
+else
+    fail "the kernel half's top-level slots were not built: $(grep -aE 'kernel half' "$LOG" | head -1)"
+    status=1
+fi
+
 # **Whether a started CPU arrived with its caches off** (2026-10-10). A fact
 # about the machine rather than a pass or fail: each secondary clears `CR0.CD`
 # and `NW` if INIT left them set, and the report counts how many did. The gate

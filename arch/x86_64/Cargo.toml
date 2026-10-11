@@ -174,7 +174,11 @@ asm_budget = 43
 # 1196 on 2026-10-10: seven lines for `enable_caching` -- reading `CR0`, and
 # clearing `CD`/`NW` with a `wbinvd` after -- so a CPU the kernel starts says
 # whether INIT left its caches off, rather than this being assumed either way.
-unsafe_budget = 1196
+# 1202 on 2026-10-11: six lines for `populate_kernel_half` -- reading each
+# kernel-half PML4 entry and building the missing ones -- so every address
+# space shares all 256 top-level slots instead of the ones present when it
+# was copied. CI's emulator faulted on a slot built after the copy.
+unsafe_budget = 1202
 # Raised from 1070 for ECAM -- one volatile read of configuration space as
 # memory -- and for counting the bytes the transmitter gives up on. The second
 # is two lines and bought a silent data loss becoming a visible number.

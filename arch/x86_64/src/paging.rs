@@ -457,6 +457,53 @@ pub unsafe fn create_address_space(
     Ok(frame)
 }
 
+/// Builds every missing kernel-half PML4 entry of `root` — an empty PDPT for
+/// each — and answers how many it built.
+///
+/// **What makes "shared by every address space" true** (2026-10-11).
+/// [`create_address_space`] copies entries 256–511 as they stand, so a slot
+/// created *afterwards* — the first mapping anything makes in a new 512 GiB of
+/// the higher half — exists only in the table active at that moment, and a
+/// thread running on any other space faults there. CI's emulator placed a
+/// virtio BAR at 768 GiB, `mmio::map` built PML4 slot 257 in one space, and the
+/// native lane faulted on it from another. With every slot present before the
+/// first copy, every space shares the same 256 PDPTs, and any later higher-half
+/// mapping lands in a table they all hold.
+///
+/// # Errors
+///
+/// [`MapError::OutOfMemory`], with the slots built so far kept.
+///
+/// # Safety
+///
+/// `root` must be the PML4 every later address space is copied from, reachable
+/// through the direct map at `hhdm_base`; boot, one CPU, before the first copy.
+pub unsafe fn populate_kernel_half(
+    root: u64,
+    hhdm_base: u64,
+    allocate_frame: &mut dyn FnMut() -> Option<u64>,
+) -> Result<usize, MapError> {
+    let mut built = 0;
+    for index in KERNEL_PML4_START..ENTRIES {
+        // SAFETY: `root` is a PML4 reachable through the direct map, per the
+        // caller; one entry is read, and written only if absent.
+        let entry = unsafe { ((hhdm_base + root) as *mut u64).add(index) };
+        // SAFETY: as above.
+        if unsafe { entry.read_volatile() } & flags::PRESENT != 0 {
+            continue;
+        }
+        let frame = allocate_frame().ok_or(MapError::OutOfMemory)?;
+        // SAFETY: a frame just allocated, reachable through the direct map,
+        // zeroed before it is linked so the new PDPT maps nothing.
+        unsafe {
+            core::ptr::write_bytes((hhdm_base + frame) as *mut u8, 0, 4096);
+            entry.write_volatile(frame | flags::PRESENT | flags::WRITABLE);
+        }
+        built += 1;
+    }
+    Ok(built)
+}
+
 /// Frees every page-table frame belonging to the lower half of `root`, then
 /// `root` itself. Returns how many frames were freed.
 ///
