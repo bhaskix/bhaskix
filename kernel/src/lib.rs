@@ -15253,9 +15253,13 @@ fn tpm_verdict() {
 
 /// Finds the ACPI `TPM2` table and says what it describes -- RFC 0089 step 5a.
 ///
-/// Three sentences: a CRB TPM at an address, a TPM whose interface this kernel
-/// does not drive (TIS and the platform-specific methods, for now), or no
-/// `TPM2` table at all. Each lane's gate holds the one it should print.
+/// Four sentences: a CRB TPM at an address, a TIS TPM at the platform's fixed
+/// base, a TPM whose interface this kernel does not drive (the
+/// platform-specific methods), or no `TPM2` table at all. Each lane's gate
+/// holds the one it should print. **The TIS sentence since 2026-10-11**: until
+/// then the parser refused a TIS table's zero control area, so a TIS TPM was
+/// reported as `no TPM2 table` -- and the `not driven here` line meant for it
+/// could never print.
 fn tpm_discovery(handoff: &Handoff) -> Option<bhaskix_arch::acpi::Tpm2> {
     let hhdm = handoff.hhdm_base.as_u64();
     let Some(rsdp) = handoff.rsdp else {
@@ -15282,9 +15286,15 @@ fn tpm_discovery(handoff: &Handoff) -> Option<bhaskix_arch::acpi::Tpm2> {
         // RFC 0089 step 5c drives it -- later, where the other domain
         // programs start; see `start_tpm_service`.
         TPM_FOUND.store(tpm.control_area, core::sync::atomic::Ordering::Release);
+    } else if tpm.start_method == bhaskix_arch::acpi::TPM2_START_TIS {
+        println!(
+            "    tpm            TIS at {:#x} (ACPI TPM2, start method {}); not driven yet",
+            bhaskix_arch::acpi::TPM_BASE,
+            tpm.start_method
+        );
     } else {
         println!(
-            "    tpm            start method {} is not driven here (CRB only)",
+            "    tpm            start method {} is not driven here (CRB and TIS only)",
             tpm.start_method
         );
     }

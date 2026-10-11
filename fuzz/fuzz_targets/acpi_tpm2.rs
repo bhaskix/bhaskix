@@ -9,8 +9,9 @@
 //! # What counts as a failure
 //!
 //! A panic, an abort or a hang -- and one property beyond not crashing: **an
-//! accepted table names a non-zero control area**, because the kernel maps
-//! and grants what this returns.
+//! accepted CRB table names a non-zero control area**, because the kernel
+//! maps and grants what this returns. Only CRB since 2026-10-11: a TIS table
+//! carries zero there by design, and its page is the platform's fixed base.
 //!
 //! Like `dmar_parse`, every input is parsed twice: as given, and with its
 //! signature, length and checksum repaired. A checksum-guarded parser is
@@ -54,7 +55,10 @@ fuzz_target!(|data: &[u8]| {
 
 fn check(bytes: &[u8]) {
     if let Some(tpm) = parse_tpm2(bytes) {
-        assert!(tpm.control_area != 0, "an accepted TPM2 named address zero");
+        assert!(
+            tpm.start_method != bhaskix_arch::acpi::TPM2_START_CRB || tpm.control_area != 0,
+            "an accepted CRB TPM2 named address zero"
+        );
         core::hint::black_box(tpm.start_method);
     }
 }

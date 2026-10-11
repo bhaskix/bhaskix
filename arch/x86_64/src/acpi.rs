@@ -782,11 +782,17 @@ pub unsafe fn mcfg(rsdp: u64, hhdm: u64, ensure: EnsureMapped<'_>) -> Option<Mcf
 }
 
 /// `StartMethod` for the command-response buffer interface, CRB --
-/// EDK2's `Tpm2Acpi.h`, `7`. The one RFC 0089 drives.
+/// EDK2's `Tpm2Acpi.h`, `7`.
 pub const TPM2_START_CRB: u32 = 7;
 
-/// `StartMethod` for the FIFO interface, TIS -- `Tpm2Acpi.h`, `6`.
+/// `StartMethod` for the FIFO interface, TIS -- `Tpm2Acpi.h`, `6`. Its table
+/// carries **no control area**: the interface is the register page at the
+/// platform's fixed base, [`TPM_BASE`].
 pub const TPM2_START_TIS: u32 = 6;
+
+/// Where a TIS TPM's locality-0 register page is: the PC Client platform's
+/// fixed base, EDK2's `PcdTpmBaseAddress` default (`SecurityPkg.dec`).
+pub const TPM_BASE: u64 = 0xFED4_0000;
 
 /// What the `TPM2` table says about the machine's TPM 2.0 -- RFC 0089 step 5.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -795,7 +801,7 @@ pub struct Tpm2 {
     /// one of the platform-specific methods nothing here drives.
     pub start_method: u32,
     /// Physical address of the control area -- for CRB, inside the
-    /// locality-0 register page.
+    /// locality-0 register page; zero for TIS, which has none.
     pub control_area: u64,
 }
 
@@ -804,9 +810,12 @@ pub struct Tpm2 {
 /// 48, after the header and the 4-byte `Flags` (EDK2's `Tpm2Acpi.h`).
 ///
 /// **The address is firmware's, and what is built from it is a register
-/// window a domain writes to**, so a zero address is refused here, as `DMAR`
-/// refuses a zero register base, and the kernel checks the page against the
-/// memory map before granting it. Revision 4 appends platform parameters and
+/// window a domain writes to**, so a zero address is refused here for CRB, as
+/// `DMAR` refuses a zero register base, and the kernel checks the page against
+/// the memory map before granting it. **Only for CRB** -- corrected
+/// 2026-10-11: a TIS table carries zero there by design (QEMU 4.2.0's
+/// `build_tpm2` writes it so), and refusing it reported a TIS TPM as no TPM2
+/// table at all. Revision 4 appends platform parameters and
 /// the log area; nothing here reads them, and a longer table is accepted.
 #[must_use]
 pub fn parse_tpm2(bytes: &[u8]) -> Option<Tpm2> {
@@ -826,7 +835,7 @@ pub fn parse_tpm2(bytes: &[u8]) -> Option<Tpm2> {
     }
     let control_area = u64_at(bytes, HEADER_LENGTH + 4)?;
     let start_method = u32_at(bytes, HEADER_LENGTH + 12)?;
-    if control_area == 0 {
+    if start_method == TPM2_START_CRB && control_area == 0 {
         return None;
     }
     Some(Tpm2 {
@@ -1207,8 +1216,23 @@ mod tests {
             })
         );
         // Revision 4's tail -- platform parameters, LAML, LASA -- is skipped.
-        let longer = tpm2_bytes(0xfed4_0040, TPM2_START_TIS, 12 + 4 + 8);
-        assert_eq!(parse_tpm2(&longer).map(|t| t.start_method), Some(6));
+        let longer = tpm2_bytes(0xfed4_0040, TPM2_START_CRB, 12 + 4 + 8);
+        assert_eq!(parse_tpm2(&longer).map(|t| t.start_method), Some(7));
+    }
+
+    /// **A TIS table as QEMU 4.2.0 builds one** -- no control area, start
+    /// method 6 -- is a TPM, not the absence of one. Until 2026-10-11 the
+    /// zero was refused for every method and the kernel said `no TPM2 table`.
+    #[test]
+    fn a_tis_table_has_no_control_area_and_is_still_a_tpm() {
+        let table = tpm2_bytes(0, TPM2_START_TIS, 12 + 4 + 8);
+        assert_eq!(
+            parse_tpm2(&table),
+            Some(Tpm2 {
+                start_method: TPM2_START_TIS,
+                control_area: 0
+            })
+        );
     }
 
     #[test]
@@ -1227,15 +1251,15 @@ mod tests {
         assert_eq!(
             parse_tpm2(&tpm2_bytes(0, TPM2_START_CRB, 0)),
             None,
-            "a TPM at physical zero"
+            "a CRB TPM at physical zero"
         );
     }
 
     #[test]
     fn a_mutation_harness_never_makes_the_tpm2_parser_panic() {
         // What is built from a believed `TPM2` is a register window a domain
-        // writes to, so anything accepted must name a non-zero address, and
-        // nothing may panic. The edge values are seeded explicitly, as
+        // writes to, so anything accepted as CRB must name a non-zero address,
+        // and nothing may panic. The edge values are seeded explicitly, as
         // coding-style.md asks of a new harness: the length field's limits
         // and the address's.
         let iterations: usize = std::env::var("BHASKIX_FUZZ_ITERATIONS")
@@ -1269,7 +1293,10 @@ mod tests {
                 }
             }
             if let Some(tpm) = parse_tpm2(&bytes) {
-                assert!(tpm.control_area != 0, "seed {seed}");
+                assert!(
+                    tpm.start_method != TPM2_START_CRB || tpm.control_area != 0,
+                    "seed {seed}"
+                );
             }
         }
     }

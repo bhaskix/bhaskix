@@ -358,6 +358,15 @@ path after boot.
    checkpoints. **5a, finding it — done 2026-10-08**: `bhaskix_arch::acpi::parse_tpm2` reads the
    table's signature, length, checksum, `AddressOfControlArea` (40) and `StartMethod` (48), and
    refuses a zero address, because what is built from it is a register window a domain writes to.
+   **Wrong for TIS, corrected 2026-10-11**: a TIS table carries no control area — QEMU 4.2.0's
+   `build_tpm2`, read that day, writes zero there with start method 6 — so the refusal reported a
+   TIS TPM as `no TPM2 table`, and the `start method N is not driven here (CRB only)` line this
+   record implied for TIS could never print. Seen on a boot with `-device tpm-tis`: the firmware
+   measured, the log was carried, and the kernel said there was no TPM. The zero is now refused
+   for CRB only, and a TIS TPM reads `TIS at 0xfed40000 (ACPI TPM2, start method 6)` — the page
+   at the platform's fixed base, EDK2's `PcdTpmBaseAddress` default. A host test of QEMU's TIS
+   shape, armed red by restoring the blanket refusal; the harness and the fuzz target's property
+   now hold the address for CRB.
    Three host tests and a seeded mutation harness with its edge values explicit, one test armed red
    by dropping the zero-address refusal; `fuzz/fuzz_targets/acpi_tpm2.rs`, which repairs signature,
    length and checksum as `dmar_parse` does, ran 33,973,270 executions in 121 s clean and reached an
