@@ -217,6 +217,50 @@ pub fn occupied(slot: u64) -> (bool, Reply) {
     (reply.status != status::NO_SUCH_CAPABILITY, reply)
 }
 
+/// Why a connection ended, as `RECV`'s third word tells it — RFC 0090 step 1.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Ending {
+    /// The peer answered the connection request with a reset.
+    Refused,
+    /// The peer never answered.
+    Unreachable,
+    /// The peer reset the connection after it was established.
+    Reset,
+    /// Both ends closed in order.
+    Orderly,
+    /// This end gave up on purpose.
+    Aborted,
+}
+
+impl Ending {
+    /// The ending a reply word names, or `None` for a connection that has not
+    /// ended — and for a number this crate does not know, which a newer
+    /// service could send and which must not be read as a reason.
+    #[must_use]
+    pub const fn from_word(word: u64) -> Option<Self> {
+        match word {
+            tcp::ended::REFUSED => Some(Self::Refused),
+            tcp::ended::UNREACHABLE => Some(Self::Unreachable),
+            tcp::ended::RESET => Some(Self::Reset),
+            tcp::ended::ORDERLY => Some(Self::Orderly),
+            tcp::ended::ABORTED => Some(Self::Aborted),
+            _ => None,
+        }
+    }
+
+    /// The word, for a report page.
+    #[must_use]
+    pub const fn word(self) -> u64 {
+        match self {
+            Self::Refused => tcp::ended::REFUSED,
+            Self::Unreachable => tcp::ended::UNREACHABLE,
+            Self::Reset => tcp::ended::RESET,
+            Self::Orderly => tcp::ended::ORDERLY,
+            Self::Aborted => tcp::ended::ABORTED,
+        }
+    }
+}
+
 /// What one stream poll said.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StreamPoll {
@@ -226,6 +270,8 @@ pub enum StreamPoll {
         state: u64,
         /// Cumulative bytes delivered into the program's receive ring.
         delivered: u64,
+        /// Why it ended, once it has — `None` while it lives.
+        ended: Option<Ending>,
     },
     /// No wire on this machine; the capability answered, the network is
     /// what there is not.
@@ -259,6 +305,7 @@ pub fn recv(connection_slot: u64, consumed: u64) -> StreamPoll {
         tcp::OK => StreamPoll::Ready {
             state: reply.second >> 32,
             delivered: reply.second & 0xffff_ffff,
+            ended: Ending::from_word(reply.third),
         },
         tcp::UNREACHABLE => StreamPoll::Unreachable,
         tcp::NO_ENTROPY => StreamPoll::NoEntropy,
@@ -441,5 +488,47 @@ pub fn accept(listener_slot: u64) -> AcceptPoll {
         tcp::LATER => AcceptPoll::Later,
         tcp::UNREACHABLE => AcceptPoll::Unreachable,
         word => AcceptPoll::ServiceSaid(word),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bhaskix_net::tcp::state::Ended;
+
+    #[test]
+    fn every_ending_round_trips_through_its_word() {
+        for ending in [
+            Ending::Refused,
+            Ending::Unreachable,
+            Ending::Reset,
+            Ending::Orderly,
+            Ending::Aborted,
+        ] {
+            assert_eq!(Ending::from_word(ending.word()), Some(ending));
+        }
+    }
+
+    #[test]
+    fn a_living_connection_and_an_unknown_number_name_no_ending() {
+        assert_eq!(Ending::from_word(tcp::ended::NONE), None);
+        assert_eq!(Ending::from_word(6), None);
+        assert_eq!(Ending::from_word(u64::MAX), None);
+    }
+
+    /// The service encodes with `Ended::code`, in a crate that cannot name
+    /// these constants; this is where the two are held to one numbering.
+    #[test]
+    fn the_service_encodes_what_this_crate_decodes() {
+        for (ended, ending) in [
+            (Ended::Refused, Ending::Refused),
+            (Ended::Unreachable, Ending::Unreachable),
+            (Ended::Reset, Ending::Reset),
+            (Ended::Orderly, Ending::Orderly),
+            (Ended::Aborted, Ending::Aborted),
+        ] {
+            assert_eq!(u64::from(ended.code()), ending.word(), "{ended:?}");
+            assert_eq!(Ending::from_word(u64::from(ended.code())), Some(ending));
+        }
     }
 }

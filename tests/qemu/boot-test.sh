@@ -5034,6 +5034,65 @@ else
     pass "the bring-up watchdog stayed quiet, as it must on a boot that finished"
 fi
 
+# **RFC 0090 step 1: a refused dial, told to the caller that made it.**
+#
+# Until this step only `bin/tcpd`'s report page knew why a connection ended;
+# `RECV` answered state 0 and nothing else, and step 0 watched `bin/tcpc` wait
+# thirty seconds on a refused dial for a stream that would never come. Now the
+# reply's third word carries the reason. A healthy boot cannot show it -- the
+# outbound connection is in TIME_WAIT, not ended, when the report is read -- so
+# the half a healthy boot *can* show is gated on it: no reply names an ending
+# while its connection lives.
+if [[ "$MODE" == "iommu" ]]; then
+    if grep -qE "tcp endings +no RECV reply named an ending while its connection lived" "$LOG"; then
+        pass "RECV named no ending for a connection that lived (RFC 0090 step 1)"
+    else
+        fail "RECV's third word was not shown silent while connections lived"
+        grep -E "tcp endings" "$LOG" || true
+        status=1
+    fi
+
+    # The other half needs a dial that ends: a **second boot** of this lane
+    # with the echo peer left out of the network (devices.sh), which slirp then
+    # refuses. Only these three gates run on it; the boot's other lines are
+    # about a network this boot deliberately lacks.
+    # Kept beside the main log when the caller asked for that one by name.
+    REFUSED_LOG="${BHASKIX_BOOT_LOG:+$BHASKIX_BOOT_LOG.refused}"
+    REFUSED_LOG="${REFUSED_LOG:-$(mktemp)}"
+    BHASKIX_ECHO_PEER=none qemu_device_list full yes
+    REFUSED_ARGS=()
+    for argument in "${QEMU_ARGS[@]}"; do
+        case "$argument" in
+            user,id=net0,*)
+                for replacement in "${VIRTIO_ARGS[@]}"; do
+                    [[ $replacement == user,id=net0,* ]] && argument="$replacement"
+                done ;;
+            "file:$LOG") argument="file:$REFUSED_LOG" ;;
+        esac
+        REFUSED_ARGS+=("$argument")
+    done
+    echo "booting again with nothing listening at the echo peer, up to ${TIMEOUT}s..."
+    run_until "$REFUSED_LOG" "Nothing left to do at this milestone" "$TIMEOUT" "${REFUSED_ARGS[@]}"
+    if grep -qF "guestfwd" <<< "${REFUSED_ARGS[*]}"; then
+        fail "the refused boot still forwards the echo peer; it would test nothing"
+        status=1
+    elif ! grep -qE "tcpd +state 0xf .*outcome 1: refused by the network" "$REFUSED_LOG"; then
+        fail "the refused boot: tcpd's report does not say refused"
+        grep -E "^ +tcpd +state" "$REFUSED_LOG" || true
+        status=1
+    elif ! grep -qE "tcp client +the connection ended at step [0-9]+: RECV said refused, and tcpd's report agrees \(outcome 1\)" "$REFUSED_LOG"; then
+        fail "the refused boot: the client was not told it was refused, or tcpd disagrees"
+        grep -E "tcp client" "$REFUSED_LOG" || true
+        status=1
+    elif ! grep -qF "Nothing left to do at this milestone" "$REFUSED_LOG"; then
+        fail "the refused boot did not finish"
+        status=1
+    else
+        pass "a refused dial: RECV told the caller 'refused', and tcpd's report agrees (RFC 0090 step 1)"
+    fi
+    [[ -n ${BHASKIX_BOOT_LOG:-} ]] || rm -f "$REFUSED_LOG" "$REFUSED_LOG.qemu"
+fi
+
 # **Readings, on every boot** -- copied into the job log pass or fail,
 # prefixed `reading`, because a passing boot's serial never reaches it. The
 # pattern and why it exists are in `readings.sh`, shared with the soak.

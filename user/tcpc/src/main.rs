@@ -192,6 +192,12 @@ mod outcome {
     /// apart because the network may exist here and "unreachable" would
     /// be a lie.
     pub const NO_ENTROPY: u64 = 11;
+    /// The outbound connection ended other than in order, and `RECV`'s third
+    /// word said why — RFC 0090 step 1. The detail word is the ending, one of
+    /// `abi::tcp::ended`, and the kernel holds it against `bin/tcpd`'s report.
+    /// Before the service told its callers, a refused dial read state 0 and
+    /// waited thirty seconds for a stream that would never come.
+    pub const ENDED: u64 = 14;
 }
 
 #[panic_handler]
@@ -256,6 +262,31 @@ fn leg_or_die(
     }
 }
 
+/// Replies so far that named an ending while their connection was not closed.
+static LIVE_ENDINGS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Every `RECV` this program makes, through one door — RFC 0090 step 1.
+///
+/// The third word must say nothing while a connection lives. Counting the
+/// replies that break that, on every poll of every connection, is what lets
+/// the boot hold the service to the half of the promise a healthy boot can
+/// see, since on a healthy boot no connection this program holds ever ends
+/// with a reason before the boot report is read.
+fn poll(slot: u64, consumed: u64) -> StreamPoll {
+    let answer = tcp::recv(slot, consumed);
+    if let StreamPoll::Ready {
+        state,
+        ended: Some(_),
+        ..
+    } = answer
+        && state != STATE_CLOSED
+    {
+        let count = LIVE_ENDINGS.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
+        report_word(abi_tcp::CLIENT_LIVE_ENDINGS, count);
+    }
+    answer
+}
+
 /// One `RECV` poll on the outbound connection: `(state, delivered)`.
 ///
 /// `consumed` names bytes this program has finished with since it last said
@@ -263,8 +294,21 @@ fn leg_or_die(
 /// Refusals and darkness end the run here, reported under `step`, because
 /// every caller would have written the same four lines.
 fn stream_state_consuming(step: u64, consumed: u64) -> (u64, u64) {
-    match tcp::recv(CONNECTION, consumed) {
-        StreamPoll::Ready { state, delivered } => (state, delivered),
+    match poll(CONNECTION, consumed) {
+        // **Told why, and told at once** — RFC 0090 step 1. An orderly close
+        // is the ending every caller already expects; anything else ends the
+        // run here under `step`, with the reason the service gave.
+        StreamPoll::Ready {
+            ended: Some(ending),
+            ..
+        } if ending != tcp::Ending::Orderly => {
+            report_word(abi_tcp::CLIENT_ENDING, ending.word());
+            report(step, outcome::ENDED, ending.word());
+            exit()
+        }
+        StreamPoll::Ready {
+            state, delivered, ..
+        } => (state, delivered),
         StreamPoll::Unreachable => {
             // No wire on this machine. The capability answered — that was
             // step 4a's claim — and the truthful end of the stream's story
@@ -300,8 +344,10 @@ fn stream_state(step: u64) -> (u64, u64) {
 /// decoding applies. `consumed` reopens the receive window, exactly as on
 /// the v4 connection.
 fn stream_state_on(slot: u64, step: u64, consumed: u64) -> (u64, u64) {
-    match tcp::recv(slot, consumed) {
-        StreamPoll::Ready { state, delivered } => (state, delivered),
+    match poll(slot, consumed) {
+        StreamPoll::Ready {
+            state, delivered, ..
+        } => (state, delivered),
         StreamPoll::Unreachable => {
             report(step, outcome::DARK, 0);
             exit()
@@ -708,7 +754,7 @@ extern "C" fn tcpc_main(hertz: u64) -> ! {
     // which only arrives after the reply reached it — the causal proof.
     let mut served = false;
     for _ in 0..300u32 {
-        match tcp::recv(INBOUND, 0) {
+        match poll(INBOUND, 0) {
             StreamPoll::Ready { delivered, .. } => {
                 if delivered >= INBOUND_LEN as u64 {
                     served = true;
@@ -743,7 +789,7 @@ extern "C" fn tcpc_main(hertz: u64) -> ! {
     }
     let mut closed = false;
     for _ in 0..300u32 {
-        match tcp::recv(INBOUND, 0) {
+        match poll(INBOUND, 0) {
             StreamPoll::Ready { state, .. } => {
                 if state != STATE_ESTABLISHED {
                     closed = true;
@@ -795,7 +841,7 @@ extern "C" fn tcpc_main(hertz: u64) -> ! {
     // previous connections' closing arithmetic. A refusal here means the
     // machine is already gone, which is dead enough.
     let resting = |slot: u64| -> bool {
-        match tcp::recv(slot, 0) {
+        match poll(slot, 0) {
             StreamPoll::Ready { state, .. } => state == STATE_CLOSED || state == STATE_TIME_WAIT,
             _ => true,
         }
@@ -916,7 +962,7 @@ extern "C" fn tcpc_main(hertz: u64) -> ! {
         // in the listener rings, echo them back, tell the service.
         let mut served6 = false;
         for _ in 0..300u32 {
-            match tcp::recv(INBOUND6, 0) {
+            match poll(INBOUND6, 0) {
                 StreamPoll::Ready { delivered, .. } => {
                     if delivered >= client_sent6 {
                         served6 = true;
@@ -989,7 +1035,7 @@ extern "C" fn tcpc_main(hertz: u64) -> ! {
         client_sent6 += CHUNK6;
         let mut served6 = false;
         for _ in 0..600u32 {
-            match tcp::recv(INBOUND6, 0) {
+            match poll(INBOUND6, 0) {
                 StreamPoll::Ready { delivered, .. } => {
                     if delivered >= client_sent6 {
                         served6 = true;
@@ -1084,7 +1130,7 @@ fn second_listener(pair: (RingView, RingView), pace: &Pace) {
     }
     let mut arrived = false;
     for _ in 0..600u32 {
-        match tcp::recv(SECOND_CONNECTION, 0) {
+        match poll(SECOND_CONNECTION, 0) {
             StreamPoll::Ready { delivered, .. } if delivered >= FOUR_LEN => {
                 arrived = true;
                 break;
@@ -1177,7 +1223,7 @@ fn four_at_once(
         };
         let mut arrived = false;
         for _ in 0..600u32 {
-            match tcp::recv(slot, 0) {
+            match poll(slot, 0) {
                 StreamPoll::Ready { delivered, .. } if delivered >= FOUR_LEN => {
                     arrived = true;
                     break;

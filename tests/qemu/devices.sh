@@ -201,6 +201,9 @@ qemu_device_list() {
         suffix=",disable-legacy=on,iommu_platform=on"
     fi
 
+    local echo_peer="guestfwd=tcp:10.0.2.100:9-cmd:cat,"
+    [[ ${BHASKIX_ECHO_PEER:-cat} == none ]] && echo_peer=""
+
     case "$profile" in
         full)
             # Two disks and a network. What the boot test and the shell test
@@ -239,7 +242,13 @@ qemu_device_list() {
                 # is why the number is stated here rather than picked in the
                 # test. `bin/ipd` forwards TCP by address and not by port, so
                 # the SYN reaches `bin/tcpd` and is answered by it.
-                -netdev "user,id=net0,restrict=on,guestfwd=tcp:10.0.2.100:9-cmd:cat,hostfwd=tcp:127.0.0.1:${BHASKIX_INBOUND_PORT:-45557}-:7,hostfwd=tcp:127.0.0.1:${BHASKIX_CLOSED_PORT:-45558}-:1234,hostfwd=tcp:127.0.0.1:${BHASKIX_SECOND_PORT:-45559}-:8,hostfwd=tcp:127.0.0.1:${BHASKIX_HOSTED_PORT:-45560}-:10,hostfwd=tcp:127.0.0.1:${BHASKIX_EPOLL_PORT:-45561}-:11,hostfwd=tcp:127.0.0.1:${BHASKIX_HTTP_PORT:-45562}-:8080"
+                #
+                # `BHASKIX_ECHO_PEER=none` leaves the echo peer out, so the one
+                # outbound dial the image makes is **refused**: under
+                # `restrict=on` slirp answers a `SYN` no `guestfwd` names with
+                # `RST | ACK` -- seen on the wire on QEMU 4.2.1 and 8.2.2, RFC
+                # 0090 step 0. The `iommu` lane's second boot uses it.
+                -netdev "user,id=net0,restrict=on,${echo_peer}hostfwd=tcp:127.0.0.1:${BHASKIX_INBOUND_PORT:-45557}-:7,hostfwd=tcp:127.0.0.1:${BHASKIX_CLOSED_PORT:-45558}-:1234,hostfwd=tcp:127.0.0.1:${BHASKIX_SECOND_PORT:-45559}-:8,hostfwd=tcp:127.0.0.1:${BHASKIX_HOSTED_PORT:-45560}-:10,hostfwd=tcp:127.0.0.1:${BHASKIX_EPOLL_PORT:-45561}-:11,hostfwd=tcp:127.0.0.1:${BHASKIX_HTTP_PORT:-45562}-:8080"
                 -device "virtio-net-pci,netdev=net0$suffix"
                 # **A second NIC, so that "how many ports?" has an answer other
                 # than one.** RFC 0074: a bond is a thing this system can build

@@ -137,6 +137,23 @@ pub enum Ended {
     Aborted,
 }
 
+impl Ended {
+    /// The number a caller is told, in the third word of `RECV`'s reply —
+    /// `bhaskix_abi::tcp::ended`'s, which this crate cannot name (both sit on
+    /// the same layer), so `bhaskix-sock` checks the two agree. Zero is never
+    /// one: it means the connection has not ended.
+    #[must_use]
+    pub const fn code(self) -> u8 {
+        match self {
+            Self::Refused => 1,
+            Self::Unreachable => 2,
+            Self::Reset => 3,
+            Self::Orderly => 4,
+            Self::Aborted => 5,
+        }
+    }
+}
+
 /// Bytes of a segment's payload, at most.
 ///
 /// Derived from the interface MTU (`net/src/eth.rs`) less an IPv4 header and a

@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Draft 2026-10-08. Written before any of it, as RFC 0086 was. **Step 0 done 2026-10-12** — slirp's refusal confirmed on both emulators; nothing else built |
+| **Status** | Draft 2026-10-08. Written before any of it, as RFC 0086 was. **Steps 0 and 1 done 2026-10-12** — slirp's refusal confirmed on both emulators; `RECV`'s third word now says why a connection ended, and a refused dial is told to the caller that made it |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | net / userspace |
 | **Milestone** | L1 ([roadmap.md](../roadmap.md)) — the row carried out of RFC 0005 step 9, "`connect` — a hosted TCP **client**" |
@@ -55,8 +55,14 @@ Seven parts, each of which is a step in the plan below. The order is the depende
 
 Every table entry keeps its `Ended` — `Refused`, `Unreachable`, `Reset`, `Aborted`, `Orderly` —
 when it reaches `Closed`, and `RECV` on a closed connection answers it in a reply word that is
-zero while the connection lives. The mapping to `outcome::` is the one `service.outcome` already
-uses. `bin/tcpc`'s report is unchanged; it simply stops being the only place the answer exists.
+zero while the connection lives. ~~The mapping to `outcome::` is the one `service.outcome` already
+uses.~~ **Corrected 2026-10-12, at step 1**: that mapping could not be the one — `outcome::` is
+private to `bin/tcpd`, has no number for a reset after establishment or for an abort, and its 3
+means *established* where the status words' 3 means *reset*. The ending has its own namespace,
+`abi::tcp::ended` (1 refused, 2 unreachable, 3 reset, 4 orderly, 5 aborted; 0 while the connection
+lives), in the reply's **third** word, which no caller read before. The **first** ending is the one
+kept: the reclaim rule can abort an entry already closed, and that is not why it ended.
+`bin/tcpd`'s report is unchanged; it simply stops being the only place the answer exists.
 
 This closes the gap with RFC 0020's own failure table, independently of everything after it.
 
@@ -115,8 +121,10 @@ uses the fixed handover.
   error pending, so it reports **`POLLIN | POLLRDNORM | POLLRDHUP | POLLOUT | POLLWRNORM | POLLERR |
   POLLHUP`** — all of it, which is what Go's poller and a C `poll` loop each test a part of. The
   draft of this paragraph said only `OUT | ERR | HUP`, from memory; the source corrected it.
-- **`SO_ERROR`** reports the pending error once and clears it: `ECONNREFUSED` for `Refused` and
-  `Reset` before establishment, `ETIMEDOUT` for `Unreachable`, `ECONNABORTED` for `Aborted`.
+- **`SO_ERROR`** reports the pending error once and clears it: `ECONNREFUSED` for `Refused`
+  ~~and `Reset` before establishment~~ (corrected 2026-10-12: the machine never produces `Reset`
+  before establishment — a `RST` in `SYN-SENT` or `SYN-RECEIVED` is `Refused`,
+  `net/src/tcp/state.rs`), `ETIMEDOUT` for `Unreachable`, `ECONNABORTED` for `Aborted`.
   `getpeername` answers `ENOTCONN` until established.
 - **The new errnos** join the personality's list, each with Linux's number, cross-checked by the
   existing table test.
@@ -268,7 +276,19 @@ Nothing on the server path changes, and the HTTP gate's numbers are the check.
    caller could not tell: `bin/tcpc` reported `FAILED at step 4: connected, stream still in
    flight`, waiting on a stream that would never come — step 1's case, seen.
 1. **The ending, told** (tcpd, part 1). Gate: tcpc's existing outbound dial reads its ending through
-   `RECV`, and it agrees with the report page.
+   `RECV`, and it agrees with the report page. **Done 2026-10-12.** On a healthy boot the outbound
+   connection is in `TIME_WAIT`, not ended, when the report is read, so the gate needs a dial that
+   ends: the `iommu` lane boots a **second time with the echo peer left out of the network**
+   (`BHASKIX_ECHO_PEER=none`, `tests/qemu/devices.sh`), slirp refuses the dial as step 0 saw, and
+   the kernel prints `tcp client the connection ended at step 5: RECV said refused, and tcpd's
+   report agrees (outcome 1)`, with tcpd counting one segment each way — the `SYN` and the reset.
+   `bin/tcpc` stops at the first reply that names the ending, where without it (the arm below) its
+   stream wait went round 234 times until the kernel stopped waiting. The other
+   half is gated on the healthy boot: `tcp endings no RECV reply named an ending while its
+   connection lived`, counted over every `RECV` `bin/tcpc` makes. Host tests in `bhaskix-sock`
+   hold `Ended::code` (the encoder, in `bhaskix-net`) to `Ending::from_word` (the decoder). Each
+   gate was watched red: tcpd answering no ending brought back step 0's thirty-second wait and
+   failed the refused boot; tcpd naming an ending for a live connection failed the healthy one.
 2. **The port allocator** (net crate, part 3). Host tests.
 3. **CONNECT through `OPEN_LEG`** (tcpd, part 2) and **`sock::tcp::connect`** (part 4). Gate: a
    second native dialler beside `bin/tcpc`, both connections live at once, two different local

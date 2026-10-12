@@ -22962,6 +22962,7 @@ fn report_tcp_client(hhdm: u64) {
             "accepted a v6 connection that is not its own [::1] client (detail: the peer as \
              family << 16 | port, or 0 if none was named)"
         }
+        14 => "the outbound connection ended other than in order, and RECV said why",
         _ => "an outcome this kernel does not know",
     };
     // RFC 0020 step 6: the numbers, converted here because the client only
@@ -23382,11 +23383,73 @@ fn report_tcp_client(hhdm: u64) {
             detail >> 32,
             detail & 0xffff_ffff
         );
+    } else if outcome == 14 {
+        report_tcp_ending(hhdm, step, detail);
     } else {
         println!(
             "\x1b[91m    tcp client     FAILED at step {step}: {said} (detail {detail:#x})\
 \x1b[0m"
         );
+    }
+    // **The half of RFC 0090 step 1 a healthy boot can see.** Nothing this
+    // program holds ends with a reason before this report is read, so the one
+    // thing to hold the third word to here is silence while connections live.
+    if let Some(base) = tcpc_report_page(hhdm) {
+        match tcpc_report_word(base, bhaskix_abi::tcp::CLIENT_LIVE_ENDINGS) {
+            0 => println!(
+                "    tcp endings    no RECV reply named an ending while its connection lived"
+            ),
+            told => println!(
+                "\x1b[91m    tcp endings    FAILED: {told} RECV repl(ies) named an ending for a \
+                 connection that was not closed\x1b[0m"
+            ),
+        }
+    }
+}
+
+/// `bin/tcpc`'s outbound connection ended, and `RECV` said why — RFC 0090
+/// step 1. Held against `bin/tcpd`'s own report page, which knew first: before
+/// this step it was the only place the reason existed.
+fn report_tcp_ending(hhdm: u64, step: u64, ending: u64) {
+    use bhaskix_abi::tcp::ended;
+
+    let name = match ending {
+        ended::REFUSED => "refused",
+        ended::UNREACHABLE => "unreachable",
+        ended::RESET => "reset",
+        ended::ORDERLY => "orderly",
+        ended::ABORTED => "aborted",
+        _ => "an ending this kernel does not know",
+    };
+    // The service's page numbers its outcomes its own way: 1 is refused and
+    // 2 unreachable there too, and it has no number for the others.
+    let expected = match ending {
+        ended::REFUSED => Some(1),
+        ended::UNREACHABLE => Some(2),
+        _ => None,
+    };
+    let raw = TCP_REPORT.load(core::sync::atomic::Ordering::Acquire);
+    let page_says = (raw != u64::MAX)
+        .then(|| shared::frames_of(shared::MemoryId::from_u64(raw)))
+        .flatten()
+        .filter(|&(_, count)| count > 0)
+        .map(|(pages, _)| {
+            let bytes = tcp_report_bytes(hhdm, pages[0]);
+            u64::from_le_bytes(bytes[16..24].try_into().unwrap_or([0; 8]))
+        });
+    match (expected, page_says) {
+        (Some(want), Some(got)) if want == got => println!(
+            "    tcp client     the connection ended at step {step}: RECV said {name}, and \
+             tcpd's report agrees (outcome {got})"
+        ),
+        (Some(_), got) => println!(
+            "\x1b[91m    tcp client     FAILED at step {step}: RECV said {name}, but tcpd's \
+             report says outcome {got:?}\x1b[0m"
+        ),
+        (None, _) => println!(
+            "    tcp client     the connection ended at step {step}: RECV said {name}; tcpd's \
+             report has no outcome for that ending"
+        ),
     }
 }
 

@@ -25,6 +25,11 @@ path = "src/lib.rs"
 [dependencies]
 bhaskix-abi = { path = "../abi" }
 
+# Only to check, on the host, that the numbers the service encodes an ending
+# with are the ones `Ending::from_word` decodes -- RFC 0090 step 1.
+[dev-dependencies]
+bhaskix-net = { path = "../net" }
+
 [lints]
 workspace = true
 

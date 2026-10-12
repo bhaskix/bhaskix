@@ -557,6 +557,10 @@ struct Connection {
     /// the outbound connection, whose rings `CONNECT` gifted. What makes a
     /// connection an *accepted* one, now that no slot number says so.
     pair: Option<u32>,
+    /// Why it ended, once it has — the third word of `RECV`'s reply (RFC 0090
+    /// step 1). Kept until the entry is retired, so a holder still reaching a
+    /// closed connection by its badge is told why rather than only that.
+    ended: Option<state::Ended>,
 }
 
 /// Where one of a listener's ring pairs is mapped, and whose it is.
@@ -800,6 +804,12 @@ fn perform(
                 connection.wake_owed = true;
             }
             Action::Closed(ended) => {
+                // **The first ending is the one told.** A connection ends once;
+                // the reclaim rule can abort an entry that is already closed,
+                // and that second `Closed(Aborted)` is not why it ended.
+                if connection.ended.is_none() {
+                    connection.ended = Some(ended);
+                }
                 if service.outbound == Some(index) {
                     service.outcome = match ended {
                         state::Ended::Refused => outcome::REFUSED,
@@ -1448,6 +1458,7 @@ fn accept_cookie(
     let irs = bhaskix_net::tcp::Sequence(parsed.sequence.0.wrapping_sub(1));
     let born = service.connections.insert(Connection {
         claimed: false,
+        ended: None,
         tcb: Tcb::from_cookie(
             connection,
             accepted.sequence,
@@ -1832,6 +1843,7 @@ fn connect_serving(
         let iss = isn::initial_sequence(&service.key, connection, now_nanos(service.hertz));
         let Ok(Handle { index, generation }) = service.connections.insert(Connection {
             claimed: true,
+            ended: None,
             tcb: Tcb::new(connection),
             deadlines: Deadlines::new(),
             sendr_at: handover.at.0,
@@ -2565,10 +2577,17 @@ extern "C" fn tcpd_main(hertz: u64) -> ! {
                         drive_at(&mut service, index, Event::Read(args[0] as u32));
                         arm_nearest(&service);
                     }
-                    let packed = service.connections.get(index).map_or(0, |connection| {
-                        state_number(&connection.tcb) << 32 | connection.delivered
+                    let (packed, ended) = service.connections.get(index).map_or((0, 0), |c| {
+                        (
+                            state_number(&c.tcb) << 32 | c.delivered,
+                            c.ended.map_or(tcp::ended::NONE, |e| u64::from(e.code())),
+                        )
                     });
-                    reply(tcp::OK, packed, 0);
+                    // The third word says why it ended — RFC 0090 step 1. RFC
+                    // 0020's failure table promised a caller "no answer" told
+                    // apart from "refused"; until this only the report page
+                    // could tell them apart.
+                    reply(tcp::OK, packed, ended);
                 }
                 tcp::SHUTDOWN => {
                     drive_at(&mut service, index, Event::Shutdown);

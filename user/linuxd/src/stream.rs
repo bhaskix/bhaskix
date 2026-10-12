@@ -580,7 +580,9 @@ pub(crate) fn condition(entry: &Entry) -> (Condition, Option<u64>) {
             };
             let slot = (adapter::TCP_CONNECTIONS + connection) as u64;
             match tcp::recv(slot, held.consumed - held.told) {
-                StreamPoll::Ready { state, delivered } => {
+                StreamPoll::Ready {
+                    state, delivered, ..
+                } => {
                     held.told = held.consumed;
                     tcp().connections[connection] = Some(held);
                     let closed = !peer_may_send(state);
@@ -671,7 +673,9 @@ pub(crate) fn read(
         return (REPLY_VALUE, Answer::error(errno::ENOTCONN));
     };
     let (state, delivered) = match tcp::recv(slot, connection.consumed - connection.told) {
-        StreamPoll::Ready { state, delivered } => (state, delivered),
+        StreamPoll::Ready {
+            state, delivered, ..
+        } => (state, delivered),
         StreamPoll::ServiceSaid(_) => (0, connection.consumed),
         _ => return (REPLY_VALUE, Answer::error(-104)), // ECONNRESET
     };

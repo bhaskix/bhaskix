@@ -1523,6 +1523,11 @@ pub mod tcp {
     /// and saying so matters: the receive window *is* the free space in the
     /// program's ring — it shrinks as bytes land and reopens only on this
     /// word, so a program that stops reporting stops the peer.
+    ///
+    /// The **third** word is why the connection ended — one of [`ended`],
+    /// [`ended::NONE`] while it lives (RFC 0090 step 1, 2026-10-12). Until
+    /// then only the service's report page knew, and a caller whose dial was
+    /// refused read state 0 and waited for a stream that would never come.
     pub const RECV: u64 = 62;
 
     /// Half-close: no more data this way. The other direction keeps working,
@@ -1575,6 +1580,15 @@ pub mod tcp {
     /// peer the service can have (RFC 0029). A hosted `accept4` and
     /// `getpeername` need it, and until this the service told no one.
     pub const PEER: u64 = 71;
+
+    /// `bin/tcpc`'s report word holding the ending [`RECV`] told it, when its
+    /// outbound connection ended other than in order — one of [`ended`]
+    /// (RFC 0090 step 1). The kernel checks it against `bin/tcpd`'s page.
+    pub const CLIENT_ENDING: usize = 14;
+    /// How many of `bin/tcpc`'s `RECV` replies named an ending while the
+    /// connection was not closed. Zero on every boot, or the third word is
+    /// lying about connections that live.
+    pub const CLIENT_LIVE_ENDINGS: usize = 15;
 
     /// `bin/tcpc`'s report word saying where its four-at-once act is —
     /// RFC 0086 step 2: one of the `FOUR_*` states below. Here rather than
@@ -1653,6 +1667,30 @@ pub mod tcp {
     /// skips a leg is told so with this, and the reply's second word says
     /// which expectation was disappointed.
     pub const BARE: u64 = 8;
+
+    /// Why a connection ended: the third word of [`RECV`]'s reply.
+    ///
+    /// **Its own namespace, not [`OK`]'s.** 1–3 are the numbers the status
+    /// words of the same meaning use, on purpose, and 4–5 are not status words
+    /// at all. `bin/tcpd`'s report page has outcome numbers of its own, which
+    /// this is not either: they have no value for a reset after establishment
+    /// or for an abort, and 3 means *established* there (RFC 0090 step 1).
+    /// `bhaskix_net::tcp::state::Ended::code` produces these numbers;
+    /// `bhaskix-sock` checks the two against each other on the host.
+    pub mod ended {
+        /// The connection lives, or has not ended yet.
+        pub const NONE: u64 = 0;
+        /// The peer answered the connection request with a reset.
+        pub const REFUSED: u64 = 1;
+        /// The peer never answered, and the bounded retransmissions ran out.
+        pub const UNREACHABLE: u64 = 2;
+        /// The peer reset the connection after it was established.
+        pub const RESET: u64 = 3;
+        /// Both ends closed in order and `TIME_WAIT` expired.
+        pub const ORDERLY: u64 = 4;
+        /// This end gave up on purpose.
+        pub const ABORTED: u64 = 5;
+    }
 
     /// Packs a connection's identity into the badge a capability carries.
     ///
