@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Draft 2026-10-08 — nothing built. Written before any of it, as RFC 0086 was |
+| **Status** | Draft 2026-10-08. Written before any of it, as RFC 0086 was. **Step 0 done 2026-10-12** — slirp's refusal confirmed on both emulators; nothing else built |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | net / userspace |
 | **Milestone** | L1 ([roadmap.md](../roadmap.md)) — the row carried out of RFC 0005 step 9, "`connect` — a hosted TCP **client**" |
@@ -257,6 +257,16 @@ Nothing on the server path changes, and the HTTP gate's numbers are the check.
 
 0. **Confirm** what libslirp's source says — a `RST | ACK` for a dial nobody forwards — from
    `bin/tcpc`, on QEMU 4.2.1 here and 8.2.2 in CI, before a refused gate is built on it.
+   **Done 2026-10-12, on both.** A build of `bin/tcpc` dialling `10.0.2.100:10` instead of `:9`,
+   never committed, booted in `boot-test.sh iommu` with a QEMU `filter-dump` on `net0`: the guest's
+   `10.0.2.15.49999 > 10.0.2.100.10: Flags [S]` is answered at once by
+   `10.0.2.100.10 > 10.0.2.15.49999: Flags [R.], seq 0, ack <SYN's seq + 1>, win 0` — on QEMU 4.2.1
+   here, and on 8.2.2 (`1:8.2.2+ds-0ubuntu1.18`, from an Ubuntu 24.04 image pinned to the digest
+   `tools/swtpm.sh` uses), and in both `bin/tcpd` reports `outcome 1: refused by the network`.
+   **The lane needs the IOMMU**: the plain `bios` lane gives the network driver no DMA window, so
+   no frame leaves the guest there — the refused-dial gate belongs in a lane that has one. And the
+   caller could not tell: `bin/tcpc` reported `FAILED at step 4: connected, stream still in
+   flight`, waiting on a stream that would never come — step 1's case, seen.
 1. **The ending, told** (tcpd, part 1). Gate: tcpc's existing outbound dial reads its ending through
    `RECV`, and it agrees with the report page.
 2. **The port allocator** (net crate, part 3). Host tests.
