@@ -184,6 +184,7 @@ CI enforces this with a grep.
 | `0xFFFF_8000_0000_0000` + | HHDM — direct map of all physical RAM |
 | `0xFFFF_9000_0000_0000` + | Kernel heap (slab / vmalloc region) |
 | `0xFFFF_A000_0000_0000` + | Per-CPU areas, kernel stacks (guard-paged) |
+| `0xFFFF_C000_0000_0000` + | Device windows: the framebuffer's write-combining mapping (since 2026-10-12) |
 | `0xFFFF_FFFF_8000_0000` + | Kernel image (text/rodata/data/bss) |
 
 KASLR shifts the kernel image base at boot. **It does not shift the heap base** — this line said it did until 2026-08-20, and [security.md](security.md) §4 had already corrected the claim on 2026-08-14: randomising the heap is a separate change with its own risk to the direct map, and it is RFC 0021's open question 2. Paging is **four-level, on

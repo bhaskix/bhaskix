@@ -66,6 +66,31 @@ static MADT_REPORTED: AtomicU32 = AtomicU32::new(0);
 /// processor has them — SMEP and SMAP. See [`note_protections`].
 static PROTECTED: AtomicU32 = AtomicU32::new(0);
 
+/// CPUs whose PAT holds `memtype::PAT_LAYOUT` -- 2026-10-12. A write-combining
+/// mapping means WC only on a CPU whose entry 5 says so, so the framebuffer's
+/// window is made only once this counts every CPU online.
+static PAT_SET: AtomicU32 = AtomicU32::new(0);
+
+/// Writes `memtype::PAT_LAYOUT` to this CPU's PAT, if it has one, and counts
+/// it. On the bootstrap CPU early in boot, and on each secondary before it
+/// runs anything but its own bring-up.
+pub fn program_pat_here() {
+    if bhaskix_arch::msr::features().pat {
+        // SAFETY: the CPU has a PAT; entries 0 to 3 keep their reset values,
+        // which is all anything maps through before this, and entries 4 to 7
+        // are used by nothing until every CPU is counted here -- or already
+        // hold these values, under the shim's loader.
+        unsafe { bhaskix_arch::memtype::program_pat() };
+        PAT_SET.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+/// CPUs whose PAT holds the layout. See [`program_pat_here`].
+#[must_use]
+pub fn pat_programmed() -> u32 {
+    PAT_SET.load(Ordering::Acquire)
+}
+
 /// The bootstrap CPU's protections — `WP`, SMEP, SMAP — on a secondary too,
 /// before it runs anything but its own bring-up, and counted only if it reads
 /// them back. Called from `secondary_main` on both boot paths.
@@ -79,6 +104,7 @@ fn protect_this_cpu() {
     // SAFETY: as above.
     unsafe { bhaskix_arch::cpu::enable_supervisor_protections() };
     note_protections();
+    program_pat_here();
 }
 
 /// CPUs that arrived with caching disabled (`CR0.CD` or `NW`), and were turned

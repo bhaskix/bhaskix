@@ -128,7 +128,11 @@ pub enum MemoryKind {
     BootloaderReclaimable,
     /// The kernel image and any boot modules. Already mapped.
     KernelAndModules,
-    /// Framebuffer memory. Mapped write-combining.
+    /// Framebuffer memory. ~~Mapped write-combining.~~ **Corrected 2026-10-12**:
+    /// only Limine mapped it so; the native loader mapped it as plain
+    /// direct-map memory. Since that day the kernel maps a write-combining
+    /// window over the framebuffer itself, on either loader, where the
+    /// firmware's MTRRs allow it -- see `framebuffer_window` in the kernel.
     Framebuffer,
 }
 

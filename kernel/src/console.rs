@@ -293,6 +293,15 @@ pub fn init_second_serial(base: u16) -> Presence {
     presence
 }
 
+/// Moves the framebuffer sink onto `address`, a mapping of the same pixels
+/// made since -- the write-combining window, 2026-10-12. Nothing is redrawn:
+/// the pixels are the same memory.
+pub fn use_framebuffer_window(address: u64) {
+    if let Some(framebuffer) = CONSOLE.lock().framebuffer.as_mut() {
+        framebuffer.move_to(address);
+    }
+}
+
 /// Brings up the framebuffer sink.
 ///
 /// Returns whether the framebuffer was usable. An unsupported pixel format is

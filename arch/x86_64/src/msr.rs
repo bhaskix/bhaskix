@@ -146,6 +146,12 @@ pub struct Features {
     /// running with a weakness nobody can see. The machine still boots — a
     /// filesystem, a shell and a supervisor need no unpredictability at all.
     pub rdrand: bool,
+    /// The page attribute table: memory types chosen per page, which is how
+    /// a framebuffer is made write-combining (2026-10-12).
+    pub pat: bool,
+    /// Memory type range registers: the firmware's types per physical range,
+    /// read before a write-combining window is made over anything.
+    pub mtrr: bool,
 }
 
 /// Probes the features in [`Features`].
@@ -168,5 +174,7 @@ pub fn features() -> Features {
         // Asked of the crate that uses it rather than tested here, so the bit
         // position exists once. See this crate's manifest.
         rdrand: bhaskix_rand::available(),
+        pat: leaf1.edx & (1 << 16) != 0,
+        mtrr: leaf1.edx & (1 << 12) != 0,
     }
 }

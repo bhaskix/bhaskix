@@ -178,7 +178,11 @@ asm_budget = 43
 # kernel-half PML4 entry and building the missing ones -- so every address
 # space shares all 256 top-level slots instead of the ones present when it
 # was copied. CI's emulator faulted on a slot built after the copy.
-unsafe_budget = 1202
+# 1204 on 2026-10-12: two lines in `memtype` -- the `IA32_PAT` write that puts
+# the shared layout in every CPU's PAT, and the one MSR read the MTRR reader
+# makes for the capability, the default type and each variable range. The
+# decoding is safe code with host tests.
+unsafe_budget = 1204
 # Raised from 1070 for ECAM -- one volatile read of configuration space as
 # memory -- and for counting the bytes the transmitter gives up on. The second
 # is two lines and bought a silent data loss becoming a visible number.

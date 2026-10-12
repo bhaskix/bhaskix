@@ -197,6 +197,10 @@ pub fn kernel_main(handoff: &Handoff) -> ! {
     println!("    gdt + tss      loaded (double fault and NMI on dedicated stacks)");
     println!("    idt            loaded (256 vectors)");
     report_cpu_features();
+    // The PAT, in the shared layout on either loader, before anything maps
+    // through entry 5 -- 2026-10-12; each secondary does the same as it comes
+    // up. See `framebuffer_window`.
+    smp::program_pat_here();
 
     // Interrupts. Everything up to this point ran with delivery disabled, so
     // this is the first time the kernel is re-entered asynchronously.
@@ -440,6 +444,7 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
     let secondaries = smp::start_secondaries(handoff);
     smp::report(handoff);
     let _ = secondaries;
+    framebuffer_window(handoff);
 
     // Reports its own failure in detail, so there is nothing useful to add
     // here -- a second, vaguer "FAILED" would only bury the first.
@@ -31679,6 +31684,101 @@ fn banner() {
 /// Printed rather than assumed. `docs/security.md` §4 treats several of these
 /// as load-bearing, and an operator should be able to see on the console which
 /// guarantees the machine in front of them can actually provide.
+/// Where the framebuffer's write-combining window is: a region of its own in
+/// the kernel half, `docs/architecture.md` §1's *device windows*.
+const FRAMEBUFFER_WINDOW: u64 = 0xFFFF_C000_0000_0000;
+
+/// **A write-combining window over the framebuffer** -- 2026-10-12.
+///
+/// The console redraws from RAM since the same morning, and on the SR550 a
+/// scroll still cost about 30 ms: every glyph an uncached write to the BMC's
+/// video memory, because the native loader maps the framebuffer as plain
+/// direct-map memory -- PAT entry 0 -- and the firmware's MTRRs make that UC.
+/// The shim's loader maps it write-combining already. This maps exactly the
+/// framebuffer's pages again, 4 KiB at a time through PAT entry 5, which
+/// `memtype::PAT_LAYOUT` makes WC, and moves the console onto that mapping.
+///
+/// **Not over the direct map's own pages**: those are 2 MiB or 1 GiB and on
+/// a server cover other devices' registers too. **Only over memory the MTRRs
+/// call UC or WC**: the direct map stays as it was, and a WC mapping aliasing
+/// a cacheable one is what the processor does not support. And only once the
+/// PAT holds the layout on every CPU online.
+fn framebuffer_window(handoff: &Handoff) {
+    use bhaskix_arch::memtype;
+
+    let Some(fb) = handoff.framebuffer else {
+        return;
+    };
+    let say = |why: &str| {
+        println!("    framebuffer     left as the loader mapped it: {why}");
+    };
+    let features = bhaskix_arch::msr::features();
+    if !features.pat {
+        return say("this cpu has no PAT");
+    }
+    if !features.mtrr {
+        return say("this cpu has no MTRRs to read, so its memory type cannot be checked");
+    }
+    let online = bhaskix_arch::percpu::online_count();
+    if smp::pat_programmed() < online {
+        return say(&alloc::format!(
+            "the PAT holds the layout on {} of {online} cpus",
+            smp::pat_programmed()
+        ));
+    }
+    let hhdm = handoff.hhdm_base.as_u64();
+    let Some(physical) = fb.address.as_u64().checked_sub(hhdm) else {
+        return say("its address is not in the direct map");
+    };
+    let length = fb.pitch * fb.height;
+    // SAFETY: the CPU has MTRRs, checked above.
+    let mtrrs = unsafe { memtype::read_mtrrs() };
+    let Some(kind) = mtrrs.type_of(physical, length) else {
+        return say("the firmware's MTRRs give it more than one type");
+    };
+    if kind != memtype::kind::UC && kind != memtype::kind::WC {
+        return say(&alloc::format!(
+            "the firmware's MTRRs call it {}, and write-combining must not alias a cacheable \
+             mapping",
+            memtype::name(kind)
+        ));
+    }
+    let first = physical & !(bhaskix_mm::FRAME_SIZE - 1);
+    let pages = (physical + length - first).div_ceil(bhaskix_mm::FRAME_SIZE);
+    // SAFETY: reading CR3; the kernel half it names is shared by every space.
+    let root = unsafe { bhaskix_arch::paging::active_page_table() };
+    let flags = bhaskix_arch::paging::flags::WRITE_COMBINING;
+    for page in 0..pages {
+        let (at, to) = (
+            FRAMEBUFFER_WINDOW + page * bhaskix_mm::FRAME_SIZE,
+            first + page * bhaskix_mm::FRAME_SIZE,
+        );
+        let mapped = heap::with(|heap| {
+            let pmm = heap.pmm_mut();
+            let mut allocate = || {
+                pmm.allocate(0, bhaskix_mm::Zone::Normal)
+                    .ok()
+                    .map(|pfn| u64::from(pfn) * bhaskix_mm::FRAME_SIZE)
+            };
+            // SAFETY: a fresh virtual range nothing else maps, over device
+            // memory the MTRRs call UC or WC, with every CPU's PAT holding the
+            // layout entry 5 of which is WC.
+            unsafe { bhaskix_arch::paging::map_page(root, at, to, flags, hhdm, &mut allocate) }
+        });
+        if !matches!(mapped, Some(Ok(()))) {
+            return say("a page of the window would not map");
+        }
+    }
+    let window = FRAMEBUFFER_WINDOW + (physical - first);
+    console::use_framebuffer_window(window);
+    println!(
+        "    framebuffer     write-combining through PAT entry {} at {window:#x}, {pages} pages; \
+         the firmware's MTRRs call it {}",
+        memtype::WC_INDEX,
+        memtype::name(kind)
+    );
+}
+
 fn report_cpu_features() {
     let f = bhaskix_arch::msr::features();
     let mark = |present: bool| if present { "yes" } else { " NO" };
@@ -31692,11 +31792,13 @@ fn report_cpu_features() {
         mark(f.smap)
     );
     println!(
-        "                   umip {}  la57 {}  invariant-tsc {}  rdrand {}",
+        "                   umip {}  la57 {}  invariant-tsc {}  rdrand {}  pat {}  mtrr {}",
         mark(f.umip),
         mark(f.la57),
         mark(f.invariant_tsc),
-        mark(f.rdrand)
+        mark(f.rdrand),
+        mark(f.pat),
+        mark(f.mtrr)
     );
     // Capability beside choice (RFC 0025): the line above says what the CPU
     // can do; this one says what this kernel does, so a log reader never

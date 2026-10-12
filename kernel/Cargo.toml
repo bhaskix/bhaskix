@@ -922,7 +922,10 @@ asm_budget = 10
 # the handoff's log rebuilt from the two words it is passed in, the copy of
 # each page of it into `bin/tpmd`'s space through the direct map, and the one
 # byte `bhaskix.fault=tpm-log` flips there.
-unsafe_budget = 2095
+# 2099 on 2026-10-12: four lines for the framebuffer's write-combining window
+# -- programming the PAT on each CPU (`smp::program_pat_here`), reading the
+# MTRRs, reading CR3, and mapping each page of the window.
+unsafe_budget = 2099
 # Up thirty-one for RFC 0005 step 9's socket probe -- `ring3_socketeer`, which
 # is `ring3_lister` with a `sockaddr_in6` copied in beside its code instead of
 # two filenames. The same two blocks every hosted probe has: one

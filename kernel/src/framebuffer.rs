@@ -232,6 +232,12 @@ impl FbConsole {
         Some(console)
     }
 
+    /// Draws through `address` from now on: another mapping of the same
+    /// pixels, made after this console was.
+    pub fn move_to(&mut self, address: u64) {
+        self.fb.address = bhaskix_boot::VirtAddr(address);
+    }
+
     /// Number of character columns.
     #[must_use]
     pub const fn columns(&self) -> usize {

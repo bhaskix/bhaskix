@@ -2197,6 +2197,22 @@ if grep -qE "framebuffer     [0-9]+x[0-9]+ at" "$LOG"; then
     fi
 fi
 
+# **And the framebuffer is written through a write-combining window** (also
+# 2026-10-12). Limine always mapped it WC; the native loader mapped it as plain
+# direct-map memory, which the firmware's MTRRs make UC, and on the SR550 a
+# redraw still cost ~30 ms. The kernel now maps exactly its pages through PAT
+# entry 5 -- WC in the layout every CPU holds -- when the MTRRs call it UC or WC.
+# QEMU's firmware does, on every lane, so the window must be there.
+if grep -qE "framebuffer     [0-9]+x[0-9]+ at" "$LOG"; then
+    wc_line=$(grep -aoE "framebuffer     (write-combining through PAT entry 5 at 0x[0-9a-f]+, [0-9]+ pages; the firmware's MTRRs call it (UC|WC)|left as the loader mapped it: .*)" "$LOG" | tr -d '\r' | head -1)
+    if [[ "$wc_line" == *"write-combining through PAT entry 5"* ]]; then
+        pass "the framebuffer is written through a write-combining window (${wc_line#framebuffer     write-combining })"
+    else
+        fail "the framebuffer has no write-combining window: '${wc_line:-no line}'"
+        status=1
+    fi
+fi
+
 # Configuration space as memory, checked against configuration space as ports.
 #
 # RFC 0014 step 4, and the reason the port pair was kept rather than replaced:

@@ -30,7 +30,7 @@ the whole point is that it cannot develop bugs.
 | `Usable` | Hand to the buddy allocator |
 | `BootloaderReclaimable` | *Intended*: reclaimed after we stop reading the handoff. **Nothing reclaims it — see below** |
 | `KernelAndModules` | Reserved; already mapped |
-| `Framebuffer` | Reserved; mapped write-combining |
+| `Framebuffer` | Reserved; ~~mapped write-combining~~ — **corrected 2026-10-12**: only Limine mapped it WC, the native loader as plain direct-map memory (UC by the MTRRs). Since that day the kernel maps a write-combining window over it at `0xFFFF_C000_0000_0000`, through PAT entry 5, on either loader, where the MTRRs call it UC or WC |
 | `AcpiReclaimable` | *Intended*: reserved until ACPI tables are parsed and copied, then released. **Nothing releases it either** |
 | `AcpiNvs`, `Reserved`, `BadMemory` | Never touched |
 

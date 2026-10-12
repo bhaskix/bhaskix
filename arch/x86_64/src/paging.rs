@@ -48,6 +48,17 @@ pub mod flags {
     /// because nothing should ever fetch instructions from a device
     /// (`docs/memory.md` §3, W^X).
     pub const DEVICE: u64 = PRESENT | WRITABLE | NO_CACHE | WRITE_THROUGH | NO_EXECUTE;
+
+    /// The PAT bit of a **4 KiB** entry, the third bit of its PAT index. The
+    /// same bit position means [`HUGE`] one level up, which is why it is named
+    /// apart rather than reused.
+    pub const PAT_4K: u64 = 1 << 7;
+
+    /// Flags for a write-combining mapping of a 4 KiB page: PAT entry 5 of
+    /// `memtype::PAT_LAYOUT` (`WRITE_THROUGH` and `PAT_4K`), writable, never
+    /// executable -- 2026-10-12, for the framebuffer. Meaningful only once the
+    /// PAT holds that layout on every CPU.
+    pub const WRITE_COMBINING: u64 = PRESENT | WRITABLE | WRITE_THROUGH | PAT_4K | NO_EXECUTE;
 }
 
 /// Mask selecting the physical address out of a page table entry.
