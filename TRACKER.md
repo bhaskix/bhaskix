@@ -1069,6 +1069,14 @@ the distinction is in the table rather than in somebody's head.
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-10-12 (the SR550's framebuffer is write-combining: 8.7 ms a scroll)
+
+Booted `78f34c0` at 18:00: the window was made (`768 pages; the firmware's MTRRs call it UC`), and
+the scroll fell from 29.7 ms to **8.7 ms** on average, services up from 98 s to **79 s**, `linux
+proc` from 410 ms to **90 ms**; reset to shell in about three and a half minutes, where it was twelve
+that morning. The TPM verdict held. The open question of the change below is answered by that
+measurement, for this machine. Restored afterwards.
+
 ### 2026-10-12 (a write-combining window over the framebuffer, on either loader)
 
 The SR550's redraw still cost ~30 ms a scroll: the native loader maps the framebuffer as plain
@@ -1085,8 +1093,13 @@ report says which: `framebuffer  write-combining through PAT entry 5 at 0xffffc0
 pages; the firmware's MTRRs call it UC` on every QEMU lane, both loaders; a gate requires it, armed
 red (the bootstrap CPU's PAT left alone: `the PAT holds the layout on 3 of 4 cpus`). The MTRR
 decoder and the PAT index arithmetic have five host tests, armed twice. The encodings were read
-from Linux's headers, not recalled. **Which type results from an MTRR of UC with a PAT of WC is
-not settled here** — the SR550's measured scroll cost is what will say whether WC took effect.
+from Linux's headers, not recalled. ~~**Which type results from an MTRR of UC with a PAT of WC is
+not settled here** — the SR550's measured scroll cost is what will say whether WC took effect.~~
+**Measured on the SR550 the same evening (18:00): it took effect** — `framebuffer  write-combining
+through PAT entry 5 ... the firmware's MTRRs call it UC`, and a scroll fell from **29.7 ms to 8.7
+ms** on average (`891 framebuffer scroll(s), 8748 us each`), services up in **79 s** (from 98 s),
+`linux proc` in **90 ms** (from 410). So on this machine a PAT of WC over memory the MTRRs call UC
+combines writes; a measurement on one CPU, not a reading of the manual.
 
 ### 2026-10-12 (confirmed on the SR550: the console six times faster, and `linux proc` passes)
 
