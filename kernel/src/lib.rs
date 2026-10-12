@@ -27135,6 +27135,22 @@ fn user_shell(handoff: &Handoff) -> Result<(), &'static str> {
              incomplete"
         );
     }
+    // What a framebuffer scroll costs -- 2026-10-12. It read the whole frame
+    // back from video memory per line until then, and on the SR550, whose
+    // framebuffer is the BMC's across PCIe, that paced the entire report at
+    // about 100--160 bytes a second. Said on every boot with a framebuffer, so
+    // a machine where scrolling is expensive says so in its own report.
+    let (scrolls, ticks, worst, from_grid) = framebuffer::scroll_statistics();
+    let micros = |ticks: u64| bhaskix_arch::tsc::to_nanos(ticks).map_or(0, |n| n / 1_000);
+    if let Some(average) = ticks.checked_div(scrolls) {
+        println!(
+            "    console scroll {scrolls} framebuffer scroll(s), {} us each on average, worst {} us; \
+             {from_grid} redrawn from the text in RAM, {} by moving video memory",
+            micros(average),
+            micros(worst),
+            scrolls - from_grid
+        );
+    }
     if let Some(nanos) = time::now_nanos() {
         println!(
             "    boot cost      {}.{:03} ms to services up, console={} vfs={}",

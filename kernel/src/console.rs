@@ -25,7 +25,7 @@ use core::fmt::{self, Write};
 use bhaskix_arch::{Presence, SerialPort};
 use bhaskix_boot::Framebuffer;
 
-use crate::framebuffer::FbConsole;
+use crate::framebuffer::{FbConsole, Grid};
 use crate::sync::{Rank, SpinLock};
 
 /// The global console.
@@ -131,6 +131,11 @@ pub struct Console {
     /// one to spare. RFC 0042 step 6.
     serial_second: Option<SerialPort>,
     framebuffer: Option<FbConsole>,
+    /// The framebuffer's text, kept here so a scroll redraws from RAM rather
+    /// than reading video memory back (2026-10-12). Here, in the static,
+    /// because it is too large for the stack `FbConsole::new` is built on,
+    /// and the console lock that guards this struct guards it too.
+    framebuffer_text: Grid,
     /// What has been printed, for reading back. RFC 0042.
     recorder: Recorder,
 }
@@ -141,6 +146,7 @@ impl Console {
             serial: None,
             serial_second: None,
             framebuffer: None,
+            framebuffer_text: Grid::new(),
             recorder: Recorder::new(),
         }
     }
@@ -166,7 +172,7 @@ impl Write for Console {
             unsafe { serial.write_str(s) };
         }
         if let Some(framebuffer) = self.framebuffer.as_mut() {
-            framebuffer.write_str(s);
+            framebuffer.write_str(&mut self.framebuffer_text, s);
         }
         Ok(())
     }

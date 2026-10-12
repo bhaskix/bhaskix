@@ -2179,6 +2179,24 @@ else
     status=1
 fi
 
+# **A scroll never reads the screen back** (2026-10-12). It moved the whole
+# frame in video memory per line, instant under QEMU and, on the SR550, whose
+# framebuffer is the BMC's across PCIe, the pace of the entire boot report --
+# 589 s to services up. Every scroll on a screen that fits the grid must be
+# redrawn from the text in RAM, and none may move video memory.
+if grep -qE "framebuffer     [0-9]+x[0-9]+ at" "$LOG"; then
+    scroll_line=$(grep -aoE "console scroll [0-9]+ framebuffer scroll\(s\).*" "$LOG" | tr -d '\r' | head -1)
+    if [[ "$scroll_line" =~ ([0-9]+)\ framebuffer\ scroll.*\ ([0-9]+)\ redrawn\ from\ the\ text\ in\ RAM,\ 0\ by\ moving\ video\ memory ]] \
+        && [[ "${BASH_REMATCH[1]}" == "${BASH_REMATCH[2]}" ]]; then
+        pass "every framebuffer scroll was redrawn from RAM, none read video memory back (${scroll_line#console scroll })"
+    elif [[ -z "$scroll_line" ]] && ! grep -qE "console scroll" "$LOG"; then
+        pass "the framebuffer never scrolled, so nothing was read back"
+    else
+        fail "a framebuffer scroll moved video memory: '${scroll_line:-no scroll line}'"
+        status=1
+    fi
+fi
+
 # Configuration space as memory, checked against configuration space as ports.
 #
 # RFC 0014 step 4, and the reason the port pair was kept rather than replaced:
