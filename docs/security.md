@@ -585,7 +585,10 @@ Domain 0 / init (measured)
 
 Our own signing keys, key rotation policy, and how community builds are signed differently from
 release builds are governance questions — see [../GOVERNANCE.md](../GOVERNANCE.md). **Nobody ships a
-release-signing key in a git repository.**
+release-signing key in a git repository.** [RFC 0091](rfc/0091-a-boot-its-owner-signed.md) (a Draft,
+2026-10-12) proposes the two signing links — Secure Boot over the loader, the loader over the kernel,
+initrd and `boot.conf` — and sets those questions out as decisions for the project lead, each with a
+recommendation; nothing of it is built.
 
 ---
 
@@ -936,5 +939,7 @@ We commit to:
 - **Attestation format:** align with an existing standard (TCG DICE, IETF RATS/EAT) or define our
   own? Strong lean toward an existing standard — see the open-standards principle.
 - **Signing and key custody** for release builds. A governance decision with technical consequences.
+  [RFC 0091](rfc/0091-a-boot-its-owner-signed.md)'s questions 3–7 lay it out (Draft, 2026-10-12).
 - Do we allow unsigned kernels in developer mode, and how is that state made unmistakable to the
-  user and to a remote verifier?
+  user and to a remote verifier? RFC 0091's question 2 recommends booting with Secure Boot off and
+  saying so in red, in the boot report and in PCR 8 — undecided.

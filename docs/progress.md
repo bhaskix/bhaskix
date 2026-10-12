@@ -11,7 +11,7 @@
 | | |
 |---|---|
 | RFCs accepted | **60** |
-| RFCs open | 28 |
+| RFCs open | 29 |
 | RFCs closed without shipping | 2 |
 | Milestone rows done | **92 of 95** |
 | Phase 2 bullets done | **13 of 13** |
@@ -32,6 +32,7 @@ gantt
     RFC 0028 bhaskixboot.efi — the machine enters through our... :done, r0028, 2026-08-17, 2026-08-18
     RFC 0088 A clock a process reads itself :active, r0088, 2026-10-02, 2026-10-12
     RFC 0089 A boot the TPM records :done, r0089, 2026-10-08, 2026-10-11
+    RFC 0091 A boot its owner signed :active, r0091, 2026-10-12, 2026-10-12
     section Filesystem & storage
     RFC 0003 Storage architecture :active, r0003, 2026-08-03, 2026-10-12
     RFC 0006 Kosh — unified storage from one node to many :active, r0006, 2026-08-03, 2026-10-12
@@ -196,6 +197,7 @@ gantt
 | 0076 | a bond on hardware | 2026-09-08 |
 | 0088 | A clock a process reads itself | 2026-10-02 |
 | 0090 | A hosted program that dials out | 2026-10-08 |
+| 0091 | A boot its owner signed | 2026-10-12 |
 
 ## Annexes
 
