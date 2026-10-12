@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Draft 2026-10-08. Written before any of it, as RFC 0086 was. **Steps 0 and 1 done 2026-10-12** — slirp's refusal confirmed on both emulators; `RECV`'s third word now says why a connection ended, and a refused dial is told to the caller that made it |
+| **Status** | Draft 2026-10-08. Written before any of it, as RFC 0086 was. **Steps 0–2 done 2026-10-12** — slirp's refusal confirmed on both emulators; `RECV`'s third word now says why a connection ended, and a refused dial is told to the caller that made it |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | net / userspace |
 | **Milestone** | L1 ([roadmap.md](../roadmap.md)) — the row carried out of RFC 0005 step 9, "`connect` — a hosted TCP **client**" |
@@ -289,7 +289,15 @@ Nothing on the server path changes, and the HTTP gate's numbers are the check.
    hold `Ended::code` (the encoder, in `bhaskix-net`) to `Ending::from_word` (the decoder). Each
    gate was watched red: tcpd answering no ending brought back step 0's thirty-second wait and
    failed the refused boot; tcpd naming an ending for a live connection failed the healthy one.
-2. **The port allocator** (net crate, part 3). Host tests.
+2. **The port allocator** (net crate, part 3). Host tests. **Done 2026-10-12**:
+   `bhaskix_net::tcp::ports::local_port(start, local, remote, remote_port, taken)` — the start any
+   raw draw, reduced into 49152–65535; the search upward and wrapping; `taken` the caller's table,
+   asked about the whole four-tuple. Six host tests, among them the top of the range wrapping to the
+   bottom, a full range answering `None` after asking each of its 16,384 ports exactly once, and a
+   tuple differing only in the peer — each of those two watched red. **One thing step 3 must
+   do that this cannot**: the fixed handover takes `LOCAL_PORT` (49999) without asking, and 49999
+   lies inside the dynamic range, so tcpd's `taken` must answer `true` for it, or an `OPEN_LEG` dial
+   to the handover's peer could take the port the handover then takes again.
 3. **CONNECT through `OPEN_LEG`** (tcpd, part 2) and **`sock::tcp::connect`** (part 4). Gate: a
    second native dialler beside `bin/tcpc`, both connections live at once, two different local
    ports.
