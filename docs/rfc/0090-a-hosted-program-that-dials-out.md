@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Draft 2026-10-08. Written before any of it, as RFC 0086 was. **Steps 0–2 done 2026-10-12** — slirp's refusal confirmed on both emulators; `RECV`'s third word now says why a connection ended, and a refused dial is told to the caller that made it |
+| **Status** | Draft 2026-10-08. Written before any of it, as RFC 0086 was. **Steps 0–3 done 2026-10-12** — slirp's refusal confirmed on both emulators; `RECV`'s third word now says why a connection ended, and a refused dial is told to the caller that made it |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | net / userspace |
 | **Milestone** | L1 ([roadmap.md](../roadmap.md)) — the row carried out of RFC 0005 step 9, "`connect` — a hosted TCP **client**" |
@@ -71,13 +71,21 @@ This closes the gap with RFC 0020's own failure table, independently of everythi
 `CONNECT` with `arg2 = OPEN_LEG` opens a **per-caller handover**, keyed by badge and by
 destination exactly as RFC 0086 step 3a keyed a new listener: legs 0 and 1 carry the connection's
 send and receive rings, an optional leg 3 its wake, and leg 2 answers the connection capability
-into the slot the caller declared. The rings of an `OPEN_LEG` connection are attached at addresses
-derived from the table index, as a listener's pairs are, not at the two fixed gift slots.
+into the slot the caller declared. The rings of an `OPEN_LEG` connection are attached ~~at addresses
+derived from the table index, as a listener's pairs are~~ **in a pair window, by pair number, as a
+listener's pairs are** (corrected 2026-10-12 at step 3: pairs were never placed by table index), not
+at the two fixed gift slots. The window is the dial's from the moment its rings map, under an
+owner of its own so no listener arms it, and **stays reserved after the connection ends** until
+part 6 can give windows back — nothing in the ABI unmaps a gift. The connection keeps `pair: None`,
+which means *not accepted*. Leg 2 answers the local port in its third word, since the service's
+report page has no word left.
 
 **The fixed handover stays**, for `bin/tcpc`, as RFC 0086 kept the fixed `LISTEN` for the first
 listener. `service.outbound` — the one connection tcpd's report narrates — stays tcpc's.
 
-`CONNECT6` gains the same leg; its destination rule (only `::1`) is unchanged and out of scope.
+~~`CONNECT6` gains the same leg; its destination rule (only `::1`) is unchanged and out of scope.~~
+**Deferred at step 3, 2026-10-12**: `CONNECT6` keeps the fixed handover until a step has a v6
+dialler to gate the leg — built now, it would ship untested.
 
 ### 3. A local port per connection (`bhaskix-net`, host-tested)
 
@@ -300,7 +308,23 @@ Nothing on the server path changes, and the HTTP gate's numbers are the check.
    to the handover's peer could take the port the handover then takes again.
 3. **CONNECT through `OPEN_LEG`** (tcpd, part 2) and **`sock::tcp::connect`** (part 4). Gate: a
    second native dialler beside `bin/tcpc`, both connections live at once, two different local
-   ports.
+   ports. **Done
+   2026-10-12.** An act in `bin/tcpc`, after its bulk transfer and before it closes its first
+   connection, dials the same peer with `sock::tcp::connect`; tcpd answers a local port drawn by
+   step 2's allocator — treating 49999 and every listener's port as taken — and the kernel prints
+   `tcp dial two connections to one peer at once: the second dialled with OPEN_LEG from local port N
+   while the first held 49999, and its bytes came back`, holding N to the range and away from 49999
+   itself. N was 53597, 49632, 58808, 62143, 62682, 58956, 61931 and 62882 on eight boots. Both arms
+   went red: the dial forced onto 49999 never established — and got the first connection, its
+   four-tuple twin, reset, which the client read through step 1's word as `RECV said reset`; and
+   `OPEN_LEG` dials sent to the fixed handover failed at the act's first leg. **Three things the
+   step found.** The four-client act assumed tcpd numbers its armed pairs 1 to 3 and indexed by
+   them; a dial taking pair 1 first broke it, and it now looks the numbers up. The first armed run
+   was reported as a stall in the bulk drain, because the act did not write the detail word the
+   kernel reads — the second time a stale word has said that (CI run 782 was the first) — so the
+   act names its own phase, `PHASE_DIAL`, and gives up within five seconds, well inside the
+   kernel's fifteen. And one of seven boots on this tree failed the four-client act with no client
+   accepted, unexplained and filed in TRACKER rather than called a flake.
 4. **`connect` in linuxd** (part 5), non-blocking first. Gate: `linux dial`, one round trip.
 5. **Pairs for dialling, and back** (part 6). Gate: sixty-four dials.
 6. **Blocking `connect`, and the refused dial**: `ECONNREFUSED` through `SO_ERROR`, and through a

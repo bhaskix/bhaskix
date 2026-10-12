@@ -74,6 +74,13 @@ const SECOND_RINGS: (u64, u64) = (23, 24);
 const SECOND_LISTENER: u64 = 25;
 const SECOND_CONNECTION: u64 = 26;
 const SECOND_PORT: u16 = 8;
+/// RFC 0090 step 3's act: one more ring pair, for a **second dial** opened
+/// with `OPEN_LEG` while the first connection is still established, and the
+/// slot its connection capability lands in.
+const DIAL_RINGS: (u64, u64) = (27, 28);
+const DIAL_CONNECTION: u64 = 29;
+/// What the second dial sends, and must get back from its own `cat`.
+const DIAL_PAYLOAD: &[u8; 16] = b"bhaskix-dial-ok!";
 /// The host, as `slirp` presents it to the guest: the peer `PEER` must name.
 const SLIRP_HOST: u32 = u32::from_be_bytes([10, 0, 2, 2]);
 const L_WAKE: u64 = 10;
@@ -88,13 +95,15 @@ const RECVR_AT: u64 = 0x2410_0000;
 const L_SENDR_AT: u64 = 0x2420_0000;
 const L_RECVR_AT: u64 = 0x2430_0000;
 /// And the three extra pairs', send then receive, a megabyte apart as above.
-/// The fourth pair is the second listener's (RFC 0086 step 3a), kept in the
-/// same array so its views are made on the same line as the others'.
-const FOUR_AT: [(u64, u64); 4] = [
+/// The fourth pair is the second listener's (RFC 0086 step 3a) and the fifth
+/// the second dial's (RFC 0090 step 3), kept in the same array so their views
+/// are made on the same line as the others'.
+const FOUR_AT: [(u64, u64); 5] = [
     (0x2440_0000, 0x2450_0000),
     (0x2460_0000, 0x2470_0000),
     (0x2480_0000, 0x2490_0000),
     (0x24a0_0000, 0x24b0_0000),
+    (0x24c0_0000, 0x24d0_0000),
 ];
 
 /// Bytes each of the four host clients sends, and must get back.
@@ -401,6 +410,7 @@ extern "C" fn tcpc_main(hertz: u64) -> ! {
         FOUR_RINGS
             .iter()
             .chain(core::iter::once(&SECOND_RINGS))
+            .chain(core::iter::once(&DIAL_RINGS))
             .zip(FOUR_AT.iter())
             .flat_map(|(&(send, recv), &(send_at, recv_at))| [(send, send_at), (recv, recv_at)]),
     )
@@ -683,6 +693,14 @@ extern "C" fn tcpc_main(hertz: u64) -> ! {
         report(7, outcome::MANGLED, u64::from(last));
         exit();
     }
+
+    // RFC 0090 step 3: a second connection to the same peer, dialled while
+    // this one is still established -- before it is closed below.
+    dial_beside(
+        four_views[4],
+        abi_tcp::WAITING_IN | abi_tcp::PHASE_BULK << 32 | CHUNKS,
+        &pace,
+    );
 
     // Close in order, and see it acknowledged.
     if let Err(status) = tcp::shutdown(CONNECTION) {
@@ -1157,6 +1175,98 @@ fn second_listener(pair: (RingView, RingView), pace: &Pace) {
     report_word(abi_tcp::CLIENT_SECOND_STATE, abi_tcp::FOUR_DONE);
 }
 
+/// RFC 0090 step 3: a **second dial**, opened with `OPEN_LEG` while the first
+/// connection — the fixed handover's, from port 49999 — is still established,
+/// and to the same peer.
+///
+/// The service draws the dial's local port from the dynamic range, so the two
+/// are two connections, each with its own `cat` at the far end. This checks
+/// that both are established at once and that the second echoes its own
+/// bytes, and records the port it was given; the kernel decides whether the
+/// port is one the first does not hold. A failure is recorded and the run goes
+/// on, so nothing here moves the demonstration's own outcome.
+fn dial_beside(pair: (RingView, RingView), detail_before: u64, pace: &Pace) {
+    // Where the act is, in the detail word the kernel reads if the client is
+    // still running when it reports -- and put back as it was when the act
+    // ends, so a stall after it reads as it did before this act existed.
+    let at = |step: u64| report_word(3, abi_tcp::WAITING_IN | abi_tcp::PHASE_DIAL << 32 | step);
+    let restore = || report_word(3, detail_before);
+    let failed = |step: u64| {
+        report_word(abi_tcp::CLIENT_DIAL_RESULT, step << 56);
+        report_word(abi_tcp::CLIENT_DIAL_STATE, abi_tcp::FOUR_FAILED);
+        restore();
+    };
+    report_word(abi_tcp::CLIENT_DIAL_STATE, abi_tcp::FOUR_READY);
+    at(1);
+    let Ok((_, local_port)) = tcp::connect(
+        SERVICE,
+        PEER,
+        PEER_PORT as u16,
+        DIAL_RINGS,
+        Some((WAKE, 1)),
+        DIAL_CONNECTION,
+    ) else {
+        return failed(1);
+    };
+    // **Bounded well inside the kernel's patience.** The kernel reads this
+    // program's page after fifteen seconds whether it has finished or not, and
+    // a dial that never establishes must fail here, by name, rather than hold
+    // the whole demonstration past that and be reported as something else.
+    at(2);
+    let mut established = false;
+    let mut both = false;
+    for _ in 0..50u32 {
+        match poll(DIAL_CONNECTION, 0) {
+            StreamPoll::Ready {
+                state: STATE_ESTABLISHED,
+                ..
+            } => {
+                established = true;
+                // Asked in the same pass: the first is still open, and this
+                // is the moment both are.
+                both = matches!(
+                    poll(CONNECTION, 0),
+                    StreamPoll::Ready {
+                        state: STATE_ESTABLISHED,
+                        ..
+                    }
+                );
+                break;
+            }
+            StreamPoll::Ready { ended: Some(_), .. } => return failed(2),
+            StreamPoll::Ready { .. } => news(WAKE, pace),
+            _ => return failed(3),
+        }
+    }
+    if !established {
+        return failed(4);
+    }
+    let (send, recv) = pair;
+    let length = DIAL_PAYLOAD.len() as u64;
+    for (offset, byte) in DIAL_PAYLOAD.iter().enumerate() {
+        send.write(offset as u64, *byte);
+    }
+    if tcp::send(DIAL_CONNECTION, length).is_err() {
+        return failed(5);
+    }
+    at(3);
+    if !recv.wait_for(length - 1, DIAL_PAYLOAD[15], WAKE, pace, 50) {
+        return failed(6);
+    }
+    if (0..length).any(|offset| recv.read(offset) != DIAL_PAYLOAD[offset as usize]) {
+        return failed(7);
+    }
+    // Consumed, so the window reopens -- and closed, so its `cat` ends.
+    let _ = poll(DIAL_CONNECTION, length);
+    let _ = tcp::shutdown(DIAL_CONNECTION);
+    report_word(
+        abi_tcp::CLIENT_DIAL_RESULT,
+        u64::from(local_port) | (u64::from(both) << 16) | (1 << 17),
+    );
+    report_word(abi_tcp::CLIENT_DIAL_STATE, abi_tcp::FOUR_DONE);
+    restore();
+}
+
 /// RFC 0086 step 2: four host clients held at once on one listener.
 ///
 /// Until this step `bin/tcpd` kept one accepted connection, so a second
@@ -1180,12 +1290,19 @@ fn four_at_once(
         report_word(abi_tcp::CLIENT_FOUR_STATE, abi_tcp::FOUR_FAILED);
         false
     };
-    // Views by pair number: 0 is `LISTEN`'s own, and the service numbers each
-    // armed pair; whatever number it answers is where that pair's views go.
+    // This act's four pairs, and the number the service gave each: 0 is
+    // `LISTEN`'s own. **The numbers are the service's labels, looked up, not
+    // assumed**: until 2026-10-12 this took them for 1 to 3 and indexed by
+    // them, which held only while nothing else had armed a pair first -- RFC
+    // 0090 step 3's second dial takes one before this act runs.
     let mut views = [(listen_send, listen_recv); 4];
+    let mut numbers = [0u32; 4];
     for (index, &(send_slot, recv_slot)) in FOUR_RINGS.iter().enumerate() {
         match tcp::arm_pair(LISTENER, send_slot, recv_slot) {
-            Ok(pair) if (1..4).contains(&pair) => views[pair as usize] = extra[index],
+            Ok(pair) if !numbers[..=index].contains(&pair) => {
+                numbers[index + 1] = pair;
+                views[index + 1] = extra[index];
+            }
             Ok(pair) => return failed(1, u64::from(pair)),
             Err(_) => return failed(2, index as u64),
         }
@@ -1213,8 +1330,13 @@ fn four_at_once(
         if tcp::expect(SERVICE, slot).is_err() {
             return failed(3, accepted as u64);
         }
+        // Which of this act's pairs the connection took, by the service's
+        // number for it.
         let pair = match tcp::accept(LISTENER) {
-            AcceptPoll::Accepted { pair } if (pair as usize) < views.len() => pair,
+            AcceptPoll::Accepted { pair } => match numbers.iter().position(|&n| n == pair) {
+                Some(local) => local as u32,
+                None => return failed(4, accepted as u64),
+            },
             AcceptPoll::Later => {
                 news(L_WAKE, pace);
                 continue;

@@ -5,12 +5,14 @@
 //! owns cross as staged gifts, one per call, and the connection capability
 //! rides a reply into a slot the program declared. This module holds the
 //! leg discipline — the staging, the bounded retry while a service is still
-//! starting, the refusal decoding — and the stream verbs. It deliberately
-//! does *not* fix the leg order into one `connect()` shape: the service
-//! declares where gifts may land in its own order, a program juggling a
-//! connection and a listener interleaves the legs to match, and the
-//! primitive is what makes that expressible. A plain client strings four
-//! legs and an `EXPECT` together in five lines.
+//! starting, the refusal decoding — and the stream verbs. ~~It deliberately
+//! does *not* fix the leg order into one `connect()` shape~~ — corrected
+//! 2026-10-12, RFC 0090 step 3: a dial of the caller's own has one, [`connect`],
+//! as a listener of its own has [`listen_open`]. What stays unfixed is the
+//! **fixed** handover's order: the service declares where those gifts may land
+//! in its own order, and `bin/tcpc`, which juggles that connection and a
+//! listener at once, interleaves their legs to match — which is what the leg
+//! primitive keeps expressible.
 
 use crate::call::{Reply, call};
 use bhaskix_abi::{method, rights, status, syscall, tcp};
@@ -435,6 +437,64 @@ pub fn listen_open(
     expect(service_slot, landing_slot).map_err(LegError::HandRefused)?;
     leg_words(service_slot, tcp::LISTEN, port, 0, None, 2)
         .map(|(handle, pair)| (handle, pair as u32))
+}
+
+/// Dials `address:port` with a connection of the caller's own — RFC 0090
+/// step 3. Returns the connection's badge and **the local port it took**.
+///
+/// The service's one fixed `CONNECT` handover belongs to `bin/tcpc`; any other
+/// dial opens its own with an open leg carrying no gift, then gifts the
+/// connection's rings (legs 0 and 1), optionally its wake (leg 3), and
+/// completes (leg 2), the capability landing in `landing_slot`. The service
+/// draws the local port from the dynamic range, so two dials to one peer are
+/// two connections. Like a listener's, the rings are the caller's memory and
+/// must not be used for anything else while the connection lives.
+///
+/// # Errors
+///
+/// [`LegError`] from whichever leg refused — `tcp::NO_ENTROPY` in its value if
+/// the service cannot draw an unpredictable port, `tcp::CONGESTED` if its
+/// table or (detail 2) the port range is full — or from declaring
+/// `landing_slot`, as `HandRefused`.
+pub fn connect(
+    service_slot: u64,
+    address: u32,
+    port: u16,
+    rings: (u64, u64),
+    wake: Option<(u64, u64)>,
+    landing_slot: u64,
+) -> Result<(u64, u16), LegError> {
+    let (address, port) = (u64::from(address), u64::from(port));
+    leg(
+        service_slot,
+        tcp::CONNECT,
+        address,
+        port,
+        None,
+        tcp::OPEN_LEG,
+    )?;
+    leg(
+        service_slot,
+        tcp::CONNECT,
+        address,
+        port,
+        Some((rings.0, 0)),
+        0,
+    )?;
+    leg(
+        service_slot,
+        tcp::CONNECT,
+        address,
+        port,
+        Some((rings.1, 0)),
+        1,
+    )?;
+    if let Some(wake) = wake {
+        leg(service_slot, tcp::CONNECT, address, port, Some(wake), 3)?;
+    }
+    expect(service_slot, landing_slot).map_err(LegError::HandRefused)?;
+    leg_words(service_slot, tcp::CONNECT, address, port, None, 2)
+        .map(|(handle, local_port)| (handle, local_port as u16))
 }
 
 /// Who is at the other end of a connection — RFC 0086 step 3a.

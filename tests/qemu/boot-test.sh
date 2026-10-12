@@ -2940,6 +2940,23 @@ else
 fi
 rm -f "$SECOND_VERDICT" 2>/dev/null || true
 
+# RFC 0090 step 3's gate: a second dial, opened with OPEN_LEG while the first
+# connection is still established, to the same peer from a port of its own.
+# The kernel checks the port (in the dynamic range, not the fixed handover's)
+# and prints FAILED otherwise. Demanded wherever the client got past its bulk
+# transfer, which is where the act runs -- in practice the networked lanes.
+if grep -qE "tcp dial +two connections to one peer at once: the second dialled with OPEN_LEG from local port [0-9]+ while the first held 49999, and its bytes came back" "$LOG"; then
+    pass "a second dial with OPEN_LEG: both connections live at once, from two local ports (RFC 0090 step 3)"
+elif grep -qE "tcp dial +FAILED" "$LOG"; then
+    fail "a second dial: $(grep -aoE 'tcp dial +FAILED.*' "$LOG" | head -1 | sed 's/\x1b\[[0-9;]*m//g')"
+    status=1
+elif grep -qE "tcp client +did everything outcome 9 says" "$LOG"; then
+    fail "the client finished its demonstration and the second-dial act never reported"
+    status=1
+else
+    pass "a second dial not attempted: the client did not reach its bulk transfer's end here"
+fi
+
 # RFC 0086 step 3b's gate -- see the driver above. The guest says the probe
 # ended after writing back; the host says whether its own bytes came back; the
 # console carries them. All three, or it did not happen.

@@ -46,7 +46,7 @@
 use bhaskix_abi::{method, rights, ring, status, syscall, tcp};
 use bhaskix_net::siphash::Key;
 use bhaskix_net::tcp::{
-    FourTuple, cookie, isn,
+    FourTuple, cookie, isn, ports,
     segment::{self, Segment},
     state::{self, Action, Event, Tcb, Timer},
     table::{Armed, Handle, Table},
@@ -164,10 +164,11 @@ const STREAM_RING_BYTES: usize = 4 * 4096;
 /// that followed would have rebuilt the same too-wide emit for ever.
 const MAX_EMIT: usize = state::DEFAULT_MSS as usize;
 
-/// The local port a connection uses. One connection, one port; a port
-/// allocator arrives with the connection table. Above the well-known range,
-/// and fixed so the report is deterministic.
-const LOCAL_PORT: u16 = 49999;
+/// The local port the fixed `CONNECT` handover uses. Above the well-known
+/// range, and fixed so the report is deterministic. ~~A port allocator arrives
+/// with the connection table.~~ It arrived with RFC 0090 step 3, for dials
+/// opened with `OPEN_LEG`, which treat this one as taken.
+const LOCAL_PORT: u16 = tcp::FIXED_LOCAL_PORT;
 
 /// The receive window a connection advertises: the client's whole ring. The
 /// ring bounds what can be stored, the window what the peer may send, and
@@ -571,7 +572,22 @@ struct Pair {
     /// The listener this pair was armed on, and returns to — RFC 0086 step
     /// 3a. A connection's listener is its pair's owner, so neither has to
     /// remember the other.
-    owner: usize,
+    owner: PairOwner,
+}
+
+/// Whose a pair window is.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PairOwner {
+    /// A listener's: armed on it, and returned to it when its connection is
+    /// retired.
+    Listener(usize),
+    /// A connection dialled with `OPEN_LEG`'s — RFC 0090 step 3. **Kept after
+    /// the connection ends**, until windows can be given back (RFC 0090 part
+    /// 6): its rings stay mapped, nothing in this ABI unmaps a gift, and
+    /// handing the window to the next opener would map over them. The
+    /// connection keeps `pair: None` -- that field means *accepted* -- and its
+    /// `sendr_at` is what names its window.
+    Dial,
 }
 
 /// What an open handover is building — RFC 0086 step 3a.
@@ -582,6 +598,10 @@ enum ArmTarget {
     /// A new listener on port `0`, via `LISTEN` with `OPEN_LEG`: its first
     /// pair, and the wake every connection it births will ring.
     Listener(u16),
+    /// A connection of the caller's own to `address:port`, via `CONNECT` with
+    /// `OPEN_LEG` — RFC 0090 step 3: its rings, its wake, and a local port of
+    /// its own rather than the fixed handover's.
+    Dial { address: u32, port: u16 },
 }
 
 /// An `ARM_PAIR` in progress: which pair it is filling, and which of its two
@@ -724,7 +744,10 @@ impl Service {
             .get(pair as usize)
             .copied()
             .flatten()
-            .map(|pair| pair.owner);
+            .and_then(|pair| match pair.owner {
+                PairOwner::Listener(listener) => Some(listener),
+                PairOwner::Dial => None,
+            });
         if let Some(listener) = owner
             .and_then(|owner| self.listeners.get_mut(owner))
             .and_then(Option::as_mut)
@@ -1632,7 +1655,11 @@ fn declare_gift_slot(connect: &Handover, listen: &Handover, arming: &Arming) {
         // A caller that sends none goes straight to leg 2 and this
         // declaration simply goes unused -- it is only made while this
         // caller's handover is open.
-        if matches!(arming.target, ArmTarget::Listener(_)) && !arming.notified {
+        if matches!(
+            arming.target,
+            ArmTarget::Listener(_) | ArmTarget::Dial { .. }
+        ) && !arming.notified
+        {
             let slot = Arming::wake_slot(arming.pair);
             let _ = call(syscall::INVOKE, ENDPOINT, method::EXPECT, [slot, 0, 0, 0]);
             return;
@@ -1911,6 +1938,94 @@ fn peer_words(tuple: FourTuple) -> (u64, u64) {
     }
 }
 
+/// Leg 2 of a dial opened with `OPEN_LEG` — RFC 0090 step 3. Returns what to
+/// reply: the outcome, the connection's badge, and **the local port it took**
+/// (this service's report page has no word left, and the caller is who needs
+/// it).
+///
+/// The local port is RFC 0090 part 3's: a start drawn from this machine's
+/// entropy now, then the first port in the dynamic range whose four-tuple is
+/// free. Taken, besides every tuple in the table: the fixed handover's port,
+/// which that handover takes without asking, and every listener's. The rest is
+/// the fixed handover's leg 2 with this caller's rings in this caller's window.
+fn dial(
+    service: &mut Service,
+    pair: u32,
+    address: u32,
+    port: u16,
+    notified: bool,
+) -> (u64, u64, u64) {
+    let (_, sendr_at) = Arming::place(pair, 0);
+    let (_, recvr_at) = Arming::place(pair, 1);
+    // The window is the dial's from the moment its rings are mapped, whatever
+    // follows — see `PairOwner::Dial`.
+    service.pairs[pair as usize] = Some(Pair {
+        sendr_at,
+        recvr_at,
+        owner: PairOwner::Dial,
+    });
+    let Some(start) = bhaskix_rand::u64() else {
+        // RFC 0021's policy, as everywhere here: no unpredictable port, no dial.
+        return (tcp::NO_ENTROPY, 0, 0);
+    };
+    let local = Address::V4(service.me);
+    let remote = Address::V4(Ipv4Addr(address));
+    let Some(connection) = ports::local_port(start, local, remote, Port(port), |tuple| {
+        tuple.local_port == Port(LOCAL_PORT)
+            || service.listener_on(tuple.local_port).is_some()
+            || service
+                .connections
+                .find(|c| c.tcb.connection == *tuple)
+                .is_some()
+    }) else {
+        // Every port of the range already carries this tuple.
+        return (tcp::CONGESTED, 2, 0);
+    };
+    let iss = isn::initial_sequence(&service.key, connection, now_nanos(service.hertz));
+    let Ok(Handle { index, generation }) = service.connections.insert(Connection {
+        claimed: true,
+        ended: None,
+        tcb: Tcb::new(connection),
+        deadlines: Deadlines::new(),
+        sendr_at,
+        recvr_at,
+        delivered: 0,
+        handle: 0,
+        notify_slot: notified.then_some(Arming::wake_slot(pair)),
+        wake_owed: false,
+        pair: None,
+    }) else {
+        return (tcp::CONGESTED, 0, 0);
+    };
+    let index = index as usize;
+    let handle = tcp::handle(index as u32, generation, false);
+    if let Some(born) = service.connections.get_mut(index) {
+        born.handle = handle;
+    }
+    // The capability back before the `SYN` leaves: a connection nobody holds a
+    // capability to would be a handshake nobody can read.
+    let handed = call(
+        syscall::INVOKE,
+        ENDPOINT,
+        method::HAND,
+        [ENDPOINT, rights::READ | rights::WRITE, handle, 0],
+    );
+    if handed.0 != status::OK {
+        retire(service, index);
+        return (tcp::BARE, 0x20 | handed.0, 0);
+    }
+    drive_at(
+        service,
+        index,
+        Event::Connect {
+            iss,
+            window: WINDOW,
+        },
+    );
+    arm_nearest(service);
+    (tcp::OK, handle, u64::from(connection.local_port.0))
+}
+
 /// Answers one `ARM_PAIR` leg on a listener — RFC 0086 step 2.
 ///
 /// [`tcp::OPEN_LEG`] picks the next unused pair and makes its slots owed, so
@@ -1949,6 +2064,10 @@ fn arm_leg(
                         return (tcp::CONGESTED, 1, 0);
                     }
                 }
+                // Anything that can refuse a dial -- entropy, a free port, a
+                // table slot -- is asked at leg 2, against the table as it is
+                // then rather than as it was before the gifts moved.
+                ArmTarget::Dial { .. } => {}
             }
             let Some(pair) = (1..MAX_PAIRS).find(|&n| service.pairs[n].is_none()) else {
                 // Every pair this service can hold has been given: the
@@ -1991,7 +2110,12 @@ fn arm_leg(
         // A new listener's wake, RFC 0023's leg 3: probed by `PEEK`, as
         // `connect_leg` probes one. An added pair inherits its listener's.
         3 => {
-            if !arming.open || !matches!(arming.target, ArmTarget::Listener(_)) {
+            if !arming.open
+                || !matches!(
+                    arming.target,
+                    ArmTarget::Listener(_) | ArmTarget::Dial { .. }
+                )
+            {
                 return (tcp::BARE, 0x43, 0);
             }
             if arming.notified {
@@ -2025,7 +2149,7 @@ fn arm_leg(
                     service.pairs[pair as usize] = Some(Pair {
                         sendr_at,
                         recvr_at,
-                        owner: listener,
+                        owner: PairOwner::Listener(listener),
                     });
                     service.rearm(pair);
                     (tcp::OK, u64::from(pair), 0)
@@ -2049,7 +2173,7 @@ fn arm_leg(
                     service.pairs[pair as usize] = Some(Pair {
                         sendr_at,
                         recvr_at,
-                        owner: index,
+                        owner: PairOwner::Listener(index),
                     });
                     let mut armed = Armed::new();
                     let _ = armed.arm(pair);
@@ -2064,6 +2188,15 @@ fn arm_leg(
                     // this one could not tell which rings its first
                     // connection lives in.
                     (tcp::OK, handle, u64::from(pair))
+                }
+                ArmTarget::Dial { address, port } => {
+                    let notified = arming.notified;
+                    // Closed whatever the dial answers: its window is reserved
+                    // either way, so nothing is left for a retry to finish,
+                    // and an open handover would hold every other caller at
+                    // `LATER`.
+                    *arming = Arming::closed();
+                    return dial(service, pair, address, port, notified);
                 }
             };
             *arming = Arming::closed();
@@ -2116,7 +2249,7 @@ fn listen_leg_serving(
         service.pairs[0] = Some(Pair {
             sendr_at: handover.at.0,
             recvr_at: handover.at.1,
-            owner: index,
+            owner: PairOwner::Listener(index),
         });
         let mut armed = Armed::new();
         let _ = armed.arm(0);
@@ -2621,7 +2754,7 @@ extern "C" fn tcpd_main(hertz: u64) -> ! {
                             .get(pair as usize)
                             .copied()
                             .flatten()
-                            .is_some_and(|pair| pair.owner == listening)
+                            .is_some_and(|pair| pair.owner == PairOwner::Listener(listening))
                     }) && !connection.claimed
                         && connection.tcb.state == state::State::Established
                 });
@@ -2662,6 +2795,30 @@ extern "C" fn tcpd_main(hertz: u64) -> ! {
             } else {
                 reply(tcp::LATER, 0, 0);
             }
+        } else if method_in == tcp::CONNECT
+            && (args[2] == tcp::OPEN_LEG
+                || (arming.open
+                    && arming.badge == badge
+                    && arming.target
+                        == (ArmTarget::Dial {
+                            address: args[0] as u32,
+                            port: args[1] as u16,
+                        })))
+        {
+            // RFC 0090 step 3: a dial of the caller's own, opened with
+            // `OPEN_LEG` as a second listener is. `bin/tcpc`'s first `CONNECT`
+            // never sends that leg and keeps the fixed handover below.
+            let (outcome_word, detail, third) = arm_leg(
+                &mut arming,
+                &mut service,
+                args[2],
+                ArmTarget::Dial {
+                    address: args[0] as u32,
+                    port: args[1] as u16,
+                },
+                badge,
+            );
+            reply(outcome_word, detail, third);
         } else if method_in == tcp::CONNECT {
             let (outcome_word, detail) =
                 connect_leg_serving(&mut connect_handover, &mut service, args);

@@ -22248,6 +22248,7 @@ fn report_net_after_exchange(hhdm: u64) {
     report_tcp_client(hhdm);
     report_tcp_four(hhdm);
     report_tcp_second(hhdm);
+    report_tcp_dial(hhdm);
 
     // RFC 0018 step 7: what the boundary cost, counted rather than argued.
     //
@@ -22363,6 +22364,9 @@ fn start_tcp_client_domain(
         // RFC 0086 step 3a: a second listener's first pair.
         (23usize, "second listener send"),
         (24usize, "second listener receive"),
+        // RFC 0090 step 3: a second dial's rings.
+        (27usize, "second dial send"),
+        (28usize, "second dial receive"),
     ] {
         let ring = shared::create(realm, TCPC_RING_BYTES)
             .map_err(|_| "a tcp client ring would not be created")?;
@@ -22427,13 +22431,13 @@ fn start_tcp_client_domain(
     // more time, which is what an effect looks like.
     match crate::time::now_nanos() {
         Some(nanos) => println!(
-            "    tcp client     bin/tcpc started at {}.{:03} ms: twelve rings and two wakes its domain owns, \
+            "    tcp client     bin/tcpc started at {}.{:03} ms: fourteen rings and two wakes its domain owns, \
              a badged capability to the service, and nothing wired between them by the kernel",
             nanos / 1_000_000,
             nanos % 1_000_000 / 1_000,
         ),
         None => println!(
-            "    tcp client     bin/tcpc started (no clock yet): twelve rings and two wakes its domain owns, \
+            "    tcp client     bin/tcpc started (no clock yet): fourteen rings and two wakes its domain owns, \
              a badged capability to the service, and nothing wired between them by the kernel"
         ),
     }
@@ -22788,6 +22792,54 @@ fn grant_adapter_tcp(adapter: domain::DomainId) -> Result<(), &'static str> {
     Ok(())
 }
 
+/// RFC 0090 step 3: a second dial, opened with `OPEN_LEG` while the client's
+/// first connection was still established, to the same peer from a port of its
+/// own.
+fn report_tcp_dial(hhdm: u64) {
+    use bhaskix_abi::tcp;
+    let Some(base) = tcpc_report_page(hhdm) else {
+        return;
+    };
+    let word = |i: usize| tcpc_report_word(base, i);
+    let (state, result) = (word(tcp::CLIENT_DIAL_STATE), word(tcp::CLIENT_DIAL_RESULT));
+    // No wait: the act runs before the client's first connection is closed,
+    // long before the client's outcome lets this report be printed.
+    if word(0) != TCPC_MARKER || state == 0 {
+        println!("    tcp dial       not attempted: the client did not reach its second dial");
+        return;
+    }
+    if state == tcp::FOUR_READY {
+        println!(
+            "\x1b[91m    tcp dial       FAILED: the act began and has not finished -- see the \
+             client's line\x1b[0m"
+        );
+        return;
+    }
+    if state != tcp::FOUR_DONE {
+        println!(
+            "\x1b[91m    tcp dial       FAILED: state {state}, stopped at step {}\x1b[0m",
+            result >> 56
+        );
+        return;
+    }
+    let port = result & 0xffff;
+    let fixed = u64::from(tcp::FIXED_LOCAL_PORT);
+    let (both, echoed) = (result & (1 << 16) != 0, result & (1 << 17) != 0);
+    // What the step promises, checked here and not taken from the client: a
+    // port of the dynamic range, and not the one the first connection holds.
+    if (49152..=65535).contains(&port) && port != fixed && both && echoed {
+        println!(
+            "    tcp dial       two connections to one peer at once: the second dialled with \
+             OPEN_LEG from local port {port} while the first held {fixed}, and its bytes came back"
+        );
+    } else {
+        println!(
+            "\x1b[91m    tcp dial       FAILED: local port {port} (must be in 49152-65535 and \
+             not {fixed}), both established at once: {both}, echoed: {echoed}\x1b[0m"
+        );
+    }
+}
+
 /// RFC 0086 step 3a: a second listener, opened with `OPEN_LEG` on port 8
 /// while the first holds port 7, and `PEER` naming who connected to it.
 ///
@@ -23051,6 +23103,11 @@ fn report_tcp_client(hhdm: u64) {
         // fact in the bulk phase -- CI run 782. The client now names the phase
         // it waits in and the item it waits for.
         match bhaskix_abi::tcp::waiting_in(detail) {
+            Some((phase, item)) if phase == bhaskix_abi::tcp::PHASE_DIAL => println!(
+                "\x1b[91m    tcp client     FAILED past step {step}: {said} — it is in its \
+                 second-dial act, at the act's step {item}, which gives up within 5 s; this \
+                 report gave up after 15\x1b[0m"
+            ),
             Some((phase, item)) => println!(
                 "\x1b[91m    tcp client     FAILED past step {step}: {said} — it is waiting in \
                  the {} phase for {} {item} to come back, and bin/tcpc waits up to 60 s for \

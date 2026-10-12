@@ -1463,6 +1463,11 @@ pub mod tcp {
     /// chunk count, for the final drain).
     pub const PHASE_BULK: u64 = 7;
 
+    /// The second-dial act (RFC 0090 step 3): item = the act's step. Named so
+    /// a client stuck in the act is not reported as stuck in the bulk drain
+    /// before it, which is what the stale word said on the first armed run.
+    pub const PHASE_DIAL: u64 = 8;
+
     /// `(phase, item)` if `detail` carries [`WAITING_IN`].
     #[must_use]
     pub const fn waiting_in(detail: u64) -> Option<(u64, u64)> {
@@ -1488,6 +1493,10 @@ pub mod tcp {
     /// delivered, send space freed, state changed — so the caller can block
     /// in `WAIT` instead of polling. The badge must be nonzero: a signal
     /// ORs the badge into the word, and zero rings nobody.
+    ///
+    /// Without [`OPEN_LEG`] these legs fill **one fixed handover** for the
+    /// whole machine, dialled from one fixed port; with it they open a
+    /// connection of the caller's own (RFC 0090 step 3) — see there.
     pub const CONNECT: u64 = 58;
 
     /// Listen on a local port. The same three-leg handover as [`CONNECT`],
@@ -1572,6 +1581,16 @@ pub mod tcp {
     /// ring), and leg 2, which answers the listener capability into the slot
     /// the caller declared. A second program listens this way; the fixed
     /// `LISTEN` handover without it is kept for the first.
+    ///
+    /// Since RFC 0090 step 3 it also opens a **dial of the caller's own**:
+    /// `CONNECT` with `arg0`/`arg1` the destination and `arg2` this leg, then
+    /// legs 0 and 1 (the connection's rings), an optional leg 3 (its wake),
+    /// and leg 2, which answers the connection capability into the declared
+    /// slot and **the local port it took in the third word** — drawn from the
+    /// dynamic range, so two dials to one peer are two connections. Leg 2 may
+    /// answer [`NO_ENTROPY`] (no unpredictable port) or [`CONGESTED`] with
+    /// detail 2 (no port of the range is free for that peer). IPv4 only so
+    /// far: `CONNECT6` keeps the fixed handover.
     pub const OPEN_LEG: u64 = 9;
 
     /// On a connection: who is at the other end — RFC 0086 step 3a. The
@@ -1589,6 +1608,21 @@ pub mod tcp {
     /// connection was not closed. Zero on every boot, or the third word is
     /// lying about connections that live.
     pub const CLIENT_LIVE_ENDINGS: usize = 15;
+
+    /// The local port of the service's one **fixed** `CONNECT` handover. A
+    /// dial opened with [`OPEN_LEG`] never takes it (RFC 0090 step 3): here
+    /// rather than in the service, because the kernel checks that promise.
+    pub const FIXED_LOCAL_PORT: u16 = 49999;
+
+    /// `bin/tcpc`'s second-dial act — RFC 0090 step 3: one of the `FOUR_*`
+    /// states, for a connection it dials with [`OPEN_LEG`] while its first
+    /// still holds the fixed handover's.
+    pub const CLIENT_DIAL_STATE: usize = 16;
+    /// The act's result: bits 0–15 the local port the dial took, bit 16 set
+    /// when both connections were established at once, bit 17 when the
+    /// dial's bytes came back; on failure, bits 56 and up the step it stopped
+    /// at.
+    pub const CLIENT_DIAL_RESULT: usize = 17;
 
     /// `bin/tcpc`'s report word saying where its four-at-once act is —
     /// RFC 0086 step 2: one of the `FOUR_*` states below. Here rather than
