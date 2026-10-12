@@ -2279,6 +2279,28 @@ fn note_thread_answer(number: u64, value: u64) {
     LAST_TID[slot].store(u64::from(thread), Ordering::Release);
 }
 
+/// The last `PEEK_INPUT` asked: the domain it named in the low 32 bits, plus
+/// one in bit 32 when it was answered and not refused; `u64::MAX` before any.
+/// For `linux poll`'s failure report (2026-10-12): its one sighting had
+/// `ppoll` behave as if the probe's domain held the input grant when nothing
+/// had granted it, and this says what the nucleus answered.
+static LAST_PEEK: AtomicU64 = AtomicU64::new(u64::MAX);
+
+fn note_peek(domain: u32, answered: bool) {
+    LAST_PEEK.store(
+        u64::from(domain) | (u64::from(answered) << 32),
+        Ordering::Relaxed,
+    );
+}
+
+/// The last `PEEK_INPUT`: the domain it named, and whether it was answered
+/// rather than refused. `None` before any.
+#[must_use]
+pub fn last_peek() -> Option<(u32, bool)> {
+    let value = LAST_PEEK.load(Ordering::Relaxed);
+    (value != u64::MAX).then_some((value as u32, value & (1 << 32) != 0))
+}
+
 /// The last foreign answer `thread` was given, if the table still holds it:
 /// `(syscall number, value that went to rax)`.
 #[must_use]
@@ -3880,6 +3902,9 @@ fn domain_supervise(frame: &SyscallFrame) -> Option<Outcome> {
             return Some(Outcome::err(Status::InsufficientRights));
         }
         if !domain::may_read_input(target.as_u32()) {
+            if frame.method == method::PEEK_INPUT {
+                note_peek(target.as_u32(), false);
+            }
             // Not "no byte" but "not yours": a caller told the console was
             // merely empty would ask again for ever.
             return Some(Outcome::err(Status::InsufficientRights));
@@ -3888,6 +3913,7 @@ fn domain_supervise(frame: &SyscallFrame) -> Option<Outcome> {
         // that a byte is waiting and leave it waiting; built on `POLL_INPUT` it
         // would eat a keystroke every time a program asked about one.
         if frame.method == method::PEEK_INPUT {
+            note_peek(target.as_u32(), true);
             return Some(Outcome::ok(u64::from(crate::input::peek_or_service())));
         }
         return Some(if frame.method == method::POLL_INPUT {

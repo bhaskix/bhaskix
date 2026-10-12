@@ -636,6 +636,13 @@ pub fn may_read_input(domain: u32) -> bool {
     INPUT_GRANTED_TO.load(core::sync::atomic::Ordering::Acquire) == domain
 }
 
+/// The domain holding the input grant, or `u32::MAX` for nobody -- for a
+/// failure report to say who held it (2026-10-12).
+#[must_use]
+pub fn input_holder() -> u32 {
+    INPUT_GRANTED_TO.load(core::sync::atomic::Ordering::Acquire)
+}
+
 /// Takes the grant back, if `domain` holds it.
 ///
 /// Called when a domain ends, so the keyboard is not held by something that is

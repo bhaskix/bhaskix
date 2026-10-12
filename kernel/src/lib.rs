@@ -6936,6 +6936,10 @@ fn poll_self_test(hhdm_base: u64, cpus: u32) -> bool {
         },
         20_000,
     );
+    // Read before the domain ends -- ending it releases any grant it holds,
+    // which would take the evidence with it (2026-10-12).
+    let holder = domain::input_holder();
+    let peek = syscall::last_peek();
     domain::end(realm, domain::Ending::Killed);
 
     let [ppolled, revents, selected, set, bad] = answers;
@@ -6951,6 +6955,24 @@ fn poll_self_test(hhdm_base: u64, cpus: u32) -> bool {
             "\x1b[91m    linux poll     FAILED: finished {done}, ppoll {ppolled} revents \
              {revents:#x}, select {selected} set {set:#x}, bad descriptor {}\x1b[0m",
             bad as i64
+        );
+        // Who the nucleus thought could read the console. The probe's domain
+        // is granted none, so `ppoll` must see `POLLERR`; a not-ready answer
+        // means it was told otherwise (see `syscall::last_peek`).
+        println!(
+            "\x1b[91m                   the probe was domain {}; the input grant was held by {}; \
+             the last PEEK_INPUT {}\x1b[0m",
+            realm.as_u32(),
+            if holder == u32::MAX {
+                alloc::string::String::from("nobody")
+            } else {
+                alloc::format!("domain {holder}")
+            },
+            match peek {
+                Some((domain, true)) => alloc::format!("named domain {domain} and was answered"),
+                Some((domain, false)) => alloc::format!("named domain {domain} and was refused"),
+                None => alloc::string::String::from("was never asked"),
+            }
         );
     }
     ok
