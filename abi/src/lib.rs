@@ -287,9 +287,15 @@ pub mod adapter {
     /// kernel method for making memory (2026-09-30). Pair `n` is rings
     /// `2n` (send) and `2n + 1` (receive).
     pub const TCP_RINGS: usize = TCP_WAKE + 1;
-    /// Seventeen pairs: sixteen connections for RFC 0086's sixteen clients,
-    /// and a listener's first pair.
-    pub const TCP_RING_COUNT: usize = 34;
+    /// ~~Seventeen pairs: sixteen connections for RFC 0086's sixteen clients,
+    /// and a listener's first pair.~~ **Twenty-one since RFC 0090 step 5**
+    /// (2026-10-13, the project lead's sizing): seventeen a listener may arm —
+    /// RFC 0086's sixteen clients and a listener's first pair, unchanged — and
+    /// [`TCP_DIAL_RESERVE`] that no listener may take, kept for dialling out.
+    pub const TCP_RING_COUNT: usize = 42;
+    /// Pairs of the pool no listener may arm — RFC 0090 part 6's reserve, so the
+    /// first server that listens does not leave a program nothing to dial with.
+    pub const TCP_DIAL_RESERVE: usize = 4;
     /// Where a hosted listener's capability lands, one slot each.
     pub const TCP_LISTENERS: usize = TCP_RINGS + TCP_RING_COUNT;
     /// How many hosted listeners at once — `bin/tcpd`'s own limit is four and
@@ -297,8 +303,9 @@ pub mod adapter {
     pub const TCP_LISTENER_COUNT: usize = 3;
     /// Where an accepted connection's capability lands, one slot each.
     pub const TCP_CONNECTIONS: usize = TCP_LISTENERS + TCP_LISTENER_COUNT;
-    /// How many hosted TCP connections at once.
-    pub const TCP_CONNECTION_COUNT: usize = 16;
+    /// How many hosted TCP connections at once: ~~16~~ 20 since RFC 0090 step
+    /// 5, so the dial reserve has room beside a listener's sixteen.
+    pub const TCP_CONNECTION_COUNT: usize = 20;
     /// The badge on [`TCP_SERVICE`]: this adapter's own on `bin/tcpd`'s
     /// endpoint, distinct from `bin/tcpc`'s, since the service gives an open
     /// handover to the caller whose badge opened it.
@@ -1606,6 +1613,18 @@ pub mod tcp {
     /// peer the service can have (RFC 0029). A hosted `accept4` and
     /// `getpeername` need it, and until this the service told no one.
     pub const PEER: u64 = 71;
+
+    /// On a connection: **the holder is done with it** — RFC 0090 step 5.
+    ///
+    /// A connection dialled with [`OPEN_LEG`] is retired once it is released
+    /// and has reached `CLOSED` or `TIME_WAIT`: the service revokes its own
+    /// copies of the rings and wake it was given — which takes their mappings
+    /// out of its space and leaves the giver's untouched — and its window and
+    /// slots are free for the next dial. Until then the connection answers as
+    /// before, so a holder that releases can still learn why it ended; after,
+    /// it answers [`GONE`], which is how the holder knows its rings are its own
+    /// again. Gifts to a dial carry `REVOKE` for this reason.
+    pub const RELEASE: u64 = 72;
 
     /// `bin/tcpc`'s report word holding the ending [`RECV`] told it, when its
     /// outbound connection ended other than in order — one of [`ended`]

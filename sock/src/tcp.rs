@@ -75,6 +75,25 @@ pub fn leg_words(
     gift: Option<(u64, u64)>,
     leg_number: u64,
 ) -> Result<(u64, u64), LegError> {
+    staged_leg(
+        service_slot,
+        verb,
+        [a0, a1, leg_number],
+        gift,
+        rights::READ | rights::WRITE,
+    )
+}
+
+/// One leg, its gift staged with `gift_rights` — `READ | WRITE` for every
+/// handover, and `REVOKE` beside them for a dial's (RFC 0090 step 5), so the
+/// service can take its own copy back out of its space once the dial is done.
+fn staged_leg(
+    service_slot: u64,
+    verb: u64,
+    [a0, a1, leg_number]: [u64; 3],
+    gift: Option<(u64, u64)>,
+    gift_rights: u64,
+) -> Result<(u64, u64), LegError> {
     for _ in 0..50_000u32 {
         if let Some((slot, badge)) = gift {
             // The badge travels with the gift, and for the wakes it must:
@@ -88,12 +107,7 @@ pub fn leg_words(
                 syscall::INVOKE,
                 service_slot,
                 method::HAND,
-                [
-                    slot,
-                    rights::READ | rights::WRITE,
-                    badge,
-                    method::HAND_STAGE,
-                ],
+                [slot, gift_rights, badge, method::HAND_STAGE],
             );
             if !staged.kernel_ok() {
                 return Err(LegError::HandRefused(staged.status));
@@ -465,36 +479,46 @@ pub fn connect(
     landing_slot: u64,
 ) -> Result<(u64, u16), LegError> {
     let (address, port) = (u64::from(address), u64::from(port));
-    leg(
-        service_slot,
-        tcp::CONNECT,
-        address,
-        port,
-        None,
-        tcp::OPEN_LEG,
-    )?;
-    leg(
-        service_slot,
-        tcp::CONNECT,
-        address,
-        port,
-        Some((rings.0, 0)),
-        0,
-    )?;
-    leg(
-        service_slot,
-        tcp::CONNECT,
-        address,
-        port,
-        Some((rings.1, 0)),
-        1,
-    )?;
+    // `REVOKE` with each gift: the service gives its copies back by revoking
+    // them when the dial is released (RFC 0090 step 5) — the giver's own are
+    // untouched, since revocation goes down the tree.
+    let dial_leg = |gift: Option<(u64, u64)>, number: u64| {
+        staged_leg(
+            service_slot,
+            tcp::CONNECT,
+            [address, port, number],
+            gift,
+            rights::READ | rights::WRITE | rights::REVOKE,
+        )
+    };
+    dial_leg(None, tcp::OPEN_LEG)?;
+    dial_leg(Some((rings.0, 0)), 0)?;
+    dial_leg(Some((rings.1, 0)), 1)?;
     if let Some(wake) = wake {
-        leg(service_slot, tcp::CONNECT, address, port, Some(wake), 3)?;
+        dial_leg(Some(wake), 3)?;
     }
     expect(service_slot, landing_slot).map_err(LegError::HandRefused)?;
-    leg_words(service_slot, tcp::CONNECT, address, port, None, 2)
-        .map(|(handle, local_port)| (handle, local_port as u16))
+    dial_leg(None, 2).map(|(handle, local_port)| (handle, local_port as u16))
+}
+
+/// Tells the service the holder is done with a dialled connection — RFC 0090
+/// step 5. It is retired once it has closed: its rings and wake leave the
+/// service's space, and the connection answers `GONE` from then on, which is
+/// when the rings are the caller's own to give again.
+///
+/// # Errors
+///
+/// The service's word, or the kernel's status, if the call was refused.
+pub fn release(connection_slot: u64) -> Result<(), u64> {
+    let reply = call(syscall::CALL, connection_slot, tcp::RELEASE, [0; 4]);
+    if !reply.kernel_ok() {
+        return Err(reply.status);
+    }
+    if reply.value == tcp::OK {
+        Ok(())
+    } else {
+        Err(reply.value)
+    }
 }
 
 /// Who is at the other end of a connection — RFC 0086 step 3a.

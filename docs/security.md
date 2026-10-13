@@ -222,7 +222,8 @@ We will not pretend to cover these. Each has a note on whether it becomes in-sco
 > between mutually distrusting processes is a real weakness and not a simplification.
 >
 > **2026-09-30, [RFC 0086](rfc/0086-the-motivating-workload.md) step 3b: the adapter now holds TCP.**
-> `bin/tcpd`'s endpoint under the adapter's own badge, seventeen ring pairs it owns, and the wake
+> `bin/tcpd`'s endpoint under the adapter's own badge, seventeen ring pairs it owns (twenty-one
+> since RFC 0090 step 5, 2026-10-13, four of them kept for dialling), and the wake
 > `tcpd` rings for news — so a compromised adapter reads and writes **every hosted TCP stream**, as
 > it already reads every hosted file and datagram. It gains nothing against `bin/tcpd` itself: the
 > service still takes only rings a caller gifts and answers only the capabilities it minted, and a

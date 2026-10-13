@@ -1256,9 +1256,12 @@ fn dial_beside(pair: (RingView, RingView), detail_before: u64, pace: &Pace) {
     if (0..length).any(|offset| recv.read(offset) != DIAL_PAYLOAD[offset as usize]) {
         return failed(7);
     }
-    // Consumed, so the window reopens -- and closed, so its `cat` ends.
+    // Consumed, so the window reopens -- and closed, so its `cat` ends -- and
+    // released, so the service retires it once it has closed and gives its
+    // window back (RFC 0090 step 5).
     let _ = poll(DIAL_CONNECTION, length);
     let _ = tcp::shutdown(DIAL_CONNECTION);
+    let _ = tcp::release(DIAL_CONNECTION);
     report_word(
         abi_tcp::CLIENT_DIAL_RESULT,
         u64::from(local_port) | (u64::from(both) << 16) | (1 << 17),

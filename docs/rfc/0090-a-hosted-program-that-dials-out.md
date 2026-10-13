@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Draft 2026-10-08. Written before any of it, as RFC 0086 was. **Steps 0–3 done 2026-10-12, step 4 on 2026-10-13 with part 7's grant built inside it** (the lead's choice) — slirp's refusal confirmed on both emulators; `RECV`'s third word now says why a connection ended, and a refused dial is told to the caller that made it |
+| **Status** | Draft 2026-10-08. Written before any of it, as RFC 0086 was. **Steps 0–3 done 2026-10-12, steps 4 and 5 on 2026-10-13, part 7's grant built inside step 4** (the lead's choice) — slirp's refusal confirmed on both emulators; `RECV`'s third word now says why a connection ended, and a refused dial is told to the caller that made it |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | net / userspace |
 | **Milestone** | L1 ([roadmap.md](../roadmap.md)) — the row carried out of RFC 0005 step 9, "`connect` — a hosted TCP **client**" |
@@ -159,6 +159,16 @@ with, and the first client that dials in a loop runs out:
   the fixed outbound rings are never detached. An `OPEN_LEG` connection is retired at `CLOSED` or
   `TIME_WAIT` like an accepted one, and its rings detached before the slot is reused — otherwise
   linuxd's next gift of the same pair lands on rings tcpd still writes.
+- **How it was built, step 5 (2026-10-13).** No call detaches a mapping from one's own space, and
+  `DELETE` only empties a slot: the mapping stays, a capability node leaks machine-wide per cycle,
+  and a ring object holds only eight mappings. What does take a gift back out is **`REVOKE` on the
+  service's own copy** — it removes the region, the page entries and the node and returns the
+  quota, and leaves the giver's copy and mapping alone, revocation going down the tree. So a dial's
+  gifts carry `REVOKE` (`sock::tcp::connect`), and **a holder says when it is done**: `tcp::RELEASE`
+  (72). tcpd retires a released dial once it is `CLOSED` or `TIME_WAIT` — not on its own initiative,
+  which would have answered `GONE` to a holder that had not yet read *refused* — revokes the three
+  gifts and frees the window. linuxd keeps a closed dial's capability until it answers `GONE`, then
+  returns the pair. `dial()`'s own refusals give their window back the same way.
 
 Accepted connections are unchanged: their pairs return to their listener, as `ARM_PAIR` defines.
 
@@ -271,8 +281,11 @@ Nothing on the server path changes, and the HTTP gate's numbers are the check.
    reaches; a per-domain grant linuxd checks; a grant enforced below linuxd), the second, with the
    third left open for its own RFC. **Still open**: whether a grant ever names destinations rather
    than all-or-none — a question for the first program that needs it.
-2. **`DIAL_RESERVE`**: four of seventeen pairs is this draft's number. The pool's size is its own
-   question.
+2. ~~**`DIAL_RESERVE`**: four of seventeen pairs is this draft's number. The pool's size is its own
+   question.~~ **Decided by the project lead, 2026-10-13**: the pool grows to **21 pairs** and the
+   reserve is **4**, so listeners still stop at 17 — the HTTP lane's sixteen clients and a spare,
+   unchanged — and linuxd's connection table grows from 16 to 20. Four of seventeen would have
+   failed the HTTP lane.
 3. **How long a blocking `connect` waits** is how long tcpd retransmits a `SYN` — eight
    retransmissions with backoff (`MAX_RETRANSMITS`). Linux's default is about two minutes (recalled,
    not measured here). This RFC reports what tcpd decides rather than adding a
@@ -352,7 +365,16 @@ Nothing on the server path changes, and the HTTP gate's numbers are the check.
    dials; a socket bound first `EOPNOTSUPP`, since tcpd draws the local port. **The grant does not
    follow a process across `fork` or `execve`**, which move it into domains linuxd makes: that
    fails closed and is step 7's, with `bin/sup` and the manifest line.
-5. **Pairs for dialling, and back** (part 6). Gate: sixty-four dials.
+5. **Pairs for dialling, and back** (part 6). Gate: sixty-four dials. **Done 2026-10-13**, by
+   `RELEASE` and tcpd revoking its own copies (part 6 says why not detach). The probe now dials 64
+   times in a row on the `iommu` lane, more than the 21-pair pool holds, and the kernel's line reads
+   `… 64 times in a row, more than the pool holds, its 16 bytes back each time`. Three arms, each red
+   where it should be: linuxd never reaping stopped at 19 of 64 with `EAGAIN` — the pool less the two
+   listeners; tcpd never giving a window back stopped at 9, its capability quota spent; tcpd
+   ignoring `RELEASE` stopped at 18. **And one thing the arms found in the test itself**: the probe
+   exited the moment it wrote its last word, so its domain could end and its page be reused before
+   the kernel read it — the first no-reap run reported `socket 1, connect 1`, which no call had
+   answered. The probe now idles once finished and the kernel ends it after reading.
 6. **Blocking `connect`, and the refused dial**: `ECONNREFUSED` through `SO_ERROR`, and through a
    blocking call's own answer.
 7. **The grant** (part 7): ~~the per-domain flag, set by the corpus and by `bin/sup`, a manifest line,

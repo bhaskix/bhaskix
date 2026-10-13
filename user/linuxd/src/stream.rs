@@ -131,6 +131,13 @@ struct Connection {
     /// answers `0`, and every one after it `EISCONN` — Linux's socket stays
     /// connecting until a `connect` sees it open, while its data already flows.
     owed_zero: bool,
+    /// Dialled by this program, so its pair is its own to give back — RFC 0090
+    /// step 5. An accepted connection's pair is its listener's.
+    dialled: bool,
+    /// Closed and released, its capability kept until `bin/tcpd` retires it:
+    /// its connection answering `GONE` is how this program knows the service's
+    /// copies of the rings are gone and the pair can be given again.
+    closing: bool,
 }
 
 struct Tcp {
@@ -141,8 +148,16 @@ struct Tcp {
     streams: [Option<Stream>; MAX_STREAMS],
     listeners: [bool; adapter::TCP_LISTENER_COUNT],
     connections: [Option<Connection>; adapter::TCP_CONNECTION_COUNT],
-    /// Pool pairs given to a listener so far; they are never given back.
+    /// Pool pairs ever handed out, from the bottom of the pool; ~~they are never
+    /// given back~~ a listener's still are not, and a dial's come back into
+    /// [`Tcp::returned`] (RFC 0090 step 5).
     pool_used: usize,
+    /// Pool pairs dials have given back, one bit each, handed out again before
+    /// a fresh one.
+    returned: u32,
+    /// Pairs listeners hold, which stop at the pool less
+    /// [`adapter::TCP_DIAL_RESERVE`].
+    listener_pairs: usize,
     /// `tcpd`'s pair number → the adapter's pool pair, plus one (0: unknown).
     pool_of: [u8; 64],
     /// Connections each listener has been given, ever: the news an
@@ -159,6 +174,8 @@ static mut TCP: Tcp = Tcp {
     listeners: [false; adapter::TCP_LISTENER_COUNT],
     connections: [None; adapter::TCP_CONNECTION_COUNT],
     pool_used: 0,
+    returned: 0,
+    listener_pairs: 0,
     pool_of: [0; 64],
     births: [0; adapter::TCP_LISTENER_COUNT],
     taken: 0,
@@ -312,14 +329,14 @@ pub(crate) fn listen(request: &PersonalityCall) -> Answer {
         State::Listening { .. } => return Answer::ok(0),
         _ => return Answer::error(errno::EINVAL),
     };
+    reap();
     let table = tcp();
     let Some(listener) = table.listeners.iter().position(|used| !used) else {
         return Answer::error(errno::ENFILE);
     };
-    if table.pool_used >= PAIRS {
+    let Some(first) = take_pair(true) else {
         return Answer::error(-105); // ENOBUFS
-    }
-    let first = table.pool_used;
+    };
     let opened = tcp::listen_open(
         adapter::TCP_SERVICE as u64,
         port,
@@ -334,11 +351,14 @@ pub(crate) fn listen(request: &PersonalityCall) -> Answer {
         Ok(opened) => opened,
         // The port is held by somebody else's listener.
         Err(tcp::LegError::Refused { value, .. }) if value == bhaskix_abi::tcp::REFUSED => {
+            untake_pair(first, true);
             return Answer::error(errno::EADDRINUSE);
         }
-        Err(_) => return Answer::error(errno::EIO),
+        Err(_) => {
+            untake_pair(first, true);
+            return Answer::error(errno::EIO);
+        }
     };
-    table.pool_used += 1;
     if let Some(slot) = table.pool_of.get_mut(pair as usize) {
         *slot = first as u8 + 1;
     }
@@ -348,18 +368,17 @@ pub(crate) fn listen(request: &PersonalityCall) -> Answer {
     // listener's first pair alone.
     let backlog = (request.second() as i32).max(1) as usize;
     for _ in 1..backlog {
-        if table.pool_used >= PAIRS {
+        let Some(next) = take_pair(true) else {
             break;
-        }
-        let next = table.pool_used;
+        };
         let Ok(pair) = tcp::arm_pair(
             (adapter::TCP_LISTENERS + listener) as u64,
             (adapter::TCP_RINGS + 2 * next) as u64,
             (adapter::TCP_RINGS + 2 * next + 1) as u64,
         ) else {
+            untake_pair(next, true);
             break;
         };
-        table.pool_used += 1;
         if let Some(slot) = table.pool_of.get_mut(pair as usize) {
             *slot = next as u8 + 1;
         }
@@ -439,6 +458,7 @@ fn wait_and_retry(request: &PersonalityCall) -> (u64, Answer) {
 /// A full table takes nothing: the connection waits in `tcpd`, which is where
 /// Linux's backlog would hold it too.
 fn take_one(listener: usize, port: u16) -> Result<bool, i64> {
+    reap();
     let table = tcp();
     let Some(connection) = table.connections.iter().position(Option::is_none) else {
         return Ok(false);
@@ -478,6 +498,8 @@ fn take_one(listener: usize, port: u16) -> Result<bool, i64> {
         failed: false,
         pending: 0,
         owed_zero: false,
+        dialled: false,
+        closing: false,
     });
     table.births[listener] += 1;
     Ok(true)
@@ -507,12 +529,81 @@ fn waiting(listener: usize) -> usize {
         .count()
 }
 
-/// Shuts a connection and gives its capability back.
+/// Shuts a connection and gives its capability back — or, for a dial, tells
+/// `bin/tcpd` this program is done with it and keeps the capability until the
+/// service has retired it (RFC 0090 step 5); [`reap`] finishes the job.
 fn drop_connection(connection: usize) {
     let slot = (adapter::TCP_CONNECTIONS + connection) as u64;
     let _ = tcp::shutdown(slot);
+    if let Some(mut held) = tcp().connections[connection]
+        && held.dialled
+    {
+        let _ = tcp::release(slot);
+        held.closing = true;
+        tcp().connections[connection] = Some(held);
+        return;
+    }
     let _ = super::call(syscall::INVOKE, slot, method::DELETE, [0; 4]);
     tcp().connections[connection] = None;
+}
+
+/// Gives back what `bin/tcpd` has finished with — RFC 0090 step 5. A closed
+/// dial whose connection answers `GONE` has been retired: the service has
+/// revoked its copies of the rings, so the pair is this program's to give
+/// again, and the capability and the slot can go.
+fn reap() {
+    let table = tcp();
+    for index in 0..table.connections.len() {
+        let Some(held) = table.connections[index] else {
+            continue;
+        };
+        if !held.closing {
+            continue;
+        }
+        let slot = (adapter::TCP_CONNECTIONS + index) as u64;
+        if matches!(
+            tcp::recv(slot, 0),
+            StreamPoll::ServiceSaid(bhaskix_abi::tcp::GONE)
+        ) {
+            let _ = super::call(syscall::INVOKE, slot, method::DELETE, [0; 4]);
+            table.connections[index] = None;
+            table.returned |= 1 << held.pool;
+        }
+    }
+}
+
+/// A pair of the pool to give `bin/tcpd`, or `None` — RFC 0090 part 6's two
+/// rules: a listener stops at the pool less the dial reserve, and a pair a
+/// dial gave back is handed out again before a fresh one.
+fn take_pair(for_listener: bool) -> Option<usize> {
+    let table = tcp();
+    if for_listener && table.listener_pairs >= PAIRS - adapter::TCP_DIAL_RESERVE {
+        return None;
+    }
+    let pair = if table.returned != 0 {
+        let pair = table.returned.trailing_zeros() as usize;
+        table.returned &= !(1 << pair);
+        pair
+    } else if table.pool_used < PAIRS {
+        table.pool_used += 1;
+        table.pool_used - 1
+    } else {
+        return None;
+    };
+    if for_listener {
+        table.listener_pairs += 1;
+    }
+    Some(pair)
+}
+
+/// Puts back a pair taken and never given to `bin/tcpd` — refused before any
+/// ring moved, or by the service after it gave back whatever it took.
+fn untake_pair(pair: usize, for_listener: bool) {
+    let table = tcp();
+    table.returned |= 1 << pair;
+    if for_listener {
+        table.listener_pairs -= 1;
+    }
 }
 
 /// `accept4(fd, addr, addrlen, flags)` and `accept` (flags 0).
@@ -823,17 +914,13 @@ fn start_dial(index: usize, destination: u32, port: u16) -> Answer {
     if stream.state != State::Fresh {
         return Answer::error(errno::EOPNOTSUPP);
     }
-    if table.pool_used >= PAIRS {
-        return Answer::error(errno::EAGAIN);
-    }
+    reap();
     let Some(slot) = table.connections.iter().position(Option::is_none) else {
         return Answer::error(errno::EAGAIN);
     };
-    // Counted whatever the answer: the rings are gifted by the first legs, so
-    // a dial refused at the last is a pair spent all the same. Pairs come back
-    // at RFC 0090 step 5.
-    let pair = table.pool_used;
-    table.pool_used += 1;
+    let Some(pair) = take_pair(false) else {
+        return Answer::error(errno::EAGAIN);
+    };
     let opened = tcp::connect(
         adapter::TCP_SERVICE as u64,
         destination,
@@ -862,6 +949,8 @@ fn start_dial(index: usize, destination: u32, port: u16) -> Answer {
                 failed: false,
                 pending: 0,
                 owed_zero: false,
+                dialled: true,
+                closing: false,
             });
             stream.state = State::Connecting { connection: slot };
             table.streams[index] = Some(stream);
@@ -869,6 +958,13 @@ fn start_dial(index: usize, destination: u32, port: u16) -> Answer {
         }
         Err(tcp::LegError::Refused { value, detail, .. }) => {
             use bhaskix_abi::tcp::{CONGESTED, NO_ENTROPY};
+            // These two the service answers before any ring has moved, or
+            // after giving back whatever had: the pair is still this
+            // program's. Any other refusal may leave a gift in the service,
+            // so that pair stays spent.
+            if matches!(value, CONGESTED | NO_ENTROPY) {
+                untake_pair(pair, false);
+            }
             Answer::error(match (value, detail) {
                 (CONGESTED, 2) => errno::EADDRNOTAVAIL,
                 (CONGESTED | NO_ENTROPY, _) => errno::EAGAIN,

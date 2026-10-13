@@ -2982,8 +2982,8 @@ rm -f "$HOSTED_VERDICT" 2>/dev/null || true
 # The kernel runs one probe twice -- ungranted, `connect` must answer EACCES;
 # granted, a non-blocking dial to the echo peer, POLLOUT, SO_ERROR 0, and its
 # bytes back -- and prints one line. Demanded on the lane that runs it.
-if grep -qE "linux dial +a hosted program not granted the network was refused \(EACCES\); granted, it dialled 10\.0\.2\.100:9 -- EINPROGRESS, POLLOUT, SO_ERROR 0 -- and its 16 bytes came back" "$LOG"; then
-    pass "a hosted program dialled out because it was granted to, and one that was not was refused (RFC 0090 step 4)"
+if grep -qE "linux dial +a hosted program not granted the network was refused \(EACCES\); granted, it dialled 10\.0\.2\.100:9 -- EINPROGRESS, POLLOUT, SO_ERROR 0 -- 64 times in a row, more than the pool holds, its 16 bytes back each time" "$LOG"; then
+    pass "a hosted program dialled out because it was granted to, 64 times, more than the pool holds, and one that was not was refused (RFC 0090 steps 4 and 5)"
 elif grep -qE "linux dial +FAILED" "$LOG"; then
     fail "a hosted dial: $(grep -aoE 'linux dial +FAILED.*' "$LOG" | head -1 | sed 's/\x1b\[[0-9;]*m//g')"
     status=1

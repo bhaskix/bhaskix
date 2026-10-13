@@ -562,6 +562,10 @@ struct Connection {
     /// step 1). Kept until the entry is retired, so a holder still reaching a
     /// closed connection by its badge is told why rather than only that.
     ended: Option<state::Ended>,
+    /// Its holder is done with it — RFC 0090 step 5's `RELEASE`. A dial is
+    /// retired once released and finished, and not before: retired early, a
+    /// refused dial would answer `GONE` before its holder learned *refused*.
+    released: bool,
 }
 
 /// Where one of a listener's ring pairs is mapped, and whose it is.
@@ -926,11 +930,81 @@ fn drive_at(service: &mut Service, index: usize, event: Event<'_>) {
     // Dropped rather than parked: no capability was ever handed out naming
     // this slot, so nothing can be holding one.
     let dropped = accepted && !connection.claimed && connection.tcb.state == state::State::Closed;
+    // RFC 0090 step 5: a dial its holder has released, now finished.
+    let finished_dial =
+        connection.released && finished(&connection) && dial_window(service, &connection).is_some();
     // Put back first, then retired if it is done: `retire` removes through the
     // table, which is what moves the generation on.
-    if service.connections.give_back(index, connection).is_ok() && dropped {
-        retire(service, index);
+    if service.connections.give_back(index, connection).is_ok() {
+        if dropped {
+            retire(service, index);
+        } else if finished_dial {
+            retire_dial(service, index);
+        }
     }
+}
+
+/// Whether a connection has nothing left to say: `CLOSED`, or sitting out
+/// `TIME_WAIT`.
+fn finished(connection: &Connection) -> bool {
+    matches!(
+        connection.tcb.state,
+        state::State::Closed | state::State::TimeWait
+    )
+}
+
+/// The pair window a dialled connection lives in, read from where its send
+/// ring is mapped — RFC 0090 step 5. `None` for anything not dialled: the
+/// fixed handover's connection is mapped elsewhere, and an accepted one names
+/// its pair.
+fn dial_window(service: &Service, connection: &Connection) -> Option<u32> {
+    if connection.pair.is_some() || connection.sendr_at < PAIR_AT_BASE {
+        return None;
+    }
+    let offset = connection.sendr_at - PAIR_AT_BASE;
+    let pair = offset / PAIR_STRIDE + 1;
+    (offset.is_multiple_of(PAIR_STRIDE)
+        && service
+            .pairs
+            .get(pair as usize)
+            .copied()
+            .flatten()
+            .is_some_and(|held| held.owner == PairOwner::Dial))
+    .then_some(pair as u32)
+}
+
+/// Retires a dial its holder released — RFC 0090 step 5. The entry goes as
+/// [`retire`] takes it, so its badge answers `GONE`; then the window it lived
+/// in is given back.
+fn retire_dial(service: &mut Service, index: usize) {
+    let window = service
+        .connections
+        .get(index)
+        .and_then(|connection| dial_window(service, connection));
+    retire(service, index);
+    if let Some(pair) = window {
+        give_window_back(service, pair);
+    }
+}
+
+/// Gives a dial's window back: **revokes this service's copies** of the rings
+/// and the wake it was given, which takes their mappings out of this space —
+/// the giver's copies, and its own mappings, are untouched, because
+/// revocation goes down the tree — and frees the window and its slots for the
+/// next dial. Without it a dialled window was this service's for good, and a
+/// program dialling in a loop ran the service out of capabilities in about
+/// twenty dials.
+fn give_window_back(service: &mut Service, pair: u32) {
+    for slot in [
+        Arming::place(pair, 0).0,
+        Arming::place(pair, 1).0,
+        Arming::wake_slot(pair),
+    ] {
+        // An empty slot — a dial that sent no wake — is refused, and that
+        // refusal says nothing that needs saying.
+        let _ = call(syscall::INVOKE, slot, method::REVOKE, [0; 4]);
+    }
+    service.pairs[pair as usize] = None;
 }
 
 /// Takes the connection in `index` out of the table for good: its generation
@@ -1482,6 +1556,7 @@ fn accept_cookie(
     let born = service.connections.insert(Connection {
         claimed: false,
         ended: None,
+        released: false,
         tcb: Tcb::from_cookie(
             connection,
             accepted.sequence,
@@ -1871,6 +1946,7 @@ fn connect_serving(
         let Ok(Handle { index, generation }) = service.connections.insert(Connection {
             claimed: true,
             ended: None,
+            released: false,
             tcb: Tcb::new(connection),
             deadlines: Deadlines::new(),
             sendr_at: handover.at.0,
@@ -1966,6 +2042,7 @@ fn dial(
     });
     let Some(start) = bhaskix_rand::u64() else {
         // RFC 0021's policy, as everywhere here: no unpredictable port, no dial.
+        give_window_back(service, pair);
         return (tcp::NO_ENTROPY, 0, 0);
     };
     let local = Address::V4(service.me);
@@ -1979,12 +2056,14 @@ fn dial(
                 .is_some()
     }) else {
         // Every port of the range already carries this tuple.
+        give_window_back(service, pair);
         return (tcp::CONGESTED, 2, 0);
     };
     let iss = isn::initial_sequence(&service.key, connection, now_nanos(service.hertz));
     let Ok(Handle { index, generation }) = service.connections.insert(Connection {
         claimed: true,
         ended: None,
+        released: false,
         tcb: Tcb::new(connection),
         deadlines: Deadlines::new(),
         sendr_at,
@@ -1995,6 +2074,7 @@ fn dial(
         wake_owed: false,
         pair: None,
     }) else {
+        give_window_back(service, pair);
         return (tcp::CONGESTED, 0, 0);
     };
     let index = index as usize;
@@ -2011,7 +2091,7 @@ fn dial(
         [ENDPOINT, rights::READ | rights::WRITE, handle, 0],
     );
     if handed.0 != status::OK {
-        retire(service, index);
+        retire_dial(service, index);
         return (tcp::BARE, 0x20 | handed.0, 0);
     }
     drive_at(
@@ -2727,6 +2807,20 @@ extern "C" fn tcpd_main(hertz: u64) -> ! {
                     arm_nearest(&service);
                     reply(tcp::OK, 0, 0);
                 }
+                // RFC 0090 step 5: the holder is done. A dial is retired now
+                // if it has finished, and otherwise when it does.
+                tcp::RELEASE => {
+                    if let Some(held) = service.connections.get_mut(index) {
+                        held.released = true;
+                    }
+                    let done = service.connections.get(index).is_some_and(|held| {
+                        finished(held) && dial_window(&service, held).is_some()
+                    });
+                    if done {
+                        retire_dial(&mut service, index);
+                    }
+                    reply(tcp::OK, 0, 0);
+                }
                 tcp::PEER => {
                     // RFC 0086 step 3a: who is at the other end. A hosted
                     // `accept4` must say, and nothing else here could.
@@ -2848,8 +2942,10 @@ extern "C" fn tcpd_main(hertz: u64) -> ! {
             let (outcome_word, detail) =
                 listen_leg_serving(&mut listen_handover, &mut service, args);
             reply(outcome_word, detail, 0);
-        } else if matches!(method_in, tcp::SEND | tcp::RECV | tcp::SHUTDOWN)
-            && badge != 0
+        } else if matches!(
+            method_in,
+            tcp::SEND | tcp::RECV | tcp::SHUTDOWN | tcp::RELEASE
+        ) && badge != 0
             && !tcp::parts(badge).2
         {
             // A stream method on a connection badge that names no live

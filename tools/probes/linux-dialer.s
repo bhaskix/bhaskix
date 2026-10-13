@@ -10,13 +10,20 @@
         #   0 socket   1 connect   2 poll(OUT)   3 its revents
         #   4 getsockopt   5 SO_ERROR's value   6 write   7 poll(IN)
         #   8 its revents   9 read   10 bytes matched   11 close + 1
-        #   15 finished
+        #   12 round trips completed   15 finished
         #
         # It stops at the first answer that is not the expected one, so a run
         # the kernel did not grant the network ends at word 1 with EACCES.
+        #
+        # **Sixty-four times** (RFC 0090 step 5): more dials than the adapter's
+        # pool holds pairs, so the run finishes only if each dial's pair comes
+        # back after its close. Words 0-11 are the last round's.
 _start:
         mov     %rdi, %r12              # the page
         mov     %rsi, %r14              # the sockaddr
+        xor     %ebx, %ebx              # rounds completed
+
+round:
 
         # socket(AF_INET = 2, SOCK_STREAM | SOCK_NONBLOCK = 0x801, 0)
         mov     $2, %edi
@@ -39,17 +46,17 @@ _start:
         cmp     $-115, %rax
         jne     done
 
-        # poll({fd, POLLOUT}, 1, 100) until it answers, at most fifty times.
-        # A short wait in a loop rather than one long one: a positive timeout
+        # poll({fd, POLLOUT}, 1, 10) until it answers, at most 500 times. A
+        # short wait in a loop rather than one long one: a positive timeout
         # here waits it out before looking again.
         mov     %r13d, 256(%r12)
         movw    $4, 260(%r12)
-        mov     $50, %r15d
+        mov     $500, %r15d
 writable:
         movw    $0, 262(%r12)
         lea     256(%r12), %rdi
         mov     $1, %esi
-        mov     $100, %edx
+        mov     $10, %edx
         mov     $7, %eax
         syscall
         mov     %rax, 16(%r12)
@@ -94,14 +101,14 @@ settled:
         cmp     $16, %rax
         jne     done
 
-        # poll({fd, POLLIN}, 1, 100) until it answers, at most fifty times.
+        # poll({fd, POLLIN}, 1, 10) until it answers, at most 500 times.
         movw    $1, 260(%r12)
-        mov     $50, %r15d
+        mov     $500, %r15d
 readable:
         movw    $0, 262(%r12)
         lea     256(%r12), %rdi
         mov     $1, %esi
-        mov     $100, %edx
+        mov     $10, %edx
         mov     $7, %eax
         syscall
         mov     %rax, 56(%r12)
@@ -138,9 +145,18 @@ arrived:
         inc     %rax
         mov     %rax, 88(%r12)
 
+        # One more round trip; again until sixty-four.
+        inc     %ebx
+        mov     %rbx, 96(%r12)
+        cmp     $64, %ebx
+        jb      round
+
 done:
         movq    $1, 120(%r12)
-        xor     %edi, %edi
-        mov     $231, %eax              # exit_group
-        syscall
-        jmp     .
+        # **Stay, and let the kernel end this domain once it has read the
+        # page.** Exiting here let the domain end and its page be given to
+        # somebody else before the kernel read it -- an armed run read 1s
+        # where the answers had been (RFC 0090 step 5).
+idle:
+        pause
+        jmp     idle

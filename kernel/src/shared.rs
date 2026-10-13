@@ -39,8 +39,10 @@ use bhaskix_mm::{FRAME_SIZE, Zone};
 ///
 /// **128 since RFC 0086 step 3b (2026-09-30), from 64**, and the reason is
 /// counted: a boot peaked at 45 live, and the Linux adapter's TCP ring pool
-/// adds 34 more — one object per ring, because `bin/tcpd` takes each ring as
-/// its own gift. Sixty-four would have refused the pool at boot. The cost is
+/// adds ~~34~~ 42 more (RFC 0090 step 5 grew it to 21 pairs, 2026-10-13; the
+/// `iommu` lane then peaked at 80 of 128) — one object per ring, because
+/// `bin/tcpd` takes each ring as its own gift. Sixty-four would have refused
+/// the pool at boot. The cost is
 /// the arena's static size, which the boot report's `fixed tables` line
 /// states; the peak is printed beside the limit so the next raise is also
 /// counted rather than guessed.
