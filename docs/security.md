@@ -229,6 +229,14 @@ We will not pretend to cover these. Each has a note on whether it becomes in-sco
 > hosted listener or connection is a capability the *adapter* holds, never the hosted process. The
 > same price stated the same way as the network was on 2026-08-23: enumerated rather than absorbed.
 >
+> **2026-10-13, [RFC 0090](rfc/0090-a-hosted-program-that-dials-out.md) step 4: hosted programs
+> dial out, and only if granted to.** The nucleus keeps the grant, one bit per domain, and answers
+> whether a domain holds it; **`bin/linuxd` is what refuses** — `connect` answers `EACCES` — because
+> `bin/tcpd` sees the adapter's badge and never the hosted domain's. So, unlike console input, where
+> the nucleus itself refuses, **a compromised adapter can dial for anyone**: the same shape as the
+> files and streams above, enumerated rather than absorbed. Enforcing below the adapter needs tcpd to
+> learn the domain, which is its own RFC.
+>
 > **Step 4 (`epoll`, 2026-09-30) adds no capability**, and one thing worth saying: a hosted
 > listener's connections are now **accepted by the adapter before any process asks**, because
 > `tcpd` cannot say a connection waits without handing it over. Such a connection is held in the

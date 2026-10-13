@@ -53,7 +53,9 @@ for the domain that capability names.
 **The grant is a per-domain flag in the nucleus**, in the shape `Personality`
 already uses: a field on the record and a bitmask for the fast check. It is set
 by whoever creates the hosted domain and holds its capability — for the corpus,
-the kernel; for a supervisor, `bin/sup`. It is cleared when the domain ends,
+the kernel; ~~for a supervisor, `bin/sup`~~ — corrected 2026-10-13: no method
+lets a program grant it, so only the kernel does; and it is one `AtomicU32`
+holder rather than a field and a mask. It is cleared when the domain ends,
 with the domain.
 
 **Why this and not `READ` on the console.** A compromised adapter with console

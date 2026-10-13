@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Draft 2026-10-08. Written before any of it, as RFC 0086 was. **Steps 0–3 done 2026-10-12** — slirp's refusal confirmed on both emulators; `RECV`'s third word now says why a connection ended, and a refused dial is told to the caller that made it |
+| **Status** | Draft 2026-10-08. Written before any of it, as RFC 0086 was. **Steps 0–3 done 2026-10-12, step 4 on 2026-10-13 with part 7's grant built inside it** (the lead's choice) — slirp's refusal confirmed on both emulators; `RECV`'s third word now says why a connection ended, and a refused dial is told to the caller that made it |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | net / userspace |
 | **Milestone** | L1 ([roadmap.md](../roadmap.md)) — the row carried out of RFC 0005 step 9, "`connect` — a hosted TCP **client**" |
@@ -134,8 +134,16 @@ uses the fixed handover.
   before establishment — a `RST` in `SYN-SENT` or `SYN-RECEIVED` is `Refused`,
   `net/src/tcp/state.rs`), `ETIMEDOUT` for `Unreachable`, `ECONNABORTED` for `Aborted`.
   `getpeername` answers `ENOTCONN` until established.
-- **The new errnos** join the personality's list, each with Linux's number, cross-checked by the
-  existing table test.
+- **The new errnos** join the personality's list, each with Linux's number, ~~cross-checked by the
+  existing table test~~ — corrected 2026-10-13: there was no such test. Step 4 adds one,
+  `the_connect_errnos_are_linuxs`, with each number read from Linux's
+  `include/uapi/asm-generic/errno*.h` at `24a19b9`.
+- **Read from Linux's source at step 4** (`24a19b9`, 2026-10-13), and built that way: a
+  non-blocking `write` or `read` on a socket still connecting answers `EAGAIN`
+  (`sk_stream_wait_connect`, `tcp_recvmsg_locked`); **a failed dial's error goes to whichever call
+  asks first** — `SO_ERROR`, `read`, `write` or `connect` — because all of them take it with
+  `sock_error`'s exchange; after it is taken a read answers `0` and a write `EPIPE`; and a socket
+  whose dial opened stays connecting until a `connect` answers `0` for it, data flowing meanwhile.
 
 ### 6. Ring pairs for dialling out, and back again (`bin/linuxd`)
 
@@ -167,8 +175,10 @@ hosted program has by being hosted.
 - **`bin/linuxd` asks the nucleus** whether the calling process's domain holds it, through the
   domain capability it already has (RFC 0032), and answers `connect` with `EACCES` when it does
   not — *permission denied*, the errno a Linux security module answers a refused `connect` with
-  (SELinux's `name_connect` check, as recalled; step 7 confirms it against the source), so a
-  program that reports it reports something true.
+  (SELinux's `name_connect` check, ~~as recalled; step 7 confirms it against the source~~
+  **confirmed at step 4** from `security/selinux/hooks.c` and `avc.c` at `24a19b9`: a denial is
+  `-EACCES`, answered by `connect` before the protocol is called), so a program that reports it
+  reports something true.
 - **The honest limit, stated in `security.md`.** For input, the nucleus refuses and a compromised
   adapter cannot lift the grant. Here **linuxd** refuses, because tcpd sees linuxd's badge and
   never the hosted domain's: a compromised adapter can dial for anyone. That is T11's existing
@@ -326,10 +336,28 @@ Nothing on the server path changes, and the HTTP gate's numbers are the check.
    kernel's fifteen. And one of seven boots on this tree failed the four-client act with no client
    accepted, unexplained and filed in TRACKER rather than called a flake.
 4. **`connect` in linuxd** (part 5), non-blocking first. Gate: `linux dial`, one round trip.
+   **Done 2026-10-13, and with part 7's grant**, which the project lead chose to build here rather
+   than at step 7 so that no build of this tree lets an ungranted program dial. The nucleus keeps
+   the grant (`DIAL_GRANTED`, a mask, since many domains may hold it where input has one holder)
+   and answers `method::MAY_DIAL` (77) on a domain capability; `bin/linuxd` asks before anything
+   else and answers `EACCES`. The decisions are `bhaskix-personality`'s, pure and host-tested —
+   `connect_step`, `dial_progress`, `ending_errno`, and readiness for a connecting stream — and
+   `bin/linuxd` dials through step 3's `sock::tcp::connect`. The kernel runs one probe
+   (`tools/probes/linux-dialer.s`) twice on the `iommu` lane: ungranted it is refused, and granted
+   it prints `linux dial … EINPROGRESS, POLLOUT, SO_ERROR 0 — and its 16 bytes came back`. On the
+   lane's refused boot the same probe already reads what step 6 will gate — `poll` answering
+   `POLLOUT | POLLERR | POLLHUP` and `SO_ERROR` `ECONNREFUSED` (111). Both arms went red: a linuxd
+   that ignored the grant let the ungranted run dial, and a `connect` answering `0` failed the
+   round trip. Blocking `connect` answers `ENOSYS` until step 6; v6 `ENETUNREACH` until `CONNECT6`
+   dials; a socket bound first `EOPNOTSUPP`, since tcpd draws the local port. **The grant does not
+   follow a process across `fork` or `execve`**, which move it into domains linuxd makes: that
+   fails closed and is step 7's, with `bin/sup` and the manifest line.
 5. **Pairs for dialling, and back** (part 6). Gate: sixty-four dials.
 6. **Blocking `connect`, and the refused dial**: `ECONNREFUSED` through `SO_ERROR`, and through a
    blocking call's own answer.
-7. **The grant** (part 7): the per-domain flag, set by the corpus and by `bin/sup`, a manifest line,
-   and linuxd's `EACCES`. Gate: the same probe, ungranted, is refused; granted, it dials.
+7. **The grant** (part 7): ~~the per-domain flag, set by the corpus and by `bin/sup`, a manifest line,
+   and linuxd's `EACCES`. Gate: the same probe, ungranted, is refused; granted, it dials.~~ The flag,
+   the kernel's grant, linuxd's `EACCES` and that gate were built at step 4 (2026-10-13). What is left:
+   a way for `bin/sup` to grant it, the manifest line, and inheritance across `fork` and `execve`.
 8. **Go dials out**: a client in the HTTP lane, granted. Then the records — RFC 0005's row, TRACKER's carried
    row, `security.md`'s T11 note.

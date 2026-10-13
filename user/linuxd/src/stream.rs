@@ -76,9 +76,22 @@ fn peer_may_send(state: u64) -> bool {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum State {
     Fresh,
-    Bound { port: u16 },
-    Listening { port: u16, listener: usize },
-    Connected { connection: usize },
+    Bound {
+        port: u16,
+    },
+    Listening {
+        port: u16,
+        listener: usize,
+    },
+    /// A `connect` under way — RFC 0090 step 4. Its connection is in the
+    /// table from the moment `bin/tcpd` dialled, and becomes [`State::Connected`]
+    /// once it opens; until then nothing reads or writes it.
+    Connecting {
+        connection: usize,
+    },
+    Connected {
+        connection: usize,
+    },
 }
 
 #[derive(Clone, Copy)]
@@ -109,6 +122,15 @@ struct Connection {
     pending_on: Option<usize>,
     /// When it was taken, so `accept` hands out the oldest first.
     born: u64,
+    /// A dial that ended before it opened — RFC 0090 step 4 — and its error
+    /// until somebody takes it: `SO_ERROR`, `read`, `write` or `connect`,
+    /// whichever asks first, as Linux's `sock_error` hands it to one caller.
+    failed: bool,
+    pending: i64,
+    /// A dial that has opened and no `connect` has said so yet. The next one
+    /// answers `0`, and every one after it `EISCONN` — Linux's socket stays
+    /// connecting until a `connect` sees it open, while its data already flows.
+    owed_zero: bool,
 }
 
 struct Tcp {
@@ -453,6 +475,9 @@ fn take_one(listener: usize, port: u16) -> Result<bool, i64> {
         local_port: port,
         pending_on: Some(listener),
         born: table.taken,
+        failed: false,
+        pending: 0,
+        owed_zero: false,
     });
     table.births[listener] += 1;
     Ok(true)
@@ -558,10 +583,25 @@ pub(crate) fn accept(request: &PersonalityCall, flags: u64) -> (u64, Answer) {
 /// A socket neither listening nor connected reports nothing — Linux says
 /// `EPOLLOUT | EPOLLHUP` for one, and nothing here connects out yet.
 pub(crate) fn condition(entry: &Entry) -> (Condition, Option<u64>) {
+    let _ = settle(entry.handle as usize);
     let Some(Some(stream)) = tcp().streams.get(entry.handle as usize).copied() else {
         return (Condition::Unknown, None);
     };
     match stream.state {
+        // RFC 0090 step 4: quiet while the dial is out, and all of it once it
+        // failed. Settled above, so an opened dial is `Connected` by now.
+        State::Connecting { connection } => {
+            let held = tcp().connections[connection];
+            let failed = held.is_some_and(|c| c.failed);
+            let error = held.is_some_and(|c| c.pending != 0);
+            (
+                Condition::Connecting {
+                    ended: failed,
+                    error,
+                },
+                failed.then_some(1 + u64::from(error)),
+            )
+        }
         State::Fresh | State::Bound { .. } => (Condition::Listener { waiting: 0 }, None),
         State::Listening { port, listener } => {
             if waiting(listener) == 0 {
@@ -653,6 +693,236 @@ fn connection_of(stream: &Stream) -> Result<(usize, u64), i64> {
     }
 }
 
+/// Where a dial stands now, and the stream moved on to match — RFC 0090 step
+/// 4. One `RECV`, read by `socket::dial_progress`: once it has opened the
+/// stream is connected, owing its `connect` a `0`; once it failed, its error
+/// waits for whoever asks first. Answers the socket as `connect` sees it.
+fn settle(index: usize) -> socket::Socket {
+    use socket::{Dial, Socket};
+    let Some(Some(mut stream)) = tcp().streams.get(index).copied() else {
+        return Socket::Unconnected;
+    };
+    let connection = match stream.state {
+        State::Fresh | State::Bound { .. } => return Socket::Unconnected,
+        State::Listening { .. } => return Socket::Listening,
+        State::Connected { connection } => {
+            return if tcp().connections[connection].is_some_and(|c| c.owed_zero) {
+                Socket::Connecting(Dial::Established)
+            } else {
+                Socket::Connected
+            };
+        }
+        State::Connecting { connection } => connection,
+    };
+    let Some(mut held) = tcp().connections[connection] else {
+        return Socket::Connecting(Dial::Failed(errno::ECONNABORTED));
+    };
+    if held.failed {
+        return Socket::Connecting(Dial::Failed(held.pending));
+    }
+    let slot = (adapter::TCP_CONNECTIONS + connection) as u64;
+    let progress = match tcp::recv(slot, 0) {
+        StreamPoll::Ready { state, ended, .. } => {
+            socket::dial_progress(state, ended.map_or(socket::ended::NONE, tcp::Ending::word))
+        }
+        _ => Dial::Failed(errno::ECONNABORTED),
+    };
+    match progress {
+        Dial::Waiting => {}
+        Dial::Established => {
+            held.owed_zero = true;
+            stream.state = State::Connected { connection };
+            tcp().streams[index] = Some(stream);
+        }
+        Dial::Failed(code) => {
+            held.failed = true;
+            held.pending = code;
+        }
+    }
+    tcp().connections[connection] = Some(held);
+    Socket::Connecting(progress)
+}
+
+/// `connect(fd, address, length)` — RFC 0090 step 4, non-blocking.
+///
+/// **First, whether this program may dial at all.** The nucleus keeps the
+/// grant, the project lead's decision of 2026-10-08, and a program without it
+/// is told `EACCES` before anything about its socket is asked — as a Linux
+/// security module refuses `connect` before the protocol is called. Then RFC
+/// 0090 part 5's table, `socket::connect_step`.
+pub(crate) fn connect(request: &PersonalityCall) -> Answer {
+    use socket::ConnectStep;
+    let (index, stream) = match stream_of(request, request.first()) {
+        Ok(found) => found,
+        Err(code) => return Answer::error(code),
+    };
+    let mut address = [0u8; 32];
+    if !super::copy_in(request.domain, request.second(), &mut address) {
+        return Answer::error(errno::EFAULT);
+    }
+    let asked = super::call(
+        syscall::INVOKE,
+        super::handle_of(request.domain),
+        method::MAY_DIAL,
+        [0; 4],
+    );
+    if asked.status != status::OK || asked.args[0] == 0 {
+        return Answer::error(errno::EACCES);
+    }
+    let given = (request.third() as usize).min(address.len());
+    let (destination, port) = match socket::parse_endpoint(&address, given) {
+        Ok(Endpoint::V4 { address, port }) if !stream.v6 => (u32::from_be_bytes(address), port),
+        // `CONNECT6` keeps the service's fixed handover until a step dials v6.
+        Ok(_) => return Answer::error(errno::ENETUNREACH),
+        Err(code) => return Answer::error(code),
+    };
+    let pending = match stream.state {
+        State::Connecting { connection } => tcp().connections[connection].map_or(0, |c| c.pending),
+        _ => 0,
+    };
+    match socket::connect_step(settle(index), stream.nonblocking, pending) {
+        ConnectStep::Start => start_dial(index, destination, port),
+        ConnectStep::Answer(code) => Answer::error(code),
+        ConnectStep::Connected => {
+            if let Some(Some(Stream {
+                state: State::Connected { connection },
+                ..
+            })) = tcp().streams.get(index).copied()
+                && let Some(mut held) = tcp().connections[connection]
+            {
+                held.owed_zero = false;
+                tcp().connections[connection] = Some(held);
+            }
+            Answer::ok(0)
+        }
+        ConnectStep::Unconnected(code) => {
+            if let Some(Some(mut now)) = tcp().streams.get(index).copied() {
+                if let State::Connecting { connection } = now.state {
+                    drop_connection(connection);
+                }
+                now.state = State::Fresh;
+                tcp().streams[index] = Some(now);
+            }
+            Answer::error(code)
+        }
+        ConnectStep::NotYet => Answer::error(errno::ENOSYS),
+    }
+}
+
+/// Dials: a pair from the pool, a slot for the connection, and the legs of
+/// `sock::tcp::connect` — RFC 0090 step 3's `OPEN_LEG` dial. Answers
+/// `EINPROGRESS`, which is what a non-blocking `connect` says when it has
+/// started and not finished.
+fn start_dial(index: usize, destination: u32, port: u16) -> Answer {
+    let table = tcp();
+    let Some(Some(mut stream)) = table.streams.get(index).copied() else {
+        return Answer::error(errno::EBADF);
+    };
+    // A dial from a port the program chose is not offered: `bin/tcpd` draws
+    // the local port, and a bound one would be a promise this cannot keep.
+    if stream.state != State::Fresh {
+        return Answer::error(errno::EOPNOTSUPP);
+    }
+    if table.pool_used >= PAIRS {
+        return Answer::error(errno::EAGAIN);
+    }
+    let Some(slot) = table.connections.iter().position(Option::is_none) else {
+        return Answer::error(errno::EAGAIN);
+    };
+    // Counted whatever the answer: the rings are gifted by the first legs, so
+    // a dial refused at the last is a pair spent all the same. Pairs come back
+    // at RFC 0090 step 5.
+    let pair = table.pool_used;
+    table.pool_used += 1;
+    let opened = tcp::connect(
+        adapter::TCP_SERVICE as u64,
+        destination,
+        port,
+        (
+            (adapter::TCP_RINGS + 2 * pair) as u64,
+            (adapter::TCP_RINGS + 2 * pair + 1) as u64,
+        ),
+        Some((adapter::TCP_WAKE as u64, adapter::TCP_WAKE_BADGE)),
+        (adapter::TCP_CONNECTIONS + slot) as u64,
+    );
+    match opened {
+        Ok((_, local_port)) => {
+            table.connections[slot] = Some(Connection {
+                pool: pair,
+                consumed: 0,
+                told: 0,
+                sent: 0,
+                peer: Peer::V4 {
+                    address: destination,
+                    port,
+                },
+                local_port,
+                pending_on: None,
+                born: 0,
+                failed: false,
+                pending: 0,
+                owed_zero: false,
+            });
+            stream.state = State::Connecting { connection: slot };
+            table.streams[index] = Some(stream);
+            Answer::error(errno::EINPROGRESS)
+        }
+        Err(tcp::LegError::Refused { value, detail, .. }) => {
+            use bhaskix_abi::tcp::{CONGESTED, NO_ENTROPY};
+            Answer::error(match (value, detail) {
+                (CONGESTED, 2) => errno::EADDRNOTAVAIL,
+                (CONGESTED | NO_ENTROPY, _) => errno::EAGAIN,
+                _ => errno::EIO,
+            })
+        }
+        Err(_) => Answer::error(errno::EIO),
+    }
+}
+
+/// What a stream call finds on a socket whose `connect` has not opened — RFC
+/// 0090 step 4, as Linux's `tcp_recvmsg_locked` and `sk_stream_wait_connect`
+/// answer, read at `24a19b9`: the pending error first, to whichever call asks;
+/// once it is taken, `0` for a read (both directions were shut) and `EPIPE`
+/// for a write; and while the dial is out, `EAGAIN` without waiting, or a wait.
+/// `None` when the socket is not connecting, so the caller goes on as before.
+fn while_connecting(
+    request: &PersonalityCall,
+    index: usize,
+    stream: &Stream,
+    reading: bool,
+) -> Option<(u64, Answer)> {
+    let _ = settle(index);
+    let state = tcp().streams.get(index).copied().flatten()?.state;
+    let State::Connecting { connection } = state else {
+        return None;
+    };
+    let Some(mut held) = tcp().connections[connection] else {
+        return Some((REPLY_VALUE, Answer::error(errno::ENOTCONN)));
+    };
+    if held.failed {
+        let _ = super::took_timed_wait(request.domain, request.thread);
+        if held.pending != 0 {
+            let taken = held.pending;
+            held.pending = 0;
+            tcp().connections[connection] = Some(held);
+            return Some((REPLY_VALUE, Answer::error(taken)));
+        }
+        return Some((
+            REPLY_VALUE,
+            if reading {
+                Answer::ok(0)
+            } else {
+                Answer::error(errno::EPIPE)
+            },
+        ));
+    }
+    if stream.nonblocking {
+        let _ = super::took_timed_wait(request.domain, request.thread);
+        return Some((REPLY_VALUE, Answer::error(errno::EAGAIN)));
+    }
+    Some(wait_and_retry(request))
+}
+
 /// `read` (and `recvfrom` with no address) on a stream.
 pub(crate) fn read(
     request: &PersonalityCall,
@@ -661,10 +931,15 @@ pub(crate) fn read(
     count: u64,
 ) -> (u64, Answer) {
     wake_returned(request.domain, request.thread);
-    let (_, stream) = match stream_of(request, descriptor) {
+    let (at, stream) = match stream_of(request, descriptor) {
         Ok(found) => found,
         Err(code) => return (REPLY_VALUE, Answer::error(code)),
     };
+    if let Some(answer) = while_connecting(request, at, &stream, true) {
+        return answer;
+    }
+    // Settled: an opened dial is connected now, so look again.
+    let stream = tcp().streams[at].unwrap_or(stream);
     let (index, slot) = match connection_of(&stream) {
         Ok(found) => found,
         Err(code) => return (REPLY_VALUE, Answer::error(code)),
@@ -711,10 +986,18 @@ pub(crate) fn read(
 
 /// `write` (and `sendto` with no address) on a stream.
 pub(crate) fn write(request: &PersonalityCall, descriptor: u64, buffer: u64, count: u64) -> Answer {
-    let (_, stream) = match stream_of(request, descriptor) {
+    let (at, stream) = match stream_of(request, descriptor) {
         Ok(found) => found,
         Err(code) => return Answer::error(code),
     };
+    // A write that would wait is answered `EAGAIN` here, as a write that would
+    // wait for ring space already is: this path has no way to park.
+    let mut quick = stream;
+    quick.nonblocking = true;
+    if let Some((_, answer)) = while_connecting(request, at, &quick, false) {
+        return answer;
+    }
+    let stream = tcp().streams[at].unwrap_or(stream);
     let (index, slot) = match connection_of(&stream) {
         Ok(found) => found,
         Err(code) => return Answer::error(code),
@@ -771,7 +1054,7 @@ pub(crate) fn getsockname(request: &PersonalityCall) -> Answer {
     let port = match stream.state {
         State::Fresh => 0,
         State::Bound { port } | State::Listening { port, .. } => port,
-        State::Connected { connection } => {
+        State::Connecting { connection } | State::Connected { connection } => {
             tcp().connections[connection].map_or(0, |c| c.local_port)
         }
     };
@@ -847,8 +1130,11 @@ pub(crate) fn setsockopt(
     Answer::ok(0)
 }
 
-/// `getsockopt(fd, level, name, value, length)`: `SO_ERROR`, which is zero —
-/// an accepted connection has no pending error the adapter could report.
+/// `getsockopt(fd, level, name, value, length)`: `SO_ERROR` — ~~which is zero:
+/// an accepted connection has no pending error the adapter could report~~ —
+/// since RFC 0090 step 4, a failed dial's error, **once**, and zero after it
+/// is taken or when there is none (`sk_getsockopt`'s `sock_error`, which
+/// exchanges it for zero, read at `24a19b9`).
 pub(crate) fn getsockopt(
     request: &PersonalityCall,
     level: u64,
@@ -856,13 +1142,27 @@ pub(crate) fn getsockopt(
     value: u64,
     length_at: u64,
 ) -> Answer {
-    if let Err(code) = stream_of(request, request.first()) {
-        return Answer::error(code);
-    }
+    let at = match stream_of(request, request.first()) {
+        Ok((at, _)) => at,
+        Err(code) => return Answer::error(code),
+    };
     if (level, name) != (socket::option::SOL_SOCKET, socket::option::SO_ERROR) {
         return Answer::error(errno::ENOPROTOOPT);
     }
-    if super::copy_out(request.domain, value, &0u32.to_le_bytes())
+    let _ = settle(at);
+    let mut error = 0u32;
+    if let Some(Some(Stream {
+        state: State::Connecting { connection },
+        ..
+    })) = tcp().streams.get(at).copied()
+        && let Some(mut held) = tcp().connections[connection]
+        && held.pending != 0
+    {
+        error = held.pending.unsigned_abs() as u32;
+        held.pending = 0;
+        tcp().connections[connection] = Some(held);
+    }
+    if super::copy_out(request.domain, value, &error.to_le_bytes())
         && super::copy_out(request.domain, length_at, &4u32.to_le_bytes())
     {
         Answer::ok(0)
@@ -899,7 +1199,9 @@ pub(crate) fn close(entry: &Entry) {
         return;
     };
     match stream.state {
-        State::Connected { connection } => drop_connection(connection),
+        State::Connecting { connection } | State::Connected { connection } => {
+            drop_connection(connection);
+        }
         // Connections taken for a listener nobody will accept from again.
         State::Listening { listener, .. } => {
             while let Some(connection) = oldest_pending(listener) {

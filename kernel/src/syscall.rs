@@ -170,6 +170,7 @@ const _: () = {
     assert!(method::TAKE_INPUT == bhaskix_abi::method::TAKE_INPUT);
     assert!(method::POLL_INPUT == bhaskix_abi::method::POLL_INPUT);
     assert!(method::PEEK_INPUT == bhaskix_abi::method::PEEK_INPUT);
+    assert!(method::MAY_DIAL == bhaskix_abi::method::MAY_DIAL);
     // The adapter's CSpace layout is stated in the ABI so both sides read one
     // file -- see `bhaskix_abi::adapter`, and the three collisions in one day
     // that put it there. Its own assertions check the layout; this checks that
@@ -324,6 +325,8 @@ pub mod method {
     pub const COPY_SPACE: u64 = 75;
     /// RFC 0086 step 5: drop the frames behind a range, keeping the mappings.
     pub const DISCARD_AT: u64 = 76;
+    /// See `bhaskix_abi::method::MAY_DIAL`.
+    pub const MAY_DIAL: u64 = 77;
     /// Map the memory this capability names into the caller's address space.
     ///
     /// Only on a `Memory` capability. `arg0` = where, page-aligned; `arg1`
@@ -1156,7 +1159,7 @@ fn dispatch_inner(frame: &mut SyscallFrame) -> Outcome {
     if kind == Some(Kind::Invoke)
         && matches!(
             frame.method,
-            method::BIND | method::INFO | method::RELEASE | method::END
+            method::BIND | method::INFO | method::RELEASE | method::END | method::MAY_DIAL
         )
         && let Some(outcome) = domain_lifecycle(frame)
     {
@@ -4414,7 +4417,7 @@ const MAX_SUPERVISED_PAGES: u64 = 64;
 /// method numbers still answer for the kinds they own.
 fn domain_lifecycle(frame: &SyscallFrame) -> Option<Outcome> {
     let me = crate::sched::current_domain()?;
-    let (object, _) = domain::with(me, |owner| {
+    let (object, rights) = domain::with(me, |owner| {
         let slot = owner.cspace.get(frame.capability as usize)?;
         cap::with_arena(|arena| arena.lookup(slot))
     })
@@ -4462,6 +4465,17 @@ fn domain_lifecycle(frame: &SyscallFrame) -> Option<Outcome> {
             Ok(Some(reason)) => Outcome::ok(reason as u64),
             Err(()) => Outcome::err(Status::Revoked),
         },
+
+        // **May this domain dial out?** — RFC 0090 step 4. A question, answered
+        // `1` or `0` rather than refused, because "no" is an answer the asker
+        // acts on (`bin/linuxd` turns it into `EACCES`), not a failure of the
+        // call. `READ`, since it says something about the domain.
+        method::MAY_DIAL => {
+            if !rights.contains(crate::cap::Rights::READ) {
+                return Some(Outcome::err(Status::InsufficientRights));
+            }
+            Outcome::ok(u64::from(domain::may_dial(target.as_u32())))
+        }
 
         // **End a domain that is still running** — RFC 0080. `RELEASE` below
         // collects one that has already ended and refuses while it is live;

@@ -1952,6 +1952,8 @@ fn answer(request: &PersonalityCall) -> (u64, Answer) {
             return (REPLY_VALUE, stream::getsockname(request));
         }
         GETPEERNAME => return (REPLY_VALUE, stream::getpeername(request)),
+        // RFC 0090 step 4: a dial out, for a program granted the network.
+        CONNECT => return (REPLY_VALUE, stream::connect(request)),
 
         IOCTL => return (REPLY_VALUE, answer_ioctl(request)),
         FSTAT => return (REPLY_VALUE, answer_fstat(request)),
@@ -3548,6 +3550,9 @@ const GETPEERNAME: u64 = 52;
 const SETSOCKOPT: u64 = 54;
 const GETSOCKOPT: u64 = 55;
 const SHUTDOWN: u64 = 48;
+/// `connect(fd, address, length)` — RFC 0090 step 4, from the build host's
+/// `asm/unistd_64.h` (`__NR_connect 42`) on 2026-10-13.
+const CONNECT: u64 = 42;
 /// The `epoll` calls RFC 0086 step 4 adds, from the build host's
 /// `asm/unistd_64.h` on 2026-09-30.
 const EPOLL_CREATE: u64 = 213;
@@ -3644,6 +3649,18 @@ fn claim_socket_slot() -> Option<u64> {
 /// keeps its own copy of the socket service's answers. This program legitimately
 /// speaks both, so it is where the two are held together: a drift is a build
 /// failure here rather than a wrong errno delivered to a hosted program.
+const _: () = {
+    // RFC 0090 step 4: the endings `RECV` names, which the personality copies.
+    use bhaskix_abi::tcp::ended as abi;
+    use bhaskix_personality::socket::ended;
+    assert!(ended::NONE == abi::NONE);
+    assert!(ended::REFUSED == abi::REFUSED);
+    assert!(ended::UNREACHABLE == abi::UNREACHABLE);
+    assert!(ended::RESET == abi::RESET);
+    assert!(ended::ORDERLY == abi::ORDERLY);
+    assert!(ended::ABORTED == abi::ABORTED);
+};
+
 const _: () = {
     use bhaskix_personality::socket::outcome;
     assert!(outcome::OK == bhaskix_abi::socket::OK);

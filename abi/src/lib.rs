@@ -615,6 +615,13 @@ pub mod method {
     /// anonymous memory is discarded: a lent region's frames are its lender's.
     pub const DISCARD_AT: u64 = 76;
 
+    /// On a `Domain` capability with `READ`: may that domain open connections
+    /// out of this machine? `1` or `0` — RFC 0090, the project lead's decision
+    /// of 2026-10-08 that a hosted program dials only if it was granted to,
+    /// built at step 4. The nucleus keeps the grant; `bin/linuxd` asks here and
+    /// answers `connect` with `EACCES` for a domain without it.
+    pub const MAY_DIAL: u64 = 77;
+
     /// Map the memory this capability names into the caller's address space.
     ///
     /// Only on a `Memory` capability. `arg0` = where, page-aligned; `arg1`

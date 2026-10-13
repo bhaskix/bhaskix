@@ -29,6 +29,12 @@ pub const POLLNVAL: u16 = 0x020;
 /// finds nothing more. Linux's `POLLRDHUP`, the same bit as `EPOLLRDHUP`,
 /// from the build host's `sys/epoll.h` (RFC 0086 step 4).
 pub const POLLRDHUP: u16 = 0x2000;
+/// Normal data may be read. With [`POLLWRNORM`], from Linux's
+/// `include/uapi/asm-generic/poll.h` at `24a19b9`, which x86-64 takes as it is
+/// (it has no `poll.h` of its own) — RFC 0090 step 4.
+pub const POLLRDNORM: u16 = 0x040;
+/// Normal data may be written.
+pub const POLLWRNORM: u16 = 0x100;
 
 /// What the adapter can see about one descriptor.
 ///
@@ -104,6 +110,18 @@ pub enum Condition {
         readable: bool,
         /// A write of 1 would return now.
         writable: bool,
+    },
+    /// A TCP stream whose `connect` has not finished — RFC 0090 step 4.
+    ///
+    /// Nothing while it is being opened: `tcp_poll` adds nothing in
+    /// `SYN-SENT`. **Everything once it failed** — `tcp_done` shut both
+    /// directions — and `POLLERR` while its error has not been taken.
+    Connecting {
+        /// The dial is over, unopened.
+        ended: bool,
+        /// Its error is still pending: nobody has read `SO_ERROR`, or met it
+        /// in a `read`, `write` or `connect`.
+        error: bool,
     },
     /// A descriptor this adapter cannot answer for.
     ///
@@ -211,6 +229,17 @@ pub fn revents(requested: u16, condition: Condition) -> u16 {
             }
             out
         }
+        Condition::Connecting { ended, error } => {
+            if !ended {
+                return 0;
+            }
+            let mut out = requested & (POLLIN | POLLRDNORM | POLLRDHUP | POLLOUT | POLLWRNORM);
+            out |= POLLHUP;
+            if error {
+                out |= POLLERR;
+            }
+            out
+        }
         Condition::Unanswered => 0,
     }
 }
@@ -288,6 +317,33 @@ pub fn selected(watched: Watched, condition: Condition) -> Ready {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// RFC 0090 step 4: a dial says nothing until it is over, and then all of
+    /// it — the error only until somebody takes it.
+    #[test]
+    fn a_connecting_stream_is_quiet_until_it_fails() {
+        let asked = POLLIN | POLLOUT | POLLRDNORM | POLLWRNORM | POLLRDHUP;
+        let waiting = Condition::Connecting {
+            ended: false,
+            error: false,
+        };
+        assert_eq!(revents(asked, waiting), 0);
+        let failed = Condition::Connecting {
+            ended: true,
+            error: true,
+        };
+        assert_eq!(revents(asked, failed), asked | POLLHUP | POLLERR);
+        assert_eq!(
+            revents(POLLOUT, failed),
+            POLLOUT | POLLHUP | POLLERR,
+            "the hangup and the error are told unasked"
+        );
+        let taken = Condition::Connecting {
+            ended: true,
+            error: false,
+        };
+        assert_eq!(revents(POLLOUT, taken), POLLOUT | POLLHUP);
+    }
 
     #[test]
     fn an_unknown_descriptor_is_invalid_whatever_was_asked() {

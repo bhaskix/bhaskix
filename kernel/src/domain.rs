@@ -661,6 +661,46 @@ fn live_id(raw: u32) -> bool {
     with(DomainId::from_u32(raw), |_| ()).is_some()
 }
 
+/// Which domains may open TCP connections out of this machine — RFC 0090, the
+/// project lead's decision of 2026-10-08, built at its step 4 (2026-10-13).
+///
+/// **Many at once, so a mask and not [`INPUT_GRANTED_TO`]'s single holder**: a
+/// console has one keyboard, and a network has no such limit. One bit per
+/// domain, sized by the same assertion as [`LINUX_DOMAINS`], and cleared when
+/// the domain ends, so a reused slot never inherits a grant.
+///
+/// The nucleus keeps it and answers [`may_dial`]; **`bin/linuxd` is what
+/// refuses**, because `bin/tcpd` sees the adapter's badge and never the hosted
+/// domain's. A compromised adapter can therefore dial for anyone — T11's
+/// shape, stated in `security.md`. Nor does it survive `fork` or `execve`,
+/// which move a hosted process into domains `bin/linuxd` makes: that fails
+/// closed, and inheritance is a later step.
+static DIAL_GRANTED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Lets `id` open connections out of this machine.
+///
+/// # Errors
+///
+/// [`DomainError::NoSuchDomain`] if there is no such domain.
+pub fn grant_dial(id: DomainId) -> Result<(), DomainError> {
+    if with(id, |_| ()).is_none() {
+        return Err(DomainError::NoSuchDomain);
+    }
+    DIAL_GRANTED.fetch_or(
+        1u64 << (id.as_u32() as usize % MAX_DOMAINS),
+        core::sync::atomic::Ordering::AcqRel,
+    );
+    Ok(())
+}
+
+/// Whether `domain` may open connections out of this machine. An id outside
+/// the table is not reduced into it: it names no domain, so it may not.
+#[must_use]
+pub fn may_dial(domain: u32) -> bool {
+    (domain as usize) < MAX_DOMAINS
+        && DIAL_GRANTED.load(core::sync::atomic::Ordering::Acquire) & (1u64 << domain) != 0
+}
+
 // One bit per domain, or the mask aliases and a dialect is applied to the
 // wrong program. See `LINUX_DOMAINS`.
 const _: () = {
@@ -1436,6 +1476,12 @@ pub fn end(id: DomainId, reason: Ending) -> bool {
             !(1u64 << (id.0 as usize % MAX_DOMAINS)),
             core::sync::atomic::Ordering::Relaxed,
         );
+        // And the dial grant, for the same reason: keyed by slot, so a reused
+        // slot would inherit it (RFC 0090 step 4).
+        DIAL_GRANTED.fetch_and(
+            !(1u64 << (id.0 as usize % MAX_DOMAINS)),
+            core::sync::atomic::Ordering::AcqRel,
+        );
         let notify = domain.notify.take();
         let parent_generation = domain.parent_generation;
         // Captured before the increment below: the children still recorded
@@ -2063,6 +2109,42 @@ mod tests {
         assert!(grant_input(second).is_ok(), "the keyboard is free again");
         assert!(may_read_input(second.as_u32()));
         destroy(second);
+    }
+
+    /// RFC 0090 step 4: dialling is granted per domain, to many at once, and
+    /// ends with the domain.
+    #[test]
+    fn dialling_is_granted_per_domain_and_released_with_it() {
+        let first = create("dial-a", ResourceEnvelope::new()).expect("a domain");
+        let second = create("dial-b", ResourceEnvelope::new()).expect("another");
+        assert!(!may_dial(first.as_u32()), "nobody is granted by default");
+
+        assert!(grant_dial(first).is_ok());
+        assert!(may_dial(first.as_u32()));
+        assert!(!may_dial(second.as_u32()), "only the one granted");
+
+        // **Two at once** — where input refuses a second holder.
+        assert!(grant_dial(second).is_ok());
+        assert!(may_dial(first.as_u32()) && may_dial(second.as_u32()));
+
+        destroy(first);
+        assert!(!may_dial(first.as_u32()), "released with its domain");
+        assert!(may_dial(second.as_u32()), "and only with its own");
+        let after = create("dial-c", ResourceEnvelope::new()).expect("a third");
+        assert!(!may_dial(after.as_u32()), "a new domain starts ungranted");
+        destroy(second);
+        destroy(after);
+    }
+
+    /// Nothing that is not a live domain is granted, or reported granted.
+    #[test]
+    fn dialling_names_only_live_domains() {
+        assert_eq!(
+            grant_dial(DomainId::from_u32(u32::MAX)),
+            Err(DomainError::NoSuchDomain)
+        );
+        assert!(!may_dial(u32::MAX), "not reduced into the table");
+        assert!(!may_dial(MAX_DOMAINS as u32));
     }
 
     /// Granting it twice to the same domain is not a refusal.

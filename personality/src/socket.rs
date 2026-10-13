@@ -114,6 +114,159 @@ pub mod errno {
     pub const EOPNOTSUPP: i64 = -95;
     /// Writing to a stream whose other end is gone.
     pub const EPIPE: i64 = -32;
+    /// Permission denied: `connect` from a program that was not granted the
+    /// network — what a Linux security module answers a refused `connect` with
+    /// (SELinux's `name_connect`, read from `security/selinux/hooks.c` and
+    /// `avc.c` at `24a19b9`). `errno-base.h`.
+    pub const EACCES: i64 = -13;
+    /// No local port left to dial from. This and every value below is from
+    /// Linux's `include/uapi/asm-generic/errno.h`, read at `24a19b9` on
+    /// 2026-10-13 for RFC 0090 step 4.
+    pub const EADDRNOTAVAIL: i64 = -99;
+    /// The network cannot reach that address.
+    pub const ENETUNREACH: i64 = -101;
+    /// A connection ended with no reason anybody gave.
+    pub const ECONNABORTED: i64 = -103;
+    /// The peer reset the connection.
+    pub const ECONNRESET: i64 = -104;
+    /// `connect` on a socket that already is.
+    pub const EISCONN: i64 = -106;
+    /// The peer never answered.
+    pub const ETIMEDOUT: i64 = -110;
+    /// The peer answered the connection request with a reset.
+    pub const ECONNREFUSED: i64 = -111;
+    /// A second non-blocking `connect` while the first is still under way.
+    pub const EALREADY: i64 = -114;
+    /// A non-blocking `connect` that has started and not finished.
+    pub const EINPROGRESS: i64 = -115;
+}
+
+/// Why a TCP connection ended — the third word of `bin/tcpd`'s `RECV` reply.
+///
+/// A copy of `bhaskix_abi::tcp::ended`, for the reason [`outcome`] is one:
+/// this crate depends on nothing, and `bin/linuxd` asserts the two equal.
+pub mod ended {
+    /// The connection lives, or has not ended yet.
+    pub const NONE: u64 = 0;
+    /// The peer answered the connection request with a reset.
+    pub const REFUSED: u64 = 1;
+    /// The peer never answered.
+    pub const UNREACHABLE: u64 = 2;
+    /// The peer reset the connection after it was established.
+    pub const RESET: u64 = 3;
+    /// Both ends closed in order.
+    pub const ORDERLY: u64 = 4;
+    /// This end gave up on purpose.
+    pub const ABORTED: u64 = 5;
+}
+
+/// `bin/tcpd`'s numbers for the two states of a connection that is being
+/// opened and is not open yet — its `state_number`, which `RECV` answers.
+pub mod opening {
+    /// `SYN-SENT`: the request is out.
+    pub const SYN_SENT: u64 = 2;
+    /// `SYN-RECEIVED`.
+    pub const SYN_RECEIVED: u64 = 3;
+    /// `ESTABLISHED`, and every number above it is a state that followed it.
+    pub const ESTABLISHED: u64 = 4;
+}
+
+/// The errno an ending becomes — RFC 0090 part 5. `SO_ERROR`, `read`,
+/// `write` and a second `connect` all answer it, whichever asks first.
+#[must_use]
+pub const fn ending_errno(word: u64) -> i64 {
+    match word {
+        ended::REFUSED => errno::ECONNREFUSED,
+        ended::UNREACHABLE => errno::ETIMEDOUT,
+        ended::RESET => errno::ECONNRESET,
+        // An abort, and an ending with no reason: Linux's own answer for the
+        // second is `ECONNABORTED` (`__inet_stream_connect`'s `sock_error`).
+        _ => errno::ECONNABORTED,
+    }
+}
+
+/// How a dial stands, from what `RECV` says of it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Dial {
+    /// Not answered yet.
+    Waiting,
+    /// Open.
+    Established,
+    /// Over before it opened: the errno it became.
+    Failed(i64),
+}
+
+/// Reads a dial's progress from `bin/tcpd`'s state number and ending word.
+///
+/// A reset or an orderly end can only follow an establishment — `bin/tcpd`
+/// turns a reset before it into *refused* — so they read as established, and
+/// the stream's own reads learn the rest. A closed connection with no reason
+/// failed for none anybody gave.
+#[must_use]
+pub const fn dial_progress(state: u64, ending: u64) -> Dial {
+    match ending {
+        ended::NONE => match state {
+            opening::SYN_SENT | opening::SYN_RECEIVED => Dial::Waiting,
+            s if s >= opening::ESTABLISHED => Dial::Established,
+            _ => Dial::Failed(errno::ECONNABORTED),
+        },
+        ended::RESET | ended::ORDERLY => Dial::Established,
+        word => Dial::Failed(ending_errno(word)),
+    }
+}
+
+/// A stream socket as `connect` sees it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Socket {
+    /// Made, perhaps bound, never connected — or connected and failed.
+    Unconnected,
+    /// A `connect` under way, and how it stands.
+    Connecting(Dial),
+    /// Open.
+    Connected,
+    /// A listener.
+    Listening,
+}
+
+/// What `connect` does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConnectStep {
+    /// Dial, and answer `EINPROGRESS`.
+    Start,
+    /// Answer this, and change nothing.
+    Answer(i64),
+    /// Answer `0`: the dial has opened, and the socket is connected now.
+    Connected,
+    /// Answer this error: the dial failed, the socket is unconnected again
+    /// and may dial afresh, and its pending error has been taken.
+    Unconnected(i64),
+    /// A blocking `connect`, which RFC 0090 step 6 builds; `ENOSYS` until then.
+    NotYet,
+}
+
+/// `connect`'s answer — RFC 0090 part 5's table, from
+/// `net/ipv4/af_inet.c`'s `__inet_stream_connect`, read at `24a19b9`.
+/// `pending` is the socket's error not yet taken, or `0`.
+#[must_use]
+pub const fn connect_step(socket: Socket, non_blocking: bool, pending: i64) -> ConnectStep {
+    match socket {
+        // `SS_CONNECTED`, and an unconnected socket whose state is not closed
+        // — a listener — are both `EISCONN`.
+        Socket::Connected | Socket::Listening => ConnectStep::Answer(errno::EISCONN),
+        Socket::Unconnected if non_blocking => ConnectStep::Start,
+        Socket::Connecting(Dial::Waiting) if non_blocking => ConnectStep::Answer(errno::EALREADY),
+        Socket::Unconnected | Socket::Connecting(Dial::Waiting) => ConnectStep::NotYet,
+        // It opened since it was last looked at: this call is the one that
+        // says so, as Linux's falls through to `SS_CONNECTED` and answers 0.
+        Socket::Connecting(Dial::Established) => ConnectStep::Connected,
+        // `sock_error(sk) ? : -ECONNABORTED`: the pending error if nobody has
+        // taken it, and the socket may dial again.
+        Socket::Connecting(Dial::Failed(_)) => ConnectStep::Unconnected(if pending != 0 {
+            pending
+        } else {
+            errno::ECONNABORTED
+        }),
+    }
 }
 
 /// The bytes of a `struct sockaddr_in`. Confirmed against this machine's
@@ -492,6 +645,121 @@ pub fn peer_endpoint(v6_socket: bool, v6_only: bool, peer: [u8; 4], port: u16) -
 
 #[cfg(test)]
 mod tests {
+    /// **The table test RFC 0090 said existed, and did not** (2026-10-13). Each
+    /// number as Linux's headers define it, read at `24a19b9`; a typo in the
+    /// module above fails here rather than reaching a program as a different
+    /// error.
+    #[test]
+    fn the_connect_errnos_are_linuxs() {
+        use super::errno::*;
+        for (ours, linux) in [
+            (EACCES, 13),
+            (EAGAIN, 11),
+            (EADDRNOTAVAIL, 99),
+            (ENETUNREACH, 101),
+            (ECONNABORTED, 103),
+            (ECONNRESET, 104),
+            (EISCONN, 106),
+            (ENOTCONN, 107),
+            (ETIMEDOUT, 110),
+            (ECONNREFUSED, 111),
+            (EALREADY, 114),
+            (EINPROGRESS, 115),
+        ] {
+            assert_eq!(ours, -linux);
+        }
+    }
+
+    #[test]
+    fn each_ending_becomes_its_own_errno() {
+        use super::{ended, ending_errno, errno::*};
+        assert_eq!(ending_errno(ended::REFUSED), ECONNREFUSED);
+        assert_eq!(ending_errno(ended::UNREACHABLE), ETIMEDOUT);
+        assert_eq!(ending_errno(ended::RESET), ECONNRESET);
+        assert_eq!(ending_errno(ended::ABORTED), ECONNABORTED);
+        assert_eq!(ending_errno(ended::NONE), ECONNABORTED, "no reason given");
+        assert_eq!(ending_errno(99), ECONNABORTED, "nor one this crate knows");
+    }
+
+    #[test]
+    fn a_dial_is_read_from_the_state_and_the_ending() {
+        use super::{Dial, dial_progress, ended, errno::*, opening};
+        assert_eq!(dial_progress(opening::SYN_SENT, ended::NONE), Dial::Waiting);
+        assert_eq!(
+            dial_progress(opening::SYN_RECEIVED, ended::NONE),
+            Dial::Waiting
+        );
+        assert_eq!(
+            dial_progress(opening::ESTABLISHED, ended::NONE),
+            Dial::Established
+        );
+        assert_eq!(
+            dial_progress(10, ended::NONE),
+            Dial::Established,
+            "TIME-WAIT"
+        );
+        assert_eq!(dial_progress(0, ended::REFUSED), Dial::Failed(ECONNREFUSED));
+        assert_eq!(
+            dial_progress(0, ended::UNREACHABLE),
+            Dial::Failed(ETIMEDOUT)
+        );
+        assert_eq!(dial_progress(0, ended::ABORTED), Dial::Failed(ECONNABORTED));
+        // Only an established connection can be reset or closed in order.
+        assert_eq!(dial_progress(0, ended::RESET), Dial::Established);
+        assert_eq!(dial_progress(0, ended::ORDERLY), Dial::Established);
+        assert_eq!(
+            dial_progress(0, ended::NONE),
+            Dial::Failed(ECONNABORTED),
+            "closed for no reason given"
+        );
+    }
+
+    /// RFC 0090 part 5's table, row by row, and what a failure leaves behind.
+    #[test]
+    fn connect_answers_as_linux_does() {
+        use super::{ConnectStep as Step, Dial, Socket, connect_step, errno::*};
+        assert_eq!(connect_step(Socket::Unconnected, true, 0), Step::Start);
+        assert_eq!(
+            connect_step(Socket::Connecting(Dial::Waiting), true, 0),
+            Step::Answer(EALREADY)
+        );
+        assert_eq!(
+            connect_step(Socket::Connecting(Dial::Established), true, 0),
+            Step::Connected
+        );
+        assert_eq!(
+            connect_step(Socket::Connected, true, 0),
+            Step::Answer(EISCONN)
+        );
+        assert_eq!(
+            connect_step(Socket::Listening, true, 0),
+            Step::Answer(EISCONN)
+        );
+        assert_eq!(
+            connect_step(Socket::Listening, false, 0),
+            Step::Answer(EISCONN)
+        );
+        // Failed: the pending error once, and `ECONNABORTED` once it is taken.
+        assert_eq!(
+            connect_step(
+                Socket::Connecting(Dial::Failed(ECONNREFUSED)),
+                true,
+                ECONNREFUSED
+            ),
+            Step::Unconnected(ECONNREFUSED)
+        );
+        assert_eq!(
+            connect_step(Socket::Connecting(Dial::Failed(ECONNREFUSED)), true, 0),
+            Step::Unconnected(ECONNABORTED)
+        );
+        // Blocking waits for step 6.
+        assert_eq!(connect_step(Socket::Unconnected, false, 0), Step::NotYet);
+        assert_eq!(
+            connect_step(Socket::Connecting(Dial::Waiting), false, 0),
+            Step::NotYet
+        );
+    }
+
     #[test]
     fn the_seven_traced_options_are_accepted_and_nothing_else_is() {
         use option::*;
