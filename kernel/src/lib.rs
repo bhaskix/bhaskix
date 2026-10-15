@@ -6918,21 +6918,13 @@ fn poll_self_test(hhdm_base: u64, cpus: u32) -> bool {
     let mut answers = [0u64; 5];
     let done = wait_until(
         || {
+            // The last word written is the one that says it finished, and it is
+            // read first -- see `finished_report`.
             let report_pa = POLL_REPORT_PA.load(Ordering::Acquire);
-            if report_pa == 0 {
-                return false;
-            }
-            // SAFETY: a frame the probe's space owns, read through the direct
-            // map -- the same idiom every probe's reader uses.
-            unsafe {
-                for (index, slot) in answers.iter_mut().enumerate() {
-                    *slot = core::ptr::read_volatile(
-                        (hhdm_base + report_pa + 8 * index as u64) as *const u64,
-                    );
-                }
-            }
-            // The last word written is the one that says it finished.
-            answers[4] != 0
+            finished_report(hhdm_base, report_pa, &[4]).is_some_and(|words| {
+                answers = words;
+                true
+            })
         },
         20_000,
     );
@@ -7010,14 +7002,10 @@ fn memory_self_test(hhdm_base: u64, cpus: u32) -> bool {
     for _ in 0..400 {
         report_pa = MEMORY_REPORT_PA.load(Ordering::Acquire);
         if report_pa != 0 {
-            // One read in a loop rather than one line per word: the probe
-            // reports six words since RFC 0086 step 5, and each line of an
-            // `unsafe` block counts against the budget.
-            for (index, slot) in answers.iter_mut().enumerate() {
-                let at = hhdm_base + report_pa + 8 * index as u64;
-                // SAFETY: a frame the probe's space owns, through the direct
-                // map, and `index` is below the six words it writes.
-                *slot = unsafe { core::ptr::read_volatile(at as *const u64) };
+            // `madvise`'s answer, word 3, is the probe's last store, so it is
+            // read before the rest -- see `finished_report`.
+            if let Some(words) = finished_report(hhdm_base, report_pa, &[3]) {
+                answers = words;
             }
             // **The last answer, not the first.** This stopped as soon as the
             // read-back appeared, before the probe had stored `munmap`'s and
@@ -9664,25 +9652,13 @@ fn dial_self_test(hhdm_base: u64, cpus: u32) -> bool {
         let mut answers = [0u64; 16];
         let done = wait_until(
             || {
+                // Word 15 first -- see `finished_report`, which CI run 860 is
+                // the reason for.
                 let report_pa = DIAL_REPORT_PA.load(Ordering::Acquire);
-                if report_pa == 0 {
-                    return false;
-                }
-                // **The finishing word first, and the answers only after it.**
-                // The probe runs on another CPU while this reads. Reading the
-                // answers first and the finishing word last let a probe that
-                // finished *between* the two reads look finished with nothing
-                // written: CI run 860 read `socket 0, connect 0` from a run
-                // that had answered `EACCES` (2026-10-15). Read in this order,
-                // x86's loads cannot see anything older than what the probe
-                // stored before its last word.
-                if report_page_word(hhdm_base + report_pa, 15) == 0 {
-                    return false;
-                }
-                for (index, slot) in answers.iter_mut().enumerate() {
-                    *slot = report_page_word(hhdm_base + report_pa, index);
-                }
-                true
+                finished_report(hhdm_base, report_pa, &[15]).is_some_and(|words| {
+                    answers = words;
+                    true
+                })
             },
             60_000,
         );
@@ -10554,16 +10530,13 @@ fn auxv_self_test(hhdm_base: u64, cpus: u32) -> bool {
     for _ in 0..400 {
         report_pa = AUXV_REPORT_PA.load(Ordering::Acquire);
         if report_pa != 0 {
-            // SAFETY: a frame the probe's space owns, read through the
-            // direct map; four loads of one page cannot fault.
-            answers = unsafe {
-                [
-                    core::ptr::read_volatile((hhdm_base + report_pa) as *const u64),
-                    core::ptr::read_volatile((hhdm_base + report_pa + 8) as *const u64),
-                    core::ptr::read_volatile((hhdm_base + report_pa + 16) as *const u64),
-                    core::ptr::read_volatile((hhdm_base + report_pa + 24) as *const u64),
-                ]
-            };
+            // The three words the auxv walk fills, read before `argc`, which
+            // the probe stored first -- see `finished_report`. Reading them in
+            // index order had `argc` sampled before it landed, which is the
+            // half of 2026-08-29's lesson below that was still open.
+            if let Some(words) = finished_report(hhdm_base, report_pa, &[1, 2, 3]) {
+                answers = words;
+            }
             // **Every word the probe writes, not any one of them.**
             //
             // These four loads happen at four instants, and the probe fills the
@@ -13072,20 +13045,13 @@ fn bell_wakes_a_poller(hhdm_base: u64, cpus: u32) -> bool {
     if ok {
         let woke = wait_until(
             || {
+                // The close, word 6, is the waiter's last store, and is read
+                // first -- see `finished_report`.
                 let pa = BELL_WAITER_PA.load(Ordering::Acquire);
-                if pa == 0 {
-                    return false;
-                }
-                // SAFETY: a frame the waiter's own space owns, read through the
-                // direct map -- the idiom every probe's reader here uses.
-                unsafe {
-                    for (index, slot) in answers.iter_mut().enumerate() {
-                        *slot = core::ptr::read_volatile(
-                            (hhdm_base + pa + 8 * index as u64) as *const u64,
-                        );
-                    }
-                }
-                answers[6] != 0
+                finished_report(hhdm_base, pa, &[6]).is_some_and(|words| {
+                    answers = words;
+                    true
+                })
             },
             30_000,
         );
@@ -13227,18 +13193,11 @@ fn socket_poll_self_test(hhdm_base: u64, cpus: u32) -> bool {
     let done = wait_until(
         || {
             let report_pa = SOCKET_POLL_REPORT_PA.load(Ordering::Acquire);
-            if report_pa == 0 {
+            // Word 15 first -- see `finished_report`.
+            let Some(words) = finished_report(hhdm_base, report_pa, &[15]) else {
                 return false;
-            }
-            // SAFETY: a frame the probe's own space owns, read through the
-            // direct map -- the idiom every probe's reader here uses.
-            unsafe {
-                for (index, slot) in answers.iter_mut().enumerate() {
-                    *slot = core::ptr::read_volatile(
-                        (hhdm_base + report_pa + 8 * index as u64) as *const u64,
-                    );
-                }
-            }
+            };
+            answers = words;
             // **The close is the last thing written**, so it is what says the
             // program finished rather than stopped somewhere in the middle --
             // and, because it is a `close`, that the socket went back.
@@ -23038,6 +22997,31 @@ fn report_page_word(base: u64, index: usize) -> u64 {
     // SAFETY: `base` is the first frame of the report object, through the
     // direct map, and `index` is clamped inside that page.
     unsafe { core::ptr::read_volatile((base + index as u64 * 8) as *const u64) }
+}
+
+/// A probe's report page once the probe has said it finished — **the
+/// finishing words read first, and the answers only after them** (2026-10-15).
+///
+/// The probe runs on another CPU while this reads. Reading the answers first
+/// and the finishing word last let a probe that finished *between* those reads
+/// look finished with answers unwritten: CI run 860 caught `dial_self_test` at
+/// it, `linux poll`'s one unexplained sighting has exactly its shape, and
+/// `auxv_self_test` met it on 2026-08-29. Read in this order, x86's loads
+/// cannot see anything older than what the probe stored before its finishing
+/// words. `done` names the words a probe stores last; all must be non-zero.
+fn finished_report<const N: usize>(hhdm: u64, report_pa: u64, done: &[usize]) -> Option<[u64; N]> {
+    if report_pa == 0 {
+        return None;
+    }
+    let base = hhdm + report_pa;
+    if done.iter().any(|&index| report_page_word(base, index) == 0) {
+        return None;
+    }
+    let mut words = [0u64; N];
+    for (index, word) in words.iter_mut().enumerate() {
+        *word = report_page_word(base, index);
+    }
+    Some(words)
 }
 
 /// The adapter's TCP grants — RFC 0086 step 3b. See the call site.

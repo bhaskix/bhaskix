@@ -925,7 +925,11 @@ asm_budget = 10
 # 2099 on 2026-10-12: four lines for the framebuffer's write-combining window
 # -- programming the PAT on each CPU (`smp::program_pat_here`), reading the
 # MTRRs, reading CR3, and mapping each page of the window.
-unsafe_budget = 2099
+# 2069 on 2026-10-15, down thirty: five probe self-tests read their report
+# pages through `finished_report` -- the finishing word first, then the
+# answers, through the one reader `report_page_word` -- instead of each its
+# own `unsafe` loop that read the finishing word last.
+unsafe_budget = 2069
 # Up thirty-one for RFC 0005 step 9's socket probe -- `ring3_socketeer`, which
 # is `ring3_lister` with a `sockaddr_in6` copied in beside its code instead of
 # two filenames. The same two blocks every hosted probe has: one
