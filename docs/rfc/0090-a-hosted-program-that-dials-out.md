@@ -374,7 +374,13 @@ Nothing on the server path changes, and the HTTP gate's numbers are the check.
    ignoring `RELEASE` stopped at 18. **And one thing the arms found in the test itself**: the probe
    exited the moment it wrote its last word, so its domain could end and its page be reused before
    the kernel read it — the first no-reap run reported `socket 1, connect 1`, which no call had
-   answered. The probe now idles once finished and the kernel ends it after reading.
+   answered. The probe now idles once finished and the kernel ends it after reading. **Corrected
+   2026-10-15: that was one path, and not the only one.** CI run 860 then read `socket 0, connect 0`
+   with the finishing word set, from a run that had answered `EACCES`: the kernel read the answers
+   *before* the finishing word, so a probe that finished between the two reads looked finished with
+   nothing written — a torn snapshot, possible whenever the reading CPU is preempted mid-read, as
+   emulation does. The kernel now reads the finishing word first. Which of the two produced the 1s is
+   not established; both paths are closed.
 6. **Blocking `connect`, and the refused dial**: `ECONNREFUSED` through `SO_ERROR`, and through a
    blocking call's own answer.
 7. **The grant** (part 7): ~~the per-domain flag, set by the corpus and by `bin/sup`, a manifest line,

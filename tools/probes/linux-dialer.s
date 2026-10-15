@@ -156,7 +156,9 @@ done:
         # **Stay, and let the kernel end this domain once it has read the
         # page.** Exiting here let the domain end and its page be given to
         # somebody else before the kernel read it -- an armed run read 1s
-        # where the answers had been (RFC 0090 step 5).
+        # where the answers had been (RFC 0090 step 5). And the kernel reads
+        # word 15 before the rest (2026-10-15): read last, a probe finishing
+        # mid-read looked finished with nothing written.
 idle:
         pause
         jmp     idle

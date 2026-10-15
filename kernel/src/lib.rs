@@ -9668,10 +9668,21 @@ fn dial_self_test(hhdm_base: u64, cpus: u32) -> bool {
                 if report_pa == 0 {
                     return false;
                 }
+                // **The finishing word first, and the answers only after it.**
+                // The probe runs on another CPU while this reads. Reading the
+                // answers first and the finishing word last let a probe that
+                // finished *between* the two reads look finished with nothing
+                // written: CI run 860 read `socket 0, connect 0` from a run
+                // that had answered `EACCES` (2026-10-15). Read in this order,
+                // x86's loads cannot see anything older than what the probe
+                // stored before its last word.
+                if report_page_word(hhdm_base + report_pa, 15) == 0 {
+                    return false;
+                }
                 for (index, slot) in answers.iter_mut().enumerate() {
                     *slot = report_page_word(hhdm_base + report_pa, index);
                 }
-                answers[15] != 0
+                true
             },
             60_000,
         );
