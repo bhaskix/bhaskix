@@ -11,6 +11,9 @@
         #   4 getsockopt   5 SO_ERROR's value   6 write   7 poll(IN)
         #   8 its revents   9 read   10 bytes matched   11 close + 1
         #   12 round trips completed   15 finished
+        #   16 refused non-blocking connect   17 its poll revents
+        #   18 its SO_ERROR   19 refused blocking connect
+        #   20 blocking connect that opens   21 its bytes matched
         #
         # It stops at the first answer that is not the expected one, so a run
         # the kernel did not grant the network ends at word 1 with EACCES.
@@ -150,6 +153,147 @@ arrived:
         mov     %rbx, 96(%r12)
         cmp     $64, %ebx
         jb      round
+
+        # RFC 0090 step 6: a dial nobody answers, both ways, then a blocking
+        # dial that opens. 10.0.2.100:10 is a port no guestfwd names, so slirp
+        # refuses it on every boot; its sockaddr is the one beside the code
+        # with the port changed, at page + 448.
+        mov     0(%r14), %rax
+        mov     %rax, 448(%r12)
+        mov     8(%r14), %rax
+        mov     %rax, 456(%r12)
+        movw    $0x0a00, 450(%r12)      # port 10, big-endian
+
+        # Refused, non-blocking: EINPROGRESS, then poll, then SO_ERROR.
+        mov     $2, %edi
+        mov     $0x801, %esi
+        xor     %edx, %edx
+        mov     $41, %eax
+        syscall
+        test    %rax, %rax
+        js      done
+        mov     %rax, %r13
+        mov     %r13, %rdi
+        lea     448(%r12), %rsi
+        mov     $16, %edx
+        mov     $42, %eax
+        syscall
+        mov     %rax, 128(%r12)
+        cmp     $-115, %rax
+        jne     done
+        mov     %r13d, 256(%r12)
+        movw    $4, 260(%r12)
+        mov     $500, %r15d
+refused_poll:
+        movw    $0, 262(%r12)
+        lea     256(%r12), %rdi
+        mov     $1, %esi
+        mov     $10, %edx
+        mov     $7, %eax
+        syscall
+        cmp     $1, %rax
+        je      refused_said
+        dec     %r15d
+        jnz     refused_poll
+        jmp     done
+refused_said:
+        movzwq  262(%r12), %rcx
+        mov     %rcx, 136(%r12)
+        movl    $0, 288(%r12)
+        movl    $4, 292(%r12)
+        mov     %r13, %rdi
+        mov     $1, %esi
+        mov     $4, %edx
+        lea     288(%r12), %r10
+        lea     292(%r12), %r8
+        mov     $55, %eax
+        syscall
+        movl    288(%r12), %ecx
+        mov     %rcx, 144(%r12)
+        mov     %r13, %rdi
+        mov     $3, %eax
+        syscall
+
+        # Refused, blocking: connect itself answers ECONNREFUSED (-111).
+        mov     $2, %edi
+        mov     $1, %esi
+        xor     %edx, %edx
+        mov     $41, %eax
+        syscall
+        test    %rax, %rax
+        js      done
+        mov     %rax, %r13
+        mov     %r13, %rdi
+        lea     448(%r12), %rsi
+        mov     $16, %edx
+        mov     $42, %eax
+        syscall
+        mov     %rax, 152(%r12)
+        mov     %r13, %rdi
+        mov     $3, %eax
+        syscall
+        cmpq    $-111, 152(%r12)
+        jne     done
+
+        # A blocking dial that opens: connect answers 0, then one echo.
+        mov     $2, %edi
+        mov     $1, %esi
+        xor     %edx, %edx
+        mov     $41, %eax
+        syscall
+        test    %rax, %rax
+        js      done
+        mov     %rax, %r13
+        mov     %r13, %rdi
+        mov     %r14, %rsi
+        mov     $16, %edx
+        mov     $42, %eax
+        syscall
+        mov     %rax, 160(%r12)
+        test    %rax, %rax
+        jnz     done
+        movq    $0, 384(%r12)
+        movq    $0, 392(%r12)
+        mov     %r13, %rdi
+        lea     320(%r12), %rsi
+        mov     $16, %edx
+        mov     $1, %eax
+        syscall
+        cmp     $16, %rax
+        jne     done
+        mov     %r13d, 256(%r12)
+        movw    $1, 260(%r12)
+        mov     $500, %r15d
+blocking_readable:
+        movw    $0, 262(%r12)
+        lea     256(%r12), %rdi
+        mov     $1, %esi
+        mov     $10, %edx
+        mov     $7, %eax
+        syscall
+        cmp     $1, %rax
+        je      blocking_arrived
+        dec     %r15d
+        jnz     blocking_readable
+        jmp     done
+blocking_arrived:
+        mov     %r13, %rdi
+        lea     384(%r12), %rsi
+        mov     $16, %edx
+        xor     %eax, %eax
+        syscall
+        cmp     $16, %rax
+        jne     done
+        mov     320(%r12), %rax
+        cmp     384(%r12), %rax
+        jne     done
+        mov     328(%r12), %rax
+        cmp     392(%r12), %rax
+        jne     done
+        movq    $1, 168(%r12)
+        mov     %r13, %rdi
+        mov     $3, %eax
+        syscall
 
 done:
         movq    $1, 120(%r12)

@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Draft 2026-10-08. Written before any of it, as RFC 0086 was. **Steps 0–3 done 2026-10-12, steps 4 and 5 on 2026-10-13, part 7's grant built inside step 4** (the lead's choice) — slirp's refusal confirmed on both emulators; `RECV`'s third word now says why a connection ended, and a refused dial is told to the caller that made it |
+| **Status** | Draft 2026-10-08. Written before any of it, as RFC 0086 was. **Steps 0–3 done 2026-10-12, steps 4 and 5 on 2026-10-13, step 6 on 2026-10-15, part 7's grant built inside step 4** (the lead's choice) — slirp's refusal confirmed on both emulators; `RECV`'s third word now says why a connection ended, and a refused dial is told to the caller that made it |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | net / userspace |
 | **Milestone** | L1 ([roadmap.md](../roadmap.md)) — the row carried out of RFC 0005 step 9, "`connect` — a hosted TCP **client**" |
@@ -382,7 +382,22 @@ Nothing on the server path changes, and the HTTP gate's numbers are the check.
    emulation does. The kernel now reads the finishing word first. Which of the two produced the 1s is
    not established; both paths are closed.
 6. **Blocking `connect`, and the refused dial**: `ECONNREFUSED` through `SO_ERROR`, and through a
-   blocking call's own answer.
+   blocking call's own answer. **Done 2026-10-15.** Read from `__inet_stream_connect` and
+   `inet_wait_for_connect` (`net/ipv4/af_inet.c` at `24a19b9`): a blocking caller waits while the
+   socket is `SYN-SENT` or `SYN-RECEIVED`, then answers `0`, or the error (or `ECONNABORTED` once it
+   was taken); a signal answers `EINTR` with the socket still connecting; and a second blocking caller
+   waits too — only a zero timeout stops at `EALREADY`. linuxd waits on the wake when the thread can
+   have it, since tcpd rings it on every change of a dial's state, and otherwise on a timer that
+   doubles from 10 ms: the nucleus re-asks a parked call sixteen times, and doubling makes those
+   cover tcpd's four-minute *unreachable*. The probe, after its sixty-four, dials `10.0.2.100:10` —
+   a port no `guestfwd` names, so refused on every boot — both ways, and makes one blocking dial
+   that opens: `refused at 10.0.2.100:10 both ways -- non-blocking, POLLOUT|POLLERR|POLLHUP and
+   SO_ERROR 111; blocking, connect's own ECONNREFUSED -- and a blocking dial that opened answered 0
+   and echoed`, gated on the main `iommu` boot rather than the refused one. **It found a bug in step
+   4's `connect`**: it read the pending error *before* settling the dial, so a blocking re-entry —
+   the one call that discovers the refusal — answered `ECONNABORTED` for a refused dial; a
+   non-blocking caller had always had `poll` settle it first. Both arms went red: a blocking
+   `connect` answering the old `EINPROGRESS`, and `SO_ERROR` answering 0 after a refusal.
 7. **The grant** (part 7): ~~the per-domain flag, set by the corpus and by `bin/sup`, a manifest line,
    and linuxd's `EACCES`. Gate: the same probe, ungranted, is refused; granted, it dials.~~ The flag,
    the kernel's grant, linuxd's `EACCES` and that gate were built at step 4 (2026-10-13). What is left:

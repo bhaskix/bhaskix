@@ -231,7 +231,8 @@ pub enum Socket {
 /// What `connect` does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ConnectStep {
-    /// Dial, and answer `EINPROGRESS`.
+    /// Dial — and answer `EINPROGRESS` if the socket does not wait, or wait
+    /// for the dial to settle if it does.
     Start,
     /// Answer this, and change nothing.
     Answer(i64),
@@ -240,22 +241,30 @@ pub enum ConnectStep {
     /// Answer this error: the dial failed, the socket is unconnected again
     /// and may dial afresh, and its pending error has been taken.
     Unconnected(i64),
-    /// A blocking `connect`, which RFC 0090 step 6 builds; `ENOSYS` until then.
-    NotYet,
+    /// A blocking `connect` whose dial is out: wait, and ask again when it has
+    /// news — RFC 0090 step 6. A re-entry and a second caller get the same
+    /// answer, and nothing is dialled twice.
+    Wait,
 }
 
 /// `connect`'s answer — RFC 0090 part 5's table, from
 /// `net/ipv4/af_inet.c`'s `__inet_stream_connect`, read at `24a19b9`.
 /// `pending` is the socket's error not yet taken, or `0`.
+///
+/// **Blocking, since step 6**: the caller waits while the dial is out —
+/// `inet_wait_for_connect` loops while the socket is `SYN-SENT` or
+/// `SYN-RECEIVED` — and is then answered `0` or the dial's error. A second
+/// blocking caller waits too: only a non-blocking one is stopped at
+/// `EALREADY`, because a zero timeout leaves the function before the wait.
 #[must_use]
 pub const fn connect_step(socket: Socket, non_blocking: bool, pending: i64) -> ConnectStep {
     match socket {
         // `SS_CONNECTED`, and an unconnected socket whose state is not closed
         // — a listener — are both `EISCONN`.
         Socket::Connected | Socket::Listening => ConnectStep::Answer(errno::EISCONN),
-        Socket::Unconnected if non_blocking => ConnectStep::Start,
+        Socket::Unconnected => ConnectStep::Start,
         Socket::Connecting(Dial::Waiting) if non_blocking => ConnectStep::Answer(errno::EALREADY),
-        Socket::Unconnected | Socket::Connecting(Dial::Waiting) => ConnectStep::NotYet,
+        Socket::Connecting(Dial::Waiting) => ConnectStep::Wait,
         // It opened since it was last looked at: this call is the one that
         // says so, as Linux's falls through to `SS_CONNECTED` and answers 0.
         Socket::Connecting(Dial::Established) => ConnectStep::Connected,
@@ -752,11 +761,25 @@ mod tests {
             connect_step(Socket::Connecting(Dial::Failed(ECONNREFUSED)), true, 0),
             Step::Unconnected(ECONNABORTED)
         );
-        // Blocking waits for step 6.
-        assert_eq!(connect_step(Socket::Unconnected, false, 0), Step::NotYet);
+        // Blocking (RFC 0090 step 6): it dials as a non-blocking one does,
+        // then waits -- and a re-entry, or a second caller, waits as well.
+        assert_eq!(connect_step(Socket::Unconnected, false, 0), Step::Start);
         assert_eq!(
             connect_step(Socket::Connecting(Dial::Waiting), false, 0),
-            Step::NotYet
+            Step::Wait
+        );
+        // Once it settles, a blocking one is answered as a non-blocking one.
+        assert_eq!(
+            connect_step(Socket::Connecting(Dial::Established), false, 0),
+            Step::Connected
+        );
+        assert_eq!(
+            connect_step(
+                Socket::Connecting(Dial::Failed(ECONNREFUSED)),
+                false,
+                ECONNREFUSED
+            ),
+            Step::Unconnected(ECONNREFUSED)
         );
     }
 

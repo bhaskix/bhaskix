@@ -2984,6 +2984,12 @@ rm -f "$HOSTED_VERDICT" 2>/dev/null || true
 # bytes back -- and prints one line. Demanded on the lane that runs it.
 if grep -qE "linux dial +a hosted program not granted the network was refused \(EACCES\); granted, it dialled 10\.0\.2\.100:9 -- EINPROGRESS, POLLOUT, SO_ERROR 0 -- 64 times in a row, more than the pool holds, its 16 bytes back each time" "$LOG"; then
     pass "a hosted program dialled out because it was granted to, 64 times, more than the pool holds, and one that was not was refused (RFC 0090 steps 4 and 5)"
+    if grep -qE "linux dial +refused at 10\.0\.2\.100:10 both ways -- non-blocking, POLLOUT\|POLLERR\|POLLHUP and SO_ERROR 111; blocking, connect's own ECONNREFUSED -- and a blocking dial that opened answered 0 and echoed" "$LOG"; then
+        pass "a refused dial is told both ways, and a blocking connect waits for its answer (RFC 0090 step 6)"
+    else
+        fail "a refused or blocking dial: $(grep -aoE 'linux dial +FAILED.*' "$LOG" | head -1 | sed 's/\x1b\[[0-9;]*m//g')"
+        status=1
+    fi
 elif grep -qE "linux dial +FAILED" "$LOG"; then
     fail "a hosted dial: $(grep -aoE 'linux dial +FAILED.*' "$LOG" | head -1 | sed 's/\x1b\[[0-9;]*m//g')"
     status=1

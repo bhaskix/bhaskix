@@ -158,6 +158,9 @@ struct Tcp {
     /// Pairs listeners hold, which stop at the pool less
     /// [`adapter::TCP_DIAL_RESERVE`].
     listener_pairs: usize,
+    /// Blocking `connect`s parked on a timer: the thread's wake key, and how
+    /// many turns it has parked — RFC 0090 step 6.
+    dial_parks: [(u64, u32); 8],
     /// `tcpd`'s pair number → the adapter's pool pair, plus one (0: unknown).
     pool_of: [u8; 64],
     /// Connections each listener has been given, ever: the news an
@@ -176,6 +179,7 @@ static mut TCP: Tcp = Tcp {
     pool_used: 0,
     returned: 0,
     listener_pairs: 0,
+    dial_parks: [(0, 0); 8],
     pool_of: [0; 64],
     births: [0; adapter::TCP_LISTENER_COUNT],
     taken: 0,
@@ -841,15 +845,29 @@ fn settle(index: usize) -> socket::Socket {
 /// is told `EACCES` before anything about its socket is asked — as a Linux
 /// security module refuses `connect` before the protocol is called. Then RFC
 /// 0090 part 5's table, `socket::connect_step`.
-pub(crate) fn connect(request: &PersonalityCall) -> Answer {
+pub(crate) fn connect(request: &PersonalityCall) -> (u64, Answer) {
+    wake_returned(request.domain, request.thread);
+    match connect_once(request) {
+        Some(answer) => {
+            let _ = super::took_timed_wait(request.domain, request.thread);
+            forget_dial_parks(request.domain, request.thread);
+            (REPLY_VALUE, answer)
+        }
+        None => wait_for_dial(request),
+    }
+}
+
+/// [`connect`]'s answer, or `None` for a blocking caller that must wait for
+/// its dial to settle — RFC 0090 step 6.
+fn connect_once(request: &PersonalityCall) -> Option<Answer> {
     use socket::ConnectStep;
     let (index, stream) = match stream_of(request, request.first()) {
         Ok(found) => found,
-        Err(code) => return Answer::error(code),
+        Err(code) => return Some(Answer::error(code)),
     };
     let mut address = [0u8; 32];
     if !super::copy_in(request.domain, request.second(), &mut address) {
-        return Answer::error(errno::EFAULT);
+        return Some(Answer::error(errno::EFAULT));
     }
     let asked = super::call(
         syscall::INVOKE,
@@ -858,46 +876,64 @@ pub(crate) fn connect(request: &PersonalityCall) -> Answer {
         [0; 4],
     );
     if asked.status != status::OK || asked.args[0] == 0 {
-        return Answer::error(errno::EACCES);
+        return Some(Answer::error(errno::EACCES));
     }
     let given = (request.third() as usize).min(address.len());
     let (destination, port) = match socket::parse_endpoint(&address, given) {
         Ok(Endpoint::V4 { address, port }) if !stream.v6 => (u32::from_be_bytes(address), port),
         // `CONNECT6` keeps the service's fixed handover until a step dials v6.
-        Ok(_) => return Answer::error(errno::ENETUNREACH),
-        Err(code) => return Answer::error(code),
+        Ok(_) => return Some(Answer::error(errno::ENETUNREACH)),
+        Err(code) => return Some(Answer::error(code)),
     };
-    let pending = match stream.state {
-        State::Connecting { connection } => tcp().connections[connection].map_or(0, |c| c.pending),
+    // **Settled first, and the pending error read after.** A blocking caller
+    // re-entering finds its dial's failure in this very `settle`; read
+    // before it, the error was not there yet and `connect` answered
+    // `ECONNABORTED` for a dial that had been refused (2026-10-15). A
+    // non-blocking caller had `poll` settle it first, which hid this.
+    let now = settle(index);
+    let pending = match tcp().streams.get(index).copied().flatten().map(|s| s.state) {
+        Some(State::Connecting { connection }) => {
+            tcp().connections[connection].map_or(0, |c| c.pending)
+        }
         _ => 0,
     };
-    match socket::connect_step(settle(index), stream.nonblocking, pending) {
-        ConnectStep::Start => start_dial(index, destination, port),
-        ConnectStep::Answer(code) => Answer::error(code),
-        ConnectStep::Connected => {
-            if let Some(Some(Stream {
-                state: State::Connected { connection },
-                ..
-            })) = tcp().streams.get(index).copied()
-                && let Some(mut held) = tcp().connections[connection]
-            {
-                held.owed_zero = false;
-                tcp().connections[connection] = Some(held);
-            }
-            Answer::ok(0)
-        }
-        ConnectStep::Unconnected(code) => {
-            if let Some(Some(mut now)) = tcp().streams.get(index).copied() {
-                if let State::Connecting { connection } = now.state {
-                    drop_connection(connection);
+    Some(
+        match socket::connect_step(now, stream.nonblocking, pending) {
+            // A blocking one waits for the dial it started; it is never dialled
+            // twice, because the re-entry finds the socket connecting.
+            ConnectStep::Start => {
+                let answer = start_dial(index, destination, port);
+                if !stream.nonblocking && answer.value == errno::EINPROGRESS as u64 {
+                    return None;
                 }
-                now.state = State::Fresh;
-                tcp().streams[index] = Some(now);
+                answer
             }
-            Answer::error(code)
-        }
-        ConnectStep::NotYet => Answer::error(errno::ENOSYS),
-    }
+            ConnectStep::Wait => return None,
+            ConnectStep::Answer(code) => Answer::error(code),
+            ConnectStep::Connected => {
+                if let Some(Some(Stream {
+                    state: State::Connected { connection },
+                    ..
+                })) = tcp().streams.get(index).copied()
+                    && let Some(mut held) = tcp().connections[connection]
+                {
+                    held.owed_zero = false;
+                    tcp().connections[connection] = Some(held);
+                }
+                Answer::ok(0)
+            }
+            ConnectStep::Unconnected(code) => {
+                if let Some(Some(mut now)) = tcp().streams.get(index).copied() {
+                    if let State::Connecting { connection } = now.state {
+                        drop_connection(connection);
+                    }
+                    now.state = State::Fresh;
+                    tcp().streams[index] = Some(now);
+                }
+                Answer::error(code)
+            }
+        },
+    )
 }
 
 /// Dials: a pair from the pool, a slot for the connection, and the legs of
@@ -972,6 +1008,51 @@ fn start_dial(index: usize, destination: u32, port: u16) -> Answer {
             })
         }
         Err(_) => Answer::error(errno::EIO),
+    }
+}
+
+/// Parks a blocking `connect` whose dial is out — RFC 0090 step 6. On the
+/// wake when this thread can have it, since `bin/tcpd` rings it on every
+/// change of the dial's state; otherwise on a timer that **doubles** from ten
+/// milliseconds. The nucleus asks a parked call again at most sixteen times
+/// and then answers `EAGAIN`: ten milliseconds a turn would give a dial 160 ms,
+/// and `bin/tcpd` takes about four minutes to call one unreachable, so the
+/// turns double and sixteen of them last about eleven minutes.
+fn wait_for_dial(request: &PersonalityCall) -> (u64, Answer) {
+    let _ = super::took_timed_wait(request.domain, request.thread);
+    if park_on_wake(request.domain, request.thread) {
+        return (REPLY_BLOCK_ON_RETRY, Answer::ok(adapter::TCP_WAKE as u64));
+    }
+    let turn = dial_park_turn(request.domain, request.thread);
+    match super::park_until(request.domain, request.thread, RETRY_NANOS << turn.min(15)) {
+        Some(slot) => (REPLY_BLOCK_ON_RETRY, Answer::ok(slot)),
+        None => (REPLY_VALUE, Answer::error(errno::EAGAIN)),
+    }
+}
+
+/// How many timed parks this thread's blocking `connect` has taken, counting
+/// this one — the exponent [`wait_for_dial`] doubles by. A full table counts
+/// nothing, which costs the doubling and nothing else.
+fn dial_park_turn(domain: u32, thread: u32) -> u32 {
+    let key = wake_key(domain, thread);
+    let parks = &mut tcp().dial_parks;
+    if let Some(entry) = parks.iter_mut().find(|(held, _)| *held == key) {
+        entry.1 += 1;
+        return entry.1 - 1;
+    }
+    if let Some(entry) = parks.iter_mut().find(|(held, _)| *held == 0) {
+        *entry = (key, 1);
+    }
+    0
+}
+
+/// Forgets a thread's parks once its `connect` has an answer.
+fn forget_dial_parks(domain: u32, thread: u32) {
+    let key = wake_key(domain, thread);
+    for entry in &mut tcp().dial_parks {
+        if entry.0 == key {
+            *entry = (0, 0);
+        }
     }
 }
 

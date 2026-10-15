@@ -1953,7 +1953,7 @@ fn answer(request: &PersonalityCall) -> (u64, Answer) {
         }
         GETPEERNAME => return (REPLY_VALUE, stream::getpeername(request)),
         // RFC 0090 step 4: a dial out, for a program granted the network.
-        CONNECT => return (REPLY_VALUE, stream::connect(request)),
+        CONNECT => return stream::connect(request),
 
         IOCTL => return (REPLY_VALUE, answer_ioctl(request)),
         FSTAT => return (REPLY_VALUE, answer_fstat(request)),
