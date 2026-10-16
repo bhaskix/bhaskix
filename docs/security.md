@@ -247,6 +247,13 @@ We will not pretend to cover these. Each has a note on whether it becomes in-sco
 > today. It is withdrawn only by its domain ending. `pkg run` refuses `cap dial` as it refuses every
 > cap but the console, so no package can ask for it yet.
 >
+> **2026-10-16, step 8: a program granted the network runs on a lane.** The kernel grants `bin/httpd`
+> at creation on the `http` lane, and it dials the echo peer and a refused port while it serves. What
+> that grant holds is all-or-none: the program may open a connection to anywhere `bin/tcpd` reaches,
+> which under QEMU's `restrict=on` is the forwarded peers and nothing else, and on hardware would be
+> the network. RFC 0090's open question 1 — a grant that names destinations — is still open, and
+> this is the first program whose grant it would narrow.
+>
 > **Step 4 (`epoll`, 2026-09-30) adds no capability**, and one thing worth saying: a hosted
 > listener's connections are now **accepted by the adapter before any process asks**, because
 > `tcpd` cannot say a connection waits without handing it over. Such a connection is held in the

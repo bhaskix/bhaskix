@@ -160,6 +160,25 @@ fi
 # made every Go run past a minute corrupt its heap (2026-10-01).
 echo "  info  $(grep -aoE 'MADV_DONTNEED this boot: .*' "$LOG" | head -1 | clean)"
 
+# **RFC 0090 step 8: the server dials out**, granted, while it serves. Once it
+# listens, `bin/httpd` dials the echo peer at 10.0.2.100:9 with Go's own
+# `net.Dial` -- `connect`, the netpoller, `SO_ERROR` and `getpeername`, a path
+# the kernel's dial probe never takes -- and checks its sixteen bytes come
+# back; then dials 10.0.2.100:10, which no guestfwd names, and checks Go reads
+# the refusal as `ECONNREFUSED`. Both lines are the program's own, so a dial
+# that hangs fails here by absence and one that errs fails here and below.
+dials="$(grep -aE 'httpd dial' "$LOG" | clean | tr '\n' ' ')"
+if grep -aqE "httpd dial ok: [0-9.:]+ -> 10\.0\.2\.100:9, 16 bytes echoed" "$LOG"; then
+    pass "Go dialled out from the server and its 16 bytes came back: $(grep -aoE 'httpd dial ok: .*' "$LOG" | head -1 | clean)"
+else
+    fail "the server's Go dial to the echo peer did not report back: ${dials:-no httpd dial line}"
+fi
+if grep -aqE "httpd dial refused ok: dial tcp 10\.0\.2\.100:10: connect: connection refused" "$LOG"; then
+    pass "Go read a refused dial as ECONNREFUSED: $(grep -aoE 'httpd dial refused ok: .*' "$LOG" | head -1 | clean)"
+else
+    fail "the server's Go dial to a refusing port did not report a refusal: ${dials:-no httpd dial line}"
+fi
+
 for marker in "KERNEL PANIC" "EXCEPTION" "FAILED"; do
     if grep -aqF -- "$marker" "$LOG"; then
         fail "found failure marker: $marker -- $(grep -am1 -F -- "$marker" "$LOG" | clean | cut -c1-200)"

@@ -675,8 +675,12 @@ pub(crate) fn accept(request: &PersonalityCall, flags: u64) -> (u64, Answer) {
 /// the peer's stream has reached, which takes nothing, and tells it what the
 /// program has read since it last asked, as `read` does.
 ///
-/// A socket neither listening nor connected reports nothing — Linux says
-/// `EPOLLOUT | EPOLLHUP` for one, and nothing here connects out yet.
+/// A socket that is dialling reports nothing until its dial settles, and all of
+/// it once the dial has failed (RFC 0090 step 4). One that has never been
+/// connected or listened still reports nothing where Linux says
+/// `EPOLLOUT | EPOLLHUP` — a difference no program here has met, since Go
+/// registers a socket with its poller only after `connect` (read in Go
+/// 1.27.1's `net/fd_unix.go`, 2026-10-16).
 pub(crate) fn condition(entry: &Entry) -> (Condition, Option<u64>) {
     let _ = settle(entry.handle as usize);
     let Some(Some(stream)) = tcp().streams.get(entry.handle as usize).copied() else {

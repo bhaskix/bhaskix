@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Draft 2026-10-08. Written before any of it, as RFC 0086 was. **Steps 0–3 done 2026-10-12, steps 4 and 5 on 2026-10-13, step 6 on 2026-10-15, step 7 on 2026-10-16, part 7's grant built inside step 4** (the lead's choice) — slirp's refusal confirmed on both emulators; `RECV`'s third word now says why a connection ended, and a refused dial is told to the caller that made it |
+| **Status** | Draft 2026-10-08. Written before any of it, as RFC 0086 was. **All eight steps built and gated, for the lead to accept**: steps 0–3 done 2026-10-12, steps 4 and 5 on 2026-10-13, step 6 on 2026-10-15, steps 7 and 8 on 2026-10-16, part 7's grant built inside step 4 (the lead's choice) — slirp's refusal confirmed on both emulators; `RECV`'s third word says why a connection ended; a hosted program dials only if granted to, and the grant follows it across `fork` and `execve`; and a Go `net/http` server dials out with Go's own `net.Dial` while it serves |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | net / userspace |
 | **Milestone** | L1 ([roadmap.md](../roadmap.md)) — the row carried out of RFC 0005 step 9, "`connect` — a hosted TCP **client**" |
@@ -429,4 +429,27 @@ Nothing on the server path changes, and the HTTP gate's numbers are the check.
    at `SPAWN` — and recorded in RFC 0033's section on handles and in TRACKER §3. On the passing boot
    both children drew such a slot.
 8. **Go dials out**: a client in the HTTP lane, granted. Then the records — RFC 0005's row, TRACKER's carried
-   row, `security.md`'s T11 note.
+   row, `security.md`'s T11 note. **Done 2026-10-16.** The client is inside `bin/httpd` (the lead's
+   choice, over a second program the kernel had no way to start beside it): once it listens, it
+   dials the echo peer at `10.0.2.100:9` with `net.Dial` and no deadline, checks sixteen bytes come
+   back, and then dials `10.0.2.100:10` and checks Go reads the refusal as `ECONNREFUSED`
+   (`errors.Is`, not the text). The kernel grants the `httpd` domain at creation, because it dials.
+   **Go's path is not the probe's**, read from Go 1.27.1's own source rather than recalled:
+   `connect`, *then* registering the socket with the netpoller, edge-triggered; waking on
+   `EPOLLOUT`, `EPOLLHUP` or `EPOLLERR`; `SO_ERROR`; and `getpeername`, which must succeed or Go
+   waits for another edge — so the step's real question was whether epoll's wake settles the dial
+   before Go asks for its peer, and on the first boot it did:
+   `httpd dial ok: 0.0.0.0:58443 -> 10.0.2.100:9, 16 bytes echoed` and `httpd dial refused ok: dial
+   tcp 10.0.2.100:10: connect: connection refused`, both while sixteen clients loaded the server
+   with no error. The `http` lane gates both lines, and three arms went red, each where it should:
+   the kernel not granting `httpd` (`connect: permission denied`, Go's words for `EACCES`); linuxd
+   answering `getpeername` with `ENOTCONN` — the server kept serving and the dial never reported,
+   Go waiting for an edge, as its source says it would; and epoll reporting nothing for a refused
+   dial — the echo still passed and only the refusal went missing. **Two differences from Linux, both known and
+   both left**: `getsockname` gives the wildcard address with the drawn port, so Go's `LocalAddr()`
+   reads `0.0.0.0` — inside the dial Go reads it only to rule out a self-connect, the same port
+   *and* address as the peer (`selfConnect`, `net/tcpsock_posix.go`), which the wildcard never
+   matches; and
+   `TCP_KEEPCNT` is refused with `ENOPROTOOPT`, which Go ignores and a stricter client might not.
+   A socket never connected or listened still reports no readiness where Linux says
+   `EPOLLOUT | EPOLLHUP`; no program here registers one before `connect`.

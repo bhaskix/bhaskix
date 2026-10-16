@@ -77,6 +77,10 @@ without the workload; it is no longer an acceptance gate.
 **Carried out, each with its home** — tracked in `TRACKER.md` §4 under *Carried out of RFC 0005*:
 
 - **`connect`, and IPv4 UDP loopback** → roadmap **L1**, whose `curl` and OpenSSH need a client.
+  **`connect` is done (2026-10-16)**: [RFC 0090](0090-a-hosted-program-that-dials-out.md), all eight
+  steps — a hosted program dials out if it was granted to, blocking or not, told why a dial ended,
+  and a Go `net/http` server dials with Go's own `net.Dial` on the `http` lane. IPv4 UDP loopback
+  is still carried.
 - **`readlinkat` and `/proc/self/exe`** → **L1**, with step 8's trigger: the first program that
   needs its own path.
 - **Asynchronous signal delivery** — `SIGURG`, and `tgkill` beyond a fatal signal to oneself —
@@ -924,8 +928,9 @@ called as though it had one — the same shape as
 > `getsockname`, `setsockopt` and edge-triggered `epoll` all landed with
 > [RFC 0086](0086-the-motivating-workload.md) (2026-09-30). Still true: `recvfrom` on a
 > datagram socket answers `EAGAIN` rather than waiting (`answer_recvfrom` in `bin/linuxd`), and
-> **`connect` is still not here**, so hosted TCP is server-only; it is carried to L1 by "What it is judged
-> against". The list below is the state of 2026-08-23.
+> ~~**`connect` is still not here**, so hosted TCP is server-only; it is carried to L1 by "What it is judged
+> against".~~ **Corrected 2026-10-16: `connect` is here** — [RFC 0090](0090-a-hosted-program-that-dials-out.md),
+> all eight steps, so hosted TCP dials out as well as serving. The list below is the state of 2026-08-23.
 
 - **No TCP.** `socket()` refuses `SOCK_STREAM` with `EPROTONOSUPPORT` rather
   than handing back a descriptor that would fail at `connect` saying nothing.

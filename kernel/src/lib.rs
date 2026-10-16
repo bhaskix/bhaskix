@@ -5533,6 +5533,14 @@ fn httpd_self_test(hhdm_base: u64, cpus: u32) -> bool {
     if !tag_linux(realm, "httpd          ") {
         return false;
     }
+    // **Granted the network, because this program dials** — RFC 0090 step 8,
+    // and the lead's rule of 2026-10-08 that a hosted program dials out only
+    // if it was granted to. It dials the echo peer and a port nobody answers
+    // while it serves; without this both are told `EACCES`.
+    if domain::grant_dial(realm).is_err() {
+        println!("\x1b[91m{LABEL}FAILED: its domain could not be granted the network\x1b[0m");
+        return false;
+    }
     syscall::trace_domain(realm.as_u32());
     let options = sched::SpawnOptions::new()
         .pinned()
