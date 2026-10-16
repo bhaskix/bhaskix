@@ -254,6 +254,15 @@ We will not pretend to cover these. Each has a note on whether it becomes in-sco
 > the network. RFC 0090's open question 1 — a grant that names destinations — is still open, and
 > this is the first program whose grant it would narrow.
 >
+> **2026-10-16: 127/8 stays inside the host.** Until today `bin/ipd` framed a datagram for
+> `127.0.0.1` to the gateway, and a hosted dial to it put a `SYN` on the wire — traffic RFC 1122
+> §3.2.1.3(g) says "MUST NOT appear outside a host", and the kind a peer on the link could answer
+> as if it were this machine's own loopback. Now a v4 frame naming 127/8 is neither sent nor taken,
+> counted when either is tried, and a v4 datagram for it is delivered locally. **The v6 half is
+> narrower**: `::1` is never framed, but the v6 receive path checks no destination, so a frame from
+> the wire addressed to `::1` would be delivered to a socket on its port — filed in `TRACKER.md`
+> §3.
+>
 > **Step 4 (`epoll`, 2026-09-30) adds no capability**, and one thing worth saying: a hosted
 > listener's connections are now **accepted by the adapter before any process asks**, because
 > `tcpd` cannot say a connection waits without handing it over. Such a connection is held in the

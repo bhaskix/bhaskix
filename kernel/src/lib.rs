@@ -8546,14 +8546,11 @@ const SOCKET_PROBE_CODE_AT: u64 = 0x0000_0000_1900_0000;
 /// by [`tools/probe-bytes.sh`](../../tools/probe-bytes.sh), which verifies its
 /// transcription against the assembled binary.
 ///
-/// **Over `[::1]` and not `127.0.0.1`, and that is a fact about this machine
-/// rather than a preference.** `bin/ipd` reinjects a datagram addressed to
-/// loopback so it never touches a device — and it does that for **v6 only**.
-/// There is no v4 loopback in the service, so a hosted `sendto` to
-/// `127.0.0.1` leaves and does not come back, and the receiving half of this
-/// test could not exist. The v4 path is wired the same way and is *not*
-/// demonstrated here; the trigger for demonstrating it is v4 loopback in
-/// `bin/ipd`, which is that service's decision and not this step's.
+/// **Over `[::1]`, and its v4 twin over `127.0.0.1` since 2026-10-16.** This
+/// said the v4 path could not be shown, and why: `bin/ipd` turned loopback
+/// around for v6 only, so a hosted `sendto` to `127.0.0.1` left and never came
+/// back. ~~The trigger for demonstrating it is v4 loopback in `bin/ipd`.~~ That
+/// trigger was met on 2026-10-16 — see [`SOCKET4_PROBE_CODE`].
 ///
 /// Four calls, and the four bytes it prints went out through `bin/ipd` and
 /// came back: no part of the adapter could have invented them.
@@ -8711,11 +8708,86 @@ const SOCKET_POLL_CODE: [u8; 249] = [
 ];
 
 /// Where the socket the probe binds is placed: a `sockaddr_in6` for `[::1]`
-/// on port 7777, past the code.
+/// on port 7777, past the code. The v4 twin's `sockaddr_in` for
+/// `127.0.0.1:7779` sits at the same offset.
 const SOCKET_PROBE_ADDRESS_AT: u64 = 256;
 const _: () = assert!(
     SOCKET_PROBE_CODE.len() < SOCKET_PROBE_ADDRESS_AT as usize,
     "the socket probe's code has grown into the address beside it"
+);
+
+/// The socket probe's v4 twin — RFC 0005's carried "IPv4 UDP loopback,
+/// shown", 2026-10-16: a hosted Linux program binds `127.0.0.1:7779`, sends a
+/// datagram to itself, and prints it **only if `recvfrom` says it came from
+/// `127.0.0.1:7779`** — so the four bytes on the console, `lo4!`, say the
+/// source was right as well as the payload. Possible since `bin/ipd` turns
+/// 127/8 around as it always turned `::1`.
+///
+/// Assembled from [`tools/probes/linux-socketeer4.s`](../../tools/probes/linux-socketeer4.s)
+/// by [`tools/probe-bytes.sh`](../../tools/probe-bytes.sh), which verifies its
+/// transcription against the assembled binary.
+#[rustfmt::skip]
+const SOCKET4_PROBE_CODE: [u8; 230] = [
+    0x49, 0x89, 0xfc,                         // mov %rdi,%r12
+    0x49, 0x89, 0xf6,                         // mov %rsi,%r14
+    0xbf, 0x02, 0x00, 0x00, 0x00,             // mov $0x2,%edi
+    0xbe, 0x02, 0x00, 0x00, 0x00,             // mov $0x2,%esi
+    0x31, 0xd2,                               // xor %edx,%edx
+    0xb8, 0x29, 0x00, 0x00, 0x00,             // mov $0x29,%eax
+    0x0f, 0x05,                               // syscall
+    0x48, 0x85, 0xc0,                         // test %rax,%rax
+    0x0f, 0x88, 0xb9, 0x00, 0x00, 0x00,       // js db <done>
+    0x49, 0x89, 0xc5,                         // mov %rax,%r13
+    0x4c, 0x89, 0xef,                         // mov %r13,%rdi
+    0x4c, 0x89, 0xf6,                         // mov %r14,%rsi
+    0xba, 0x10, 0x00, 0x00, 0x00,             // mov $0x10,%edx
+    0xb8, 0x31, 0x00, 0x00, 0x00,             // mov $0x31,%eax
+    0x0f, 0x05,                               // syscall
+    0x48, 0x85, 0xc0,                         // test %rax,%rax
+    0x0f, 0x88, 0x9b, 0x00, 0x00, 0x00,       // js db <done>
+    0x41, 0xc7, 0x04, 0x24, 0x6c, 0x6f, 0x34, 0x21, // movl $0x21346f6c,(%r12)
+    0x4c, 0x89, 0xef,                         // mov %r13,%rdi
+    0x4c, 0x89, 0xe6,                         // mov %r12,%rsi
+    0xba, 0x04, 0x00, 0x00, 0x00,             // mov $0x4,%edx
+    0x45, 0x31, 0xd2,                         // xor %r10d,%r10d
+    0x4d, 0x89, 0xf0,                         // mov %r14,%r8
+    0x41, 0xb9, 0x10, 0x00, 0x00, 0x00,       // mov $0x10,%r9d
+    0xb8, 0x2c, 0x00, 0x00, 0x00,             // mov $0x2c,%eax
+    0x0f, 0x05,                               // syscall
+    0x48, 0x85, 0xc0,                         // test %rax,%rax
+    0x78, 0x70,                               // js db <done>
+    0x41, 0xbf, 0x0c, 0x00, 0x00, 0x00,       // mov $0xc,%r15d
+    0x41, 0xc7, 0x84, 0x24, 0xa0, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, // movl $0x10,0xa0(%r12)
+    0x49, 0x8d, 0x74, 0x24, 0x40,             // lea 0x40(%r12),%rsi
+    0x4c, 0x89, 0xef,                         // mov %r13,%rdi
+    0xba, 0x04, 0x00, 0x00, 0x00,             // mov $0x4,%edx
+    0x45, 0x31, 0xd2,                         // xor %r10d,%r10d
+    0x4d, 0x8d, 0x84, 0x24, 0x80, 0x00, 0x00, 0x00, // lea 0x80(%r12),%r8
+    0x4d, 0x8d, 0x8c, 0x24, 0xa0, 0x00, 0x00, 0x00, // lea 0xa0(%r12),%r9
+    0xb8, 0x2d, 0x00, 0x00, 0x00,             // mov $0x2d,%eax
+    0x0f, 0x05,                               // syscall
+    0x48, 0x85, 0xc0,                         // test %rax,%rax
+    0x7f, 0x07,                               // jg b0 <arrived>
+    0x41, 0xff, 0xcf,                         // dec %r15d
+    0x75, 0xc3,                               // jne 71 <retry>
+    0xeb, 0x2b,                               // jmp db <done>
+    0x48, 0x89, 0xc3,                         // mov %rax,%rbx
+    0x48, 0xb9, 0x02, 0x00, 0x1e, 0x63, 0x7f, 0x00, 0x00, 0x01, // movabs $0x100007f631e0002,%rcx
+    0x49, 0x3b, 0x8c, 0x24, 0x80, 0x00, 0x00, 0x00, // cmp 0x80(%r12),%rcx
+    0x75, 0x14,                               // jne db <done>
+    0x48, 0x89, 0xda,                         // mov %rbx,%rdx
+    0x49, 0x8d, 0x74, 0x24, 0x40,             // lea 0x40(%r12),%rsi
+    0xbf, 0x01, 0x00, 0x00, 0x00,             // mov $0x1,%edi
+    0xb8, 0x01, 0x00, 0x00, 0x00,             // mov $0x1,%eax
+    0x0f, 0x05,                               // syscall
+    0x31, 0xff,                               // xor %edi,%edi
+    0xb8, 0xe7, 0x00, 0x00, 0x00,             // mov $0xe7,%eax
+    0x0f, 0x05,                               // syscall
+    0xeb, 0xfe,                               // jmp e4 <done+0x9>
+];
+const _: () = assert!(
+    SOCKET4_PROBE_CODE.len() < SOCKET_PROBE_ADDRESS_AT as usize,
+    "the v4 socket probe's code has grown into the address beside it"
 );
 
 /// Where the directory probe's code lands in its own space.
@@ -8953,6 +9025,34 @@ const _: () = assert!(
 
 /// The thread that becomes the socket probe — RFC 0005 step 9.
 extern "C" fn ring3_socketeer(hhdm_base: u64) -> ! {
+    // A `sockaddr_in6` for `[::1]:7777`, laid out the way
+    // `personality::socket::parse_endpoint` reads one: the family in the
+    // first two bytes **little-endian**, the port in the next two
+    // **big-endian**, then four bytes of flow label, then the address.
+    // Two byte orders four bytes apart is exactly the trap that field
+    // layout sets, and it is written here once rather than assembled by
+    // hand in the probe.
+    let mut address = [0u8; 28];
+    address[0..2].copy_from_slice(&10u16.to_le_bytes()); // AF_INET6
+    address[2..4].copy_from_slice(&7777u16.to_be_bytes());
+    address[8..24].copy_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+    enter_socket_probe(hhdm_base, &SOCKET_PROBE_CODE, &address)
+}
+
+/// The thread that becomes the v4 socket probe — RFC 0005's carried loopback
+/// item, 2026-10-16. A `sockaddr_in` for `127.0.0.1:7779`, in the same two
+/// byte orders.
+extern "C" fn ring3_socketeer4(hhdm_base: u64) -> ! {
+    let mut address = [0u8; 16];
+    address[0..2].copy_from_slice(&2u16.to_le_bytes()); // AF_INET
+    address[2..4].copy_from_slice(&7779u16.to_be_bytes());
+    address[4..8].copy_from_slice(&[127, 0, 0, 1]);
+    enter_socket_probe(hhdm_base, &SOCKET4_PROBE_CODE, &address)
+}
+
+/// Maps a socket probe's code and page, puts its address beside the code, and
+/// enters it — the body both families share.
+fn enter_socket_probe(hhdm_base: u64, code: &[u8], address: &[u8]) -> ! {
     use bhaskix_boot::VirtAddr;
     use bhaskix_mm::{Protection, VirtRange};
     use vm::AddressSpace;
@@ -8977,27 +9077,18 @@ extern "C" fn ring3_socketeer(hhdm_base: u64) -> ! {
     let Some(code_pa) = space.translate(VirtAddr(SOCKET_PROBE_CODE_AT)) else {
         stop()
     };
+    // Both codes are held under the address offset by `const` assertions, and
+    // an address is at most a `sockaddr_in6`; said here too, so the copies
+    // below cannot overlap whatever is passed.
+    if code.len() >= SOCKET_PROBE_ADDRESS_AT as usize || address.len() > 28 {
+        stop()
+    }
     // SAFETY: a freshly mapped frame this space owns, filled through the
     // direct map; the executable mapping is never writable. The address goes
-    // at a fixed offset past the code, which a `const` assertion above holds
-    // clear of it.
+    // at a fixed offset past the code, which the check above holds clear of
+    // it, and both copies stay inside the one frame.
     unsafe {
-        core::ptr::copy_nonoverlapping(
-            SOCKET_PROBE_CODE.as_ptr(),
-            (hhdm_base + code_pa) as *mut u8,
-            SOCKET_PROBE_CODE.len(),
-        );
-        // A `sockaddr_in6` for `[::1]:7777`, laid out the way
-        // `personality::socket::parse_endpoint` reads one: the family in the
-        // first two bytes **little-endian**, the port in the next two
-        // **big-endian**, then four bytes of flow label, then the address.
-        // Two byte orders four bytes apart is exactly the trap that field
-        // layout sets, and it is written here once rather than assembled by
-        // hand in the probe.
-        let mut address = [0u8; 28];
-        address[0..2].copy_from_slice(&10u16.to_le_bytes()); // AF_INET6
-        address[2..4].copy_from_slice(&7777u16.to_be_bytes());
-        address[8..24].copy_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+        core::ptr::copy_nonoverlapping(code.as_ptr(), (hhdm_base + code_pa) as *mut u8, code.len());
         core::ptr::copy_nonoverlapping(
             address.as_ptr(),
             (hhdm_base + code_pa + SOCKET_PROBE_ADDRESS_AT) as *mut u8,
@@ -9356,7 +9447,7 @@ static DIAL_REPORT_PA: core::sync::atomic::AtomicU64 = core::sync::atomic::Atomi
 /// non-blocking `connect` to the echo peer, `poll`, `SO_ERROR`, one round
 /// trip, every answer stored in its page.
 #[rustfmt::skip]
-const DIAL_PROBE_CODE: [u8; 1377] = [
+const DIAL_PROBE_CODE: [u8; 1484] = [
     0x49, 0x89, 0xfc,                         // mov %rdi,%r12
     0x49, 0x89, 0xf6,                         // mov %rsi,%r14
     0x31, 0xdb,                               // xor %ebx,%ebx
@@ -9367,7 +9458,7 @@ const DIAL_PROBE_CODE: [u8; 1377] = [
     0x0f, 0x05,                               // syscall
     0x49, 0x89, 0x04, 0x24,                   // mov %rax,(%r12)
     0x48, 0x85, 0xc0,                         // test %rax,%rax
-    0x0f, 0x88, 0x2c, 0x05, 0x00, 0x00,       // js 554 <done>
+    0x0f, 0x88, 0x97, 0x05, 0x00, 0x00,       // js 5bf <done>
     0x49, 0x89, 0xc5,                         // mov %rax,%r13
     0x4c, 0x89, 0xef,                         // mov %r13,%rdi
     0x4c, 0x89, 0xf6,                         // mov %r14,%rsi
@@ -9378,7 +9469,7 @@ const DIAL_PROBE_CODE: [u8; 1377] = [
     0x48, 0x83, 0xf8, 0xf3,                   // cmp $0xfffffffffffffff3,%rax
     0x0f, 0x84, 0x82, 0x04, 0x00, 0x00,       // je 4ce <inherit>
     0x48, 0x83, 0xf8, 0x8d,                   // cmp $0xffffffffffffff8d,%rax
-    0x0f, 0x85, 0xfe, 0x04, 0x00, 0x00,       // jne 554 <done>
+    0x0f, 0x85, 0x69, 0x05, 0x00, 0x00,       // jne 5bf <done>
     0x45, 0x89, 0xac, 0x24, 0x00, 0x01, 0x00, 0x00, // mov %r13d,0x100(%r12)
     0x66, 0x41, 0xc7, 0x84, 0x24, 0x04, 0x01, 0x00, 0x00, 0x04, 0x00, // movw $0x4,0x104(%r12)
     0x41, 0xbf, 0xf4, 0x01, 0x00, 0x00,       // mov $0x1f4,%r15d
@@ -9395,7 +9486,7 @@ const DIAL_PROBE_CODE: [u8; 1377] = [
     0x74, 0x0a,                               // je b6 <settled>
     0x41, 0xff, 0xcf,                         // dec %r15d
     0x75, 0xbe,                               // jne 6f <writable>
-    0xe9, 0x9e, 0x04, 0x00, 0x00,             // jmpq 554 <done>
+    0xe9, 0x09, 0x05, 0x00, 0x00,             // jmpq 5bf <done>
     0x41, 0xc7, 0x84, 0x24, 0x20, 0x01, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, // movl $0xffffffff,0x120(%r12)
     0x41, 0xc7, 0x84, 0x24, 0x24, 0x01, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, // movl $0x4,0x124(%r12)
     0x4c, 0x89, 0xef,                         // mov %r13,%rdi
@@ -9409,9 +9500,9 @@ const DIAL_PROBE_CODE: [u8; 1377] = [
     0x41, 0x8b, 0x8c, 0x24, 0x20, 0x01, 0x00, 0x00, // mov 0x120(%r12),%ecx
     0x49, 0x89, 0x4c, 0x24, 0x28,             // mov %rcx,0x28(%r12)
     0x48, 0x85, 0xc0,                         // test %rax,%rax
-    0x0f, 0x85, 0x47, 0x04, 0x00, 0x00,       // jne 554 <done>
+    0x0f, 0x85, 0xb2, 0x04, 0x00, 0x00,       // jne 5bf <done>
     0x85, 0xc9,                               // test %ecx,%ecx
-    0x0f, 0x85, 0x3f, 0x04, 0x00, 0x00,       // jne 554 <done>
+    0x0f, 0x85, 0xaa, 0x04, 0x00, 0x00,       // jne 5bf <done>
     0x48, 0xb8, 0x62, 0x68, 0x61, 0x73, 0x6b, 0x69, 0x78, 0x2d, // movabs $0x2d78696b73616862,%rax
     0x48, 0xb9, 0x6c, 0x64, 0x69, 0x61, 0x6c, 0x2d, 0x6f, 0x6b, // movabs $0x6b6f2d6c6169646c,%rcx
     0x49, 0x89, 0x84, 0x24, 0x40, 0x01, 0x00, 0x00, // mov %rax,0x140(%r12)
@@ -9423,7 +9514,7 @@ const DIAL_PROBE_CODE: [u8; 1377] = [
     0x0f, 0x05,                               // syscall
     0x49, 0x89, 0x44, 0x24, 0x30,             // mov %rax,0x30(%r12)
     0x48, 0x83, 0xf8, 0x10,                   // cmp $0x10,%rax
-    0x0f, 0x85, 0xf5, 0x03, 0x00, 0x00,       // jne 554 <done>
+    0x0f, 0x85, 0x60, 0x04, 0x00, 0x00,       // jne 5bf <done>
     0x66, 0x41, 0xc7, 0x84, 0x24, 0x04, 0x01, 0x00, 0x00, 0x01, 0x00, // movw $0x1,0x104(%r12)
     0x41, 0xbf, 0xf4, 0x01, 0x00, 0x00,       // mov $0x1f4,%r15d
     0x66, 0x41, 0xc7, 0x84, 0x24, 0x06, 0x01, 0x00, 0x00, 0x00, 0x00, // movw $0x0,0x106(%r12)
@@ -9439,7 +9530,7 @@ const DIAL_PROBE_CODE: [u8; 1377] = [
     0x74, 0x0a,                               // je 1b7 <arrived>
     0x41, 0xff, 0xcf,                         // dec %r15d
     0x75, 0xbe,                               // jne 170 <readable>
-    0xe9, 0x9d, 0x03, 0x00, 0x00,             // jmpq 554 <done>
+    0xe9, 0x08, 0x04, 0x00, 0x00,             // jmpq 5bf <done>
     0x4c, 0x89, 0xef,                         // mov %r13,%rdi
     0x49, 0x8d, 0xb4, 0x24, 0x80, 0x01, 0x00, 0x00, // lea 0x180(%r12),%rsi
     0xba, 0x10, 0x00, 0x00, 0x00,             // mov $0x10,%edx
@@ -9447,13 +9538,13 @@ const DIAL_PROBE_CODE: [u8; 1377] = [
     0x0f, 0x05,                               // syscall
     0x49, 0x89, 0x44, 0x24, 0x48,             // mov %rax,0x48(%r12)
     0x48, 0x83, 0xf8, 0x10,                   // cmp $0x10,%rax
-    0x0f, 0x85, 0x7a, 0x03, 0x00, 0x00,       // jne 554 <done>
+    0x0f, 0x85, 0xe5, 0x03, 0x00, 0x00,       // jne 5bf <done>
     0x49, 0x8b, 0x84, 0x24, 0x40, 0x01, 0x00, 0x00, // mov 0x140(%r12),%rax
     0x49, 0x3b, 0x84, 0x24, 0x80, 0x01, 0x00, 0x00, // cmp 0x180(%r12),%rax
-    0x0f, 0x85, 0x64, 0x03, 0x00, 0x00,       // jne 554 <done>
+    0x0f, 0x85, 0xcf, 0x03, 0x00, 0x00,       // jne 5bf <done>
     0x49, 0x8b, 0x84, 0x24, 0x48, 0x01, 0x00, 0x00, // mov 0x148(%r12),%rax
     0x49, 0x3b, 0x84, 0x24, 0x88, 0x01, 0x00, 0x00, // cmp 0x188(%r12),%rax
-    0x0f, 0x85, 0x4e, 0x03, 0x00, 0x00,       // jne 554 <done>
+    0x0f, 0x85, 0xb9, 0x03, 0x00, 0x00,       // jne 5bf <done>
     0x49, 0xc7, 0x44, 0x24, 0x50, 0x01, 0x00, 0x00, 0x00, // movq $0x1,0x50(%r12)
     0x4c, 0x89, 0xef,                         // mov %r13,%rdi
     0xb8, 0x03, 0x00, 0x00, 0x00,             // mov $0x3,%eax
@@ -9475,7 +9566,7 @@ const DIAL_PROBE_CODE: [u8; 1377] = [
     0xb8, 0x29, 0x00, 0x00, 0x00,             // mov $0x29,%eax
     0x0f, 0x05,                               // syscall
     0x48, 0x85, 0xc0,                         // test %rax,%rax
-    0x0f, 0x88, 0xe5, 0x02, 0x00, 0x00,       // js 554 <done>
+    0x0f, 0x88, 0x50, 0x03, 0x00, 0x00,       // js 5bf <done>
     0x49, 0x89, 0xc5,                         // mov %rax,%r13
     0x4c, 0x89, 0xef,                         // mov %r13,%rdi
     0x49, 0x8d, 0xb4, 0x24, 0xc0, 0x01, 0x00, 0x00, // lea 0x1c0(%r12),%rsi
@@ -9484,7 +9575,7 @@ const DIAL_PROBE_CODE: [u8; 1377] = [
     0x0f, 0x05,                               // syscall
     0x49, 0x89, 0x84, 0x24, 0x80, 0x00, 0x00, 0x00, // mov %rax,0x80(%r12)
     0x48, 0x83, 0xf8, 0x8d,                   // cmp $0xffffffffffffff8d,%rax
-    0x0f, 0x85, 0xb9, 0x02, 0x00, 0x00,       // jne 554 <done>
+    0x0f, 0x85, 0x24, 0x03, 0x00, 0x00,       // jne 5bf <done>
     0x45, 0x89, 0xac, 0x24, 0x00, 0x01, 0x00, 0x00, // mov %r13d,0x100(%r12)
     0x66, 0x41, 0xc7, 0x84, 0x24, 0x04, 0x01, 0x00, 0x00, 0x04, 0x00, // movw $0x4,0x104(%r12)
     0x41, 0xbf, 0xf4, 0x01, 0x00, 0x00,       // mov $0x1f4,%r15d
@@ -9498,7 +9589,7 @@ const DIAL_PROBE_CODE: [u8; 1377] = [
     0x74, 0x0a,                               // je 2e8 <refused_said>
     0x41, 0xff, 0xcf,                         // dec %r15d
     0x75, 0xd1,                               // jne 2b4 <refused_poll>
-    0xe9, 0x6c, 0x02, 0x00, 0x00,             // jmpq 554 <done>
+    0xe9, 0xd7, 0x02, 0x00, 0x00,             // jmpq 5bf <done>
     0x49, 0x0f, 0xb7, 0x8c, 0x24, 0x06, 0x01, 0x00, 0x00, // movzwq 0x106(%r12),%rcx
     0x49, 0x89, 0x8c, 0x24, 0x88, 0x00, 0x00, 0x00, // mov %rcx,0x88(%r12)
     0x41, 0xc7, 0x84, 0x24, 0x20, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // movl $0x0,0x120(%r12)
@@ -9521,7 +9612,7 @@ const DIAL_PROBE_CODE: [u8; 1377] = [
     0xb8, 0x29, 0x00, 0x00, 0x00,             // mov $0x29,%eax
     0x0f, 0x05,                               // syscall
     0x48, 0x85, 0xc0,                         // test %rax,%rax
-    0x0f, 0x88, 0xe9, 0x01, 0x00, 0x00,       // js 554 <done>
+    0x0f, 0x88, 0x54, 0x02, 0x00, 0x00,       // js 5bf <done>
     0x49, 0x89, 0xc5,                         // mov %rax,%r13
     0x4c, 0x89, 0xef,                         // mov %r13,%rdi
     0x49, 0x8d, 0xb4, 0x24, 0xc0, 0x01, 0x00, 0x00, // lea 0x1c0(%r12),%rsi
@@ -9533,14 +9624,14 @@ const DIAL_PROBE_CODE: [u8; 1377] = [
     0xb8, 0x03, 0x00, 0x00, 0x00,             // mov $0x3,%eax
     0x0f, 0x05,                               // syscall
     0x49, 0x83, 0xbc, 0x24, 0x98, 0x00, 0x00, 0x00, 0x91, // cmpq $0xffffffffffffff91,0x98(%r12)
-    0x0f, 0x85, 0xae, 0x01, 0x00, 0x00,       // jne 554 <done>
+    0x0f, 0x85, 0x19, 0x02, 0x00, 0x00,       // jne 5bf <done>
     0xbf, 0x02, 0x00, 0x00, 0x00,             // mov $0x2,%edi
     0xbe, 0x01, 0x00, 0x00, 0x00,             // mov $0x1,%esi
     0x31, 0xd2,                               // xor %edx,%edx
     0xb8, 0x29, 0x00, 0x00, 0x00,             // mov $0x29,%eax
     0x0f, 0x05,                               // syscall
     0x48, 0x85, 0xc0,                         // test %rax,%rax
-    0x0f, 0x88, 0x92, 0x01, 0x00, 0x00,       // js 554 <done>
+    0x0f, 0x88, 0xfd, 0x01, 0x00, 0x00,       // js 5bf <done>
     0x49, 0x89, 0xc5,                         // mov %rax,%r13
     0x4c, 0x89, 0xef,                         // mov %r13,%rdi
     0x4c, 0x89, 0xf6,                         // mov %r14,%rsi
@@ -9549,7 +9640,7 @@ const DIAL_PROBE_CODE: [u8; 1377] = [
     0x0f, 0x05,                               // syscall
     0x49, 0x89, 0x84, 0x24, 0xa0, 0x00, 0x00, 0x00, // mov %rax,0xa0(%r12)
     0x48, 0x85, 0xc0,                         // test %rax,%rax
-    0x0f, 0x85, 0x6c, 0x01, 0x00, 0x00,       // jne 554 <done>
+    0x0f, 0x85, 0xd7, 0x01, 0x00, 0x00,       // jne 5bf <done>
     0x49, 0xc7, 0x84, 0x24, 0x80, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // movq $0x0,0x180(%r12)
     0x49, 0xc7, 0x84, 0x24, 0x88, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // movq $0x0,0x188(%r12)
     0x4c, 0x89, 0xef,                         // mov %r13,%rdi
@@ -9558,7 +9649,7 @@ const DIAL_PROBE_CODE: [u8; 1377] = [
     0xb8, 0x01, 0x00, 0x00, 0x00,             // mov $0x1,%eax
     0x0f, 0x05,                               // syscall
     0x48, 0x83, 0xf8, 0x10,                   // cmp $0x10,%rax
-    0x0f, 0x85, 0x33, 0x01, 0x00, 0x00,       // jne 554 <done>
+    0x0f, 0x85, 0x9e, 0x01, 0x00, 0x00,       // jne 5bf <done>
     0x45, 0x89, 0xac, 0x24, 0x00, 0x01, 0x00, 0x00, // mov %r13d,0x100(%r12)
     0x66, 0x41, 0xc7, 0x84, 0x24, 0x04, 0x01, 0x00, 0x00, 0x01, 0x00, // movw $0x1,0x104(%r12)
     0x41, 0xbf, 0xf4, 0x01, 0x00, 0x00,       // mov $0x1f4,%r15d
@@ -9572,20 +9663,20 @@ const DIAL_PROBE_CODE: [u8; 1377] = [
     0x74, 0x0a,                               // je 46e <blocking_arrived>
     0x41, 0xff, 0xcf,                         // dec %r15d
     0x75, 0xd1,                               // jne 43a <blocking_readable>
-    0xe9, 0xe6, 0x00, 0x00, 0x00,             // jmpq 554 <done>
+    0xe9, 0x51, 0x01, 0x00, 0x00,             // jmpq 5bf <done>
     0x4c, 0x89, 0xef,                         // mov %r13,%rdi
     0x49, 0x8d, 0xb4, 0x24, 0x80, 0x01, 0x00, 0x00, // lea 0x180(%r12),%rsi
     0xba, 0x10, 0x00, 0x00, 0x00,             // mov $0x10,%edx
     0x31, 0xc0,                               // xor %eax,%eax
     0x0f, 0x05,                               // syscall
     0x48, 0x83, 0xf8, 0x10,                   // cmp $0x10,%rax
-    0x0f, 0x85, 0xc8, 0x00, 0x00, 0x00,       // jne 554 <done>
+    0x0f, 0x85, 0x33, 0x01, 0x00, 0x00,       // jne 5bf <done>
     0x49, 0x8b, 0x84, 0x24, 0x40, 0x01, 0x00, 0x00, // mov 0x140(%r12),%rax
     0x49, 0x3b, 0x84, 0x24, 0x80, 0x01, 0x00, 0x00, // cmp 0x180(%r12),%rax
-    0x0f, 0x85, 0xb2, 0x00, 0x00, 0x00,       // jne 554 <done>
+    0x0f, 0x85, 0x1d, 0x01, 0x00, 0x00,       // jne 5bf <done>
     0x49, 0x8b, 0x84, 0x24, 0x48, 0x01, 0x00, 0x00, // mov 0x148(%r12),%rax
     0x49, 0x3b, 0x84, 0x24, 0x88, 0x01, 0x00, 0x00, // cmp 0x188(%r12),%rax
-    0x0f, 0x85, 0x9c, 0x00, 0x00, 0x00,       // jne 554 <done>
+    0x0f, 0x85, 0x07, 0x01, 0x00, 0x00,       // jne 5bf <done>
     0x49, 0xc7, 0x84, 0x24, 0xa8, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, // movq $0x1,0xa8(%r12)
     0x4c, 0x89, 0xef,                         // mov %r13,%rdi
     0xb8, 0x03, 0x00, 0x00, 0x00,             // mov $0x3,%eax
@@ -9593,8 +9684,8 @@ const DIAL_PROBE_CODE: [u8; 1377] = [
     0xb8, 0x39, 0x00, 0x00, 0x00,             // mov $0x39,%eax
     0x0f, 0x05,                               // syscall
     0x48, 0x85, 0xc0,                         // test %rax,%rax
-    0x78, 0x7a,                               // js 554 <done>
-    0x75, 0x35,                               // jne 511 <inherit_parent>
+    0x0f, 0x88, 0xe1, 0x00, 0x00, 0x00,       // js 5bf <done>
+    0x75, 0x35,                               // jne 515 <inherit_parent>
     0xbf, 0x02, 0x00, 0x00, 0x00,             // mov $0x2,%edi
     0xbe, 0x01, 0x08, 0x00, 0x00,             // mov $0x801,%esi
     0x31, 0xd2,                               // xor %edx,%edx
@@ -9609,7 +9700,7 @@ const DIAL_PROBE_CODE: [u8; 1377] = [
     0x89, 0xc7,                               // mov %eax,%edi
     0xb8, 0xe7, 0x00, 0x00, 0x00,             // mov $0xe7,%eax
     0x0f, 0x05,                               // syscall
-    0xeb, 0xfe,                               // jmp 50f <inherit+0x41>
+    0xeb, 0xfe,                               // jmp 513 <inherit+0x45>
     0x49, 0x89, 0x84, 0x24, 0xb8, 0x00, 0x00, 0x00, // mov %rax,0xb8(%r12)
     0x48, 0x89, 0xc7,                         // mov %rax,%rdi
     0x41, 0xc7, 0x84, 0x24, 0xd0, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // movl $0x0,0x1d0(%r12)
@@ -9621,9 +9712,31 @@ const DIAL_PROBE_CODE: [u8; 1377] = [
     0x49, 0x89, 0x84, 0x24, 0xc0, 0x00, 0x00, 0x00, // mov %rax,0xc0(%r12)
     0x41, 0x8b, 0x8c, 0x24, 0xd0, 0x01, 0x00, 0x00, // mov 0x1d0(%r12),%ecx
     0x49, 0x89, 0x8c, 0x24, 0xb0, 0x00, 0x00, 0x00, // mov %rcx,0xb0(%r12)
+    0x49, 0x8b, 0x06,                         // mov (%r14),%rax
+    0x49, 0x89, 0x84, 0x24, 0xe0, 0x01, 0x00, 0x00, // mov %rax,0x1e0(%r12)
+    0x49, 0x8b, 0x46, 0x08,                   // mov 0x8(%r14),%rax
+    0x49, 0x89, 0x84, 0x24, 0xe8, 0x01, 0x00, 0x00, // mov %rax,0x1e8(%r12)
+    0x41, 0xc7, 0x84, 0x24, 0xe4, 0x01, 0x00, 0x00, 0x7f, 0x00, 0x00, 0x01, // movl $0x100007f,0x1e4(%r12)
+    0xbf, 0x02, 0x00, 0x00, 0x00,             // mov $0x2,%edi
+    0xbe, 0x01, 0x08, 0x00, 0x00,             // mov $0x801,%esi
+    0x31, 0xd2,                               // xor %edx,%edx
+    0xb8, 0x29, 0x00, 0x00, 0x00,             // mov $0x29,%eax
+    0x0f, 0x05,                               // syscall
+    0x48, 0x85, 0xc0,                         // test %rax,%rax
+    0x78, 0x2c,                               // js 5bf <done>
+    0x49, 0x89, 0xc5,                         // mov %rax,%r13
+    0x4c, 0x89, 0xef,                         // mov %r13,%rdi
+    0x49, 0x8d, 0xb4, 0x24, 0xe0, 0x01, 0x00, 0x00, // lea 0x1e0(%r12),%rsi
+    0xba, 0x10, 0x00, 0x00, 0x00,             // mov $0x10,%edx
+    0xb8, 0x2a, 0x00, 0x00, 0x00,             // mov $0x2a,%eax
+    0x0f, 0x05,                               // syscall
+    0x49, 0x89, 0x84, 0x24, 0xc8, 0x00, 0x00, 0x00, // mov %rax,0xc8(%r12)
+    0x4c, 0x89, 0xef,                         // mov %r13,%rdi
+    0xb8, 0x03, 0x00, 0x00, 0x00,             // mov $0x3,%eax
+    0x0f, 0x05,                               // syscall
     0x49, 0xc7, 0x44, 0x24, 0x78, 0x01, 0x00, 0x00, 0x00, // movq $0x1,0x78(%r12)
     0xf3, 0x90,                               // pause
-    0xeb, 0xfc,                               // jmp 55d <idle>
+    0xeb, 0xfc,                               // jmp 5c8 <idle>
 ];
 
 const DIAL_PROBE: ServerProbe = ServerProbe {
@@ -9932,6 +10045,25 @@ fn dial_self_test(hhdm_base: u64, cpus: u32) -> bool {
             a[22], refused[22]
         );
     }
+    // **A dial to 127.0.0.1** -- RFC 0005's carried loopback item,
+    // 2026-10-16. All of 127/8 is this host's loopback, which RFC 1122 says
+    // must not appear outside a host, and v4 TCP has no loopback here: so the
+    // dial is answered `ENETUNREACH` before a pair is taken, where its `SYN`
+    // used to leave for the gateway. Ungranted it is `EACCES`, which says the
+    // grant is still asked first.
+    let loopback = (a[25] as i64) == -101 && (refused[25] as i64) == -13;
+    if loopback {
+        println!(
+            "    linux dial     a dial to 127.0.0.1 answered ENETUNREACH (EACCES first when not \
+             granted) -- v4 TCP has no loopback here, and nothing for 127/8 is dialled"
+        );
+    } else {
+        println!(
+            "\x1b[91m    linux dial     FAILED: a dial to 127.0.0.1 answered {} granted and {} \
+             not, where ENETUNREACH (-101) and EACCES (-13) were owed\x1b[0m",
+            a[25] as i64, refused[25] as i64
+        );
+    }
     // RFC 0090 step 6, after the sixty-four: a dial nobody answers, to
     // 10.0.2.100:10, refused both ways, and a blocking dial that opens. The
     // `poll` answer is what was asked (`POLLOUT`) and what is told unasked
@@ -9981,7 +10113,7 @@ fn dial_self_test(hhdm_base: u64, cpus: u32) -> bool {
             a[12]
         );
     }
-    ok && step_six && kept
+    ok && step_six && kept && loopback
 }
 
 /// RFC 0086 step 4: the same, through `epoll` with non-blocking descriptors.
@@ -13499,6 +13631,77 @@ fn socket_poll_self_test(hhdm_base: u64, cpus: u32) -> bool {
         );
     }
     ok
+}
+
+/// RFC 0005's carried "IPv4 UDP loopback, shown" — 2026-10-16: the v4 twin of
+/// [`socket_self_test`], over `127.0.0.1`.
+///
+/// **The verdict is on the console, as the v6 test's is**: the probe prints
+/// `lo4!` only when its datagram came back *from `127.0.0.1:7779`*, and the
+/// boot test reads it. This says the probe ran and ended — a bounded retry on
+/// `recvfrom` gives up rather than hanging — and why it may not have run.
+fn socket4_self_test(hhdm_base: u64, cpus: u32) -> bool {
+    use core::sync::atomic::Ordering;
+
+    if cpus < 2 {
+        println!("\x1b[93m    linux socket4  skipped, needs a second cpu\x1b[0m");
+        return true;
+    }
+    const CPU: u32 = 3;
+    if network_endpoint_capability().is_none() || !NET_CONTAINED.load(Ordering::Acquire) {
+        println!(
+            "    linux socket4  skipped: no network this machine can drive, so there is no \
+             bin/ipd to turn 127.0.0.1 around"
+        );
+        return true;
+    }
+    let Ok(realm) = domain::create("socketeer4", domain::ResourceEnvelope::new()) else {
+        println!("\x1b[91m    linux socket4  FAILED: no domain\x1b[0m");
+        return false;
+    };
+    if !tag_linux(realm, "linux socket4  ") {
+        return false;
+    }
+    let options = sched::SpawnOptions::new()
+        .pinned()
+        .in_domain(realm.as_u32());
+    if sched::spawn_on_with(
+        CPU,
+        "socketeer4",
+        ring3_socketeer4,
+        hhdm_base,
+        hhdm_base,
+        options,
+    )
+    .is_err()
+    {
+        println!("\x1b[91m    linux socket4  FAILED: the probe would not spawn\x1b[0m");
+        return false;
+    }
+    // The v6 test's bound, for its reasons: twelve `recvfrom`s that each cross
+    // the adapter and the service.
+    let mut ended = false;
+    for _ in 0..4000 {
+        if sched::threads_counted_in(realm.as_u32()) == 0 {
+            ended = true;
+            break;
+        }
+        wait_millis(5);
+    }
+    retire_probe(realm);
+    if ended {
+        println!(
+            "    linux socket4  a Linux program sent a UDP datagram to itself over 127.0.0.1 \
+             through bin/ipd; it prints what came back only if it came from 127.0.0.1:7779, and \
+             that is on the console above or nothing is"
+        );
+    } else {
+        println!(
+            "\x1b[91m    linux socket4  FAILED: the probe never ended -- its bounded retry on \
+             recvfrom should have given up rather than hanging\x1b[0m"
+        );
+    }
+    ended
 }
 
 /// RFC 0005 step 9's witness: a hosted Linux program uses a socket.
@@ -21966,8 +22169,6 @@ fn report_net_after_exchange(hhdm: u64) {
     // the print below that test the same bits, and two spellings of one rule is
     // how they stop agreeing.
     const LACP_WORD: usize = 29;
-    /// `bin/ipd`'s `REPORT_TAIL`, written one word past its report.
-    const IPD_REPORT_TAIL: u64 = 0x4c49_4154_4450_4931;
     const AGGREGATED: u64 = 0x38;
     // Twenty-eight words, 224 bytes. Twenty-one until RFC 0063 appended what
     // the service holds and how often each slot has been reused at 23 and 24 --
@@ -21984,7 +22185,9 @@ fn report_net_after_exchange(hhdm: u64) {
     // to be wrong instead of three.
     // Thirty-eight words and a sentinel, and the last four are `bin/ipd`'s own:
     // the address each of its LACP machines speaks under -- RFC 0076 step 4.
-    let mut ipd = [0u64; 52];
+    // Fifty-two and the sentinel since 2026-10-16, when word 51 -- loopback --
+    // was appended; the sentinel's index is the array's last, not a number.
+    let mut ipd = [0u64; 53];
     // SAFETY: a frame this object owns, through the direct map, read as the
     // little-endian words the service wrote there -- `ipd.len() * 8` bytes of
     // a page, so the read cannot reach past the frame.
@@ -22471,7 +22674,7 @@ fn report_net_after_exchange(hhdm: u64) {
     // the boot report said in a sentence that the switch recorded no partner.
     // Checked on every boot, not only where the words are used, because the
     // cheapest place to catch it is before anybody believes a number.
-    let complete = ipd[51] == IPD_REPORT_TAIL;
+    let complete = ipd[ipd.len() - 1] == IPD_REPORT_TAIL;
     if !complete {
         println!(
             "\x1b[93m    ipd report     INCOMPLETE: this kernel reads {} words and bin/ipd \
@@ -24172,6 +24375,45 @@ fn tcp_report_bytes(hhdm: u64, frame: u64) -> &'static [u8] {
     // SAFETY: a frame the report object owns, through the direct map, read as
     // the little-endian words the service wrote there.
     unsafe { core::slice::from_raw_parts((hhdm + frame) as *const u8, bytes) }
+}
+
+/// `bin/ipd`'s `REPORT_TAIL`, written one word past its report.
+const IPD_REPORT_TAIL: u64 = 0x4c49_4154_4450_4931;
+
+/// What `bin/ipd`'s loopback did, at the end of the boot — its report word 51,
+/// RFC 0005's carried "IPv4 UDP loopback", 2026-10-16.
+///
+/// **Read late, for the reason [`report_tcp_cookies_late`] is.** The boot's
+/// first look at this report comes before the socket probes run, so a
+/// turnaround count printed there reads zero on every boot. Printed, not
+/// judged: the v4 probe's own four bytes are the gate, and the count kept off
+/// the wire is zero on a correct boot, where nothing frames 127/8 at all.
+fn report_loopback_late(hhdm: u64) {
+    use core::sync::atomic::Ordering;
+
+    let raw = NET_RING_REPORT.load(Ordering::Acquire);
+    if raw == u64::MAX {
+        return;
+    }
+    let Some((pages, count)) = shared::frames_of(shared::MemoryId::from_u64(raw)) else {
+        return;
+    };
+    if count == 0 {
+        return;
+    }
+    let base = hhdm + pages[0];
+    // Only from a report written to its full length, so a zero is one the
+    // service wrote rather than page memory.
+    if report_page_word(base, 52) != IPD_REPORT_TAIL {
+        return;
+    }
+    let word = report_page_word(base, 51);
+    println!(
+        "    ipd loopback*  {} v4 datagram(s) for 127/8 turned around; {} frame(s) naming 127/8 \
+         kept off the wire",
+        word >> 32,
+        word & 0xffff_ffff
+    );
 }
 
 /// The cookie count again, at the end of the boot.
@@ -28255,6 +28497,9 @@ fn user_shell(handoff: &Handoff) -> Result<(), &'static str> {
     if !socket_self_test(hhdm, bhaskix_arch::percpu::online_count()) {
         println!("\x1b[91m    linux socket   FAILED\x1b[0m");
     }
+    if !socket4_self_test(hhdm, bhaskix_arch::percpu::online_count()) {
+        println!("\x1b[91m    linux socket4  FAILED\x1b[0m");
+    }
     if !killed_domain_gives_its_socket_back(hhdm, bhaskix_arch::percpu::online_count()) {
         println!("\x1b[91m    socket reclaim FAILED\x1b[0m");
     }
@@ -28390,6 +28635,7 @@ fn user_shell(handoff: &Handoff) -> Result<(), &'static str> {
         // lock per byte, which is what tore the hosted line for weeks. It is
         // false here on a healthy boot, and a gate reads this line.
         report_tcp_cookies_late(handoff.hhdm_base.as_u64());
+        report_loopback_late(handoff.hhdm_base.as_u64());
 
         // **The mismark counter, read at the end rather than only at the ring.**
         //

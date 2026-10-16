@@ -77,6 +77,9 @@ impl Ipv4Addr {
     /// `255.255.255.255` — the limited broadcast address.
     pub const BROADCAST: Self = Self(u32::MAX);
 
+    /// `127.0.0.1` — this host, by its loopback.
+    pub const LOOPBACK: Self = Self::new(127, 0, 0, 1);
+
     /// Builds an address from its four octets, most significant first.
     #[must_use]
     pub const fn new(a: u8, b: u8, c: u8, d: u8) -> Self {
@@ -129,6 +132,16 @@ impl Ipv4Addr {
     #[must_use]
     pub const fn is_unspecified(self) -> bool {
         self.0 == 0
+    }
+
+    /// Whether this address is in `127.0.0.0/8`, **all** of which is this
+    /// host's loopback — RFC 1122 §3.2.1.3(g), read 2026-10-16: "Internal host
+    /// loopback address. Addresses of this form MUST NOT appear outside a
+    /// host." So a datagram for one is delivered here and never framed, and a
+    /// frame carrying one, in either address, is neither sent nor taken.
+    #[must_use]
+    pub const fn is_loopback(self) -> bool {
+        self.0 >> 24 == 127
     }
 
     /// Whether this address is on `self`'s network given `prefix` bits.
@@ -195,6 +208,9 @@ impl Ipv6Addr {
     /// `ff02::2` — every router on the link.
     pub const ALL_ROUTERS: Self = Self([0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
 
+    /// `::1` — this node, by its loopback.
+    pub const LOOPBACK: Self = Self([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+
     /// An address from eight 16-bit segments, written the way the literature
     /// writes them.
     #[must_use]
@@ -236,6 +252,15 @@ impl Ipv6Addr {
     #[must_use]
     pub const fn is_unspecified(self) -> bool {
         matches!(self.0, [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+    }
+
+    /// Whether this is `::1` — **one address**, where IPv4's loopback is a
+    /// whole `/8`. RFC 4291 §2.5.3, read 2026-10-16: a packet to it "must
+    /// never be sent outside of a single node", and one "received on an
+    /// interface with a destination address of loopback must be dropped".
+    #[must_use]
+    pub const fn is_loopback(self) -> bool {
+        matches!(self.0, [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1])
     }
 
     /// The EUI-64 interface identifier of a MAC address: the six bytes with
@@ -388,6 +413,15 @@ impl Address {
         }
     }
 
+    /// Whether this is the family's loopback — see each family's own.
+    #[must_use]
+    pub const fn is_loopback(self) -> bool {
+        match self {
+            Self::V4(address) => address.is_loopback(),
+            Self::V6(address) => address.is_loopback(),
+        }
+    }
+
     /// Whether this is the family's "nobody yet" address.
     #[must_use]
     pub const fn is_unspecified(self) -> bool {
@@ -532,5 +566,29 @@ mod tests {
         assert!(Ipv4Addr::new(239, 255, 255, 255).is_multicast());
         assert!(!Ipv4Addr::new(223, 255, 255, 255).is_multicast());
         assert!(!Ipv4Addr::new(240, 0, 0, 0).is_multicast());
+    }
+
+    #[test]
+    fn v4_loopback_is_the_whole_slash_eight_and_no_more() {
+        // The /8's edges are in -- not only `127.0.0.1` ...
+        assert!(Ipv4Addr::LOOPBACK.is_loopback());
+        assert!(Ipv4Addr::new(127, 0, 0, 0).is_loopback());
+        assert!(Ipv4Addr::new(127, 255, 255, 255).is_loopback());
+        assert!(Ipv4Addr::new(127, 1, 2, 3).is_loopback());
+        // ... and its neighbours are out.
+        assert!(!Ipv4Addr::new(126, 255, 255, 255).is_loopback());
+        assert!(!Ipv4Addr::new(128, 0, 0, 0).is_loopback());
+        assert!(!Ipv4Addr::new(10, 0, 2, 15).is_loopback());
+        assert!(Address::V4(Ipv4Addr::new(127, 9, 9, 9)).is_loopback());
+    }
+
+    #[test]
+    fn v6_loopback_is_one_address() {
+        assert!(Ipv6Addr::LOOPBACK.is_loopback());
+        assert!(!Ipv6Addr::UNSPECIFIED.is_loopback());
+        assert!(!Ipv6Addr::new([0, 0, 0, 0, 0, 0, 0, 2]).is_loopback());
+        // `::ffff:127.0.0.1` is a v4-mapped address, not v6's loopback.
+        assert!(!Ipv6Addr::new([0, 0, 0, 0, 0, 0xffff, 0x7f00, 1]).is_loopback());
+        assert!(Address::V6(Ipv6Addr::LOOPBACK).is_loopback());
     }
 }

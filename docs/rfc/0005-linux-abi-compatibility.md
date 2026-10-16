@@ -61,7 +61,7 @@ acceptance call stays theirs~~ **and accepted it as amended the same day.**
 | 6 | Threads and futex, with a contention stress test | **Part** — `clone`, `gettid`, `exit_group` and `futex` gated; `tgkill` delivers only a fatal signal a thread sends itself; **no contention stress test exists** |
 | 7 | Tier 0: corpus programs 1–5 pass | **Superseded by step 10** — below |
 | 8 | Tier 1, with its fuzz target | **Part** — all but `readlinkat` and `/proc/self/exe`, left out on purpose (step 8's record) |
-| 9 | Tier 2: sockets and `epoll` | **Part** — UDP, server-side TCP and edge-triggered `epoll` gated; **no `connect`**, so hosted TCP is server-only, and IPv4 UDP loopback was never shown |
+| 9 | Tier 2: sockets and `epoll` | **Part** — UDP, server-side TCP and edge-triggered `epoll` gated; ~~**no `connect`**, so hosted TCP is server-only, and IPv4 UDP loopback was never shown~~ **both carried items done 2026-10-16**: `connect` ([RFC 0090](0090-a-hosted-program-that-dials-out.md)), and IPv4 UDP loopback, shown over `127.0.0.1` |
 | 10 | The motivating workload under load | ✅ **Met 2026-10-01**, [RFC 0086](0086-the-motivating-workload.md) |
 
 **Step 10 supersedes step 7's corpus.** The corpus was the work queue while no workload was
@@ -79,8 +79,12 @@ without the workload; it is no longer an acceptance gate.
 - **`connect`, and IPv4 UDP loopback** → roadmap **L1**, whose `curl` and OpenSSH need a client.
   **`connect` is done (2026-10-16)**: [RFC 0090](0090-a-hosted-program-that-dials-out.md), all eight
   steps — a hosted program dials out if it was granted to, blocking or not, told why a dial ended,
-  and a Go `net/http` server dials with Go's own `net.Dial` on the `http` lane. IPv4 UDP loopback
-  is still carried.
+  and a Go `net/http` server dials with Go's own `net.Dial` on the `http` lane. ~~IPv4 UDP loopback
+  is still carried.~~ **IPv4 UDP loopback is done too (2026-10-16)**: `bin/ipd` turns all of 127/8
+  around as it always turned `::1`, and keeps 127/8 off the wire either way, which RFC 1122
+  §3.2.1.3(g) requires ("MUST NOT appear outside a host"); a hosted program sends a datagram to
+  itself over `127.0.0.1` and reads it back from `127.0.0.1:7779`. A hosted v4 *TCP* dial to 127/8
+  is answered `ENETUNREACH` — v4 TCP has no loopback yet, and is carried in `TRACKER.md` §4.
 - **`readlinkat` and `/proc/self/exe`** → **L1**, with step 8's trigger: the first program that
   needs its own path.
 - **Asynchronous signal delivery** — `SIGURG`, and `tgkill` beyond a fatal signal to oneself —
@@ -841,11 +845,14 @@ absorbed, because I5's whole value is that departures from it stay visible.
 ### Over `[::1]`, and that is a fact about this machine
 
 `bin/ipd` reinjects a datagram addressed to loopback so it never touches a
-device — **for v6 only**. There is no v4 loopback in the service, so a hosted
+device — ~~**for v6 only**. There is no v4 loopback in the service, so a hosted
 `sendto` to `127.0.0.1` leaves and does not come back, and the receiving half
 of this test could not exist over v4. The v4 path is wired identically and is
 **not** demonstrated; the trigger for demonstrating it is v4 loopback in
-`bin/ipd`, which is that service's decision.
+`bin/ipd`, which is that service's decision.~~ **Corrected 2026-10-16: for v4
+too.** The service turns all of 127/8 around and keeps it off the wire, and a
+twin of this test runs over `127.0.0.1`, checking the source `recvfrom` names
+as well as the bytes.
 
 ### Three findings, and the first is about the test rather than the code
 

@@ -134,13 +134,17 @@ const MARKER: u64 = 0x3154_5052_4450_4931;
 /// sentence, that the switch recorded no partner: a conclusion drawn entirely
 /// from memory nobody had assigned. The array literal that feeds this function
 /// must have exactly this many entries, and the compiler now says so.
-const REPORT_WORDS: usize = 51;
+///
+/// **Fifty-two since 2026-10-16**, when word 51 -- what loopback turned around
+/// and kept off the wire -- was appended after the ARP stall counts.
+const REPORT_WORDS: usize = 52;
 
-/// **And tied to the machines behind its last four words.** Those four are
-/// written out one per line, because an array literal is what `write_report`
-/// takes -- so a fifth LACP machine would be a fifth address with nowhere to
-/// go, and the total would still add up. This is what says it would not.
-const _: () = assert!(REPORT_WORDS == 39 + 3 * LACP_MACHINES);
+/// **And tied to the machines behind the per-link words.** Those are written
+/// out one per line, because an array literal is what `write_report` takes --
+/// so a fifth LACP machine would be a fifth address with nowhere to go, and
+/// the total would still add up. This is what says it would not: three groups
+/// of one word per machine, and forty others.
+const _: () = assert!(REPORT_WORDS == 40 + 3 * LACP_MACHINES);
 
 /// The last word, written with a sentinel so a reader can prove the page was
 /// written to its full length rather than trusting that it was.
@@ -784,10 +788,6 @@ const HOST6: Ipv6Addr = Ipv6Addr::new([0xfec0, 0, 0, 0, 0, 0, 0, 2]);
 /// from [`BURST_ID`], because the identifier is how replies are told apart.
 const PING6_ID: u16 = 0xbe59;
 
-/// `::1`. Self-addressed traffic never touches a wire on a correct stack;
-/// a datagram sent here is delivered to the matching socket directly.
-const LOOPBACK6: Ipv6Addr = Ipv6Addr([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
-
 /// RFC 0018 step 7: the burst that prices the two-domain split.
 ///
 /// Every packet in this burst crosses the boundary twice — once from `bin/netd`
@@ -1230,11 +1230,6 @@ unsafe fn read_runs(base: u64, into: *mut u8, runs: (ring::Run, ring::Run)) {
     }
 }
 
-/// Builds and hands over one UDP datagram.
-///
-/// Every layer of it comes from `bhaskix-net`: the same code the parser on the
-/// other side of the wire is tested against, and the reason this program can
-/// send a correct packet without knowing how to drive anything.
 /// Builds and sends one v6 datagram: UDP over IPv6 over Ethernet, every
 /// byte from `bhaskix-net`, everything routed via `via` — the router's
 /// link address, the same one-road discipline the v4 path has with its
@@ -1270,6 +1265,11 @@ fn send_datagram6(
     unsafe { send(&out[..at + body]) }
 }
 
+/// Builds and hands over one UDP datagram.
+///
+/// Every layer of it comes from `bhaskix-net`: the same code the parser on the
+/// other side of the wire is tested against, and the reason this program can
+/// send a correct packet without knowing how to drive anything.
 fn send_datagram(
     me: (MacAddr, Ipv4Addr),
     gateway: MacAddr,
@@ -1278,6 +1278,13 @@ fn send_datagram(
     to_port: u16,
     payload: &[u8],
 ) -> bool {
+    // **127/8 is not framed** -- RFC 1122 §3.2.1.3(g). `SEND_TO` turns it
+    // around before calling here, so this is the check that holds for every
+    // other caller.
+    if to.is_loopback() || me.1.is_loopback() {
+        kept_off_the_wire();
+        return false;
+    }
     let mut out = [0u8; MAX_FRAME];
     let body = match udp::write(
         &mut out[eth::HEADER + ipv4::HEADER..],
@@ -1320,6 +1327,67 @@ fn send_datagram(
 
 /// Datagrams placed into a bound socket. See `drain_ring`.
 static DELIVERED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// v4 datagrams for `127.0.0.0/8` delivered here instead of framed — the
+/// loopback `::1` always had, given to v4 (RFC 0005's carried item,
+/// 2026-10-16). The high half of report word 51.
+static LOOPBACK_TURNED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// v4 frames carrying a `127.0.0.0/8` address, either way, that were not sent
+/// or not taken: RFC 1122 §3.2.1.3(g), "Addresses of this form MUST NOT appear
+/// outside a host". **Zero on a correct boot**, because nothing here frames
+/// one once the turnaround exists; a count is a path that tried. The low half
+/// of report word 51.
+static LOOPBACK_KEPT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Report word 51: [`LOOPBACK_TURNED`] above bit 32, [`LOOPBACK_KEPT`] below.
+fn loopback_word() -> u64 {
+    let turned = LOOPBACK_TURNED.load(core::sync::atomic::Ordering::Relaxed);
+    let kept = LOOPBACK_KEPT.load(core::sync::atomic::Ordering::Relaxed);
+    (turned.min(u64::from(u32::MAX)) << 32) | kept.min(u64::from(u32::MAX))
+}
+
+/// Counts one 127/8 frame kept off the wire.
+fn kept_off_the_wire() {
+    LOOPBACK_KEPT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Puts one datagram into the socket of the family `v6` says, bound to
+/// `port`, rings the bell and counts it — the wire's delivery and
+/// loopback's, which were the same lines written three times. `false` when
+/// no socket holds the port: the datagram is gone, exactly as the wire would
+/// lose it.
+fn deliver(
+    sockets: &mut [Socket; SOCKETS],
+    v6: bool,
+    port: u16,
+    payload: &[u8],
+    from: Address,
+    from_port: u16,
+) -> bool {
+    let Some(socket) = sockets
+        .iter_mut()
+        .find(|held| held.v6 == v6 && held.port != 0 && held.port == port)
+    else {
+        return false;
+    };
+    // One datagram, and a second overwrites the first rather than being
+    // dropped: the newest answer is the one a client asking now wants, and
+    // a queue is a later question.
+    let take = payload.len().min(DATAGRAM);
+    socket.held[..take].copy_from_slice(&payload[..take]);
+    socket.length = take as u16;
+    ring_datagram_bell();
+    socket.from = from;
+    socket.from_port = from_port;
+    // **Counted, because nothing counted it.** Every number this program
+    // reported described frames crossing the ring; not one said whether a
+    // datagram ever reached a socket. So "the client heard nothing" and
+    // "the service delivered nothing" were the same observation, and the
+    // search went looking at the device three times over.
+    DELIVERED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    true
+}
 
 /// Bulk copies of a packet's bytes this program has made.
 ///
@@ -1382,6 +1450,8 @@ mod why {
     pub const NOT_FOR_US: u64 = 5;
     pub const NOT_A_DATAGRAM: u64 = 6;
     pub const NO_SOCKET: u64 = 7;
+    /// A v4 frame naming `127.0.0.0/8` -- see `LOOPBACK_KEPT`.
+    pub const LOOPBACK: u64 = 8;
 }
 
 /// Records why a frame was refused, **with the bytes that caused it**.
@@ -1511,6 +1581,7 @@ fn refresh() {
         LLDP_MANAGEMENT.load(Relaxed),
         LLDP_NAME.load(Relaxed),
         ASK_STALLS.load(Relaxed),
+        loopback_word(),
     ]);
 }
 
@@ -1742,7 +1813,7 @@ fn drain_tcp_back(
             destination6.copy_from_slice(&entry[20..36]);
             let (source6, destination6) = (Ipv6Addr(source6), Ipv6Addr(destination6));
             let segment = &entry[36..length];
-            if destination6 == LOOPBACK6 {
+            if destination6.is_loopback() {
                 // SAFETY: the forward ring is mapped writable.
                 if unsafe { forward_tcp6(source6, destination6, segment) } {
                     TCP_RETURNED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -1780,6 +1851,14 @@ fn drain_tcp_back(
         }
 
         let destination = Ipv4Addr(u32::from_be_bytes([entry[4], entry[5], entry[6], entry[7]]));
+        // **127/8 is not framed** -- RFC 1122 §3.2.1.3(g). v4 TCP has no
+        // loopback here (`::1` does, above), and `bin/linuxd` answers a hosted
+        // dial to 127/8 `ENETUNREACH` before it reaches `bin/tcpd`; a native
+        // caller's segment stops here rather than leaving for the gateway.
+        if destination.is_loopback() || me.1.is_loopback() {
+            kept_off_the_wire();
+            continue;
+        }
         let segment = &entry[8..length];
         let body_length = segment.len();
         if ipv4::write_header(
@@ -2044,23 +2123,16 @@ fn drain_ring(
                 refuse(why::NOT_A_DATAGRAM, length, seen);
                 continue;
             };
-            let Some(socket) = sockets
-                .iter_mut()
-                .find(|held| held.v6 && held.port != 0 && held.port == datagram.destination.0)
-            else {
+            if !deliver(
+                sockets,
+                true,
+                datagram.destination.0,
+                datagram.payload,
+                Address::V6(header6.source),
+                datagram.source.0,
+            ) {
                 refuse(why::NO_SOCKET, length, seen);
-                continue;
-            };
-            let take = datagram.payload.len().min(DATAGRAM);
-            socket.held[..take].copy_from_slice(&datagram.payload[..take]);
-            socket.length = take as u16;
-            ring_datagram_bell();
-            socket.from = Address::V6(header6.source);
-            socket.from_port = datagram.source.0;
-            DELIVERED.store(
-                DELIVERED.load(core::sync::atomic::Ordering::Relaxed) + 1,
-                core::sync::atomic::Ordering::Relaxed,
-            );
+            }
             continue;
         }
         if parsed.ethertype != EtherType::IPV4 {
@@ -2071,6 +2143,15 @@ fn drain_ring(
             refuse(why::NOT_A_HEADER, length, seen);
             continue;
         };
+        // **127/8 does not arrive from a wire** -- RFC 1122 §3.2.1.3(g). A
+        // frame naming it, as source or destination, is not this host's to
+        // take, whatever it carries; before the TCP hand-off, so it reaches
+        // no service at all.
+        if header.source.is_loopback() || header.destination.is_loopback() {
+            kept_off_the_wire();
+            refuse(why::LOOPBACK, length, seen);
+            continue;
+        }
         // RFC 0020 step 4: a TCP segment for this interface goes to the
         // domain that understands it. Forwarded before the UDP refusal, so
         // "not UDP" keeps meaning what it says — a protocol nobody here
@@ -2096,31 +2177,16 @@ fn drain_ring(
             refuse(why::NOT_A_DATAGRAM, length, seen);
             continue;
         };
-        let Some(socket) = sockets
-            .iter_mut()
-            .find(|held| !held.v6 && held.port != 0 && held.port == datagram.destination.0)
-        else {
+        if !deliver(
+            sockets,
+            false,
+            datagram.destination.0,
+            datagram.payload,
+            Address::V4(header.source),
+            datagram.source.0,
+        ) {
             refuse(why::NO_SOCKET, length, seen);
-            continue;
-        };
-        // One datagram, and a second overwrites the first rather than being
-        // dropped: the newest answer is the one a client asking now wants, and
-        // a queue is a later question.
-        let take = datagram.payload.len().min(DATAGRAM);
-        socket.held[..take].copy_from_slice(&datagram.payload[..take]);
-        socket.length = take as u16;
-        ring_datagram_bell();
-        socket.from = Address::V4(header.source);
-        socket.from_port = datagram.source.0;
-        // **Counted, because nothing counted it.** Every number this program
-        // reported described frames crossing the ring; not one said whether a
-        // datagram ever reached a socket. So "the client heard nothing" and
-        // "the service delivered nothing" were the same observation, and the
-        // search went looking at the device three times over.
-        DELIVERED.store(
-            DELIVERED.load(core::sync::atomic::Ordering::Relaxed) + 1,
-            core::sync::atomic::Ordering::Relaxed,
-        );
+        }
     }
 }
 
@@ -2375,14 +2441,28 @@ fn serve(
                     reply(socket::GONE, 0, 0);
                     continue;
                 }
-                let sent = send_datagram(
-                    me,
-                    gateway,
-                    held.port,
-                    Ipv4Addr(args[0] as u32),
-                    args[1] as u16,
-                    &payload[..(took as usize).min(wanted)],
-                );
+                let to = Ipv4Addr(args[0] as u32);
+                let payload = &payload[..(took as usize).min(wanted)];
+                // **Loopback first, as `::1`'s arm does** -- all of 127/8, which
+                // RFC 1122 §3.2.1.3(g) says must not appear outside a host. Until
+                // 2026-10-16 this went to `send_datagram` and out to the gateway,
+                // so a datagram to `127.0.0.1` left and never came back. The
+                // source is `127.0.0.1` and the sender's port, as `::1` is
+                // `::1`'s; a port nobody holds swallows it, as the wire would.
+                if to.is_loopback() {
+                    let _ = deliver(
+                        sockets,
+                        false,
+                        args[1] as u16,
+                        payload,
+                        Address::V4(Ipv4Addr::LOOPBACK),
+                        held.port,
+                    );
+                    LOOPBACK_TURNED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                    reply(socket::OK, 0, 0);
+                    continue;
+                }
+                let sent = send_datagram(me, gateway, held.port, to, args[1] as u16, payload);
                 reply(if sent { socket::OK } else { socket::NO_NETWORK }, 0, 0);
             }
             socket::SEND_TO6 if !held.v6 => {
@@ -2417,23 +2497,15 @@ fn serve(
                 // socket here, with the source the convention names. A
                 // port nobody holds swallows the datagram, exactly as the
                 // wire would.
-                if to == LOOPBACK6 {
-                    let from_port = held.port;
-                    if let Some(target) = sockets
-                        .iter_mut()
-                        .find(|other| other.v6 && other.port != 0 && other.port == to_port)
-                    {
-                        let take = length.min(DATAGRAM);
-                        target.held[..take].copy_from_slice(&payload[..take]);
-                        target.length = take as u16;
-                        ring_datagram_bell();
-                        target.from = Address::V6(LOOPBACK6);
-                        target.from_port = from_port;
-                        DELIVERED.store(
-                            DELIVERED.load(core::sync::atomic::Ordering::Relaxed) + 1,
-                            core::sync::atomic::Ordering::Relaxed,
-                        );
-                    }
+                if to.is_loopback() {
+                    let _ = deliver(
+                        sockets,
+                        true,
+                        to_port,
+                        &payload[..length],
+                        Address::V6(Ipv6Addr::LOOPBACK),
+                        held.port,
+                    );
                     reply(socket::OK, 0, 0);
                     continue;
                 }
@@ -3851,6 +3923,10 @@ fn report(
         // -- so a word placed in the middle silently renumbers all of them. The
         // first attempt at this put it at index 6 and moved everything after.
         ASK_STALLS.load(core::sync::atomic::Ordering::Relaxed),
+        // **Word 51: loopback**, appended for the same reason -- v4 datagrams
+        // turned around in the high half, frames naming 127/8 kept off the
+        // wire in the low. See `loopback_word`.
+        loopback_word(),
     ];
     V6_PREFIX.store(v6_prefix, core::sync::atomic::Ordering::Relaxed);
     V6_STATE.store(v6_state, core::sync::atomic::Ordering::Relaxed);

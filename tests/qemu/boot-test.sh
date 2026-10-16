@@ -3002,6 +3002,15 @@ if grep -qE "linux dial +a hosted program not granted the network was refused \(
         fail "the grant across fork: $(grep -aoE 'linux dial +(FAILED: the grant across fork|the (granted|ungranted) run did not finish).*' "$LOG" | head -1 | sed 's/\x1b\[[0-9;]*m//g')"
         status=1
     fi
+    # 2026-10-16: a dial to 127.0.0.1 is answered ENETUNREACH -- v4 TCP has no
+    # loopback here, and RFC 1122 keeps 127/8 inside a host -- with the grant
+    # still asked first.
+    if grep -qF "linux dial     a dial to 127.0.0.1 answered ENETUNREACH (EACCES first when not granted)" "$LOG"; then
+        pass "a hosted dial to 127.0.0.1 was answered ENETUNREACH, and EACCES first when ungranted"
+    else
+        fail "a dial to 127.0.0.1: $(grep -aoE 'linux dial +FAILED: a dial to 127.*' "$LOG" | head -1 | sed 's/\x1b\[[0-9;]*m//g')"
+        status=1
+    fi
 elif grep -qE "linux dial +FAILED" "$LOG"; then
     fail "a hosted dial: $(grep -aoE 'linux dial +FAILED.*' "$LOG" | head -1 | sed 's/\x1b\[[0-9;]*m//g')"
     status=1
@@ -4213,8 +4222,8 @@ fi
 # what `recvfrom` gave back. It is in no file, no service and no part of the
 # adapter, so it cannot appear unless the datagram made the round trip.
 #
-# Over v6 because `bin/ipd` reinjects loopback for v6 only. The v4 path is
-# wired identically and is deliberately not claimed here.
+# Over v6 here; ~~because `bin/ipd` reinjects loopback for v6 only~~ -- since
+# 2026-10-16 v4 has its own gate, the next one.
 if grep -qE "linux socket   a Linux program bound a UDP socket and sent a datagram" "$LOG"; then
     if grep -qF "dup0" "$LOG"; then
         pass "a hosted program bound a UDP socket and echoed a datagram to itself"
@@ -4227,6 +4236,26 @@ elif grep -qF "linux socket   skipped" "$LOG"; then
     pass "no network this machine can drive, so hosted sockets have nothing to ask"
 else
     fail "the hosted socket test did not conclude: $(grep -aoE 'linux socket .*' "$LOG" | head -1)"
+    status=1
+fi
+
+# The v4 twin, over 127.0.0.1 -- RFC 0005's carried "IPv4 UDP loopback,
+# shown", 2026-10-16, possible since `bin/ipd` turns 127/8 around as it always
+# turned `::1`. **`lo4!` is the gate, for the reason above, and it is a
+# stronger one**: the probe prints it only if `recvfrom` said the datagram came
+# from 127.0.0.1:7779, so a datagram delivered with the wrong source fails here
+# as surely as one that never came back.
+if grep -qE "linux socket4  a Linux program sent a UDP datagram to itself over 127\.0\.0\.1" "$LOG"; then
+    if grep -qF "lo4!" "$LOG"; then
+        pass "a hosted program sent a UDP datagram to itself over 127.0.0.1 and read it back from 127.0.0.1:7779"
+    else
+        fail "the v4 socket probe ran and nothing came back from 127.0.0.1:7779 -- the datagram left for the wire, went to no socket, or came back under another source"
+        status=1
+    fi
+elif grep -qF "linux socket4  skipped" "$LOG"; then
+    pass "no network this machine can drive, so there is no bin/ipd to turn 127.0.0.1 around"
+else
+    fail "the v4 socket test did not conclude: $(grep -aoE 'linux socket4 .*' "$LOG" | head -1 | sed 's/\x1b\[[0-9;]*m//g')"
     status=1
 fi
 
