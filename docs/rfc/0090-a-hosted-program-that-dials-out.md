@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Draft 2026-10-08. Written before any of it, as RFC 0086 was. **All eight steps built and gated, for the lead to accept**: steps 0–3 done 2026-10-12, steps 4 and 5 on 2026-10-13, step 6 on 2026-10-15, steps 7 and 8 on 2026-10-16, part 7's grant built inside step 4 (the lead's choice) — slirp's refusal confirmed on both emulators; `RECV`'s third word says why a connection ended; a hosted program dials only if granted to, and the grant follows it across `fork` and `execve`; and a Go `net/http` server dials out with Go's own `net.Dial` while it serves |
+| **Status** | ✅ **ACCEPTED 2026-10-16 by the project lead.** Drafted 2026-10-08, written before any of it, as RFC 0086 was — **all eight steps built and gated**: steps 0–3 done 2026-10-12, steps 4 and 5 on 2026-10-13, step 6 on 2026-10-15, steps 7 and 8 on 2026-10-16, part 7's grant built inside step 4 (the lead's choice) — slirp's refusal confirmed on both emulators; `RECV`'s third word says why a connection ended; a hosted program dials only if granted to, and the grant follows it across `fork` and `execve`; and a Go `net/http` server dials out with Go's own `net.Dial` while it serves |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | net / userspace |
 | **Milestone** | L1 ([roadmap.md](../roadmap.md)) — the row carried out of RFC 0005 step 9, "`connect` — a hosted TCP **client**" |
