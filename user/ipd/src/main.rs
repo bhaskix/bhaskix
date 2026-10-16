@@ -28,6 +28,7 @@
 #![no_main]
 
 use bhaskix_abi::{method, rights, ring, socket, status, syscall};
+use bhaskix_net::arrival::{Arrival, arrival4, arrival6};
 use bhaskix_net::{
     Address, ArpOp, ArpPacket, EthFrame, EtherType, Ipv4Addr, Ipv4Header, Ipv6Addr, Ipv6Header,
     MacAddr, NeighbourCache, NextHeader, Port, Protocol, UdpDatagram, arp, eth, icmp, icmpv6, ipv4,
@@ -1243,6 +1244,12 @@ fn send_datagram6(
     to_port: u16,
     payload: &[u8],
 ) -> bool {
+    // **`::1` is not framed** -- RFC 4291 §2.5.3. `SEND_TO6` turns it around
+    // before calling here, so this holds for every other caller.
+    if to.is_loopback() || from.is_loopback() {
+        kept_off_the_wire();
+        return false;
+    }
     let mut out = [0u8; MAX_FRAME];
     let at = eth::HEADER + ipv6::HEADER;
     let body = match udp::write6(
@@ -1333,10 +1340,11 @@ static DELIVERED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64:
 /// 2026-10-16). The high half of report word 51.
 static LOOPBACK_TURNED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
-/// v4 frames carrying a `127.0.0.0/8` address, either way, that were not sent
-/// or not taken: RFC 1122 §3.2.1.3(g), "Addresses of this form MUST NOT appear
-/// outside a host". **Zero on a correct boot**, because nothing here frames
-/// one once the turnaround exists; a count is a path that tried. The low half
+/// Frames naming a loopback address, either way, that were not sent or not
+/// taken: 127/8 for v4 (RFC 1122 §3.2.1.3(g), "Addresses of this form MUST NOT
+/// appear outside a host") and `::1` for v6 (RFC 4291 §2.5.3) since the v6
+/// door, 2026-10-16. **Zero on a correct boot**, because nothing here frames
+/// one once the turnarounds exist; a count is a path that tried. The low half
 /// of report word 51.
 static LOOPBACK_KEPT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
@@ -1347,7 +1355,7 @@ fn loopback_word() -> u64 {
     (turned.min(u64::from(u32::MAX)) << 32) | kept.min(u64::from(u32::MAX))
 }
 
-/// Counts one 127/8 frame kept off the wire.
+/// Counts one frame naming a loopback address kept off the wire.
 fn kept_off_the_wire() {
     LOOPBACK_KEPT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
 }
@@ -1450,7 +1458,7 @@ mod why {
     pub const NOT_FOR_US: u64 = 5;
     pub const NOT_A_DATAGRAM: u64 = 6;
     pub const NO_SOCKET: u64 = 7;
-    /// A v4 frame naming `127.0.0.0/8` -- see `LOOPBACK_KEPT`.
+    /// A frame naming a loopback address, 127/8 or `::1` -- see `LOOPBACK_KEPT`.
     pub const LOOPBACK: u64 = 8;
 }
 
@@ -1820,6 +1828,12 @@ fn drain_tcp_back(
                 }
                 continue;
             }
+            // A segment from `::1` to anywhere else would carry the loopback
+            // address off this node, which RFC 4291 §2.5.3 forbids.
+            if source6.is_loopback() {
+                kept_off_the_wire();
+                continue;
+            }
             let (Some(_from), Some(via)) = (v6_from, router6) else {
                 continue;
             };
@@ -1916,6 +1930,7 @@ fn publish_tcp_tail(tail: u64) {
 fn drain_ring(
     sockets: &mut [Socket; SOCKETS],
     me: (MacAddr, Ipv4Addr),
+    me6: (Ipv6Addr, Option<Ipv6Addr>),
     tail: &mut u64,
     can_tcp: bool,
     lacp: &mut Bundle,
@@ -2114,6 +2129,22 @@ fn drain_ring(
                 refuse(why::NOT_A_HEADER, length, seen);
                 continue;
             };
+            // **The door, which this branch did not have until 2026-10-16** --
+            // it delivered a datagram for any host by port, `::1` included.
+            // `bhaskix_net::arrival` decides, host-tested, because no lane can
+            // put such a frame on this wire.
+            match arrival6(header6.source, header6.destination, me6.0, me6.1) {
+                Arrival::Accept => {}
+                Arrival::Loopback => {
+                    kept_off_the_wire();
+                    refuse(why::LOOPBACK, length, seen);
+                    continue;
+                }
+                Arrival::NotForUs => {
+                    refuse(why::NOT_FOR_US, length, seen);
+                    continue;
+                }
+            }
             if header6.next_header != NextHeader::UDP {
                 refuse(why::NOT_UDP, length, seen);
                 continue;
@@ -2143,14 +2174,21 @@ fn drain_ring(
             refuse(why::NOT_A_HEADER, length, seen);
             continue;
         };
-        // **127/8 does not arrive from a wire** -- RFC 1122 §3.2.1.3(g). A
-        // frame naming it, as source or destination, is not this host's to
-        // take, whatever it carries; before the TCP hand-off, so it reaches
-        // no service at all.
-        if header.source.is_loopback() || header.destination.is_loopback() {
-            kept_off_the_wire();
-            refuse(why::LOOPBACK, length, seen);
-            continue;
+        // **One door, decided in `bhaskix_net::arrival`**: 127/8 either way
+        // (RFC 1122 §3.2.1.3(g)), then this host's address or the broadcast.
+        // Before the TCP hand-off, so a refused frame reaches no service at
+        // all; the `NOT_FOR_US` check that sat after the UDP one is this.
+        match arrival4(header.source, header.destination, me.1) {
+            Arrival::Accept => {}
+            Arrival::Loopback => {
+                kept_off_the_wire();
+                refuse(why::LOOPBACK, length, seen);
+                continue;
+            }
+            Arrival::NotForUs => {
+                refuse(why::NOT_FOR_US, length, seen);
+                continue;
+            }
         }
         // RFC 0020 step 4: a TCP segment for this interface goes to the
         // domain that understands it. Forwarded before the UDP refusal, so
@@ -2167,10 +2205,6 @@ fn drain_ring(
         }
         if header.protocol != Protocol::UDP || header.is_fragment() {
             refuse(why::NOT_UDP, length, seen);
-            continue;
-        }
-        if header.destination != me.1 && header.destination != Ipv4Addr::BROADCAST {
-            refuse(why::NOT_FOR_US, length, seen);
             continue;
         }
         let Ok(datagram) = UdpDatagram::parse(payload, header.source, header.destination) else {
@@ -2295,7 +2329,15 @@ fn serve(
                 NOTIFIED_WAKES.load(core::sync::atomic::Ordering::Relaxed) + 1,
                 core::sync::atomic::Ordering::Relaxed,
             );
-            drain_ring(sockets, me, &mut tail, can_tcp, &mut lacp, &mut openings);
+            drain_ring(
+                sockets,
+                me,
+                (Ipv6Addr::link_local_from(me.0), v6_from),
+                &mut tail,
+                can_tcp,
+                &mut lacp,
+                &mut openings,
+            );
             if can_tcp {
                 drain_tcp_back(me, gateway, v6_from, router6, &mut tcp_tail);
             }
@@ -2409,7 +2451,15 @@ fn serve(
                 // this would answer "nothing waiting" for a datagram already in
                 // the ring, and a program polling the socket would be told for
                 // ever that nothing had arrived while its datagrams piled up.
-                drain_ring(sockets, me, &mut tail, can_tcp, &mut lacp, &mut openings);
+                drain_ring(
+                    sockets,
+                    me,
+                    (Ipv6Addr::link_local_from(me.0), v6_from),
+                    &mut tail,
+                    can_tcp,
+                    &mut lacp,
+                    &mut openings,
+                );
                 // The length, and **nothing taken**: the datagram stays where
                 // it is for the `recvfrom` that follows.
                 reply(socket::OK, u64::from(sockets[index as usize].length), 0);
@@ -2527,7 +2577,15 @@ fn serve(
                 // asking for a datagram is the only event it can act on. Not a
                 // workaround: the alternative is a poll loop, and this system
                 // has already paid for one of those today.
-                drain_ring(sockets, me, &mut tail, can_tcp, &mut lacp, &mut openings);
+                drain_ring(
+                    sockets,
+                    me,
+                    (Ipv6Addr::link_local_from(me.0), v6_from),
+                    &mut tail,
+                    can_tcp,
+                    &mut lacp,
+                    &mut openings,
+                );
 
                 let waiting = sockets[index as usize];
                 if waiting.length == 0 {
@@ -2566,7 +2624,15 @@ fn serve(
                 reply(socket::WRONG_FAMILY, 0, 0);
             }
             socket::RECV_FROM6 => {
-                drain_ring(sockets, me, &mut tail, can_tcp, &mut lacp, &mut openings);
+                drain_ring(
+                    sockets,
+                    me,
+                    (Ipv6Addr::link_local_from(me.0), v6_from),
+                    &mut tail,
+                    can_tcp,
+                    &mut lacp,
+                    &mut openings,
+                );
                 let waiting = sockets[index as usize];
                 if waiting.length == 0 {
                     reply(socket::EMPTY, 0, 0);
@@ -3924,8 +3990,8 @@ fn report(
         // first attempt at this put it at index 6 and moved everything after.
         ASK_STALLS.load(core::sync::atomic::Ordering::Relaxed),
         // **Word 51: loopback**, appended for the same reason -- v4 datagrams
-        // turned around in the high half, frames naming 127/8 kept off the
-        // wire in the low. See `loopback_word`.
+        // turned around in the high half, frames naming a loopback address
+        // kept off the wire in the low. See `loopback_word`.
         loopback_word(),
     ];
     V6_PREFIX.store(v6_prefix, core::sync::atomic::Ordering::Relaxed);

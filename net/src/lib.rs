@@ -54,6 +54,8 @@
 
 pub mod addr;
 pub mod arp;
+/// What a host takes off a wire — one verdict per family.
+pub mod arrival;
 pub mod dhcp;
 pub mod eth;
 pub mod icmp;

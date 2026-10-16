@@ -24387,7 +24387,7 @@ const IPD_REPORT_TAIL: u64 = 0x4c49_4154_4450_4931;
 /// first look at this report comes before the socket probes run, so a
 /// turnaround count printed there reads zero on every boot. Printed, not
 /// judged: the v4 probe's own four bytes are the gate, and the count kept off
-/// the wire is zero on a correct boot, where nothing frames 127/8 at all.
+/// the wire is zero on a correct boot, where nothing frames a loopback address.
 fn report_loopback_late(hhdm: u64) {
     use core::sync::atomic::Ordering;
 
@@ -24409,8 +24409,8 @@ fn report_loopback_late(hhdm: u64) {
     }
     let word = report_page_word(base, 51);
     println!(
-        "    ipd loopback*  {} v4 datagram(s) for 127/8 turned around; {} frame(s) naming 127/8 \
-         kept off the wire",
+        "    ipd loopback*  {} v4 datagram(s) for 127/8 turned around; {} frame(s) naming a \
+         loopback address (127/8 or ::1) kept off the wire",
         word >> 32,
         word & 0xffff_ffff
     );
