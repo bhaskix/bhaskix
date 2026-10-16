@@ -7092,6 +7092,19 @@ fn answer_wait(request: &PersonalityCall) -> (u64, Answer) {
     }
 }
 
+/// Carries the dial grant from a hosted process's domain to the one in
+/// [`CHILD`] — RFC 0090 step 7. `fork` and `execve` put a process in a domain
+/// this program makes; without this the grant stayed behind, and a granted
+/// program's children and exec'd images could not dial. Asked of the nucleus,
+/// which keeps the grant, and given by it: this program only copies one that
+/// exists. A refusal leaves the new domain ungranted, which is closed.
+fn inherit_dial(from: u32) {
+    let asked = call(syscall::INVOKE, handle_of(from), method::MAY_DIAL, [0; 4]);
+    if asked.status == status::OK && asked.args[0] != 0 {
+        let _ = call(syscall::INVOKE, CHILD, method::GRANT_DIAL, [0; 4]);
+    }
+}
+
 /// Answers a hosted `fork` — RFC 0033 step 8, stage one.
 ///
 /// **By copying, and the copying is the point.** The RFC's stage two is a
@@ -7150,6 +7163,9 @@ fn answer_fork(request: &PersonalityCall, image: &[u64; FAULT_REGISTERS]) -> Ans
     // parent was sent to the parent.
     let inherited = dispositions_of(request.domain).clone();
     dispositions_of(child_domain).inherit(&inherited);
+    // **And its right to dial, if it had one** — RFC 0090 step 7. Before the
+    // child's first thread starts, so it cannot reach `connect` ungranted.
+    inherit_dial(request.domain);
     let outcome = build_fork_child(request, rip, rsp);
     // **Keep a capability to the child before letting go of the build slot** —
     // RFC 0079. `CHILD` is one slot, reused by the next fork, and until now it
@@ -7424,6 +7440,9 @@ fn answer_execve(request: &PersonalityCall) -> (u64, Answer) {
         return (REPLY_VALUE, Answer::error(-11));
     }
     let child = took_spawned(made.args[0]);
+    // The process keeps its right to dial across the exec — RFC 0090 step 7.
+    // Here, while the old domain lives and before the new one runs anything.
+    inherit_dial(request.domain);
 
     // **The errno is the builder's to choose.** The built-in image can only
     // fail for want of memory; a program off the filesystem can be refused by

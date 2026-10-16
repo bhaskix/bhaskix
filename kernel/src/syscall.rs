@@ -171,6 +171,7 @@ const _: () = {
     assert!(method::POLL_INPUT == bhaskix_abi::method::POLL_INPUT);
     assert!(method::PEEK_INPUT == bhaskix_abi::method::PEEK_INPUT);
     assert!(method::MAY_DIAL == bhaskix_abi::method::MAY_DIAL);
+    assert!(method::GRANT_DIAL == bhaskix_abi::method::GRANT_DIAL);
     // The adapter's CSpace layout is stated in the ABI so both sides read one
     // file -- see `bhaskix_abi::adapter`, and the three collisions in one day
     // that put it there. Its own assertions check the layout; this checks that
@@ -327,6 +328,8 @@ pub mod method {
     pub const DISCARD_AT: u64 = 76;
     /// See `bhaskix_abi::method::MAY_DIAL`.
     pub const MAY_DIAL: u64 = 77;
+    /// See `bhaskix_abi::method::GRANT_DIAL`.
+    pub const GRANT_DIAL: u64 = 78;
     /// Map the memory this capability names into the caller's address space.
     ///
     /// Only on a `Memory` capability. `arg0` = where, page-aligned; `arg1`
@@ -1159,7 +1162,12 @@ fn dispatch_inner(frame: &mut SyscallFrame) -> Outcome {
     if kind == Some(Kind::Invoke)
         && matches!(
             frame.method,
-            method::BIND | method::INFO | method::RELEASE | method::END | method::MAY_DIAL
+            method::BIND
+                | method::INFO
+                | method::RELEASE
+                | method::END
+                | method::MAY_DIAL
+                | method::GRANT_DIAL
         )
         && let Some(outcome) = domain_lifecycle(frame)
     {
@@ -4533,6 +4541,25 @@ fn domain_lifecycle(frame: &SyscallFrame) -> Option<Outcome> {
                 return Some(Outcome::err(Status::InsufficientRights));
             }
             Outcome::ok(u64::from(domain::may_dial(target.as_u32())))
+        }
+
+        // **Grant it** — RFC 0090 step 7. `WRITE`, since it changes what the
+        // domain may do; and never on the caller's own domain, because a
+        // program granting itself the network would make the grant mean
+        // nothing. `PERSONALITY` is refused on oneself by a thread check this
+        // has no equivalent of, so the refusal is said here outright, as
+        // `END` says it.
+        method::GRANT_DIAL => {
+            if !rights.contains(crate::cap::Rights::WRITE) {
+                return Some(Outcome::err(Status::InsufficientRights));
+            }
+            if target == me {
+                return Some(Outcome::err(Status::WrongObject));
+            }
+            match domain::grant_dial(target) {
+                Ok(()) => Outcome::ok(0),
+                Err(_) => Outcome::err(Status::NoDomain),
+            }
         }
 
         // **End a domain that is still running** — RFC 0080. `RELEASE` below

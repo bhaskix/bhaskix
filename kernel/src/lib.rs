@@ -9895,29 +9895,32 @@ fn dial_self_test(hhdm_base: u64, cpus: u32) -> bool {
         && a[10] == 1
         && a[11] == 1
         && a[12] == 64;
-    // **A forked child keeps its identity** -- the defect found 2026-10-16.
-    // Nothing grants a forked child the network yet, so both answer `EACCES`
-    // and exit 13, and each parent collects exactly that. A child whose slot
-    // the adapter had held a handle for was ended by the slot's previous
-    // occupant's `FORGET` instead: collected as killed by signal 9, or never
-    // collected, its parent parked in `wait4` for good. How many of the two
-    // took such a slot is said, so a pass on a boot where none did is not
-    // mistaken for the path having run.
+    // **RFC 0090 step 7: the grant follows a fork.** A granted program's
+    // forked child dials -- `EINPROGRESS`, exit 115 -- so the grant came with
+    // it; an ungranted one's is refused -- `EACCES`, exit 13 -- so forking
+    // gave nothing. Both are a child's own status as well, which is the
+    // defect found 2026-10-16: a child whose slot the adapter had held a
+    // handle for was ended by the slot's previous occupant's `FORGET`,
+    // collected as killed by signal 9 or never collected. How many of the
+    // two took such a slot is said, so a pass on a boot where none did is not
+    // mistaken for that path having run.
     let replaced = syscall::ADAPTER_SPAWN_REPLACED
         .load(Ordering::Relaxed)
         .wrapping_sub(replaced_before);
     let granted_child = child_of(a[22]);
-    let kept = granted_child == Some(13) && ungranted_child == Some(13);
+    let kept = granted_child == Some(115) && ungranted_child == Some(13);
     if kept {
         println!(
-            "    linux dial     a forked child exited with its own status in both runs (13, \
-             EACCES) -- {replaced} of the 2 took a slot the adapter had held a handle for"
+            "    linux dial     a forked child of a granted program dialled (EINPROGRESS); one of \
+             an ungranted program was refused (EACCES) -- the grant follows the process; \
+             {replaced} of the 2 took a slot the adapter had held a handle for"
         );
     } else {
         println!(
-            "\x1b[91m    linux dial     FAILED: a forked child's status -- the granted run's \
-             {granted_child:?}, the ungranted run's {ungranted_child:?} (wait statuses {:#x}, \
-             {:#x}); {replaced} of the 2 took a slot the adapter had held a handle for\x1b[0m",
+            "\x1b[91m    linux dial     FAILED: the grant across fork -- the granted program's \
+             child {granted_child:?}, the ungranted one's {ungranted_child:?} (wait statuses \
+             {:#x}, {:#x}); {replaced} of the 2 took a slot the adapter had held a handle \
+             for\x1b[0m",
             a[22], refused[22]
         );
     }
@@ -13901,6 +13904,46 @@ fn exec_self_test(hhdm_base: u64, cpus: u32) -> bool {
     ended
 }
 
+/// What the hosted exec self-test learned of the dial grant -- RFC 0090 step 7.
+#[derive(Clone, Copy)]
+enum Followed {
+    /// No record of this exec has appeared yet.
+    Unread,
+    /// The domain the exec made holds the grant.
+    Granted,
+    /// It is alive and does not.
+    Refused,
+    /// It had ended before it was asked, and a grant ends with its domain.
+    Gone,
+}
+
+impl Followed {
+    /// Reads the grant of the domain linuxd's exec record names, once: a
+    /// record that is still `before`, or that names an exec out of some
+    /// domain other than `from`, is not this exec's.
+    fn or_read(self, before: Option<[u64; 3]>, from: u32) -> Self {
+        if !matches!(self, Self::Unread) {
+            return self;
+        }
+        let Some(record) = adapter_exec_record() else {
+            return self;
+        };
+        if Some(record) == before || record[1] != u64::from(from) {
+            return self;
+        }
+        let Ok(to) = u32::try_from(record[2]) else {
+            return Self::Gone;
+        };
+        if domain::may_dial(to) {
+            Self::Granted
+        } else if matches!(domain::state_of(domain::DomainId::from_u32(to)), Ok(None)) {
+            Self::Refused
+        } else {
+            Self::Gone
+        }
+    }
+}
+
 /// RFC 0059's witness: a Linux program `execve`s a **real program off the
 /// filesystem**, with the arguments and environment its parent chose.
 ///
@@ -14054,6 +14097,19 @@ with {} deferred wake(s) during that write",
     if !tag_linux(realm, "hosted exec    ") {
         return false;
     }
+    // **Granted the network before it execs, so that the domain it becomes
+    // can be asked whether the grant came along** -- RFC 0090 step 7. Nothing
+    // here dials; the grant is given only to be followed.
+    if domain::grant_dial(realm).is_err() {
+        println!(
+            "\x1b[91m    hosted exec    FAILED: its domain could not be granted the network\x1b[0m"
+        );
+        return false;
+    }
+    // The record as it stands now, so that an older one is not read as this
+    // exec's: the built-in exec's record names a domain whose slot this one
+    // may have reused.
+    let record_before = adapter_exec_record();
     let options = sched::SpawnOptions::new()
         .pinned()
         .in_domain(realm.as_u32());
@@ -14071,14 +14127,23 @@ with {} deferred wake(s) during that write",
         return false;
     }
 
+    // **Read as soon as the record appears, not once the probe is gone.** A
+    // grant is cleared with its domain, so the domain the exec made has to be
+    // asked while it lives. linuxd writes the record before it answers the
+    // `execve`, and every call the new program makes waits on linuxd, so the
+    // program cannot have finished before the record is there to be read.
+    let mut followed = Followed::Unread;
     let mut ended = false;
     for _ in 0..400 {
+        followed = followed.or_read(record_before, realm.as_u32());
         if sched::threads_counted_in(realm.as_u32()) == 0 {
             ended = true;
             break;
         }
         wait_millis(5);
     }
+    // Once more: the exec may have landed between this loop's two looks.
+    followed = followed.or_read(record_before, realm.as_u32());
     retire_probe(realm);
 
     if !ended {
@@ -14115,6 +14180,30 @@ with {} deferred wake(s) during that write",
         None => println!(
             "\x1b[93m    hosted exec    the adapter kept no record of it, so the pid cannot be \
              checked from both ends\x1b[0m"
+        ),
+    }
+    // **And whether the grant came along** -- RFC 0090 step 7. Asked of the
+    // nucleus about the domain linuxd's record names, so linuxd's claim to
+    // have copied it is not what is checked.
+    match followed {
+        Followed::Granted => println!(
+            "    hosted exec    the domain it became holds the dial grant its program held -- the \
+             grant follows an execve"
+        ),
+        Followed::Refused => {
+            println!(
+                "\x1b[91m    hosted exec    FAILED: the domain it became is alive without the \
+                 dial grant its program held\x1b[0m"
+            );
+            return false;
+        }
+        Followed::Gone => println!(
+            "\x1b[93m    hosted exec    the dial grant could not be read: the domain the exec \
+             made had ended before it was asked\x1b[0m"
+        ),
+        Followed::Unread => println!(
+            "\x1b[93m    hosted exec    the dial grant could not be read: no record of this exec \
+             appeared\x1b[0m"
         ),
     }
     true

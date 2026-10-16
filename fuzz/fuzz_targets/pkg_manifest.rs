@@ -314,7 +314,7 @@ fn push_length(out: &mut Vec<u8>, variant: u8, value: u64) {
 /// helper is used by the arm that must produce a manifest which parses.
 fn push_valid_cap(out: &mut Vec<u8>, choice: u8, service: &[u8], pages: u64) {
     out.extend_from_slice(b"cap ");
-    match choice % 13 {
+    match choice % 14 {
         0 => out.extend_from_slice(b"console"),
         1 => out.extend_from_slice(b"notification"),
         2 => out.extend_from_slice(b"timer"),
@@ -325,6 +325,8 @@ fn push_valid_cap(out: &mut Vec<u8>, choice: u8, service: &[u8], pages: u64) {
         7 => out.extend_from_slice(b"directory"),
         8 => out.extend_from_slice(b"directory writable"),
         9 => out.extend_from_slice(b"memory"),
+        // RFC 0090 step 7.
+        13 => out.extend_from_slice(b"dial"),
         10 => {
             out.extend_from_slice(b"memory pages=");
             push_decimal(out, pages);
@@ -651,12 +653,13 @@ const DIRECTIVES: [&[u8]; 12] = [
 
 /// Arguments that are plausible for *some* directive and therefore wrong for
 /// most of them.
-const ARGUMENTS: [&[u8]; 14] = [
+const ARGUMENTS: [&[u8]; 15] = [
     b"hello",
     b"0.1.0",
     b"bin/hello",
     b"hertz",
     b"console",
+    b"dial",
     b"memory pages=2",
     b"memory pages=0",
     b"endpoint net",

@@ -672,9 +672,13 @@ fn live_id(raw: u32) -> bool {
 /// The nucleus keeps it and answers [`may_dial`]; **`bin/linuxd` is what
 /// refuses**, because `bin/tcpd` sees the adapter's badge and never the hosted
 /// domain's. A compromised adapter can therefore dial for anyone — T11's
-/// shape, stated in `security.md`. Nor does it survive `fork` or `execve`,
-/// which move a hosted process into domains `bin/linuxd` makes: that fails
-/// closed, and inheritance is a later step.
+/// shape, stated in `security.md`.
+///
+/// **It follows a process, because `bin/linuxd` copies it** (step 7): `fork`
+/// and `execve` move a hosted process into domains the adapter makes, and the
+/// adapter asks [`may_dial`] of the old one and grants the new one through
+/// `GRANT_DIAL`. A holder of a domain capability with `WRITE` may grant it —
+/// to any domain but its own, so no program grants itself the network.
 static DIAL_GRANTED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// Lets `id` open connections out of this machine.

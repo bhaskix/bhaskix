@@ -2990,14 +2990,16 @@ if grep -qE "linux dial +a hosted program not granted the network was refused \(
         fail "a refused or blocking dial: $(grep -aoE 'linux dial +FAILED: refused.*' "$LOG" | head -1 | sed 's/\x1b\[[0-9;]*m//g')"
         status=1
     fi
-    # A forked child keeps its identity (2026-10-16): each run forks once, and
-    # each parent must collect its own child's exit status -- 13, since nothing
-    # grants a child the network -- not a signal 9 from the slot's previous
-    # occupant's FORGET, and not a wait that never ends.
-    if grep -qE "linux dial +a forked child exited with its own status in both runs \(13, EACCES\) -- [0-2] of the 2 took a slot the adapter had held a handle for" "$LOG"; then
-        pass "a forked child exited with its own status in both runs: $(grep -aoE '[0-2] of the 2 took a slot the adapter had held a handle for' "$LOG" | head -1)"
+    # RFC 0090 step 7: the grant follows a fork. Both halves in one line --
+    # a granted program's child dials, an ungranted one's is refused -- so a
+    # grant that leaked to every child fails it as surely as one that was lost.
+    # Each is also the child's own exit status, collected by its parent: not
+    # a signal 9 from the slot's previous occupant's FORGET, and not a wait
+    # that never ends (2026-10-16).
+    if grep -qE "linux dial +a forked child of a granted program dialled \(EINPROGRESS\); one of an ungranted program was refused \(EACCES\) -- the grant follows the process; [0-2] of the 2 took a slot the adapter had held a handle for" "$LOG"; then
+        pass "a forked child of a granted program dialled, and one of an ungranted program was refused (RFC 0090 step 7); $(grep -aoE '[0-2] of the 2 took a slot the adapter had held a handle for' "$LOG" | head -1)"
     else
-        fail "a forked child's status: $(grep -aoE 'linux dial +(FAILED: a forked child|the (granted|ungranted) run did not finish).*' "$LOG" | head -1 | sed 's/\x1b\[[0-9;]*m//g')"
+        fail "the grant across fork: $(grep -aoE 'linux dial +(FAILED: the grant across fork|the (granted|ungranted) run did not finish).*' "$LOG" | head -1 | sed 's/\x1b\[[0-9;]*m//g')"
         status=1
     fi
 elif grep -qE "linux dial +FAILED" "$LOG"; then
@@ -3532,6 +3534,16 @@ if grep -qE "hosted exec    a Linux program execed [1-9][0-9]* bytes read off th
         status=1
     else
         pass "a hosted program execed a real ELF off the filesystem: pid $hosted_pid, its own argv and environment, and an auxiliary vector it could follow"
+    fi
+    # RFC 0090 step 7: the grant follows an execve. The kernel asks the nucleus
+    # about the domain linuxd's record names, so this does not take linuxd's
+    # word for it. **Only the positive line passes**: "could not be read" is a
+    # check that did not happen, and a gate that accepted it could not fail.
+    if grep -qF "hosted exec    the domain it became holds the dial grant its program held -- the grant follows an execve" "$LOG"; then
+        pass "the domain an execve made holds the dial grant its program held (RFC 0090 step 7)"
+    else
+        fail "the grant across execve: $(grep -aoE 'hosted exec +(FAILED: the domain it became|the dial grant could not be read).*' "$LOG" | head -1 | sed 's/\x1b\[[0-9;]*m//g')"
+        status=1
     fi
 elif grep -qF "hosted exec    skipped: this machine has no filesystem service" "$LOG"; then
     pass "no filesystem service on this machine, so there is no program for a hosted execve to find"

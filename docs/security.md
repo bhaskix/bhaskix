@@ -238,6 +238,15 @@ We will not pretend to cover these. Each has a note on whether it becomes in-sco
 > files and streams above, enumerated rather than absorbed. Enforcing below the adapter needs tcpd to
 > learn the domain, which is its own RFC.
 >
+> **2026-10-16, step 7: the grant follows a process, and a holder can give it.** `GRANT_DIAL` grants
+> it to a domain through a capability with `WRITE` — the right that already sets the domain's
+> personality — and refuses the caller's own domain, so no program grants itself the network.
+> `bin/linuxd` uses it to copy the grant across `fork` and `execve`, asking the old domain and
+> granting the new one. That gives a compromised adapter nothing it lacked: it can already dial for
+> anyone. Nothing reads the grant but linuxd, so on a domain that is not hosted it means nothing
+> today. It is withdrawn only by its domain ending. `pkg run` refuses `cap dial` as it refuses every
+> cap but the console, so no package can ask for it yet.
+>
 > **Step 4 (`epoll`, 2026-09-30) adds no capability**, and one thing worth saying: a hosted
 > listener's connections are now **accepted by the adapter before any process asks**, because
 > `tcpd` cannot say a connection waits without handing it over. Such a connection is held in the

@@ -36,6 +36,7 @@
 //! cap domain-control
 //! cap directory              #   read; add 'writable' for the write side
 //! cap directory writable
+//! cap dial                   #   open connections out of this machine
 //! file <path> sha256=<64 hex> length=<n>
 //! ```
 //!
@@ -104,6 +105,14 @@ pub enum Cap<'a> {
         /// the badge's top bit, minted by the kernel, never by a caller).
         writable: bool,
     },
+    /// Leave to open TCP connections out of this machine — RFC 0090, the
+    /// project lead's decision of 2026-10-08 that a hosted program dials only
+    /// if it was granted to, and step 7's manifest line for it. **A word with
+    /// no granter yet**: nothing that runs a package can start a hosted
+    /// program today, and `pkg run` refuses a manifest asking for anything but
+    /// the console. The grammar knows it so the request can be written down
+    /// and reviewed before the supervisor that honours it exists.
+    Dial,
 }
 
 /// One program section: the binary, its entry convention, its requests.
@@ -415,6 +424,7 @@ pub fn parse(bytes: &[u8]) -> Result<Manifest<'_>, ManifestError> {
                     (b"dma-window", b"") => Cap::DmaWindow,
                     (b"interrupt", b"") => Cap::Interrupt,
                     (b"domain-control", b"") => Cap::DomainControl,
+                    (b"dial", b"") => Cap::Dial,
                     (b"directory", b"") => Cap::Directory { writable: false },
                     (b"directory", b"writable") => Cap::Directory { writable: true },
                     (b"memory", b"") => Cap::Memory { pages: None },
@@ -599,6 +609,7 @@ cap interrupt
               cap domain-control
 cap directory
               cap directory writable
+cap dial
 
               file bin/all sha256=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855 length=0
 ",
@@ -621,6 +632,7 @@ cap directory
                 Cap::DomainControl,
                 Cap::Directory { writable: false },
                 Cap::Directory { writable: true },
+                Cap::Dial,
             ]
         );
     }
@@ -637,6 +649,7 @@ cap directory
             "cap console extra",
             "cap device-registers extra",
             "cap domain-control now",
+            "cap dial out",
         ] {
             assert!(
                 matches!(

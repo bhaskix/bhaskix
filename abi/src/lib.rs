@@ -676,6 +676,15 @@ pub mod method {
     /// answers `connect` with `EACCES` for a domain without it.
     pub const MAY_DIAL: u64 = 77;
 
+    /// On a `Domain` capability with `WRITE`: let that domain open
+    /// connections out of this machine — RFC 0090 step 7. The holder of a
+    /// domain gives it, as the kernel gives it to the domains it makes;
+    /// `bin/linuxd` uses it to carry a grant across `fork` and `execve`, which
+    /// put a hosted process in new domains. **Refused on the caller's own
+    /// domain**: a program does not grant itself the network. A grant ends
+    /// with its domain, and there is no withdrawing one before that.
+    pub const GRANT_DIAL: u64 = 78;
+
     /// Map the memory this capability names into the caller's address space.
     ///
     /// Only on a `Memory` capability. `arg0` = where, page-aligned; `arg1`

@@ -15,8 +15,9 @@
         #   18 its SO_ERROR   19 refused blocking connect
         #   20 blocking connect that opens   21 its bytes matched
         #   22 a forked child's wait status: it dialled and exited with
-        #      -connect, so 13 (EACCES) << 8 when nothing granted it the
-        #      network
+        #      -connect, so 115 (EINPROGRESS) << 8 when the grant followed
+        #      the fork (RFC 0090 step 7), 13 (EACCES) << 8 when there was
+        #      none to follow
         #   23 fork's answer in the parent   24 wait4's answer
         #
         # It stops at the first answer that is not the expected one, so a run
@@ -302,10 +303,11 @@ blocking_arrived:
         mov     $3, %eax
         syscall
 
-        # Does a forked child dial as its parent does? The child dials and
-        # exits with -connect; the parent waits and keeps the status. Only rax,
-        # rip and rsp survive a fork here, so the child names the sockaddr by
-        # its fixed address beside the code (the kernel asserts it).
+        # Does a forked child dial as its parent does (RFC 0090 step 7)? The
+        # child dials and exits with -connect; the parent waits and keeps the
+        # status. Only rax, rip and rsp survive a fork here, so the child names
+        # the sockaddr by its fixed address beside the code (the kernel
+        # asserts it).
 inherit:
         mov     $57, %eax               # fork
         syscall

@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Draft 2026-10-08. Written before any of it, as RFC 0086 was. **Steps 0–3 done 2026-10-12, steps 4 and 5 on 2026-10-13, step 6 on 2026-10-15, part 7's grant built inside step 4** (the lead's choice) — slirp's refusal confirmed on both emulators; `RECV`'s third word now says why a connection ended, and a refused dial is told to the caller that made it |
+| **Status** | Draft 2026-10-08. Written before any of it, as RFC 0086 was. **Steps 0–3 done 2026-10-12, steps 4 and 5 on 2026-10-13, step 6 on 2026-10-15, step 7 on 2026-10-16, part 7's grant built inside step 4** (the lead's choice) — slirp's refusal confirmed on both emulators; `RECV`'s third word now says why a connection ended, and a refused dial is told to the caller that made it |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | net / userspace |
 | **Milestone** | L1 ([roadmap.md](../roadmap.md)) — the row carried out of RFC 0005 step 9, "`connect` — a hosted TCP **client**" |
@@ -195,6 +195,14 @@ hosted program has by being hosted.
   shape — the adapter already reads every hosted process's files — and it is recorded there.
   Enforcing below linuxd needs tcpd to learn the domain, by a badge per hosted domain or the
   domain capability in the call; that is its own RFC, and nothing here closes the door on it.
+- **As built (step 7, 2026-10-16).** Whoever holds a domain capability with `WRITE` grants it with
+  `method::GRANT_DIAL` (78) — to any domain but its own, so no program grants itself the network;
+  nothing withdraws it but the domain ending. `bin/linuxd` copies it at `fork` and `execve`, asking
+  the old domain and granting the new one before it runs anything. A manifest asks for it with
+  `cap dial`, parsed and fuzzed. **What is not there yet**: no supervisor starts a hosted program —
+  `bin/sup` and `pkg run` start native ones — so `pkg run` still refuses `cap dial`, as it refuses
+  every cap but the console, and the only domains granted at creation are the kernel's own probes —
+  the dialer's granted run and the hosted-exec test.
 
 ### Concurrency, failure, `unsafe`
 
@@ -402,5 +410,23 @@ Nothing on the server path changes, and the HTTP gate's numbers are the check.
    and linuxd's `EACCES`. Gate: the same probe, ungranted, is refused; granted, it dials.~~ The flag,
    the kernel's grant, linuxd's `EACCES` and that gate were built at step 4 (2026-10-13). What is left:
    a way for `bin/sup` to grant it, the manifest line, and inheritance across `fork` and `execve`.
+   **Done 2026-10-16**, as the lead scoped it — the method, the inheritance and the grammar.
+   `GRANT_DIAL` (78) on a domain capability with `WRITE`, refused on the caller's own domain;
+   `bin/linuxd` copies the grant at `fork` and `execve` (`inherit_dial`), asking `MAY_DIAL` of the
+   old domain before the new one runs anything; `cap dial` in the manifest grammar, parsed, tested
+   and fuzzed, and refused by `pkg run` until something starts a hosted program from a package.
+   Two witnesses on the `iommu` lane. The dialer probe forks once in each run and the child dials:
+   `a forked child of a granted program dialled (EINPROGRESS); one of an ungranted program was
+   refused (EACCES) -- the grant follows the process`, one line, so a grant leaked to every child
+   fails it as surely as one lost. And the hosted-exec test's domain is granted before it execs; the
+   kernel asks the nucleus about the domain linuxd's exec record names, the moment the record
+   appears, because a grant ends with its domain — `hosted exec    the domain it became holds the
+   dial grant its program held`. Both arms went red on both lines: linuxd not copying the grant,
+   and `GRANT_DIAL` answering `OK` and granting nothing. **The fork witness found an older defect
+   first**: a `fork` or `execve` child that drew a slot whose previous occupant linuxd had held a
+   handle for was ended by that occupant's `FORGET`, and the granted run hung in `wait4` on three
+   boots of three. It is fixed in the commit before this step's — the kernel now tells the adapter
+   at `SPAWN` — and recorded in RFC 0033's section on handles and in TRACKER §3. On the passing boot
+   both children drew such a slot.
 8. **Go dials out**: a client in the HTTP lane, granted. Then the records — RFC 0005's row, TRACKER's carried
    row, `security.md`'s T11 note.
