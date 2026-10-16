@@ -14,6 +14,10 @@
         #   16 refused non-blocking connect   17 its poll revents
         #   18 its SO_ERROR   19 refused blocking connect
         #   20 blocking connect that opens   21 its bytes matched
+        #   22 a forked child's wait status: it dialled and exited with
+        #      -connect, so 13 (EACCES) << 8 when nothing granted it the
+        #      network
+        #   23 fork's answer in the parent   24 wait4's answer
         #
         # It stops at the first answer that is not the expected one, so a run
         # the kernel did not grant the network ends at word 1 with EACCES.
@@ -46,6 +50,9 @@ round:
         mov     $42, %eax
         syscall
         mov     %rax, 8(%r12)
+        # Not granted: the fork, then stop.
+        cmp     $-13, %rax
+        je      inherit
         cmp     $-115, %rax
         jne     done
 
@@ -294,6 +301,44 @@ blocking_arrived:
         mov     %r13, %rdi
         mov     $3, %eax
         syscall
+
+        # Does a forked child dial as its parent does? The child dials and
+        # exits with -connect; the parent waits and keeps the status. Only rax,
+        # rip and rsp survive a fork here, so the child names the sockaddr by
+        # its fixed address beside the code (the kernel asserts it).
+inherit:
+        mov     $57, %eax               # fork
+        syscall
+        test    %rax, %rax
+        js      done
+        jnz     inherit_parent
+        mov     $2, %edi
+        mov     $0x801, %esi
+        xor     %edx, %edx
+        mov     $41, %eax
+        syscall
+        mov     %rax, %rdi
+        mov     $0x1c000800, %esi
+        mov     $16, %edx
+        mov     $42, %eax
+        syscall
+        neg     %rax
+        mov     %eax, %edi
+        mov     $231, %eax              # exit_group(-connect)
+        syscall
+        jmp     .
+inherit_parent:
+        mov     %rax, 184(%r12)
+        mov     %rax, %rdi              # wait4(child, &status, 0, 0)
+        movl    $0, 464(%r12)
+        lea     464(%r12), %rsi
+        xor     %edx, %edx
+        xor     %r10d, %r10d
+        mov     $61, %eax
+        syscall
+        mov     %rax, 192(%r12)
+        movl    464(%r12), %ecx
+        mov     %rcx, 176(%r12)
 
 done:
         movq    $1, 120(%r12)

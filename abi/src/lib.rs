@@ -228,6 +228,53 @@ pub mod adapter {
     /// and belongs in an RFC rather than in a hurry.
     pub const HANDLE_CAPACITY: usize = NETWORK - HANDLE_FLOOR;
 
+    /// What [`crate::method::SPAWN`] answers **the adapter**: the new domain,
+    /// the handle the kernel put in [`HANDLE_FLOOR`]'s region for it, and
+    /// whether that handle replaced a previous occupant's.
+    ///
+    /// **Why the adapter is told at `SPAWN`** (2026-10-16). It was told by
+    /// `FORGET` and `HANDLE` at the new domain's first foreign call, which for
+    /// a domain the kernel made comes before anything is known about it. But
+    /// `bin/linuxd` makes domains itself, for `fork` and `execve`, and by that
+    /// first call it had already admitted the child — so the predecessor's
+    /// `FORGET` matched the child's record, ended it as killed by signal 9 and
+    /// woke no parent. One word, because a call answers one: the domain in the
+    /// low half, where every caller already reads it, the handle plus one in
+    /// bits 32-62 (zero for none), and the replacement in bit 63.
+    pub mod spawned {
+        /// The word, as the kernel writes it.
+        #[must_use]
+        pub const fn word(domain: u32, handle: Option<usize>, replaced: bool) -> u64 {
+            let handle = match handle {
+                Some(slot) => (slot as u64 + 1) & 0x7fff_ffff,
+                None => 0,
+            };
+            domain as u64 | handle << 32 | (replaced as u64) << 63
+        }
+
+        /// The domain that was made.
+        #[must_use]
+        pub const fn domain(word: u64) -> u32 {
+            word as u32
+        }
+
+        /// The slot of the adapter's handle for it, if the kernel put one.
+        #[must_use]
+        pub const fn handle(word: u64) -> Option<usize> {
+            match (word >> 32) & 0x7fff_ffff {
+                0 => None,
+                slot => Some(slot as usize - 1),
+            }
+        }
+
+        /// Whether that handle replaced a previous occupant's, which is
+        /// whatever the adapter still remembers about the slot to forget.
+        #[must_use]
+        pub const fn replaced(word: u64) -> bool {
+            word >> 63 != 0
+        }
+    }
+
     /// Every fixed grant, for the checks below.
     const FIXED: [usize; 15] = [
         ENDPOINT,
@@ -869,6 +916,11 @@ pub mod method {
     /// `GRANT` at a time, which is the whole reason this is three steps rather
     /// than one. Refused if the slot is occupied, if the creator's envelope
     /// allows no more children, or if the domain table is full.
+    ///
+    /// Answers the new domain's id. **The Linux adapter is answered more**, in
+    /// the same word and with the id where every caller reads it: the handle
+    /// the kernel gave it for the new domain, and whether that replaced a
+    /// previous occupant's — see [`crate::adapter::spawned`].
     pub const SPAWN: u64 = 49;
     /// Start a program in a domain this program holds.
     ///
@@ -2555,6 +2607,29 @@ impl LineEditor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_spawned_word_keeps_the_domain_where_every_caller_reads_it() {
+        use adapter::spawned;
+        for (domain, handle, replaced) in [
+            (0u32, None, false),
+            (63, Some(adapter::HANDLE_FLOOR), true),
+            (5, Some(adapter::NETWORK - 1), false),
+            (u32::MAX, Some(0), true),
+        ] {
+            let word = spawned::word(domain, handle, replaced);
+            // The id in the low half: what `sup` and the shell read, which
+            // neither knows the rest of this word exists.
+            assert_eq!(word as u32, domain, "{word:#x}");
+            assert_eq!(spawned::domain(word), domain, "{word:#x}");
+            assert_eq!(spawned::handle(word), handle, "{word:#x}");
+            assert_eq!(spawned::replaced(word), replaced, "{word:#x}");
+        }
+        // **And a caller the kernel did not answer more** reads no handle and
+        // nothing to forget.
+        assert_eq!(spawned::handle(7), None);
+        assert!(!spawned::replaced(7));
+    }
 
     #[test]
     fn a_listing_word_carries_three_fields_that_cannot_be_read_as_each_other() {

@@ -3425,45 +3425,12 @@ fn ensure_adapter_holds(domain: u32) -> bool {
 pub const FORGET_METHOD: u64 = u64::MAX - 1;
 
 fn ensure_adapter_holds_inner(domain: u32) -> Option<bool> {
-    let adapter = ADAPTER_DOMAIN.load(Ordering::Relaxed);
-    if adapter == u32::MAX {
+    if ADAPTER_DOMAIN.load(Ordering::Relaxed) == u32::MAX {
         return Some(false);
     }
-    let slot = ADAPTER_HELD.get(domain as usize)?;
-    let id = crate::domain::DomainId::from_u32(domain);
-    let generation = crate::domain::with(id, |owner| owner.generation())?;
-    let wanted = u64::from(generation) + 1;
-    let held = slot.load(Ordering::Relaxed);
-    if held == wanted {
+    let AdapterHandle::Installed { index, replaced } = install_adapter_handle(domain)? else {
         return Some(true);
-    }
-
-    let handle = cap::with_arena(|arena| {
-        arena
-            .insert_root(
-                cap::ObjectRef::new(cap::ObjectKind::Domain, u64::from(domain)),
-                cap::Rights::ALL,
-                0,
-            )
-            .ok()
-    });
-    let handle = handle?;
-    let previous = ADAPTER_SLOT.get(domain as usize)?;
-    let adapter_id = crate::domain::DomainId::from_u32(adapter);
-    // The slot is allocated, and the *old* one is given back first: a
-    // previous incarnation's handle is authority over a domain that no longer
-    // exists, and leaving it installed would both leak a slot and leave the
-    // adapter able to name a stale capability.
-    let index = crate::domain::with(adapter_id, |owner| {
-        if let Some(held) = previous.load(Ordering::Relaxed).checked_sub(1) {
-            let _ = owner.cspace.remove(held as usize);
-        }
-        let index = owner.cspace.first_free_at_or_above(ADAPTER_SLOT_FLOOR)?;
-        owner.cspace.install_at(index, handle).ok()?;
-        Some(index)
-    })??;
-    previous.store(index as u32 + 1, Ordering::Relaxed);
-    slot.store(wanted, Ordering::Relaxed);
+    };
     // **Only when a *previous* incarnation was remembered.** The first grant
     // for a fresh slot has nothing to forget, and telling the adapter to
     // forget something it never knew would cost a round trip on the first
@@ -3471,7 +3438,7 @@ fn ensure_adapter_holds_inner(domain: u32) -> Option<bool> {
     let endpoint = ADAPTER_ENDPOINT.load(Ordering::Relaxed);
     if endpoint != u64::MAX {
         let endpoint = crate::ipc::EndpointId::from_u32(endpoint as u32);
-        if held != 0 {
+        if replaced {
             FORGETS_SENT.fetch_add(1, Ordering::Relaxed);
             // **The answer is kept, and this is why.** It was `let _ =`, and
             // `FORGETS_SENT` is incremented *before* the call — so a `FORGET`
@@ -3500,6 +3467,72 @@ fn ensure_adapter_holds_inner(domain: u32) -> Option<bool> {
         );
     }
     Some(true)
+}
+
+/// What [`install_adapter_handle`] found or did.
+#[derive(Clone, Copy)]
+enum AdapterHandle {
+    /// The adapter already held this incarnation's handle.
+    Held,
+    /// It holds one now, at `index`. `replaced` says a previous incarnation's
+    /// was taken back, so the adapter remembers something it must forget.
+    Installed { index: usize, replaced: bool },
+}
+
+/// Domains the adapter made whose slot it had held a handle for before — told
+/// so at [`spawn`] rather than by `FORGET`. The report prints it, so that a
+/// gate passing on a boot where this never happened says so.
+pub static ADAPTER_SPAWN_REPLACED: AtomicU64 = AtomicU64::new(0);
+
+/// Gives the adapter a `Domain` capability for `domain`'s current incarnation
+/// if it does not hold one, **and tells nobody** -- the half of
+/// [`ensure_adapter_holds`] that [`spawn`] shares, because there the adapter is
+/// the caller and is told in the answer. `None` when there is no adapter, or
+/// no capability or slot could be had.
+fn install_adapter_handle(domain: u32) -> Option<AdapterHandle> {
+    let adapter = ADAPTER_DOMAIN.load(Ordering::Relaxed);
+    if adapter == u32::MAX {
+        return None;
+    }
+    let slot = ADAPTER_HELD.get(domain as usize)?;
+    let id = crate::domain::DomainId::from_u32(domain);
+    let generation = crate::domain::with(id, |owner| owner.generation())?;
+    let wanted = u64::from(generation) + 1;
+    let held = slot.load(Ordering::Relaxed);
+    if held == wanted {
+        return Some(AdapterHandle::Held);
+    }
+
+    let handle = cap::with_arena(|arena| {
+        arena
+            .insert_root(
+                cap::ObjectRef::new(cap::ObjectKind::Domain, u64::from(domain)),
+                cap::Rights::ALL,
+                0,
+            )
+            .ok()
+    });
+    let handle = handle?;
+    let previous = ADAPTER_SLOT.get(domain as usize)?;
+    let adapter_id = crate::domain::DomainId::from_u32(adapter);
+    // The slot is allocated, and the *old* one is given back first: a
+    // previous incarnation's handle is authority over a domain that no longer
+    // exists, and leaving it installed would both leak a slot and leave the
+    // adapter able to name a stale capability.
+    let index = crate::domain::with(adapter_id, |owner| {
+        if let Some(held) = previous.load(Ordering::Relaxed).checked_sub(1) {
+            let _ = owner.cspace.remove(held as usize);
+        }
+        let index = owner.cspace.first_free_at_or_above(ADAPTER_SLOT_FLOOR)?;
+        owner.cspace.install_at(index, handle).ok()?;
+        Some(index)
+    })??;
+    previous.store(index as u32 + 1, Ordering::Relaxed);
+    slot.store(wanted, Ordering::Relaxed);
+    Some(AdapterHandle::Installed {
+        index,
+        replaced: held != 0,
+    })
 }
 
 /// Records what one foreign call cost.
@@ -3838,6 +3871,31 @@ fn spawn(frame: &SyscallFrame) -> Outcome {
         return Outcome::err(Status::SlotUnavailable);
     }
 
+    // **The adapter is told here what it used to be told at the child's first
+    // foreign call** -- the defect found 2026-10-16. `bin/linuxd` makes
+    // domains for `fork` and `execve` and has admitted the child before that
+    // call, so the `FORGET` meant for the slot's previous occupant matched the
+    // child: it was ended as killed by signal 9, no parent was woken, and its
+    // next call admitted it again as a stranger. Done now, inside the
+    // adapter's own call, the handle is held before the child can run, the
+    // child's first call finds it and sends nothing, and the *next* occupant's
+    // first call is the one that forgets this child.
+    //
+    // If no handle can be had the answer is the id alone, and the first
+    // foreign call tries again as it always has.
+    if ADAPTER_DOMAIN.load(Ordering::Relaxed) == me.as_u32()
+        && let Some(AdapterHandle::Installed { index, replaced }) =
+            install_adapter_handle(child.as_u32())
+    {
+        if replaced {
+            ADAPTER_SPAWN_REPLACED.fetch_add(1, Ordering::Relaxed);
+        }
+        return Outcome::ok(bhaskix_abi::adapter::spawned::word(
+            child.as_u32(),
+            Some(index),
+            replaced,
+        ));
+    }
     Outcome::ok(u64::from(child.as_u32()))
 }
 

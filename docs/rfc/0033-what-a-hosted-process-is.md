@@ -362,6 +362,22 @@ handle is authority over a domain that no longer exists.
 futex self-tests all went red at once, which is what "this program can answer questions about
 numbers and nothing else" looks like from the outside.
 
+**Corrected 2026-10-16: that ordering is safe only for a domain the kernel made.** For a domain the
+adapter makes itself — a `fork` child, an `execve` image — the adapter has admitted a record for it
+*before* its first foreign call, under the slot's incarnation, which only `FORGET` moved. So when
+the slot had held a handle before, the previous occupant's `FORGET` matched the **new** record:
+it was ended as killed by signal 9, `discard` kept it for its parent, no parent was woken, and the
+child's next call admitted it again as a parentless stranger. RFC 0090 step 7's fork probe found it:
+the granted run hung in `wait4` on three boots of three, a trace read `note_exit` for a pid with
+parent 0 one higher than `fork` had answered, and one ungranted child was collected as signal 9
+where it had exited 13. Whether it hit depended on which slot the child drew, which is why every
+earlier fork test passed. **Now the kernel tells the adapter at `SPAWN`**: it installs the handle
+inside the adapter's own call and answers, in the same word as the id, where the handle is and
+whether it replaced a predecessor's (`abi::adapter::spawned`). The adapter forgets the
+predecessor there, before the child inherits anything or is admitted, so the child's first call
+sends nothing, and the next occupant's `FORGET` is the one that forgets the child. And a `FORGET`
+that reaps a record with a parent now wakes that parent, as an exit does.
+
 ### A fault of a known shape, seen once, and what its own instrument says about it
 
 The first full suite after the raise produced a kernel fault in the `console=nucleus vfs=nucleus`

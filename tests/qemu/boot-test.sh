@@ -2987,7 +2987,17 @@ if grep -qE "linux dial +a hosted program not granted the network was refused \(
     if grep -qE "linux dial +refused at 10\.0\.2\.100:10 both ways -- non-blocking, POLLOUT\|POLLERR\|POLLHUP and SO_ERROR 111; blocking, connect's own ECONNREFUSED -- and a blocking dial that opened answered 0 and echoed" "$LOG"; then
         pass "a refused dial is told both ways, and a blocking connect waits for its answer (RFC 0090 step 6)"
     else
-        fail "a refused or blocking dial: $(grep -aoE 'linux dial +FAILED.*' "$LOG" | head -1 | sed 's/\x1b\[[0-9;]*m//g')"
+        fail "a refused or blocking dial: $(grep -aoE 'linux dial +FAILED: refused.*' "$LOG" | head -1 | sed 's/\x1b\[[0-9;]*m//g')"
+        status=1
+    fi
+    # A forked child keeps its identity (2026-10-16): each run forks once, and
+    # each parent must collect its own child's exit status -- 13, since nothing
+    # grants a child the network -- not a signal 9 from the slot's previous
+    # occupant's FORGET, and not a wait that never ends.
+    if grep -qE "linux dial +a forked child exited with its own status in both runs \(13, EACCES\) -- [0-2] of the 2 took a slot the adapter had held a handle for" "$LOG"; then
+        pass "a forked child exited with its own status in both runs: $(grep -aoE '[0-2] of the 2 took a slot the adapter had held a handle for' "$LOG" | head -1)"
+    else
+        fail "a forked child's status: $(grep -aoE 'linux dial +(FAILED: a forked child|the (granted|ungranted) run did not finish).*' "$LOG" | head -1 | sed 's/\x1b\[[0-9;]*m//g')"
         status=1
     fi
 elif grep -qE "linux dial +FAILED" "$LOG"; then

@@ -7138,7 +7138,7 @@ fn answer_fork(request: &PersonalityCall, image: &[u64; FAULT_REGISTERS]) -> Ans
     if made.status != status::OK {
         return Answer::error(-11); // EAGAIN
     }
-    let child_domain = made.args[0] as u32;
+    let child_domain = took_spawned(made.args[0]);
     // **The child inherits its parent's handlers** — RFC 0083, and Linux's own
     // behaviour. Dispositions are kept per *domain* here and a fork makes a
     // new one, so without this a forked child woke with none: a shell that
@@ -7423,6 +7423,7 @@ fn answer_execve(request: &PersonalityCall) -> (u64, Answer) {
         // make a process.
         return (REPLY_VALUE, Answer::error(-11));
     }
+    let child = took_spawned(made.args[0]);
 
     // **The errno is the builder's to choose.** The built-in image can only
     // fail for want of memory; a program off the filesystem can be refused by
@@ -7458,7 +7459,6 @@ fn answer_execve(request: &PersonalityCall) -> (u64, Answer) {
         // call arriving from the new domain finds the same process. The
         // generation is this program's own count of how often the slot has
         // been handed over -- see `INCARNATION`.
-        let child = made.args[0] as u32;
         let generation = incarnation_of(child);
         if let Some(process) = process_for(request.domain) {
             let pid = process.pid;
@@ -7967,6 +7967,125 @@ fn map_at_eager(domain: u64, address: u64, pages: u64, protection: u64) -> bool 
     )
     .status
         == status::OK
+}
+
+/// Records where this program's handle for a hosted domain is — RFC 0033
+/// step 3. Told by the kernel's `HANDLE` at the domain's first foreign call, or
+/// in `SPAWN`'s answer for a domain this program made.
+fn note_handle(domain: u32, slot: u64) {
+    // SAFETY: one thread, one request at a time -- as `sleepers`.
+    let handles = handles();
+    handles[domain as usize % limits::MAX_DOMAINS] = (slot as u32).saturating_add(1);
+}
+
+/// Forgets a domain slot's previous occupant: everything this program keeps
+/// keyed by a domain id belongs to somebody else once the slot is reused.
+///
+/// Called for the kernel's `FORGET`, and — since 2026-10-16 — by
+/// [`took_spawned`] for a domain this program made, which is where the slot's
+/// reuse is first known. The kernel used to say so only at the new domain's
+/// first foreign call, by which time this program had admitted a `fork` or
+/// `execve` child, so this matched the *child's* record and ended it.
+fn forget(domain: u32) {
+    // **And its sockets** -- RFC 0058 Part A. `note_exit` releases them
+    // for a process that *exits*; a domain killed from outside reaches
+    // neither `exit_group` nor a fatal fault, so this message is the
+    // only thing that ever learns of it. `bin/ipd` holds four sockets
+    // and one held by a domain nobody can name refuses every later
+    // bind -- which showed up as a *different* program losing its
+    // network, the failure shape a shared adapter produces.
+    //
+    // Late rather than never: this arrives when the slot is reused, so
+    // a socket held by a domain killed and not replaced stays held.
+    // That bound is stated in RFC 0058 rather than rounded to "fixed".
+    release_sockets_of(domain);
+    // And any timed wait it was parked in -- see `abandon_timed_wait`.
+    abandon_timed_wait(domain, None);
+    abandon_held(domain, None);
+    let slot = domain as usize % limits::MAX_DOMAINS;
+    // SAFETY: single-threaded by construction, as elsewhere here.
+    let incarnations = incarnation();
+    let generation = incarnations[slot];
+    // **And its kept domain capability** -- RFC 0079, and the same
+    // shape as the sockets above. `note_exit` releases it for a
+    // process that exits; one killed from outside, or one that calls
+    // plain `exit` rather than `exit_group`, reaches neither, so this
+    // message is again the only thing that learns of it. The leak was
+    // not deduced: the report read `1 of 32 kept now, 2 at the peak`
+    // on a boot where every hosted domain had already ended, which is
+    // a slot that was claimed and never given back.
+    //
+    // **Looked up, not admitted.** `process_for` admits a record when it
+    // finds none, so asking it about a slot being forgotten made one.
+    if let Some(process) = processes().by_domain(domain, generation)
+        && process.domain_slot != 0
+    {
+        release_domain_slot(process.domain_slot);
+    }
+    *dispositions_of(domain) = Dispositions::new();
+    // And whatever it left asleep. A sleeper keyed by a domain id
+    // that now names somebody else would let a `WAKE` from the new
+    // domain wake a notification the old one parked on -- the same
+    // class of mistake the dispositions above are cleared for.
+    let gone = domain + 1;
+    for sleeper in sleepers().iter_mut().filter(|s| s.domain == gone) {
+        sleeper.domain = 0;
+    }
+    // And the process record, which is the identity itself — RFC 0033
+    // step 4. The incarnation moves, so a stale record is unfindable,
+    // and the record is reaped.
+    incarnations[slot] = generation.wrapping_add(1);
+    // SAFETY: as above.
+    let processes = processes();
+    // **A domain slot reused means whoever was in it is gone**, and
+    // by now its status has either been recorded — `exit_group` and
+    // the fault path both do it before the domain ends — or there is
+    // none to record, because something outside ended it. The invented
+    // `Exit::Status(0)` that used to be written here was a lie with no
+    // reader while nothing could `wait4`; step 9 gave it one, so it is
+    // gone. What is left is the reap: a record whose parent cannot
+    // read it any more.
+    if let Some((pid, parent)) = processes
+        .by_domain(domain, generation)
+        .map(|p| (p.pid, p.ppid))
+    {
+        let _ = processes.ended(
+            pid,
+            Exit::Signalled {
+                signal: 9,
+                core: false,
+            },
+        );
+        let _ = processes.discard(pid);
+        // **And its parent told**, as `note_exit` tells it. A record with a
+        // parent is kept as a zombie by `discard`, and a parent parked in
+        // `wait4` is parked on a slot only this program signals -- without
+        // this it waited for ever. Found 2026-10-16, when this matched a
+        // forked child whose parent was already waiting.
+        wake_waiter(parent);
+    }
+}
+
+/// Takes `SPAWN`'s answer for a domain this program made, and says which
+/// domain it is.
+///
+/// **Before anything else is done to the domain** — the defect found
+/// 2026-10-16. A `fork` or `execve` child is admitted under the slot's
+/// incarnation, which only [`forget`] moves; when the kernel said a slot was
+/// reused only at the new domain's first foreign call, the previous occupant's
+/// `FORGET` arrived after the child was admitted and ended the child instead.
+/// Now the kernel says so in `SPAWN`'s answer, and the previous occupant is
+/// forgotten here, before the child inherits anything or is given a record.
+fn took_spawned(word: u64) -> u32 {
+    use bhaskix_abi::adapter::spawned;
+    let child = spawned::domain(word);
+    if spawned::replaced(word) {
+        forget(child);
+    }
+    if let Some(slot) = spawned::handle(word) {
+        note_handle(child, slot as u64);
+    }
+    child
 }
 
 /// This program's own count of how often a domain slot has been handed to it.
@@ -8542,92 +8661,15 @@ extern "C" fn linuxd_main(hertz: u64) -> ! {
         // 3. Recorded and acknowledged; the capability itself was installed
         // by the kernel before this message was sent.
         if received.method == HANDLE_METHOD {
-            let domain = (received.badge as u32) as usize % limits::MAX_DOMAINS;
-            // SAFETY: one thread, one request at a time -- as `sleepers`.
-            let handles = handles();
-            handles[domain] = (args[0] as u32).saturating_add(1);
+            note_handle(received.badge as u32, args[0]);
             let _ = call(syscall::REPLY, 0, 0, [0; 4]);
             continue;
         }
+        // A domain slot reused: whatever is remembered about it was its
+        // previous occupant's. For a domain this program made, `SPAWN` said so
+        // instead -- see `took_spawned`.
         if received.method == FORGET_METHOD {
-            // **And its sockets** -- RFC 0058 Part A. `note_exit` releases them
-            // for a process that *exits*; a domain killed from outside reaches
-            // neither `exit_group` nor a fatal fault, so this message is the
-            // only thing that ever learns of it. `bin/ipd` holds four sockets
-            // and one held by a domain nobody can name refuses every later
-            // bind -- which showed up as a *different* program losing its
-            // network, the failure shape a shared adapter produces.
-            //
-            // Late rather than never: this arrives when the slot is reused, so
-            // a socket held by a domain killed and not replaced stays held.
-            // That bound is stated in RFC 0058 rather than rounded to "fixed".
-            release_sockets_of(received.badge as u32);
-            // And any timed wait it was parked in -- see `abandon_timed_wait`.
-            abandon_timed_wait(received.badge as u32, None);
-            abandon_held(received.badge as u32, None);
-            // **And its kept domain capability** -- RFC 0079, and the same
-            // shape as the sockets above. `note_exit` releases it for a
-            // process that exits; one killed from outside, or one that calls
-            // plain `exit` rather than `exit_group`, reaches neither, so this
-            // message is again the only thing that learns of it. The leak was
-            // not deduced: the report read `1 of 32 kept now, 2 at the peak`
-            // on a boot where every hosted domain had already ended, which is
-            // a slot that was claimed and never given back.
-            if let Some(process) = process_for(received.badge as u32)
-                && process.domain_slot != 0
-            {
-                release_domain_slot(process.domain_slot);
-            }
-            *dispositions_of(received.badge as u32) = Dispositions::new();
-            // And whatever it left asleep. A sleeper keyed by a domain id
-            // that now names somebody else would let a `WAKE` from the new
-            // domain wake a notification the old one parked on -- the same
-            // class of mistake the dispositions above are cleared for.
-            let gone = (received.badge as u32) + 1;
-            for sleeper in sleepers().iter_mut().filter(|s| s.domain == gone) {
-                sleeper.domain = 0;
-            }
-            // And the process record, which is the identity itself — RFC 0033
-            // step 4. The record is dropped rather than left as a zombie:
-            // nothing hosted is its parent yet, so nobody will ever read its
-            // status. When `fork` exists, a process whose parent is alive
-            // becomes a zombie here instead, and `Exit::Status(0)` becomes a
-            // lie that matters — the real status has to come from the domain's
-            // own `Ending`, which this message does not carry.
-            //
-            // **The incarnation counter is not observable yet, and that is
-            // stated rather than implied.** Bumping it makes a stale record
-            // unfindable; dropping the record makes it unfindable too, and the
-            // drop always succeeds while no hosted process has a parent. So
-            // removing the bump changes nothing a test can see today. It stops
-            // being decoration the moment `discard` can refuse — which is the
-            // moment a parent exists to read the status.
-            let domain = received.badge as u32;
-            let slot = domain as usize % limits::MAX_DOMAINS;
-            // SAFETY: single-threaded by construction, as elsewhere here.
-            let incarnations = incarnation();
-            let generation = incarnations[slot];
-            incarnations[slot] = generation.wrapping_add(1);
-            // SAFETY: as above.
-            let processes = processes();
-            // **A domain slot reused means whoever was in it is gone**, and
-            // by now its status has either been recorded — `exit_group` and
-            // the fault path both do it before the domain ends — or there is
-            // none to record, because something outside ended it. The invented
-            // `Exit::Status(0)` that used to be written here was a lie with no
-            // reader while nothing could `wait4`; step 9 gave it one, so it is
-            // gone. What is left is the reap: a record whose parent cannot
-            // read it any more.
-            if let Some(pid) = processes.by_domain(domain, generation).map(|p| p.pid) {
-                let _ = processes.ended(
-                    pid,
-                    Exit::Signalled {
-                        signal: 9,
-                        core: false,
-                    },
-                );
-                let _ = processes.discard(pid);
-            }
+            forget(received.badge as u32);
             let _ = call(syscall::REPLY, 0, 0, [0; 4]);
             continue;
         }
