@@ -5162,7 +5162,14 @@ if [[ "$MODE" == "iommu" ]]; then
         REFUSED_ARGS+=("$argument")
     done
     echo "booting again with nothing listening at the echo peer, up to ${TIMEOUT}s..."
-    run_until "$REFUSED_LOG" "Nothing left to do at this milestone" "$TIMEOUT" "${REFUSED_ARGS[@]}"
+    # **Until its own last line, not until the boot ends** (2026-10-16). This
+    # boot reuses the main image, which promises host clients, so the hosted
+    # stream and `epoll` servers wait out their whole timeouts for hosts that
+    # never connect -- and twice that pushed the boot past its budget before
+    # it reached the end, failing a lane whose three gates were already
+    # decided. The client's line is the later of the two they read (tcpd's
+    # report comes first); a boot that hangs before it still fails them.
+    run_until "$REFUSED_LOG" "RECV said refused, and tcpd's report agrees" "$TIMEOUT" "${REFUSED_ARGS[@]}"
     if grep -qF "guestfwd" <<< "${REFUSED_ARGS[*]}"; then
         fail "the refused boot still forwards the echo peer; it would test nothing"
         status=1
@@ -5173,9 +5180,6 @@ if [[ "$MODE" == "iommu" ]]; then
     elif ! grep -qE "tcp client +the connection ended at step [0-9]+: RECV said refused, and tcpd's report agrees \(outcome 1\)" "$REFUSED_LOG"; then
         fail "the refused boot: the client was not told it was refused, or tcpd disagrees"
         grep -E "tcp client" "$REFUSED_LOG" || true
-        status=1
-    elif ! grep -qF "Nothing left to do at this milestone" "$REFUSED_LOG"; then
-        fail "the refused boot did not finish"
         status=1
     else
         pass "a refused dial: RECV told the caller 'refused', and tcpd's report agrees (RFC 0090 step 1)"
