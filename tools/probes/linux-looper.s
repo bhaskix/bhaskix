@@ -1,6 +1,6 @@
         .text
         .globl _start
-        # IPv4 TCP loopback, 2026-10-16: a hosted program dials its own
+        # IPv4 TCP loopback, 2026-10-19: a hosted program dials its own
         # listener over 127.0.0.1. rdi = a writable page, rsi = a sockaddr_in
         # for 127.0.0.1:12 the kernel placed beside the code. One word per
         # answer in the page, and word 30, written last, says it finished:

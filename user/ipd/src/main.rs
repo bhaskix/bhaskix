@@ -1868,7 +1868,7 @@ fn drain_tcp_back(
         let destination = Ipv4Addr(u32::from_be_bytes([entry[4], entry[5], entry[6], entry[7]]));
         // **127/8 comes back in, and is never framed** -- RFC 1122
         // §3.2.1.3(g), and the v4 twin of `::1`'s turnaround above
-        // (2026-10-16). The record already carried its source, which `bin/tcpd`
+        // (2026-10-19). The record already carried its source, which `bin/tcpd`
         // chose as `127.0.0.1` for a loopback connection; the forward ring
         // takes the same layout, so the segment goes straight back to the
         // service as if it had arrived.

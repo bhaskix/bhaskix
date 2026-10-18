@@ -104,7 +104,7 @@ pub struct FourTuple {
 impl FourTuple {
     /// The same connection seen from its other end.
     ///
-    /// **Loopback is why this exists** (2026-10-16): both ends of a connection
+    /// **Loopback is why this exists** (2026-10-19): both ends of a connection
     /// to `127.0.0.1` live in one service, holding tuples that are each other's
     /// reverse. A dial that drew a port whose *reverse* names a lingering end
     /// would have its segments matched to that end, so a dial must count the

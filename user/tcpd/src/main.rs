@@ -126,7 +126,7 @@ const PAIR_STRIDE: u64 = 0x2_0000;
 /// one, and a hosted program's server needs its own on its own port; four was
 /// room for both and two more, refused past that.
 ///
-/// **Six since 2026-10-16**, the lead's choice. The `iommu` lane filled all
+/// **Six since 2026-10-19**, the lead's choice. The `iommu` lane filled all
 /// four — `bin/tcpc`'s two, the hosted stream and `epoll` servers — and IPv4
 /// TCP loopback's probe needs a fifth: this service cannot stop listening, so
 /// a hosted program's listener outlives the program and its slot is never
@@ -1248,7 +1248,7 @@ fn drain_forward(service: &mut Service) {
 
 /// Whether a segment to `destination` is this machine's to take: its own v4
 /// address, or a loopback address of either family — all of `127.0.0.0/8`
-/// since 2026-10-16 (RFC 1122 §3.2.1.3(g)), as `::1` was before. The one rule
+/// since 2026-10-19 (RFC 1122 §3.2.1.3(g)), as `::1` was before. The one rule
 /// [`accept_syn`] and [`accept_cookie`] share, so a `SYN` and the `ACK` that
 /// completes it cannot disagree about whose it is.
 fn is_ours(service: &Service, destination: Address) -> bool {
@@ -2080,7 +2080,7 @@ fn dial(
     let Some(connection) = ports::local_port(start, local, remote, Port(port), |tuple| {
         tuple.local_port == Port(LOCAL_PORT)
             || service.listener_on(tuple.local_port).is_some()
-            // **And the reverse** (2026-10-16): over loopback both ends live
+            // **And the reverse** (2026-10-19): over loopback both ends live
             // here, and a dial whose reverse names a lingering accepted end
             // would have its segments matched to that end.
             || service

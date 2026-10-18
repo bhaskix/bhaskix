@@ -344,7 +344,7 @@ inherit_parent:
         movl    464(%r12), %ecx
         mov     %rcx, 176(%r12)
 
-        # A blocking dial to 127.0.0.1:9, 2026-10-16. Nothing listens there,
+        # A blocking dial to 127.0.0.1:9, 2026-10-19. Nothing listens there,
         # so bin/tcpd answers the SYN with a RST over loopback and connect is
         # refused (ECONNREFUSED) -- and EACCES first when not granted, because
         # loopback needs the grant too. The echo peer's sockaddr with its

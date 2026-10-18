@@ -25,6 +25,14 @@ ISO="${BHASKIX_ISO:-$REPO_ROOT/build/bhaskix.iso}"
 # only when something fails, which is right for a gate and unhelpful when the
 # thing you want is a number the machine measured.
 LOG="${BHASKIX_BOOT_LOG:-$(mktemp)}"
+# **Emptied now, before any host client is forked** (2026-10-19). The clients
+# below watch this file for the guest's `ready` lines, and `run_until` only
+# empties it when QEMU starts -- so a named log that already held a finished
+# boot handed them that boot's lines, and they connected into a machine not yet
+# listening: `opened 0 of 4` five seconds into a run, the four-client act then
+# accepting nobody and the stream test's client gone before its server came.
+# Reproduced on purpose against a stale copy, and gone with this line.
+: > "$LOG"
 TIMEOUT="${BOOT_TEST_TIMEOUT:-120}"
 
 # One trap, doing both jobs. Two `trap ... EXIT` lines would not run in
@@ -3002,7 +3010,7 @@ if grep -qE "linux dial +a hosted program not granted the network was refused \(
         fail "the grant across fork: $(grep -aoE 'linux dial +(FAILED: the grant across fork|the (granted|ungranted) run did not finish).*' "$LOG" | head -1 | sed 's/\x1b\[[0-9;]*m//g')"
         status=1
     fi
-    # 2026-10-16: a blocking dial to 127.0.0.1:9, where nothing listens, is
+    # 2026-10-19: a blocking dial to 127.0.0.1:9, where nothing listens, is
     # refused over loopback -- the SYN and its RST both turned round in
     # bin/ipd, never framed -- with the grant still asked first.
     if grep -qF "linux dial     a blocking dial to 127.0.0.1:9, where nothing listens, was refused over loopback (ECONNREFUSED; EACCES when not granted)" "$LOG"; then
@@ -3021,7 +3029,7 @@ else
     pass "a hosted dial not attempted here: $(grep -aoE 'linux dial +skipped.*' "$LOG" | head -1 | sed -E 's/linux dial +//')"
 fi
 
-# IPv4 TCP loopback, 2026-10-16: a hosted program dials its own listener over
+# IPv4 TCP loopback, 2026-10-19: a hosted program dials its own listener over
 # 127.0.0.1 and both ends must name the other -- accept4 the dialler at
 # 127.0.0.1 on a drawn port, getpeername the listener at 127.0.0.1:12 -- with
 # sixteen bytes each way. The first hosted loopback TCP of either family.
@@ -5179,7 +5187,7 @@ if [[ "$MODE" == "iommu" ]]; then
         REFUSED_ARGS+=("$argument")
     done
     echo "booting again with nothing listening at the echo peer, up to ${TIMEOUT}s..."
-    # **Until its own last line, not until the boot ends** (2026-10-16). This
+    # **Until its own last line, not until the boot ends** (2026-10-19). This
     # boot reuses the main image, which promises host clients, so the hosted
     # stream and `epoll` servers wait out their whole timeouts for hosts that
     # never connect -- and twice that pushed the boot past its budget before

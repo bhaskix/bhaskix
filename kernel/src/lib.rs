@@ -9765,7 +9765,7 @@ const LOOPER_PROBE_ADDRESS_AT: u64 = 1024;
 /// The physical address of the loopback probe's page, for its report.
 static LOOPER_REPORT_PA: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
-/// IPv4 TCP loopback's witness, 2026-10-16: a hosted Linux program dials its
+/// IPv4 TCP loopback's witness, 2026-10-19: a hosted Linux program dials its
 /// own listener over `127.0.0.1` and both ends say who the other is.
 ///
 /// Assembled from [`tools/probes/linux-looper.s`](../../tools/probes/linux-looper.s)
@@ -10266,7 +10266,7 @@ fn dial_self_test(hhdm_base: u64, cpus: u32) -> bool {
         );
     }
     // **A blocking dial to 127.0.0.1:9**, where nothing listens -- v4 TCP
-    // loopback, 2026-10-16. `bin/tcpd` takes 127/8 as its own, answers the
+    // loopback, 2026-10-19. `bin/tcpd` takes 127/8 as its own, answers the
     // `SYN` with a RST, and `bin/ipd` turns both round without framing them,
     // so the dial is refused: `ECONNREFUSED`, the whole loopback path both
     // ways. Ungranted it is `EACCES`, because loopback needs the grant too
@@ -10336,7 +10336,7 @@ fn dial_self_test(hhdm_base: u64, cpus: u32) -> bool {
     ok && step_six && kept && loopback
 }
 
-/// IPv4 TCP loopback, 2026-10-16: a hosted program dials **its own listener**
+/// IPv4 TCP loopback, 2026-10-19: a hosted program dials **its own listener**
 /// over `127.0.0.1` — the first hosted loopback TCP of either family, since
 /// hosted v6 dials are not made at all.
 ///
