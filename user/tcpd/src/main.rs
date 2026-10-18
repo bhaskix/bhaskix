@@ -123,9 +123,16 @@ const PAIR_AT_BASE: u64 = 0x2400_0000;
 const PAIR_STRIDE: u64 = 0x2_0000;
 
 /// Listeners at once — RFC 0086 step 3a. `bin/tcpc`'s demonstration holds
-/// one, and a hosted program's server needs its own on its own port; four is
+/// one, and a hosted program's server needs its own on its own port; four was
 /// room for both and two more, refused past that.
-const MAX_LISTENERS: usize = 4;
+///
+/// **Six since 2026-10-16**, the lead's choice. The `iommu` lane filled all
+/// four — `bin/tcpc`'s two, the hosted stream and `epoll` servers — and IPv4
+/// TCP loopback's probe needs a fifth: this service cannot stop listening, so
+/// a hosted program's listener outlives the program and its slot is never
+/// given back. Six is that lane's five and one spare. The limit that matters
+/// is unchanged and stated in `bin/linuxd`: a listener that never closes.
+const MAX_LISTENERS: usize = 6;
 
 /// Where the wake a new listener's opener gifts lands: one slot per pair
 /// number, because a listener opened with `OPEN_LEG` is named by the first
@@ -1239,6 +1246,30 @@ fn drain_forward(service: &mut Service) {
     }
 }
 
+/// Whether a segment to `destination` is this machine's to take: its own v4
+/// address, or a loopback address of either family — all of `127.0.0.0/8`
+/// since 2026-10-16 (RFC 1122 §3.2.1.3(g)), as `::1` was before. The one rule
+/// [`accept_syn`] and [`accept_cookie`] share, so a `SYN` and the `ACK` that
+/// completes it cannot disagree about whose it is.
+fn is_ours(service: &Service, destination: Address) -> bool {
+    destination == Address::V4(service.me) || destination.is_loopback()
+}
+
+/// The address a connection to `remote` speaks from: `127.0.0.1` to a v4
+/// loopback address, as a `::1` connection speaks from `::1`, and this
+/// machine's own address to anywhere else.
+///
+/// **Not a choice of style.** The peer replies to the source it saw, and the
+/// checksum covers both addresses: a loopback dial from this machine's address
+/// would be answered *to* that address, which `bin/ipd` frames for the wire.
+fn local_for(service: &Service, remote: Address) -> Address {
+    match remote {
+        Address::V4(address) if address.is_loopback() => Address::V4(Ipv4Addr::LOOPBACK),
+        Address::V6(address) if address.is_loopback() => LOOPBACK6,
+        _ => Address::V4(service.me),
+    }
+}
+
 /// Births the accepted connection, if this segment is the `SYN` a listener
 /// has been waiting for. Returns its table slot.
 ///
@@ -1263,7 +1294,7 @@ fn accept_syn(
     // The listener is family-blind on purpose: the tuple carries the family,
     // so one port serves both — a v6 SYN to `::1` births a v6 connection on
     // the same rings a v4 one would use.
-    let ours = destination == Address::V4(service.me) || destination == LOOPBACK6;
+    let ours = is_ours(service, destination);
     if !parsed.flags.contains(Flags::SYN) || parsed.acknowledgement.is_some() || !ours {
         return Err(Unmatched::NotOurs);
     }
@@ -1486,8 +1517,7 @@ fn accept_cookie(
         return None;
     }
     let acknowledgement = parsed.acknowledgement?;
-    let ours = destination == Address::V4(service.me) || destination == LOOPBACK6;
-    if !ours {
+    if !is_ours(service, destination) {
         return None;
     }
     let listening = service.listener_on(parsed.destination)?;
@@ -1857,8 +1887,8 @@ fn connect_leg_serving(
     service: &mut Service,
     args: [u64; 4],
 ) -> (u64, u64) {
-    let local = Address::V4(service.me);
     let remote = Address::V4(Ipv4Addr(args[0] as u32));
+    let local = local_for(service, remote);
     connect_serving(handover, service, args[2], local, remote, args[1] as u16)
 }
 
@@ -2045,14 +2075,17 @@ fn dial(
         give_window_back(service, pair);
         return (tcp::NO_ENTROPY, 0, 0);
     };
-    let local = Address::V4(service.me);
     let remote = Address::V4(Ipv4Addr(address));
+    let local = local_for(service, remote);
     let Some(connection) = ports::local_port(start, local, remote, Port(port), |tuple| {
         tuple.local_port == Port(LOCAL_PORT)
             || service.listener_on(tuple.local_port).is_some()
+            // **And the reverse** (2026-10-16): over loopback both ends live
+            // here, and a dial whose reverse names a lingering accepted end
+            // would have its segments matched to that end.
             || service
                 .connections
-                .find(|c| c.tcb.connection == *tuple)
+                .find(|c| c.tcb.connection == *tuple || c.tcb.connection == tuple.reversed())
                 .is_some()
     }) else {
         // Every port of the range already carries this tuple.

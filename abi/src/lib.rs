@@ -669,15 +669,17 @@ pub mod method {
     /// anonymous memory is discarded: a lent region's frames are its lender's.
     pub const DISCARD_AT: u64 = 76;
 
-    /// On a `Domain` capability with `READ`: may that domain open connections
-    /// out of this machine? `1` or `0` — RFC 0090, the project lead's decision
-    /// of 2026-10-08 that a hosted program dials only if it was granted to,
-    /// built at step 4. The nucleus keeps the grant; `bin/linuxd` asks here and
-    /// answers `connect` with `EACCES` for a domain without it.
+    /// On a `Domain` capability with `READ`: may that domain open TCP
+    /// connections — to this machine's loopback or out of it? `1` or `0` —
+    /// RFC 0090, the project lead's decision of 2026-10-08 that a hosted
+    /// program dials only if it was granted to, built at step 4, and of
+    /// 2026-10-16 that loopback is no exception: no ambient reach to whatever
+    /// listens on this machine. The nucleus keeps the grant; `bin/linuxd` asks
+    /// here and answers `connect` with `EACCES` for a domain without it.
     pub const MAY_DIAL: u64 = 77;
 
-    /// On a `Domain` capability with `WRITE`: let that domain open
-    /// connections out of this machine — RFC 0090 step 7. The holder of a
+    /// On a `Domain` capability with `WRITE`: let that domain open TCP
+    /// connections, to this machine's loopback or out of it — RFC 0090 step 7. The holder of a
     /// domain gives it, as the kernel gives it to the domains it makes;
     /// `bin/linuxd` uses it to carry a grant across `fork` and `execve`, which
     /// put a hosted process in new domains. **Refused on the caller's own

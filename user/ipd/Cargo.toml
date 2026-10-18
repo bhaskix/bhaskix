@@ -154,4 +154,7 @@ asm_budget = 4
 # SR550 boot asked that wire about an address nobody on it has, and reported
 # "0 arp mappings learned" as though it had asked a fair question. The twin of
 # the interface's own address, missed when that one was corrected.
-unsafe_budget = 176
+# 177 for IPv4 TCP loopback, 2026-10-16: one call, `forward_tcp` from the back
+# ring's v4 arm -- the twin of the `forward_tcp6` the v6 arm has made since RFC
+# 0029, so a segment for 127/8 goes back to `bin/tcpd` instead of being framed.
+unsafe_budget = 177

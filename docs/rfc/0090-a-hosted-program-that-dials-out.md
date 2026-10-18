@@ -203,6 +203,12 @@ hosted program has by being hosted.
   `bin/sup` and `pkg run` start native ones — so `pkg run` still refuses `cap dial`, as it refuses
   every cap but the console, and the only domains granted at creation are the kernel's own probes —
   the dialer's granted run and the hosted-exec test.
+- **Loopback needs the grant too — decided by the project lead, 2026-10-16**, when IPv4 TCP
+  loopback was built after this RFC was accepted. A dial to `127.0.0.1` stays inside the machine,
+  and this part's own wording ("out of this machine") would have let it through; the lead ruled
+  it in, because a program that could dial loopback freely could reach whatever listens on this
+  machine with no authority to do so. The grant's wording became "open TCP connections, to this
+  machine's loopback or out of it", and `bin/linuxd` asks it before any dial, loopback included.
 
 ### Concurrency, failure, `unsafe`
 

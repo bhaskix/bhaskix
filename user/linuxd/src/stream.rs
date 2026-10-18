@@ -884,11 +884,6 @@ fn connect_once(request: &PersonalityCall) -> Option<Answer> {
     }
     let given = (request.third() as usize).min(address.len());
     let (destination, port) = match socket::parse_endpoint(&address, given) {
-        // 127/8 has no network here for TCP -- `socket::dial_reaches`. Answered
-        // before a pair is taken, so nothing is dialled and nothing leaves.
-        Ok(Endpoint::V4 { address, .. }) if !stream.v6 && !socket::dial_reaches(address) => {
-            return Some(Answer::error(errno::ENETUNREACH));
-        }
         Ok(Endpoint::V4 { address, port }) if !stream.v6 => (u32::from_be_bytes(address), port),
         // `CONNECT6` keeps the service's fixed handover until a step dials v6.
         Ok(_) => return Some(Answer::error(errno::ENETUNREACH)),

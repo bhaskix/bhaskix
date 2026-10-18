@@ -83,8 +83,10 @@ without the workload; it is no longer an acceptance gate.
   is still carried.~~ **IPv4 UDP loopback is done too (2026-10-16)**: `bin/ipd` turns all of 127/8
   around as it always turned `::1`, and keeps 127/8 off the wire either way, which RFC 1122
   §3.2.1.3(g) requires ("MUST NOT appear outside a host"); a hosted program sends a datagram to
-  itself over `127.0.0.1` and reads it back from `127.0.0.1:7779`. A hosted v4 *TCP* dial to 127/8
-  is answered `ENETUNREACH` — v4 TCP has no loopback yet, and is carried in `TRACKER.md` §4.
+  itself over `127.0.0.1` and reads it back from `127.0.0.1:7779`. ~~A hosted v4 *TCP* dial to 127/8
+  is answered `ENETUNREACH` — v4 TCP has no loopback yet, and is carried in `TRACKER.md` §4.~~ **And
+  v4 TCP loopback the same day**: a hosted program dials its own listener over `127.0.0.1`, both ends
+  naming the other — the dial grant still asked. Hosted v6 dials are still refused, and carried.
 - **`readlinkat` and `/proc/self/exe`** → **L1**, with step 8's trigger: the first program that
   needs its own path.
 - **Asynchronous signal delivery** — `SIGURG`, and `tgkill` beyond a fatal signal to oneself —

@@ -3002,13 +3002,13 @@ if grep -qE "linux dial +a hosted program not granted the network was refused \(
         fail "the grant across fork: $(grep -aoE 'linux dial +(FAILED: the grant across fork|the (granted|ungranted) run did not finish).*' "$LOG" | head -1 | sed 's/\x1b\[[0-9;]*m//g')"
         status=1
     fi
-    # 2026-10-16: a dial to 127.0.0.1 is answered ENETUNREACH -- v4 TCP has no
-    # loopback here, and RFC 1122 keeps 127/8 inside a host -- with the grant
-    # still asked first.
-    if grep -qF "linux dial     a dial to 127.0.0.1 answered ENETUNREACH (EACCES first when not granted)" "$LOG"; then
-        pass "a hosted dial to 127.0.0.1 was answered ENETUNREACH, and EACCES first when ungranted"
+    # 2026-10-16: a blocking dial to 127.0.0.1:9, where nothing listens, is
+    # refused over loopback -- the SYN and its RST both turned round in
+    # bin/ipd, never framed -- with the grant still asked first.
+    if grep -qF "linux dial     a blocking dial to 127.0.0.1:9, where nothing listens, was refused over loopback (ECONNREFUSED; EACCES when not granted)" "$LOG"; then
+        pass "a hosted dial to an unlistened loopback port was refused over loopback, and EACCES when ungranted"
     else
-        fail "a dial to 127.0.0.1: $(grep -aoE 'linux dial +FAILED: a dial to 127.*' "$LOG" | head -1 | sed 's/\x1b\[[0-9;]*m//g')"
+        fail "a dial to 127.0.0.1:9: $(grep -aoE 'linux dial +FAILED: a dial to 127.*' "$LOG" | head -1 | sed 's/\x1b\[[0-9;]*m//g')"
         status=1
     fi
 elif grep -qE "linux dial +FAILED" "$LOG"; then
@@ -3019,6 +3019,23 @@ elif [[ "$MODE" == "iommu" ]]; then
     status=1
 else
     pass "a hosted dial not attempted here: $(grep -aoE 'linux dial +skipped.*' "$LOG" | head -1 | sed -E 's/linux dial +//')"
+fi
+
+# IPv4 TCP loopback, 2026-10-16: a hosted program dials its own listener over
+# 127.0.0.1 and both ends must name the other -- accept4 the dialler at
+# 127.0.0.1 on a drawn port, getpeername the listener at 127.0.0.1:12 -- with
+# sixteen bytes each way. The first hosted loopback TCP of either family.
+# Demanded where the dial test runs.
+if grep -qE "linux loop +a Linux program dialled its own listener over 127\.0\.0\.1: accepted from 127\.0\.0\.1:[0-9]+, its peer 127\.0\.0\.1:12, sixteen bytes each way, never framed" "$LOG"; then
+    pass "a hosted program dialled its own listener over 127.0.0.1: $(grep -aoE 'accepted from 127\.0\.0\.1:[0-9]+' "$LOG" | head -1), sixteen bytes each way"
+elif grep -qE "linux loop +FAILED" "$LOG"; then
+    fail "TCP loopback: $(grep -aoE 'linux loop +FAILED.*' "$LOG" | head -1 | sed 's/\x1b\[[0-9;]*m//g')"
+    status=1
+elif [[ "$MODE" == "iommu" ]]; then
+    fail "the loopback test did not run on the lane that runs it: $(grep -aoE 'linux loop.*' "$LOG" | head -1 | sed 's/\x1b\[[0-9;]*m//g')"
+    status=1
+else
+    pass "TCP loopback not attempted here: $(grep -aoE 'linux loop +skipped.*' "$LOG" | head -1 | sed -E 's/linux loop +//')"
 fi
 
 # RFC 0086 step 4: a hosted server that learns of its client, and of each half

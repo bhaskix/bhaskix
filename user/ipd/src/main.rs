@@ -1864,12 +1864,23 @@ fn drain_tcp_back(
             continue;
         }
 
+        let source = Ipv4Addr(u32::from_be_bytes([entry[0], entry[1], entry[2], entry[3]]));
         let destination = Ipv4Addr(u32::from_be_bytes([entry[4], entry[5], entry[6], entry[7]]));
-        // **127/8 is not framed** -- RFC 1122 §3.2.1.3(g). v4 TCP has no
-        // loopback here (`::1` does, above), and `bin/linuxd` answers a hosted
-        // dial to 127/8 `ENETUNREACH` before it reaches `bin/tcpd`; a native
-        // caller's segment stops here rather than leaving for the gateway.
-        if destination.is_loopback() || me.1.is_loopback() {
+        // **127/8 comes back in, and is never framed** -- RFC 1122
+        // §3.2.1.3(g), and the v4 twin of `::1`'s turnaround above
+        // (2026-10-16). The record already carried its source, which `bin/tcpd`
+        // chose as `127.0.0.1` for a loopback connection; the forward ring
+        // takes the same layout, so the segment goes straight back to the
+        // service as if it had arrived.
+        if destination.is_loopback() {
+            // SAFETY: the forward ring is mapped writable.
+            if unsafe { forward_tcp(source, destination, &entry[8..length]) } {
+                TCP_RETURNED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            }
+            continue;
+        }
+        // A loopback source to anywhere else would carry 127/8 off the host.
+        if source.is_loopback() || me.1.is_loopback() {
             kept_off_the_wire();
             continue;
         }

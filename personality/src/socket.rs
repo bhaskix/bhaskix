@@ -247,17 +247,6 @@ pub enum ConnectStep {
     Wait,
 }
 
-/// Whether a v4 dial to `address` has a network to go to — RFC 0005's carried
-/// loopback item, 2026-10-16. **Not one in `127.0.0.0/8`**: all of it is this
-/// host's loopback, RFC 1122 §3.2.1.3(g) — "Addresses of this form MUST NOT
-/// appear outside a host" — and v4 TCP has no loopback here, so such a dial is
-/// answered `ENETUNREACH` before anything is dialled, as a v6 dial `CONNECT6`
-/// cannot make already is. Without it the dial's `SYN` left for the gateway.
-#[must_use]
-pub const fn dial_reaches(address: [u8; 4]) -> bool {
-    address[0] != 127
-}
-
 /// `connect`'s answer — RFC 0090 part 5's table, from
 /// `net/ipv4/af_inet.c`'s `__inet_stream_connect`, read at `24a19b9`.
 /// `pending` is the socket's error not yet taken, or `0`.
@@ -732,19 +721,6 @@ mod tests {
             Dial::Failed(ECONNABORTED),
             "closed for no reason given"
         );
-    }
-
-    /// Every v4 loopback address is refused a dial — the whole `/8`, not only
-    /// `127.0.0.1` — and its neighbours are not.
-    #[test]
-    fn no_v4_dial_reaches_loopback() {
-        use super::dial_reaches;
-        assert!(!dial_reaches([127, 0, 0, 1]));
-        assert!(!dial_reaches([127, 0, 0, 0]));
-        assert!(!dial_reaches([127, 255, 255, 255]));
-        assert!(dial_reaches([126, 255, 255, 255]));
-        assert!(dial_reaches([128, 0, 0, 0]));
-        assert!(dial_reaches([10, 0, 2, 100]));
     }
 
     /// RFC 0090 part 5's table, row by row, and what a failure leaves behind.

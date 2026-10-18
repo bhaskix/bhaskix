@@ -19,7 +19,8 @@
         #      the fork (RFC 0090 step 7), 13 (EACCES) << 8 when there was
         #      none to follow
         #   23 fork's answer in the parent   24 wait4's answer
-        #   25 a dial to 127.0.0.1: -101 (ENETUNREACH) granted, -13 not
+        #   25 a blocking dial to 127.0.0.1:9, where nothing listens: -111
+        #      (ECONNREFUSED) granted -- the loopback RST -- and -13 not
         #
         # It stops at the first answer that is not the expected one, so a run
         # the kernel did not grant the network ends at word 1 with EACCES.
@@ -343,17 +344,18 @@ inherit_parent:
         movl    464(%r12), %ecx
         mov     %rcx, 176(%r12)
 
-        # A dial to 127.0.0.1, 2026-10-16: the loopback RFC 1122 keeps inside a
-        # host, which v4 TCP has no road to here, is answered ENETUNREACH
-        # before anything is dialled -- and EACCES first when not granted.
-        # The echo peer's sockaddr with its address changed, at page + 480.
+        # A blocking dial to 127.0.0.1:9, 2026-10-16. Nothing listens there,
+        # so bin/tcpd answers the SYN with a RST over loopback and connect is
+        # refused (ECONNREFUSED) -- and EACCES first when not granted, because
+        # loopback needs the grant too. The echo peer's sockaddr with its
+        # address changed, at page + 480.
         mov     0(%r14), %rax
         mov     %rax, 480(%r12)
         mov     8(%r14), %rax
         mov     %rax, 488(%r12)
         movl    $0x0100007f, 484(%r12)  # 127.0.0.1, network order
         mov     $2, %edi
-        mov     $0x801, %esi
+        mov     $1, %esi                # SOCK_STREAM, blocking
         xor     %edx, %edx
         mov     $41, %eax
         syscall

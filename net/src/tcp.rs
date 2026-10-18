@@ -101,9 +101,46 @@ pub struct FourTuple {
     pub remote_port: Port,
 }
 
+impl FourTuple {
+    /// The same connection seen from its other end.
+    ///
+    /// **Loopback is why this exists** (2026-10-16): both ends of a connection
+    /// to `127.0.0.1` live in one service, holding tuples that are each other's
+    /// reverse. A dial that drew a port whose *reverse* names a lingering end
+    /// would have its segments matched to that end, so a dial must count the
+    /// reverse as taken too.
+    #[must_use]
+    pub const fn reversed(self) -> Self {
+        Self {
+            local: self.remote,
+            local_port: self.remote_port,
+            remote: self.local,
+            remote_port: self.local_port,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_tuple_reversed_swaps_its_ends_and_twice_is_itself() {
+        use crate::addr::Ipv4Addr;
+        let dial = FourTuple {
+            local: Address::V4(Ipv4Addr::LOOPBACK),
+            local_port: Port(49152),
+            remote: Address::V4(Ipv4Addr::new(127, 0, 0, 2)),
+            remote_port: Port(12),
+        };
+        let accepted = dial.reversed();
+        assert_eq!(accepted.local, dial.remote);
+        assert_eq!(accepted.local_port, Port(12));
+        assert_eq!(accepted.remote, dial.local);
+        assert_eq!(accepted.remote_port, Port(49152));
+        assert_ne!(accepted, dial);
+        assert_eq!(accepted.reversed(), dial);
+    }
 
     #[test]
     fn the_circle_wraps_and_a_naive_comparison_would_not() {

@@ -267,6 +267,13 @@ We will not pretend to cover these. Each has a note on whether it becomes in-sco
 > have addressed a hosted socket's port at an address that was not this machine's and been
 > delivered. Proven by host tests only; no emulator lane can put such a frame on the wire.
 >
+> **2026-10-16: loopback TCP, and the grant still asked.** A hosted program can now dial `127.0.0.1`
+> and reach whatever listens there — its own listener, another hosted program's, or a native
+> service's. **The dial grant is required for it**, the lead's decision: without that, loopback
+> would have been reach without authority, and every listener on the machine a capability any
+> hosted program held. The two ends of a loopback connection live in `bin/tcpd` and every segment
+> is turned round in `bin/ipd`, so a compromised adapter gains nothing here it did not already have.
+>
 > **Step 4 (`epoll`, 2026-09-30) adds no capability**, and one thing worth saying: a hosted
 > listener's connections are now **accepted by the adapter before any process asks**, because
 > `tcpd` cannot say a connection waits without handing it over. Such a connection is held in the

@@ -661,8 +661,9 @@ fn live_id(raw: u32) -> bool {
     with(DomainId::from_u32(raw), |_| ()).is_some()
 }
 
-/// Which domains may open TCP connections out of this machine — RFC 0090, the
-/// project lead's decision of 2026-10-08, built at its step 4 (2026-10-13).
+/// Which domains may open TCP connections — to this machine's loopback or out
+/// of it — RFC 0090, the project lead's decision of 2026-10-08, built at its
+/// step 4 (2026-10-13); loopback was ruled in on 2026-10-16.
 ///
 /// **Many at once, so a mask and not [`INPUT_GRANTED_TO`]'s single holder**: a
 /// console has one keyboard, and a network has no such limit. One bit per
@@ -681,7 +682,7 @@ fn live_id(raw: u32) -> bool {
 /// to any domain but its own, so no program grants itself the network.
 static DIAL_GRANTED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
-/// Lets `id` open connections out of this machine.
+/// Lets `id` open TCP connections, to this machine's loopback or out of it.
 ///
 /// # Errors
 ///
@@ -697,7 +698,8 @@ pub fn grant_dial(id: DomainId) -> Result<(), DomainError> {
     Ok(())
 }
 
-/// Whether `domain` may open connections out of this machine. An id outside
+/// Whether `domain` may open TCP connections, to this machine's loopback or out
+/// of it. An id outside
 /// the table is not reduced into it: it names no domain, so it may not.
 #[must_use]
 pub fn may_dial(domain: u32) -> bool {
