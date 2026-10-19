@@ -12,7 +12,9 @@
         #   11 getpeername   12 the first eight bytes of the peer it named
         #   13 write dialler->accepted   14 read   15 those 16 bytes matched
         #   16 write accepted->dialler   17 read   18 those 16 bytes matched
-        #   19 three closes, each answer plus one, summed   30 finished
+        #   19 three closes, each answer plus one, summed
+        #   20 socket, 21 bind, 22 listen, listening again on 127.0.0.1:12
+        #      after the close -- RFC 0092 step 0's measurement   30 finished
         #
         # It stops at the first answer that is not the expected one.
 _start:
@@ -219,6 +221,32 @@ arrived:
         syscall
         lea     1(%r15, %rax), %r15
         mov     %r15, 152(%r12)
+
+        # RFC 0092 step 0: listen again on the port just closed. A listener
+        # that cannot be closed answers this with an error; read, not judged.
+        mov     $2, %edi
+        mov     $1, %esi
+        xor     %edx, %edx
+        mov     $41, %eax
+        syscall
+        mov     %rax, 160(%r12)
+        test    %rax, %rax
+        js      done
+        mov     %rax, %r13
+        mov     %r13, %rdi
+        mov     %r14, %rsi
+        mov     $16, %edx
+        mov     $49, %eax
+        syscall
+        mov     %rax, 168(%r12)
+        mov     %r13, %rdi
+        mov     $1, %esi
+        mov     $50, %eax
+        syscall
+        mov     %rax, 176(%r12)
+        mov     %r13, %rdi
+        mov     $3, %eax
+        syscall
 
 done:
         movq    $1, 240(%r12)

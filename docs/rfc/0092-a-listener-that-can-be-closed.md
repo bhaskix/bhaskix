@@ -43,9 +43,14 @@ What the limit costs today, measured or read 2026-10-19:
 - **The port.** A closed hosted listener keeps answering SYNs. Its connections complete inside
   tcpd's cookie path and sit unclaimed; a program that listens on that port again is refused.
 - **Linux**, which a hosted program expects: `close` on a listening socket frees the port at once,
-  and connections that completed but were never accepted are reset. That is from the behaviour of
+  and connections that completed but were never accepted are reset. ~~That is from the behaviour of
   `inet_csk_listen_stop` as commonly described, to be read from the source at step 0, not assumed
-  from this sentence.
+  from this sentence.~~ **Read at step 0 (2026-10-19, Linux `24a19b9`)**: `inet_csk_listen_stop`
+  calls `inet_child_forget` for every child not migrated by reuseport
+  (`net/ipv4/inet_connection_sock.c`). That calls `sk->sk_prot->disconnect(child, O_NONBLOCK)` —
+  `tcp_disconnect` for TCP (`net/ipv4/tcp_ipv4.c`, `.disconnect = tcp_disconnect`) — which, for an
+  ESTABLISHED socket (`tcp_need_reset`), sends an active reset and sets `ECONNRESET`
+  (`net/ipv4/tcp.c`).
 
 ## What is there today
 
@@ -201,6 +206,15 @@ None measured to begin with. Closing costs one `RELEASE` and, per pair, three re
 
 0. **Read and measure.** Read `inet_csk_listen_stop` in Linux's source. Add the two failing gates —
    re-listen and the eight-listener loop — and see them red today: `EADDRINUSE` and `ENFILE`.
+   **Done 2026-10-19.** The source confirms the reset (Motivation). The measurement is not a gate
+   yet, because a gate committed red turns the tree red. It is a reading the loopback probe prints
+   after its close: `listening again on 127.0.0.1:12 after its close: socket 3, bind 0, listen -23`.
+   **That is `ENFILE`, not the `EADDRINUSE` this plan guessed**: on the `iommu` lane linuxd's own
+   three listener slots are spent — the stream test, the `epoll` test and this probe — before tcpd
+   is asked, so linuxd's slot is the first thing a close must give back, and tcpd's port the second.
+   The reading becomes a gate at the step that makes it answer `0`. The eight-listener loop and the
+   unaccepted-reset probe would stop at the same `ENFILE` today, so they are built with the steps
+   that let them get further.
 1. **Generations** for listener slots, host-tested; the `GONE` arm takes listener handles.
 2. **`REVOKE` on listener gifts**, in `sock`.
 3. **tcpd answers `RELEASE` on a listener**, in §4's order, and `RELEASE` with the abort flag on a
