@@ -1124,6 +1124,20 @@ gates:
 	    printf '  \033[1;32mok\033[0m    the console-line gate refuses a line past one run\n'; \
 	fi
 	tools/check-doc-versions.py
+# Every shell command a document puts after a prompt is one the shell has. The
+# README and `make demo` told newcomers to type `ps`, which the user-mode shell
+# never had -- found 2026-10-19 by booting the release ISO as a stranger would.
+# And watched refusing a guide wrong five ways, all five named.
+	tools/check-guides.py
+	@mkdir -p build
+	@if tools/check-guides.py --only tests/fixtures/guides/wrong.md >build/guides-fixture.log 2>&1; then \
+	    printf '  \033[1;31mFAIL\033[0m  the guides check accepted a guide wrong five ways\n'; exit 1; \
+	elif [ "$$(grep -c 'wrong.md:' build/guides-fixture.log)" != 5 ]; then \
+	    printf '  \033[1;31mFAIL\033[0m  the guides check named %s of the fixture'"'"'s five faults\n' \
+	        "$$(grep -c 'wrong.md:' build/guides-fixture.log)"; exit 1; \
+	else \
+	    printf '  \033[1;32mok\033[0m    the guides check refuses a guide wrong five ways\n'; \
+	fi
 # And watched refusing one. `architecture.md` §7 claimed for a year that
 # architecture-specific instructions appear only in `arch/` while nothing checked
 # it; the fixture is a crate holding one instruction and declaring no budget,

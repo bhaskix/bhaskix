@@ -34,7 +34,7 @@ that does it, with the date.
 - [x] **The release note refreshed** — *2026-10-19*. Re-measured against TRACKER and that day's
       suite, and its three boot commands run from copies of the build; the next refresh is the week
       of the release.
-- [ ] **What a stranger sees first** — *engineering*. Booted from a copied ISO on 2026-10-19, the
+- [x] **What a stranger sees first** — *2026-10-19*. Booted from a copied ISO on 2026-10-19, the
       kernel's last line said `M6 in progress`, the kernel shell's help promised "m6-05's user-mode
       shell", and the README and `make demo` told a newcomer to type `ps`, which the user-mode
       shell answers with "not a command". All four corrected, with a gate that fails when a document

@@ -1071,6 +1071,7 @@ the distinction is in the table rather than in somebody's head.
 | Soak: repeated boots **and repeated shell runs** (`make soak`; CI nightly, not per push) | M6 | `make test` | Faults that depend on where a tick lands |
 | A connection nobody accepted does not wedge the port ([RFC 0061](docs/rfc/0061-a-connection-nobody-accepted.md)) | Phase 2 | `make test` | security.md T12 |
 | Both service placements build | Phase 2 | `make gates` | architecture.md §2 |
+| **A document names only shell commands the shell has** — `tools/check-guides.py` reads each shell's dispatch arms and checks every command after a `bhaskix$` or `bhaskix>` prompt in the guides and the README, and every suggestion in `make demo`'s banner; a guide's relative links must resolve, and each guide says when it was verified and against what. Added 2026-10-19, after the README and `make demo` were found telling newcomers to type `ps`, which the user-mode shell never had; watched refusing a fixture wrong five ways, all five named | Phase 3 | `make gates` | Guides are transcripts ([release-checklist.md](docs/release-checklist.md)) |
 | AI-degradation test (kill `bhaskixd-ai`, suite still passes) | Phase 4 | `make test` | ai-native.md §4 |
 
 ---
@@ -1078,6 +1079,31 @@ the distinction is in the table rather than in somebody's head.
 ## 7. Changelog
 
 Newest first. One entry per meaningful change of project state.
+
+### 2026-10-19 (what a stranger sees first, and a gate that keeps it true)
+
+Booting the release ISO as a downloader would found four things a newcomer meets in their first
+minute, every one of them stale:
+- the kernel's last line said `M6 in progress`, true until M6 completed on 2026-08-13 (`docs/roadmap.md`);
+- the kernel shell's help promised "m6-05's user-mode shell", which has been the default for
+  months — and that help is printed on every boot by the shell's self-test;
+- `boot/limine.conf` said the command line was "empty for now";
+- the README and `make demo` told a newcomer to type `ps`, which the user-mode shell has never had:
+  `ps: not a command. Try 'help'.`
+
+All four are corrected. The last line now reads `Bring-up complete. Nothing left to do at this
+milestone.` — its tail kept word for word, because five harnesses wait on it. `ps` gave way to
+`caps`, which the user-mode shell has.
+
+**And a gate, so the last one cannot come back.** `tools/check-guides.py`, in `make gates`, reads
+each shell's commands from the arms of its dispatch `match` and checks every command a document puts
+after a prompt. That covers the README, `make demo`'s banner, and the guides to come under
+`docs/guide/`, whose links must resolve and which must each say when they were verified. **Watched
+red on the tree as it stood** (the README's and the demo's `ps`), then green. **And caught wrong in
+its own first draft**: its pattern let `\s` cross a newline, so one prompt line swallowed the next,
+and it counted ten of eleven commands. A `ps` placed right after another command would have passed.
+The fixture now puts two prompt lines back to back, and the old pattern names four of its five
+faults, which fails the gate's count.
 
 ### 2026-10-19 (the release has a checklist, and its note was wrong again)
 

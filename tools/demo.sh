@@ -60,7 +60,7 @@ ${bold}Bhaskix${off} ${dim}-- a capability operating system, booting in QEMU${of
     ${cyan}help${off}         ${dim}what this shell can do${off}
     ${cyan}ls /${off}         ${dim}a real filesystem, reached through a capability${off}
     ${cyan}cat etc/hostname${off}
-    ${cyan}ps${off}           ${dim}the domains this machine is running${off}
+    ${cyan}caps${off}         ${dim}what this shell is allowed to do${off}
     ${cyan}pkg list${off}     ${dim}what is installed${off}
     ${cyan}dmesg${off}        ${dim}the boot report again, a page at a time${off}
 

@@ -1658,7 +1658,7 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
         // Say so rather than spawning a shell that would block for ever on a
         // console nothing can write to.
         BRINGUP_DONE.store(true, core::sync::atomic::Ordering::Release);
-        println!("\x1b[92m  M6 in progress. Nothing left to do at this milestone.\x1b[0m");
+        println!("\x1b[92m  Bring-up complete. Nothing left to do at this milestone.\x1b[0m");
         println!("  no console input on this machine, so no shell.");
     } else if kernel_shell {
         // On the CPU the serial interrupt is routed to. That pairing is
@@ -1673,7 +1673,9 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
             sched::SpawnOptions::new().pinned(),
         ) {
             Ok(_) => {
-                println!("\x1b[92m  M6 in progress. Nothing left to do at this milestone.\x1b[0m")
+                println!(
+                    "\x1b[92m  Bring-up complete. Nothing left to do at this milestone.\x1b[0m"
+                )
             }
             Err(error) => println!("  the shell could not be spawned: {error:?}"),
         }
@@ -29181,7 +29183,7 @@ fn user_shell(handoff: &Handoff) -> Result<(), &'static str> {
         println!();
     }
     BRINGUP_DONE.store(true, core::sync::atomic::Ordering::Release);
-    println!("\x1b[92m  M6 in progress. Nothing left to do at this milestone.\x1b[0m");
+    println!("\x1b[92m  Bring-up complete. Nothing left to do at this milestone.\x1b[0m");
 
     let options = sched::SpawnOptions::new()
         .pinned()

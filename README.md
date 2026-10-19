@@ -189,7 +189,7 @@ report is a claim it just tested** — and then land at a prompt:
 ```
 bhaskix$ ls /
 bhaskix$ cat etc/hostname
-bhaskix$ ps
+bhaskix$ caps
 bhaskix$ pkg list
 bhaskix$ dmesg
 ```

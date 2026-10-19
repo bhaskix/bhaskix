@@ -179,7 +179,8 @@ fn help() -> Outcome {
     println!("    lsblk             the block device, if there is one");
     println!();
     println!("  this shell is the kernel: it holds no capability and asks");
-    println!("  permission for nothing. m6-05's user-mode shell will.");
+    println!("  permission for nothing. the user-mode shell, the default,");
+    println!("  holds capabilities and asks.");
     Outcome::Ran
 }
 
