@@ -146,6 +146,12 @@ Stated as plainly as the list above, because that is what criterion R7 asks for.
 - **This release's binaries are not signed either.** `SHA256SUMS` sits beside
   them and detects a damaged download. It does not detect a malicious one,
   because anyone who could replace a binary could replace the sums.
+- **Nothing written survives a reboot.** The writable filesystem is formatted
+  at every boot: a package installed on one boot is gone on the next. Measured
+  2026-10-19 — two boots on one disk image, `1 installed` and then `0 installed`.
+  The format also writes over the marker the next boot's self-test reads, so a
+  disk image must be remade for each boot, or that boot reports
+  `block service FAILED`; [the guides](guide/README.md) say how.
 - **No package repository, no signatures, no ABI stability.** Nothing here is
   promised to keep working across versions.
 - **No desktop, no graphical environment.**
@@ -178,10 +184,14 @@ These are open, reproducible, and recorded in [TRACKER.md](../TRACKER.md)'s
 open-defects table with their specimens. They are listed here rather than left
 for a user to discover. ~~**Counted 2026-10-08: twenty rows not closed**~~ —
 that count was right for its day. **Read row by row on 2026-10-19: twenty-three
-rows not closed.** The table below groups two that are one family, and leaves
+rows not closed**, and twenty-four that evening. Booting an image built as the release will be, and typing at
+its shell, found five more defects later that day; all five were fixed the same
+day, and they are in the closed table. It also found the reboot limit above, the
+twenty-fourth row. The table below groups two that are one family, and leaves
 out one that is open in name only: the `uefi, qemu64` lane, restored to
 `make test` and failing only by other rows' defects. Eleven rows closed between
-the two refreshes; they are in the second table.
+the two refreshes, and with the five found and fixed later the same day they are
+in the second table.
 
 | Defect — what you would see | Rate, as TRACKER states it | Fix |
 |---|---|---|
@@ -204,6 +214,7 @@ the two refreshes; they are in the second table.
 | A `poll` probe says "not ready" for a domain with no console grant | 1 sighting (2026-10-12) | parked until the next one; the cause is an inference |
 | The native TPM lane's second serial log comes back empty | 1 in 9 runs (2026-10-11) | instrumented, not explained |
 | The LACP test's report ends with no state line | 1 sighting (2026-10-16) | not explained |
+| A second boot on the same disk image reports `block service FAILED` | every such boot (2026-10-19) | not fixed: the boot's format writes over the marker its self-test reads. Remake the image before each boot, as the guides say |
 | BusyBox `sh` faults at `0x48` | ~2% of harness runs; 0 of 8,443 CI boots (2026-10-04) | likely fixed 2026-10-02, not proven |
 | A per-CPU hold count underflows (the remainder of the old "445 ms wake" row) | no specimen in 450 boots of one image (2026-08-28) | a cause guarded 2026-09-03; not shown to be *the* cause |
 
@@ -215,6 +226,11 @@ not yet absence.
 
 | Defect | Closed |
 |---|---|
+| The shell's `pkg` messages printed `?[1;32minstalled?[0m`: it colours its output, and the console turned every escape from a ring-3 program into `?` | **2026-10-19**, by the lead's decision — colour passes, and nothing else does: clearing, cursor movement, blink, conceal and reverse are still refused, and a coloured line ends with a reset ([RFC 0052](rfc/0052-a-line-that-waits-for-its-newline.md), amended) |
+| A package's output and the shell's interleaved on the console, in sixteen-byte pieces | **2026-10-19**, found typing `pkg run hello` — the four line holders were given back only on a read, so writers that never read kept them; a finished line now gives its holder back, and a host test reproduces the boot's specimen against the old rule byte for byte |
+| `held`, typed after an `open` that failed or after a `release`, ended the user-mode shell: it read an unmapped page, and a fault ends the domain | **2026-10-19**, found typing the shell's own commands as a newcomer would — `held` now says nothing is lent, and the shell test types it after `release` |
+| With an IOMMU and only the boot CD on the SATA controller, the AHCI self-test reported `FAILED` twice, counting the CD as a disk | **2026-10-19**, found booting the release's ISO with a network — the count follows the driver's own decision, host-tested |
+| The native loader refused the release's own initrd, 6,993,920 bytes against a 4 MiB buffer, with a bare status | **2026-10-19** — sixteen MiB, the kernel's figure, and an oversized payload refused in words |
 | Through its own loader on the SR550, a hosted program reading `/proc/self` never finished (five of five sixteen-CPU boots) | **2026-10-12** — the cause was the console, not the program: every line waited on a framebuffer scroll that read video memory back. With the text kept in RAM, the machine reached its services in 98 s instead of 589 s, and in 79 s once the framebuffer was mapped write-combining. `linux proc` passes there. This note listed it as open until 2026-10-19 |
 | A forked or exec'd child in a recycled slot was ended by its predecessor's cleanup | **2026-10-16** — the adapter's handle is installed when the domain is made |
 | A wire frame addressed to `::1` would have been delivered | **2026-10-16** — one verdict per family on what comes off a wire; found by reading, proven on the host only |
@@ -349,6 +365,10 @@ this host's, Ubuntu 20.04; a newer distribution may name the pair
 `OVMF_CODE_4M.fd` and `OVMF_VARS_4M.fd`, and the two must match. A line `cmdline=<options>` in
 `esp/bhaskix/boot.conf` sets the kernel's command line; the ISO's command line
 is fixed.
+
+**Guides** — booting it, its shell and packages, and running a Linux program on
+it, every command run and every output copied from the run — are in
+[docs/guide/](guide/README.md).
 
 **From source:**
 

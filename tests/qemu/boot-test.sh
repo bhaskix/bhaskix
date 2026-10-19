@@ -646,6 +646,21 @@ echo 0 > "$WEDGE_TRIED"
     until [[ -f "$INBOUND_VERDICT" ]]; do
         sleep 0.25
     done
+    # **And for `bin/tcpc` to be done with port 7 -- the four-client act
+    # included** (2026-10-19). "Finished and gone" above was true when the
+    # verdict came three seconds after the echo, as the driver used to wait.
+    # From 2026-10-19 it comes the moment the echo is heard, and `bin/tcpc` is
+    # not finished then: it opens its v6 twin to `[::1]:7` on the same listener
+    # and takes the oldest connection there. CI run 870 caught it taking one of
+    # these: `FAILED at step 16: accepted a v6 connection that is not its own
+    # [::1] client (detail 0x4bf14)` -- family 4, beside `host tried 6 and
+    # opened 6`. The four-client act waits for its own reason; this waits for
+    # that act to be over, so nothing here is on the port while anything of
+    # `bin/tcpc`'s still accepts. The gate below passes whatever the accepted
+    # slot holds when `bin/tcpd` reports, so starting later costs it nothing.
+    until grep -aqE "tcp four +(not attempted|[0-9]+ connections held|FAILED)" "$LOG" 2>/dev/null; do
+        sleep 0.25
+    done
     tried=0
     for _ in $(seq 1 14); do
         tried=$((tried + 1))
