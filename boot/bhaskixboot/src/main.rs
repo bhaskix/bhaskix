@@ -41,11 +41,26 @@ const KERNEL_PATH: &str = "bhaskix\\kernel";
 const INITRD_PATH: &str = "bhaskix\\initrd.tar";
 const CONFIG_PATH: &str = "bhaskix\\boot.conf";
 
-/// Pages allocated for each payload buffer: sixteen MiB for the kernel,
-/// four for the initrd. A payload past its cap is a printed refusal, not a
+/// Pages allocated for each payload buffer: sixteen MiB for the kernel, and
+/// sixteen for the initrd. A payload past its cap is a printed refusal, not a
 /// silent truncation.
+///
+/// **The initrd's was four until 2026-10-19**, when an ISO built as the first
+/// release is -- with the Go server in it -- carried a 6,993,920-byte initrd,
+/// and this loader refused the release's own payload while Limine booted it.
+/// Sixteen matches the kernel's buffer, the size already shown to fit.
 const KERNEL_BUFFER_PAGES: usize = 4096;
-const INITRD_BUFFER_PAGES: usize = 1024;
+const INITRD_BUFFER_PAGES: usize = 4096;
+
+/// Why [`read_fully`] read nothing.
+enum Unread {
+    /// The firmware refused, with this status.
+    Firmware(usize),
+    /// The file is larger than the buffer its cap allows. Until 2026-10-19
+    /// this was `usize::MAX` printed as a status, the same number a too-long
+    /// path or a null answer prints: a refusal that could not say which.
+    TooLarge,
+}
 
 /// FNV-1a, 64-bit — the same arithmetic the harness recomputes.
 struct Fnv(u64);
@@ -83,8 +98,8 @@ const READ_CHUNK: usize = 1 << 20;
 /// payload than the build produced.
 ///
 /// Writes a dot per chunk, so slow media reads as slow rather than as stopped.
-fn read_fully(root: *mut File, path: &str, buffer: &mut [u8]) -> Result<usize, usize> {
-    let file = efi::open_read_only(root, path)?;
+fn read_fully(root: *mut File, path: &str, buffer: &mut [u8]) -> Result<usize, Unread> {
+    let file = efi::open_read_only(root, path).map_err(Unread::Firmware)?;
     let mut total = 0usize;
     loop {
         if total == buffer.len() {
@@ -94,7 +109,7 @@ fn read_fully(root: *mut File, path: &str, buffer: &mut [u8]) -> Result<usize, u
             return if more == 0 {
                 Ok(total)
             } else {
-                Err(usize::MAX)
+                Err(Unread::TooLarge)
             };
         }
         let end = if buffer.len() - total > READ_CHUNK {
@@ -106,7 +121,7 @@ fn read_fully(root: *mut File, path: &str, buffer: &mut [u8]) -> Result<usize, u
             Ok(got) => got,
             Err(status) => {
                 efi::close(file);
-                return Err(status);
+                return Err(Unread::Firmware(status));
             }
         };
         if got == 0 {
@@ -427,6 +442,22 @@ fn measure_one(tcg2: *mut efi::Tcg2, (pcr, tag): (u32, u32), name: &str, bytes: 
 /// A refusal, printed with its status, and the park that follows every one
 /// of them: past the exit there is nowhere to return a status to, and
 /// before it an inconsistent loader has no business handing control back.
+/// A payload that was not read, refused with its reason: the firmware's
+/// status, or the cap it is larger than.
+fn refuse_unread(what: &str, pages: usize, why: Unread) -> ! {
+    match why {
+        Unread::Firmware(status) => refuse(what, status as u64),
+        Unread::TooLarge => {
+            serial::write("bhaskixboot: ");
+            serial::write(what);
+            serial::write(": larger than its ");
+            serial::write_dec(((pages * 4096) >> 20) as u64);
+            serial::write(" MiB buffer\r\n");
+            park()
+        }
+    }
+}
+
 fn refuse(what: &str, status: u64) -> ! {
     serial::write("bhaskixboot: ");
     serial::write(what);
@@ -534,7 +565,7 @@ extern "efiapi" fn efi_main(image_handle: usize, system_table: *mut SystemTable)
     serial::write("bhaskixboot: reading bhaskix\\kernel ");
     let kernel_len = match read_fully(root, KERNEL_PATH, kernel_buffer) {
         Ok(len) => len,
-        Err(status) => refuse("payload kernel REFUSED", status as u64),
+        Err(why) => refuse_unread("payload kernel REFUSED", KERNEL_BUFFER_PAGES, why),
     };
     report_payload("kernel", &kernel_buffer[..kernel_len]);
 
@@ -547,7 +578,7 @@ extern "efiapi" fn efi_main(image_handle: usize, system_table: *mut SystemTable)
     serial::write("bhaskixboot: reading bhaskix\\initrd.tar ");
     let initrd_len = match read_fully(root, INITRD_PATH, initrd_buffer) {
         Ok(len) => len,
-        Err(status) => refuse("payload initrd REFUSED", status as u64),
+        Err(why) => refuse_unread("payload initrd REFUSED", INITRD_BUFFER_PAGES, why),
     };
     report_payload("initrd", &initrd_buffer[..initrd_len]);
 
