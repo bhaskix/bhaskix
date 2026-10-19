@@ -1081,6 +1081,22 @@ the distinction is in the table rather than in somebody's head.
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-10-19 (the first guide: *Get started*)
+
+`docs/guide/` exists, with an index and *Get started*, which the project's website renders. Every
+command in it was run from copies of an ISO built as the release will be — the Go server in,
+BusyBox out — and of the loader at `edbfe47`, booted under BIOS, under UEFI and through
+`bhaskixboot.efi`, and typed at over a pty. Its output blocks are transcripts of those runs, trimmed
+only with `…`. **What the runs found** went into the guide rather than around it:
+- the plain QEMU command gives Bhaskix no disk and no network card it may use, because a device
+  reaches memory only through an IOMMU that contains it, so fourteen self-tests say `skipped`;
+- with one CPU, thirty-four more do;
+- on that disk-less machine `pkg list` answers `no authority -- nothing in that slot`, because the
+  place packages live is on a disk, which is the capability model showing rather than a fault.
+
+The other two guides need a disk and a network, which the ISO alone does not provide; the checklist
+says so.
+
 ### 2026-10-19 (the release's own loader refused the release's payload)
 
 An ISO built as the release will be, with the Go server in and BusyBox out, carries a 6,993,920-byte

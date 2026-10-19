@@ -40,8 +40,10 @@ that does it, with the date.
       shell answers with "not a command". All four corrected, with a gate that fails when a document
       names a shell command the shell does not have.
 - [ ] **The guides** — *engineering*, in `docs/guide/` and on the website: *Get started* by
-      26 October; *The shell and packages* and *Linux programs* by 8 November. Every command in
-      them is one that was run, and its output a transcript.
+      26 October (**written 2026-10-19**, verified against `edbfe47`); *The shell and packages* and
+      *Linux programs* by 8 November. Every command in them is one that was run, and its output a
+      transcript. The last two need a disk and a network, which the release's ISO alone does not
+      give: the guides must say how a downloader gets them.
 - [ ] **The website** — *engineering*. Under its own version control, its landing page brought up
       to date, and the guides rendered onto it. It says "planned" about the release until step 5
       of the day.
