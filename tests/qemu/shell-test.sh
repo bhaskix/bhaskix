@@ -256,11 +256,14 @@ else
         # put this shell on the wrong side of its own transaction -- the block
         # service lends, this program borrows.
         #
-        # `held` before `release`, and nothing reading the page after it:
-        # releasing unmaps the page, so a later read would fault -- and since
-        # RFC 0017 step 1 a fault ends the domain, which would end the shell in
-        # the middle of its own test.
-        commands+=$'ask\r'$'held\r'$'release\r'
+        # `held` before `release` -- and **again after it**, since 2026-10-19.
+        # Releasing unmaps the page, so a read of it faults, and since RFC 0017
+        # step 1 a fault ends the domain. Until that day `held` read the address
+        # whether or not anything was mapped there, so typing it after a
+        # `release`, or after an `open` that failed, ended the shell. Now it
+        # answers that nothing is lent, and the second `held` is the gate: the
+        # old shell dies on it, and every check after it with the shell.
+        commands+=$'ask\r'$'held\r'$'release\r'$'held\r'
         # RFC 0030 step 3: a package installed at the prompt, onto the
         # writable filesystem, out of an archive the boot image carries. The
         # same install twice, because the second answer -- already installed
@@ -713,6 +716,9 @@ else
             # Asked by mapping, not by reading: reading it would fault, and a
             # fault ends this domain.
             "a released page cannot be mapped again:released page +can no longer be mapped"
+            # And `held` after the release says so, rather than reading the
+            # unmapped page and ending the shell.
+            "a page given back is not read again:held +nothing is lent"
         )
         for check in "${lend_checks[@]}"; do
             checks+=("$check")

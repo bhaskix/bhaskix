@@ -119,6 +119,15 @@ const OPENED: u64 = 9;
 const LENT_PAGE: u64 = 11;
 /// Where that page is mapped, read-only.
 const LENT_AT: u64 = 0x3400_0000;
+/// Whether a page is mapped at [`LENT_AT`]: set by an `open` whose page mapped,
+/// cleared before each new lending and by a `release` that gave one back.
+///
+/// [`held`] reads that address, and a read of an unmapped one faults -- which
+/// since RFC 0017 step 1 ends this domain. **Until 2026-10-19 `held` typed after
+/// an `open` that failed ended the shell**, from two commands `help` lists;
+/// found by typing them as a newcomer would. Cleared on any doubt, because a
+/// false "nothing is lent" costs a sentence and a false "lent" costs the shell.
+static PAGE_MAPPED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 /// The block service's endpoint, in another domain.
 const BLOCK: u64 = 12;
 /// Where a capability the block service hands over is accepted.
@@ -1358,6 +1367,9 @@ fn open(name: &[u8]) {
     if declared.status != status::OK {
         return;
     }
+    // The lending below replaces whatever [`LENT_PAGE`] held, so the old page
+    // may go with it whether or not this one arrives.
+    PAGE_MAPPED.store(false, core::sync::atomic::Ordering::Relaxed);
     let lent = call(OPENED, dir::MAP, [0; 4]);
     write(b"  9  lent      ");
     if lent.status != status::OK || lent.args[0] != dir::OK {
@@ -1383,6 +1395,7 @@ fn open(name: &[u8]) {
         write(b"\n");
         return;
     }
+    PAGE_MAPPED.store(true, core::sync::atomic::Ordering::Relaxed);
     // SAFETY: the kernel mapped one page read-only at exactly this address,
     // through a capability this program now holds, and nothing else in this
     // program uses it. The mapping either happened or the status above was not
@@ -1542,9 +1555,13 @@ fn ask() {
 /// where every eviction can be checked; this is the same claim in a machine,
 /// after real work.
 fn held() {
+    if !PAGE_MAPPED.load(core::sync::atomic::Ordering::Relaxed) {
+        write(b"  held          nothing is lent: 'open' a name in the directory first\n");
+        return;
+    }
     // SAFETY: the page the filesystem service lent, mapped read-only at this
-    // address by `open`. If nothing was lent the read below would fault, which
-    // is why the command is only useful after one.
+    // address by `open` -- which [`PAGE_MAPPED`] says happened and has not been given
+    // back since. A read of it unmapped would fault and end this domain.
     let head = unsafe { core::slice::from_raw_parts(LENT_AT as *const u8, 8) };
     write(b"  held          the lent page still begins \"");
     write(head);
@@ -1572,6 +1589,7 @@ fn release() {
         write(b"\n");
         return;
     }
+    PAGE_MAPPED.store(false, core::sync::atomic::Ordering::Relaxed);
     write(b"given back, ");
     write_number(given.args[1]);
     write(b" pages still lent\n");
