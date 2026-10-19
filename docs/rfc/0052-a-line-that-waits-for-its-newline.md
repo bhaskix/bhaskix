@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | ✅ **ACCEPTED 2026-08-27** — proposed, built and accepted the same day, and the last of three console changes that began with a hosted program's `execed pid 3` arriving as `e`, a kernel report, then `xeced pid 3`. The console service holds each caller's partial line, keyed by the badge the kernel stamps and the caller cannot choose, and puts it in one `PUT_RUN` on a newline, on a full buffer, or **when that caller reads** — the last being what keeps a prompt visible, since a shell writes `bhaskix$ ` with no newline and then waits. It is also the argument for the service being the right place: **the nucleus cannot see `console::READ`**, so it could not have done this correctly, which is a stronger reason than the one RFC 0050 gave for refusing to buffer there. **What acceptance does not claim.** *(1)* **It has not run on the SR550**; that boot predates it, and sixteen processors is where console contention is worst. *(2)* **Bytes can be held and invisible**: a caller that writes a partial line and then neither newlines, nor fills its buffer, nor reads keeps those bytes held — bounded at `4 × 256`, and the console can be one partial line behind per caller. *(3)* **Ordering between callers changes** — a caller that finishes its line appears before one that has not — which is the cost every line-buffered terminal pays and is the point. *(4)* A **fifth** concurrent caller is not buffered at all and writes straight through, degraded to RFC 0050's behaviour rather than refused, and **it is not counted**; that is unresolved question 2. *(5)* A kernel line can still land *between* a program's lines. Nothing in the service can prevent that, and it was never the fault: the fault was a kernel line landing **inside** one |
+| **Status** | ✅ **ACCEPTED 2026-08-27**, **amended 2026-10-19** (colour passes, and the filter runs on the whole line — see [the amendment](#amendment-2026-10-19-colour-and-where-the-filter-runs)) — proposed, built and accepted the same day, and the last of three console changes that began with a hosted program's `execed pid 3` arriving as `e`, a kernel report, then `xeced pid 3`. The console service holds each caller's partial line, keyed by the badge the kernel stamps and the caller cannot choose, and puts it in one `PUT_RUN` on a newline, on a full buffer, or **when that caller reads** — the last being what keeps a prompt visible, since a shell writes `bhaskix$ ` with no newline and then waits. It is also the argument for the service being the right place: **the nucleus cannot see `console::READ`**, so it could not have done this correctly, which is a stronger reason than the one RFC 0050 gave for refusing to buffer there. **What acceptance does not claim.** *(1)* **It has not run on the SR550**; that boot predates it, and sixteen processors is where console contention is worst. *(2)* **Bytes can be held and invisible**: a caller that writes a partial line and then neither newlines, nor fills its buffer, nor reads keeps those bytes held — bounded at `4 × 256`, and the console can be one partial line behind per caller. *(3)* **Ordering between callers changes** — a caller that finishes its line appears before one that has not — which is the cost every line-buffered terminal pays and is the point. *(4)* A **fifth** concurrent caller is not buffered at all and writes straight through, degraded to RFC 0050's behaviour rather than refused, and **it is not counted**; that is unresolved question 2. *(5)* A kernel line can still land *between* a program's lines. Nothing in the service can prevent that, and it was never the fault: the fault was a kernel line landing **inside** one |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | userspace |
 | **Milestone** | Phase 2 — Core Operating System |
@@ -56,10 +56,12 @@ while fixing another.
 caller writes straight through, one `PUT_RUN` per chunk, exactly as today —
 degraded to RFC 0050's behaviour rather than refused or dropped.
 
-**The filtering does not move.** Bytes are filtered on the way *into* the buffer,
+~~**The filtering does not move.** Bytes are filtered on the way *into* the buffer,
 by the same substitution and in the same place, so a program still cannot put an
 escape sequence on the kernel's console and cannot get one there by splitting it
-across two writes.
+across two writes.~~ **It moved on 2026-10-19**, to where the held line is put, so
+that colour could pass whole; a program still cannot clear the screen, move the
+cursor, or blink, hide or reverse text. See the amendment at the end.
 
 ## Alternatives considered
 
@@ -142,3 +144,44 @@ module-wide guard now serialises them, in the shape `notify`'s test module
 already used — and adding it carelessly deadlocked the suite, because the guard
 went in twice in one test and the lock is not reentrant. Fifteen consecutive
 clean runs afterwards.
+
+## Amendment, 2026-10-19: colour, and where the filter runs
+
+**What prompted it.** Typed at a machine built as the first release will be, every
+`pkg` message read `?[1;32minstalled?[0m`. The shell colours its output, as the
+project's user-friendliness directive asks, and this service turned every escape
+byte into `?`. The project lead decided that **colour passes, and nothing else
+does**.
+
+**Why the filter had to move.** It ran on each chunk on the way in, and a chunk is
+sixteen bytes; the shell's `write` cuts a line into chunks without regard to what
+is in them, so a colour sequence was routinely split and never whole in any one
+chunk. The filter now runs on the caller's **whole held line, when it is put** —
+at its newline, when the buffer fills, and in the flush before a read.
+
+**What passes.**
+- Printable bytes, newline and tab, as before.
+- A **complete** `ESC [ params m`, at most sixteen bytes of parameters, each one
+  of: reset `0`, bold `1`, dim `2`, normal `22`, the colours `30–37` and `90–97`,
+  default `39`, and the same for backgrounds (`40–47`, `100–107`, `49`).
+
+Everything else that is not printable still becomes `?`: clearing, cursor
+movement, blink, conceal, reverse, any other escape, and a sequence the line ends
+in the middle of.
+
+**What it costs, said rather than found.** A program can now colour its line the
+way the kernel colours its own report. Two things bound that:
+- **a line that set a colour ends with a reset**, before its newline, so a
+  program cannot leave the kernel's next line in its colour;
+- a caller with **no held line** — the fifth, writing straight through — keeps
+  the strict per-chunk filter, because it has no whole line to check.
+
+**One correction to this RFC's failure mode.** Since 2026-10-19 a holder is also
+given back when its caller's line completes, not only when the caller reads;
+until then, four callers that wrote whole lines and never read kept all four
+holders for the boot, and every later caller wrote straight through, interleaved.
+A held partial line still waits for one of the three things above.
+
+Tested on the host in `services/console`: a colour sequence split across chunks
+arrives whole and is reset (red against the old filter); the refusals above;
+and a caller with no held line filtered strictly.

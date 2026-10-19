@@ -32,9 +32,10 @@ pub struct Ports {
     /// of one per byte.
     ///
     /// **Already filtered**, and that is the caller's job rather than this
-    /// port's: `write` maps each byte through the same substitution it always
-    /// did before handing the run over, so a program still cannot put an escape
-    /// sequence on the kernel's console.
+    /// port's: a held line goes through `sanitize`, which passes colour and
+    /// nothing else, and a caller with no held line through the strict
+    /// substitution -- so a program still cannot clear the screen, move the
+    /// cursor, or blink, hide or reverse text on the kernel's console.
     pub put_run: fn(&[u8]),
     /// Waits for a byte to be typed, and returns it.
     pub read: fn() -> u8,
@@ -134,7 +135,7 @@ impl Lines {
         };
         let line = &mut self.held[index];
         if line.used > 0 {
-            (ports.put_run)(&line.bytes[..line.used]);
+            put_line(ports, &line.bytes[..line.used]);
             line.used = 0;
         }
         // The slot is given back, so a program that writes once and goes away
@@ -146,8 +147,14 @@ impl Lines {
     fn append(&mut self, ports: &Ports, badge: u64, bytes: &[u8]) {
         let Some(line) = self.slot(badge) else {
             // No slot: this caller is not buffered at all, which is exactly
-            // what every caller got before RFC 0052.
-            (ports.put_run)(bytes);
+            // what every caller got before RFC 0052 -- and filtered strictly,
+            // because a chunk on its own cannot see a colour sequence whole.
+            let mut strict = [0u8; CHUNK_BYTES];
+            let length = bytes.len().min(CHUNK_BYTES);
+            for (out, byte) in strict.iter_mut().zip(&bytes[..length]) {
+                *out = printable(*byte);
+            }
+            (ports.put_run)(&strict[..length]);
             return;
         };
         for byte in bytes {
@@ -157,7 +164,7 @@ impl Lines {
             // meant it to or not, so that a program writing without newlines
             // gets its output in pieces rather than never.
             if *byte == b'\n' || line.used == LINE_BYTES {
-                (ports.put_run)(&line.bytes[..line.used]);
+                put_line(ports, &line.bytes[..line.used]);
                 line.used = 0;
             }
         }
@@ -175,6 +182,111 @@ impl Lines {
         if line.used == 0 {
             line.badge = 0;
         }
+    }
+}
+
+/// A byte as the console may show it on its own: printable, space, newline or
+/// tab, and `?` for anything else.
+fn printable(byte: u8) -> u8 {
+    match byte {
+        b if b.is_ascii_graphic() || b == b' ' => b,
+        b'\n' | b'\t' => byte,
+        _ => b'?',
+    }
+}
+
+/// The SGR parameters that may pass: reset, bold, dim, normal weight, and the
+/// eight, default and bright colours, foreground and background. Nothing that
+/// blinks, hides, reverses or moves anything.
+fn colour_parameter(value: u16) -> bool {
+    matches!(value, 0..=2 | 22 | 30..=37 | 39 | 40..=47 | 49 | 90..=97 | 100..=107)
+}
+
+/// The length of a colour sequence starting at `bytes[0]`, if one does: a
+/// complete `ESC [ params m` whose parameters are all [`colour_parameter`]s
+/// and at most sixteen bytes long. `None` for anything else, including a
+/// sequence the line ends in the middle of.
+fn colour_at(bytes: &[u8]) -> Option<usize> {
+    const MOST: usize = 16;
+    if bytes.len() < 3 || bytes[0] != 0x1b || bytes[1] != b'[' {
+        return None;
+    }
+    let params_end = bytes[2..]
+        .iter()
+        .take(MOST + 1)
+        .position(|byte| !(byte.is_ascii_digit() || *byte == b';'))?
+        + 2;
+    if params_end - 2 > MOST || bytes[params_end] != b'm' {
+        return None;
+    }
+    let mut value: u16 = 0;
+    let mut digits = 0;
+    for byte in &bytes[2..params_end] {
+        if *byte == b';' {
+            if !colour_parameter(value) {
+                return None;
+            }
+            value = 0;
+            digits = 0;
+        } else {
+            digits += 1;
+            if digits > 3 {
+                return None;
+            }
+            value = value * 10 + u16::from(byte - b'0');
+        }
+    }
+    colour_parameter(value).then_some(params_end + 1)
+}
+
+/// A held line as it may reach the kernel's console, into `out`; returns the
+/// length.
+///
+/// **Colour and nothing else** -- the lead's decision of 2026-10-19, amending
+/// RFC 0052. Printable bytes, newline and tab pass; a complete colour sequence
+/// passes whole; every other byte that is not printable becomes `?`, and the
+/// text of a refused sequence shows. A line that set a colour ends by resetting
+/// it, before its newline, so a program cannot print the kernel's next line in
+/// its colour. Checked here, on the whole line, because the caller's `write`
+/// cuts a line into sixteen-byte chunks and a sequence is routinely split.
+fn sanitize(line: &[u8], out: &mut [u8; LINE_BYTES + RESET.len()]) -> usize {
+    let mut length = 0;
+    let mut coloured = false;
+    let mut at = 0;
+    while at < line.len() {
+        if let Some(sequence) = colour_at(&line[at..]) {
+            out[length..length + sequence].copy_from_slice(&line[at..at + sequence]);
+            length += sequence;
+            at += sequence;
+            coloured = true;
+        } else {
+            out[length] = printable(line[at]);
+            length += 1;
+            at += 1;
+        }
+    }
+    if coloured {
+        let newline = length > 0 && out[length - 1] == b'\n';
+        let reset_at = if newline { length - 1 } else { length };
+        out.copy_within(reset_at..length, reset_at + RESET.len());
+        out[reset_at..reset_at + RESET.len()].copy_from_slice(RESET);
+        length += RESET.len();
+    }
+    length
+}
+
+/// What ends a coloured line.
+const RESET: &[u8] = b"\x1b[0m";
+
+/// Puts one held line, sanitised. One `PUT_RUN` unless a reset pushed a full
+/// line past `MAX_CONSOLE_RUN`, when the tail goes in a second.
+fn put_line(ports: &Ports, line: &[u8]) {
+    let mut out = [0u8; LINE_BYTES + RESET.len()];
+    let length = sanitize(line, &mut out);
+    let first = length.min(LINE_BYTES);
+    (ports.put_run)(&out[..first]);
+    if length > first {
+        (ports.put_run)(&out[first..length]);
     }
 }
 
@@ -237,32 +349,21 @@ impl Service for Console {
 fn write(lines: &mut Lines, ports: &Ports, badge: u64, args: &[u64; 4]) -> [u64; 4] {
     let chunk = Chunk::unpack(args);
 
-    // Filtered, exactly as the kernel shell filters what it prints. This is
-    // the *kernel's* console: a program that could emit an escape sequence
-    // here could clear the screen, move the cursor, or print a line that looks
-    // like it came from the kernel. Newline and tab pass through, because
-    // without them nothing can be laid out.
-    // **Filtered into a buffer, then put in one go.** The filtering is
-    // unchanged and still happens here; what changed on 2026-08-27 is that the
-    // whole chunk crosses in a single invocation, so a kernel line printed on
-    // another CPU cannot land between two of its bytes.
+    // This is the *kernel's* console: a program that could emit an escape
+    // sequence here could clear the screen, move the cursor, or print a line
+    // that looks like it came from the kernel. So what a program writes is
+    // filtered -- printable bytes, newline and tab, and since 2026-10-19 colour
+    // and nothing else -- and a whole line crosses in one `PUT_RUN`, so a kernel
+    // line printed on another CPU cannot land inside it (2026-08-27).
     //
-    // **A chunk and not a line**, which is the honest limit: `CHUNK_BYTES` is
-    // 16, so a longer write is several messages and they can still be
-    // separated. What this removes is the fifteen gaps *inside* each of them.
-    let mut filtered = [0u8; bhaskix_abi::CHUNK_BYTES];
-    for (out, byte) in filtered.iter_mut().zip(chunk.bytes()) {
-        *out = match byte {
-            b if b.is_ascii_graphic() || *b == b' ' => *byte,
-            b'\n' | b'\t' => *byte,
-            _ => b'?',
-        };
-    }
-    // Into the caller's held line rather than straight out -- RFC 0052. The
-    // filtering above is unchanged and still happens *before* anything is held,
-    // so a program cannot get an escape sequence onto the kernel's console by
-    // splitting it across two writes.
-    lines.append(ports, badge, &filtered[..chunk.len()]);
+    // Into the caller's held line rather than straight out -- RFC 0052 -- and
+    // **filtered when the line is put, not here** (2026-10-19). Until then each
+    // chunk was filtered on the way in, which kept every escape off the console
+    // and also kept every colour off it: a colour sequence split across two
+    // chunks was never whole in either. The line is checked whole now, by
+    // `sanitize`, which passes colour and nothing else; a caller with no held
+    // line is still filtered strictly, chunk by chunk, in `append`.
+    lines.append(ports, badge, &chunk.bytes()[..chunk.len()]);
 
     [chunk.len() as u64, 0, 0, 0]
 }
@@ -541,6 +642,71 @@ mod tests {
             *held(&PUT),
             "bhaskix$ ",
             "the reader's prompt appears, and the other caller's line stays held"
+        );
+    }
+
+    /// **Colour passes, whole, and never outlives its line** — the lead's
+    /// decision of 2026-10-19, amending RFC 0052. The shell's `write` cuts a
+    /// line into sixteen-byte chunks, so a colour sequence is routinely split
+    /// in two; it is checked where the caller's whole line is held, and a line
+    /// that set a colour ends by resetting it, so the kernel's next line is not
+    /// printed in a program's colour.
+    #[test]
+    fn colour_split_across_chunks_arrives_whole_and_is_reset() {
+        let _alone = alone();
+        held(&PUT).clear();
+        let mut lines = Lines::new();
+
+        // `  \x1b[1;32minstalled\x1b[0m  /pkg/hello`, as the shell sends it:
+        // the first chunk ends inside the word, the second inside nothing, and
+        // a sequence starts in one chunk and ends in the next.
+        write_as(&mut lines, 7, b"  \x1b[1;32minstall");
+        write_as(&mut lines, 7, b"ed\x1b[0m  /pkg/hel");
+        write_as(&mut lines, 7, b"lo \x1b[9");
+        write_as(&mut lines, 7, b"3mnew\n");
+        assert_eq!(
+            *held(&PUT),
+            "  \x1b[1;32minstalled\x1b[0m  /pkg/hello \x1b[93mnew\x1b[0m\n",
+            "every colour whole, including the one split across two chunks, and a reset before the newline"
+        );
+    }
+
+    /// **Colour, and nothing else.** A clear, a cursor move, blink and
+    /// conceal are refused whole — the sequence becomes `?` and its text is
+    /// shown, as before 2026-10-19 — and so is a sequence the line ended in
+    /// the middle of.
+    #[test]
+    fn only_colour_passes_and_a_cut_sequence_does_not() {
+        let _alone = alone();
+        held(&PUT).clear();
+        let mut lines = Lines::new();
+
+        write_as(&mut lines, 7, b"\x1b[2J\x1b[H\x1b[5m");
+        write_as(&mut lines, 7, b"x\x1b[1;8my\x1b[31\n");
+        assert_eq!(
+            *held(&PUT),
+            "?[2J?[H?[5mx?[1;8my?[31\n",
+            "a clear, a cursor move, blink, conceal mixed with bold, and an unfinished colour: all refused"
+        );
+    }
+
+    /// **A caller with no held line gets no colour.** The fifth caller writes
+    /// straight through, a chunk at a time, and a chunk cannot see a sequence
+    /// whole -- so it keeps the strict filter it always had.
+    #[test]
+    fn a_caller_with_no_held_line_is_filtered_strictly() {
+        let _alone = alone();
+        held(&PUT).clear();
+        let mut lines = Lines::new();
+
+        for badge in 1..=4 {
+            write_as(&mut lines, badge, b"partial ");
+        }
+        write_as(&mut lines, 9, b"\x1b[31mred\n");
+        assert_eq!(
+            *held(&PUT),
+            "?[31mred\n",
+            "every holder is taken by a partial line, so the fifth caller's colour is refused"
         );
     }
 
