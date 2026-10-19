@@ -49,9 +49,12 @@ that does it, with the date.
       `v*`:
   - build `make iso` and `boot/bhaskixboot/target/x86_64-unknown-uefi/release/bhaskixboot.efi`;
   - **choose the ISO's Linux programs explicitly** (decided 2026-10-19): the Go `net/http` server
-    in (`HTTPD_IN_IMAGE=1`), BusyBox out (`BUSYBOX_SRC=`). BusyBox is GPL-2.0, and shipping its
-    binary would oblige publishing its source; without the explicit choice, whether it lands in the
-    ISO depends on what the build machine happens to have installed;
+    in (`HTTPD_IN_IMAGE=1`), BusyBox out (`BUSYBOX_SRC= BUSYBOX=build/no-busybox`). BusyBox is
+    GPL-2.0, and shipping its binary would oblige publishing its source; without the explicit
+    choice, whether it lands in the ISO depends on what the build machine happens to have
+    installed. **Both variables, not one**: `build/busybox`'s rule has no prerequisites, so in a tree
+    that already holds a copy, emptying `BUSYBOX_SRC` alone changes nothing and the old binary ships
+    (read in the Makefile 2026-10-19). The workflow asserts the ISO's `bin/busybox` is empty;
   - ship Go's `LICENSE` beside the binaries, because the server carries Go's runtime;
   - **pin Limine to the tag `v8.7.0-binary`**, not the moving `v8.x-binary` branch that setup and CI
     follow, and record that tag in the release note;
