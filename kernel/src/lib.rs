@@ -4371,9 +4371,16 @@ extern "C" fn ring3_go(hhdm_base: u64) -> ! {
     };
     let bytes = file.bytes();
     if bytes.is_empty() {
-        println!(
-            "\x1b[93m    {label}      skipped: the staged file is empty, which means this              machine had no Go toolchain when the image was built\x1b[0m"
-        );
+        // Empty for a different reason per program. Until 2026-10-19 every one
+        // was blamed on a missing Go toolchain, BusyBox included -- which has
+        // nothing to do with Go, and which the release ISO leaves out on
+        // purpose (GPL-2.0; docs/release-checklist.md).
+        let why = if busybox {
+            "this image carries no BusyBox: the build machine had no static one, or the build left it out"
+        } else {
+            "the build machine had no Go toolchain when the image was built"
+        };
+        println!("\x1b[93m    {label}      skipped: the staged file is empty; {why}\x1b[0m");
         stop()
     }
     let Ok(mut space) = AddressSpace::new(hhdm_base) else {

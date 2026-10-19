@@ -1105,6 +1105,12 @@ and it counted ten of eleven commands. A `ps` placed right after another command
 The fixture now puts two prompt lines back to back, and the old pattern names four of its five
 faults, which fails the gate's count.
 
+**A fifth, found by booting an ISO built as the release will be** — the Go server in, BusyBox out:
+the boot report said `busybox skipped: the staged file is empty, which means this machine had no
+Go toolchain when the image was built`. BusyBox has nothing to do with Go; one message served all
+three corpus programs. Every boot of the release would have printed a false reason. The reason now
+depends on the program.
+
 ### 2026-10-19 (the release has a checklist, and its note was wrong again)
 
 The project lead set the release's shape: `v0.1.0-preview`, a GitHub Release of `bhaskix.iso` and
