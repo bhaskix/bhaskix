@@ -39,11 +39,13 @@ that does it, with the date.
       shell", and the README and `make demo` told a newcomer to type `ps`, which the user-mode
       shell answers with "not a command". All four corrected, with a gate that fails when a document
       names a shell command the shell does not have.
-- [ ] **The guides** — *engineering*, in `docs/guide/` and on the website: *Get started* by
-      26 October (**written 2026-10-19**, verified against `edbfe47`); *The shell and packages* and
-      *Linux programs* by 8 November. Every command in them is one that was run, and its output a
-      transcript. The last two need a disk and a network, which the release's ISO alone does not
-      give: the guides must say how a downloader gets them.
+- [x] **The guides** — *2026-10-19*, all three, ahead of their dates, verified against
+      `9a87171` from copies of release-built files: *Get started* (with *A fuller machine*, the
+      disk and network the other two need, made from two small files), *The shell and packages*,
+      and *Linux programs*. Every command in them was run and its output is a transcript. Writing
+      them found eight defects that day, among them a shell that died on `held` and a `pkg run`
+      that announced an ending before it happened — see TRACKER. Re-verified against the candidate
+      (one week before) and the tag (the day).
 - [ ] **The website** — *engineering*. Under its own version control, its landing page brought up
       to date, and the guides rendered onto it. It says "planned" about the release until step 5
       of the day.

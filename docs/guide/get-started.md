@@ -2,7 +2,7 @@
 
 # Get started
 
-**Verified** 2026-10-19 against `edbfe47`, under QEMU 4.2.1, by booting copies
+**Verified** 2026-10-19 against `9a87171`, under QEMU 4.2.1, by booting copies
 of that commit's ISO and loader exactly as below and typing every command shown.
 
 This guide boots Bhaskix in QEMU, tries its shell, and leaves. Expect about ten
@@ -121,6 +121,7 @@ Through Bhaskix's own loader, a few `bhaskixboot:` lines come first, as it reads
 the kernel and the initrd. Under BIOS it begins:
 
 ```
+
       ____  _   _    _    ____  _  _____  __
      | __ )| | | |  / \  / ___|| |/ /_ _| \ \/ /
      |  _ \| |_| | / _ \ \___ \| ' / | |   \  /
@@ -146,12 +147,12 @@ the kernel and the initrd. Under BIOS it begins:
                    umip  NO  la57 yes  invariant-tsc  NO  rdrand yes  pat yes  mtrr yes
     paging         4-level, on purpose; la57 stays a capability, not a mode
     unpredictable  two draws differ, and the machine reports rdrand
-    local apic     enabled, timer calibrated to 62.591 MHz
+    local apic     enabled, timer calibrated to 62.615 MHz
     interrupts     ENABLED, timer at 100 Hz
 …
 ```
 
-and runs for about four hundred lines. A line that reads `FAILED` is a
+and runs for about 400 lines. A line that reads `FAILED` is a
 defect; please [report it](https://github.com/bhaskix/bhaskix/issues). None did
 in these runs.
 
@@ -161,7 +162,7 @@ disk, and no network card it may use: Bhaskix lets a device reach memory only
 through an IOMMU that contains it, and this command gives it none. So the
 filesystem and network self-tests say what they would have needed and stop.
 BusyBox says it is not in this image; the release leaves it out (see
-[*Linux programs*](README.md)). The other guides add a disk and a network.
+[*Linux programs*](linux-programs.md)). The other guides add a disk and a network.
 
 It ends at the shell:
 
@@ -174,8 +175,8 @@ bhaskix$
 ```
 
 Under QEMU 4.2.1 on this project's machine, with four CPUs, the prompt
-arrived **24 seconds** after QEMU started under BIOS, and **31** under UEFI and
-through Bhaskix's own loader — while the machine was busy with other work.
+arrived **23 seconds** after QEMU started under BIOS, **33** under UEFI and
+**29** through Bhaskix's own loader — while the machine was busy with other work.
 Emulation is slow, and your time will differ.
 
 ## Your first commands
@@ -234,7 +235,7 @@ bhaskix$ ls /
      20480  greedy.bpk
      20480  hello.bpk
         31  hello.txt
-        28  motd
+        79  motd
          0  packages/
 ```
 
@@ -290,6 +291,73 @@ Nothing persists from the ISO boots: the machine had no disk, and its memory
 went with it. Two files remain in your directory — `vars.fd`, OVMF's settings,
 and `esp/`, the loader's partition — and you can delete both.
 
+## A fuller machine: a disk and a network
+
+The machine above has no disk and no network card Bhaskix may use. [*The shell
+and packages*](shell-and-packages.md) and [*Linux programs*](linux-programs.md) need both, and this is the machine they use.
+
+**It needs an IOMMU.** Bhaskix lets a device reach memory only through an IOMMU
+that contains it, and refuses a disk or a network card it cannot contain — which
+is why the machine above has neither. QEMU provides one with
+`-device intel-iommu`.
+
+**Its disks are made the way the project's own tests make theirs.** Each begins
+with a marker that the boot's self-tests read back, and a disk without its
+marker is reported as a `FAILED` check: this preview's self-tests were written
+against these disks, and say so rather than guess. Two small files:
+
+```sh
+printf 'BHASKIX-DOMAIN-DISK-SECTOR-0' > domain.img && truncate -s 4M domain.img
+printf 'BHASKIX-SATA-DISK-SECTOR-0' > sata.img && truncate -s 256K sata.img
+```
+
+`domain.img` holds the writable filesystem — packages are installed onto it,
+and Linux programs write their files there. **Remake both files before every
+boot.** Bhaskix formats `domain.img` each time it starts, so nothing written to
+it survives a reboot, and the format writes over the marker — so the next boot,
+on the same file, reports `block service FAILED`. `sata.img` sits on the SATA
+controller, ahead of the loader's partition.
+
+This machine boots through Bhaskix's own loader, from the `esp/` directory of
+[*Through Bhaskix's own loader*](#through-bhaskixs-own-loader), and reads the
+boot image a second time as a disk of its own:
+
+```sh
+cp esp/bhaskix/initrd.tar initrd.tar
+cp /usr/share/OVMF/OVMF_VARS.fd vars.fd
+qemu-system-x86_64 -M q35,kernel-irqchip=split -cpu max -smp 4 -m 512M \
+    -display none -serial mon:stdio -no-reboot \
+    -drive if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE.fd \
+    -drive if=pflash,format=raw,file=vars.fd \
+    -device intel-iommu,intremap=on \
+    -drive file=initrd.tar,format=raw,if=none,id=boot,readonly=on \
+    -device virtio-blk-pci,drive=boot,disable-legacy=on,iommu_platform=on \
+    -drive file=domain.img,format=raw,if=none,id=data \
+    -device virtio-blk-pci,drive=data,disable-legacy=on,iommu_platform=on \
+    -netdev user,id=net,restrict=on,guestfwd=tcp:10.0.2.100:9-cmd:cat,hostfwd=tcp:127.0.0.1:18080-:8080 \
+    -device virtio-net-pci,netdev=net,disable-legacy=on,iommu_platform=on \
+    -drive file=sata.img,format=raw,if=none,id=sata -device ide-hd,drive=sata,bus=ide.0 \
+    -drive if=ide,index=2,format=raw,file=fat:rw:esp
+```
+
+What the new lines do:
+- `kernel-irqchip=split` and `intel-iommu` give the machine its IOMMU.
+- Two `virtio-blk` disks: the boot image, read-only, and `domain.img`. Each
+  has `iommu_platform=on`, so the IOMMU stands between it and memory.
+- One `virtio-net` card on QEMU's user network. `restrict=on` keeps the machine
+  from reaching anything beyond your computer, apart from two openings:
+  - `hostfwd` forwards your `127.0.0.1:18080` to the machine's port 8080, where
+    *Linux programs* runs a web server. If 18080 is taken on your machine, QEMU
+    refuses to start and says so; change the first number to a free port;
+  - `guestfwd` hands a connection to `10.0.2.100:9` to `cat` on your machine,
+    which sends every byte back. That is how that guide's server shows it can
+    dial out.
+- `sata.img` on the SATA controller's first port, and the loader's partition on
+  its third.
+
+It reaches `bhaskix$` with nothing `FAILED`, after about 36 seconds
+here. Five lines say `skipped`: BusyBox, which this release leaves out, and tests that only the project's own test harness can complete, because they wait for a client it connects.
+
 ## If something goes wrong
 
 - **QEMU cannot find `OVMF_CODE.fd`.** See *Under UEFI* above: your
@@ -301,7 +369,7 @@ and `esp/`, the loader's partition — and you can delete both.
 - **A command answers `not a command`.** This shell does not have it; `help`
   lists what it has. It is not a Linux shell, so a command you know from Linux,
   such as `ps`, may not be here. Linux programs run beside it, through an
-  adapter; the *Linux programs* guide, due by 8 November, shows how.
+  adapter; [*Linux programs*](linux-programs.md) shows how.
 
 Report anything else on [GitHub](https://github.com/bhaskix/bhaskix/issues).
 Report a security problem privately, as
@@ -309,8 +377,10 @@ Report a security problem privately, as
 
 ## Next
 
-- *The shell and packages* and *Linux programs*, due by 8 November 2026 — see
-  the [guides](README.md).
+- [*The shell and packages*](shell-and-packages.md): every command, what
+  holding a capability means, and installing a package.
+- [*Linux programs*](linux-programs.md): what runs, how to start it, and what
+  is refused and why.
 - The [release note](../release-notes.md): what this preview does, what it does
   not, and the defects it is known to have.
 - The [roadmap](../roadmap.md): where it is going.

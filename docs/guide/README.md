@@ -9,8 +9,8 @@ why the system is shaped the way it is; the guides say what to type.
 | Guide | What it covers |
 |---|---|
 | [Get started](get-started.md) | Download and check the release, boot it in QEMU three ways, try your first commands, and leave |
-| *The shell and packages* | Every shell command, what holding a capability means, and installing a package. **Due by 8 November 2026** |
-| *Linux programs* | What runs, how to start it, and what is refused and why. **Due by 8 November 2026** |
+| [The shell and packages](shell-and-packages.md) | Every shell command, what holding a capability means, installing a package, and the kernel's own shell |
+| [Linux programs](linux-programs.md) | What "hosted" means, an unmodified Go web server answering your browser, BusyBox for source builds, and what is refused and why |
 
 ## How these are written
 
