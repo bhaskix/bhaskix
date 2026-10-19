@@ -28,7 +28,7 @@ What can be counted honestly, with how to recount it:
 
 | | | how it is derived |
 |---|---|---|
-| **First release** | **29 November 2026** — set by the project lead 2026-08-19; a developer preview, scope in `docs/roadmap.md` | Seven criteria, **six** met as of 2026-08-23. The one that is not is the one that decides what the release may claim: ~~**R5** boots on real hardware~~ **MET 2026-08-23** (M1-17: the report was captured and read on the SR550, and its RT wake latency — 1.532 µs worst against a 50 µs target — is the first hardware measurement this project has) and **R6** two independent document reviewers (Phase 0's own unmet criterion). If either is still open on the day, the release ships saying so |
+| **First release** | **29 November 2026** — set by the project lead 2026-08-19; a developer preview, scope in `docs/roadmap.md` | Seven criteria, **six** met as of 2026-08-23. The one that is not is the one that decides what the release may claim: ~~**R5** boots on real hardware~~ **MET 2026-08-23** (M1-17: the report was captured and read on the SR550, and its RT wake latency — 1.532 µs worst against a 50 µs target — is the first hardware measurement this project has) and **R6** two independent document reviewers (Phase 0's own unmet criterion). If either is still open on the day, the release ships saying so. **Decided 2026-10-19 by the project lead**: the tag is `v0.1.0-preview`; it is a GitHub Release whose binaries — `bhaskix.iso` and `bhaskixboot.efi`, with SHA-256 sums — CI builds from the tag; the ISO carries the Go server and not BusyBox; the lead publishes it. The steps and their dates: [docs/release-checklist.md](docs/release-checklist.md) |
 | Phases | **2 of 6 complete**, third in progress | `docs/roadmap.md` headings; Phase 0 and 1 marked complete |
 | Phase 2 bullets | **9 of 10 done** | §4 below; the tenth row — libc, resolved into the Linux personality — **was missing from that table until 2026-08-19** while the roadmap carried the bullet, so this count read 9 of 9 and meant 9 of 10. The ninth — package management and image building — closed 2026-08-19 with RFC 0030 (accepted the same day), the eighth — networking — on 2026-08-18 with RFC 0029. The table has grown as bullets became rows: 7 until telemetry joined 2026-08-17, 8 until packages joined 2026-08-19, 9 until the missing libc row was added the same day |
 | Networking, within RFC 0018 | **7 of 7 steps — RFC 0018 ACCEPTED** | its implementation plan: crate, driver, ring, return path and ARP, ICMP, sockets, DHCP. A ring 3 program obtains an address holding a socket and a page, and the folded-domain measurement priced the boundary |
@@ -1078,6 +1078,31 @@ the distinction is in the table rather than in somebody's head.
 ## 7. Changelog
 
 Newest first. One entry per meaningful change of project state.
+
+### 2026-10-19 (the release has a checklist, and its note was wrong again)
+
+The project lead set the release's shape: `v0.1.0-preview`, a GitHub Release of `bhaskix.iso` and
+`bhaskixboot.efi` built by CI from the tag, the Go server in the ISO and BusyBox out of it (GPL-2.0),
+published by the lead. [docs/release-checklist.md](docs/release-checklist.md) dates every step to
+29 November. Guides become a deliverable (`docs/guide/`, rendered onto the project's website): *Get
+started* by 26 October, *The shell and packages* and *Linux programs* by 8 November.
+
+**The release note was refreshed, and was wrong in ways a reader would act on — eleven days after
+the last refresh.** It said CI runs no native-loader lane (false since 2026-10-11), that RFC 0089
+was a draft and nothing verified the TPM's measurements (accepted, and the log replayed, since
+2026-10-11), and it listed `/proc/self` on the SR550 as open (fixed 2026-10-12). **Its RFC count
+used a command that overcounts by one** from today: RFC 0092's status line says "connections
+nobody accepted", so `grep -ci accepted` reads 62. The note now anchors the match on the status
+cell — 61 of 92. Its defects table was re-derived row by row from §3: **twenty-three rows not
+closed**, eleven closed since 2026-10-08.
+
+**Booted as a stranger would, from copies of today's ISO and loader**, all three paths reach
+`bhaskix$` — BIOS, OVMF, and `bhaskixboot.efi` from a hand-built ESP. Typed at over a pty: `caps`
+answers, and `Ctrl-A x` leaves QEMU only under `-serial mon:stdio` — with plain `stdio` it does
+nothing, which the note's commands now account for. The same boot found what a stranger meets
+first and should not: the kernel's last line says `M6 in progress`, and the README and `make demo`
+tell a newcomer to type `ps`, which the user-mode shell answers with `ps: not a command`. Both are
+on the checklist, with a gate to keep them fixed.
 
 ### 2026-10-19 (RFC 0092 drafted: a listener that can be closed)
 

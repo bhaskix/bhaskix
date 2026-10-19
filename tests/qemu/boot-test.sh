@@ -577,7 +577,9 @@ INBOUND_HOLD="${BHASKIX_INBOUND_HOLD:-20}"
             fi
             printf '%s' "$payload" >&3
             reply=''
-            LC_ALL=C IFS= read -r -N 16 -t "$INBOUND_HOLD" reply <&3 || true
+            # A reset ends the read with an error bash would print on every
+            # lane; the attempt log already records what was heard.
+            LC_ALL=C IFS= read -r -N 16 -t "$INBOUND_HOLD" reply <&3 2>/dev/null || true
             exec 3>&- 3<&- || true
             echo "attempt $n opened at ${opened} ms, heard '${reply}' by $(since) ms" >> "$INBOUND_ATTEMPTS"
             # Through a rename, so the clients waiting for this file never
