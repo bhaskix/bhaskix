@@ -542,22 +542,58 @@ flock -u 9 2>/dev/null || true
 # for the rest of the boot and no later connection can ever be built. See
 # TRACKER §3. Fixing this driver makes the gate honest; it does not make the
 # machine correct.
+#
+# **Overlapping attempts that stay to hear the reply** (2026-10-19). Three
+# seconds was too short to wait, and waiting longer on one attempt at a time
+# was too slow to retry. With a single attempt waiting three seconds, the
+# guest could serve an echo nobody was there to read: either a stale
+# connection -- an early attempt's SYN completing on a later rung of slirp's
+# ladder, after the driver had closed -- took `bin/tcpc`'s one accept, or a
+# guest slowed by load echoed after the three seconds. Both give the row
+# TRACKER files as "the inbound echo is served and the host driver never gets
+# its bytes". Now a new attempt starts every three seconds, each listens for
+# up to `INBOUND_HOLD` seconds with bash's own `read` -- no child process, so
+# killing the attempt closes its socket -- and the first echo ends the rest.
+# Every attempt leaves one line in `INBOUND_ATTEMPTS`, printed when the gate
+# fails.
 INBOUND_VERDICT=$(mktemp)
 rm -f "$INBOUND_VERDICT"
+INBOUND_ATTEMPTS=$(mktemp)
+INBOUND_HOLD="${BHASKIX_INBOUND_HOLD:-20}"
 (
     payload='bhaskix-tcp-in-1'
-    for _ in $(seq 1 "$TIMEOUT"); do
-        if { exec 3<>/dev/tcp/127.0.0.1/$BHASKIX_INBOUND_PORT; } 2>/dev/null; then
-            printf '%s' "$payload" >&3
-            reply=$(timeout 3 dd bs=1 count=16 <&3 2>/dev/null || true)
-            exec 3>&- 3<&- || true
-            if [[ "$reply" == "$payload" ]]; then
-                echo "echoed" > "$INBOUND_VERDICT"
+    started=$(date +%s%3N)
+    attempts=()
+    # The boot's end kills this driver by its PID; its attempts go with it.
+    trap 'kill "${attempts[@]}" 2>/dev/null; exit 0' TERM
+    for n in $(seq 1 $(( TIMEOUT / 3 + 1 ))); do
+        [[ -f "$INBOUND_VERDICT" ]] && break
+        (
+            since() { echo "$(( $(date +%s%3N) - started ))"; }
+            opened=$(since)
+            if ! { exec 3<>/dev/tcp/127.0.0.1/$BHASKIX_INBOUND_PORT; } 2>/dev/null; then
+                echo "attempt $n at ${opened} ms: no connection" >> "$INBOUND_ATTEMPTS"
                 exit 0
             fi
-        fi
-        sleep 1
+            printf '%s' "$payload" >&3
+            reply=''
+            LC_ALL=C IFS= read -r -N 16 -t "$INBOUND_HOLD" reply <&3 || true
+            exec 3>&- 3<&- || true
+            echo "attempt $n opened at ${opened} ms, heard '${reply}' by $(since) ms" >> "$INBOUND_ATTEMPTS"
+            # Through a rename, so the clients waiting for this file never
+            # find it half-written.
+            if [[ "$reply" == "$payload" ]]; then
+                echo "echoed" > "$INBOUND_VERDICT.$n" && mv -f "$INBOUND_VERDICT.$n" "$INBOUND_VERDICT"
+            fi
+        ) &
+        attempts+=($!)
+        sleep 3
     done
+    # The echo is in, or the budget is spent: no attempt still listening is
+    # wanted, and one left open is a connection nobody accepts on a port the
+    # four-client act and the wedge prober use next.
+    kill "${attempts[@]}" 2>/dev/null
+    exit 0
 ) &
 INBOUND_DRIVER=$!
 
@@ -2878,6 +2914,9 @@ if grep -qE "tcp client +did everything outcome 9 says, then opened a v6 connect
         rm -f "$INBOUND_VERDICT"
     else
         fail "the guest says it served the inbound echo; the host driver never got its bytes back"
+        # Every attempt the driver made, when it opened and what it heard --
+        # what tells a stale connection from a slow echo.
+        sort -t' ' -k2 -n "$INBOUND_ATTEMPTS" 2>/dev/null | sed 's/^/      /'
         status=1
     fi
 elif grep -qE "tcp client +holds a working connection capability on a machine with no network" "$LOG"; then
@@ -2906,7 +2945,7 @@ else
     grep -E "tcp client" "$LOG" || true
     status=1
 fi
-rm -f "$INBOUND_VERDICT" 2>/dev/null || true
+rm -f "$INBOUND_VERDICT" "$INBOUND_ATTEMPTS" 2>/dev/null || true
 
 # RFC 0086 step 2's gate -- see the driver above. Demanded exactly where the
 # client reached the end of its demonstration, which is where the act runs.
