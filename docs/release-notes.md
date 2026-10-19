@@ -340,8 +340,11 @@ qemu-system-x86_64 -M q35 -cpu max -smp 4 -m 512M -display none -serial mon:stdi
 All three were run on 2026-10-19, from copies of that day's build, under QEMU
 4.2.1, and typed at: `caps` answered, and `Ctrl-A x` ended QEMU. That needs
 `mon:stdio` — with plain `-serial stdio`, `Ctrl-A x` does nothing. The first runs
-left out `-smp 4`, and two self-tests reported "skipped" for want of a second
-and a third CPU; the lanes boot four, and there they run. The OVMF paths are
+left out `-smp 4`, and ~~two self-tests reported "skipped" for want of a second
+and a third CPU~~ **thirty-two self-tests reported `skipped` for want of CPUs,
+and one more for want of an IOMMU** — corrected the same day: the first count
+read only the report's last lines. The lanes boot four CPUs, and there those
+thirty-two run. The OVMF paths are
 this host's, Ubuntu 20.04; a newer distribution may name the pair
 `OVMF_CODE_4M.fd` and `OVMF_VARS_4M.fd`, and the two must match. A line `cmdline=<options>` in
 `esp/bhaskix/boot.conf` sets the kernel's command line; the ISO's command line
