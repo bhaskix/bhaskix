@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Draft 2026-10-19. Written before any of it, for the lead to read before anything is built. |
+| **Status** | Draft 2026-10-19. Written before any of it. **The lead decided both open questions the same day**: a connection that lives on pins its listener's slot until it ends, and connections nobody accepted are reset, as Linux does — which adds an abort to the design (§4, §5). Nothing built. |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | net / userspace |
 | **Milestone** | L1 ([roadmap.md](../roadmap.md)) — a hosted server that restarts, and a machine that serves more than three listeners over a boot |
@@ -112,9 +112,10 @@ part 6 says why).
 5. **When none is left**, the first pair and the wake are revoked, the slot is freed, its
    generation moves on, and `RELEASE` answers `OK`. Asked again, it answers `GONE`.
 
-**A program that keeps an accepted connection open keeps its listener's slot.** This is the
-decision the lead is asked for (question 1). The alternative — freeing the slot at once and moving
-the children's wake — is costed under Alternatives.
+**A program that keeps an accepted connection open keeps its listener's slot** — the lead's decision
+of 2026-10-19 (question 1). The port is free at once either way, so a server that re-listens is not
+held up by it; the alternative, freeing the slot at once and moving the children's wake, is costed
+under Alternatives.
 
 ### 5. linuxd
 
@@ -125,8 +126,12 @@ the children's wake — is costed under Alternatives.
 - **`reap`**, which already runs on every `listen` and dial, asks each closing listener. On `GONE` it
   deletes the capability, returns the listener's mask to the pool, lowers `listener_pairs`, and
   frees the slot.
-- **Connections linuxd took and nobody accepted** are still shut with a `FIN`, because tcpd has
-  already handed them over. A RST needs an abort verb on a connection (question 2).
+- **Connections linuxd took and nobody accepted are reset**, the lead's decision of 2026-10-19
+  (question 2), as Linux resets them. tcpd has already handed them over, so linuxd asks for it:
+  **`RELEASE` on a connection's handle with `args[0] = 1` aborts it** — tcpd's `Event::Abort`,
+  which sends a RST — and retires it as `RELEASE` already retires a dial. `args[0] = 0`, every
+  caller today, keeps its meaning. The connection's pair then comes back through the same
+  revocation as every other.
 - **The module doc's stated limit** is replaced by what is now true.
 
 ## Alternatives considered
@@ -174,6 +179,8 @@ None measured to begin with. Closing costs one `RELEASE` and, per pair, three re
     three slots and more pairs than the listener cap — the 64-dial gate's shape. Today the fourth
     `listen` is `ENFILE`.
   - **A SYN to a closed port is refused**, by the loopback RST, as the dialer's word 25 already is.
+  - **An unaccepted connection is reset.** A probe listens, dials itself, does *not* accept, and
+    closes the listener; the dialler's next read must answer `ECONNRESET`.
 - **Arms, each red:**
   - a close that frees no slot (the loop stops at three);
   - a close that leaves the port (the re-listen is refused);
@@ -181,12 +188,11 @@ None measured to begin with. Closing costs one `RELEASE` and, per pair, three re
 
 ## Unresolved questions
 
-1. **The slot, while an accepted connection lives.** This draft keeps it until the last child ends.
-   That is simple and leaves a long-lived connection pinning one of linuxd's three slots. For the
-   lead.
-2. **RST or FIN for connections linuxd took and nobody accepted.** Linux resets them; this draft
-   shuts them, because tcpd has already handed them over and has no abort verb on a connection.
-   For the lead.
+1. ~~**The slot, while an accepted connection lives.**~~ **Decided 2026-10-19**: kept until the last
+   child ends.
+2. ~~**RST or FIN for connections linuxd took and nobody accepted.**~~ **Decided 2026-10-19**: reset,
+   through `RELEASE` with an abort flag (§5); step 0 confirms from Linux's source that Linux resets
+   them, and the decision is revisited if it does not.
 3. **Native listeners.** `bin/tcpc` never closes its two, and this RFC refuses `RELEASE` on the
    legacy one. A native program that needs to close one will meet this RFC's answer for hosted
    ones.
@@ -197,7 +203,8 @@ None measured to begin with. Closing costs one `RELEASE` and, per pair, three re
    re-listen and the eight-listener loop — and see them red today: `EADDRINUSE` and `ENFILE`.
 1. **Generations** for listener slots, host-tested; the `GONE` arm takes listener handles.
 2. **`REVOKE` on listener gifts**, in `sock`.
-3. **tcpd answers `RELEASE` on a listener**, in §4's order.
+3. **tcpd answers `RELEASE` on a listener**, in §4's order, and `RELEASE` with the abort flag on a
+   connection.
 4. **linuxd closes and reaps listeners**, with the per-listener pair masks.
 5. **The gates green and the arms red.** The records: TRACKER, RFC 0086's limit, linuxd's module doc,
    and `MAX_LISTENERS`, whose six can then come back down if nothing needs it.
