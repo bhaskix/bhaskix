@@ -867,6 +867,40 @@ pub fn device_kind(sig: u32) -> DeviceKind {
     }
 }
 
+/// How many ports hold a disk, as far as the driver's report can tell.
+///
+/// `ports` is each port's index and its `DET` field, read before any port was
+/// started. `started` is the one port the driver started and the signature it
+/// latched there, or `None` when it started none. A port with a device present
+/// and communicating counts, **except** the started one when its signature is
+/// not a disk's.
+///
+/// That exception is why this exists. Until 2026-10-19 the kernel counted every
+/// communicating port as a disk, so on a machine whose only SATA device is its
+/// boot CD -- QEMU's `q35` puts `-cdrom` on this controller -- the count was one.
+/// The self-test's skip for "no disk" was not taken, and it asked the CD for a
+/// sector and reported `FAILED` twice. The driver had already decided
+/// correctly, through [`device_kind`]; the count had not asked it.
+///
+/// A port the driver never started has no signature yet, and still counts:
+/// nothing has said it is not a disk.
+#[must_use]
+pub fn disks_reported(
+    ports: impl IntoIterator<Item = (usize, u8)>,
+    started: Option<(usize, u32)>,
+) -> usize {
+    ports
+        .into_iter()
+        .filter(|&(index, det)| {
+            let declined = matches!(
+                started,
+                Some((port, sig)) if port == index && device_kind(sig) != DeviceKind::Disk
+            );
+            u32::from(det) == ssts::DET_PRESENT && !declined
+        })
+        .count()
+}
+
 /// Reads a started port's signature.
 ///
 /// Only meaningful **after** the port has been started: `PxSIG` holds what the
@@ -2175,6 +2209,51 @@ mod tests {
         assert_eq!(device_kind(0), DeviceKind::Unknown(0));
         // All-ones is what an unstarted port reads, and it is not a device.
         assert_eq!(device_kind(u32::MAX), DeviceKind::Unknown(u32::MAX));
+    }
+
+    /// `DET` as a port's report word carries it.
+    const PRESENT: u8 = ssts::DET_PRESENT as u8;
+    const NONE: u8 = ssts::DET_NONE as u8;
+
+    #[test]
+    fn a_boot_cd_alone_is_not_a_disk_to_count() {
+        // The machine of 2026-10-19: QEMU's `q35` with an IOMMU, the ISO as
+        // `-cdrom` on port 2, and nothing else. The driver started port 2,
+        // latched ATAPI, and declined it -- so there is no disk, and the
+        // self-test must skip rather than ask a CD for a sector.
+        let ports = [(0, NONE), (1, NONE), (2, PRESENT), (3, NONE)];
+        assert_eq!(disks_reported(ports, Some((2, signature::PACKET))), 0);
+        // And the old count, which asked nothing of the signature, said one.
+        assert_eq!(ports.iter().filter(|&&(_, det)| det == PRESENT).count(), 1);
+    }
+
+    #[test]
+    fn a_disk_counts_and_so_does_a_port_nobody_has_asked_yet() {
+        // The lanes' machine: a disk on port 0, which the driver started and
+        // found to be one, and the boot CD on port 2, never started. Both
+        // count -- the CD because nothing has said otherwise -- and two is not
+        // zero, so the self-test runs and reads the disk, as it always has.
+        let ports = [(0, PRESENT), (1, NONE), (2, PRESENT)];
+        assert_eq!(disks_reported(ports, Some((0, signature::DISK))), 2);
+        // No port started at all: the count is the driver's `DET` and nothing
+        // else, the rule before 2026-10-19 unchanged.
+        assert_eq!(disks_reported(ports, None), 2);
+        // An empty controller -- the SR550's -- is zero either way.
+        assert_eq!(disks_reported([(0, NONE), (1, NONE)], None), 0);
+    }
+
+    #[test]
+    fn a_started_port_that_never_signed_is_declined_with_the_driver() {
+        // All-ones is an unstarted port's reading; if the driver started a
+        // port and still read it, it declined that port as "not a disk", and
+        // the count follows the driver rather than overruling it.
+        let ports = [(1, PRESENT)];
+        assert_eq!(disks_reported(ports, Some((1, u32::MAX))), 0);
+        // A declined port elsewhere does not take a disk with it.
+        assert_eq!(
+            disks_reported([(0, PRESENT), (1, PRESENT)], Some((1, signature::PACKET))),
+            1
+        );
     }
 
     #[test]

@@ -21008,12 +21008,19 @@ static AHCI_REFUSED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU
 /// it. So this test is `block_service_self_test` with one endpoint changed and
 /// one expected string changed, and nothing else -- if the two had to differ by
 /// more than that, the interface would be in the wrong place.
-/// How many ports the driver found a device communicating on, or `None` if it
-/// has not left a report yet.
+/// How many ports hold a disk, as far as the driver's report says, or `None` if
+/// it has not left a report yet.
 ///
 /// Reads the same words `report_ahci_domain` prints from -- `word(8)` for the
-/// implemented-port count and the packed per-port word for `DET` -- so the two
-/// cannot disagree about whether this machine has a disk.
+/// implemented-port count, the packed per-port word for `DET`, and words 13 and
+/// 11 for the port the driver started and the signature it latched there -- so
+/// the two cannot disagree about whether this machine has a disk.
+///
+/// **Until 2026-10-19 this counted every communicating port**, and a machine
+/// whose only SATA device was its boot CD counted one disk: the self-test asked
+/// the CD for a sector and reported `FAILED` twice, though the driver had
+/// already declined it. The count is `bhaskix_ahci::disks_reported`'s now,
+/// host-tested beside the classification it shares with the driver.
 fn ahci_disks(hhdm: u64) -> Option<usize> {
     use core::sync::atomic::Ordering;
 
@@ -21032,14 +21039,13 @@ fn ahci_disks(hhdm: u64) -> Option<usize> {
     if word(0) != AHCID_MARKER {
         return None;
     }
-    let ports = word(8) as usize;
-    let mut disks = 0usize;
-    for index in 0..ports.min(bhaskix_ahci::MAX_PORTS) {
-        if (word(16 + index) >> 8) & 0xff == 3 {
-            disks += 1;
-        }
-    }
-    Some(disks)
+    let ports = (0..(word(8) as usize).min(bhaskix_ahci::MAX_PORTS)).map(|slot| {
+        let packed = word(16 + slot);
+        ((packed & 0xff) as usize, ((packed >> 8) & 0xff) as u8)
+    });
+    // `u64::MAX` until the driver starts a port, as `report_ahci_domain` reads it.
+    let started = (word(13) != u64::MAX).then(|| (word(13) as usize, word(11) as u32));
+    Some(bhaskix_ahci::disks_reported(ports, started))
 }
 
 fn ahci_service_self_test(hhdm: u64) -> bool {
