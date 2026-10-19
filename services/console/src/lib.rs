@@ -161,6 +161,20 @@ impl Lines {
                 line.used = 0;
             }
         }
+        // **Nothing held, so nothing to hold a slot for.** Until 2026-10-19 a
+        // slot was given back only by `flush`, which only a *read* calls -- so
+        // every caller that writes whole lines and never reads, which is most
+        // services and every package, kept its slot for the rest of the boot.
+        // Four of them took all four, and from then on every writer went
+        // straight through in sixteen-byte chunks: typed at a release-built
+        // machine with a disk and a network, `pkg run hello` printed
+        // `namaste from an   it ended cleaninstalled packagly`. A slot now
+        // means a partial line is pending, which is what it was for. Freed only
+        // at the end of a chunk, so a newline in the middle of one cannot hand
+        // the slot to another caller while this one still has bytes coming.
+        if line.used == 0 {
+            line.badge = 0;
+        }
     }
 }
 
@@ -454,6 +468,34 @@ mod tests {
             *held(&PUT),
             "second\nfirst\n",
             "and the other follows, whole"
+        );
+    }
+
+    /// **Callers that wrote whole lines and never read do not use up the
+    /// slots.** The boot of 2026-10-19, in miniature: four services each write
+    /// a line and never read, then a package and the shell write the lines that
+    /// came out interleaved, in the very pieces they arrived in -- sixteen-byte
+    /// chunks, each caller's interrupted by the other's.
+    #[test]
+    fn whole_lines_free_their_slot_for_the_next_caller() {
+        let _alone = alone();
+        held(&PUT).clear();
+        let mut lines = Lines::new();
+
+        for badge in 1..=4 {
+            write_as(&mut lines, badge, b"service ready\n");
+        }
+        held(&PUT).clear();
+
+        write_as(&mut lines, 7, b"namaste from an ");
+        write_as(&mut lines, 9, b"  it ended clean");
+        write_as(&mut lines, 7, b"installed packag");
+        write_as(&mut lines, 9, b"ly\n");
+        write_as(&mut lines, 7, b"e\n");
+        assert_eq!(
+            *held(&PUT),
+            "  it ended cleanly\nnamaste from an installed package\n",
+            "each line whole, in the order they ended -- not the chunks interleaved"
         );
     }
 
