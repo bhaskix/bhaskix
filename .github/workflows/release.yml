@@ -1,0 +1,59 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# A release, as far as a draft. A pushed tag `v*` builds the release's files
+# with `make release-dist` -- the same target a person rehearses with locally,
+# for the reason ci.yml gives: the Makefile is the single source of truth for
+# what a step *is* -- and opens a **draft** GitHub Release holding them.
+#
+# Nothing here publishes. Making a release public cannot be unsaid, so it is
+# the project lead's act, by hand, after the draft has been checked
+# (docs/release-checklist.md, "The day").
+
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write # to open the draft release, and nothing else
+
+jobs:
+  draft:
+    name: draft release
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      - run: rustup show active-toolchain # honours rust-toolchain.toml
+
+      - name: Install xorriso
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq xorriso mtools
+
+      # **A tag, not the branch ci.yml follows.** CI tracks `v8.x-binary` so it
+      # meets a new Limine early; a release has to name exactly the Limine it
+      # shipped, and this is the one every lane ran against when the release
+      # note was written. The commit is checked as well as the tag, because a
+      # tag can be moved.
+      - name: Fetch Limine v8.7.0-binary
+        run: |
+          git clone --branch v8.7.0-binary --depth 1 \
+            https://github.com/limine-bootloader/limine.git boot/limine/limine
+          test "$(git -C boot/limine/limine rev-parse HEAD)" = aad3edd370955449717a334f0289dee10e2c5f01
+          make -C boot/limine/limine
+
+      - name: Build and check the release's files
+        run: make release-dist TAG="$GITHUB_REF_NAME"
+
+      - name: The release note, with links that work on a release page
+        run: tools/release-body.py "$GITHUB_REF_NAME" > dist/body.md
+
+      - name: Open a draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" --draft --prerelease \
+            --title "Bhaskix $GITHUB_REF_NAME" --notes-file dist/body.md \
+            dist/bhaskix.iso dist/bhaskixboot.efi dist/SHA256SUMS dist/LICENSE-go

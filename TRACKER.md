@@ -1081,6 +1081,20 @@ the distinction is in the table rather than in somebody's head.
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-10-19 (the release workflow, as far as a draft)
+
+`.github/workflows/release.yml` runs on a pushed tag `v*` and opens a **draft** GitHub Release;
+nothing in it publishes. It calls the same `make release-dist` a person rehearses with. That target:
+- builds the ISO with the Go server in and BusyBox out;
+- reads the ISO back and refuses one that carries BusyBox or lacks the server;
+- refuses a tag that does not name the version in both `Cargo.toml` files;
+- writes `SHA256SUMS` beside the two binaries and Go's licence.
+
+Limine is pinned to `v8.7.0-binary` and its commit checked, where CI follows the moving branch.
+`tools/release-body.py` makes the note the release's body, with every relative link rewritten to the
+file at the tag. **Rehearsed locally and every refusal watched; the GitHub rehearsal waits for the
+lead, because it pushes a tag.**
+
 ### 2026-10-19 (the first guide: *Get started*)
 
 `docs/guide/` exists, with an index and *Get started*, which the project's website renders. Every

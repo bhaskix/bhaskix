@@ -52,3 +52,6 @@ MiscDocs/
 
 # Python bytecode, which tools/ci-readings.py would otherwise leave when it imports ci-count.py.
 __pycache__/
+
+# Release files (make release-dist)
+/dist/

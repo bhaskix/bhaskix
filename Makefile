@@ -274,7 +274,7 @@ OVMF_SUFFIX  := $(if $(wildcard /usr/share/OVMF/OVMF_CODE_4M.fd),_4M,)
 OVMF_CODE    := $(firstword $(wildcard $(OVMF_DIR)OVMF_CODE$(OVMF_SUFFIX).fd))
 OVMF_VARS    := $(firstword $(wildcard $(OVMF_DIR)OVMF_VARS$(OVMF_SUFFIX).fd))
 
-.PHONY: FORCE all kernel iso demo run run-uefi progress test test-host test-boot test-boot-uefi test-boot-uefi-qemu64 test-boot-iommu test-keyboard \
+.PHONY: FORCE all kernel iso demo run run-uefi release-dist progress test test-host test-boot test-boot-uefi test-boot-uefi-qemu64 test-boot-iommu test-keyboard \
         test-boot-iommu-off test-boot-qemu64 test-boot-native test-boot-native-full test-boot-native-tpm \
         test-boot-native-tpm-tis test-placements mkfs test-shell test-faults test-usb-keyboard test-lacp test-bond test-http fmt clippy gates hooks clean distclean help
 
@@ -655,6 +655,26 @@ $(ISO): kernel boot/limine.conf $(CMDLINE_STAMP) $(INITRD) $(DOMAIN_DISK) $(SATA
 
 $(LIMINE_DIR):
 	@echo "Limine is missing. Run tools/setup-dev.sh" >&2; exit 1
+
+# --- release -------------------------------------------------------------
+
+# A release's files, built and checked in dist/ (docs/release-checklist.md):
+# the ISO with the Go server in and BusyBox out, the native loader, Go's licence,
+# and SHA256SUMS over the two binaries. `.github/workflows/release.yml` runs it on
+# a pushed tag; run it here to rehearse. With TAG, the tag must name the version
+# both Cargo.toml files carry.
+#
+# **Both BusyBox variables, not one**: `$(BUSYBOX)`'s rule has no prerequisites,
+# so in a tree that already holds a copy, emptying BUSYBOX_SRC alone changes
+# nothing and the old binary ships. The script reads the ISO back and refuses
+# one that carries it.
+RELEASE_ISO  := build/release.iso
+release-dist:
+	$(MAKE) iso HTTPD_IN_IMAGE=1 BUSYBOX_SRC= BUSYBOX=build/no-busybox CMDLINE= \
+	    INITRD=build/initrd-release.tar INITRD_ROOT=build/initrd_root_release \
+	    ISO=$(RELEASE_ISO) ISO_ROOT=build/iso_root_release
+	$(MAKE) $(BOOTEFI)
+	tools/release-dist.sh $(RELEASE_ISO) $(BOOTEFI) build/toolchain/go$(GO_VERSION)/LICENSE dist $(TAG)
 
 # --- run -----------------------------------------------------------------
 

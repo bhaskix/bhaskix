@@ -66,6 +66,13 @@ that does it, with the date.
   **Rehearsed** on a throwaway tag (`v0.0.0-rehearsal`); the draft is then inspected and deleted,
   along with the tag.
 
+  **Written 2026-10-19**, as `make release-dist` (the build, and `tools/release-dist.sh`'s checks)
+  and `tools/release-body.py`, which rewrites the note's relative links for a release page. The
+  workflow only fetches the pinned Limine, calls them, and opens the draft. **Rehearsed locally**:
+  `make release-dist TAG=v0.0.0-rehearsal` built and checked the files, and each refusal was watched
+  — a tag naming the wrong version, an ISO carrying BusyBox, one without the Go server. **The
+  rehearsal on GitHub is still owed.** It pushes a tag, so it waits for the lead's go-ahead.
+
 ## Two weeks before — 15 November: the freeze
 
 - [ ] **Freeze** — *engineering*. From here on only fixes, tests and documents land. Work that
