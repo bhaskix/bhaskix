@@ -65,6 +65,43 @@ const STAGING_AT: u64 = 0x3700_0000;
 const TRANSFER_AT: u64 = 0x3800_0000;
 /// The badge the child's ending carries, so a wake can be told from any other.
 const CHILD_BADGE: u64 = 0xc1d;
+/// Bits a wait for a child's ending took from [`SIGNAL`] that were not the
+/// ending's, kept for `irq`.
+///
+/// [`SIGNAL`] serves two purposes: a child's ending is bound to it with
+/// [`CHILD_BADGE`], and the boot rings it once so that `irq` has something to
+/// wake on. **Until 2026-10-19 `spawn` and `pkg run` took whatever woke them as
+/// the ending**, so on a boot where `irq` had not yet been typed, `pkg run
+/// hello` took the boot's ring, announced `it ended cleanly` while the package
+/// was still writing, and released it -- and the two, sharing one console
+/// badge and so one held line, printed `namaste from an   it ended
+/// cleaninstalled packagly`. Found typing the commands in a newcomer's order;
+/// the shell test typed `irq` first, which hid it.
+static SET_ASIDE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Waits on [`SIGNAL`] until a child's ending arrives, setting aside anything
+/// else that woke it for `irq`.
+///
+/// One limit, said rather than hidden: two rings already pending together
+/// arrive as one word, and a bit both badges share cannot be told apart -- it
+/// goes to the ending. Only a ring that lands while this waits can do that.
+fn wait_for_ending() -> Reply {
+    loop {
+        let woken = syscall(syscall::INVOKE, SIGNAL, method::WAIT, [0; 4]);
+        if !woken.delivered() {
+            return woken;
+        }
+        let bits = woken.args[0];
+        if bits & CHILD_BADGE == CHILD_BADGE {
+            let other = bits & !CHILD_BADGE;
+            if other != 0 {
+                SET_ASIDE.fetch_or(other, core::sync::atomic::Ordering::Relaxed);
+            }
+            return woken;
+        }
+        SET_ASIDE.fetch_or(bits, core::sync::atomic::Ordering::Relaxed);
+    }
+}
 /// At most this much of a file is read in as an image.
 ///
 /// The shell's memory object is four pages, and this is all of it. A larger
@@ -833,15 +870,24 @@ fn map() {
 /// interrupt reaches a notification is gated where the interrupt is.
 fn signals() {
     write(b"  6  signal rd  ");
-    let woken = syscall(syscall::INVOKE, SIGNAL, method::WAIT, [0; 4]);
-    if woken.status == status::OK {
+    // A ring a wait for a child's ending took and was not looking for is this
+    // command's, and it is reported as the wake it was.
+    let aside = SET_ASIDE.swap(0, core::sync::atomic::Ordering::Relaxed);
+    if aside != 0 {
         write(b"woke with badge ");
-        write_number(woken.args[0]);
-        write(b"\n");
+        write_number(aside);
+        write(b", set aside by an earlier wait for a program's ending\n");
     } else {
-        write(b"status ");
-        write_number(woken.status);
-        write(b"\n");
+        let woken = syscall(syscall::INVOKE, SIGNAL, method::WAIT, [0; 4]);
+        if woken.status == status::OK {
+            write(b"woke with badge ");
+            write_number(woken.args[0]);
+            write(b"\n");
+        } else {
+            write(b"status ");
+            write_number(woken.status);
+            write(b"\n");
+        }
     }
 
     // Taken means taken. A notification is a signal and not a queue, so the
@@ -1079,7 +1125,7 @@ fn spawn(path: &[u8]) {
     }
 
     // Wait for it, then ask why it ended and give the slot back.
-    let ended = syscall(syscall::INVOKE, SIGNAL, method::WAIT, [0; 4]);
+    let ended = wait_for_ending();
     if !ended.delivered() {
         report_refusal(b"spawn: waiting for it", &ended);
         return;
@@ -2218,7 +2264,7 @@ refused whole, nothing granted\x1b[0m\n",
         let _ = syscall(syscall::INVOKE, CHILD, method::RELEASE, [0; 4]);
         return;
     }
-    let ended = syscall(syscall::INVOKE, SIGNAL, method::WAIT, [0; 4]);
+    let ended = wait_for_ending();
     if ended.delivered() {
         write(b"  it ended cleanly\n");
     }

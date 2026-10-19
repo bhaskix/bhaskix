@@ -249,7 +249,7 @@ else
     # kernel statistics, so until 2026-08-27 it answered `input: not a command`
     # and a machine whose keyboard seemed dead had no way to say whether a key
     # had reached it.
-    commands=$'help\r'$'dmesg\r'$'q\r'$'caps\r'$'input\r'$'map\r'$'irq\r'$'open greeting\r'
+    commands=$'help\r'$'dmesg\r'$'q\r'$'caps\r'$'input\r'$'map\r'$'open greeting\r'
     commands+=$'open sub/inner\r'$'open ..\r'$'open inner\r'$'ls /\r'$'cat etc/hostname\r'
     if [[ "$MODE" == "iommu" ]]; then
         # `ask` was called `lend` until 2026-08-21, when the name was found to
@@ -297,6 +297,16 @@ else
     # Last, because a program started in it writes to the same console this
     # test is reading.
     commands+=$'spawn bin/probe\r'$'spawn bin/probe\r'
+    # **`irq` last, after every wait for a program's ending** (2026-10-19).
+    # The boot rings the shell's notification once so that `irq` has a wake to
+    # report, and `spawn` and `pkg run` wait on that same notification for a
+    # child's ending. Typed first, as it was until that day, `irq` took the
+    # boot's ring and the waits after it were clean -- which hid that a wait
+    # with the ring still pending took it for the ending: `pkg run hello`
+    # announced `it ended cleanly` while the package was still writing, and
+    # the two printed into one console line. Typed after them, every wait meets
+    # the ring a newcomer's would, and `irq` reports it as set aside.
+    commands+=$'irq\r'
     commands+=$'nosuchcommand\r'
 fi
 

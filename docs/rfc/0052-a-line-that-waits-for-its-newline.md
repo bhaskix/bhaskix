@@ -180,7 +180,12 @@ way the kernel colours its own report. Two things bound that:
 given back when its caller's line completes, not only when the caller reads;
 until then, four callers that wrote whole lines and never read kept all four
 holders for the boot, and every later caller wrote straight through, interleaved.
-A held partial line still waits for one of the three things above.
+That is a mechanism a host test demonstrates, and it is **not** what spliced a
+package's line into the shell's on 2026-10-19; this paragraph implied it was
+until it was corrected the same evening. The splice was the shell's: it announced
+a package's ending before the package had finished, and the package writes with
+the shell's own console badge, so the two shared one held line (TRACKER §3). A held partial line still waits for one of
+the three things above.
 
 Tested on the host in `services/console`: a colour sequence split across chunks
 arrives whole and is reset (red against the old filter); the refusals above;
