@@ -49,7 +49,7 @@ that does it, with the date.
 - [ ] **The website** — *engineering*. Under its own version control, its landing page brought up
       to date, and the guides rendered onto it. It says "planned" about the release until step 5
       of the day.
-- [ ] **A release workflow** — *engineering*. `.github/workflows/release.yml`, run on a pushed tag
+- [x] **A release workflow** — *engineering*, rehearsed 2026-10-20. `.github/workflows/release.yml`, run on a pushed tag
       `v*`:
   - build `make iso` and `boot/bhaskixboot/target/x86_64-unknown-uefi/release/bhaskixboot.efi`;
   - **choose the ISO's Linux programs explicitly** (decided 2026-10-19): the Go `net/http` server
@@ -74,6 +74,12 @@ that does it, with the date.
   `make release-dist TAG=v0.0.0-rehearsal` built and checked the files, and each refusal was watched
   — a tag naming the wrong version, an ISO carrying BusyBox, one without the Go server. **The
   rehearsal on GitHub is still owed.** It pushes a tag, so it waits for the lead's go-ahead.
+  **Rehearsed on GitHub 2026-10-20**, on the lead's word: the tag `v0.0.0-rehearsal` on
+  `da71aee` built a draft pre-release with the four files. Downloaded into an empty directory:
+  `sha256sum -c` OK for both binaries, the ISO carrying a 0-byte BusyBox and the 5,779,616-byte
+  server, Go's licence beside them, and a 32,927-character body with no relative link left. The
+  downloaded ISO booted to `bhaskix$` in 24 s with nothing `FAILED`. The draft and the tag were
+  deleted the same hour; nothing was published.
 
 ## Two weeks before — 15 November: the freeze
 

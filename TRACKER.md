@@ -1086,6 +1086,21 @@ the distinction is in the table rather than in somebody's head.
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-10-20 (the release workflow, rehearsed on GitHub)
+
+On the lead's word, after CI run 871 was green, the tag `v0.0.0-rehearsal` on `da71aee` ran
+`.github/workflows/release.yml` from a fresh checkout. It succeeded: a **draft pre-release** with
+`bhaskix.iso`, `bhaskixboot.efi`, `LICENSE-go` and `SHA256SUMS`. Inspected as a downloader would,
+from an empty directory:
+- `sha256sum -c` OK for both binaries;
+- the ISO carries a 0-byte BusyBox and the 5,779,616-byte server;
+- the body, 32,927 characters, has every link pointed at the tag and none left relative;
+- the downloaded ISO booted to `bhaskix$` in 24 s with nothing `FAILED`.
+
+The draft and the tag were deleted afterwards (`release not found`, no tag on the remote), and
+nothing was published. CI run 870's failure did not recur: run 871, with the wedge prober reordered,
+was green.
+
 ### 2026-10-19 (all three guides, verified against one commit)
 
 `docs/guide/` now holds *Get started*, *The shell and packages* and *Linux programs*, all
