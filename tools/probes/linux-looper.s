@@ -27,6 +27,11 @@
         #   56 a blocking dial to 127.0.0.1:12 just after its listener's close:
         #      ECONNREFUSED, the port free at once (words 32 to 55 are this
         #      page's scratch)
+        #   57 accept4 on a listener whose connection is then kept open
+        #   58 that listener's close   59 a blocking dial to the port while
+        #   the closed listener still holds the connection: ECONNREFUSED
+        #   60 a listen on the port meanwhile: 0 -- the port is free at once
+        #   though the slot is not (RFC 0092 section 4, step 1)
         #   30 finished
         #
         # It stops at the first answer that is not the expected one.
@@ -430,6 +435,103 @@ told:
         lea     1(%rax), %rcx
         mov     %rcx, 248(%r12)
         mov     %rbx, %rdi
+        mov     $3, %eax
+        syscall
+
+        # A listener closed while a connection it accepted is still open: it
+        # drains, keeping its slot, and its port must be free all the same.
+        mov     $2, %edi
+        mov     $1, %esi
+        xor     %edx, %edx
+        mov     $41, %eax
+        syscall
+        test    %rax, %rax
+        js      done
+        mov     %rax, %r13
+        mov     %r13, %rdi
+        mov     %r14, %rsi
+        mov     $16, %edx
+        mov     $49, %eax
+        syscall
+        test    %rax, %rax
+        jnz     done
+        mov     %r13, %rdi
+        mov     $1, %esi
+        mov     $50, %eax
+        syscall
+        test    %rax, %rax
+        jnz     done
+        call    dial
+        test    %rax, %rax
+        jnz     done
+        movl    $16, 336(%r12)
+        mov     %r13, %rdi
+        lea     320(%r12), %rsi
+        lea     336(%r12), %rdx
+        xor     %r10d, %r10d
+        mov     $288, %eax
+        syscall
+        lea     1(%rax), %rcx
+        mov     %rcx, 456(%r12)
+        test    %rax, %rax
+        js      done
+        mov     %rax, %rbp
+        mov     %r13, %rdi
+        mov     $3, %eax
+        syscall
+        lea     1(%rax), %rcx
+        mov     %rcx, 464(%r12)
+        # A blocking dial to the port now: refused, though the listener has
+        # not yet let go of its slot.
+        mov     $2, %edi
+        mov     $1, %esi
+        xor     %edx, %edx
+        mov     $41, %eax
+        syscall
+        test    %rax, %rax
+        js      done
+        mov     %rax, %r13
+        mov     %r13, %rdi
+        mov     %r14, %rsi
+        mov     $16, %edx
+        mov     $42, %eax
+        syscall
+        lea     1(%rax), %rcx
+        mov     %rcx, 472(%r12)
+        mov     %r13, %rdi
+        mov     $3, %eax
+        syscall
+        # And a listen on the port meanwhile.
+        mov     $2, %edi
+        mov     $1, %esi
+        xor     %edx, %edx
+        mov     $41, %eax
+        syscall
+        test    %rax, %rax
+        js      done
+        mov     %rax, %r13
+        mov     %r13, %rdi
+        mov     %r14, %rsi
+        mov     $16, %edx
+        mov     $49, %eax
+        syscall
+        test    %rax, %rax
+        jnz     done
+        mov     %r13, %rdi
+        mov     $1, %esi
+        mov     $50, %eax
+        syscall
+        lea     1(%rax), %rcx
+        mov     %rcx, 480(%r12)
+        # Then everything closed: the kept connection, its dialler, the new
+        # listener.
+        mov     %rbp, %rdi
+        mov     $3, %eax
+        syscall
+        mov     %rbx, %rdi
+        mov     $3, %eax
+        syscall
+        mov     %r13, %rdi
         mov     $3, %eax
         syscall
 
