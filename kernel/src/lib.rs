@@ -9793,8 +9793,11 @@ static LOOPER_REPORT_PA: core::sync::atomic::AtomicU64 = core::sync::atomic::Ato
 /// RFC 0092 step 5** it then closes listeners: a dial to the port just after
 /// its listener's close is refused, and again while a closed listener still
 /// holds a connection it accepted, when listening on the port works too; it
-/// listens on the port again and is dialled there, listens and closes eight times over, and closes one
-/// with a connection nobody accepted, whose dialler must read `ECONNRESET`.
+/// listens on the port again and is dialled there, listens and closes eight
+/// times over, and closes one with a connection nobody accepted, whose dialler
+/// must read `ECONNRESET`. **Since RFC 0093** it last holds a finished
+/// connection's descriptor open on a one-pair listener, and a second peer must
+/// find no pair until it is closed.
 ///
 /// Assembled from [`tools/probes/linux-looper.s`](../../tools/probes/linux-looper.s)
 /// by [`tools/probe-bytes.sh`](../../tools/probe-bytes.sh), which verifies its

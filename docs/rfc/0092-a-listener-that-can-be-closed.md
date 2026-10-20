@@ -120,7 +120,9 @@ part 6 says why).
 **A program that keeps an accepted connection open keeps its listener's slot** — the lead's decision
 of 2026-10-19 (question 1). The port is free at once either way, so a server that re-listens is not
 held up by it; the alternative, freeing the slot at once and moving the children's wake, is costed
-under Alternatives.
+under Alternatives. **Since [RFC 0093](0093-a-ring-pair-stays-with-its-connection.md)
+(2026-10-20)** the same holds for a connection whose holder has not released it, finished or not: a
+connection leaves tcpd's table, and its listener's slot can come back, only once it is released.
 
 ### 5. linuxd
 

@@ -96,7 +96,8 @@ document, release note or README may state or imply that it works."*
 | **Records what it booted in a TPM, and checks the record.** The native loader measures the kernel and initrd into PCR 9 and the command line into PCR 8. The event log reaches the kernel, and `bin/tpmd` **replays it against the TPM**: `log and TPM agree on PCRs 0-9` (2026-10-19), and a log that lies about the kernel is caught | `make test-boot-native-tpm` and `-tpm-tis`, against an emulated TPM (swtpm) over CRB and TIS. ~~**locally only** — it needs Docker, and CI does not run it yet. RFC 0089 is a **draft**, and nothing *verifies* the measurements~~ — **wrong since 2026-10-11, corrected 2026-10-19**: CI runs both lanes, and RFC 0089 was accepted 2026-10-11. On the SR550's own TPM: `log and TPM agree on PCRs 0-7, 9 ... over FIFO` (2026-10-11). **Recorded, not refused**: see below |
 | **Boots on physical hardware** — a Lenovo SR550, read over serial-over-LAN | 2026-08-23 through Limine; through its own loader to the user-mode shell since 2026-10-11 |
 
-Alongside, **as measured on 2026-10-19**: **61 of 92 RFCs accepted**, each
+Alongside, **as measured on 2026-10-20**: **61 of 93 RFCs accepted** (61 of 92 on
+2026-10-19, before RFC 0093 was drafted), each
 accepted one implemented and measured rather than merely written. The command:
 
 ```sh
@@ -104,8 +105,8 @@ for f in docs/rfc/0*.md; do grep -m1 Status "$f"; done \
   | grep -ciE '^\| \*\*Status\*\* \| *(✅ *)?\*\*accepted'
 ```
 
-`docs/rfc/` holds 94 files: the template, `0040-libcrux-inspection.md` (RFC
-0040's step-1 output rather than an RFC), and 92 RFCs. ~~`grep -ci accepted`~~
+`docs/rfc/` holds 95 files: the template, `0040-libcrux-inspection.md` (RFC
+0040's step-1 output rather than an RFC), and 93 RFCs. ~~`grep -ci accepted`~~
 was this note's command until 2026-10-19, and it reads 62 from that day, because
 RFC 0092's status says "connections nobody accepted". Host unit tests:
 **1,407** (`cargo test --workspace`, summed across one `make test` run,
@@ -196,8 +197,8 @@ out one that is open in name only: the `uefi, qemu64` lane, restored to
 `make test` and failing only by other rows' defects. Eleven rows closed between
 the two refreshes, and with the five found and fixed later the same day they are
 in the second table. **2026-10-20**: one more row filed, read from the code rather
-than seen — a hosted `write` after its connection has finished — and added to
-the table below.
+than seen — a hosted `write` after its connection has finished — ~~and added to
+the table below~~ and closed the same day, so it is in the second table.
 
 | Defect — what you would see | Rate, as TRACKER states it | Fix |
 |---|---|---|
@@ -222,7 +223,6 @@ the table below.
 | The LACP test's report ends with no state line | 1 sighting (2026-10-16) | not explained |
 | A second boot on the same disk image reports `block service FAILED` | every such boot (2026-10-19) | not fixed: the boot's format writes over the marker its self-test reads. Remake the image before each boot, as the guides say |
 | BusyBox `sh` faults at `0x48` | ~2% of harness runs; 0 of 8,443 CI boots (2026-10-04) | likely fixed 2026-10-02, not proven |
-| A hosted program's `write` on a connection the network service has already finished can land in the next connection's buffer | read from the code 2026-10-20; never seen | not chosen: ask the service before writing, or hold a finished connection's buffer until the program closes it |
 | A per-CPU hold count underflows (the remainder of the old "445 ms wake" row) | no specimen in 450 boots of one image (2026-08-28) | a cause guarded 2026-09-03; not shown to be *the* cause |
 
 **Several of these have fixes waiting on a count**, and the column says which.
@@ -233,6 +233,7 @@ not yet absence.
 
 | Defect | Closed |
 |---|---|
+| A hosted program's `write` on a connection the network service had already finished could land in the next connection's buffer | **2026-10-20**, the day it was filed, by [RFC 0093](rfc/0093-a-ring-pair-stays-with-its-connection.md): a connection keeps its buffers until the program closes it. Read from the code; its mechanism was seen once, on a test build that restored the old behaviour on purpose |
 | The shell's `pkg` messages printed `?[1;32minstalled?[0m`: it colours its output, and the console turned every escape from a ring-3 program into `?` | **2026-10-19**, by the lead's decision — colour passes, and nothing else does: clearing, cursor movement, blink, conceal and reverse are still refused, and a coloured line ends with a reset ([RFC 0052](rfc/0052-a-line-that-waits-for-its-newline.md), amended) |
 | A package's output and the shell's interleaved on the console, in sixteen-byte pieces, and the shell said `it ended cleanly` before the package had | **2026-10-19**, found typing `pkg run hello`. ~~the four line holders were given back only on a read, so writers that never read kept them; a finished line now gives its holder back, and a host test reproduces the boot's specimen against the old rule byte for byte~~ — that was this table's first explanation, the same day, and it was wrong: the boot printed the same line with that change in. **The cause**: `pkg run` took a notification the boot had left pending for `irq` as the package's ending, and the package writes with the shell's own console badge, so the two shared one line. Found by typing `irq` first, which took that notification — and the lines came out whole. `pkg run` and `spawn` now wait for the ending's own bits; the shell test types `irq` last and went red on the old shell |
 | `held`, typed after an `open` that failed or after a `release`, ended the user-mode shell: it read an unmapped page, and a fault ends the domain | **2026-10-19**, found typing the shell's own commands as a newcomer would — `held` now says nothing is lent, and the shell test types it after `release` |
@@ -408,8 +409,8 @@ fresh checkout may build against a later 8.x; the release build pins the tag.
 - [TRACKER.md](../TRACKER.md) — what is *proven* versus what merely compiles,
   the open defects, and a changelog that records the mistakes as well as the
   results.
-- [docs/rfc/](rfc/) — 92 RFCs; the 61 accepted ones were each built and measured
-  before acceptance (2026-10-19).
+- [docs/rfc/](rfc/) — 93 RFCs; the 61 accepted ones were each built and measured
+  before acceptance (2026-10-20).
 - [docs/security.md](security.md) — the threat model, and which threats are
   mitigated versus merely named.
 - [docs/roadmap.md](roadmap.md) — scope, and the release criteria this note is

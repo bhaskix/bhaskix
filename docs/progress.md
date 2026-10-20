@@ -11,7 +11,7 @@
 | | |
 |---|---|
 | RFCs accepted | **61** |
-| RFCs open | 29 |
+| RFCs open | 30 |
 | RFCs closed without shipping | 2 |
 | Milestone rows done | **92 of 95** |
 | Phase 2 bullets done | **13 of 13** |
@@ -78,6 +78,7 @@ gantt
     RFC 0076 a bond on hardware :active, r0076, 2026-09-08, 2026-10-20
     RFC 0090 A hosted program that dials out :done, r0090, 2026-10-08, 2026-10-16
     RFC 0092 A listener that can be closed :active, r0092, 2026-10-19, 2026-10-20
+    RFC 0093 A ring pair stays with its connection until the... :active, r0093, 2026-10-20, 2026-10-20
     section Drivers & IOMMU
     RFC 0011 IrqHandler — who may receive an interrupt :done, r0011, 2026-08-04, 1d
     RFC 0012 The IOMMU and what a device is allowed to reach :done, r0012, 2026-08-04, 1d
@@ -199,6 +200,7 @@ gantt
 | 0088 | A clock a process reads itself | 2026-10-02 |
 | 0091 | A boot its owner signed | 2026-10-12 |
 | 0092 | A listener that can be closed | 2026-10-19 |
+| 0093 | A ring pair stays with its connection until the holder lets go | 2026-10-20 |
 
 ## Annexes
 
