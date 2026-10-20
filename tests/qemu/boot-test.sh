@@ -3103,13 +3103,14 @@ else
 fi
 
 # RFC 0092 step 5: a listener that can be closed. The same probe, after the
-# loopback: it listens on 127.0.0.1:12 again and is dialled there, listens and
+# loopback: a blocking dial to 127.0.0.1:12 just after its listener's close is
+# refused, as the port is free at once; it listens there again and is dialled, listens and
 # closes eight times over -- more than linuxd's three listener slots and
 # tcpd's six -- and closes a listener with a connection nobody accepted, whose
 # dialler must read ECONNRESET and then 0, as on Linux. Before the RFC the
 # second listen was ENFILE. Demanded where the loopback runs.
-if grep -qE "linux loop +a closed listener gives its port back: listened again on 127\.0\.0\.1:12 and was dialled there, listened and closed eight times over, and a connection nobody accepted was reset -- ECONNRESET, then 0 \(RFC 0092\)" "$LOG"; then
-    pass "a closed listener gives its port back: re-listened and dialled, eight listens closed in turn, an unaccepted connection reset"
+if grep -qE "linux loop +a closed listener gives its port back: a dial just after the close was refused \(ECONNREFUSED\), listened again on 127\.0\.0\.1:12 and was dialled there, listened and closed eight times over, and a connection nobody accepted was reset -- ECONNRESET, then 0 \(RFC 0092\)" "$LOG"; then
+    pass "a closed listener gives its port back: a dial after its close refused, re-listened and dialled, eight listens closed in turn, an unaccepted connection reset"
 elif grep -qE "linux loop +FAILED: a closed listener" "$LOG"; then
     fail "closing a listener: $(grep -aoE 'linux loop +FAILED: a closed listener.*' "$LOG" | head -1 | sed 's/\x1b\[[0-9;]*m//g')"
     status=1

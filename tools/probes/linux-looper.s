@@ -24,6 +24,9 @@
         #   27 poll(POLLIN) on it: 1 once a connection waits   28 its close
         #   29 the dialler's read after that close: ECONNRESET, as on Linux
         #   31 its next read: 0, the reset told once
+        #   56 a blocking dial to 127.0.0.1:12 just after its listener's close:
+        #      ECONNREFUSED, the port free at once (words 32 to 55 are this
+        #      page's scratch)
         #   30 finished
         #
         # It stops at the first answer that is not the expected one.
@@ -231,6 +234,28 @@ arrived:
         syscall
         lea     1(%r15, %rax), %r15
         mov     %r15, 152(%r12)
+
+        # RFC 0092 step 5: the port is free the moment its listener closes, so
+        # a blocking dial to it now is refused, as one to a port nobody ever
+        # listened on is.
+        mov     $2, %edi
+        mov     $1, %esi
+        xor     %edx, %edx
+        mov     $41, %eax
+        syscall
+        test    %rax, %rax
+        js      done
+        mov     %rax, %rbx
+        mov     %rbx, %rdi
+        mov     %r14, %rsi
+        mov     $16, %edx
+        mov     $42, %eax
+        syscall
+        lea     1(%rax), %rcx
+        mov     %rcx, 448(%r12)
+        mov     %rbx, %rdi
+        mov     $3, %eax
+        syscall
 
         # RFC 0092 step 0: listen again on the port just closed. A listener
         # that cannot be closed answers this with an error; read, not judged.
