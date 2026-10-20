@@ -201,6 +201,20 @@ bhaskix$ dmesg
 IOMMU containing them, a USB keyboard. `make run` boots a bare one instead: a
 single read-only disk and no network, which starts faster and can do much less.
 
+**Guides**, step by step, where every command shown was run and every output is
+a transcript of that run:
+- [Get started](docs/guide/get-started.md) — download and check the release,
+  boot it in QEMU three ways, and a fuller machine with a disk and a network;
+- [The shell and packages](docs/guide/shell-and-packages.md) — every command,
+  what holding a capability means, installing a package;
+- [Linux programs](docs/guide/linux-programs.md) — an unmodified Go web server
+  answering your browser, and what is refused and why.
+
+**The first release** is a developer preview, `v0.1.0-preview`, planned for
+**29 November 2026**: an ISO, Bhaskix's own UEFI loader, and a
+[release note](docs/release-notes.md) that states the gaps as plainly as the
+features. How it gets out the door is [docs/release-checklist.md](docs/release-checklist.md).
+
 ## Why another operating system
 
 Every general-purpose operating system in production today was architected before containers,
