@@ -345,8 +345,11 @@ pub mod adapter {
     pub const TCP_DIAL_RESERVE: usize = 4;
     /// Where a hosted listener's capability lands, one slot each.
     pub const TCP_LISTENERS: usize = TCP_RINGS + TCP_RING_COUNT;
-    /// How many hosted listeners at once — `bin/tcpd`'s own limit is four and
-    /// `bin/tcpc` holds one of them.
+    /// How many hosted listeners at once. ~~`bin/tcpd`'s own limit is four and
+    /// `bin/tcpc` holds one of them.~~ `bin/tcpd`'s limit is six since
+    /// 2026-10-19, and `bin/tcpc` holds two (corrected 2026-10-20). Since RFC
+    /// 0092 a closed listener's slot comes back, once every connection it
+    /// accepted has ended.
     pub const TCP_LISTENER_COUNT: usize = 3;
     /// Where an accepted connection's capability lands, one slot each.
     pub const TCP_CONNECTIONS: usize = TCP_LISTENERS + TCP_LISTENER_COUNT;

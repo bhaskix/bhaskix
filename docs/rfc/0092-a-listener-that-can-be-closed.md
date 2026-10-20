@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Draft 2026-10-19. Written before any of it. **The lead decided both open questions the same day**: a connection that lives on pins its listener's slot until it ends, and connections nobody accepted are reset, as Linux does — which adds an abort to the design (§4, §5). ~~Nothing built.~~ **Step 0 done 2026-10-19; steps 1 and 2 done 2026-10-20** — listener slots have generations, from the connection table's own `Table`, and the `GONE` arm takes listener badges; a listener's rings and wake are gifted returnable, as a dial's are. **Step 3 written 2026-10-20 and not yet exercised**: tcpd answers `RELEASE` on a listener in §4's order, and the abort flag on a connection, but nothing sends either until linuxd does in step 4, so step 5's gates are its proof. |
+| **Status** | Draft 2026-10-19. Written before any of it. **The lead decided both open questions the same day**: a connection that lives on pins its listener's slot until it ends, and connections nobody accepted are reset, as Linux does — which adds an abort to the design (§4, §5). ~~Nothing built.~~ **Step 0 done 2026-10-19; steps 1 and 2 done 2026-10-20** — listener slots have generations, from the connection table's own `Table`, and the `GONE` arm takes listener badges; a listener's rings and wake are gifted returnable, as a dial's are. ~~**Step 3 written 2026-10-20 and not yet exercised**~~ **Steps 3, 4 and 5 done 2026-10-20 — every step built and gated, for the lead to accept.** tcpd answers `RELEASE` on a listener in §4's order and the abort flag on a connection; linuxd closes and reaps its listeners; the loopback probe's five new checks pass on the `iommu` lane (four boots, 207 passed and none failed each), and each of four arms is red — one only after a fifth check was added, because it first stayed green (step 5's record). |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | net / userspace |
 | **Milestone** | L1 ([roadmap.md](../roadmap.md)) — a hosted server that restarts, and a machine that serves more than three listeners over a boot |
@@ -179,13 +179,18 @@ None measured to begin with. Closing costs one `RELEASE` and, per pair, three re
   over a listener's pairs and children — step 1 finds out.
 - **QEMU, gated on the `iommu` lane:**
   - **Re-listen.** The loopback probe closes its listener, listens on `127.0.0.1:12` again, and
-    dials it again. Today the second `listen` is `EADDRINUSE`; that is step 0's failing gate.
+    dials it again. ~~Today the second `listen` is `EADDRINUSE`~~ — step 0 measured `ENFILE`
+    (corrected 2026-10-20); that is step 0's failing gate.
   - **More than three.** A probe that listens and closes eight times in a row, more than linuxd's
-    three slots and more pairs than the listener cap — the 64-dial gate's shape. Today the fourth
-    `listen` is `ENFILE`.
+    three slots and more pairs than the listener cap — the 64-dial gate's shape. ~~Today the fourth
+    `listen` is `ENFILE`.~~ Today it never starts: the re-listen before it is already `ENFILE`
+    (corrected 2026-10-20).
   - **A SYN to a closed port is refused**, by the loopback RST, as the dialer's word 25 already is.
   - **An unaccepted connection is reset.** A probe listens, dials itself, does *not* accept, and
     closes the listener; the dialler's next read must answer `ECONNRESET`.
+  - **The port is free while the slot is not** (added in step 5, when an arm showed the checks above
+    never read the closing flag). A listener closed while a connection it accepted is open: a dial
+    to its port is refused, and a listen on it answers 0.
 - **Arms, each red:**
   - a close that frees no slot (the loop stops at three);
   - a close that leaves the port (the re-listen is refused);
@@ -224,7 +229,7 @@ None measured to begin with. Closing costs one `RELEASE` and, per pair, three re
      ended would otherwise have held the slot, and `RELEASE` answered `LATER`, for ever.
    - **`ACCEPT` and `ARM_PAIR` on a closing listener answer `GONE`**, not `LATER`: nothing more
      will be accepted or armed on it, and `LATER` would be asked for ever.
-4. **linuxd closes and reaps listeners**, with the per-listener pair masks. **Written 2026-10-20**,
+4. **linuxd closes and reaps listeners**, with the per-listener pair masks. **Done 2026-10-20**,
    with three things §5 did not say:
    - **`OK` finishes it as `GONE` does.** Both say tcpd holds nothing of the listener, so a close
      with no accepted connection alive gives back the slot and pairs at once, not at the next
@@ -236,4 +241,48 @@ None measured to begin with. Closing costs one `RELEASE` and, per pair, three re
      `Result<(), u64>` puts tcpd's words and the kernel's statuses in one number. tcpd's `GONE` is 4
      and its `LATER` 7, and nothing keeps a kernel status from being either.
 5. **The gates green and the arms red.** The records: TRACKER, RFC 0086's limit, linuxd's module doc,
-   and `MAX_LISTENERS`, whose six can then come back down if nothing needs it.
+   and `MAX_LISTENERS`, whose six can then come back down if nothing needs it. **Done 2026-10-20.**
+
+   **The gates.** The loopback probe, after its dial, now closes listeners. It is one probe, in
+   this order, and it stops at the first answer that is wrong:
+   - a blocking dial to `127.0.0.1:12` just after its listener closes is refused (`ECONNREFUSED`);
+   - it listens on the port again and is dialled there;
+   - it listens and closes eight times over;
+   - it closes a listener with a connection nobody accepted, and the dialler reads `ECONNRESET`,
+     then `0`;
+   - while a closed listener still holds a connection it accepted, a dial to its port is refused,
+     and a listen on it answers `0`.
+
+   Each word the probe records is its answer plus one, so a word it never reached reads `0` and
+   cannot pass. Green on four `iommu` boots: 207 passed and none failed on each.
+
+   **The arms, each booted on that lane:**
+
+   | Arm | What it read |
+   |---|---|
+   | linuxd frees no slot | the re-listen `listen -23`, `ENFILE` — step 0's reading |
+   | tcpd answers `OK` and closes nothing | red, but **earlier than predicted**. The loopback's own first `listen` answered `EIO` (-5), and the dial test's fork check failed. The cause is inferred, not read: linuxd handed out pairs and slots tcpd still held |
+   | linuxd shuts the unaccepted connection in order | reads `0 then 0`; everything before it passed |
+   | tcpd finds a closing listener by its port | **green against the first four checks**: every listener they close has no connection left, so tcpd removes it at once and the closing flag is never read. That is why the draining check exists. Against it the arm reads a dial `0` — it connected — and a listen `-98`, `EADDRINUSE`; everything else passed |
+
+   **Not armed by a boot: a stale generation.** linuxd deletes a listener's capability before its
+   slot can be reused, so no hosted program can present a stale handle. Step 1's host test, watched
+   failing against a vacancy that always says 1, is that arm.
+
+   **Not host-tested: the teardown order.** The testing plan asked whether it could be a pure
+   decision over a listener's pairs and children. It was written into `bin/tcpd`'s `main.rs` beside
+   the calls that revoke, and only the boots and arms above prove it — a weaker instrument than the
+   project prefers, stated here.
+
+   **Beyond the plan.** A hosted `read` now answers a peer's reset with `ECONNRESET`, once, then 0.
+   That is Linux 6.12's `tcp_recvmsg_locked`, read from its source. The unaccepted check needs it,
+   and until now a reset read as an orderly end. One difference stays, stated in the code: Linux
+   reads 0 for a reset that follows the peer's `FIN`.
+
+   **`MAX_LISTENERS` stays six.** `bin/tcpc` holds two listeners (port 7 by `LISTEN`, a second by
+   `listen_open`) and linuxd three, so five can be open at once. A closed listener that is still
+   draining also keeps its slot while the one that replaces it takes another.
+
+   **A claim corrected.** The commit that added the refused-dial check said it sat "where an arm
+   that keeps the port fails it alone". The fourth arm's first run disproved that, for the reason in
+   its row.

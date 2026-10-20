@@ -276,8 +276,9 @@ thirty-third, which failed it).
 
 **What is interim, and said in `stream.rs`:** a blocking `accept`/`read` waits
 by retrying every ten milliseconds, not by readiness — step 4's `epoll` is
-where that changes; a pair given to a listener stays with it, since `tcpd` has
-no un-listen; and the send side has no flow control the adapter can see, so a
+where that changes; ~~a pair given to a listener stays with it, since `tcpd` has
+no un-listen~~ (until [RFC 0092](0092-a-listener-that-can-be-closed.md), 2026-10-20: a
+listener that closes is stopped and its pairs come back); and the send side has no flow control the adapter can see, so a
 write is bounded to a page and trusts the peer to keep acknowledging.
 
 ## Step 4's record (2026-09-30): `epoll`

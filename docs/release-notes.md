@@ -158,12 +158,16 @@ Stated as plainly as the list above, because that is what criterion R7 asks for.
 - **A hosted program cannot dial over IPv6.** Every hosted IPv6 dial is answered
   `ENETUNREACH` (filed 2026-10-16). IPv6 TCP, `::1` included, works only for
   Bhaskix's own programs.
-- **A hosted listener cannot be closed.** Its port, its table slot and its
+- ~~**A hosted listener cannot be closed.** Its port, its table slot and its
   buffers stay held for the rest of the boot. A server that closes and listens
-  again is refused, and the adapter holds three listeners per boot.
-  [RFC 0092](rfc/0092-a-listener-that-can-be-closed.md), drafted 2026-10-19
-  with the lead's decisions, is the fix. Its step 0 measured the refusal:
-  `listen -23`.
+  again is refused, and the adapter holds three listeners per boot.~~
+  **Corrected 2026-10-20: a hosted listener can be closed**
+  ([RFC 0092](rfc/0092-a-listener-that-can-be-closed.md), built and gated, for
+  the lead to accept). Its port is free the moment it closes, and connections
+  it took and nobody accepted are reset, as on Linux. What remains: the adapter
+  holds **three listeners at once**, and a closed one keeps its place until
+  every connection it accepted has ended. Its step 0 measured the old refusal,
+  `listen -23`; the `iommu` lane now requires `listen 0`.
 - **Networking on physical hardware is narrow.** ~~Networking has never run on
   physical hardware~~ — **wrong since 2026-09-13**, and this line said it until
   2026-10-08: a host on the SR550's network pinged it and **it replied**, through
@@ -191,7 +195,9 @@ twenty-fourth row. The table below groups two that are one family, and leaves
 out one that is open in name only: the `uefi, qemu64` lane, restored to
 `make test` and failing only by other rows' defects. Eleven rows closed between
 the two refreshes, and with the five found and fixed later the same day they are
-in the second table.
+in the second table. **2026-10-20**: one more row filed, read from the code rather
+than seen — a hosted `write` after its connection has finished — and added to
+the table below.
 
 | Defect — what you would see | Rate, as TRACKER states it | Fix |
 |---|---|---|
@@ -216,6 +222,7 @@ in the second table.
 | The LACP test's report ends with no state line | 1 sighting (2026-10-16) | not explained |
 | A second boot on the same disk image reports `block service FAILED` | every such boot (2026-10-19) | not fixed: the boot's format writes over the marker its self-test reads. Remake the image before each boot, as the guides say |
 | BusyBox `sh` faults at `0x48` | ~2% of harness runs; 0 of 8,443 CI boots (2026-10-04) | likely fixed 2026-10-02, not proven |
+| A hosted program's `write` on a connection the network service has already finished can land in the next connection's buffer | read from the code 2026-10-20; never seen | not chosen: ask the service before writing, or hold a finished connection's buffer until the program closes it |
 | A per-CPU hold count underflows (the remainder of the old "445 ms wake" row) | no specimen in 450 boots of one image (2026-08-28) | a cause guarded 2026-09-03; not shown to be *the* cause |
 
 **Several of these have fixes waiting on a count**, and the column says which.

@@ -118,10 +118,14 @@ that the adapter answered with `ENOSYS`; Go carries on without it.
   `EACCES`.
 - **No IPv6 dials.** A hosted program's IPv6 `connect` is answered
   `ENETUNREACH`. IPv4 works, including `127.0.0.1`.
-- **A listener cannot be closed.** A hosted server that closes its listening
+- ~~**A listener cannot be closed.** A hosted server that closes its listening
   socket keeps its port for the rest of the boot, and the adapter has three
-  listening sockets to give out in a whole boot. [RFC 0092](../rfc/0092-a-listener-that-can-be-closed.md)
-  is the fix, drafted.
+  listening sockets to give out in a whole boot.~~ *Corrected 2026-10-20*:
+  **a listener can be closed**, and its port is free at once
+  ([RFC 0092](../rfc/0092-a-listener-that-can-be-closed.md); checked by the
+  project's own tests, not yet by a transcript in this guide). What remains:
+  the adapter has **three listening sockets at once**, and one you closed keeps
+  its place until every connection it accepted has ended.
 - **No dynamic linking, and no application milestone.** The Linux
   compatibility milestones, L1 to L4, are all unmet: nginx, PostgreSQL, MariaDB
   and OpenSSH have never run here. See the

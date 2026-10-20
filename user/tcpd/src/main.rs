@@ -128,10 +128,16 @@ const PAIR_STRIDE: u64 = 0x2_0000;
 ///
 /// **Six since 2026-10-19**, the lead's choice. The `iommu` lane filled all
 /// four — `bin/tcpc`'s two, the hosted stream and `epoll` servers — and IPv4
-/// TCP loopback's probe needs a fifth: this service cannot stop listening, so
+/// TCP loopback's probe needs a fifth: ~~this service cannot stop listening, so
 /// a hosted program's listener outlives the program and its slot is never
-/// given back. Six is that lane's five and one spare. The limit that matters
-/// is unchanged and stated in `bin/linuxd`: a listener that never closes.
+/// given back~~. Six is that lane's five and one spare. ~~The limit that
+/// matters is unchanged and stated in `bin/linuxd`: a listener that never
+/// closes.~~
+///
+/// **Still six since RFC 0092 (2026-10-20)**, when a listener can be released.
+/// `bin/tcpc` holds two and `bin/linuxd` three, so five can be open at once.
+/// A released listener that is still draining keeps its slot while the one
+/// that replaced it takes another.
 const MAX_LISTENERS: usize = 6;
 
 /// Where the wake a new listener's opener gifts lands: one slot per pair
