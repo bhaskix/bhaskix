@@ -14,7 +14,17 @@
         #   16 write accepted->dialler   17 read   18 those 16 bytes matched
         #   19 three closes, each answer plus one, summed
         #   20 socket, 21 bind, 22 listen, listening again on 127.0.0.1:12
-        #      after the close -- RFC 0092 step 0's measurement   30 finished
+        #      after the close -- RFC 0092 step 0's measurement
+        #   RFC 0092 step 5, each answer plus one so a word never reached
+        #   reads 0:
+        #   23 accept4 on that listener, from a fresh dial
+        #   24 listens of eight that answered 0, each listener closed before
+        #      the next   25 the first that did not, plus one
+        #   26 listen, for a listener that is closed without an accept
+        #   27 poll(POLLIN) on it: 1 once a connection waits   28 its close
+        #   29 the dialler's read after that close: ECONNRESET, as on Linux
+        #   31 its next read: 0, the reset told once
+        #   30 finished
         #
         # It stops at the first answer that is not the expected one.
 _start:
@@ -244,7 +254,157 @@ arrived:
         mov     $50, %eax
         syscall
         mov     %rax, 176(%r12)
+        test    %rax, %rax
+        jnz     done
+
+        # RFC 0092 step 5: dial the new listener and accept from it -- the
+        # port is not only free but answered.
+        call    dial
+        test    %rax, %rax
+        jnz     done
+        movl    $16, 336(%r12)
         mov     %r13, %rdi
+        lea     320(%r12), %rsi
+        lea     336(%r12), %rdx
+        xor     %r10d, %r10d
+        mov     $288, %eax
+        syscall
+        lea     1(%rax), %rcx
+        mov     %rcx, 184(%r12)
+        test    %rax, %rax
+        js      done
+        mov     %rax, %rbp
+        mov     %rbp, %rdi
+        mov     $3, %eax
+        syscall
+        mov     %rbx, %rdi
+        mov     $3, %eax
+        syscall
+        mov     %r13, %rdi
+        mov     $3, %eax
+        syscall
+
+        # Eight listeners on the same port, each closed before the next:
+        # more than linuxd's three slots and tcpd's six.
+        mov     $8, %r15d
+again:
+        mov     $2, %edi
+        mov     $1, %esi
+        xor     %edx, %edx
+        mov     $41, %eax
+        syscall
+        test    %rax, %rax
+        js      refused
+        mov     %rax, %r13
+        mov     %r13, %rdi
+        mov     %r14, %rsi
+        mov     $16, %edx
+        mov     $49, %eax
+        syscall
+        test    %rax, %rax
+        jnz     refused
+        mov     %r13, %rdi
+        mov     $1, %esi
+        mov     $50, %eax
+        syscall
+        test    %rax, %rax
+        jnz     refused
+        incq    192(%r12)
+        mov     %r13, %rdi
+        mov     $3, %eax
+        syscall
+        dec     %r15d
+        jnz     again
+        jmp     unaccepted
+refused:
+        lea     1(%rax), %rcx
+        mov     %rcx, 200(%r12)
+        jmp     done
+
+        # A listener closed with a connection waiting in it that nobody
+        # accepted: the dialler is reset, and its read says so.
+unaccepted:
+        mov     $2, %edi
+        mov     $1, %esi
+        xor     %edx, %edx
+        mov     $41, %eax
+        syscall
+        test    %rax, %rax
+        js      done
+        mov     %rax, %r13
+        mov     %r13, %rdi
+        mov     %r14, %rsi
+        mov     $16, %edx
+        mov     $49, %eax
+        syscall
+        test    %rax, %rax
+        jnz     done
+        mov     %r13, %rdi
+        mov     $1, %esi
+        mov     $50, %eax
+        syscall
+        lea     1(%rax), %rcx
+        mov     %rcx, 208(%r12)
+        test    %rax, %rax
+        jnz     done
+        call    dial
+        test    %rax, %rax
+        jnz     done
+        # poll({L, POLLIN}) until the connection waits in it
+        mov     %r13d, 256(%r12)
+        movw    $1, 260(%r12)
+        mov     $500, %r15d
+waiting:
+        movw    $0, 262(%r12)
+        lea     256(%r12), %rdi
+        mov     $1, %esi
+        mov     $10, %edx
+        mov     $7, %eax
+        syscall
+        cmp     $1, %rax
+        je      queued
+        dec     %r15d
+        jnz     waiting
+        jmp     done
+queued:
+        mov     %rax, 216(%r12)
+        mov     %r13, %rdi
+        mov     $3, %eax
+        syscall
+        lea     1(%rax), %rcx
+        mov     %rcx, 224(%r12)
+        # poll({C, POLLIN}) until the reset arrives, then read twice
+        mov     %ebx, 256(%r12)
+        movw    $1, 260(%r12)
+        mov     $500, %r15d
+reset:
+        movw    $0, 262(%r12)
+        lea     256(%r12), %rdi
+        mov     $1, %esi
+        mov     $10, %edx
+        mov     $7, %eax
+        syscall
+        cmp     $1, %rax
+        je      told
+        dec     %r15d
+        jnz     reset
+        jmp     done
+told:
+        mov     %rbx, %rdi
+        lea     416(%r12), %rsi
+        mov     $16, %edx
+        xor     %eax, %eax
+        syscall
+        lea     1(%rax), %rcx
+        mov     %rcx, 232(%r12)
+        mov     %rbx, %rdi
+        lea     416(%r12), %rsi
+        mov     $16, %edx
+        xor     %eax, %eax
+        syscall
+        lea     1(%rax), %rcx
+        mov     %rcx, 248(%r12)
+        mov     %rbx, %rdi
         mov     $3, %eax
         syscall
 
@@ -255,3 +415,42 @@ done:
 idle:
         pause
         jmp     idle
+
+        # C = a nonblocking socket dialled to 127.0.0.1:12, in %rbx, once
+        # poll says it is writable. %rax is 0 then, and otherwise not.
+dial:
+        mov     $2, %edi
+        mov     $0x801, %esi
+        xor     %edx, %edx
+        mov     $41, %eax
+        syscall
+        test    %rax, %rax
+        js      undialled
+        mov     %rax, %rbx
+        mov     %rbx, %rdi
+        mov     %r14, %rsi
+        mov     $16, %edx
+        mov     $42, %eax
+        syscall
+        cmp     $-115, %rax
+        jne     undialled
+        mov     %ebx, 256(%r12)
+        movw    $4, 260(%r12)
+        mov     $500, %r15d
+opened:
+        movw    $0, 262(%r12)
+        lea     256(%r12), %rdi
+        mov     $1, %esi
+        mov     $10, %edx
+        mov     $7, %eax
+        syscall
+        cmp     $1, %rax
+        je      dialled
+        dec     %r15d
+        jnz     opened
+undialled:
+        mov     $1, %eax
+        ret
+dialled:
+        xor     %eax, %eax
+        ret

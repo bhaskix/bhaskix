@@ -56,7 +56,7 @@ use bhaskix_personality::file::{Entry, Kind};
 use bhaskix_personality::poll::Condition;
 use bhaskix_personality::socket::{self, Endpoint, SockOpt, errno, write_endpoint};
 use bhaskix_sock::ring::RingView;
-use bhaskix_sock::tcp::{self, AcceptPoll, Peer, Stopping, StreamPoll};
+use bhaskix_sock::tcp::{self, AcceptPoll, Ending, Peer, Stopping, StreamPoll};
 use core::sync::atomic::AtomicU64;
 use core::sync::atomic::Ordering::Relaxed;
 
@@ -152,6 +152,9 @@ struct Connection {
     /// its connection answering `GONE` is how this program knows the service's
     /// copies of the rings are gone and the pair can be given again.
     closing: bool,
+    /// The peer's reset has been answered to a `read` as `ECONNRESET` -- once,
+    /// as Linux's `sock_error` hands it out and clears it (RFC 0092 step 5).
+    reset_told: bool,
 }
 
 /// A listener of the adapter's own on `bin/tcpd`.
@@ -540,6 +543,7 @@ fn take_one(listener: usize, port: u16) -> Result<bool, i64> {
         owed_zero: false,
         dialled: false,
         closing: false,
+        reset_told: false,
     });
     table.births[listener] += 1;
     Ok(true)
@@ -1103,6 +1107,7 @@ fn start_dial(index: usize, destination: u32, port: u16) -> Answer {
                 owed_zero: false,
                 dialled: true,
                 closing: false,
+                reset_told: false,
             });
             stream.state = State::Connecting { connection: slot };
             table.streams[index] = Some(stream);
@@ -1240,15 +1245,30 @@ pub(crate) fn read(
     let Some(mut connection) = tcp().connections[index] else {
         return (REPLY_VALUE, Answer::error(errno::ENOTCONN));
     };
-    let (state, delivered) = match tcp::recv(slot, connection.consumed - connection.told) {
+    let (state, delivered, ended) = match tcp::recv(slot, connection.consumed - connection.told) {
         StreamPoll::Ready {
-            state, delivered, ..
-        } => (state, delivered),
-        StreamPoll::ServiceSaid(_) => (0, connection.consumed),
-        _ => return (REPLY_VALUE, Answer::error(-104)), // ECONNRESET
+            state,
+            delivered,
+            ended,
+        } => (state, delivered, ended),
+        StreamPoll::ServiceSaid(_) => (0, connection.consumed, None),
+        _ => return (REPLY_VALUE, Answer::error(errno::ECONNRESET)),
     };
     connection.told = connection.consumed;
     let available = delivered.saturating_sub(connection.consumed);
+    // **A peer's reset is `ECONNRESET`, once, after whatever arrived before
+    // it** -- RFC 0092 step 5, read from Linux 6.12's `tcp_recvmsg_locked`:
+    // queued bytes are copied first; with none, `sock_error` answers the
+    // error and clears it, and the next `read` finds the shutdown and answers
+    // 0. Until this, a reset read as an orderly end. One difference stays:
+    // Linux answers 0 to a reset that came after the peer's `FIN`, and this
+    // adapter cannot tell that one apart, so it says `ECONNRESET` there too.
+    if available == 0 && ended == Some(Ending::Reset) && !connection.reset_told {
+        connection.reset_told = true;
+        tcp().connections[index] = Some(connection);
+        let _ = super::took_timed_wait(request.domain, request.thread);
+        return (REPLY_VALUE, Answer::error(errno::ECONNRESET));
+    }
     if available == 0 {
         tcp().connections[index] = Some(connection);
         if !peer_may_send(state) {

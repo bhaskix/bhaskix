@@ -3102,6 +3102,24 @@ else
     pass "TCP loopback not attempted here: $(grep -aoE 'linux loop +skipped.*' "$LOG" | head -1 | sed -E 's/linux loop +//')"
 fi
 
+# RFC 0092 step 5: a listener that can be closed. The same probe, after the
+# loopback: it listens on 127.0.0.1:12 again and is dialled there, listens and
+# closes eight times over -- more than linuxd's three listener slots and
+# tcpd's six -- and closes a listener with a connection nobody accepted, whose
+# dialler must read ECONNRESET and then 0, as on Linux. Before the RFC the
+# second listen was ENFILE. Demanded where the loopback runs.
+if grep -qE "linux loop +a closed listener gives its port back: listened again on 127\.0\.0\.1:12 and was dialled there, listened and closed eight times over, and a connection nobody accepted was reset -- ECONNRESET, then 0 \(RFC 0092\)" "$LOG"; then
+    pass "a closed listener gives its port back: re-listened and dialled, eight listens closed in turn, an unaccepted connection reset"
+elif grep -qE "linux loop +FAILED: a closed listener" "$LOG"; then
+    fail "closing a listener: $(grep -aoE 'linux loop +FAILED: a closed listener.*' "$LOG" | head -1 | sed 's/\x1b\[[0-9;]*m//g')"
+    status=1
+elif [[ "$MODE" == "iommu" ]]; then
+    fail "the listener-close test did not run on the lane that runs it: $(grep -aoE 'linux loop.*' "$LOG" | tail -1 | sed 's/\x1b\[[0-9;]*m//g')"
+    status=1
+else
+    pass "closing a listener not attempted here: $(grep -aoE 'linux loop +skipped.*' "$LOG" | head -1 | sed -E 's/linux loop +//')"
+fi
+
 # RFC 0086 step 4: a hosted server that learns of its client, and of each half
 # of its bytes, only through `epoll_wait`. Decided as the stream probe's is: by
 # the host's verdict and the bytes on the console, never by the probe ending.
