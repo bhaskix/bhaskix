@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Draft 2026-10-19. Written before any of it. **The lead decided both open questions the same day**: a connection that lives on pins its listener's slot until it ends, and connections nobody accepted are reset, as Linux does — which adds an abort to the design (§4, §5). ~~Nothing built.~~ **Step 0 done 2026-10-19; step 1 done 2026-10-20** — listener slots have generations, from the connection table's own `Table`, and the `GONE` arm takes listener badges. |
+| **Status** | Draft 2026-10-19. Written before any of it. **The lead decided both open questions the same day**: a connection that lives on pins its listener's slot until it ends, and connections nobody accepted are reset, as Linux does — which adds an abort to the design (§4, §5). ~~Nothing built.~~ **Step 0 done 2026-10-19; steps 1 and 2 done 2026-10-20** — listener slots have generations, from the connection table's own `Table`, and the `GONE` arm takes listener badges; a listener's rings and wake are gifted returnable, as a dial's are. |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | net / userspace |
 | **Milestone** | L1 ([roadmap.md](../roadmap.md)) — a hosted server that restarts, and a machine that serves more than three listeners over a boot |

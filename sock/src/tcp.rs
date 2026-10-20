@@ -84,9 +84,16 @@ pub fn leg_words(
     )
 }
 
+/// The rights a gift carries when the service will give it back: `REVOKE`
+/// beside `READ | WRITE`, so the service can take its own copy back out of its
+/// space when it is done -- a dial's since RFC 0090 step 5, and a listener's
+/// since RFC 0092 step 2, which is what lets a closed listener return its
+/// rings rather than keep them mapped for the rest of the boot. Revocation goes
+/// down the tree, so the giver's own capabilities are untouched.
+const RETURNABLE: u64 = rights::READ | rights::WRITE | rights::REVOKE;
+
 /// One leg, its gift staged with `gift_rights` — `READ | WRITE` for every
-/// handover, and `REVOKE` beside them for a dial's (RFC 0090 step 5), so the
-/// service can take its own copy back out of its space once the dial is done.
+/// handover, and [`RETURNABLE`] for one the service will give back.
 fn staged_leg(
     service_slot: u64,
     verb: u64,
@@ -397,24 +404,21 @@ pub fn arm_pair(
     send_ring_slot: u64,
     recv_ring_slot: u64,
 ) -> Result<u32, LegError> {
-    leg(listener_slot, tcp::ARM_PAIR, 0, 0, None, tcp::OPEN_LEG)?;
-    leg(
-        listener_slot,
-        tcp::ARM_PAIR,
-        0,
-        0,
-        Some((send_ring_slot, 0)),
-        0,
-    )?;
-    leg(
-        listener_slot,
-        tcp::ARM_PAIR,
-        0,
-        0,
-        Some((recv_ring_slot, 0)),
-        1,
-    )?;
-    leg(listener_slot, tcp::ARM_PAIR, 0, 0, None, 2).map(|pair| pair as u32)
+    // Returnable, so a listener that closes can give the pair back (RFC 0092).
+    let arm_leg = |gift: Option<(u64, u64)>, number: u64| {
+        staged_leg(
+            listener_slot,
+            tcp::ARM_PAIR,
+            [0, 0, number],
+            gift,
+            RETURNABLE,
+        )
+        .map(|(second, _)| second)
+    };
+    arm_leg(None, tcp::OPEN_LEG)?;
+    arm_leg(Some((send_ring_slot, 0)), 0)?;
+    arm_leg(Some((recv_ring_slot, 0)), 1)?;
+    arm_leg(None, 2).map(|pair| pair as u32)
 }
 
 /// Opens a **new listener** on `port` — RFC 0086 step 3a — and returns its
@@ -442,15 +446,25 @@ pub fn listen_open(
     landing_slot: u64,
 ) -> Result<(u64, u32), LegError> {
     let port = u64::from(port);
-    leg(service_slot, tcp::LISTEN, port, 0, None, tcp::OPEN_LEG)?;
-    leg(service_slot, tcp::LISTEN, port, 0, Some((rings.0, 0)), 0)?;
-    leg(service_slot, tcp::LISTEN, port, 0, Some((rings.1, 0)), 1)?;
+    // Returnable, so a listener that closes can give its rings and its wake
+    // back (RFC 0092), as a dial does.
+    let listen_leg = |gift: Option<(u64, u64)>, number: u64| {
+        staged_leg(
+            service_slot,
+            tcp::LISTEN,
+            [port, 0, number],
+            gift,
+            RETURNABLE,
+        )
+    };
+    listen_leg(None, tcp::OPEN_LEG)?;
+    listen_leg(Some((rings.0, 0)), 0)?;
+    listen_leg(Some((rings.1, 0)), 1)?;
     if let Some(wake) = wake {
-        leg(service_slot, tcp::LISTEN, port, 0, Some(wake), 3)?;
+        listen_leg(Some(wake), 3)?;
     }
     expect(service_slot, landing_slot).map_err(LegError::HandRefused)?;
-    leg_words(service_slot, tcp::LISTEN, port, 0, None, 2)
-        .map(|(handle, pair)| (handle, pair as u32))
+    listen_leg(None, 2).map(|(handle, pair)| (handle, pair as u32))
 }
 
 /// Dials `address:port` with a connection of the caller's own — RFC 0090
@@ -479,16 +493,15 @@ pub fn connect(
     landing_slot: u64,
 ) -> Result<(u64, u16), LegError> {
     let (address, port) = (u64::from(address), u64::from(port));
-    // `REVOKE` with each gift: the service gives its copies back by revoking
-    // them when the dial is released (RFC 0090 step 5) — the giver's own are
-    // untouched, since revocation goes down the tree.
+    // [`RETURNABLE`] with each gift: the service gives its copies back by
+    // revoking them when the dial is released (RFC 0090 step 5).
     let dial_leg = |gift: Option<(u64, u64)>, number: u64| {
         staged_leg(
             service_slot,
             tcp::CONNECT,
             [address, port, number],
             gift,
-            rights::READ | rights::WRITE | rights::REVOKE,
+            RETURNABLE,
         )
     };
     dial_leg(None, tcp::OPEN_LEG)?;
