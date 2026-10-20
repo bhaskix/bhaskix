@@ -186,6 +186,24 @@ impl<T, const N: usize> Table<T, N> {
             .min_by_key(|&index| self.births[index])
     }
 
+    /// The handle the next [`Table::insert`] would return, or `None` when the
+    /// table is full -- without inserting anything.
+    ///
+    /// For an owner that must hand out a capability naming the slot *before*
+    /// the occupant exists: `bin/tcpd` mints a listener's badge, gives the
+    /// caller a capability carrying it, and only then fills the slot, so the
+    /// badge has to carry the generation the slot will have. Until RFC 0092
+    /// step 1 every listener badge carried generation 1 and nothing needed to
+    /// know.
+    #[must_use]
+    pub fn vacancy(&self) -> Option<Handle> {
+        let index = self.slots.iter().position(Option::is_none)?;
+        Some(Handle {
+            index: index as u32,
+            generation: self.generations[index],
+        })
+    }
+
     /// The first occupant, in slot order, for which `wanted` holds.
     pub fn find(&self, mut wanted: impl FnMut(&T) -> bool) -> Option<usize> {
         (0..N).find(|&index| self.slots[index].as_ref().is_some_and(&mut wanted))
@@ -316,6 +334,32 @@ mod tests {
             "the old handle names nothing"
         );
         assert_eq!(table.resolve(second), Ok(0));
+    }
+
+    #[test]
+    fn a_vacancy_is_the_handle_the_next_insert_returns() {
+        let mut table: Table<u8, 2> = Table::new();
+        let first = table.vacancy();
+        assert_eq!(
+            table.insert(1).ok(),
+            first,
+            "an empty table's first slot, generation 1"
+        );
+        let second = table.vacancy();
+        assert_eq!(table.insert(2).ok(), second);
+        assert_eq!(table.vacancy(), None, "a full table has no vacancy");
+        // Emptied, the slot comes back under its next generation -- which is
+        // the badge a listener minted for it would have to carry.
+        assert!(table.remove(0).is_some());
+        let again = table.vacancy();
+        assert_eq!(
+            again,
+            Some(Handle {
+                index: 0,
+                generation: 2
+            })
+        );
+        assert_eq!(table.insert(3).ok(), again);
     }
 
     #[test]

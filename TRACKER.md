@@ -1086,6 +1086,23 @@ the distinction is in the table rather than in somebody's head.
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-10-20 (RFC 0092 step 1: a listener's slot has a generation)
+
+`bin/tcpd`'s listeners now live in the same generational `Table` its connections do, not in a
+plain array. A listener's badge carries its slot's generation where it carried a constant 1, and a
+badge is honoured only if that generation is the slot's current one.
+
+One small addition was needed, `Table::vacancy`: the handle the next insert would return. A
+listener's badge is handed to the caller *before* its slot is filled, so it must carry the
+generation the slot is about to have. The addition is host-tested, and the test was watched failing
+against a vacancy that always says 1, which is the old rule.
+
+The `GONE` arm now takes a listener badge that names no live listener, for `ACCEPT`, `ARM_PAIR` and
+`RELEASE`, where it used to fall through to `LATER` for ever.
+
+**Nothing observable changes yet**: no listener leaves its slot until step 3. Step 1 is what makes
+the slot safe to reuse once it can.
+
 ### 2026-10-20 (interactive BusyBox was put down, not exited; and its fork is a `clone`)
 
 Interactive BusyBox's `sh` "exited at its second prompt" in every typed session of 2026-10-19. A

@@ -723,7 +723,7 @@ struct Service {
     /// The slot holding the connection `CONNECT` opened, if one is live.
     outbound: Option<usize>,
     /// Listeners, by index — the index is the one in each listener's badge.
-    listeners: [Option<Listener>; MAX_LISTENERS],
+    listeners: Table<Listener, MAX_LISTENERS>,
     /// Which listener `LISTEN`'s own handover made — `bin/tcpc`'s, whose
     /// rings are pair 0 at fixed addresses. Every other listener is opened
     /// with `OPEN_LEG`.
@@ -735,16 +735,22 @@ struct Service {
 impl Service {
     /// The listener holding `port`, if one does.
     fn listener_on(&self, port: Port) -> Option<usize> {
-        self.listeners
-            .iter()
-            .position(|listener| listener.as_ref().is_some_and(|l| Port(l.port) == port))
+        self.listeners.find(|listener| Port(listener.port) == port)
     }
 
     /// The listener whose capability carries `badge`, if any.
+    ///
+    /// **By generation, as a connection's badge is** -- RFC 0092 step 1. Until
+    /// then every listener badge carried generation 1 and was matched whole,
+    /// which was safe only because a listener never left its slot: once one
+    /// can, a badge kept from it must name nothing, not its slot's next
+    /// listener.
     fn listener_badged(&self, badge: u64) -> Option<usize> {
-        self.listeners
-            .iter()
-            .position(|listener| listener.as_ref().is_some_and(|l| l.handle == badge))
+        let (index, generation, listener) = tcp::parts(badge);
+        if !listener {
+            return None;
+        }
+        self.listeners.resolve(Handle { index, generation }).ok()
     }
 
     /// Puts `pair` back in its owner's queue. Cannot overflow: a pair is only
@@ -759,10 +765,7 @@ impl Service {
                 PairOwner::Listener(listener) => Some(listener),
                 PairOwner::Dial => None,
             });
-        if let Some(listener) = owner
-            .and_then(|owner| self.listeners.get_mut(owner))
-            .and_then(Option::as_mut)
-        {
+        if let Some(listener) = owner.and_then(|owner| self.listeners.get_mut(owner)) {
             let _ = listener.armed.arm(pair);
         }
     }
@@ -1300,7 +1303,7 @@ fn accept_syn(
     }
     let Some(listener) = service
         .listener_on(parsed.destination)
-        .and_then(|index| service.listeners[index].as_ref())
+        .and_then(|index| service.listeners.get(index))
     else {
         return Err(Unmatched::NoListener);
     };
@@ -1547,11 +1550,13 @@ fn accept_cookie(
     // refusal is only worth counting for a peer that proved it is there.
     // Finished connections go first, returning their slots and pairs.
     retire_finished(service);
-    let listener_port = service.listeners[listening]
-        .as_ref()
+    let listener_port = service
+        .listeners
+        .get(listening)
         .map_or(0, |listener| listener.port);
-    let Some(pair) = service.listeners[listening]
-        .as_mut()
+    let Some(pair) = service
+        .listeners
+        .get_mut(listening)
         .and_then(|listener| listener.armed.take())
     else {
         // Every pair is held by a live connection. The peer retransmits its
@@ -1568,15 +1573,16 @@ fn accept_cookie(
     else {
         // A pair armed and never registered is this program's bug; put it
         // back rather than lose it, and refuse this handshake.
-        if let Some(listener) = service.listeners[listening].as_mut() {
+        if let Some(listener) = service.listeners.get_mut(listening) {
             let _ = listener.armed.arm(pair);
         }
         ACK_WHILE_BUSY.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         note_refusal(2, listener_port);
         return None;
     };
-    let notify_slot = service.listeners[listening]
-        .as_ref()
+    let notify_slot = service
+        .listeners
+        .get(listening)
         .and_then(|listener| listener.notify_slot);
 
     // The peer's initial sequence is one below where its `ACK` sits: byte `k`
@@ -2165,15 +2171,14 @@ fn arm_leg(
                 return (tcp::OK, 0, 0);
             }
             match target {
-                ArmTarget::Pair(listener)
-                    if service.listeners.get(listener).is_some_and(Option::is_some) => {}
+                ArmTarget::Pair(listener) if service.listeners.get(listener).is_some() => {}
                 ArmTarget::Pair(_) => return (tcp::BARE, 0x40, 0),
                 ArmTarget::Listener(port) => {
                     // A port already held is refused before any gift moves.
                     if service.listener_on(Port(port)).is_some() {
                         return (tcp::REFUSED, 0, 0);
                     }
-                    if service.listeners.iter().all(Option::is_some) {
+                    if service.listeners.vacancy().is_none() {
                         return (tcp::CONGESTED, 1, 0);
                     }
                 }
@@ -2268,10 +2273,13 @@ fn arm_leg(
                     (tcp::OK, u64::from(pair), 0)
                 }
                 ArmTarget::Listener(port) => {
-                    let Some(index) = service.listeners.iter().position(Option::is_none) else {
+                    // The badge carries the generation the slot will have,
+                    // because the caller holds it before the slot is filled.
+                    let Some(vacancy) = service.listeners.vacancy() else {
                         return (tcp::CONGESTED, 1, 0);
                     };
-                    let handle = tcp::handle(index as u32, 1, true);
+                    let index = vacancy.index as usize;
+                    let handle = tcp::handle(vacancy.index, vacancy.generation, true);
                     // The capability back first: a listener nobody holds a
                     // capability to would take connections nobody can accept.
                     let handed = call(
@@ -2290,12 +2298,18 @@ fn arm_leg(
                     });
                     let mut armed = Armed::new();
                     let _ = armed.arm(pair);
-                    service.listeners[index] = Some(Listener {
+                    // Lands in the vacancy, because nothing was inserted since
+                    // it was read; refused loudly if not, because the badge
+                    // already handed out names that slot and no other.
+                    if service.listeners.insert(Listener {
                         port,
                         handle,
                         notify_slot: arming.notified.then_some(Arming::wake_slot(pair)),
                         armed,
-                    });
+                    }) != Ok(vacancy)
+                    {
+                        return (tcp::BARE, 0x60, 0);
+                    }
                     // The pair's number in the third word: `ACCEPT` names
                     // connections by pair, and a caller that did not learn
                     // this one could not tell which rings its first
@@ -2338,7 +2352,7 @@ fn listen_leg_serving(
             && handover.notified
             && let Some(listener) = service
                 .legacy_listener
-                .and_then(|index| service.listeners[index].as_mut())
+                .and_then(|index| service.listeners.get_mut(index))
         {
             listener.notify_slot = Some(handover.notify_slot);
         }
@@ -2352,9 +2366,10 @@ fn listen_leg_serving(
         if service.listener_on(Port(args[0] as u16)).is_some() {
             return (tcp::REFUSED, 0);
         }
-        let Some(index) = service.listeners.iter().position(Option::is_none) else {
+        let Some(vacancy) = service.listeners.vacancy() else {
             return (tcp::CONGESTED, 1);
         };
+        let index = vacancy.index as usize;
         // `LISTEN`'s own rings are pair 0, armed at once: the one pair every
         // listener had before RFC 0086 step 2, and still all a caller that
         // never arms another needs. In whichever listener slot is free --
@@ -2366,17 +2381,20 @@ fn listen_leg_serving(
         });
         let mut armed = Armed::new();
         let _ = armed.arm(0);
-        service.listeners[index] = Some(Listener {
+        if service.listeners.insert(Listener {
             port: args[0] as u16,
-            handle: tcp::handle(index as u32, 1, true),
+            handle: tcp::handle(vacancy.index, vacancy.generation, true),
             notify_slot: handover.notified.then_some(handover.notify_slot),
             armed,
-        });
+        }) != Ok(vacancy)
+        {
+            return (tcp::BARE, 0x60);
+        }
         service.legacy_listener = Some(index);
     }
     if let Some(listener) = service
         .legacy_listener
-        .and_then(|index| service.listeners[index].as_ref())
+        .and_then(|index| service.listeners.get(index))
     {
         handover.handle = listener.handle;
     }
@@ -2684,7 +2702,7 @@ extern "C" fn tcpd_main(hertz: u64) -> ! {
         cookies_offered: 0,
         connections: Table::new(),
         outbound: None,
-        listeners: [const { None }; MAX_LISTENERS],
+        listeners: Table::new(),
         legacy_listener: None,
         pairs: [None; MAX_PAIRS],
     };
@@ -2975,16 +2993,26 @@ extern "C" fn tcpd_main(hertz: u64) -> ! {
             let (outcome_word, detail) =
                 listen_leg_serving(&mut listen_handover, &mut service, args);
             reply(outcome_word, detail, 0);
-        } else if matches!(
-            method_in,
-            tcp::SEND | tcp::RECV | tcp::SHUTDOWN | tcp::RELEASE
-        ) && badge != 0
-            && !tcp::parts(badge).2
+        } else if badge != 0
+            && if tcp::parts(badge).2 {
+                matches!(method_in, tcp::ACCEPT | tcp::ARM_PAIR | tcp::RELEASE)
+            } else {
+                matches!(
+                    method_in,
+                    tcp::SEND | tcp::RECV | tcp::SHUTDOWN | tcp::RELEASE
+                )
+            }
         {
             // A stream method on a connection badge that names no live
             // connection: its slot was retired and its generation moved on —
             // RFC 0086 step 2. `LATER` would have the caller poll a connection
             // that no longer exists for ever; `GONE` is the truth.
+            //
+            // **And a listener's method on a listener badge that names no live
+            // listener** -- RFC 0092 step 1. A live one was answered above, by
+            // `listener_badged`, so a listener badge that reaches here names a
+            // slot that has moved on. Nothing frees a listener's slot yet; this
+            // is the answer its handle will get once something does.
             reply(tcp::GONE, 0, 0);
         } else {
             reply(tcp::LATER, 0, 0);
