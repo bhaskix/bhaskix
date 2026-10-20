@@ -224,6 +224,16 @@ None measured to begin with. Closing costs one `RELEASE` and, per pair, three re
      ended would otherwise have held the slot, and `RELEASE` answered `LATER`, for ever.
    - **`ACCEPT` and `ARM_PAIR` on a closing listener answer `GONE`**, not `LATER`: nothing more
      will be accepted or armed on it, and `LATER` would be asked for ever.
-4. **linuxd closes and reaps listeners**, with the per-listener pair masks.
+4. **linuxd closes and reaps listeners**, with the per-listener pair masks. **Written 2026-10-20**,
+   with three things §5 did not say:
+   - **`OK` finishes it as `GONE` does.** Both say tcpd holds nothing of the listener, so a close
+     with no accepted connection alive gives back the slot and pairs at once, not at the next
+     `reap`.
+   - **A pair a hosted connection still names is held back** when its listener is stopped, and is
+     returned when the last such connection is dropped. Otherwise a new listener or dial could be
+     given a ring an old descriptor can still write.
+   - **`sock` gains `stop_listening`, whose answer is an enum**, and `abort`. `release`'s
+     `Result<(), u64>` puts tcpd's words and the kernel's statuses in one number. tcpd's `GONE` is 4
+     and its `LATER` 7, and nothing keeps a kernel status from being either.
 5. **The gates green and the arms red.** The records: TRACKER, RFC 0086's limit, linuxd's module doc,
    and `MAX_LISTENERS`, whose six can then come back down if nothing needs it.

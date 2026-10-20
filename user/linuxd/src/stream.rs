@@ -26,9 +26,23 @@
 //!   the retry path's two `EAGAIN`s it was (the nucleus parks one call at
 //!   most sixteen times; the adapter may find no timed-wait slot) is not
 //!   established, and `TRACKER.md` says so.
-//! - **A pair given to a listener stays with it.** `bin/tcpd` has no way to
+//! - ~~**A pair given to a listener stays with it.** `bin/tcpd` has no way to
 //!   stop listening, so a hosted listener that closes keeps its pairs for the
-//!   life of the boot.
+//!   life of the boot.~~ **Since RFC 0092 (2026-10-20)** a listener that
+//!   closes is stopped: its port is free at once, the connections taken for it
+//!   and never accepted are reset, and its slot and pairs come back once
+//!   `bin/tcpd` holds nothing of it -- which is not until every connection it
+//!   accepted has ended, by the lead's decision of 2026-10-19. See [`close`]
+//!   and [`reap`].
+//! - **A write on a connection `bin/tcpd` has retired lands in its ring
+//!   before the adapter learns so.** [`write`] copies into the pair, then
+//!   sends, and the send is what answers `GONE`. A listener's pair is armed
+//!   again when its connection retires, so the bytes can land in the ring of
+//!   the connection that took the pair next. Read from the code on
+//!   2026-10-20, writing RFC 0092 step 4 -- not seen happen, not caused by
+//!   that step, and not yet fixed. A stopped listener's pairs are held back
+//!   while a connection still names one ([`Tcp::orphans`]), so a close does
+//!   not widen it to dials and other listeners.
 //! - **The send side has no flow control the adapter can see.** `bin/tcpd`
 //!   tells a client how far the peer's stream has reached, not how much of its
 //!   own it has acknowledged, so a write is bounded to a page and trusts the
@@ -42,7 +56,7 @@ use bhaskix_personality::file::{Entry, Kind};
 use bhaskix_personality::poll::Condition;
 use bhaskix_personality::socket::{self, Endpoint, SockOpt, errno, write_endpoint};
 use bhaskix_sock::ring::RingView;
-use bhaskix_sock::tcp::{self, AcceptPoll, Peer, StreamPoll};
+use bhaskix_sock::tcp::{self, AcceptPoll, Peer, Stopping, StreamPoll};
 use core::sync::atomic::AtomicU64;
 use core::sync::atomic::Ordering::Relaxed;
 
@@ -140,17 +154,29 @@ struct Connection {
     closing: bool,
 }
 
+/// A listener of the adapter's own on `bin/tcpd`.
+#[derive(Clone, Copy)]
+struct Listener {
+    /// The pool pairs it was given, one bit each -- RFC 0092: what comes back
+    /// when it is stopped.
+    pools: u32,
+    /// Its stream was closed and `bin/tcpd` has not yet let it go; [`reap`]
+    /// asks again.
+    closing: bool,
+}
+
 struct Tcp {
     ready: bool,
     /// Rings of the pool mapped so far, in order. Mapping resumes here, so a
     /// ring already mapped is never asked to map again.
     mapped: usize,
     streams: [Option<Stream>; MAX_STREAMS],
-    listeners: [bool; adapter::TCP_LISTENER_COUNT],
+    listeners: [Option<Listener>; adapter::TCP_LISTENER_COUNT],
     connections: [Option<Connection>; adapter::TCP_CONNECTION_COUNT],
     /// Pool pairs ever handed out, from the bottom of the pool; ~~they are never
-    /// given back~~ a listener's still are not, and a dial's come back into
-    /// [`Tcp::returned`] (RFC 0090 step 5).
+    /// given back~~ ~~a listener's still are not~~ a dial's come back into
+    /// [`Tcp::returned`] (RFC 0090 step 5), and since RFC 0092 a stopped
+    /// listener's do too.
     pool_used: usize,
     /// Pool pairs dials have given back, one bit each, handed out again before
     /// a fresh one.
@@ -158,6 +184,10 @@ struct Tcp {
     /// Pairs listeners hold, which stop at the pool less
     /// [`adapter::TCP_DIAL_RESERVE`].
     listener_pairs: usize,
+    /// Pairs of a stopped listener that a hosted connection still names: each
+    /// is held back from [`Tcp::returned`] until the last connection naming it
+    /// is dropped, so no new owner shares a ring with an old one.
+    orphans: u32,
     /// Blocking `connect`s parked on a timer: the thread's wake key, and how
     /// many turns it has parked — RFC 0090 step 6.
     dial_parks: [(u64, u32); 8],
@@ -174,11 +204,12 @@ static mut TCP: Tcp = Tcp {
     ready: false,
     mapped: 0,
     streams: [None; MAX_STREAMS],
-    listeners: [false; adapter::TCP_LISTENER_COUNT],
+    listeners: [None; adapter::TCP_LISTENER_COUNT],
     connections: [None; adapter::TCP_CONNECTION_COUNT],
     pool_used: 0,
     returned: 0,
     listener_pairs: 0,
+    orphans: 0,
     dial_parks: [(0, 0); 8],
     pool_of: [0; 64],
     births: [0; adapter::TCP_LISTENER_COUNT],
@@ -335,7 +366,7 @@ pub(crate) fn listen(request: &PersonalityCall) -> Answer {
     };
     reap();
     let table = tcp();
-    let Some(listener) = table.listeners.iter().position(|used| !used) else {
+    let Some(listener) = table.listeners.iter().position(Option::is_none) else {
         return Answer::error(errno::ENFILE);
     };
     let Some(first) = take_pair(true) else {
@@ -366,7 +397,7 @@ pub(crate) fn listen(request: &PersonalityCall) -> Answer {
     if let Some(slot) = table.pool_of.get_mut(pair as usize) {
         *slot = first as u8 + 1;
     }
-    table.listeners[listener] = true;
+    let mut pools = 1 << first;
 
     // More pairs, up to the backlog and the pool. A backlog of one is the
     // listener's first pair alone.
@@ -386,7 +417,12 @@ pub(crate) fn listen(request: &PersonalityCall) -> Answer {
         if let Some(slot) = table.pool_of.get_mut(pair as usize) {
             *slot = next as u8 + 1;
         }
+        pools |= 1 << next;
     }
+    table.listeners[listener] = Some(Listener {
+        pools,
+        closing: false,
+    });
     table.streams[index] = Some(Stream {
         state: State::Listening { port, listener },
         ..stream
@@ -548,14 +584,90 @@ fn drop_connection(connection: usize) {
         return;
     }
     let _ = super::call(syscall::INVOKE, slot, method::DELETE, [0; 4]);
-    tcp().connections[connection] = None;
+    forget_connection(connection);
+}
+
+/// Resets a connection taken for a listener and never accepted, and gives its
+/// capability back -- RFC 0092: what Linux does to one when its listener
+/// closes, by the lead's decision of 2026-10-19. `bin/tcpd` retires it, and
+/// its pair goes back to the listener, which is closing.
+fn abort_connection(connection: usize) {
+    let slot = (adapter::TCP_CONNECTIONS + connection) as u64;
+    let _ = tcp::abort(slot);
+    let _ = super::call(syscall::INVOKE, slot, method::DELETE, [0; 4]);
+    forget_connection(connection);
+}
+
+/// Empties a connection's row. A pair a stopped listener left behind for it
+/// goes to [`Tcp::returned`] once no row names it.
+fn forget_connection(connection: usize) {
+    let table = tcp();
+    let Some(held) = table.connections[connection].take() else {
+        return;
+    };
+    let bit = 1 << held.pool;
+    let named = table
+        .connections
+        .iter()
+        .flatten()
+        .any(|other| !other.dialled && other.pool == held.pool);
+    if !held.dialled && table.orphans & bit != 0 && !named {
+        table.orphans &= !bit;
+        table.returned |= bit;
+    }
+}
+
+/// Asks `bin/tcpd` to stop `listener` -- RFC 0092 -- and gives back what it
+/// held if it has: the capability, its slot, and its pairs, less any a hosted
+/// connection still names. Otherwise it is left closing, for [`reap`].
+fn stop_listener(listener: usize) {
+    let slot = (adapter::TCP_LISTENERS + listener) as u64;
+    let table = tcp();
+    let Some(mut held) = table.listeners[listener] else {
+        return;
+    };
+    match tcp::stop_listening(slot) {
+        // `OK` and `GONE` both say `bin/tcpd` holds nothing of it: its copies
+        // of the rings and the wake are revoked.
+        Stopping::Stopped | Stopping::Gone => {}
+        // Draining, or a word that is asked about again: kept, closing.
+        _ => {
+            held.closing = true;
+            table.listeners[listener] = Some(held);
+            return;
+        }
+    }
+    let _ = super::call(syscall::INVOKE, slot, method::DELETE, [0; 4]);
+    let named = table
+        .connections
+        .iter()
+        .flatten()
+        .filter(|connection| !connection.dialled)
+        .fold(0u32, |named, connection| named | 1 << connection.pool);
+    table.returned |= held.pools & !named;
+    table.orphans |= held.pools & named;
+    table.listener_pairs -= held.pools.count_ones() as usize;
+    // `bin/tcpd`'s numbers for those pairs are its own again, and may name
+    // another's next.
+    for tagged in &mut table.pool_of {
+        if *tagged > 0 && held.pools & (1 << (*tagged - 1)) != 0 {
+            *tagged = 0;
+        }
+    }
+    table.listeners[listener] = None;
 }
 
 /// Gives back what `bin/tcpd` has finished with — RFC 0090 step 5. A closed
 /// dial whose connection answers `GONE` has been retired: the service has
 /// revoked its copies of the rings, so the pair is this program's to give
-/// again, and the capability and the slot can go.
+/// again, and the capability and the slot can go. A closing listener is asked
+/// again (RFC 0092), and given back once `bin/tcpd` has let it go.
 fn reap() {
+    for listener in 0..adapter::TCP_LISTENER_COUNT {
+        if tcp().listeners[listener].is_some_and(|held| held.closing) {
+            stop_listener(listener);
+        }
+    }
     let table = tcp();
     for index in 0..table.connections.len() {
         let Some(held) = table.connections[index] else {
@@ -1372,8 +1484,10 @@ pub(crate) fn nonblocking(entry: &Entry) -> bool {
 
 /// A stream descriptor's last row closed: a connection is shut and its
 /// capability dropped (its pair returns to the listener when `tcpd` retires
-/// it); a listener keeps its pairs, which is this step's stated limit, and
-/// sheds the connections it had taken and nobody accepted.
+/// it). A listener resets the connections it had taken and nobody accepted
+/// and is stopped -- RFC 0092: its port is free at once, and its slot and
+/// pairs come back now if `bin/tcpd` holds nothing of it, and otherwise when
+/// [`reap`] finds it has let go.
 pub(crate) fn close(entry: &Entry) {
     let index = entry.handle as usize;
     let Some(Some(stream)) = tcp().streams.get(index).copied() else {
@@ -1386,8 +1500,9 @@ pub(crate) fn close(entry: &Entry) {
         // Connections taken for a listener nobody will accept from again.
         State::Listening { listener, .. } => {
             while let Some(connection) = oldest_pending(listener) {
-                drop_connection(connection);
+                abort_connection(connection);
             }
+            stop_listener(listener);
         }
         State::Fresh | State::Bound { .. } => {}
     }

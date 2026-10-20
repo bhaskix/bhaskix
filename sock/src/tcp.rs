@@ -534,6 +534,72 @@ pub fn release(connection_slot: u64) -> Result<(), u64> {
     }
 }
 
+/// Resets a connection and releases it — RFC 0092: [`release`] with
+/// [`tcp::RELEASE_ABORT`], so the service sends a `RST` rather than ending it
+/// in order. For a connection taken from a listener and never accepted, when
+/// that listener closes, which is what Linux sends for one.
+///
+/// # Errors
+///
+/// The service's word, or the kernel's status, if the call was refused.
+pub fn abort(connection_slot: u64) -> Result<(), u64> {
+    let reply = call(
+        syscall::CALL,
+        connection_slot,
+        tcp::RELEASE,
+        [tcp::RELEASE_ABORT, 0, 0, 0],
+    );
+    if !reply.kernel_ok() {
+        return Err(reply.status);
+    }
+    if reply.value == tcp::OK {
+        Ok(())
+    } else {
+        Err(reply.value)
+    }
+}
+
+/// What a listener answered [`stop_listening`] — RFC 0092 §1.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Stopping {
+    /// It holds nothing and its slot is free: every ring and wake it was given
+    /// has left the service's space.
+    Stopped,
+    /// Its port is free, and it is still giving back — a connection it
+    /// accepted lives on. Ask again.
+    Draining,
+    /// It names nothing: an earlier ask stopped it.
+    Gone,
+    /// The service said something else; the raw word.
+    ServiceSaid(u64),
+    /// The kernel refused the call; the raw status.
+    KernelSaid(u64),
+}
+
+impl Stopping {
+    /// The service's word, read.
+    const fn of(word: u64) -> Self {
+        match word {
+            tcp::OK => Self::Stopped,
+            tcp::LATER => Self::Draining,
+            tcp::GONE => Self::Gone,
+            word => Self::ServiceSaid(word),
+        }
+    }
+}
+
+/// Stops the listener in `listener_slot` listening — RFC 0092. Its port is
+/// free from the first ask; asked until it answers [`Stopping::Stopped`] or
+/// [`Stopping::Gone`], after which the rings and wake it was given are the
+/// caller's own again.
+pub fn stop_listening(listener_slot: u64) -> Stopping {
+    let reply = call(syscall::CALL, listener_slot, tcp::RELEASE, [0; 4]);
+    if !reply.kernel_ok() {
+        return Stopping::KernelSaid(reply.status);
+    }
+    Stopping::of(reply.value)
+}
+
 /// Who is at the other end of a connection — RFC 0086 step 3a.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Peer {
@@ -592,6 +658,17 @@ pub fn accept(listener_slot: u64) -> AcceptPoll {
 mod tests {
     use super::*;
     use bhaskix_net::tcp::state::Ended;
+
+    #[test]
+    fn a_listeners_answers_are_told_apart() {
+        assert_eq!(Stopping::of(tcp::OK), Stopping::Stopped);
+        assert_eq!(Stopping::of(tcp::LATER), Stopping::Draining);
+        assert_eq!(Stopping::of(tcp::GONE), Stopping::Gone);
+        assert_eq!(
+            Stopping::of(tcp::REFUSED),
+            Stopping::ServiceSaid(tcp::REFUSED)
+        );
+    }
 
     #[test]
     fn every_ending_round_trips_through_its_word() {
