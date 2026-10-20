@@ -834,6 +834,11 @@ extern "C" fn tcpc_main(hertz: u64) -> ! {
         exit();
     }
     let _ = tcp::shutdown(INBOUND);
+    // RFC 0093: done with it. The service retires an accepted connection only
+    // once its holder says so, and its pair goes back to the listener then --
+    // the pair this program's four-client act, and RFC 0061's prober after it,
+    // are served on.
+    let _ = tcp::release(INBOUND);
     report(13, outcome::SERVED, 0);
 
     // ------------------------------------------------------------------
@@ -1094,6 +1099,7 @@ extern "C" fn tcpc_main(hertz: u64) -> ! {
     report_word(13, CHUNKS6 * CHUNK6);
     let _ = tcp::shutdown(CONNECTION6);
     let _ = tcp::shutdown(INBOUND6);
+    let _ = tcp::release(INBOUND6);
     report(19, outcome::LOOPED6, 0);
     let extra = [four_views[0], four_views[1], four_views[2]];
     if four_at_once(l_send_view, l_recv_view, extra, &pace) {
@@ -1168,6 +1174,7 @@ fn second_listener(pair: (RingView, RingView), pace: &Pace) {
         return failed(9);
     }
     let _ = tcp::shutdown(SECOND_CONNECTION);
+    let _ = tcp::release(SECOND_CONNECTION);
     report_word(
         abi_tcp::CLIENT_SECOND_PEER,
         (u64::from(address) << 16) | u64::from(port),
@@ -1369,6 +1376,7 @@ fn four_at_once(
             accepted += 1;
         } else {
             let _ = tcp::shutdown(slot);
+            let _ = tcp::release(slot);
             let _ = call(syscall::INVOKE, slot, method::DELETE, [0; 4]);
             ghosts += 1;
         }
@@ -1396,6 +1404,7 @@ fn four_at_once(
             return failed(8, (taken << 16) | (4 << 8) | echoed);
         }
         let _ = tcp::shutdown(connection);
+        let _ = tcp::release(connection);
         echoed += 1;
     }
     report_word(

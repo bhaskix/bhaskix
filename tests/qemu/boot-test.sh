@@ -3123,6 +3123,24 @@ else
     pass "closing a listener not attempted here: $(grep -aoE 'linux loop +skipped.*' "$LOG" | head -1 | sed -E 's/linux loop +//')"
 fi
 
+# RFC 0093: a ring pair stays with its connection until the holder lets go. The
+# same probe, last: a one-pair listener's connection finishes while its
+# descriptor is still open, and a second peer must then find no pair -- before
+# RFC 0093 it was born on that one, which the old holder could still write
+# into. Once the descriptor is closed, a third peer is accepted on the pair it
+# gave back. Demanded where the loopback runs.
+if grep -qE "linux loop +a finished connection held open keeps its ring pair: a second peer found none until the holder closed it, then a third was accepted on it \(RFC 0093\)" "$LOG"; then
+    pass "a finished connection held open keeps its ring pair: a second peer found none until it was closed"
+elif grep -qE "linux loop +FAILED: a connection held open" "$LOG"; then
+    fail "a held connection's pair: $(grep -aoE 'linux loop +FAILED: a connection held open.*' "$LOG" | head -1 | sed 's/\x1b\[[0-9;]*m//g')"
+    status=1
+elif [[ "$MODE" == "iommu" ]]; then
+    fail "the held-pair test did not run on the lane that runs it: $(grep -aoE 'linux loop.*' "$LOG" | tail -1 | sed 's/\x1b\[[0-9;]*m//g')"
+    status=1
+else
+    pass "a held connection's pair not attempted here: $(grep -aoE 'linux loop +skipped.*' "$LOG" | head -1 | sed -E 's/linux loop +//')"
+fi
+
 # RFC 0086 step 4: a hosted server that learns of its client, and of each half
 # of its bytes, only through `epoll_wait`. Decided as the stream probe's is: by
 # the host's verdict and the bytes on the console, never by the probe ending.

@@ -979,10 +979,19 @@ fn drive_at(service: &mut Service, index: usize, event: Event<'_>) {
     // RFC 0090 step 5: a dial its holder has released, now finished.
     let finished_dial =
         connection.released && finished(&connection) && dial_window(service, &connection).is_some();
+    // RFC 0093: an accepted connection retires once its holder has released
+    // it and it has finished -- not before, or its pair could serve the next
+    // peer while the holder can still write into it.
+    let finished_accepted = accepted
+        && state::retirable(
+            connection.tcb.state,
+            connection.claimed,
+            connection.released,
+        );
     // Put back first, then retired if it is done: `retire` removes through the
     // table, which is what moves the generation on.
     if service.connections.give_back(index, connection).is_ok() {
-        if dropped {
+        if dropped || finished_accepted {
             retire(service, index);
         } else if finished_dial {
             retire_dial(service, index);
@@ -1111,20 +1120,26 @@ fn begin_closing(service: &mut Service, listening: usize) {
 ///
 /// 4. **Pairs held by accepted connections** stay with them; each comes back
 ///    through [`Service::rearm`] when its connection retires -- here, once it
-///    has finished, since no birth on this port will retire it. **A connection
-///    that lives on keeps its listener's slot** -- the lead's decision of
-///    2026-10-19 -- so this answers `false` until the last one has.
+///    has finished and (since RFC 0093) been released by its holder, because
+///    no birth on this port will retire it. **A connection that lives on
+///    keeps its listener's slot** -- the lead's decision of 2026-10-19 -- and
+///    since RFC 0093 one its holder still holds does too, so this answers
+///    `false` until the last one has gone.
 /// 5. **When none is left**, the first pair and the wake are revoked, and the
 ///    slot is freed: its generation moves on, so the listener's badge answers
 ///    `GONE` from here.
 fn finish_closing(service: &mut Service, listening: usize) -> bool {
-    // Its finished children are retired here, by `retire_finished`'s rule:
+    // Its retirable children are retired here, by `retire_finished`'s rule:
     // that runs only when a connection is born, and a closing listener has
     // none born, so without this a child that ended would hold the slot for
     // ever.
     for index in 0..MAX_CONNECTIONS {
         let ended = service.connections.get(index).is_some_and(|connection| {
-            finished(connection) && owned_by(service, connection, listening)
+            state::retirable(
+                connection.tcb.state,
+                connection.claimed,
+                connection.released,
+            ) && owned_by(service, connection, listening)
         });
         if ended {
             retire(service, index);
@@ -1169,18 +1184,24 @@ fn retire(service: &mut Service, index: usize) {
 }
 
 /// Retires every accepted connection that has finished — `CLOSED`, or
-/// sitting out `TIME_WAIT` — so its slot and its pair can serve the next
-/// peer.
+/// sitting out `TIME_WAIT` — ~~so its slot and its pair can serve the next
+/// peer~~ and that nobody holds: never handed out, or released by its holder
+/// (RFC 0093, [`state::retirable`]). Then its slot and its pair can serve the
+/// next peer.
 ///
 /// `TIME_WAIT` holds the tuple, not the slot: this is the same early release
 /// the single accepted slot always had, applied to every slot that is done.
+/// **What it no longer does** is retire a connection a program still holds:
+/// the pair would be armed for the next peer while the program could still
+/// write into it.
 fn retire_finished(service: &mut Service) {
     for index in 0..MAX_CONNECTIONS {
         let finished = service.connections.get(index).is_some_and(|connection| {
             connection.pair.is_some()
-                && matches!(
+                && state::retirable(
                     connection.tcb.state,
-                    state::State::Closed | state::State::TimeWait
+                    connection.claimed,
+                    connection.released,
                 )
         });
         if finished {
@@ -2996,8 +3017,9 @@ extern "C" fn tcpd_main(hertz: u64) -> ! {
                     arm_nearest(&service);
                     reply(tcp::OK, 0, 0);
                 }
-                // RFC 0090 step 5: the holder is done. A dial is retired now
-                // if it has finished, and otherwise when it does.
+                // RFC 0090 step 5: the holder is done. A dial -- and since
+                // RFC 0093 an accepted connection -- is retired now if it has
+                // finished, and otherwise when it does.
                 tcp::RELEASE => {
                     // RFC 0092: with the abort flag, a reset rather than an
                     // orderly end -- what Linux sends for a connection that
@@ -3013,8 +3035,17 @@ extern "C" fn tcpd_main(hertz: u64) -> ! {
                     let done = service.connections.get(index).is_some_and(|held| {
                         finished(held) && dial_window(&service, held).is_some()
                     });
+                    // RFC 0093: an accepted connection, released after it
+                    // finished, retires now and its pair goes back to its
+                    // listener.
+                    let accepted_done = service.connections.get(index).is_some_and(|held| {
+                        held.pair.is_some()
+                            && state::retirable(held.tcb.state, held.claimed, held.released)
+                    });
                     if done {
                         retire_dial(&mut service, index);
+                    } else if accepted_done {
+                        retire(&mut service, index);
                     }
                     reply(tcp::OK, 0, 0);
                 }

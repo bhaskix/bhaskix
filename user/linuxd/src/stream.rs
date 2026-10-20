@@ -34,15 +34,15 @@
 //!   `bin/tcpd` holds nothing of it -- which is not until every connection it
 //!   accepted has ended, by the lead's decision of 2026-10-19. See [`close`]
 //!   and [`reap`].
-//! - **A write on a connection `bin/tcpd` has retired lands in its ring
+//! - ~~**A write on a connection `bin/tcpd` has retired lands in its ring
 //!   before the adapter learns so.** [`write`] copies into the pair, then
 //!   sends, and the send is what answers `GONE`. A listener's pair is armed
 //!   again when its connection retires, so the bytes can land in the ring of
-//!   the connection that took the pair next. Read from the code on
-//!   2026-10-20, writing RFC 0092 step 4 -- not seen happen, not caused by
-//!   that step, and not yet fixed. A stopped listener's pairs are held back
-//!   while a connection still names one ([`Tcp::orphans`]), so a close does
-//!   not widen it to dials and other listeners.
+//!   the connection that took the pair next.~~ Read from the code on
+//!   2026-10-20 and **fixed the same day by RFC 0093**: `bin/tcpd` retires an
+//!   accepted connection only once this adapter has released it, which it
+//!   does at close, after which nothing of that descriptor can write. So a
+//!   pair is never armed for a new peer while a descriptor still names it.
 //! - **The send side has no flow control the adapter can see.** `bin/tcpd`
 //!   tells a client how far the peer's stream has reached, not how much of its
 //!   own it has acknowledged, so a write is bounded to a page and trusts the
@@ -187,10 +187,6 @@ struct Tcp {
     /// Pairs listeners hold, which stop at the pool less
     /// [`adapter::TCP_DIAL_RESERVE`].
     listener_pairs: usize,
-    /// Pairs of a stopped listener that a hosted connection still names: each
-    /// is held back from [`Tcp::returned`] until the last connection naming it
-    /// is dropped, so no new owner shares a ring with an old one.
-    orphans: u32,
     /// Blocking `connect`s parked on a timer: the thread's wake key, and how
     /// many turns it has parked — RFC 0090 step 6.
     dial_parks: [(u64, u32); 8],
@@ -212,7 +208,6 @@ static mut TCP: Tcp = Tcp {
     pool_used: 0,
     returned: 0,
     listener_pairs: 0,
-    orphans: 0,
     dial_parks: [(0, 0); 8],
     pool_of: [0; 64],
     births: [0; adapter::TCP_LISTENER_COUNT],
@@ -517,9 +512,11 @@ fn take_one(listener: usize, port: u16) -> Result<bool, i64> {
     };
     let pool = match table.pool_of.get(pair as usize).copied() {
         Some(tagged) if tagged > 0 => usize::from(tagged - 1),
-        // A pair this adapter never armed: not its connection to serve.
+        // A pair this adapter never armed: not its connection to serve. Released,
+        // so `bin/tcpd` can retire it once it ends (RFC 0093).
         _ => {
             let _ = tcp::shutdown(landing);
+            let _ = tcp::release(landing);
             let _ = super::call(syscall::INVOKE, landing, method::DELETE, [0; 4]);
             return Err(errno::EIO);
         }
@@ -573,22 +570,25 @@ fn waiting(listener: usize) -> usize {
         .count()
 }
 
-/// Shuts a connection and gives its capability back — or, for a dial, tells
-/// `bin/tcpd` this program is done with it and keeps the capability until the
-/// service has retired it (RFC 0090 step 5); [`reap`] finishes the job.
+/// Shuts a connection and tells `bin/tcpd` this program is done with it --
+/// RFC 0090 step 5 for a dial, RFC 0093 for an accepted one. A dial keeps its
+/// capability until the service has retired it, because its pair is this
+/// program's to give again then, and [`reap`] finishes the job. An accepted
+/// connection's pair goes back to its listener, not here, so its capability
+/// goes at once.
 fn drop_connection(connection: usize) {
     let slot = (adapter::TCP_CONNECTIONS + connection) as u64;
     let _ = tcp::shutdown(slot);
+    let _ = tcp::release(slot);
     if let Some(mut held) = tcp().connections[connection]
         && held.dialled
     {
-        let _ = tcp::release(slot);
         held.closing = true;
         tcp().connections[connection] = Some(held);
         return;
     }
     let _ = super::call(syscall::INVOKE, slot, method::DELETE, [0; 4]);
-    forget_connection(connection);
+    tcp().connections[connection] = None;
 }
 
 /// Resets a connection taken for a listener and never accepted, and gives its
@@ -599,31 +599,18 @@ fn abort_connection(connection: usize) {
     let slot = (adapter::TCP_CONNECTIONS + connection) as u64;
     let _ = tcp::abort(slot);
     let _ = super::call(syscall::INVOKE, slot, method::DELETE, [0; 4]);
-    forget_connection(connection);
-}
-
-/// Empties a connection's row. A pair a stopped listener left behind for it
-/// goes to [`Tcp::returned`] once no row names it.
-fn forget_connection(connection: usize) {
-    let table = tcp();
-    let Some(held) = table.connections[connection].take() else {
-        return;
-    };
-    let bit = 1 << held.pool;
-    let named = table
-        .connections
-        .iter()
-        .flatten()
-        .any(|other| !other.dialled && other.pool == held.pool);
-    if !held.dialled && table.orphans & bit != 0 && !named {
-        table.orphans &= !bit;
-        table.returned |= bit;
-    }
+    tcp().connections[connection] = None;
 }
 
 /// Asks `bin/tcpd` to stop `listener` -- RFC 0092 -- and gives back what it
-/// held if it has: the capability, its slot, and its pairs, less any a hosted
-/// connection still names. Otherwise it is left closing, for [`reap`].
+/// held if it has: the capability, its slot, and its pairs. Otherwise it is
+/// left closing, for [`reap`].
+///
+/// **No hosted connection can still name one of those pairs** -- RFC 0093.
+/// This program keeps a row for an accepted connection only until it releases
+/// it, and `bin/tcpd` answers that a listener has stopped only once every
+/// connection it accepted has been released and retired. The mask RFC 0092
+/// step 4 kept for pairs a row still named was dead from then, and went.
 fn stop_listener(listener: usize) {
     let slot = (adapter::TCP_LISTENERS + listener) as u64;
     let table = tcp();
@@ -642,14 +629,7 @@ fn stop_listener(listener: usize) {
         }
     }
     let _ = super::call(syscall::INVOKE, slot, method::DELETE, [0; 4]);
-    let named = table
-        .connections
-        .iter()
-        .flatten()
-        .filter(|connection| !connection.dialled)
-        .fold(0u32, |named, connection| named | 1 << connection.pool);
-    table.returned |= held.pools & !named;
-    table.orphans |= held.pools & named;
+    table.returned |= held.pools;
     table.listener_pairs -= held.pools.count_ones() as usize;
     // `bin/tcpd`'s numbers for those pairs are its own again, and may name
     // another's next.

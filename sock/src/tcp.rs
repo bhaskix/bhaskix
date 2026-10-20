@@ -514,10 +514,13 @@ pub fn connect(
     dial_leg(None, 2).map(|(handle, local_port)| (handle, local_port as u16))
 }
 
-/// Tells the service the holder is done with a dialled connection — RFC 0090
-/// step 5. It is retired once it has closed: its rings and wake leave the
-/// service's space, and the connection answers `GONE` from then on, which is
-/// when the rings are the caller's own to give again.
+/// Tells the service the holder is done with a connection — RFC 0090 step 5
+/// for a dialled one, RFC 0093 for an accepted one. It is retired once it has
+/// closed, and not before. A dial's rings and wake then leave the service's
+/// space, and the connection answers `GONE` from then on, which is when the
+/// rings are the caller's own to give again. An accepted connection's pair
+/// goes back to its listener; until it is released, no other peer is given
+/// that pair.
 ///
 /// # Errors
 ///

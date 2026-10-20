@@ -32,6 +32,12 @@
         #   the closed listener still holds the connection: ECONNREFUSED
         #   60 a listen on the port meanwhile: 0 -- the port is free at once
         #   though the slot is not (RFC 0092 section 4, step 1)
+        #   RFC 0093, a finished connection whose descriptor is still open
+        #   keeps its ring pair:
+        #   61 whether a second peer was born meanwhile on a one-pair
+        #      listener: 1 if not, 2 if it was
+        #   62 accept4 of a third peer once the first descriptor is closed
+        #   63 the first connection's read of its peer's close: 0
         #   30 finished
         #
         # It stops at the first answer that is not the expected one.
@@ -529,6 +535,149 @@ told:
         mov     $3, %eax
         syscall
         mov     %rbx, %rdi
+        mov     $3, %eax
+        syscall
+        mov     %r13, %rdi
+        mov     $3, %eax
+        syscall
+
+        # RFC 0093: a listener with one pair (backlog 1) accepts A. A's dialler
+        # closes; A reads the end of the stream and shuts its own side, so A
+        # finishes while its descriptor stays open. A second dial must then
+        # find no pair -- nothing to accept -- until A is closed, after which a
+        # third dial is accepted on the pair A gave back.
+        mov     $2, %edi
+        mov     $1, %esi
+        xor     %edx, %edx
+        mov     $41, %eax
+        syscall
+        test    %rax, %rax
+        js      done
+        mov     %rax, %r13
+        mov     %r13, %rdi
+        mov     %r14, %rsi
+        mov     $16, %edx
+        mov     $49, %eax
+        syscall
+        test    %rax, %rax
+        jnz     done
+        mov     %r13, %rdi
+        mov     $1, %esi
+        mov     $50, %eax
+        syscall
+        test    %rax, %rax
+        jnz     done
+        call    dial
+        test    %rax, %rax
+        jnz     done
+        movl    $16, 336(%r12)
+        mov     %r13, %rdi
+        lea     320(%r12), %rsi
+        lea     336(%r12), %rdx
+        xor     %r10d, %r10d
+        mov     $288, %eax
+        syscall
+        test    %rax, %rax
+        js      done
+        mov     %rax, %rbp
+        # C closes; A reads its end, then shuts its own side.
+        mov     %rbx, %rdi
+        mov     $3, %eax
+        syscall
+        mov     %rbp, %rdi
+        lea     416(%r12), %rsi
+        mov     $16, %edx
+        xor     %eax, %eax
+        syscall
+        lea     1(%rax), %rcx
+        mov     %rcx, 504(%r12)
+        test    %rax, %rax
+        jnz     done
+        mov     %rbp, %rdi
+        mov     $1, %esi
+        mov     $48, %eax
+        syscall
+        # About 100 ms for A to reach CLOSED: ten empty polls of L.
+        mov     %r13d, 256(%r12)
+        movw    $1, 260(%r12)
+        mov     $10, %r15d
+settle:
+        movw    $0, 262(%r12)
+        lea     256(%r12), %rdi
+        mov     $1, %esi
+        mov     $10, %edx
+        mov     $7, %eax
+        syscall
+        dec     %r15d
+        jnz     settle
+        # D2: its handshake completes from its side; on ours it needs a pair.
+        call    dial
+        test    %rax, %rax
+        jnz     done
+        mov     %rbx, 440(%r12)
+        # Thirty polls of L, about 300 ms: 1 if nothing was born, 2 if it was.
+        mov     %r13d, 256(%r12)
+        movw    $1, 260(%r12)
+        mov     $30, %r15d
+        movq    $1, 488(%r12)
+held:
+        movw    $0, 262(%r12)
+        lea     256(%r12), %rdi
+        mov     $1, %esi
+        mov     $10, %edx
+        mov     $7, %eax
+        syscall
+        cmp     $1, %rax
+        je      shared
+        dec     %r15d
+        jnz     held
+        jmp     released
+shared:
+        movq    $2, 488(%r12)
+        jmp     done
+released:
+        # A's close releases it, and its pair goes back to L.
+        mov     %rbp, %rdi
+        mov     $3, %eax
+        syscall
+        call    dial
+        test    %rax, %rax
+        jnz     done
+        # At most about two seconds for D3 to be born on that pair.
+        mov     %r13d, 256(%r12)
+        movw    $1, 260(%r12)
+        mov     $200, %r15d
+returned:
+        movw    $0, 262(%r12)
+        lea     256(%r12), %rdi
+        mov     $1, %esi
+        mov     $10, %edx
+        mov     $7, %eax
+        syscall
+        cmp     $1, %rax
+        je      reborn
+        dec     %r15d
+        jnz     returned
+        jmp     done
+reborn:
+        movl    $16, 336(%r12)
+        mov     %r13, %rdi
+        lea     320(%r12), %rsi
+        lea     336(%r12), %rdx
+        xor     %r10d, %r10d
+        mov     $288, %eax
+        syscall
+        lea     1(%rax), %rcx
+        mov     %rcx, 496(%r12)
+        test    %rax, %rax
+        js      done
+        mov     %rax, %rdi
+        mov     $3, %eax
+        syscall
+        mov     %rbx, %rdi
+        mov     $3, %eax
+        syscall
+        mov     440(%r12), %rdi
         mov     $3, %eax
         syscall
         mov     %r13, %rdi

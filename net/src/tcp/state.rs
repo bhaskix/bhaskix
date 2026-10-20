@@ -1144,6 +1144,30 @@ pub fn reclaim_unclaimed(state: State, claimed: bool) -> bool {
     !claimed && matches!(state, State::CloseWait)
 }
 
+/// Whether the service may take a finished connection out of its table, and
+/// give the ring pair it holds to the next one — RFC 0093.
+///
+/// # The rule
+///
+/// **Finished, and nobody holds it.** Finished is `CLOSED` or `TIME_WAIT`:
+/// nothing more will be said on it (`TIME_WAIT` holds the tuple, not the
+/// slot). Nobody holds it if it was never handed to a program (`claimed`
+/// false) or if the program it was handed to has said it is done (`released`).
+///
+/// # Why `released` and not only finished
+///
+/// Until RFC 0093 a finished connection was retired whoever held it, and its
+/// pair armed for the next peer. A program still holding the descriptor could
+/// then write into a ring the next connection owned: a hosted `write` copies
+/// its bytes before it sends, and only the send learns the connection is gone.
+/// A program releases at close, and after its close nothing of it can write,
+/// so a pair that waits for the release cannot be shared. Dials have worked
+/// this way since RFC 0090 step 5; accepted connections now do too.
+#[must_use]
+pub fn retirable(state: State, claimed: bool, released: bool) -> bool {
+    matches!(state, State::Closed | State::TimeWait) && (!claimed || released)
+}
+
 /// The `RST` that answers a segment naming no connection here, or `None` when
 /// there is nothing to say.
 ///
@@ -1611,6 +1635,70 @@ mod reclaim_tests {
                 !reclaim_unclaimed(state, false),
                 "an open unclaimed connection was reclaimed in {state:?}"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod retire_tests {
+    use super::{State, retirable};
+
+    const EVERY_STATE: [State; 11] = [
+        State::Closed,
+        State::Listen,
+        State::SynSent,
+        State::SynReceived,
+        State::Established,
+        State::FinWait1,
+        State::FinWait2,
+        State::CloseWait,
+        State::Closing,
+        State::LastAck,
+        State::TimeWait,
+    ];
+
+    /// **The defect, driven directly.** A connection handed to a program and
+    /// not released is the program's, finished or not: retiring it would give
+    /// its pair to the next peer while the program can still write into it.
+    #[test]
+    fn a_connection_its_holder_has_not_released_is_never_retired() {
+        for state in EVERY_STATE {
+            assert!(
+                !retirable(state, true, false),
+                "a held connection was retired in {state:?}"
+            );
+        }
+    }
+
+    /// Released and finished: the holder is done and nothing more will be
+    /// said, so the pair goes to the next peer.
+    #[test]
+    fn a_released_connection_retires_once_finished() {
+        assert!(retirable(State::Closed, true, true));
+        assert!(retirable(State::TimeWait, true, true));
+    }
+
+    /// A connection nobody was handed has no holder to wait for, as before
+    /// RFC 0093.
+    #[test]
+    fn a_connection_nobody_was_handed_retires_once_finished() {
+        assert!(retirable(State::Closed, false, false));
+        assert!(retirable(State::TimeWait, false, false));
+    }
+
+    /// Nothing unfinished is retired, held or not, released or not.
+    #[test]
+    fn nothing_unfinished_retires() {
+        for state in EVERY_STATE {
+            if matches!(state, State::Closed | State::TimeWait) {
+                continue;
+            }
+            for (claimed, released) in [(false, false), (true, false), (true, true)] {
+                assert!(
+                    !retirable(state, claimed, released),
+                    "retired in {state:?}, claimed {claimed}, released {released}"
+                );
+            }
         }
     }
 }

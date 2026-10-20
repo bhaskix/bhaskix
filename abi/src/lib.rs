@@ -1691,6 +1691,13 @@ pub mod tcp {
     /// it answers [`GONE`], which is how the holder knows its rings are its own
     /// again. Gifts to a dial carry `REVOKE` for this reason.
     ///
+    /// **An accepted connection too, since RFC 0093**: it is retired only once
+    /// its holder has released it and it has finished, and its pair then goes
+    /// back to its listener. Until RFC 0093 a finished accepted connection was
+    /// retired whoever held it, and its pair could serve the next peer while
+    /// the holder could still write into it. A holder that never releases
+    /// keeps the connection's slot and pair, as a dial's holder does.
+    ///
     /// **On a listener: stop listening** — RFC 0092. The port is free at once;
     /// connections nobody accepted are reset; armed pairs are given back; and
     /// the answer is `LATER` while a connection it accepted lives or a pair is
