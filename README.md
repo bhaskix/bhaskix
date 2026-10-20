@@ -301,8 +301,9 @@ Builds on **stable Rust** — no nightly, no `#![feature]` anywhere in the tree
 
 `make test` runs, cheapest first, so a trivial mistake fails in seconds rather
 than after a QEMU boot: `rustfmt`; `clippy` on both the freestanding and host
-targets; **1,339 host tests** (recounted 2026-10-08 from a `make test` run; it read
-1,010, recounted 2026-08-24 from a `make test-host` run, for six weeks; before
+targets; **1,407 host tests** (recounted 2026-10-20 from a `make test` run on
+`a8c0df0`; it read 1,339 from 2026-10-08, and 1,010, recounted 2026-08-24 from a
+`make test-host` run, for six weeks; before
 that this line said "346 host assertions" for months, carried forward uncounted,
 and then **949 for a day after that count went stale**, which is the same
 failure one recount later); the project-invariant gates (bootloader
