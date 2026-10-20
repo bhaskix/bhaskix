@@ -144,8 +144,9 @@ printf 'cmdline=busybox=sh\n' > esp/bhaskix/boot.conf
 ```
 
 `busybox=sh` hands the keyboard to BusyBox's own `sh`, in a Linux domain,
-before the Bhaskix shell starts. Its prompt is `/ #`. When `sh` ends, the
-keyboard goes back and the boot goes on to `bhaskix$`:
+before the Bhaskix shell starts. Its prompt is `/ #`. `exit` gives the keyboard
+back, and the boot goes on to `bhaskix$`. This section was re-verified against
+`7d710cc` on 2026-10-20, after the fix described below:
 
 ```
 BusyBox v1.30.1 (Ubuntu 1:1.30.1-4ubuntu6.5) built-in shell (ash)
@@ -154,20 +155,21 @@ Enter 'help' for a list of built-in commands.
 sh: can't access tty; job control turned off
 / # echo hello from busybox
 hello from busybox
-/ #     busybox      158 calls, asked: 107 102 108 104 158 12 12 158 63 89 12 12 10 157 102 39 13 13 110 63 79 16 16 13 13 13 13 13 13 5 16 1 1 1 257 16 72 16 1 1 1 3 4 16 16 16 107 257 16 79 107 7 1 13 7 0 7 0 7 0 7 0 7 0 (and 94 more)
+/ # pwd
+/
+/ # uname -a
+sh: can't fork: Function not implemented
+/ # exit
+    busybox      281 calls, asked: 107 102 108 104 158 12 12 158 63 89 12 12 10 157 102 39 13 13 110 63 79 16 16 13 13 13 13 13 13 5 16 1 1 1 257 16 72 16 1 1 1 3 4 16 16 16 107 257 16 79 107 7 1 13 7 0 1 7 0 1 7 0 1 7 (and 217 more)
 ```
 
-**That is as far as it goes in this preview**, and both reasons are filed in
-TRACKER rather than left for you to find:
+**`sh`'s own commands run; a command that needs a new process does not, yet.**
+`echo` and `pwd` above are two of `sh`'s builtins. `uname` is not, and is refused
+— `sh: can't fork: Function not implemented` — because `sh` asks the adapter for
+a kind of `clone` that makes a process, and the adapter so far makes only
+threads. That is filed in TRACKER as L1 work.
 
-- `sh` ended at its second prompt by itself, the moment it had printed it — the
-  kernel's `busybox ... calls` line above is the domain ending, not anything
-  typed. It does so every time the terminal answers its cursor question and
-  then waits, which a real terminal does.
-- A command that is not one of `sh`'s builtins is refused. In another session
-  on the same build, `uname -a` answered `sh: can't fork: Function not
-  implemented`.
-
-What does work every time, and is checked by `make test-busybox` on every run
-of the project's tests, is BusyBox reaching its prompt and running the first
-line typed at it.
+Until 2026-10-20 `sh` did not even get that far: the kernel put it down two
+seconds after starting it, at its second prompt, which a person reading the
+first answer always reached. It now runs until `exit`, and the project's own
+BusyBox test types a second line after a pause to keep it that way.
