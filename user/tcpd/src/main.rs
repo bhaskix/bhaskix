@@ -677,6 +677,13 @@ struct Listener {
     notify_slot: Option<u64>,
     /// Pairs armed and not taken, oldest first.
     armed: Armed<u32, MAX_PAIRS>,
+    /// The pair it was opened with, whose wake every connection it births
+    /// rings -- given back last when it closes, because its children share
+    /// that wake (RFC 0092 §4).
+    first_pair: u32,
+    /// Its holder released it: it no longer answers for its port, and it is
+    /// giving back what it holds -- RFC 0092.
+    closing: bool,
 }
 
 /// Everything the serve loop carries.
@@ -735,7 +742,10 @@ struct Service {
 impl Service {
     /// The listener holding `port`, if one does.
     fn listener_on(&self, port: Port) -> Option<usize> {
-        self.listeners.find(|listener| Port(listener.port) == port)
+        // A closing listener answers for nothing: its port is free the moment
+        // it is released, as a closed listening socket's is on Linux (RFC 0092).
+        self.listeners
+            .find(|listener| !listener.closing && Port(listener.port) == port)
     }
 
     /// The listener whose capability carries `badge`, if any.
@@ -765,8 +775,28 @@ impl Service {
                 PairOwner::Listener(listener) => Some(listener),
                 PairOwner::Dial => None,
             });
-        if let Some(listener) = owner.and_then(|owner| self.listeners.get_mut(owner)) {
-            let _ = listener.armed.arm(pair);
+        let Some(listening) = owner else {
+            return;
+        };
+        match self
+            .listeners
+            .get(listening)
+            .map(|listener| (listener.closing, listener.first_pair))
+        {
+            // RFC 0092: a closing listener takes nothing back to arm. The pair
+            // a retired child held is given back now -- except the first,
+            // whose wake the other children still ring; that one goes last.
+            Some((true, first)) => {
+                if pair != first {
+                    give_window_back(self, pair);
+                }
+            }
+            Some((false, _)) => {
+                if let Some(listener) = self.listeners.get_mut(listening) {
+                    let _ = listener.armed.arm(pair);
+                }
+            }
+            None => {}
         }
     }
 }
@@ -1015,6 +1045,104 @@ fn give_window_back(service: &mut Service, pair: u32) {
         let _ = call(syscall::INVOKE, slot, method::REVOKE, [0; 4]);
     }
     service.pairs[pair as usize] = None;
+}
+
+/// Whether `connection` was born on listener `listening` -- it took one of
+/// that listener's pairs.
+fn owned_by(service: &Service, connection: &Connection, listening: usize) -> bool {
+    connection.pair.is_some_and(|pair| {
+        service
+            .pairs
+            .get(pair as usize)
+            .copied()
+            .flatten()
+            .is_some_and(|pair| pair.owner == PairOwner::Listener(listening))
+    })
+}
+
+/// Starts closing listener `listening` -- RFC 0092 §4, the first three steps,
+/// in its order. Once only: a second `RELEASE` finds it closing and goes on.
+///
+/// 1. **The port, at once**: marked closing, [`Service::listener_on`] no
+///    longer finds it, so a new `SYN` to the port is refused and the port can
+///    be listened on again.
+/// 2. **Connections nobody accepted are aborted** -- a `RST` each, which is
+///    what Linux's `inet_csk_listen_stop` does, by the lead's decision of
+///    2026-10-19. Aborted and never claimed, each is dropped, and its pair
+///    comes back through [`Service::rearm`], which gives it back.
+/// 3. **Armed pairs** -- mapped, no connection -- are given back, all but the
+///    first, which goes last.
+fn begin_closing(service: &mut Service, listening: usize) {
+    let Some(listener) = service.listeners.get_mut(listening) else {
+        return;
+    };
+    if listener.closing {
+        return;
+    }
+    listener.closing = true;
+    let first = listener.first_pair;
+    for index in 0..MAX_CONNECTIONS {
+        let unaccepted = service.connections.get(index).is_some_and(|connection| {
+            !connection.claimed && owned_by(service, connection, listening)
+        });
+        if unaccepted {
+            drive_at(service, index, Event::Abort);
+        }
+    }
+    while let Some(pair) = service
+        .listeners
+        .get_mut(listening)
+        .and_then(|listener| listener.armed.take())
+    {
+        if pair != first {
+            give_window_back(service, pair);
+        }
+    }
+}
+
+/// Finishes closing listener `listening` if nothing of it is left, and says
+/// whether it did -- RFC 0092 §4, steps 4 and 5.
+///
+/// 4. **Pairs held by accepted connections** stay with them; each comes back
+///    through [`Service::rearm`] when its connection retires -- here, once it
+///    has finished, since no birth on this port will retire it. **A connection
+///    that lives on keeps its listener's slot** -- the lead's decision of
+///    2026-10-19 -- so this answers `false` until the last one has.
+/// 5. **When none is left**, the first pair and the wake are revoked, and the
+///    slot is freed: its generation moves on, so the listener's badge answers
+///    `GONE` from here.
+fn finish_closing(service: &mut Service, listening: usize) -> bool {
+    // Its finished children are retired here, by `retire_finished`'s rule:
+    // that runs only when a connection is born, and a closing listener has
+    // none born, so without this a child that ended would hold the slot for
+    // ever.
+    for index in 0..MAX_CONNECTIONS {
+        let ended = service.connections.get(index).is_some_and(|connection| {
+            finished(connection) && owned_by(service, connection, listening)
+        });
+        if ended {
+            retire(service, index);
+        }
+    }
+    let children = (0..MAX_CONNECTIONS).any(|index| {
+        service
+            .connections
+            .get(index)
+            .is_some_and(|connection| owned_by(service, connection, listening))
+    });
+    if children {
+        return false;
+    }
+    let Some(first) = service
+        .listeners
+        .get(listening)
+        .map(|listener| listener.first_pair)
+    else {
+        return true;
+    };
+    give_window_back(service, first);
+    let _ = service.listeners.remove(listening);
+    true
 }
 
 /// Takes the connection in `index` out of the table for good: its generation
@@ -2306,6 +2434,8 @@ fn arm_leg(
                         handle,
                         notify_slot: arming.notified.then_some(Arming::wake_slot(pair)),
                         armed,
+                        first_pair: pair,
+                        closing: false,
                     }) != Ok(vacancy)
                     {
                         return (tcp::BARE, 0x60, 0);
@@ -2386,6 +2516,8 @@ fn listen_leg_serving(
             handle: tcp::handle(vacancy.index, vacancy.generation, true),
             notify_slot: handover.notified.then_some(handover.notify_slot),
             armed,
+            first_pair: 0,
+            closing: false,
         }) != Ok(vacancy)
         {
             return (tcp::BARE, 0x60);
@@ -2861,6 +2993,14 @@ extern "C" fn tcpd_main(hertz: u64) -> ! {
                 // RFC 0090 step 5: the holder is done. A dial is retired now
                 // if it has finished, and otherwise when it does.
                 tcp::RELEASE => {
+                    // RFC 0092: with the abort flag, a reset rather than an
+                    // orderly end -- what Linux sends for a connection that
+                    // completed and was never accepted when its listener
+                    // closes, and what `bin/linuxd` asks for one it took.
+                    if args[0] == tcp::RELEASE_ABORT {
+                        drive_at(&mut service, index, Event::Abort);
+                        arm_nearest(&service);
+                    }
                     if let Some(held) = service.connections.get_mut(index) {
                         held.released = true;
                     }
@@ -2884,7 +3024,31 @@ extern "C" fn tcpd_main(hertz: u64) -> ! {
                 _ => reply(tcp::LATER, 0, 0),
             }
         } else if let Some(listening) = service.listener_badged(badge) {
-            if method_in == tcp::ACCEPT {
+            let closing = service
+                .listeners
+                .get(listening)
+                .is_some_and(|listener| listener.closing);
+            if method_in == tcp::RELEASE {
+                // RFC 0092: "stop listening". `bin/tcpc`'s fixed handover is
+                // refused -- its pair arithmetic starts at 1 and nothing
+                // native closes one -- and a listener a pair is being armed
+                // for is asked again, so an `ARM_PAIR` and a close never
+                // interleave.
+                if service.legacy_listener == Some(listening) {
+                    reply(tcp::REFUSED, 0, 0);
+                } else if arming.open && arming.target == ArmTarget::Pair(listening) {
+                    reply(tcp::LATER, 0, 0);
+                } else {
+                    begin_closing(&mut service, listening);
+                    let done = finish_closing(&mut service, listening);
+                    arm_nearest(&service);
+                    reply(if done { tcp::OK } else { tcp::LATER }, 0, 0);
+                }
+            } else if closing && matches!(method_in, tcp::ACCEPT | tcp::ARM_PAIR) {
+                // Nothing more will be accepted or armed on a listener its
+                // holder released; `LATER` would be asked for ever.
+                reply(tcp::GONE, 0, 0);
+            } else if method_in == tcp::ACCEPT {
                 // Poll-shaped for the same reason `CONNECT` is: one reply
                 // obligation per thread. The accepted connection's
                 // capability rides the reply that says yes, into the slot

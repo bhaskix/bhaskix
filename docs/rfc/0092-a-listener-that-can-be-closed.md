@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Draft 2026-10-19. Written before any of it. **The lead decided both open questions the same day**: a connection that lives on pins its listener's slot until it ends, and connections nobody accepted are reset, as Linux does — which adds an abort to the design (§4, §5). ~~Nothing built.~~ **Step 0 done 2026-10-19; steps 1 and 2 done 2026-10-20** — listener slots have generations, from the connection table's own `Table`, and the `GONE` arm takes listener badges; a listener's rings and wake are gifted returnable, as a dial's are. |
+| **Status** | Draft 2026-10-19. Written before any of it. **The lead decided both open questions the same day**: a connection that lives on pins its listener's slot until it ends, and connections nobody accepted are reset, as Linux does — which adds an abort to the design (§4, §5). ~~Nothing built.~~ **Step 0 done 2026-10-19; steps 1 and 2 done 2026-10-20** — listener slots have generations, from the connection table's own `Table`, and the `GONE` arm takes listener badges; a listener's rings and wake are gifted returnable, as a dial's are. **Step 3 written 2026-10-20 and not yet exercised**: tcpd answers `RELEASE` on a listener in §4's order, and the abort flag on a connection, but nothing sends either until linuxd does in step 4, so step 5's gates are its proof. |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | net / userspace |
 | **Milestone** | L1 ([roadmap.md](../roadmap.md)) — a hosted server that restarts, and a machine that serves more than three listeners over a boot |
@@ -218,7 +218,12 @@ None measured to begin with. Closing costs one `RELEASE` and, per pair, three re
 1. **Generations** for listener slots, host-tested; the `GONE` arm takes listener handles.
 2. **`REVOKE` on listener gifts**, in `sock`.
 3. **tcpd answers `RELEASE` on a listener**, in §4's order, and `RELEASE` with the abort flag on a
-   connection.
+   connection. **Written 2026-10-20**, with two things §4 did not say:
+   - **A closing listener retires its own finished children.** tcpd retires a finished
+     connection only when another is born, and a closing listener has none born, so a child that
+     ended would otherwise have held the slot, and `RELEASE` answered `LATER`, for ever.
+   - **`ACCEPT` and `ARM_PAIR` on a closing listener answer `GONE`**, not `LATER`: nothing more
+     will be accepted or armed on it, and `LATER` would be asked for ever.
 4. **linuxd closes and reaps listeners**, with the per-listener pair masks.
 5. **The gates green and the arms red.** The records: TRACKER, RFC 0086's limit, linuxd's module doc,
    and `MAX_LISTENERS`, whose six can then come back down if nothing needs it.

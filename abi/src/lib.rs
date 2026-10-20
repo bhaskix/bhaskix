@@ -1687,7 +1687,20 @@ pub mod tcp {
     /// before, so a holder that releases can still learn why it ended; after,
     /// it answers [`GONE`], which is how the holder knows its rings are its own
     /// again. Gifts to a dial carry `REVOKE` for this reason.
+    ///
+    /// **On a listener: stop listening** — RFC 0092. The port is free at once;
+    /// connections nobody accepted are reset; armed pairs are given back; and
+    /// the answer is `LATER` while a connection it accepted lives or a pair is
+    /// being armed for it, `OK` once
+    /// the listener holds nothing and its slot is free, and [`GONE`] after.
+    /// Refused for `bin/tcpc`'s fixed handover.
     pub const RELEASE: u64 = 72;
+
+    /// `args[0]` of [`RELEASE`] on a connection: **reset it** rather than let
+    /// it end in order — RFC 0092, the lead's decision of 2026-10-19 that a
+    /// connection taken and never accepted is reset when its listener closes,
+    /// as Linux does. Any other value releases as before.
+    pub const RELEASE_ABORT: u64 = 1;
 
     /// `bin/tcpc`'s report word holding the ending [`RECV`] told it, when its
     /// outbound connection ended other than in order — one of [`ended`]
