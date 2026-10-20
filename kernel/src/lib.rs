@@ -5755,8 +5755,20 @@ fn corpus_self_test(hhdm_base: u64, cpus: u32, busybox: bool) -> bool {
     // console self-test reporting "16 of 5 bytes" while a page fault report
     // interleaved with its own output. `retire_probe` waits for the threads
     // to be gone, which is what the domain going away does not say.
-    for _ in 0..400 {
+    //
+    // **Except the interactive `sh`, which is waited for until it ends**
+    // (2026-10-19). It shared this two-second bound, so "`sh` runs until
+    // somebody types `exit`", the promise above, was two seconds of `sh`: typed
+    // at as a person would, it was put down at its second prompt, parked in
+    // `poll` for a key, with no `exit_group` among its last sixty-four calls.
+    // `busybox-test.sh` typed one line inside the two seconds, and from
+    // outside a retirement looks exactly like an `exit`. A person asked for
+    // this shell on the command line; it ends when they end it.
+    let interactive = busybox && BUSYBOX_INTERACTIVE.load(core::sync::atomic::Ordering::Acquire);
+    let mut waited = 0u32;
+    while interactive || waited < 400 {
         wait_millis(5);
+        waited = waited.saturating_add(1);
         if domain::with(realm, |_| ()).is_none() {
             break;
         }

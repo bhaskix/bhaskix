@@ -227,6 +227,41 @@ else
     status=1
 fi
 
+# **And a second line, typed after a pause, as a person types** (2026-10-19).
+#
+# The kernel put the interactive `sh` down two seconds after starting it -- the
+# corpus's own bound, which this mode shared -- so a person who read the first
+# answer before typing the next line met a shell that was already gone: it was
+# retired at its second prompt, parked in `poll` for a key, with no `exit_group`
+# among its last sixty-four calls. The line above was typed at once and fit
+# inside the two seconds, and from outside a retirement looks like `exit`. So
+# this waits longer than that, answers the second prompt's cursor question --
+# counted, because the first one is still in the log -- and requires BusyBox,
+# not the shell after it, to answer.
+sleep 4
+for _ in $(seq 1 40); do
+    [[ $(grep -ao $'\033\\[6n' "$LOG" 2>/dev/null | wc -l) -ge 2 ]] && break
+    sleep 0.25
+done
+if [[ $(grep -ao $'\033\\[6n' "$LOG" 2>/dev/null | wc -l) -ge 2 ]]; then
+    printf '\033[1;3R' >&3
+    sleep 1
+fi
+printf 'echo still at busybox qrq\r' >&3
+if await "still at busybox qrq"; then
+    replied=$(grep -an 'still at busybox qrq' "$LOG" | head -1 | cut -d: -f1)
+    greeted=$(head -n "$replied" "$LOG" | grep -acE 'bhaskix[$>] ' || true)
+    if [[ -n "$replied" && "$greeted" -eq 0 ]]; then
+        pass "BusyBox's sh was still there after a pause, and ran a second line"
+    else
+        fail "the second line was answered by the Bhaskix shell: BusyBox's sh had ended without being told to"
+        status=1
+    fi
+else
+    fail "nothing answered a second line typed after a pause"
+    status=1
+fi
+
 # **And it was never told a lie about `poll`** -- RFC 0055.
 #
 # Asserted after the typing rather than before, because the interesting calls
