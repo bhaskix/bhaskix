@@ -46,9 +46,12 @@ that does it, with the date.
       them found eight defects that day, among them a shell that died on `held` and a `pkg run`
       that announced an ending before it happened — see TRACKER. Re-verified against the candidate
       (one week before) and the tag (the day).
-- [ ] **The website** — *engineering*. Under its own version control, its landing page brought up
+- [x] **The website** — *engineering*, 2026-10-20. Under its own version control, its landing page brought up
       to date, and the guides rendered onto it. It says "planned" about the release until step 5
-      of the day.
+      of the day. **Done**: a local repository since 2026-10-19; the landing page brought up to
+      date that day and its test count re-measured 2026-10-20; the three guides rendered from
+      `origin/main` at `a8c0df0` and served from 2026-10-20, after CI run 873 passed on it. The
+      release reads "planned for 29 November 2026" in all three places it is named.
 - [x] **A release workflow** — *engineering*, rehearsed 2026-10-20. `.github/workflows/release.yml`, run on a pushed tag
       `v*`:
   - build `make iso` and `boot/bhaskixboot/target/x86_64-unknown-uefi/release/bhaskixboot.efi`;
