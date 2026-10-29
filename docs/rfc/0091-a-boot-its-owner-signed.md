@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | ⬜ **Draft 2026-10-12 — nothing built.** The project lead chose the scope (firmware → loader → kernel; package and update signing stay with the secure-update RFC) and asked for a draft that lays the decisions out. **The signature algorithm, the enforcement policy and every key-custody question below are the lead's to decide** before step 1 starts. |
+| **Status** | ⬜ **Draft 2026-10-12 — nothing built.** The project lead chose the scope (firmware → loader → kernel; package and update signing stay with the secure-update RFC) and asked for a draft that lays the decisions out. ~~**The signature algorithm, the enforcement policy and every key-custody question below are the lead's to decide** before step 1 starts.~~ **The lead decided questions 1–8 on 2026-10-29, each as recommended**: SLH-DSA-SHA2-128s for link 2; refuse only with Secure Boot on, handing back to the boot manager; the lead alone holds the release keys, on an offline machine, under an offline CA with a signing leaf; `dbx` for revocation, rollback left to T7; owner keys outside the tree; the verdict in PCR 8. Question 9, the SR550, stays for step 7, on the lead's word at the time. Step 0 may start. |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | boot (`bhaskixboot.efi`, `bhaskix_boot::Handoff`), a new `bootsig` crate and a `sha256` leaf crate, kernel (boot report), tools (a signer), tests, governance (key custody) |
 | **Milestone** | Phase 3 — *Secure boot chain*, the roadmap's first row; [security.md](../security.md) §1 **T6** and gap 1 |
@@ -20,9 +20,10 @@ one small signed statement, `bhaskix\boot.sig`, naming the SHA-256 of the kernel
 whole of `boot.conf`, against a public key compiled into the loader — so the first link's signature
 covers the key the second link trusts. With Secure Boot on, a boot set that fails is refused; with it
 off, the loader boots anyway and says, on the screen, in the boot report and in a PCR, that nothing
-was enforced. The recommended signature for the second link is **SLH-DSA-SHA2-128s** (FIPS 205),
+was enforced. The signature for the second link is **SLH-DSA-SHA2-128s** (FIPS 205, the lead's choice of 2026-10-29),
 whose verification needs only the SHA-256 the tree already has. **Nothing is built by this draft**:
-the algorithm, the policy and who holds which key are laid out below for the lead to decide.
+the algorithm, the policy and who holds which key are laid out below, ~~for the lead to decide~~ and
+were decided by the lead on 2026-10-29, each as recommended (*Unresolved questions*).
 
 ## Motivation
 
@@ -155,7 +156,7 @@ signature verification … during the current boot", and it "must be 0 if the pl
 or Audit Mode during its initialization" (§3.3) — so it alone answers whether link 1 held, and `SetupMode` adds nothing the
 loader acts on. An absent variable (firmware older than Secure Boot) is read as 0.
 
-**The recommended policy** — *Unresolved question* 2, the lead's:
+**The policy** — *Unresolved question* 2, decided by the lead 2026-10-29 as recommended:
 
 | `SecureBoot` | `boot.sig` | Loader | Boot report |
 |---|---|---|---|
@@ -168,8 +169,8 @@ loader acts on. An absent variable (firmware older than Secure Boot) is read as 
 **Why boot at all with Secure Boot off.** With link 1 down, the loader is itself unprotected: whoever
 can write `boot.sig` can write `BOOTX64.EFI`, and a refusal there stops nobody the RFC is about while
 stopping every developer whose machine has Secure Boot off — which today is every machine this project
-boots on, the SR550 included. Refusing anyway is the alternative the lead may prefer; the table is a
-recommendation.
+boots on, the SR550 included. ~~Refusing anyway is the alternative the lead may prefer; the table is a
+recommendation.~~ Refusing anyway was the alternative; the lead chose the table (2026-10-29).
 
 **The refusal is seen.** Today `refuse()` (main.rs) writes to serial only and parks; a screen with
 nothing on it is not an answer a person can act on. This one prints a plain sentence on ConOut and
@@ -195,7 +196,7 @@ user and to a remote verifier":
 The firmware fixes link 1's algorithm. Link 2's is the project's, and the choice is mostly about what
 the loader must contain and what custody must look like — *Unresolved question* 1.
 
-| | SLH-DSA-SHA2-128s (FIPS 205) — **recommended** | Ed25519 (RFC 8032) | LMS (RFC 8554, SP 800-208) | The firmware's PKCS#7 (RSA-2048) |
+| | SLH-DSA-SHA2-128s (FIPS 205) — **chosen 2026-10-29** | Ed25519 (RFC 8032) | LMS (RFC 8554, SP 800-208) | The firmware's PKCS#7 (RSA-2048) |
 |---|---|---|---|---|
 | What verification needs | **SHA-256 and MGF1-SHA-256 only** (§11.2.1; that verification calls neither PRF nor the HMAC is read from Algorithm 20's calls, not a sentence of the standard) | SHA-512 — not in the tree — and arithmetic mod 2²⁵⁵−19 with a square root for point decoding (§5.1.1, §5.1.7) | SHA-256 only | Nothing in the tree: the loader asks the firmware |
 | Source | written here, `forbid(unsafe)`, against NIST's vectors | waits on [RFC 0040](0040-where-cryptography-comes-from.md), a Draft; the libcrux Ed25519 needs an allocator as published, and nobody has measured one that does not | written here | firmware's |
@@ -343,31 +344,33 @@ which runs on the custody machine (step 2).
 ## Unresolved questions
 
 **Every one of these is the lead's.** Each carries a recommendation; none is decided by this draft.
+**Questions 1–8 were decided by the lead on 2026-10-29, each as recommended; question 9 stays open
+until step 7.**
 
-1. **The algorithm for link 2.** Recommended: **SLH-DSA-SHA2-128s**. The alternatives are the other
+1. **The algorithm for link 2.** **Decided 2026-10-29 by the lead, as recommended**. Recommended: **SLH-DSA-SHA2-128s**. The alternatives are the other
    three columns. Decide together with question 4: the algorithm decides what custody can be.
-2. **The policy.** Recommended: the table above — refuse only with Secure Boot on, and return to the
+2. **The policy.** **Decided 2026-10-29 by the lead, as recommended**. Recommended: the table above — refuse only with Secure Boot on, and return to the
    boot manager rather than park. The alternative is refusing whenever a key is compiled in; it
    protects nothing extra while link 1 is down and stops every Secure Boot-off machine.
-3. **Who holds the release keys.** Recommended: the lead alone for now, written down in GOVERNANCE.md
+3. **Who holds the release keys.** **Decided 2026-10-29 by the lead, as recommended**. Recommended: the lead alone for now, written down in GOVERNANCE.md
    §5 — the project has one author and the governance model says so — with a second holder of a
    sealed backup named when there is a second maintainer, and k-of-n considered then.
-4. **Where they live.** Recommended, for SLH-DSA: an **offline machine** that has never been networked,
+4. **Where they live.** **Decided 2026-10-29 by the lead, as recommended**. Recommended, for SLH-DSA: an **offline machine** that has never been networked,
    disk-encrypted, the key backed up on two offline media kept in two places. For Ed25519 it would be a
    hardware token. **Never a cloud KMS** — the key that decides what boots on an owner's machine should
    not sit in a third country's data centre.
-5. **The hierarchy.** Recommended: for the firmware-facing key, an **offline CA certificate in `db`**
+5. **The hierarchy.** **Decided 2026-10-29 by the lead, as recommended**. Recommended: for the firmware-facing key, an **offline CA certificate in `db`**
    and a signing leaf beneath it, so a leaf is rotated without every owner re-enrolling (`db` verifies
    against "a certificate against which an entry in the image's certificate table can be verified");
    for the boot-set key, keys compiled into each loader release and rotated with it — no second
    hierarchy.
-6. **Revocation and rollback.** Recommended: `dbx` for both kinds of loss, as above, and the security
+6. **Revocation and rollback.** **Decided 2026-10-29 by the lead, as recommended**. Recommended: `dbx` for both kinds of loss, as above, and the security
    version left at 0 until T7's RFC gives it a counter.
-7. **Owner and developer keys.** Recommended: `bootsign keygen` writes an owner's keys **outside the
+7. **Owner and developer keys.** **Decided 2026-10-29 by the lead, as recommended**. Recommended: `bootsign keygen` writes an owner's keys **outside the
    tree** (`$BHASKIX_KEYS`, default `~/.bhaskix-keys`), so no `git add` can reach them and
    `make clean` cannot destroy a key a machine has enrolled; CI and the lanes use the test key, in
    `tests/keys/`, labelled as a test key in its file name and its report line.
-8. **Which PCR carries the verdict.** Recommended: **8**. The TCG profile says "PCR[0-7] are
+8. **Which PCR carries the verdict.** **Decided 2026-10-29 by the lead, as recommended**. Recommended: **8**. The TCG profile says "PCR[0-7] are
    exclusively for the use of platform firmware. Operating system and OS present software should never
    use those PCRs" (§3.3.1); shim extends PCR 7 anyway (its `README.tpm`), and this RFC does not copy
    it. RFC 0089 read PCRs 10–15 as taken in the UAPI registry; 9 is "files read" by grub's convention
@@ -379,7 +382,8 @@ which runs on the custody machine (step 2).
 
 ## Implementation plan
 
-Nothing starts until questions 1 and 2 are answered. Steps 1–5 need no custody decision; step 6 does.
+Nothing starts until questions 1 and 2 are answered — ~~and~~ they were, on 2026-10-29. Steps 1–5 need
+no custody decision; step 6 does, and questions 3–7 were decided the same day.
 
 0. **The three measurements** in the testing plan — the snakeoil certificate's expiry, the PKCS#7
    protocol, `SecureBoot` as read. No code merged; the answers recorded here.
@@ -392,7 +396,7 @@ Nothing starts until questions 1 and 2 are answered. Steps 1–5 need no custody
    line; the hashing cost measured.
 4. **The native-lane gates**, Secure Boot off.
 5. **The Secure Boot lane**, QEMU and CI, with the release recipe's test-key refusal gated.
-6. **Release keys and the first signed loader** — **blocked on questions 3–7**, and GOVERNANCE.md §5
+6. **Release keys and the first signed loader** — ~~**blocked on questions 3–7**~~ (decided 2026-10-29), and GOVERNANCE.md §5
    updated in the same change.
 7. **The SR550** — question 9, on the lead's word at the time.
 
