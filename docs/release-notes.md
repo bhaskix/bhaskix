@@ -110,8 +110,8 @@ for f in docs/rfc/0*.md; do grep -m1 Status "$f"; done \
 0040's step-1 output rather than an RFC), and 93 RFCs. ~~`grep -ci accepted`~~
 was this note's command until 2026-10-19, and it reads 62 from that day, because
 RFC 0092's status says "connections nobody accepted". Host unit tests:
-**1,411** (`cargo test --workspace`, summed across one `make test` run,
-2026-10-20 on `61bb353`; 1,407 earlier that day on `a8c0df0`, 1,398 on
+**1,414** (`cargo test --workspace`, summed across one `make test` run,
+2026-10-29 on `18985db`; 1,411 on 2026-10-20 on `61bb353`, 1,407 earlier that day on `a8c0df0`, 1,398 on
 2026-10-19, 1,339 on 2026-10-08).
 
 > **Dated 2026-09-23, because this line was the only measurement in the document

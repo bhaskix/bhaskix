@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | ⬜ **Draft 2026-10-12 — nothing built.** The project lead chose the scope (firmware → loader → kernel; package and update signing stay with the secure-update RFC) and asked for a draft that lays the decisions out. ~~**The signature algorithm, the enforcement policy and every key-custody question below are the lead's to decide** before step 1 starts.~~ **The lead decided questions 1–8 on 2026-10-29, each as recommended**: SLH-DSA-SHA2-128s for link 2; refuse only with Secure Boot on, handing back to the boot manager; the lead alone holds the release keys, on an offline machine, under an offline CA with a signing leaf; `dbx` for revocation, rollback left to T7; owner keys outside the tree; the verdict in PCR 8. Question 9, the SR550, stays for step 7, on the lead's word at the time. Step 0 may start. |
+| **Status** | ⬜ **Draft 2026-10-12 — ~~nothing built~~ step 1 built 2026-10-29** (`bhaskix-sha256` and `bhaskix-bootsig`; step 0's QEMU halves measured the same day). The project lead chose the scope (firmware → loader → kernel; package and update signing stay with the secure-update RFC) and asked for a draft that lays the decisions out. ~~**The signature algorithm, the enforcement policy and every key-custody question below are the lead's to decide** before step 1 starts.~~ **The lead decided questions 1–8 on 2026-10-29, each as recommended**: SLH-DSA-SHA2-128s for link 2; refuse only with Secure Boot on, handing back to the boot manager; the lead alone holds the release keys, on an offline machine, under an offline CA with a signing leaf; `dbx` for revocation, rollback left to T7; owner keys outside the tree; the verdict in PCR 8. Question 9, the SR550, stays for step 7, on the lead's word at the time. Step 0 may start. |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | boot (`bhaskixboot.efi`, `bhaskix_boot::Handoff`), a new `bootsig` crate and a `sha256` leaf crate, kernel (boot report), tools (a signer), tests, governance (key custody) |
 | **Milestone** | Phase 3 — *Secure boot chain*, the roadmap's first row; [security.md](../security.md) §1 **T6** and gap 1 |
@@ -411,6 +411,7 @@ no custody decision; step 6 does, and questions 3–7 were decided the same day.
    protocol, `SecureBoot` as read. No code merged; the answers recorded here.
 1. **`sha256` and `bootsig`**: the leaf crate re-exported by `pkg`; the statement; SLH-DSA-SHA2-128s
    verification against the ACVP vectors, armed; a fuzz target; the verification cost measured.
+   **Done 2026-10-29**, recorded below *Implementation plan*.
 2. **`tools/bootsign`** and the test key: `keygen`, `sign`, `show`; cross-checked against OpenSSL 3.5+
    in a container, both directions; owner keys outside the tree.
 3. **The loader**: `boot.sig`, `GetVariable`, verify after measuring, the policy, the refusal on ConOut
@@ -421,6 +422,48 @@ no custody decision; step 6 does, and questions 3–7 were decided the same day.
 6. **Release keys and the first signed loader** — ~~**blocked on questions 3–7**~~ (decided 2026-10-29), and GOVERNANCE.md §5
    updated in the same change.
 7. **The SR550** — question 9, on the lead's word at the time.
+
+### Step 1, as built (2026-10-29)
+
+- **`bhaskix-sha256`** is `pkg/src/sha256.rs` moved unchanged, its six published-vector tests with
+  it, and re-exported by `bhaskix-pkg`, so no caller changed. `Sha256` became `Clone`, so the
+  constant first block of every tweakable hash, `PK.seed ‖ 0^48`, is compressed once per
+  verification.
+- **`bhaskix-bootsig`** (layer −2, `no_std`, no allocation, `unsafe` budget 0, depending on
+  `bhaskix-sha256` alone) holds `slh_dsa` and `statement`.
+  - `slh_dsa` implements FIPS 205 Algorithms 2–5, 8, 11, 13, 17, 20 and 24, each named in its
+    doc comment, over §11.2.1's hashes and Table 3's 22-byte address. The message is taken in
+    parts, so `M′` is never assembled.
+  - `statement` is the 128-byte layout. `check` names the first check a boot set fails, in this
+    RFC's order: the parse, the three digests, the key, then the signature.
+- **The vectors**: NIST ACVP-Server's SHA2-128s sigVer groups 19 (external, pure) and 31
+  (internal), 28 tests, in `third_party/acvp-slh-dsa/`. The NIST notice is kept intact there, and
+  the selection is recorded. Every one gets its verdict and its reason.
+- **Armed red, each once and reverted**:
+  - a verifier accepting any right-length signature turns all 16 modified-message,
+    modified-R, -SIGFORS and -SIGHT negatives red;
+  - with the length check removed, a too-large signature is **accepted**;
+  - six one-line transcription faults each turn the valid vectors red: `H_msg` ignoring the
+    message, the WOTS⁺ checksum unshifted, the siblings swapped, the FORS index offset dropped,
+    the layer unset, and MGF1's counter wrong;
+  - each of `check`'s nine refusals, disabled, turns its own test red.
+- **The cost, measured**: one verification is 2,098 tweakable hashes for the vector measured.
+  253 are fixed by the parameters (d·h′ + k·a `H`s, the eight `T_l`, k FORS leaves). The other
+  1,845 are WOTS⁺ chain steps, which depend on the message, between 0 and d·len·(w − 1) = 3,675.
+  That is 2,164 compressions for them, plus one for the seed block and the message's own hashing.
+  The median is **845 µs** over 100 (809 µs to 1.01 ms), in release on a Xeon Silver 4314 at
+  2.4 GHz, under a load of about 4 from other users. The loader's figure is step 3's to measure,
+  where it runs.
+- **Fuzzed**: `fuzz_targets/bootsig.rs`, three arms. Ten minutes from an empty corpus gave
+  314,709 executions and no crash, hang or artifact.
+  - Read back from the corpus, arm B got past the parse in 101 inputs and **verified a signature
+    in 33**, refusing every one, as nothing it builds was signed.
+  - Arm C verified the unchanged NIST vector in 5, refused a bent one in 64, and pushed the
+    context past 255 in 1.
+  - Arm A never got past the size check: libFuzzer's input limit stayed under 2,820 bytes against
+    a 7,984-byte file. Arm B is what reaches the parse's checks.
+- **Not testable until step 2**: `check` *accepting* a boot set, which needs a signer. Its
+  signature path is proven by the vectors through `slh_dsa::verify`.
 
 ## Sources
 
