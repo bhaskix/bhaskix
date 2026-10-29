@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | ⬜ **Draft 2026-10-12 — ~~nothing built~~ step 1 built 2026-10-29** (`bhaskix-sha256` and `bhaskix-bootsig`; step 0's QEMU halves measured the same day). The project lead chose the scope (firmware → loader → kernel; package and update signing stay with the secure-update RFC) and asked for a draft that lays the decisions out. ~~**The signature algorithm, the enforcement policy and every key-custody question below are the lead's to decide** before step 1 starts.~~ **The lead decided questions 1–8 on 2026-10-29, each as recommended**: SLH-DSA-SHA2-128s for link 2; refuse only with Secure Boot on, handing back to the boot manager; the lead alone holds the release keys, on an offline machine, under an offline CA with a signing leaf; `dbx` for revocation, rollback left to T7; owner keys outside the tree; the verdict in PCR 8. Question 9, the SR550, stays for step 7, on the lead's word at the time. Step 0 may start. |
+| **Status** | ⬜ **Draft 2026-10-12 — ~~nothing built~~ steps 1 and 2 built 2026-10-29** (`bhaskix-sha256` and `bhaskix-bootsig`, then the signer and `bootsign`; step 0's QEMU halves measured the same day). The project lead chose the scope (firmware → loader → kernel; package and update signing stay with the secure-update RFC) and asked for a draft that lays the decisions out. ~~**The signature algorithm, the enforcement policy and every key-custody question below are the lead's to decide** before step 1 starts.~~ **The lead decided questions 1–8 on 2026-10-29, each as recommended**: SLH-DSA-SHA2-128s for link 2; refuse only with Secure Boot on, handing back to the boot manager; the lead alone holds the release keys, on an offline machine, under an offline CA with a signing leaf; `dbx` for revocation, rollback left to T7; owner keys outside the tree; the verdict in PCR 8. Question 9, the SR550, stays for step 7, on the lead's word at the time. Step 0 may start. |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | boot (`bhaskixboot.efi`, `bhaskix_boot::Handoff`), a new `bootsig` crate and a `sha256` leaf crate, kernel (boot report), tools (a signer), tests, governance (key custody) |
 | **Milestone** | Phase 3 — *Secure boot chain*, the roadmap's first row; [security.md](../security.md) §1 **T6** and gap 1 |
@@ -413,7 +413,8 @@ no custody decision; step 6 does, and questions 3–7 were decided the same day.
    verification against the ACVP vectors, armed; a fuzz target; the verification cost measured.
    **Done 2026-10-29**, recorded below *Implementation plan*.
 2. **`tools/bootsign`** and the test key: `keygen`, `sign`, `show`; cross-checked against OpenSSL 3.5+
-   in a container, both directions; owner keys outside the tree.
+   in a container, both directions; owner keys outside the tree. **Done 2026-10-29**, signed hedged
+   (the lead's choice), recorded below *Step 1, as built*.
 3. **The loader**: `boot.sig`, `GetVariable`, verify after measuring, the policy, the refusal on ConOut
    and serial, the return to the boot manager, the PCR 8 event, handoff version 4; the kernel's report
    line; the hashing cost measured.
@@ -463,7 +464,56 @@ no custody decision; step 6 does, and questions 3–7 were decided the same day.
   - Arm A never got past the size check: libFuzzer's input limit stayed under 2,820 bytes against
     a 7,984-byte file. Arm B is what reaches the parse's checks.
 - **Not testable until step 2**: `check` *accepting* a boot set, which needs a signer. Its
-  signature path is proven by the vectors through `slh_dsa::verify`.
+  signature path is proven by the vectors through `slh_dsa::verify`. ~~Not testable~~ — step 2's
+  integration tests are the first to see it accept.
+
+### Step 2, as built (2026-10-29)
+
+- **Signing**, in `bhaskix-bootsig` behind a `sign` feature the loader never enables. It reuses
+  the verifier's address, tweakable hashes, digit and digest arithmetic, so the two halves cannot
+  disagree about them. It adds `PRF`, `PRF_msg` over HMAC-SHA-256, and Algorithms 6, 7, 9, 10,
+  12, 14–16, 18, 19 and 22. It stays `no_std` and allocation-free, and the caller supplies the
+  randomness.
+- **Hedged**, as the lead chose: `bootsign` draws `addrnd` from `/dev/urandom` for every
+  signature, so two signatures over one statement differ and both verify, which a test shows.
+  `addrnd = None`, the deterministic variant, exists only for NIST's deterministic vectors.
+- **Proven byte-exact** against:
+  - RFC 4231's seven HMAC-SHA-256 cases, extracted from the RFC's text by script;
+  - all 10 NIST ACVP SHA2-128s keyGen vectors;
+  - all 28 sigGen vectors for the two interfaces, deterministic and hedged, each then verified.
+
+  The tests turn on `sign` through a self dev-dependency, so `cargo test --workspace`, and with it
+  CI, checks the signer. The two crates are optimised in the dev profile, which takes the signing
+  tests from minutes to about 8 s; overflow checks stay on.
+- **Armed red, each reverted**:
+  - the WOTS⁺ PRF address type wrong: keyGen and every sigGen group go red;
+  - `addrnd` ignored: **only the two hedged groups** go red;
+  - HMAC's inner pad wrong: RFC 4231 and sigGen go red;
+  - XMSS's sibling index, FORS's secret index, or keygen's layer wrong: their vectors go red.
+- **`bootsign`** (`make bootsign`; `make gates` checks it still builds):
+  - `keygen` writes to `$BHASKIX_KEYS`, by default `~/.bhaskix-keys/`: the directory `0700`, the
+    secret `0600`. It refuses a destination inside a git work tree and never overwrites a key.
+  - `keygen --test` made the published test key, `tests/keys/bootsig-TEST-KEY`, key id
+    `a6c913d8a0e2476e`, which `statement::TEST_KEY_ID` names and a test holds to the file.
+  - `sign` hashes the ESP's three files and signs hedged. It runs the loader's own `check` before
+    writing, so it never writes a `boot.sig` that would not verify.
+  - `show` names each digest as matching or `DIFFERS` and gives `check`'s verdict.
+
+  Eight integration tests drive the binary. Armed: with the self-check bypassed, a damaged key
+  writes a bad `boot.sig`, and with the in-tree refusal disabled, `keygen` writes into a work
+  tree. Signing a 13 MB kernel and a 3.4 MB initrd took 0.90 s wall time and 18 MB of memory on
+  the build host, at a load of 2.3; `show` took 0.10 s.
+- **Cross-checked with OpenSSL 3.5.5** (`tools/bootsign-crosscheck.sh`, in an Ubuntu 26.04
+  container), all four results ok:
+  - OpenSSL verified a `bootsign` signature, and refused it over a statement with a byte changed;
+  - `bootsign` verified OpenSSL's signature, and refused it with a byte changed.
+
+  The keys crossed as OpenSSL's own encodings, read from what it wrote: a 20-byte PKCS#8 prefix
+  and an 18-byte SPKI prefix in front of FIPS 205's raw bytes. Armed: with the OID byte wrong,
+  the first result goes FAIL.
+- **Limits, stated**:
+  - the signer's constant-time property is argued, not measured;
+  - secret bytes are not zeroed in memory, which would need `unsafe` this crate's budget forbids.
 
 ## Sources
 
