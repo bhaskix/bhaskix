@@ -157,8 +157,14 @@ The `-ix` is the Unix lineage, the same suffix Minix and Linux carry.
 > itself and replays the log with the tree's own SHA-256. Read off the SR550: `log and TPM agree on
 > PCRs 0-7, 9: 47 events replayed (sha256), in bin/tpmd over FIFO`. It took a second boot — the
 > first was red, rightly, and found two defects, both fixed the same evening — and the TPM had to be
-> switched from 1.2 to 2.0 first. **It enforces nothing**: a changed kernel still boots, recorded;
-> signing waits on key custody.
+> switched from 1.2 to 2.0 first. ~~**It enforces nothing**: a changed kernel still boots, recorded;
+> signing waits on key custody.~~ **Since 2026-10-29 the loader also checks a signature** over the
+> kernel, the initrd and `boot.conf`, and with Secure Boot on refuses a set that fails it
+> ([RFC 0091](docs/rfc/0091-a-boot-its-owner-signed.md)). Key custody is decided
+> ([GOVERNANCE.md](GOVERNANCE.md) §5), but **the project's own keys do not exist yet**: the preview's
+> loader trusts no key, the lead's key ceremony is prepared and rehearsed but not run, and the first
+> signed release is the one after the preview. An owner can sign their own boot today —
+> [the guide](docs/guide/secure-boot.md).
 >
 > Nothing here should run anywhere that matters — see [SECURITY.md](SECURITY.md).
 >

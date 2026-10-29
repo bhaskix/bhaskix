@@ -59,7 +59,10 @@ that does it, with the date.
     (`build/release-loader`, `RELEASE_BOOT_KEYS`, default `none`; RFC 0091 step 5), and
     `tools/release-dist.sh` refuses any loader holding the published test key. **The preview's
     loader trusts no key** (the lead's decision of 2026-10-29); a release with keys names their
-    public files in `RELEASE_BOOT_KEYS` after step 6's ceremony;
+    public files in `RELEASE_BOOT_KEYS` after step 6's ceremony — the first is the release after the
+    preview, and its signing steps are [release-keys.md](release-keys.md) §6: `make release-dist`
+    writes `dist/to-sign/`, the lead signs it offline, and `make release-finish` checks what comes
+    back before anything is assembled;
   - **choose the ISO's Linux programs explicitly** (decided 2026-10-19): the Go `net/http` server
     in (`HTTPD_IN_IMAGE=1`), BusyBox out (`BUSYBOX_SRC= BUSYBOX=build/no-busybox`). BusyBox is
     GPL-2.0, and shipping its binary would oblige publishing its source; without the explicit
@@ -131,8 +134,9 @@ that does it, with the date.
 1. [ ] **CI green and a quiet-host `make test` green** on the release commit — *engineering*.
 2. [ ] **Tag** — *engineering*: `git tag -s v0.1.0-preview` on the release commit, if a signing key
        for tags exists by then, otherwise an annotated tag, and push it. The tag is not a release
-       signature; [GOVERNANCE.md](../GOVERNANCE.md) §5 keeps key custody a governance decision, and
-       the note says the binaries are unsigned.
+       signature; [GOVERNANCE.md](../GOVERNANCE.md) §5 ~~keeps key custody a governance decision~~
+       states the key custody the lead decided on 2026-10-29, and the note says the binaries are
+       unsigned, as decided for the preview.
 3. [ ] **The release workflow builds the draft** — the two binaries, `SHA256SUMS`, and the note as
        its body.
 4. [ ] **The draft checked** — *engineering*:
@@ -153,5 +157,6 @@ that does it, with the date.
 
 It does not decide what is *in* the release — [roadmap.md](roadmap.md) did, on 2026-08-19, and the
 note says what got there. It does not sign anything: signing is
-[RFC 0091](rfc/0091-a-boot-its-owner-signed.md)'s, a draft with questions for the lead, and the
-roadmap leaves it out of this release on purpose.
+[RFC 0091](rfc/0091-a-boot-its-owner-signed.md)'s, ~~a draft with questions for the lead~~ its
+questions decided and its ceremony prepared on 2026-10-29, and the preview is unsigned by the
+lead's decision — the first signed release is the one after it.

@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | ⬜ **Draft 2026-10-12 — ~~nothing built~~ steps 1–5 built 2026-10-29** (`bhaskix-sha256` and `bhaskix-bootsig`; the signer and `bootsign`; the loader's check and the kernel's report line; the native-lane gates, Secure Boot off; the Secure Boot lane and the recipe's test-key refusal; step 0's QEMU halves measured the same day). Steps 6 and 7 remain: release keys, and the SR550. **The preview's loader trusts no key**, the lead's decision of 2026-10-29 (*Step 5, as built*). The project lead chose the scope (firmware → loader → kernel; package and update signing stay with the secure-update RFC) and asked for a draft that lays the decisions out. ~~**The signature algorithm, the enforcement policy and every key-custody question below are the lead's to decide** before step 1 starts.~~ **The lead decided questions 1–8 on 2026-10-29, each as recommended**: SLH-DSA-SHA2-128s for link 2; refuse only with Secure Boot on, handing back to the boot manager; the lead alone holds the release keys, on an offline machine, under an offline CA with a signing leaf; `dbx` for revocation, rollback left to T7; owner keys outside the tree; the verdict in PCR 8. Question 9, the SR550, stays for step 7, on the lead's word at the time. Step 0 may start. |
+| **Status** | ⬜ **Draft 2026-10-12 — ~~nothing built~~ steps 1–5 built 2026-10-29, step 6 prepared the same day** (the ceremony's tools, its rehearsal lane and GOVERNANCE.md §5; the ceremony itself is the lead's; `bhaskix-sha256` and `bhaskix-bootsig`; the signer and `bootsign`; the loader's check and the kernel's report line; the native-lane gates, Secure Boot off; the Secure Boot lane and the recipe's test-key refusal; step 0's QEMU halves measured the same day). ~~Steps 6 and 7 remain: release keys, and the SR550.~~ Step 6 waits on the lead's ceremony and the first signed release; step 7 is the SR550. **The preview's loader trusts no key**, the lead's decision of 2026-10-29 (*Step 5, as built*). The project lead chose the scope (firmware → loader → kernel; package and update signing stay with the secure-update RFC) and asked for a draft that lays the decisions out. ~~**The signature algorithm, the enforcement policy and every key-custody question below are the lead's to decide** before step 1 starts.~~ **The lead decided questions 1–8 on 2026-10-29, each as recommended**: SLH-DSA-SHA2-128s for link 2; refuse only with Secure Boot on, handing back to the boot manager; the lead alone holds the release keys, on an offline machine, under an offline CA with a signing leaf; `dbx` for revocation, rollback left to T7; owner keys outside the tree; the verdict in PCR 8. Question 9, the SR550, stays for step 7, on the lead's word at the time. Step 0 may start. |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | boot (`bhaskixboot.efi`, `bhaskix_boot::Handoff`), a new `bootsig` crate and a `sha256` leaf crate, kernel (boot report), tools (a signer), tests, governance (key custody) |
 | **Milestone** | Phase 3 — *Secure boot chain*, the roadmap's first row; [security.md](../security.md) §1 **T6** and gap 1 |
@@ -423,7 +423,10 @@ no custody decision; step 6 does, and questions 3–7 were decided the same day.
 5. **The Secure Boot lane**, QEMU and CI, with the release recipe's test-key refusal gated. **Done
    2026-10-29**, recorded below *Steps 3 and 4, as built*.
 6. **Release keys and the first signed loader** — ~~**blocked on questions 3–7**~~ (decided 2026-10-29), and GOVERNANCE.md §5
-   updated in the same change.
+   updated in the same change. **Prepared 2026-10-29**, recorded below *Step 5, as built*: the
+   ceremony's tools and procedure, rehearsed end to end by a lane, the recipe's check on what the
+   ceremony signs, and GOVERNANCE.md §5. **What completes it is the lead's**: running the ceremony,
+   and the first signed release, which is the one after the preview.
 7. **The SR550** — question 9, on the lead's word at the time.
 
 ### Step 1, as built (2026-10-29)
@@ -608,6 +611,79 @@ no custody decision; step 6 does, and questions 3–7 were decided the same day.
   with the same words.
   - **Armed**: the loader left unsigned, the byte left alone, and the signed loader in the unsigned
     boot. Each went red where it should.
+
+### Step 6, prepared (2026-10-29)
+
+**The lead's decisions that day**, each as recommended:
+- the offline machine runs Ubuntu 26.04 LTS;
+- the first signed release is the one after the preview, which ships unsigned as decided;
+- GOVERNANCE.md §8's two weeks of public discussion are this RFC's public draft, 2026-10-12 to
+  2026-10-29, with the lead's agreement as the approval;
+- an owner's guide comes in this step.
+
+**Step 0 for this step, read off a 26.04 container, not recalled:**
+- **Packages:** `sbsigntool` 0.9.4-3.1ubuntu9, `openssl` 3.5.5-1ubuntu3.7, `python3-virt-firmware`
+  25.12-1 (the OVMF variable-store editor), `pesign` 116-8.1build1, `ovmf` 2025.11-3ubuntu7.3.
+  Ubuntu 24.04 packages `python3-virt-firmware` too (24.1.1-2); 20.04 does not.
+- **`bootsign` runs there as built here.** It links only the C library and its runtime, built
+  against glibc 2.31; 26.04 has 2.43.
+- **`sbsigntool`'s dependencies ship in a fresh 26.04 install** (libc6, libssl3t64, libuuid1), so
+  the ceremony kit carries that one package. Launchpad's `+files` URL serves the archive's own bytes
+  (the same SHA-256), and keeps a version after the pool drops it.
+- **`sbsign`'s signature chains from the leaf to a CA held in `db`.** OVMF accepted the leaf's
+  loader on a store holding only the CA (the lane's boot (a)); `sbverify --cert` agrees.
+
+**Found while building:**
+- **The system `openssl.cnf` doubles extensions.** Ubuntu's `v3_ca` adds Basic Constraints and a
+  key identifier, and `-addext` added them again. The first rehearsal's CA carried each twice, which
+  RFC 5280 forbids, and its leaf would not verify. `tools/release-keys.sh` now passes a configuration
+  of its own.
+- **`sbattach --remove` does not give back the bytes `sbsign` was handed.** It leaves the PE
+  checksum `sbsign` filled in. So `release-finish` compares the two with that field zeroed on both
+  sides.
+- **Steps 3–5 left four of the documents this RFC names stale**: `architecture.md`, `security.md`,
+  `roadmap.md`, and RFCs 0028 and 0007. They were corrected the same day.
+
+**What was built:**
+- **A gate** (`tools/check-no-secret-keys.py`, in `make gates`) refuses a tracked PEM private key, a
+  `*.secret` file other than the published test key, or a 64-byte file ending in a public key under
+  `boot/keys/`. An SLH-DSA secret ends with its own public key. **Armed**: its self-test builds
+  throwaway repositories, and with the third check disabled it goes red on that case alone.
+- **`tools/release-keys.sh`**, the ceremony:
+  - `init`, `export`, `sign`, `rotate-leaf`, `rotate-bootset`, and `backup`/`restore`;
+  - the backup is read back and compared before it is trusted;
+  - it refuses an interface that is up, a git work tree, and an existing key.
+
+  **Armed**: each refusal once.
+- **`tools/ceremony-kit.sh`** (`make ceremony-kit`): the removable medium, with `sbsigntool` pinned.
+- **The recipe:** `release-dist.sh` writes `dist/to-sign/` when `RELEASE_BOOT_KEYS` names keys, and
+  checks the loader holds each. `release-finish.sh` (`make release-finish`) verifies what comes back
+  before assembling. `boot/keys/` waits for the export.
+- **The rehearsal lane** (`make test-release-keys`, in `make test` and in CI): the ceremony in
+  Ubuntu 26.04 (natively on CI, in a pinned container here, with no network), then five boots with
+  the rehearsal CA in `db`:
+  - (a) the leaf's loader verifies its boot set, Secure Boot on;
+  - (b) a rotated leaf's boots;
+  - (c) the leaf in `dbx` refuses its loader;
+  - (d) the loader's hash in `dbx` refuses it;
+  - (e) a stranger's is refused.
+
+  Then `release-finish` accepts the rehearsal's output, and refuses a leaf-signed loader that is not
+  the one built, and a `boot.sig` made with another key. 12 checks, green in 37 s here.
+  - **Armed**, every check. The first armed run showed (c) and (d) passing with no `dbx` entry at
+    all: a store that lost the CA refuses everything. So each store with a `dbx` entry now also
+    boots a loader its entry does not name, and with the CA removed those controls fail.
+- **Documents:** `docs/release-keys.md` (the procedure), GOVERNANCE.md §5, and the guide *Sign your
+  own boot*. The guide was run as written: part 1 on 20.04 and QEMU 4.2.1, part 2 on 26.04 and
+  QEMU 10.2.1.
+
+**What completes step 6 is the lead's**:
+- running the ceremony;
+- committing the exported public halves to `boot/keys/`;
+- the first signed release, which sets `RELEASE_BOOT_KEYS`, is signed offline, and passes
+  `release-finish`.
+
+Step 7 (the SR550) follows, on the lead's word.
 
 ## Sources
 
