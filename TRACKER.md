@@ -34,7 +34,7 @@ What can be counted honestly, with how to recount it:
 | Networking, within RFC 0018 | **7 of 7 steps — RFC 0018 ACCEPTED** | its implementation plan: crate, driver, ring, return path and ARP, ICMP, sockets, DHCP. A ring 3 program obtains an address holding a socket and a page, and the folded-domain measurement priced the boundary |
 | TCP, within RFC 0020 | **All six steps — both directions echo on every networked boot, guest and host agreeing, and the boundary is measured rather than argued about** | its implementation plan. `bin/tcpd` boots in its own domain, draws its secret and refuses without one; `bin/tcpc` supplies the rings, holds the connections, and is the instrument. The measured verdict named wake-by-notification and a wider window, in that order; the wake collected its win (RFC 0023), and the width — bought 2026-08-17, the whole ring advertised — moved nothing: the per-chunk serve-loop unit owns the bulk rate (§7) |
 | Tasks in defined milestones | **92 `DONE`, 4 `TODO`** | `grep -c` on the milestone tables in §3 |
-| Suite | ~~**1,263 assertions per `make test`**, **1056 host tests**~~ ~~**2,028 `ok` lines per `make test` and 1,339 host tests, both counted 2026-10-08 from one run's log, RFC 0089 step 5's tree**~~ **2,085 `ok` lines per `make test` and 1,356 host tests, counted 2026-10-11 from one quiet run's log (`3627cc5`, RFC 0089 steps 6 and 4's fixture; `ok ` at a line's start after colour is stripped, and `test result` sums)** (the struck figures were 2026-08-27's, and this row said them for six weeks), 5 placements | §6; the host number is `cargo test --workspace`, summed across the run and recounted **2026-08-27** after RFC 0050's two over `console::put_run` and RFC 0051's one over the service's aggregation order (1013 before them, recounted 2026-08-24 after RFC 0043 step 3's three over the pass-through bit layout and the widest-AGAW choice (1010 before them; after RFC 0048 step 1's two over the split retransmission budget (1008 before them, itself after RFC 0047's four over `reset_for`; 1004 before those; 949 on 2026-08-23; this row said 949 and dated itself 2026-08-19, which was wrong in both halves — it was recounted on the 23rd without the row being touched) |
+| Suite | ~~**1,263 assertions per `make test`**, **1056 host tests**~~ ~~**2,028 `ok` lines per `make test` and 1,339 host tests, both counted 2026-10-08 from one run's log, RFC 0089 step 5's tree**~~ ~~**2,085 `ok` lines per `make test` and 1,356 host tests, counted 2026-10-11 from one quiet run's log (`3627cc5`, RFC 0089 steps 6 and 4's fixture)**~~ **2,314 `ok` lines per `make test` and 1,450 host tests, counted 2026-10-29 from one quiet run's log (`5578433`, RFC 0091 step 6 prepared; `ok ` at a line's start after colour is stripped, and `test result` sums)** — the 2026-10-11 figures stood here for eighteen days while the suite grew (the struck figures were 2026-08-27's, and this row said them for six weeks), 5 placements | §6; the host number is `cargo test --workspace`, summed across the run and recounted **2026-08-27** after RFC 0050's two over `console::put_run` and RFC 0051's one over the service's aggregation order (1013 before them, recounted 2026-08-24 after RFC 0043 step 3's three over the pass-through bit layout and the widest-AGAW choice (1010 before them; after RFC 0048 step 1's two over the split retransmission budget (1008 before them, itself after RFC 0047's four over `reset_for`; 1004 before those; 949 on 2026-08-23; this row said 949 and dated itself 2026-08-19, which was wrong in both halves — it was recounted on the 23rd without the row being touched) |
 
 **Three exit criteria are unmet, and no task count reaches them.** They are the honest answer to
 "how far along":
@@ -1089,6 +1089,22 @@ the distinction is in the table rather than in somebody's head.
 ## 7. Changelog
 
 Newest first. One entry per meaningful change of project state.
+
+### 2026-10-29 (NOTICE names what the project fetches, and each release carries the licences)
+
+**NOTICE named Limine alone.** The release ISO has carried Go's runtime, compiled into its web
+server, since the Go server went in; BusyBox is fetched and pinned for the test images; and
+`sbsigntool` rides on the key ceremony's medium as of today. NOTICE now names all four, each with
+its licence read off its own text, and its Limine entry stops calling Limine "scheduled for
+replacement in Phase 2". **And the release did not carry Limine's licence**, though Limine's
+binaries boot the ISO and BSD 2-Clause asks a binary redistribution to carry the notice.
+`tools/release-dist.sh` now ships `LICENSE-limine` beside `LICENSE-go`, with the project's own
+`LICENSE` and `NOTICE`, and the release workflow uploads all four. A new gate,
+`tools/check-notice.py`, refuses a fetching script under `tools/` that does not declare its
+component, or that names one NOTICE lacks. It is armed by a self-test, and a renamed NOTICE heading
+turns it red. Two stale records went with it: `busybox-test.sh`'s header still said the lane fails
+and is not in `make test`, two months after both stopped being true; and §1's suite row had stood
+at 2026-10-11's figures.
 
 ### 2026-10-29 (RFC 0091 step 6 prepared: the key ceremony, rehearsed)
 

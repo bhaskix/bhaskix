@@ -3,10 +3,15 @@
 #
 # Types at BusyBox's shell and asserts on its replies — RFC 0053's lane.
 #
-# # THIS LANE FAILS TODAY, ON PURPOSE, AND IS NOT IN `make test`
+# # ~~THIS LANE FAILS TODAY, ON PURPOSE, AND IS NOT IN `make test`~~
 #
-# It fails at one assertion — *"the reply came after BusyBox was done"* — and
-# that is the true state of the machine rather than a broken test. A shell has
+# **It passes, and has been in `make test` since 2026-08-28** (`55ff91a`, RFC
+# 0054: a hosted read that waits). This header kept saying otherwise for two
+# months, until 2026-10-29. What follows is the record of how it failed before
+# that, and why, kept because it is the reason the lane exists.
+#
+# It failed at one assertion — *"the reply came after BusyBox was done"* — and
+# that was the true state of the machine rather than a broken test. A shell has
 # to **wait** for a key, and `bin/linuxd` can only ask whether one is *already*
 # waiting: `POLL_INPUT` answers "nothing yet", BusyBox gets `EAGAIN` and exits,
 # and the line typed at it is answered by the Bhaskix shell that starts
@@ -18,10 +23,10 @@
 # blocks the *calling* thread, which is the adapter's only one, so it stops the
 # whole personality until somebody types. This lane is what found that.
 #
-# It is kept, and kept out of `make test`, because it is the thing that will say
-# when the remaining work is done — and because it has already earned its place
-# twice: it found the blocking stall, and it caught its own first assertion
-# passing while the wrong shell answered.
+# ~~It is kept, and kept out of `make test`, because it is the thing that will say
+# when the remaining work is done~~ -- it said so on 2026-08-28 -- and it had
+# already earned its place twice: it found the blocking stall, and it caught its
+# own first assertion passing while the wrong shell answered.
 #
 # # One unexplained run, recorded rather than forgotten
 #
