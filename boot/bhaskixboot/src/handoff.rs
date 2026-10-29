@@ -84,6 +84,8 @@ pub struct Findings<'boot> {
     pub initrd: (u64, usize),
     /// What the loader recorded in the TPM -- RFC 0089.
     pub recorded: Recorded,
+    /// What the loader decided about `boot.sig` -- RFC 0091.
+    pub signature: bhaskix_boot::Signature,
     /// The bootstrap CPU's local APIC id, read by `cpuid`.
     pub bsp_lapic_id: u32,
 }
@@ -303,6 +305,7 @@ pub fn assemble(block: u64, findings: &Findings<'_>) -> Result<Assembled, usize>
         regions_truncated: false,
         initrd: Some(initrd),
         measurement,
+        signature: findings.signature,
     };
     // SAFETY: the block's first page, aligned far beyond the struct's
     // needs, written once and read by the kernel alone after the jump.

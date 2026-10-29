@@ -30,6 +30,8 @@ mod handoff;
 mod paging;
 mod serial;
 
+use bhaskix_boot::{Signature, Unverified};
+use bhaskix_bootsig::statement::Digests;
 use bhaskix_elf::{AddressHalf, PAGE_SIZE, page_span, parse_in};
 use efi::{File, SimpleTextOutput, SystemTable};
 
@@ -40,6 +42,14 @@ const BANNER: &str = "bhaskixboot 0.0.0: the machine entered through our own doo
 const KERNEL_PATH: &str = "bhaskix\\kernel";
 const INITRD_PATH: &str = "bhaskix\\initrd.tar";
 const CONFIG_PATH: &str = "bhaskix\\boot.conf";
+/// The boot set's signature -- RFC 0091 link 2.
+const SIG_PATH: &str = "bhaskix\\boot.sig";
+
+/// The boot-set keys this loader trusts, compiled in by `build.rs` from
+/// `BHASKIX_BOOT_KEYS`, or the published test key when that is unset.
+mod keys {
+    include!(concat!(env!("OUT_DIR"), "/keys.rs"));
+}
 
 /// Pages allocated for each payload buffer: sixteen MiB for the kernel, and
 /// sixteen for the initrd. A payload past its cap is a printed refusal, not a
@@ -439,6 +449,139 @@ fn measure_one(tcg2: *mut efi::Tcg2, (pcr, tag): (u32, u32), name: &str, bytes: 
     }
 }
 
+/// The time-stamp counter, for RFC 0091's cost line.
+fn tsc() -> u64 {
+    // SAFETY: `rdtsc` reads a counter and has no other effect.
+    unsafe { core::arch::x86_64::_rdtsc() }
+}
+
+/// What the firmware said about Secure Boot, on the wire.
+fn report_secure_boot(state: efi::SecureBoot) {
+    match state {
+        efi::SecureBoot::On => serial::write(
+            "bhaskixboot: SecureBoot reads 1 -- the firmware verified this loader\r\n",
+        ),
+        efi::SecureBoot::Off => {
+            serial::write("bhaskixboot: SecureBoot reads 0 -- nothing verified this loader\r\n")
+        }
+        efi::SecureBoot::Absent => {
+            serial::write("bhaskixboot: SecureBoot is absent; read as off\r\n")
+        }
+        efi::SecureBoot::Unreadable(status) => {
+            serial::write("bhaskixboot: SecureBoot unreadable, status ");
+            serial::write_hex(status as u64);
+            serial::write("; read as off\r\n");
+        }
+    }
+}
+
+/// How long hashing the boot set and checking `boot.sig` took, in TSC ticks
+/// and, calibrated against ten milliseconds of the firmware's `Stall`, in
+/// milliseconds -- RFC 0091's performance implications, measured where it runs.
+fn report_cost(table: *mut SystemTable, ticks: u64, bytes: usize) {
+    let before = tsc();
+    efi::stall(table, 10_000);
+    let per_ms = tsc().wrapping_sub(before) / 10;
+    serial::write("bhaskixboot: boot set hashed and checked: ");
+    serial::write_dec(bytes as u64);
+    serial::write(" bytes in ");
+    serial::write_dec(ticks);
+    serial::write(" ticks");
+    if let Some(ms) = ticks.checked_div(per_ms) {
+        serial::write(", ~");
+        serial::write_dec(ms);
+        serial::write(" ms at ");
+        serial::write_dec(per_ms);
+        serial::write(" ticks/ms");
+    }
+    serial::write("\r\n");
+}
+
+/// The PCR 8 event's bytes: the verdict (0 verified, 1 not), the key id that
+/// verified (zeros otherwise), and the `SecureBoot` byte read (0xfe absent,
+/// 0xff unreadable).
+fn verdict_bytes(signature: Signature, secure_boot: efi::SecureBoot) -> [u8; 10] {
+    let mut bytes = [0u8; 10];
+    match signature {
+        Signature::Verified { key_id, .. } => bytes[1..9].copy_from_slice(&key_id),
+        _ => bytes[0] = 1,
+    }
+    bytes[9] = match secure_boot {
+        efi::SecureBoot::On => 1,
+        efi::SecureBoot::Off => 0,
+        efi::SecureBoot::Absent => 0xfe,
+        efi::SecureBoot::Unreadable(_) => 0xff,
+    };
+    bytes
+}
+
+/// The verdict, on the screen and the wire.
+fn report_signature(signature: Signature, secure_boot: efi::SecureBoot) {
+    let enforced = secure_boot == efi::SecureBoot::On;
+    let mut line = Line::new();
+    match signature {
+        Signature::Verified { key_id, .. } => {
+            let mut hex = [0u8; 16];
+            const DIGITS: &[u8; 16] = b"0123456789abcdef";
+            for (i, byte) in key_id.iter().enumerate() {
+                hex[2 * i] = DIGITS[usize::from(byte >> 4)];
+                hex[2 * i + 1] = DIGITS[usize::from(byte & 15)];
+            }
+            line.push("bhaskixboot: boot signature verified: key ");
+            line.push(core::str::from_utf8(&hex).unwrap_or("?"));
+            if key_id == bhaskix_boot::TEST_KEY_ID {
+                line.push(" TEST KEY");
+            }
+            line.push(if enforced {
+                ", Secure Boot on\r\n"
+            } else {
+                ", NOT ENFORCED: Secure Boot is off\r\n"
+            });
+        }
+        Signature::NotVerified(reason) => {
+            line.push("bhaskixboot: boot signature NOT VERIFIED (");
+            line.push(reason.describe());
+            line.push(if enforced {
+                ")\r\n"
+            } else {
+                "), NOT ENFORCED: Secure Boot is off -- booting\r\n"
+            });
+        }
+        Signature::NotChecked => {}
+    }
+    diag(line.as_str());
+}
+
+/// One line, assembled before it is written. **`diag` must be handed whole
+/// lines**: it writes the wire and the firmware console, and OVMF mirrors its
+/// console onto the same wire, so a line written in pieces arrives with each
+/// piece twice, interleaved (seen 2026-10-29, on the first boot of this check).
+struct Line {
+    bytes: [u8; 192],
+    len: usize,
+}
+
+impl Line {
+    const fn new() -> Self {
+        Self {
+            bytes: [0; 192],
+            len: 0,
+        }
+    }
+
+    /// Appends `text`, or as much of it as fits.
+    fn push(&mut self, text: &str) {
+        let take = text.len().min(self.bytes.len() - self.len);
+        self.bytes[self.len..self.len + take].copy_from_slice(&text.as_bytes()[..take]);
+        self.len += take;
+    }
+
+    fn as_str(&self) -> &str {
+        core::str::from_utf8(&self.bytes[..self.len])
+            .unwrap_or("bhaskixboot: (a line that did not fit)\r\n")
+    }
+}
+
 /// A refusal, printed with its status, and the park that follows every one
 /// of them: past the exit there is nowhere to return a status to, and
 /// before it an inconsistent loader has no business handing control back.
@@ -582,17 +725,31 @@ extern "efiapi" fn efi_main(image_handle: usize, system_table: *mut SystemTable)
     };
     report_payload("initrd", &initrd_buffer[..initrd_len]);
 
+    // **Absent and unreadable are different now** (RFC 0091): `boot.sig` names
+    // the digest of every byte of `boot.conf`, so a file too large to read, or
+    // one the firmware refused, is not quietly an empty one. Both still boot
+    // with an empty command line when nothing is enforcing; the verdict says
+    // which happened.
     let mut conf = [0u8; 4096];
-    let conf_text: &str = match read_fully(root, CONFIG_PATH, &mut conf) {
+    let mut conf_unreadable = false;
+    let conf_len = match read_fully(root, CONFIG_PATH, &mut conf) {
         Ok(len) => {
             report_payload("conf", &conf[..len]);
-            core::str::from_utf8(&conf[..len]).unwrap_or("")
+            len
+        }
+        Err(Unread::Firmware(efi::NOT_FOUND)) => {
+            serial::write("bhaskixboot: payload conf absent; the command line is empty\r\n");
+            0
         }
         Err(_) => {
-            serial::write("bhaskixboot: payload conf absent; the command line is empty\r\n");
-            ""
+            serial::write(
+                "bhaskixboot: payload conf unreadable; the command line is empty and boot.sig cannot verify\r\n",
+            );
+            conf_unreadable = true;
+            0
         }
     };
+    let conf_text = core::str::from_utf8(&conf[..conf_len]).unwrap_or("");
     // The first line, `cmdline=<rest>`; anything else is an empty command
     // line, from the shape of the parse rather than a guess. Later lines are
     // options; one exists, a test option (RFC 0089 step 8).
@@ -605,6 +762,18 @@ extern "efiapi" fn efi_main(image_handle: usize, system_table: *mut SystemTable)
         .lines()
         .skip(1)
         .any(|line| line.trim() == "early-event-log");
+    // The boot set's signature, read with the files it names and before the
+    // volume closes -- RFC 0091. Absent is a verdict, not a refusal: whether it
+    // stops the boot is the policy's to say, below.
+    let mut sig = [0u8; 8192];
+    let sig_read = match read_fully(root, SIG_PATH, &mut sig) {
+        Ok(len) => {
+            report_payload("sig", &sig[..len]);
+            Ok(len)
+        }
+        Err(Unread::Firmware(efi::NOT_FOUND)) => Err(Unverified::Missing),
+        Err(_) => Err(Unverified::Unreadable),
+    };
     efi::close(root);
 
     // **Measured before anything interprets it** -- RFC 0089. The bytes as
@@ -617,6 +786,65 @@ extern "efiapi" fn efi_main(image_handle: usize, system_table: *mut SystemTable)
         cmdline,
         early_event_log,
     );
+    // **RFC 0091 link 2: the boot set, checked after it was measured and before
+    // anything interprets it.** The loader hashes what it holds rather than
+    // reading digests back out of the event log, which the firmware wrote.
+    let secure_boot = efi::secure_boot(table);
+    report_secure_boot(secure_boot);
+    let started = tsc();
+    let signature = match sig_read {
+        Err(why) => Signature::NotVerified(why),
+        Ok(_) if conf_unreadable => Signature::NotVerified(Unverified::Unreadable),
+        Ok(len) => {
+            let held = Digests {
+                kernel: bhaskix_sha256::digest(&kernel_buffer[..kernel_len]),
+                initrd: bhaskix_sha256::digest(&initrd_buffer[..initrd_len]),
+                boot_conf: bhaskix_sha256::digest(&conf[..conf_len]),
+            };
+            match bhaskix_bootsig::check(&sig[..len], keys::KEYS, &held) {
+                Ok(key_id) => Signature::Verified {
+                    key_id,
+                    secure_boot: secure_boot == efi::SecureBoot::On,
+                },
+                Err(refusal) => Signature::NotVerified(Unverified::Refused(refusal)),
+            }
+        }
+    };
+    report_cost(
+        table,
+        tsc().wrapping_sub(started),
+        kernel_len + initrd_len + conf_len,
+    );
+    // The verdict into PCR 8 -- question 8 -- *before* acting on it, so a
+    // refused boot is in the record too, and before the log is copied, so the
+    // copy holds it.
+    if let Some(tcg2) = tcg2 {
+        measure_one(
+            tcg2,
+            bhaskix_tcglog::measured::VERDICT,
+            "verdict",
+            &verdict_bytes(signature, secure_boot),
+        );
+    }
+    report_signature(signature, secure_boot);
+    // **The policy** (question 2, decided 2026-10-29): with Secure Boot on, a
+    // set that did not verify is refused -- said on the screen and the wire,
+    // held long enough to read, and handed back to the boot manager, which
+    // tries the next option as the firmware does with an image it refuses
+    // (UEFI §32.6.1). The only refusal here that returns. With Secure Boot
+    // off, link 1 is down and this loader is itself unprotected, so refusing
+    // would stop nobody the check is about: it boots, and says so.
+    if let (efi::SecureBoot::On, Signature::NotVerified(reason)) = (secure_boot, signature) {
+        let mut line = Line::new();
+        line.push("bhaskixboot: refusing to boot: ");
+        line.push(reason.describe());
+        line.push(" (Secure Boot is on)\r\n");
+        diag(line.as_str());
+        diag("bhaskixboot: returning to the boot manager in 5 seconds\r\n");
+        efi::stall(table, 5_000_000);
+        return efi::SECURITY_VIOLATION;
+    }
+
     // And the log those measurements went into, copied while the protocol
     // that names it still exists -- RFC 0089 step 3.
     let recorded = match tcg2 {
@@ -844,6 +1072,7 @@ extern "efiapi" fn efi_main(image_handle: usize, system_table: *mut SystemTable)
         cmdline,
         initrd: (initrd_base, initrd_len),
         recorded,
+        signature,
         bsp_lapic_id,
     };
     let built = match handoff::assemble(block, &findings) {

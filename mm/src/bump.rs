@@ -251,6 +251,7 @@ mod tests {
         Handoff {
             initrd: None,
             measurement: bhaskix_boot::Measurement::NotAttempted,
+            signature: bhaskix_boot::Signature::NotChecked,
             version: HANDOFF_VERSION,
             memory_map: &MAP,
             hhdm_base: VirtAddr(0xffff_8000_0000_0000),

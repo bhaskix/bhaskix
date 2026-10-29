@@ -20,6 +20,16 @@ dependencies = [
 [[package]]
 name = "bhaskix-boot"
 version = "0.0.0"
+dependencies = [
+ "bhaskix-bootsig",
+]
+
+[[package]]
+name = "bhaskix-bootsig"
+version = "0.0.0"
+dependencies = [
+ "bhaskix-sha256",
+]
 
 [[package]]
 name = "bhaskix-device"
@@ -113,6 +123,10 @@ dependencies = [
  "bhaskix-service",
  "bhaskix-ustar",
 ]
+
+[[package]]
+name = "bhaskix-sha256"
+version = "0.0.0"
 
 [[package]]
 name = "bhaskix-tcglog"

@@ -37,6 +37,10 @@ pub mod measured {
     pub const INITRD: (u32, u32) = (9, 0x4248_4B02);
     /// The command line, after `cmdline=` is stripped -- PCR 8.
     pub const CMDLINE: (u32, u32) = (8, 0x4248_4B03);
+    /// The loader's verdict on `boot.sig` -- PCR 8 (RFC 0091, question 8): the
+    /// verdict, the key id and the `SecureBoot` byte it read, extended before
+    /// the loader acts on them, so a refused boot is recorded too.
+    pub const VERDICT: (u32, u32) = (8, 0x4248_4B04);
 }
 
 /// Writes an `EFI_TCG2_EVENT` whose event data is a `TCG_PCClientTaggedEvent`,

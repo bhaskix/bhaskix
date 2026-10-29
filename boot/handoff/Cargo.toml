@@ -12,6 +12,11 @@ license.workspace = true
 name = "bhaskix_boot"
 path = "src/lib.rs"
 
+# RFC 0091: the boot-set verdict's types and words, so the kernel's report
+# and `bootsign show` say a refusal the same way. Types only; no signing.
+[dependencies]
+bhaskix-bootsig = { path = "../../bootsig" }
+
 [lints]
 workspace = true
 

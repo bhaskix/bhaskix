@@ -695,6 +695,9 @@ pub unsafe fn collect_handoff() -> Handoff {
         // Limine measures nothing, and says so: RFC 0089 measures on the
         // native loader's path only.
         measurement: bhaskix_boot::Measurement::NotAttempted,
+        // Nor does it check a boot.sig: RFC 0091's link 2 is the native
+        // loader's, and the report says this path verifies nothing.
+        signature: bhaskix_boot::Signature::NotChecked,
     }
 }
 

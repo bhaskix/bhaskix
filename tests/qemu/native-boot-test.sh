@@ -305,13 +305,13 @@ done
 # anyone looking later, like a measured boot that found nothing wrong.
 if [[ "${BHASKIX_TPM:-0}" == 1 ]]; then
     measured=0
-    for object in "kernel into PCR 9" "initrd into PCR 9" "cmdline into PCR 8"; do
+    for object in "kernel into PCR 9" "initrd into PCR 9" "cmdline into PCR 8" "verdict into PCR 8"; do
         grep -qF "bhaskixboot: measured $object" "$LOG" 2>/dev/null && measured=$((measured + 1))
     done
-    if [[ $measured -eq 3 ]] && ! grep -qF "REFUSED, status" "$LOG"; then
-        pass "the loader measured the kernel, the initrd and the command line through the firmware's TPM"
+    if [[ $measured -eq 4 ]] && ! grep -qF "REFUSED, status" "$LOG"; then
+        pass "the loader measured the kernel, the initrd, the command line and its boot.sig verdict through the firmware's TPM"
     else
-        fail "the loader measured $measured of 3 objects: $(grep -aE 'bhaskixboot: (measure|no TCG2)' "$LOG" | tr -d '\r' | tr '\n' ' ')"
+        fail "the loader measured $measured of 4 objects: $(grep -aE 'bhaskixboot: (measure|no TCG2)' "$LOG" | tr -d '\r' | tr '\n' ' ')"
         status=1
     fi
 else
@@ -452,8 +452,8 @@ else
     status=1
 fi
 INITRD_BYTES2=$(stat -c %s "$ESP/bhaskix/initrd.tar")
-if grep -qE "bhaskixboot: handoff assembled: version 3, [1-9][0-9]* regions, initrd $INITRD_BYTES2 bytes, stack top 0x[0-9a-f]{16}" "$LOG" 2>/dev/null; then
-    pass "the handoff is assembled: version 3, the initrd whole"
+if grep -qE "bhaskixboot: handoff assembled: version 4, [1-9][0-9]* regions, initrd $INITRD_BYTES2 bytes, stack top 0x[0-9a-f]{16}" "$LOG" 2>/dev/null; then
+    pass "the handoff is assembled: version 4, the initrd whole"
 else
     fail "handoff line missing or wrong"
     status=1
@@ -480,7 +480,7 @@ else
     fail "the kernel's loader line does not name bhaskixboot"
     status=1
 fi
-if grep -qF "handoff version 3" "$LOG" 2>/dev/null; then
+if grep -qF "handoff version 4" "$LOG" 2>/dev/null; then
     pass "the kernel validated and accepted the handoff the loader built"
 else
     fail "the kernel never reported the handoff"
@@ -781,7 +781,10 @@ PY
         # way; the fix counts what the table holds at the loader's own call
         # and appends only what follows. The same boot has no command line,
         # which since the same day is not measured at all -- so the verdict
-        # must agree on PCRs 5 and 9 and name no PCR 8. The CRB lane only: the
+        # ~~must agree on PCRs 5 and 9 and name no PCR 8~~ must agree on PCRs 5,
+        # 8 and 9: since RFC 0091 step 3 PCR 8 always holds the loader's
+        # boot.sig verdict, measured whatever the command line, so the empty
+        # command line shows as no cmdline event rather than as no PCR 8. The CRB lane only: the
         # firmware's log is the same whichever interface the TPM speaks.
         if [[ "$TPM_INTERFACE" == crb ]]; then
             echo "the early-log arm: GetEventLog asked early, no command line, up to ${TIMEOUT}s..."
@@ -796,7 +799,9 @@ PY
                 && [[ "${preboot:-0}" -ge 2 ]] \
                 && grep -qF "bhaskixboot: the command line is empty; not measured" "$EARLY_LOG" \
                 && grep -qE "measured boot   kernel [0-9a-f]{8} initrd [0-9a-f]{8} cmdline empty, not measured" "$EARLY_LOG" \
-                && agrees_on "$early" 5 9 && ! agrees_on "$early" 8; then
+                && grep -qF "bhaskixboot: measured verdict into PCR 8" "$EARLY_LOG" \
+                && ! grep -qF "bhaskixboot: measured cmdline into PCR 8" "$EARLY_LOG" \
+                && agrees_on "$early" 5 8 9; then
                 pass "an early GetEventLog and an empty command line: $preboot final event(s) not appended twice, and $early"
             else
                 fail "the early-log arm: '${early:-no verdict}', $(grep -aE 'bhaskixboot: (final events|GetEventLog asked|the command line)|measured boot' "$EARLY_LOG" | tr -d '\r' | tr '\n' ' ')"

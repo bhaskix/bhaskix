@@ -13,6 +13,24 @@
 /// `EFI_SUCCESS`.
 pub const SUCCESS: usize = 0;
 
+/// `EFI_SECURITY_VIOLATION`: `MAX_BIT | 26` (edk2 `MdePkg/Include/Base.h`,
+/// read 2026-10-29). What `efi_main` returns when it refuses a boot set with
+/// Secure Boot on, so the boot manager tries the next option -- what the
+/// firmware does itself with an image it refuses (UEFI §32.6.1).
+pub const SECURITY_VIOLATION: usize = (1 << 63) | 26;
+
+/// `EFI_NOT_FOUND`: `MAX_BIT | 14`, from the same header.
+pub const NOT_FOUND: usize = (1 << 63) | 14;
+
+/// `EFI_GLOBAL_VARIABLE` (edk2 `MdePkg/Include/Guid/GlobalVariable.h`), the
+/// vendor of `SecureBoot`.
+const GLOBAL_VARIABLE: Guid = Guid(
+    0x8BE4_DF61,
+    0x93CA,
+    0x11d2,
+    [0xAA, 0x0D, 0x00, 0xE0, 0x98, 0x03, 0x2B, 0x8C],
+);
+
 /// The UEFI system table's signature, `IBI SYST` little-endian.
 const SYSTEM_TABLE_SIGNATURE: u64 = 0x5453_5953_2049_4249;
 
@@ -169,7 +187,11 @@ struct BootServices {
     ) -> usize,
     through_unload_image: [usize; 9],
     exit_boot_services: unsafe extern "efiapi" fn(image_handle: usize, map_key: usize) -> usize,
-    through_locate_handle_buffer: [usize; 10],
+    get_next_monotonic_count: usize,
+    /// `Stall`, slot 28 (edk2 `UefiSpec.h`): RFC 0091's refusal is held on the
+    /// screen long enough to read before the boot manager moves on.
+    stall: unsafe extern "efiapi" fn(microseconds: usize) -> usize,
+    through_locate_handle_buffer: [usize; 8],
     locate_protocol: unsafe extern "efiapi" fn(
         protocol: *const Guid,
         registration: *mut core::ffi::c_void,
@@ -233,7 +255,7 @@ pub struct SystemTable {
     con_out: *mut SimpleTextOutput,
     standard_error_handle: usize,
     std_err: usize,
-    runtime_services: usize,
+    runtime_services: *mut RuntimeServices,
     boot_services: *mut BootServices,
     number_of_table_entries: usize,
     configuration_table: *const ConfigurationEntry,
@@ -244,6 +266,23 @@ pub struct SystemTable {
 struct ConfigurationEntry {
     vendor_guid: Guid,
     vendor_table: usize,
+}
+
+/// `EFI_RUNTIME_SERVICES`, down to `GetVariable` -- the seventh slot after
+/// the header (edk2 `MdePkg/Include/Uefi/UefiSpec.h`, read 2026-10-29: GetTime,
+/// SetTime, GetWakeupTime, SetWakeupTime, SetVirtualAddressMap and
+/// ConvertPointer come first). RFC 0091 reads one variable with it.
+#[repr(C)]
+pub struct RuntimeServices {
+    hdr: TableHeader,
+    before_get_variable: [usize; 6],
+    get_variable: unsafe extern "efiapi" fn(
+        name: *const u16,
+        vendor: *const Guid,
+        attributes: *mut u32,
+        data_size: *mut usize,
+        data: *mut u8,
+    ) -> usize,
 }
 
 /// The loaded-image protocol, down to the device handle — which volume this
@@ -314,6 +353,78 @@ pub fn con_out(table: *mut SystemTable) -> Option<*mut SimpleTextOutput> {
     } else {
         Some(con_out)
     }
+}
+
+/// What the firmware's `SecureBoot` variable said (UEFI §3.3) -- RFC 0091.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum SecureBoot {
+    /// 1: the firmware verified this loader's signature before starting it.
+    On,
+    /// 0, which UEFI requires in setup and audit mode.
+    Off,
+    /// No such variable: firmware older than Secure Boot, or a build without
+    /// it. Read as off, as RFC 0091 says.
+    Absent,
+    /// The firmware would not say; the status. Read as off.
+    Unreadable(usize),
+}
+
+/// Reads `SecureBoot` through `GetVariable`, once, before the exit.
+#[must_use]
+pub fn secure_boot(table: *mut SystemTable) -> SecureBoot {
+    // SAFETY: `table` passed `validate`; the runtime services pointer is
+    // null-checked before its only use.
+    let services = unsafe { (*table).runtime_services };
+    if services.is_null() {
+        return SecureBoot::Unreadable(0);
+    }
+    let name: [u16; 11] = [
+        b'S' as u16,
+        b'e' as u16,
+        b'c' as u16,
+        b'u' as u16,
+        b'r' as u16,
+        b'e' as u16,
+        b'B' as u16,
+        b'o' as u16,
+        b'o' as u16,
+        b't' as u16,
+        0,
+    ];
+    let mut value = [0u8; 1];
+    let mut size = value.len();
+    // SAFETY: `services` is the firmware's runtime services table, non-null;
+    // the name is NUL-terminated UCS-2, the GUID and both out-pointers live
+    // for the call, and `size` says how much `value` holds. Attributes are
+    // optional and not asked for.
+    let status = unsafe {
+        ((*services).get_variable)(
+            name.as_ptr(),
+            &GLOBAL_VARIABLE,
+            core::ptr::null_mut(),
+            &mut size,
+            value.as_mut_ptr(),
+        )
+    };
+    match (status, size, value[0]) {
+        (SUCCESS, 1, 1) => SecureBoot::On,
+        (SUCCESS, 1, 0) => SecureBoot::Off,
+        (NOT_FOUND, _, _) => SecureBoot::Absent,
+        (status, _, _) => SecureBoot::Unreadable(status),
+    }
+}
+
+/// Waits `microseconds` in the firmware's `Stall`, before the exit.
+pub fn stall(table: *mut SystemTable, microseconds: usize) {
+    // SAFETY: `table` passed `validate`, and boot services are live until the
+    // exit, which this is never called after.
+    let services = unsafe { (*table).boot_services };
+    if services.is_null() {
+        return;
+    }
+    // SAFETY: as above; `Stall` takes a count and returns a status, ignored
+    // because a short wait is not worth refusing over.
+    unsafe { ((*services).stall)(microseconds) };
 }
 
 /// Prints a NUL-terminated UCS-2 buffer on the firmware console.

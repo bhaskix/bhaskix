@@ -35,6 +35,11 @@ bhaskix-rand = { path = "../../rand" }
 # RFC 0089: the events the loader asks the firmware to log, built where a host
 # test holds their bytes.
 bhaskix-tcglog = { path = "../../tcglog" }
+# RFC 0091 link 2: the boot set's statement and its SLH-DSA-SHA2-128s check,
+# without the `sign` feature -- the loader verifies and never signs -- and the
+# SHA-256 it hashes the three files with.
+bhaskix-bootsig = { path = "../../bootsig" }
+bhaskix-sha256 = { path = "../../sha256" }
 
 [profile.release]
 panic = "abort"
@@ -44,7 +49,9 @@ opt-level = "s"
 # 5 — a UEFI loader runs before anything abstracts the machine: two port
 # accesses for the serial line, one `hlt` to stop, one long jump into the
 # kernel, and one `CPUID` to learn what it is running on.
-asm_budget = 5
+# 6 on 2026-10-29: one `rdtsc`, RFC 0091 step 3 -- the cost line that times
+# hashing the boot set and checking `boot.sig`, calibrated against `Stall`.
+asm_budget = 6
 # 11, measured, no headroom: the serial port I/O, the signature-checked
 # firmware table reads and the console call through them, and the panic
 # halt. Grows step by step with the loader, and every growth is a line in
@@ -99,4 +106,9 @@ asm_budget = 5
 # each entry's prefix and then the entry its prefix declares, read after the
 # exit from ACPI NVS the firmware leaves behind. Sized as the log's last entry
 # is, by `bhaskix-tcglog`'s fuzzed arithmetic at budget zero.
-unsafe_budget = 148
+# 161 on 2026-10-29: thirteen lines for RFC 0091 step 3. The runtime services
+# table read and the one `GetVariable(SecureBoot)` call, whose five arguments
+# rustfmt lays one to a line (ten); the boot services read and the `Stall` that
+# holds a refusal on screen (two); and `rdtsc` for the cost line (one). The
+# check itself is `bhaskix-bootsig`'s, at budget zero.
+unsafe_budget = 161

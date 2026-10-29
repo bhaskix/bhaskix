@@ -40,7 +40,9 @@ use core::fmt;
 ///
 /// The shim writes it into [`Handoff::version`] and the kernel checks it. Bump
 /// this on any change to the layout or meaning of the structures below.
-pub const HANDOFF_VERSION: u32 = 3;
+///
+/// 4: [`Handoff::signature`], the boot set's verdict (RFC 0091).
+pub const HANDOFF_VERSION: u32 = 4;
 
 /// What the native loader leaves in the second argument register at entry
 /// — `b"BHXBOOT1"`, little-endian.
@@ -367,6 +369,58 @@ pub enum Measurement {
     },
 }
 
+/// A key's id, and the published test key's: part of the contract, so the
+/// kernel can name the test key whenever it is the one that verified.
+pub use bhaskix_bootsig::statement::{KeyId, TEST_KEY_ID};
+
+/// Why a boot set was not verified -- RFC 0091. The loader's own reasons,
+/// and the check's, whose words are `bhaskix-bootsig`'s so the kernel's report
+/// and `bootsign show` cannot say it differently.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Unverified {
+    /// There was no `bhaskix\boot.sig` on the boot volume.
+    Missing,
+    /// `boot.sig` or `boot.conf` could not be read whole: an error, or a file
+    /// larger than the loader reads.
+    Unreadable,
+    /// The check refused it.
+    Refused(bhaskix_bootsig::statement::Refusal),
+}
+
+impl Unverified {
+    /// The reason, in words a boot report can print.
+    #[must_use]
+    pub const fn describe(self) -> &'static str {
+        match self {
+            Self::Missing => "there is no boot.sig",
+            Self::Unreadable => "boot.sig or boot.conf could not be read whole",
+            Self::Refused(refusal) => refusal.describe(),
+        }
+    }
+}
+
+/// What the loader decided about the boot set's signature -- RFC 0091.
+///
+/// A boot set that failed with Secure Boot on never reaches the kernel: the
+/// loader refuses it and returns to the boot manager. So a kernel sees either
+/// a verified set, or one the loader booted anyway because nothing was
+/// enforcing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Signature {
+    /// The loader does not check -- the Limine path.
+    NotChecked,
+    /// `boot.sig` verified under the key with this id.
+    Verified {
+        /// The key that verified it. The published test key's is [`TEST_KEY_ID`].
+        key_id: KeyId,
+        /// Whether the firmware said Secure Boot was on -- whether the check
+        /// was enforced.
+        secure_boot: bool,
+    },
+    /// The boot set was not verified, and booted because Secure Boot was off.
+    NotVerified(Unverified),
+}
+
 /// Everything the kernel is given at entry.
 ///
 /// Constructed by the boot shim and consumed exactly once, by
@@ -414,6 +468,8 @@ pub struct Handoff {
     pub initrd: Option<&'static [u8]>,
     /// What the loader measured into the TPM -- RFC 0089. Version 3.
     pub measurement: Measurement,
+    /// What the loader decided about `boot.sig` -- RFC 0091. Version 4.
+    pub signature: Signature,
 }
 
 impl Handoff {
@@ -595,7 +651,29 @@ mod tests {
             regions_truncated: false,
             initrd: None,
             measurement: Measurement::NotAttempted,
+            signature: Signature::NotChecked,
         }
+    }
+
+    #[test]
+    fn version_4_carries_the_signature_verdict() {
+        assert_eq!(HANDOFF_VERSION, 4);
+        let mut h = handoff(&GOOD_MAP);
+        assert_eq!(h.signature, Signature::NotChecked);
+        h.signature = Signature::Verified {
+            key_id: [1; 8],
+            secure_boot: false,
+        };
+        assert!(h.validate().is_ok());
+    }
+
+    #[test]
+    fn every_unverified_reason_has_words_and_the_checks_are_bootsigs() {
+        use bhaskix_bootsig::statement::Refusal;
+        assert_eq!(Unverified::Missing.describe(), "there is no boot.sig");
+        assert!(!Unverified::Unreadable.describe().is_empty());
+        let refusal = Refusal::KernelDiffers;
+        assert_eq!(Unverified::Refused(refusal).describe(), refusal.describe());
     }
 
     #[test]

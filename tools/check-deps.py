@@ -145,7 +145,7 @@ LAYERS = {
     "bhaskix-service-console": 0,
     "bhaskix-service-vfs": 0,
 
-    "bhaskix-boot": 0,        # pure types, depends on nothing
+    "bhaskix-boot": 0,        # pure types; the boot-set verdict's from bhaskix-bootsig (RFC 0091)
     "bhaskix-arch-x86-64": 0,  # arch -> nothing
     "bhaskix-mm": 1,
     "bhaskix-sched": 2,

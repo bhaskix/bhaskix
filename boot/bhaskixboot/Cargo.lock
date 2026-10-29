@@ -5,6 +5,16 @@ version = 4
 [[package]]
 name = "bhaskix-boot"
 version = "0.0.0"
+dependencies = [
+ "bhaskix-bootsig",
+]
+
+[[package]]
+name = "bhaskix-bootsig"
+version = "0.0.0"
+dependencies = [
+ "bhaskix-sha256",
+]
 
 [[package]]
 name = "bhaskix-elf"
@@ -12,6 +22,10 @@ version = "0.0.0"
 
 [[package]]
 name = "bhaskix-rand"
+version = "0.0.0"
+
+[[package]]
+name = "bhaskix-sha256"
 version = "0.0.0"
 
 [[package]]
@@ -23,7 +37,9 @@ name = "bhaskixboot"
 version = "0.0.0"
 dependencies = [
  "bhaskix-boot",
+ "bhaskix-bootsig",
  "bhaskix-elf",
  "bhaskix-rand",
+ "bhaskix-sha256",
  "bhaskix-tcglog",
 ]

@@ -5189,7 +5189,7 @@ else
 fi
 
 # The handoff must have been validated, not skipped.
-if grep -qF "handoff version 3" "$LOG"; then
+if grep -qF "handoff version 4" "$LOG"; then
     pass "handoff accepted"
 else
     fail "handoff was not reported -- validation may have been skipped"

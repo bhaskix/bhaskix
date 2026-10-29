@@ -102,6 +102,7 @@ static HANDOFF: BootCell<Handoff> = BootCell::new(Handoff {
     regions_truncated: false,
     initrd: None,
     measurement: bhaskix_boot::Measurement::NotAttempted,
+    signature: bhaskix_boot::Signature::NotChecked,
 });
 
 /// Version string reported at boot.
@@ -33911,6 +33912,60 @@ fn report_measurement(measurement: bhaskix_boot::Measurement, cmdline_empty: boo
     }
 }
 
+/// The `boot signature` line -- RFC 0091. Always printed, in one of four
+/// sentences that cannot be read as one another. Anything short of a set
+/// verified with Secure Boot on is red, because it is what the line exists to
+/// make unmistakable: a boot nobody enforced must never look like one that was.
+/// The published test key is named whenever it is the key that verified.
+fn report_signature(signature: bhaskix_boot::Signature) {
+    use bhaskix_boot::{Signature, TEST_KEY_ID};
+    let id = |key_id: [u8; 8]| {
+        let mut text = [0u8; 16];
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        for (i, byte) in key_id.iter().enumerate() {
+            text[2 * i] = HEX[usize::from(byte >> 4)];
+            text[2 * i + 1] = HEX[usize::from(byte & 15)];
+        }
+        text
+    };
+    match signature {
+        Signature::NotChecked => {
+            println!(
+                "\x1b[91m    boot signature  NOT CHECKED: this loader does not check boot.sig\x1b[0m"
+            );
+        }
+        Signature::Verified {
+            key_id,
+            secure_boot,
+        } => {
+            let hex = id(key_id);
+            let hex = core::str::from_utf8(&hex).unwrap_or("?");
+            let test = if key_id == TEST_KEY_ID {
+                " TEST KEY"
+            } else {
+                ""
+            };
+            if secure_boot && test.is_empty() {
+                println!("\x1b[92m    boot signature  verified: key {hex}, Secure Boot on\x1b[0m");
+            } else if secure_boot {
+                println!(
+                    "\x1b[91m    boot signature  verified: key {hex}{test}, Secure Boot on -- the test key is published, so anyone could have signed this\x1b[0m"
+                );
+            } else {
+                println!(
+                    "\x1b[91m    boot signature  verified: key {hex}{test}, but NOT ENFORCED: Secure Boot is off\x1b[0m"
+                );
+            }
+        }
+        Signature::NotVerified(reason) => {
+            println!(
+                "\x1b[91m    boot signature  NOT VERIFIED ({}), NOT ENFORCED: Secure Boot is off\x1b[0m",
+                reason.describe()
+            );
+        }
+    }
+}
+
 fn report_boot_state(
     handoff: &Handoff,
     serial: bhaskix_arch::Presence,
@@ -33921,6 +33976,7 @@ fn report_boot_state(
     println!("    loader          {}", handoff.loader);
     println!("    handoff version {}", handoff.version);
     report_measurement(handoff.measurement, handoff.cmdline.is_empty());
+    report_signature(handoff.signature);
     println!(
         "    cmdline         {}",
         if handoff.cmdline.is_empty() {

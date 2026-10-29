@@ -20,6 +20,9 @@ dependencies = [
 [[package]]
 name = "bhaskix-boot"
 version = "0.0.0"
+dependencies = [
+ "bhaskix-bootsig",
+]
 
 [[package]]
 name = "bhaskix-boot-shim"

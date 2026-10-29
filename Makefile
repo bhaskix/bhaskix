@@ -640,7 +640,9 @@ $(USER_TRACED): $(TRACED_DIR)/src/main.rs $(TRACED_DIR)/link.ld $(TRACED_DIR)/Ca
 # affected; a local `make test` could be.
 $(BOOTEFI): $(wildcard $(BOOTEFI_DIR)/src/*.rs) $(BOOTEFI_DIR)/Cargo.toml \
             $(wildcard boot/handoff/src/*.rs) $(wildcard elf/src/*.rs) \
-            $(wildcard rand/src/*.rs) $(wildcard tcglog/src/*.rs)
+            $(wildcard rand/src/*.rs) $(wildcard tcglog/src/*.rs) \
+            $(wildcard bootsig/src/*.rs) $(wildcard bootsig/src/*/*.rs) $(wildcard sha256/src/*.rs) \
+            $(BOOTEFI_DIR)/build.rs tests/keys/bootsig-TEST-KEY.public
 	cd $(BOOTEFI_DIR) && $(CARGO) build --release --target x86_64-unknown-uefi
 	@echo "built $@"
 
