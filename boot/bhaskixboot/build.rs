@@ -8,6 +8,12 @@
 //! the boot report names in red. A loader that trusts it accepts anything
 //! anyone signs, so the release recipe refuses to build one (RFC 0091 step 5).
 //!
+//! `BHASKIX_BOOT_KEYS=none` trusts no key at all: every `boot.sig` is then
+//! refused as naming a key this loader does not hold. That is the preview
+//! release's loader, the project lead's decision of 2026-10-29: signed boot
+//! arrives with release keys, and until then the loader says it verified
+//! nothing rather than trusting a key anyone holds.
+//!
 //! The keys are in the loader's image, so link 1 -- the firmware's check of
 //! that image -- covers them.
 
@@ -23,6 +29,7 @@ fn main() {
     println!("cargo::rerun-if-env-changed=BHASKIX_BOOT_KEYS");
     let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("cargo sets it"));
     let paths: Vec<PathBuf> = match std::env::var("BHASKIX_BOOT_KEYS") {
+        Ok(list) if list == "none" => Vec::new(),
         Ok(list) if !list.is_empty() => list.split(':').map(PathBuf::from).collect(),
         _ => vec![manifest.join("../../tests/keys/bootsig-TEST-KEY.public")],
     };

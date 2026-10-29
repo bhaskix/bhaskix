@@ -67,6 +67,22 @@ httpd=$(member_size httpd)
 [[ -z $busybox || $busybox == 0 ]] || fail "the ISO carries a $busybox-byte BusyBox; the release leaves it out"
 [[ -n $httpd && $httpd -gt 0 ]] || fail "the ISO carries no Go server; the release puts it in"
 
+# RFC 0091 step 5: **the loader must not trust the published test key.** Whatever
+# that key signed, anyone could have signed, so a release loader holding it
+# would boot what anyone made. Read from the file that ships -- the key's 32
+# public bytes anywhere in the image -- and not from how it was built.
+test_key=tests/keys/bootsig-TEST-KEY.public
+[[ -s $test_key ]] || fail "no test key at $test_key to check the loader against"
+if python3 -I - "$efi" "$test_key" <<'PY'
+import sys
+image = open(sys.argv[1], "rb").read()
+key = open(sys.argv[2], "rb").read()
+sys.exit(0 if len(key) == 32 and key in image else 1)
+PY
+then
+    fail "the loader trusts the published test key; build it with RELEASE_BOOT_KEYS naming release keys, or none"
+fi
+
 rm -rf "$out"
 mkdir -p "$out"
 cp "$iso" "$out/bhaskix.iso"
@@ -75,6 +91,6 @@ cp "$go_license" "$out/LICENSE-go"
 (cd "$out" && sha256sum bhaskix.iso bhaskixboot.efi > SHA256SUMS && sha256sum -c --quiet SHA256SUMS) ||
     fail "the sums did not check"
 
-echo "release-dist: ${tag:-untagged} in $out/ -- BusyBox ${busybox:-absent}, Go server $httpd bytes"
+echo "release-dist: ${tag:-untagged} in $out/ -- BusyBox ${busybox:-absent}, Go server $httpd bytes, the loader trusting no test key"
 (cd "$out" && ls -l bhaskix.iso bhaskixboot.efi LICENSE-go SHA256SUMS | awk '{ printf "  %10s  %s\n", $5, $9 }')
 sed 's/^/  /' "$out/SHA256SUMS"

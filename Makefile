@@ -692,12 +692,23 @@ $(LIMINE_DIR):
 # nothing and the old binary ships. The script reads the ISO back and refuses
 # one that carries it.
 RELEASE_ISO  := build/release.iso
+# **The release's loader is its own build** (RFC 0091 step 5), never the
+# lanes' `$(BOOTEFI)`: those trust the published test key, and building the
+# release's keys into the same file would leave the lanes booting the wrong one.
+# `none` -- no key -- is the preview's, the project lead's decision of
+# 2026-10-29; a release with keys names their public files here (step 6).
+# `tools/release-dist.sh` refuses any loader holding the test key.
+RELEASE_BOOT_KEYS  ?= none
+RELEASE_LOADER_DIR := build/release-loader
+RELEASE_LOADER     := $(RELEASE_LOADER_DIR)/x86_64-unknown-uefi/release/bhaskixboot.efi
 release-dist:
 	$(MAKE) iso HTTPD_IN_IMAGE=1 BUSYBOX_SRC= BUSYBOX=build/no-busybox CMDLINE= \
 	    INITRD=build/initrd-release.tar INITRD_ROOT=build/initrd_root_release \
 	    ISO=$(RELEASE_ISO) ISO_ROOT=build/iso_root_release
-	$(MAKE) $(BOOTEFI)
-	tools/release-dist.sh $(RELEASE_ISO) $(BOOTEFI) build/toolchain/go$(GO_VERSION)/LICENSE dist $(TAG)
+	cd $(BOOTEFI_DIR) && BHASKIX_BOOT_KEYS=$(RELEASE_BOOT_KEYS) \
+	    CARGO_TARGET_DIR=$(CURDIR)/$(RELEASE_LOADER_DIR) \
+	    $(CARGO) build --release --target x86_64-unknown-uefi
+	tools/release-dist.sh $(RELEASE_ISO) $(RELEASE_LOADER) build/toolchain/go$(GO_VERSION)/LICENSE dist $(TAG)
 
 # --- run -----------------------------------------------------------------
 
