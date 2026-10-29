@@ -943,7 +943,7 @@ test-boot-uefi-qemu64: $(ISO)
 # RFC 0028's graduated lane: the native loader under OVMF. Its gate list is
 # the honest statement of how far sovereignty has come, and it grows a check
 # per implemented step until it runs what the Limine lanes run.
-test-boot-native: $(BOOTEFI) $(ISO)
+test-boot-native: $(BOOTEFI) $(ISO) bootsign
 	tests/qemu/native-boot-test.sh
 
 # RFC 0028 step 7's closing claim, executable: the native loader answers the
@@ -951,7 +951,7 @@ test-boot-native: $(BOOTEFI) $(ISO)
 # media changed. The loader-specific lane above keeps what this one cannot
 # express (payload checksums, the slide policy, the negative arm); this one
 # holds bhaskixboot to everything the incumbent is held to.
-test-boot-native-full: $(BOOTEFI) $(ISO)
+test-boot-native-full: $(BOOTEFI) $(ISO) bootsign
 	tests/qemu/boot-test.sh native
 
 # RFC 0089: the native lane with a TPM 2.0 attached, through the emulator
@@ -959,13 +959,13 @@ test-boot-native-full: $(BOOTEFI) $(ISO)
 # something to assert -- the loader's measurements -- and it says `skip` on a
 # machine with no usable docker, as the native lanes do without OVMF. CI runs
 # it from step 7.
-test-boot-native-tpm: $(BOOTEFI) $(ISO)
+test-boot-native-tpm: $(BOOTEFI) $(ISO) bootsign
 	BHASKIX_TPM=1 tests/qemu/native-boot-test.sh
 
 # The same lane with the TPM on the FIFO interface, TIS -- RFC 0089 step 5d,
 # because a discrete TPM, such as a server's, usually speaks it. Every TPM
 # gate the CRB lane holds, plus the interface `bin/tpmd` found.
-test-boot-native-tpm-tis: $(BOOTEFI) $(ISO)
+test-boot-native-tpm-tis: $(BOOTEFI) $(ISO) bootsign
 	BHASKIX_TPM=1 BHASKIX_TPM_INTERFACE=tis tests/qemu/native-boot-test.sh
 
 

@@ -433,6 +433,13 @@ if [[ "$MODE" == "native" ]]; then
     cp "$KERNEL_ELF" "$ESP/bhaskix/kernel"
     cp "$DISK" "$ESP/bhaskix/initrd.tar"
     printf 'cmdline=\n' > "$ESP/bhaskix/boot.conf"
+    # RFC 0091 step 4: signed with the published test key, as the loader-specific
+    # lane's boot set is, so this lane's verdict is a verified one.
+    if ! "$REPO_ROOT/target/x86_64-unknown-linux-gnu/release/bootsign" sign \
+            --key "$REPO_ROOT/tests/keys/bootsig-TEST-KEY.secret" "$ESP" >/dev/null; then
+        fail "bootsign could not sign the staged boot set (run 'make bootsign')"
+        exit 1
+    fi
     # **Explicitly on a port of its own, and this is not tidiness.**
     #
     # A bare `-drive` takes `if=ide` and QEMU auto-assigns it the first free
@@ -5209,6 +5216,23 @@ if grep -qF "$expected" "$LOG"; then
     pass "the kernel said how this boot was measured: ${expected#measured boot   }"
 else
     fail "the kernel did not say '${expected}': $(grep -aE 'measured boot' "$LOG" | tr -d '\r' | head -1)"
+    status=1
+fi
+
+# RFC 0091 step 4: **the kernel says whether this boot set's signature was
+# checked, and whether anything enforced it**, in a sentence per path that
+# cannot be read as another. The native loader verifies the test-key-signed set
+# with Secure Boot off; the BIOS-path loader checks nothing, and the kernel says
+# so in red -- in words that name no loader, as the `measured boot` line does.
+if [[ "$MODE" == "native" ]]; then
+    expected="boot signature  verified: key a6c913d8a0e2476e TEST KEY, but NOT ENFORCED: Secure Boot is off"
+else
+    expected="boot signature  NOT CHECKED: this loader does not check boot.sig"
+fi
+if grep -qF "$expected" "$LOG"; then
+    pass "the kernel said how this boot set's signature fared: ${expected#boot signature  }"
+else
+    fail "the kernel did not say '${expected}': $(grep -aE 'boot signature' "$LOG" | tr -d '\r' | head -1)"
     status=1
 fi
 

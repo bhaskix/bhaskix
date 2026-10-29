@@ -145,6 +145,18 @@ cp "$INITRD" "$ESP/bhaskix/initrd.tar"
 # `iommu=off` rests on.
 printf 'cmdline=kaslr=show\n' > "$ESP/bhaskix/boot.conf"
 
+# RFC 0091 step 4: **the boot set is signed, with the published test key.** Every
+# lane here runs with Secure Boot off, so the loader boots whatever the verdict
+# and says nothing enforced it; the gates below hold the verdict to the files.
+# `make bootsign` is a prerequisite of this lane.
+BOOTSIGN="$REPO_ROOT/target/x86_64-unknown-linux-gnu/release/bootsign"
+TEST_KEY="$REPO_ROOT/tests/keys/bootsig-TEST-KEY"
+TEST_KEY_ID=a6c913d8a0e2476e
+if ! "$BOOTSIGN" sign --key "$TEST_KEY.secret" "$ESP" >/dev/null; then
+    fail "bootsign could not sign the staged boot set (run 'make bootsign')"
+    exit 1
+fi
+
 # The build's own checksums, computed independently of the loader by the
 # same stated arithmetic (FNV-1a 64), so the gate is two implementations
 # agreeing about the same bytes -- not the loader agreeing with itself.
@@ -298,6 +310,34 @@ do
         status=1
     fi
 done
+
+# RFC 0091 step 4: **the loader checked boot.sig, said which key, and said it
+# enforced nothing.** Secure Boot is off on this lane: CI's firmware has no
+# `SecureBoot` variable at all and OVMF here has it at 0, and both read as off.
+if grep -qE "bhaskixboot: SecureBoot (reads 0|is absent; read as off)" "$LOG" 2>/dev/null; then
+    pass "the loader read SecureBoot as off: $(grep -aoE 'SecureBoot (reads 0|is absent)' "$LOG" | head -1)"
+else
+    fail "the loader did not say what SecureBoot read: $(grep -aE 'bhaskixboot: SecureBoot' "$LOG" | tr -d '\r' | head -1)"
+    status=1
+fi
+if grep -qF "bhaskixboot: boot signature verified: key $TEST_KEY_ID TEST KEY, NOT ENFORCED: Secure Boot is off" "$LOG" 2>/dev/null; then
+    pass "the loader verified the signed boot set: key $TEST_KEY_ID, named as the test key, not enforced"
+else
+    fail "the loader's verdict on the signed boot set: $(grep -aE 'bhaskixboot: boot signature' "$LOG" | tr -d '\r' | head -1)"
+    status=1
+fi
+if grep -qF "boot signature  verified: key $TEST_KEY_ID TEST KEY, but NOT ENFORCED: Secure Boot is off" "$LOG" 2>/dev/null; then
+    pass "the kernel reported the verdict the loader handed over, in red: test key, not enforced"
+else
+    fail "the kernel's boot signature line: $(grep -aE '    boot signature' "$LOG" | tr -d '\r' | head -1)"
+    status=1
+fi
+if grep -qE "bhaskixboot: boot set hashed and checked: [0-9]+ bytes in [0-9]+ ticks" "$LOG" 2>/dev/null; then
+    pass "the loader timed its own check: $(grep -aoE 'boot set hashed and checked: [^\r]*' "$LOG" | head -1)"
+else
+    fail "the loader did not time its check of the boot set"
+    status=1
+fi
 
 # RFC 0089 step 2: **measured, or saying it was not.** With a TPM the loader
 # must report all three objects measured and none refused; without one it must
@@ -688,6 +728,72 @@ else
     echo "--- negative-arm serial log ---"
     cat "$NEGATIVE_LOG" 2>/dev/null | head -20
 fi
+# RFC 0091 step 4: **and before the parser refused it, the check had.** The
+# corrupted kernel is not the one boot.sig names; with Secure Boot off the
+# loader says so and goes on, and the parser is what stops it here.
+if grep -qF "bhaskixboot: boot signature NOT VERIFIED (the kernel is not the one boot.sig names), NOT ENFORCED: Secure Boot is off -- booting" "$NEGATIVE_LOG" 2>/dev/null; then
+    pass "the changed kernel was named as not the one boot.sig names, and not enforced"
+else
+    fail "the changed kernel's verdict: $(grep -aE 'bhaskixboot: boot signature' "$NEGATIVE_LOG" | tr -d '\r' | head -1)"
+    status=1
+fi
+
+# RFC 0091 step 4: **every other way a boot set can fail its check, each named.**
+# Each boot stops at the loader's verdict line: the verdict is the loader's, and
+# the kernel's report of it is gated on the full boots above. Without a TPM
+# only -- the TPM lanes have their own arms, and these need none.
+if [[ "${BHASKIX_TPM:-0}" != 1 ]]; then
+    restore_kernel
+    verdict_of_boot() {
+        local log
+        log=$(mktemp)
+        cp "$OVMF_VARS" "$WRITABLE_VARS"
+        timeout "$TIMEOUT" qemu-system-x86_64 \
+            -machine q35 -cpu max -m 256 -display none \
+            -drive "if=pflash,unit=0,format=raw,readonly=on,file=$OVMF_CODE" \
+            -drive "if=pflash,unit=1,format=raw,file=$WRITABLE_VARS" \
+            -drive "format=raw,file=fat:rw:$ESP" \
+            -serial "file:$log" \
+            >/dev/null 2>&1 &
+        local pid=$!
+        for _ in $(seq 1 "$TIMEOUT"); do
+            grep -q "bhaskixboot: boot signature" "$log" 2>/dev/null && break
+            kill -0 "$pid" 2>/dev/null || break
+            sleep 1
+        done
+        kill "$pid" 2>/dev/null
+        wait "$pid" 2>/dev/null
+        grep -aE 'bhaskixboot: boot signature' "$log" | tr -d '\r' | head -1
+        rm -f "$log"
+    }
+    expect_unverified() {
+        local what="$1" reason="$2" said
+        said="$(verdict_of_boot)"
+        if [[ "$said" == "bhaskixboot: boot signature NOT VERIFIED ($reason), NOT ENFORCED: Secure Boot is off -- booting" ]]; then
+            pass "$what: named -- $reason -- and booted, nothing enforcing"
+        else
+            fail "$what: wanted '$reason', the loader said '${said:-nothing}'"
+            status=1
+        fi
+    }
+    echo "the signature arms: four ways a boot set fails its check, up to ${TIMEOUT}s each..."
+    printf '\377' | dd of="$ESP/bhaskix/initrd.tar" bs=1 seek=4096 conv=notrunc 2>/dev/null
+    expect_unverified "one initrd byte changed" "the initrd is not the one boot.sig names"
+    cp "$INITRD" "$ESP/bhaskix/initrd.tar"
+    printf 'cmdline=kaslr=show quiet\n' > "$ESP/bhaskix/boot.conf"
+    expect_unverified "a word added to boot.conf" "boot.conf is not the one boot.sig names"
+    printf 'cmdline=kaslr=show\n' > "$ESP/bhaskix/boot.conf"
+    mv "$ESP/bhaskix/boot.sig" "$ESP/boot.sig.kept"
+    expect_unverified "boot.sig removed" "there is no boot.sig"
+    mv "$ESP/boot.sig.kept" "$ESP/bhaskix/boot.sig"
+    STRANGER_KEYS=$(mktemp -d)
+    BHASKIX_KEYS="$STRANGER_KEYS/keys" "$BOOTSIGN" keygen >/dev/null
+    "$BOOTSIGN" sign --key "$(ls "$STRANGER_KEYS"/keys/*.secret)" "$ESP" >/dev/null
+    expect_unverified "signed by a key the loader does not hold" "boot.sig names a key this loader does not hold"
+    rm -rf "$STRANGER_KEYS"
+    # Back to the boot set as signed, so the staged ESP is never left lying.
+    "$BOOTSIGN" sign --key "$TEST_KEY.secret" "$ESP" >/dev/null
+fi
 
 # RFC 0089 step 3's gate, the one step 2 could not have: **the kernel's digest
 # follows the kernel's bytes.** One byte flipped inside `.debug_info` -- in the
@@ -731,12 +837,16 @@ PY
             fail "a flipped kernel byte gave '${flipped:-no measured line}' against $MEASURED_DIGESTS"
             status=1
         fi
-        # And the TPM agrees: its PCR 9 moved and its PCR 8 did not.
+        # And the TPM agrees: its PCR 9 moved. ~~And its PCR 8 did not~~ --
+        # since RFC 0091 step 3 PCR 8 moves too, and must: the kernel is no
+        # longer the one boot.sig names, so the loader's verdict, which PCR 8
+        # holds, changed with it. The verdict is checked as well.
         flipped_pcrs="$(grep -aE 'tpm            PCR 8 ' "$FLIPPED_LOG" | tr -d '\r' | head -1)"
         read -r p8 p9 <<< "${PCRS:-- -}"
         if [[ "$flipped_pcrs" =~ PCR\ 8\ ([0-9a-f]{8})\ PCR\ 9\ ([0-9a-f]{8}) ]] \
-            && [[ "${BASH_REMATCH[1]}" == "$p8" && "${BASH_REMATCH[2]}" != "$p9" ]]; then
-            pass "the TPM agrees: PCR 9 moved ($p9 -> ${BASH_REMATCH[2]}) and PCR 8 did not"
+            && [[ "${BASH_REMATCH[1]}" != "$p8" && "${BASH_REMATCH[2]}" != "$p9" ]] \
+            && grep -qF "NOT VERIFIED (the kernel is not the one boot.sig names)" "$FLIPPED_LOG"; then
+            pass "the TPM agrees: PCR 9 moved ($p9 -> ${BASH_REMATCH[2]}), and PCR 8 with the verdict ($p8 -> ${BASH_REMATCH[1]})"
         else
             fail "the TPM's PCRs after a flipped kernel byte: '${flipped_pcrs:-no PCR line}' against PCR 8 $p8, PCR 9 $p9"
             status=1
