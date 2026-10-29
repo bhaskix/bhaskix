@@ -82,9 +82,30 @@ Until then, the lead commits to:
 - **The name is not the code.** "Bhaskix" identifies builds that come from this project so that users
   can tell what they are running. A fork should be named differently. Trademark policy will be
   formalised before the first release.
-- **Nobody ships a release-signing key in a repository.** Key custody is a governance decision with
-  technical consequences ([docs/security.md](docs/security.md) §3) and will be documented before any
-  signed release exists.
+- **Nobody ships a release-signing key in a repository** — and since 2026-10-29 `make gates`
+  refuses a tracked private key or `*.secret` file, or a file ending in a committed public key.
+- **Key custody** is a governance decision with technical consequences
+  ([docs/security.md](docs/security.md) §3). ~~It will be documented before any signed release
+  exists.~~ Decided by the project lead on 2026-10-29
+  ([RFC 0091](docs/rfc/0091-a-boot-its-owner-signed.md), questions 3–7):
+  - **Who.** The project lead alone holds the release keys. When there is a second maintainer, a
+    sealed backup is placed with them, and custody shared k-of-n is considered then.
+  - **Where.** On a machine that has never been networked, its disk encrypted, and in two encrypted
+    backups on two offline media kept in two places. **Never in a cloud key service**: the key that
+    decides what boots on an owner's machine does not sit in a third country's data centre.
+  - **What.** An offline CA, whose certificate owners enrol in their firmware's `db`, with a signing
+    leaf beneath it that signs each loader — so a leaf is replaced without any owner enrolling
+    again — and a boot-set key whose public half is compiled into each loader release and rotated
+    with it.
+  - **Loss.** Revoked through `dbx`; refusing an older signed release waits for a rollback counter
+    (security.md, T7).
+  - **Owners' keys**, for a boot they sign themselves, live outside every checkout. The published
+    test key in `tests/keys/` protects nothing, is named in red wherever it verified a boot, and is
+    refused by the release recipe.
+  - **The procedure** is [docs/release-keys.md](docs/release-keys.md).
+
+  This custody text was amended under §8 on 2026-10-29. RFC 0091 had proposed it publicly from
+  2026-10-12, and the lead agreed to it.
 
 ## 6. Funding and independence
 
