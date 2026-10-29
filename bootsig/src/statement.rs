@@ -38,6 +38,11 @@ pub const ALGORITHM: u32 = 1;
 /// Which key signed: the first eight bytes of SHA-256 over its public key.
 pub type KeyId = [u8; 8];
 
+/// The id of the project's **published test key**, `tests/keys/bootsig-TEST-KEY`.
+/// Whatever it signed, anyone could have signed, so a report names it in red
+/// (RFC 0091, *Security implications*). A test holds this to the key file.
+pub const TEST_KEY_ID: KeyId = [0xa6, 0xc9, 0x13, 0xd8, 0xa0, 0xe2, 0x47, 0x6e];
+
 /// The key id of a public key.
 #[must_use]
 pub fn key_id(public_key: &[u8; PUBLIC_KEY_BYTES]) -> KeyId {
@@ -158,6 +163,36 @@ impl<'a> BootSig<'a> {
         id.copy_from_slice(&self.statement[24..32]);
         id
     }
+
+    /// The three digests the statement names.
+    #[must_use]
+    pub fn digests(&self) -> Digests {
+        let field = |at: usize| {
+            let mut digest = [0; DIGEST];
+            digest.copy_from_slice(self.digest_at(at));
+            digest
+        };
+        Digests {
+            kernel: field(32),
+            initrd: field(64),
+            boot_conf: field(96),
+        }
+    }
+}
+
+/// The statement naming `digests` under the key with id `key_id`: what
+/// `bootsign` signs (RFC 0091 step 2).
+#[cfg(feature = "sign")]
+#[must_use]
+pub fn statement(key_id: &KeyId, digests: &Digests) -> [u8; STATEMENT_BYTES] {
+    let mut bytes = [0; STATEMENT_BYTES];
+    bytes[..16].copy_from_slice(&MAGIC);
+    bytes[16..20].copy_from_slice(&ALGORITHM.to_le_bytes());
+    bytes[24..32].copy_from_slice(key_id);
+    bytes[32..64].copy_from_slice(&digests.kernel);
+    bytes[64..96].copy_from_slice(&digests.initrd);
+    bytes[96..128].copy_from_slice(&digests.boot_conf);
+    bytes
 }
 
 /// Verifies `boot_sig` for the boot set whose files hash to `held`, against
@@ -219,6 +254,13 @@ mod tests {
         bytes[64..96].copy_from_slice(&held.initrd);
         bytes[96..128].copy_from_slice(&held.boot_conf);
         bytes
+    }
+
+    #[test]
+    fn the_test_key_id_is_the_published_test_keys() {
+        let public: &[u8; PUBLIC_KEY_BYTES] =
+            include_bytes!("../../tests/keys/bootsig-TEST-KEY.public");
+        assert_eq!(key_id(public), TEST_KEY_ID);
     }
 
     #[test]

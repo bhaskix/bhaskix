@@ -450,6 +450,20 @@ mod tests {
     }
 
     #[test]
+    fn the_published_test_key_is_a_key_pair_keygen_would_make() {
+        let secret: &[u8; SECRET_KEY_BYTES] =
+            include_bytes!("../../../tests/keys/bootsig-TEST-KEY.secret");
+        let public: &[u8] = include_bytes!("../../../tests/keys/bootsig-TEST-KEY.public");
+        let (sk, pk) = keygen_internal(
+            secret[..N].try_into().unwrap(),
+            secret[N..2 * N].try_into().unwrap(),
+            secret[2 * N..3 * N].try_into().unwrap(),
+        );
+        assert_eq!(&sk, secret);
+        assert_eq!(&pk[..], public);
+    }
+
+    #[test]
     fn a_context_over_255_bytes_is_refused() {
         let (sk, _) = keygen_internal(&[1; N], &[2; N], &[3; N]);
         assert_eq!(

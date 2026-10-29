@@ -282,7 +282,7 @@ OVMF_VARS    := $(firstword $(wildcard $(OVMF_DIR)OVMF_VARS$(OVMF_SUFFIX).fd))
 
 .PHONY: FORCE all kernel iso demo run run-uefi release-dist progress test test-host test-boot test-boot-uefi test-boot-uefi-qemu64 test-boot-iommu test-keyboard \
         test-boot-iommu-off test-boot-qemu64 test-boot-native test-boot-native-full test-boot-native-tpm \
-        test-boot-native-tpm-tis test-placements mkfs test-shell test-faults test-usb-keyboard test-lacp test-bond test-http fmt clippy gates hooks clean distclean help
+        test-boot-native-tpm-tis test-placements mkfs bootsign test-shell test-faults test-usb-keyboard test-lacp test-bond test-http fmt clippy gates hooks clean distclean help
 
 all: iso
 
@@ -306,6 +306,14 @@ $(MKFS): $(wildcard fs/src/*.rs) $(wildcard fs/src/bin/*.rs) fs/Cargo.toml
 $(MKIMAGE): $(wildcard pkg/src/*.rs) $(wildcard pkg/src/bin/*.rs) pkg/Cargo.toml
 	$(CARGO) build --release --target $(HOST_TARGET) -p bhaskix-pkg --features tool
 	@echo "built $@"
+
+# The boot signer, RFC 0091 step 2: `bootsign keygen`, `sign` and `show`. A host
+# program behind `bhaskix-bootsig`'s `tool` feature, for mkimage's reason, and
+# so the loader, which links the crate without it, never carries the signer.
+BOOTSIGN     := target/$(HOST_TARGET)/release/bootsign
+bootsign:
+	$(CARGO) build --release --target $(HOST_TARGET) -p bhaskix-bootsig --features tool --bin bootsign
+	@echo "built $(BOOTSIGN)"
 
 # The image, with one file whose contents nothing else on the machine has. A
 # format that reads back its own zeroes would look identical to one that works.
@@ -1121,6 +1129,9 @@ gates:
 	@$(CARGO) build --quiet --target $(HOST_TARGET) -p bhaskix-pkg --features tool \
 	    && printf '  \033[1;32mok\033[0m    the package image assembler still builds\n' \
 	    || { echo "  FAIL  the package image assembler does not build"; exit 1; }
+	@$(CARGO) build --quiet --target $(HOST_TARGET) -p bhaskix-bootsig --features tool --bin bootsign \
+	    && printf '  \033[1;32mok\033[0m    the boot signer still builds\n' \
+	    || { echo "  FAIL  the boot signer does not build"; exit 1; }
 	tools/check-unsafe-budget.py --self-test
 	tools/check-unsafe-budget.py
 	tools/check-instruction-containment.py
