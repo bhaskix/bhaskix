@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | ⬜ **Draft 2026-10-12 — ~~nothing built~~ steps 1 and 2 built 2026-10-29** (`bhaskix-sha256` and `bhaskix-bootsig`, then the signer and `bootsign`; step 0's QEMU halves measured the same day). The project lead chose the scope (firmware → loader → kernel; package and update signing stay with the secure-update RFC) and asked for a draft that lays the decisions out. ~~**The signature algorithm, the enforcement policy and every key-custody question below are the lead's to decide** before step 1 starts.~~ **The lead decided questions 1–8 on 2026-10-29, each as recommended**: SLH-DSA-SHA2-128s for link 2; refuse only with Secure Boot on, handing back to the boot manager; the lead alone holds the release keys, on an offline machine, under an offline CA with a signing leaf; `dbx` for revocation, rollback left to T7; owner keys outside the tree; the verdict in PCR 8. Question 9, the SR550, stays for step 7, on the lead's word at the time. Step 0 may start. |
+| **Status** | ⬜ **Draft 2026-10-12 — ~~nothing built~~ steps 1–4 built 2026-10-29** (`bhaskix-sha256` and `bhaskix-bootsig`; the signer and `bootsign`; the loader's check and the kernel's report line; the native-lane gates, Secure Boot off; step 0's QEMU halves measured the same day). Steps 5–7 remain: the Secure Boot lane, release keys, the SR550. The project lead chose the scope (firmware → loader → kernel; package and update signing stay with the secure-update RFC) and asked for a draft that lays the decisions out. ~~**The signature algorithm, the enforcement policy and every key-custody question below are the lead's to decide** before step 1 starts.~~ **The lead decided questions 1–8 on 2026-10-29, each as recommended**: SLH-DSA-SHA2-128s for link 2; refuse only with Secure Boot on, handing back to the boot manager; the lead alone holds the release keys, on an offline machine, under an offline CA with a signing leaf; `dbx` for revocation, rollback left to T7; owner keys outside the tree; the verdict in PCR 8. Question 9, the SR550, stays for step 7, on the lead's word at the time. Step 0 may start. |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | boot (`bhaskixboot.efi`, `bhaskix_boot::Handoff`), a new `bootsig` crate and a `sha256` leaf crate, kernel (boot report), tools (a signer), tests, governance (key custody) |
 | **Milestone** | Phase 3 — *Secure boot chain*, the roadmap's first row; [security.md](../security.md) §1 **T6** and gap 1 |
@@ -164,7 +164,7 @@ loader acts on. An absent variable (firmware older than Secure Boot) is read as 
 | 1 | missing, unknown key, wrong digest, bad signature | **refuses**: says why on the **screen and serial**, then returns `EFI_SECURITY_VIOLATION` to the boot manager, which tries the next boot option — what the firmware itself does with an image it refuses (§32.6.1) | — |
 | 0 | verifies, known key | boots | red: `boot signature  verified: key <id>, but NOT ENFORCED: Secure Boot is off` |
 | 0 | anything else | boots | red: `boot signature  NOT VERIFIED (<which check failed>), NOT ENFORCED: Secure Boot is off` |
-| — | (Limine path) | — | red: `boot signature  NOT CHECKED: the Limine path verifies nothing` |
+| — | (Limine path) | — | red: ~~`boot signature  NOT CHECKED: the Limine path verifies nothing`~~ `boot signature  NOT CHECKED: this loader does not check boot.sig` — as built, because only `boot/` may name Limine (`tools/check-containment.sh`), as the `measured boot` line's *this loader does not measure* already does |
 
 **Why boot at all with Secure Boot off.** With link 1 down, the loader is itself unprotected: whoever
 can write `boot.sig` can write `BOOTX64.EFI`, and a refusal there stops nobody the RFC is about while
@@ -310,7 +310,8 @@ which runs on the custody machine (step 2).
 
 - **The loader hashes the kernel and initrd itself** — about 16 MB (RFC 0089's measured sizes), on top
   of the firmware's hashing for the PCRs. Measured in step 3 with the loader's own timing, on QEMU and
-  on the SR550, not estimated here.
+  on the SR550, not estimated here. **Measured 2026-10-29 under OVMF here** (QEMU 4.2.1, TCG): hashing
+  16,451,083 bytes and checking `boot.sig` took about 432 ms; the SR550's figure waits for a boot there.
 - **Verification**: by count from FIPS 205 Table 2 — FORS `k·(1+a)` = 182 hash calls, plus, for each of
   `d` = 7 layers, at most `len·(w−1)` = 35·15 = 525 chain steps and `h′` = 9 tree hashes — **at most
   about 3,900 SHA-256 calls** for one signature, half that on average for the chains. Counted, not
@@ -417,8 +418,8 @@ no custody decision; step 6 does, and questions 3–7 were decided the same day.
    (the lead's choice), recorded below *Step 1, as built*.
 3. **The loader**: `boot.sig`, `GetVariable`, verify after measuring, the policy, the refusal on ConOut
    and serial, the return to the boot manager, the PCR 8 event, handoff version 4; the kernel's report
-   line; the hashing cost measured.
-4. **The native-lane gates**, Secure Boot off.
+   line; the hashing cost measured. **Done 2026-10-29**, recorded below *Step 2, as built*.
+4. **The native-lane gates**, Secure Boot off. **Done 2026-10-29**, with step 3.
 5. **The Secure Boot lane**, QEMU and CI, with the release recipe's test-key refusal gated.
 6. **Release keys and the first signed loader** — ~~**blocked on questions 3–7**~~ (decided 2026-10-29), and GOVERNANCE.md §5
    updated in the same change.
@@ -514,6 +515,60 @@ no custody decision; step 6 does, and questions 3–7 were decided the same day.
 - **Limits, stated**:
   - the signer's constant-time property is argued, not measured;
   - secret bytes are not zeroed in memory, which would need `unsafe` this crate's budget forbids.
+
+### Steps 3 and 4, as built (2026-10-29)
+
+- **The loader** reads `bhaskix\boot.sig` with the files it names, before the volume closes.
+  - After RFC 0089's measurements, it hashes the kernel, the initrd and every byte of `boot.conf`
+    as read, and runs `bhaskix_bootsig::check` against the keys compiled in.
+  - `build.rs` takes the keys from `BHASKIX_BOOT_KEYS` and defaults to the published test key.
+  - `boot.conf` too large to read is now named as unreadable, never treated as absent.
+- **`SecureBoot`** is read through `GetVariable`, from a typed `RuntimeServices` table whose layout
+  comes from edk2's `UefiSpec.h` (`GetVariable` is the seventh slot after the header). An absent
+  variable is read as off, which is CI's plain firmware's case.
+- **The policy, as decided.**
+  - With Secure Boot on and the set not verified, the refusal goes on the screen and the wire, is
+    held 5 s with `Stall`, and `EFI_SECURITY_VIOLATION` goes back to the boot manager. It is the
+    only refusal that returns.
+  - With Secure Boot off, the loader boots and says nothing enforced it.
+- **PCR 8**: the verdict, the key id and the `SecureBoot` byte, measured as `bhaskix verdict`
+  before acting, so a refused boot is recorded too. It is measured before the event log is copied,
+  so the copy holds it. Both TPM lanes' replays agree on PCRs 0–9 with it.
+- **Handoff version 4**: `Signature` is `NotChecked`, `Verified` or `NotVerified`. Its reasons are
+  `bhaskix-bootsig`'s, so the kernel's report and `bootsign show` cannot word a refusal
+  differently. The kernel's `boot signature` line is green only for a non-test key with Secure
+  Boot on, and names the test key whenever it verified.
+- **Budgets**: `unsafe` 148 → 161 (the variable read and its call, `Stall`, `rdtsc`), and
+  instruction sites 5 → 6 (`rdtsc`), each with its reason in `Cargo.toml`.
+- **Found on the first boot**: `diag` writes the wire and the firmware console, and OVMF mirrors its
+  console onto the same wire. So a line written in pieces arrived with each piece twice,
+  interleaved. Lines are assembled whole before they are written.
+- **Step 4, the gates** (every native lane signs its ESP with the test key):
+  - the loader's `SecureBoot` reading and its verdict, verified with the test key named and not
+    enforced;
+  - the kernel's red line, and the cost line;
+  - five failures, each named in the check's words while the boot goes on: the negative arm's
+    corrupted kernel, an initrd byte, a word in `boot.conf`, `boot.sig` removed, and a key the
+    loader does not hold;
+  - the digest arm's PCR 8, which now moves with the verdict, as it must;
+  - `NOT CHECKED` on the BIOS lanes.
+
+  Armed red from temporary copies:
+  - the ESP left unsigned;
+  - the mutations disabled;
+  - the full lane unsigned.
+
+  Each went red where it should. All five native and BIOS lanes passed. On CI's emulator (QEMU
+  10.2.1, OVMF 2025.11, `SecureBoot` absent), the full native lane passed with `-cpu max`. Its
+  `-cpu qemu64` cell failed on KASLR: that model has no RDRAND for a slide, and it is not a CI
+  combination.
+- **The Secure Boot path, shown by hand ahead of step 5's lane**. The loader was `sbsign`ed with the
+  snakeoil key and run under OVMF's Secure Boot build.
+  - A good set: `SecureBoot reads 1`, then `verified: key a6c913d8a0e2476e TEST KEY, Secure Boot
+    on`. The kernel's line is red, because the test key is published.
+  - A kernel byte changed after signing: `refusing to boot: the kernel is not the one boot.sig
+    names (Secure Boot is on)`, then the return. The firmware logged `failed to start Boot0001 …:
+    Security Violation`.
 
 ## Sources
 
