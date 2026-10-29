@@ -87,8 +87,9 @@ that does it, with the date.
 ## Two weeks before — 15 November: the freeze
 
 - [ ] **Freeze** — *engineering*. From here on only fixes, tests and documents land. Work that
-      changes a service's lifecycle — RFC 0092's listener close is the one in flight — either lands
-      before the 15th with its suite green, or waits until after the release.
+      changes a service's lifecycle either lands before the 15th with its suite green, or waits
+      until after the release. ~~RFC 0092's listener close is the one in flight~~ — it landed
+      2026-10-20 with its suite green, and was accepted 2026-10-29.
 - [ ] **The defects table re-counted** against TRACKER §3, and any row closed since the refresh
       moved to the note's "closed" table.
 

@@ -96,7 +96,8 @@ document, release note or README may state or imply that it works."*
 | **Records what it booted in a TPM, and checks the record.** The native loader measures the kernel and initrd into PCR 9 and the command line into PCR 8. The event log reaches the kernel, and `bin/tpmd` **replays it against the TPM**: `log and TPM agree on PCRs 0-9` (2026-10-19), and a log that lies about the kernel is caught | `make test-boot-native-tpm` and `-tpm-tis`, against an emulated TPM (swtpm) over CRB and TIS. ~~**locally only** — it needs Docker, and CI does not run it yet. RFC 0089 is a **draft**, and nothing *verifies* the measurements~~ — **wrong since 2026-10-11, corrected 2026-10-19**: CI runs both lanes, and RFC 0089 was accepted 2026-10-11. On the SR550's own TPM: `log and TPM agree on PCRs 0-7, 9 ... over FIFO` (2026-10-11). **Recorded, not refused**: see below |
 | **Boots on physical hardware** — a Lenovo SR550, read over serial-over-LAN | 2026-08-23 through Limine; through its own loader to the user-mode shell since 2026-10-11 |
 
-Alongside, **as measured on 2026-10-20**: **61 of 93 RFCs accepted** (61 of 92 on
+Alongside, **as measured on 2026-10-29**: **63 of 93 RFCs accepted** (61 of 93 on
+2026-10-20, before the lead accepted RFC 0092 and RFC 0093; 61 of 92 on
 2026-10-19, before RFC 0093 was drafted), each
 accepted one implemented and measured rather than merely written. The command:
 
@@ -109,8 +110,9 @@ for f in docs/rfc/0*.md; do grep -m1 Status "$f"; done \
 0040's step-1 output rather than an RFC), and 93 RFCs. ~~`grep -ci accepted`~~
 was this note's command until 2026-10-19, and it reads 62 from that day, because
 RFC 0092's status says "connections nobody accepted". Host unit tests:
-**1,407** (`cargo test --workspace`, summed across one `make test` run,
-2026-10-20 on `a8c0df0`; 1,398 on 2026-10-19, 1,339 on 2026-10-08).
+**1,411** (`cargo test --workspace`, summed across one `make test` run,
+2026-10-20 on `61bb353`; 1,407 earlier that day on `a8c0df0`, 1,398 on
+2026-10-19, 1,339 on 2026-10-08).
 
 > **Dated 2026-09-23, because this line was the only measurement in the document
 > without a date on it** — every row of the table above carries one. The header

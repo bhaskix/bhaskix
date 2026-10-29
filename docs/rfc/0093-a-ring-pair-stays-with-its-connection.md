@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Draft 2026-10-20. **The lead chose the fix before this was written**: hold the pair until the holder lets go, over asking the service before every write, or leaving the defect filed. **Every step built and gated 2026-10-20, for the lead to accept**: the rule host-tested and watched red against the old one; the `iommu` lane's loopback probe gates it (208 passed, none failed); each of three arms is red, two of them earlier than predicted, for reasons the implementation plan records. |
+| **Status** | ✅ **ACCEPTED 2026-10-29 by the project lead.** Drafted 2026-10-20. **The lead chose the fix before this was written**: hold the pair until the holder lets go, over asking the service before every write, or leaving the defect filed. **Every step built and gated 2026-10-20**: the rule host-tested and watched red against the old one; the `iommu` lane's loopback probe gates it (208 passed, none failed); each of three arms is red, two of them earlier than predicted, for reasons the implementation plan records. |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | net / userspace |
 | **Milestone** | L1 ([roadmap.md](../roadmap.md)) — a hosted server whose bytes reach only the peer they were written for |
