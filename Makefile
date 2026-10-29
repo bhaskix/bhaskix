@@ -1153,6 +1153,12 @@ gates:
 	@$(CARGO) build --quiet --target $(HOST_TARGET) -p bhaskix-bootsig --features tool --bin bootsign \
 	    && printf '  \033[1;32mok\033[0m    the boot signer still builds\n' \
 	    || { echo "  FAIL  the boot signer does not build"; exit 1; }
+# No signing secret is tracked -- GOVERNANCE.md section 5's promise, a gate
+# since RFC 0091 step 6 (2026-10-29), before the first release key exists. And
+# watched refusing each kind, in throwaway repositories, so nothing key-shaped
+# is ever committed to show it.
+	tools/check-no-secret-keys.py --self-test
+	tools/check-no-secret-keys.py
 	tools/check-unsafe-budget.py --self-test
 	tools/check-unsafe-budget.py
 	tools/check-instruction-containment.py
