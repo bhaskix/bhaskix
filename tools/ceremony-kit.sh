@@ -19,6 +19,7 @@
 # those off a 26.04 container. `bootsign` is built here against glibc 2.31 and
 # runs on 26.04's 2.43 -- read there with `ldd`, the same day -- so it is
 # carried as built, after the same check here.
+# NOTICE: sbsigntool
 set -euo pipefail
 
 [[ $# -eq 1 ]] || { echo "usage: tools/ceremony-kit.sh OUT" >&2; exit 2; }

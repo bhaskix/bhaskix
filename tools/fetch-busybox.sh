@@ -29,6 +29,7 @@
 # is. Prints the binary's path on success.
 #
 #   tools/fetch-busybox.sh [destination-root]      (default: build/toolchain)
+# NOTICE: BusyBox
 set -euo pipefail
 
 VERSION=1.37.0-7ubuntu1

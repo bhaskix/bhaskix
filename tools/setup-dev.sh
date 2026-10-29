@@ -13,6 +13,7 @@
 # The exit criterion for Phase 0 (docs/roadmap.md) is that a new contributor
 # can run this script followed by `make run` and get a QEMU window.
 
+# NOTICE: Limine bootloader
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

@@ -21,6 +21,7 @@
 # is used as it is. Prints the `go` binary's path on success.
 #
 #   tools/fetch-go.sh [destination-root]      (default: build/toolchain)
+# NOTICE: Go
 set -euo pipefail
 
 VERSION=1.27.1

@@ -36,17 +36,52 @@ took.
     re-encoded on 2026-10-29, as PROVENANCE.md there records.
     Test data for bhaskix-bootsig's host tests; linked into nothing.
 
-The following components are fetched at build time by tools/setup-dev.sh and are
-distributed under their own licenses. They are build and boot dependencies; no
-part of them is linked into the Bhaskix kernel.
+The following components are fetched by the scripts named, each pinned there,
+and distributed under their own licenses. No part of any of them is linked into
+the Bhaskix kernel. Until 2026-10-29 this list named Limine alone, while the
+release ISO also carried Go's runtime; tools/check-notice.py now refuses a
+fetching script that does not name its component here.
 
-  Limine bootloader
+  Limine bootloader  (tools/setup-dev.sh, branch v8.x-binary)
     https://github.com/limine-bootloader/limine
+    Copyright (C) 2019-2025 mintsuki and contributors.
     Licensed under the BSD 2-Clause License.
     Used only as a boot protocol implementation. The Bhaskix kernel consumes
     bhaskix_boot::Handoff, a project-owned structure; see docs/architecture.md §1.
-    Limine is replaceable and is scheduled for replacement by bhaskixboot.efi in
-    Phase 2 (docs/roadmap.md).
+    ~~Scheduled for replacement by bhaskixboot.efi in Phase 2~~ -- replaced on
+    UEFI by bhaskixboot.efi, the project's own loader, on 2026-08-18; Limine
+    remains the BIOS path and boots the ISO. Its binaries are in every ISO,
+    so each release ships its license as LICENSE-limine.
+
+  Go  (tools/fetch-go.sh, the release named there)
+    https://go.dev
+    Copyright 2009 The Go Authors.
+    Licensed under the BSD 3-Clause License.
+    The toolchain that builds bin/httpd, an unmodified Go net/http program run
+    through the Linux personality; Go's runtime and standard library are
+    compiled into that program, which the release ISO carries. Each release
+    ships Go's license as LICENSE-go.
+
+  BusyBox  (tools/fetch-busybox.sh, Ubuntu's busybox-static package)
+    https://busybox.net
+    Copyright many authors, 1998-2015.
+    Licensed under the GNU General Public License, version 2.
+    Used by the test images only, unmodified. The release leaves it out --
+    tools/release-dist.sh refuses an ISO that carries it -- because shipping it
+    would oblige publishing its source.
+
+  sbsigntool  (tools/ceremony-kit.sh, Ubuntu's sbsigntool package)
+    git://kernel.ubuntu.com/jk/sbsigntool (the source its Debian copyright file names)
+    Copyright 2012 Canonical Ltd, and others.
+    Licensed under the GNU General Public License, version 3 or later, with an
+    OpenSSL exception; parts under the GPL 3+, the LGPL 2+ and CC0.
+    Carried, unmodified, on the removable medium of the release-key ceremony
+    (docs/release-keys.md) to the project lead's offline machine. It is not
+    part of any release.
+
+Test lanes also install, from Ubuntu's archive into local containers that are
+never distributed, swtpm, virt-firmware, pesign, sbsigntool and OpenSSL; each
+is pinned in tools/swtpm.sh or tests/qemu/release-keys-test.sh.
 
 Contributors retain copyright in their contributions. Bhaskix does not require
 copyright assignment; contributions are made under the Developer Certificate of

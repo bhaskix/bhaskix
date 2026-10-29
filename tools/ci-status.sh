@@ -46,6 +46,7 @@
 # is not a gate, and a gate that passes when GitHub is unreachable is worse than
 # no gate. This is a thing a person runs.
 
+# NOTICE: none -- reads CI results from GitHub's API and fetches no component
 set -uo pipefail
 
 REPO="${BHASKIX_CI_REPO:-bhaskix/bhaskix}"

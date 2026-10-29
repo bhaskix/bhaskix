@@ -1183,6 +1183,11 @@ gates:
 # is ever committed to show it.
 	tools/check-no-secret-keys.py --self-test
 	tools/check-no-secret-keys.py
+# Every script that fetches from outside names its component, and NOTICE names
+# it too -- NOTICE listed Limine alone while the release ISO carried Go's
+# runtime, until 2026-10-29. And watched refusing, in throwaway repositories.
+	tools/check-notice.py --self-test
+	tools/check-notice.py
 	tools/check-unsafe-budget.py --self-test
 	tools/check-unsafe-budget.py
 	tools/check-instruction-containment.py
