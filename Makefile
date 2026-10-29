@@ -282,7 +282,7 @@ OVMF_VARS    := $(firstword $(wildcard $(OVMF_DIR)OVMF_VARS$(OVMF_SUFFIX).fd))
 
 .PHONY: FORCE all kernel iso demo run run-uefi release-dist progress test test-host test-boot test-boot-uefi test-boot-uefi-qemu64 test-boot-iommu test-keyboard \
         test-boot-iommu-off test-boot-qemu64 test-boot-native test-boot-native-full test-boot-native-tpm \
-        test-boot-native-tpm-tis test-placements mkfs bootsign test-shell test-faults test-usb-keyboard test-lacp test-bond test-http fmt clippy gates hooks clean distclean help
+        test-boot-native-tpm-tis test-boot-secureboot test-placements mkfs bootsign test-shell test-faults test-usb-keyboard test-lacp test-bond test-http fmt clippy gates hooks clean distclean help
 
 all: iso
 
@@ -794,7 +794,7 @@ run-uefi: $(ISO)
 # one, and `gave up after 0.255s` says nothing about an image at all.
 test: fmt clippy test-host gates test-boot test-boot-uefi test-boot-iommu test-boot-iommu-off \
       test-boot-qemu64 test-boot-uefi-qemu64 test-boot-native test-boot-native-full test-boot-native-tpm \
-      test-boot-native-tpm-tis test-placements test-shell \
+      test-boot-native-tpm-tis test-boot-secureboot test-placements test-shell \
       test-keyboard test-usb-keyboard test-busybox test-bond test-lacp test-faults test-http
 	@echo
 	@echo "  all checks passed"
@@ -978,6 +978,14 @@ test-boot-native-tpm: $(BOOTEFI) $(ISO) bootsign
 # gate the CRB lane holds, plus the interface `bin/tpmd` found.
 test-boot-native-tpm-tis: $(BOOTEFI) $(ISO) bootsign
 	BHASKIX_TPM=1 BHASKIX_TPM_INTERFACE=tis tests/qemu/native-boot-test.sh
+
+# RFC 0091 step 5: the native loader under OVMF's Secure Boot build, both links
+# at once -- an unsigned loader refused by the firmware, a signed one verifying
+# a signed boot set, and a changed kernel refused and handed back to the boot
+# manager. Needs `sbsign` (sbsigntool) and a snakeoil-enrolled OVMF; says `skip`
+# without them, unless BHASKIX_REQUIRE=1, as CI sets.
+test-boot-secureboot: $(BOOTEFI) $(ISO) bootsign
+	tests/qemu/secureboot-test.sh
 
 
 # Types at the machine over the serial line and asserts on the replies. The

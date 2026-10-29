@@ -282,6 +282,15 @@ jobs:
           BHASKIX_REQUIRE: 1
           BHASKIX_NATIVE_BOOT_LOG: native-tpm-tis.log
         run: make test-boot-native-tpm-tis
+      # RFC 0091 step 5: both links of the boot chain under OVMF's Secure Boot
+      # build, its snakeoil key enrolled -- `sbsign` signs the loader for the
+      # firmware, `bootsign` the boot set for the loader.
+      - name: Boot through the native loader under Secure Boot (snakeoil-enrolled OVMF)
+        env:
+          BHASKIX_REQUIRE: 1
+        run: |
+          sudo apt-get install -y -qq sbsigntool
+          make test-boot-secureboot
 
       - name: Upload the logs on failure
         if: failure()
