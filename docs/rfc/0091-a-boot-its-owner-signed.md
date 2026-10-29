@@ -328,6 +328,27 @@ which runs on the custody machine (step 2).
     its snakeoil key is enrolled "in PK, KEK & DB", in a container, as `tools/swtpm.sh` does for swtpm.
   - Whether OVMF and the SR550 offer `EFI_PKCS7_VERIFY_PROTOCOL` (question 1's fourth column).
   - What `GetVariable("SecureBoot")` reads on the plain native lanes (expected 0) and on the SR550.
+- **Step 0, measured 2026-10-29 — the QEMU halves done, the SR550's waiting on a boot there.**
+  Every arm was run, from scratch files; no code was written or merged.
+
+  | | This host: QEMU 4.2.1, OVMF `0~20191122.bd85bf54-2ubuntu3.6` | CI's runner: QEMU 10.2.1, OVMF `2025.11-3ubuntu7.3` (Ubuntu 26.04, in a container) |
+  |---|---|---|
+  | The loader `sbsign`ed with the package's snakeoil key, on the Secure Boot build and the snakeoil variable store | **boots** (its banner prints), although the certificate expired 2019-12-01: **this OVMF does not honour certificate expiry**, so the lane needs no other firmware | boots; this certificate is a newer one, valid to 2053-05-17, so expiry does not arise |
+  | The same loader unsigned — the control | refused: `failed to load Boot0001 …: Security Violation`, and the firmware's own shell refused the same way | refused: `Access Denied -- rejected probably by Secure Boot` |
+  | `EFI_PKCS7_VERIFY_PROTOCOL` (`dh -p Pkcs7Verify` in a UEFI shell; `dh -p SimpleFileSystem` listing a handle is the control) | **absent** from the plain build and from the Secure Boot build | **absent** from both |
+  | `SecureBoot`, read with the shell's `dmpstore` | **0** on the plain 4 MiB pair the native lanes use (`SetupMode` 1); 0 on the Secure Boot build with an un-enrolled store | **absent** on the plain pair — the "read as 0" case of *What the loader does with the answer*, so CI's native lanes are what exercise it; 0 on the Secure Boot build with an un-enrolled store |
+
+  - **The Secure Boot lane here needs `-global ICH9-LPC.disable_s3=1`.** Without it the Secure
+    Boot build wrote nothing to serial or to the debug port in 60 s; with it, it reached its boot
+    manager at once. QEMU 10.2.1 needed no such flag.
+  - **The snakeoil key is encrypted.** The 20.04 package's `README.Debian` gives the password,
+    `snakeoil`; it opens the 26.04 key as well. CI's firmware has no shell of its own, so the probe
+    there booted Ubuntu's `efi-shell-x64` (the same edk2 release) from the ESP.
+  - **Not measured**: `SecureBoot` *with* the snakeoil store enrolled. The shell is refused there,
+    so the value was not read; enforcement was observed instead, in the refusals above. Every value
+    in the table was read by the shell's `dmpstore`, not by the loader — that reading is step 3's,
+    through `GetVariable`. And the SR550's two halves — the PKCS#7 protocol and `SecureBoot` — need
+    a boot there, on the lead's word.
 - **Host**: `bootsig` against NIST's ACVP vectors (`SLH-DSA-sigVer-FIPS205`, the SHA2-128s groups —
   each with valid signatures and the labelled negatives "modified message", "modified signature - R",
   "- SIGFORS", "- SIGHT", "too large", "too small"), every negative armed red once; the statement's
@@ -385,7 +406,8 @@ until step 7.**
 Nothing starts until questions 1 and 2 are answered — ~~and~~ they were, on 2026-10-29. Steps 1–5 need
 no custody decision; step 6 does, and questions 3–7 were decided the same day.
 
-0. **The three measurements** in the testing plan — the snakeoil certificate's expiry, the PKCS#7
+0. **The three measurements** in the testing plan (**the QEMU halves done 2026-10-29**, recorded there; the SR550's
+   wait for a boot on it) — the snakeoil certificate's expiry, the PKCS#7
    protocol, `SecureBoot` as read. No code merged; the answers recorded here.
 1. **`sha256` and `bootsig`**: the leaf crate re-exported by `pkg`; the statement; SLH-DSA-SHA2-128s
    verification against the ACVP vectors, armed; a fuzz target; the verification cost measured.
