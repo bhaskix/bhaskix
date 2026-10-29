@@ -29,7 +29,8 @@ took.
 
   SLH-DSA test vectors  (third_party/acvp-slh-dsa/)
     From NIST ACVP-Server, https://github.com/usnistgov/ACVP-Server: the
-    SLH-DSA-SHA2-128s signature-verification vectors, as of upstream commit
+    SLH-DSA-SHA2-128s signature-verification, key-generation and signing
+    vectors, as of upstream commit
     112690e8484d. Provided by NIST under the notice kept intact in
     third_party/acvp-slh-dsa/LICENSE-NIST.md; selected, trimmed and
     re-encoded on 2026-10-29, as PROVENANCE.md there records.

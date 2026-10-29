@@ -20,6 +20,18 @@ path = "src/lib.rs"
 [dependencies]
 bhaskix-sha256 = { path = "../sha256" }
 
+[features]
+# Key generation and signing (RFC 0091 step 2), for `bootsign` on the custody
+# machine. Off by default, so the loader, which only verifies, never links a
+# line of it.
+sign = []
+
+# The tests enable `sign` for themselves, so `cargo test --workspace` (and
+# with it `make test-host` and CI) checks the signer against NIST's vectors
+# without the feature reaching anything that ships.
+[dev-dependencies]
+bhaskix-bootsig = { path = ".", features = ["sign"] }
+
 [lints]
 workspace = true
 

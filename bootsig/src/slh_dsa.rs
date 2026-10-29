@@ -255,17 +255,26 @@ fn chain(tweak: &Tweak, x: &[u8], start: u32, steps: u32, adrs: &mut Adrs) -> [u
     tmp
 }
 
-/// Algorithm 8, `wots_pkFromSig`: the WOTS⁺ public key a signature implies.
-fn wots_pk_from_sig(tweak: &Tweak, sig: &[u8], message: &[u8; N], adrs: &mut Adrs) -> [u8; N] {
+/// Lines 1–7 of Algorithms 7 and 8: the message's base-`w` digits and then
+/// its checksum's, `len` in all.
+fn wots_digits(message: &[u8; N]) -> [u32; LEN] {
     let msg: [u32; LEN1] = base_2b(message, LG_W as u32);
     let mut csum: u32 = msg.iter().map(|digit| W - 1 - digit).sum();
     // Line 6: left-align the checksum in its bytes.
     csum <<= (8 - (LEN2 * LG_W) % 8) % 8;
     let csum_bytes = csum.to_be_bytes();
     let checksum: [u32; LEN2] = base_2b(&csum_bytes[4 - (LEN2 * LG_W).div_ceil(8)..], LG_W as u32);
+    let mut digits = [0; LEN];
+    digits[..LEN1].copy_from_slice(&msg);
+    digits[LEN1..].copy_from_slice(&checksum);
+    digits
+}
+
+/// Algorithm 8, `wots_pkFromSig`: the WOTS⁺ public key a signature implies.
+fn wots_pk_from_sig(tweak: &Tweak, sig: &[u8], message: &[u8; N], adrs: &mut Adrs) -> [u8; N] {
+    let digits = wots_digits(message);
     let mut tmp = [0; LEN * N];
-    for i in 0..LEN {
-        let digit = if i < LEN1 { msg[i] } else { checksum[i - LEN1] };
+    for (i, &digit) in digits.iter().enumerate() {
         adrs.set_word_2(i as u32);
         let end = chain(tweak, &sig[i * N..(i + 1) * N], digit, W - 1 - digit, adrs);
         tmp[i * N..(i + 1) * N].copy_from_slice(&end);
@@ -361,6 +370,16 @@ fn fors_pk_from_sig(tweak: &Tweak, sig_fors: &[u8], md: &[u8], adrs: &mut Adrs) 
     tweak.t(&fors_pk_adrs, &roots)
 }
 
+/// Lines 6–10 of Algorithm 19 and 9–13 of Algorithm 20: the FORS digest,
+/// the XMSS tree, and the leaf within it.
+fn split_digest(digest: &[u8; M]) -> (&[u8], u64, u32) {
+    let (md, rest) = digest.split_at(MD_BYTES);
+    let (tmp_idx_tree, tmp_idx_leaf) = rest.split_at(TREE_BYTES);
+    let idx_tree = to_int(tmp_idx_tree) & ((1 << (HEIGHT - HEIGHT / D)) - 1);
+    let idx_leaf = (to_int(tmp_idx_leaf) & ((1 << (HEIGHT / D)) - 1)) as u32;
+    (md, idx_tree, idx_leaf)
+}
+
 /// Algorithm 20, `slh_verify_internal`: verifies `signature` over the message
 /// formed by concatenating `message`'s parts, under `public_key`.
 ///
@@ -385,10 +404,7 @@ pub fn verify_internal(
     let (r, rest) = signature.split_at(N);
     let (sig_fors, sig_ht) = rest.split_at(FORS_BYTES);
     let digest = h_msg(r, pk_seed, pk_root, message);
-    let (md, rest) = digest.split_at(MD_BYTES);
-    let (tmp_idx_tree, tmp_idx_leaf) = rest.split_at(TREE_BYTES);
-    let idx_tree = to_int(tmp_idx_tree) & ((1 << (HEIGHT - HEIGHT / D)) - 1);
-    let idx_leaf = (to_int(tmp_idx_leaf) & ((1 << (HEIGHT / D)) - 1)) as u32;
+    let (md, idx_tree, idx_leaf) = split_digest(&digest);
     let mut adrs = Adrs::new();
     adrs.set_tree_address(idx_tree);
     adrs.set_type_and_clear(FORS_TREE);
@@ -423,6 +439,11 @@ pub fn verify(
     let prefix = [0, context_len];
     verify_internal(&[&prefix[..], context, message], signature, public_key)
 }
+
+#[cfg(feature = "sign")]
+mod sign;
+#[cfg(feature = "sign")]
+pub use sign::{SECRET_KEY_BYTES, keygen_internal, sign, sign_internal};
 
 /// A count of the tweakable-hash calls one thread made, and the SHA-256
 /// compressions they cost, so the cost test measures rather than estimates.

@@ -161,6 +161,15 @@ panic = "abort"
 overflow-checks = true
 debug = true
 
+# The SLH-DSA signer's tests sign with NIST's vectors: about two million
+# SHA-256 compressions per signature, minutes unoptimised and seconds
+# optimised. Overflow checks stay on; only these two crates are optimised.
+[profile.dev.package.bhaskix-bootsig]
+opt-level = 3
+
+[profile.dev.package.bhaskix-sha256]
+opt-level = 3
+
 [profile.release]
 panic = "abort"
 overflow-checks = true   # kept ON in release: an integer overflow in a page
