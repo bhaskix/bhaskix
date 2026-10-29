@@ -98,11 +98,12 @@ connector=$(boot connect "$connect_log")
 
 # Both machines print their boot report and then run a shell; there is nothing
 # to type at, so the gate is the report line and the deadline is the machine's.
+# The marker is an extended regular expression.
 await_both() {
     local marker="$1" waited=0
     while :; do
-        if grep -qF -- "$marker" "$listen_log" 2>/dev/null \
-            && grep -qF -- "$marker" "$connect_log" 2>/dev/null; then
+        if grep -qE -- "$marker" "$listen_log" 2>/dev/null \
+            && grep -qE -- "$marker" "$connect_log" 2>/dev/null; then
             return 0
         fi
         kill -0 "$listener" 2>/dev/null || return 1
@@ -113,7 +114,14 @@ await_both() {
     done
 }
 
-await_both "ipd lacp" || true
+# **The state line, not the first `ipd lacp`** (2026-10-29). The report prints
+# the LACPDU count first and the state after it, and this waited for the string
+# both share -- so a guest caught between the two lines when the poll fired was
+# killed before it said its state. Two suite runs failed with exactly that shape,
+# one on each side (TRACKER §3). Waiting for the state line means a guest is
+# never killed short of it, and one that still has none has had the whole
+# deadline to print it.
+await_both "ipd lacp +state " || true
 
 for pid in "$listener" "$connector"; do
     kill -0 "$pid" 2>/dev/null && kill "$pid" 2>/dev/null
@@ -127,6 +135,13 @@ for side in listen connect; do
     log="$listen_log"; [[ "$side" == connect ]] && log="$connect_log"
     if ! grep -q "ipd lacp" "$log"; then
         fail "$side guest never published an LACP state -- the machine either did not reach its serve loop or never learnt its own address"
+        continue
+    fi
+    if ! grep -qE "ipd lacp +state " "$log"; then
+        # Not killed early: the wait above is for this line. So its absence is
+        # the guest's own -- `bin/ipd`'s state word read zero, which is when the
+        # kernel leaves the line out, or the machine stopped first.
+        fail "$side guest printed its LACPDU count and no state line within ${TIMEOUT}s: $(grep -m1 'ipd lacp' "$log" | sed 's/\x1b\[[0-9;]*m//g' | sed 's/^ *//')"
         continue
     fi
     if grep -q "aggregated: synchronised, collecting and distributing" "$log"; then
