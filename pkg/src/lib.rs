@@ -24,4 +24,6 @@
 
 pub mod manifest;
 pub mod package;
-pub mod sha256;
+/// SHA-256, which lives in [`bhaskix_sha256`] since RFC 0091 needed it in the
+/// loader. Re-exported here, so every `bhaskix_pkg::sha256` path still works.
+pub use bhaskix_sha256 as sha256;

@@ -35,6 +35,7 @@ tool = []
 
 [dependencies]
 bhaskix-ustar = { path = "../ustar" }
+bhaskix-sha256 = { path = "../sha256" }
 
 [dev-dependencies]
 bhaskix-ustar = { path = "../ustar", features = ["test-support"] }

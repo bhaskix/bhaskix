@@ -26,6 +26,19 @@
 //! and would have to be ripped out the day signatures arrive, because a
 //! signature over a CRC certifies nothing. Content identity is written once,
 //! in the form the future consumer needs.
+//!
+//! # Why a crate of its own
+//!
+//! That consumer arrived with [RFC 0091](../../docs/rfc/0091-a-boot-its-owner-signed.md):
+//! the boot chain's signature check needs nothing but this hash, and the
+//! native loader's dependencies are leaves. Inside `bhaskix-pkg` it would
+//! have brought the manifest grammar and the archive walk into the first code
+//! that runs. So it moved here unchanged on 2026-10-29, and `bhaskix-pkg`
+//! re-exports it as `bhaskix_pkg::sha256`, so no caller changed.
+
+#![cfg_attr(not(test), no_std)]
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
+#![forbid(unsafe_code)]
 
 /// Bytes in a digest.
 pub const DIGEST: usize = 32;

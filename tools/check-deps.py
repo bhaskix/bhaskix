@@ -124,6 +124,9 @@ LAYERS = {
     # initial stack with it and a host test checks the bytes, so it depends
     # on nothing -- the leaf-layer argument a seventh time.
     "bhaskix-personality": -3,
+    # SHA-256, moved out of the package format for RFC 0091: the loader's
+    # signature check needs the hash and nothing above it.
+    "bhaskix-sha256": -3,
     # The package format, RFC 0030: manifest, archive walk, SHA-256. A rung
     # above the leaves because it reads archives through `bhaskix-ustar`;
     # nothing below the programs and the host tools depends on it.

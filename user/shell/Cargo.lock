@@ -10,8 +10,13 @@ version = "0.0.0"
 name = "bhaskix-pkg"
 version = "0.0.0"
 dependencies = [
+ "bhaskix-sha256",
  "bhaskix-ustar",
 ]
+
+[[package]]
+name = "bhaskix-sha256"
+version = "0.0.0"
 
 [[package]]
 name = "bhaskix-user-shell"

@@ -106,6 +106,10 @@ members = [
     # zero unsafe; `mkimage` grows here at step 2 the way `mkfs` lives in
     # `fs`.
     "pkg",
+
+    # RFC 0091 -- SHA-256 as a leaf, so the loader's signature check reaches the
+    # hash without the package format.
+    "sha256",
 ]
 
 # The negative fixture for `tools/check-placements.sh`: a service that reaches

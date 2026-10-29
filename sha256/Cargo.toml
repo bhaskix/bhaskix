@@ -1,0 +1,30 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# SHA-256 as pure arithmetic, moved out of `bhaskix-pkg` for RFC 0091: the
+# boot chain's signature check needs this hash and nothing else, and the
+# native loader depends only on leaves. `bhaskix-pkg` re-exports it, so its
+# callers did not change.
+[package]
+name = "bhaskix-sha256"
+description = "SHA-256 (FIPS 180-4), streaming and one-shot, as pure arithmetic."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[lib]
+name = "bhaskix_sha256"
+path = "src/lib.rs"
+
+# Nothing: a leaf.
+[dependencies]
+
+[lints]
+workspace = true
+
+[package.metadata.bhaskix]
+# A hash function: arithmetic all the way down, with no `unsafe` that could
+# be justified for it.
+unsafe_budget = 0
