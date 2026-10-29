@@ -105,10 +105,29 @@ impl VirtRange {
         Some(Self { start, end })
     }
 
-    /// Creates a range of `pages` pages starting at `start`.
+    /// Creates a range of `pages` pages starting at `start`, returning `None`
+    /// where [`new`](Self::new) would -- and where the end would not fit in a
+    /// `u64`.
+    ///
+    /// **Checked, because both numbers can come from ring 3.** The nucleus
+    /// builds every `MAP_AT`, `UNMAP_AT`, `PROTECT_AT` and `DISCARD_AT` range
+    /// here from its caller's arguments, and release kernels keep overflow
+    /// checks on. Until 2026-10-29 this added and multiplied without checking,
+    /// so a hosted program's `munmap(0xffff_ffff_ffff_f000, 0x2000)` -- which
+    /// the personality's decoder rightly passes on, page-aligned and two pages
+    /// long -- panicked the nucleus on the CPU running `bin/linuxd`, and so did
+    /// `mmap(MAP_FIXED)`, `mprotect` and `madvise` at that address. Every
+    /// caller already treated `None` as the refusal; the arithmetic panicked
+    /// before it could return one.
     #[must_use]
     pub const fn from_pages(start: VirtAddr, pages: u64) -> Option<Self> {
-        Self::new(start, VirtAddr(start.as_u64() + pages * PAGE_SIZE))
+        let Some(bytes) = pages.checked_mul(PAGE_SIZE) else {
+            return None;
+        };
+        let Some(end) = start.as_u64().checked_add(bytes) else {
+            return None;
+        };
+        Self::new(start, VirtAddr(end))
     }
 
     /// Length in bytes.
@@ -510,7 +529,9 @@ impl RangeMap {
     /// structure.
     #[must_use]
     pub fn find_free(&self, low: VirtAddr, high: VirtAddr, pages: u64) -> Option<VirtRange> {
-        let needed = pages * PAGE_SIZE;
+        // Checked for the reason `VirtRange::from_pages` is (2026-10-29): a page
+        // count too large to have a size in bytes has no free range either.
+        let needed = pages.checked_mul(PAGE_SIZE)?;
         let mut candidate = low.as_u64();
 
         for region in &self.regions {
@@ -572,6 +593,40 @@ mod tests {
     }
 
     const PAGE: u64 = crate::FRAME_SIZE;
+
+    /// 2026-10-29: a range whose end does not fit in a `u64` is refused, not
+    /// panicked over -- the nucleus builds ranges here from ring-3 arguments,
+    /// and the last two pages below 2^64, asked for by a hosted `munmap`,
+    /// panicked it. Both ways the end can overflow, and the edge that fits.
+    #[test]
+    fn a_range_whose_end_would_not_fit_is_refused_not_panicked_over() {
+        // The add overflows: two pages from the last page.
+        assert!(VirtRange::from_pages(VirtAddr(0xffff_ffff_ffff_f000), 2).is_none());
+        // The multiply overflows before the add is reached.
+        assert!(VirtRange::from_pages(VirtAddr(0), u64::MAX / PAGE + 1).is_none());
+        assert!(VirtRange::from_pages(VirtAddr(0x1000), u64::MAX).is_none());
+        // One page ending exactly at 2^64 still does not fit: its end would
+        // be 2^64, which is no u64.
+        assert!(VirtRange::from_pages(VirtAddr(0xffff_ffff_ffff_f000), 1).is_none());
+        // And the largest range that does fit is still built.
+        let top = VirtRange::from_pages(VirtAddr(0xffff_ffff_ffff_e000), 1).unwrap();
+        assert_eq!(top.end, VirtAddr(0xffff_ffff_ffff_f000));
+    }
+
+    /// The same for the free-range search: a page count with no size in bytes
+    /// finds nothing, rather than panicking on the multiplication.
+    #[test]
+    fn a_free_range_too_large_to_measure_is_not_found_rather_than_panicked_over() {
+        let map = RangeMap::new();
+        assert!(
+            map.find_free(VirtAddr(0x1000), VirtAddr(0x10_0000), u64::MAX)
+                .is_none()
+        );
+        assert!(
+            map.find_free(VirtAddr(0x1000), VirtAddr(0x10_0000), 2)
+                .is_some()
+        );
+    }
 
     /// RFC 0087: a revoked shared region becomes anonymous in place, and only
     /// the one it names.
