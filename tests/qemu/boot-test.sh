@@ -2933,6 +2933,26 @@ fi
 # and echoes itself through the loopback -- the whole machine, both roles,
 # second family. On networked lanes that ending is now the demanded one.
 if grep -qE "tcp client +did everything outcome 9 says, then opened a v6 connection" "$LOG"; then
+    # **The twin's listener was its own** (2026-10-29): on the port the kernel
+    # names -- and the claim the kernel cannot make, that this boot's netdev
+    # forwards nothing to it, is made here, read from the arguments the boot
+    # ran with, so a forward added later turns this red rather than
+    # reopening the race step 16 lost on port 7, where a host's lingering echo
+    # attempt took the one pair the twin needed.
+    twin_line="$(grep -aoE 'tcp twin +.*' "$LOG" | head -1 | sed -E 's/\x1b\[[0-9;]*m//g' | tr -d '\r')"
+    twin_said="^tcp twin +the v6 twin listened on port ([0-9]+), on a listener of its own apart from port 7's, and that listener stopped and gave its rings back\$"
+    if [[ "$twin_line" =~ $twin_said ]]; then
+        twin_port="${BASH_REMATCH[1]}"
+        if grep -qE "hostfwd=tcp:[^,]*-:${twin_port}([, ]|$)" <<< "${QEMU_ARGS[*]}"; then
+            fail "the v6 twin's port ${twin_port} is forwarded from the host by this boot's netdev, so a host connection could reach step 16 again"
+            status=1
+        else
+            pass "the v6 twin accepted on a listener of its own, on port ${twin_port}, which this boot forwards nothing to, and that listener gave its rings back"
+        fi
+    else
+        fail "the v6 twin's listener line is missing or wrong: ${twin_line:-(none)}"
+        status=1
+    fi
     if [[ -f "$INBOUND_VERDICT" ]]; then
         pass "both directions: outbound echoed, and a host-initiated connection was accepted and served"
         rm -f "$INBOUND_VERDICT"

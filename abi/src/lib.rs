@@ -1762,6 +1762,26 @@ pub mod tcp {
     /// at.
     pub const CLIENT_SECOND_PEER: usize = 23;
 
+    /// The port `bin/tcpc`'s **IPv6 twin** listens on — a listener of its own,
+    /// opened with [`OPEN_LEG`] for the twin alone, on a port the networked
+    /// QEMU lanes forward nothing to, so no host connection in them can reach
+    /// it. A property of the lanes, not of the port: on a real network any
+    /// host could dial it, and the program still asks who its peer is.
+    ///
+    /// Until 2026-10-29 the twin was accepted on port 7, beside the host's
+    /// inbound echo, where one armed pair served both. A lingering echo attempt
+    /// that retransmitted after the served echo gave that pair back took it, the
+    /// twin's handshake `ACK` was refused for want of it -- and a refused final
+    /// `ACK` under SYN cookies is never sent again -- so the twin accepted the
+    /// stranger (CI run 870, and once here). Here rather than in the program,
+    /// because the kernel reports the port and the boot test checks that nothing
+    /// forwards to it.
+    pub const CLIENT_TWIN_PORT: u16 = 7007;
+    /// The twin's listener: [`FOUR_READY`] while it is open, [`FOUR_DONE`] once
+    /// it has stopped and every ring it was given is the program's own again --
+    /// the second-listener act's rings, which that act opens with next.
+    pub const CLIENT_TWIN_STATE: usize = 24;
+
     /// The first four bytes of a v6 record in the rings between the
     /// protocol service and the TCP service, where a v4 record carries the
     /// source address instead: `255.255.255.255` can never originate a

@@ -24749,9 +24749,9 @@ fn report_tcp_client(hhdm: u64) {
         }
         12 => {
             "did everything outcome 9 says, then opened a v6 connection to [::1], accepted it \
-             with its own listener, and echoed itself eight samples and 32 KiB through the \
-             loopback -- the whole TCP machine, both roles, second family, one program \
-             (RFC 0029 steps 5 and 6)"
+             on a listener of its own, apart from port 7's, and echoed itself \
+             eight samples and 32 KiB through the loopback -- the whole TCP machine, both \
+             roles, second family, one program (RFC 0029 steps 5 and 6)"
         }
         13 => {
             "accepted a v6 connection that is not its own [::1] client (detail: the peer as \
@@ -24827,6 +24827,26 @@ fn report_tcp_client(hhdm: u64) {
     }
     if outcome == 9 || outcome == 8 || outcome == 10 || outcome == 11 || outcome == 12 {
         println!("    tcp client     {said}");
+        // **The twin's listener was its own, and it let go** (2026-10-29). The
+        // program publishes `FOUR_DONE` only after its listener stopped, and
+        // only then outcome 12 -- so outcome 12 with anything else is the
+        // program contradicting itself, and said so in red.
+        if outcome == 12
+            && let Some(base) = tcpc_report_page(hhdm)
+        {
+            let port = bhaskix_abi::tcp::CLIENT_TWIN_PORT;
+            match report_page_word(base, bhaskix_abi::tcp::CLIENT_TWIN_STATE) {
+                bhaskix_abi::tcp::FOUR_DONE => println!(
+                    "    tcp twin       the v6 twin listened on port {port}, on a listener of its \
+                     own apart from port 7's, and that listener stopped and gave its rings back"
+                ),
+                state => println!(
+                    "\x1b[91m    tcp twin       FAILED: the client reported its v6 echo done, \
+                     but its twin's listener on port {port} reads state {state}, not stopped\
+                     \x1b[0m"
+                ),
+            }
+        }
     } else if outcome == 2
         && (detail == bhaskix_abi::tcp::WAIT_ENTERED
             || bhaskix_abi::tcp::waiting_in(detail).is_some())

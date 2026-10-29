@@ -136,6 +136,9 @@ const PAIR_STRIDE: u64 = 0x2_0000;
 ///
 /// **Still six since RFC 0092 (2026-10-20)**, when a listener can be released.
 /// `bin/tcpc` holds two and `bin/linuxd` three, so five can be open at once.
+/// `bin/tcpc`'s second is first its IPv6 twin's and then, once that one has
+/// stopped (2026-10-29), its second-listener act's -- one after the other, never
+/// both, which is why the twin waits for its listener to say it has stopped.
 /// A released listener that is still draining keeps its slot while the one
 /// that replaced it takes another.
 const MAX_LISTENERS: usize = 6;

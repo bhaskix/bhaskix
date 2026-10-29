@@ -79,6 +79,10 @@ const SECOND_PORT: u16 = 8;
 /// slot its connection capability lands in.
 const DIAL_RINGS: (u64, u64) = (27, 28);
 const DIAL_CONNECTION: u64 = 29;
+/// Where the IPv6 twin's own listener lands -- on
+/// [`abi_tcp::CLIENT_TWIN_PORT`], over [`SECOND_RINGS`] borrowed until the
+/// second-listener act opens with them (2026-10-29).
+const TWIN_LISTENER: u64 = 30;
 /// What the second dial sends, and must get back from its own `cat`.
 const DIAL_PAYLOAD: &[u8; 16] = b"bhaskix-dial-ok!";
 /// The host, as `slirp` presents it to the guest: the peer `PEER` must name.
@@ -845,12 +849,22 @@ extern "C" fn tcpc_main(hertz: u64) -> ! {
     // RFC 0029 step 5: the same machine, second family, both roles. The
     // v4 story is over: the outbound connection closed, the accepted one
     // closed, and both table slots are free — but the handover's rings
-    // are still mapped in the service, and the listener is still armed.
+    // are still mapped in the service.
     // One CONNECT6 leg re-opens the outbound slot with a v6 tuple over
     // those same rings; the SYN to [::1] loops back through the protocol
-    // service without touching a wire, this program's own listener
+    // service without touching a wire, a listener of this program's own
     // accepts it, and this program serves itself an echo — client and
     // server, sixteen bytes, every state both machines walk.
+    //
+    // ~~That listener was port 7's~~ -- **a listener for the twin alone since
+    // 2026-10-29**, on a port the lanes forward nothing to. On port 7 it shared one
+    // armed pair with the host's inbound echo: an echo attempt still waiting
+    // when the served one gave that pair back retransmitted, took it, and the
+    // twin's handshake `ACK` was refused for want of it. Under SYN cookies a
+    // refused final `ACK` is never sent again, so the twin's server side was
+    // never built and step 16 accepted the stranger -- CI run 870, and once
+    // here, read off `bin/tcpd`'s counts: seven cookies offered, two built,
+    // thirteen `ACK`s refused for want of a pair on port 7.
     // ------------------------------------------------------------------
     const LOOPBACK: [u8; 16] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
     report(14, outcome::STARTING, 0);
@@ -878,12 +892,36 @@ extern "C" fn tcpc_main(hertz: u64) -> ! {
         }
         news(WAKE, &pace);
     }
+    // The twin's listener, before the clock starts: over the second-listener
+    // act's rings, which that act opens with only after this listener has
+    // stopped and given them back below. A refusal names its leg's word in
+    // the low bits, under `0x7007` so it reads as this listener's.
+    if let Err(error) = tcp::listen_open(
+        SERVICE,
+        abi_tcp::CLIENT_TWIN_PORT,
+        SECOND_RINGS,
+        Some((L_WAKE, 2)),
+        TWIN_LISTENER,
+    ) {
+        let detail = match error {
+            LegError::Stuck => {
+                report(14, outcome::STUCK, 0x7007 << 32);
+                exit();
+            }
+            LegError::HandRefused(status) => status,
+            LegError::Refused { detail, .. } => detail,
+        };
+        report(14, outcome::REFUSED, 0x7007 << 32 | (detail & 0xffff_ffff));
+        exit();
+    }
+    report_word(abi_tcp::CLIENT_TWIN_STATE, abi_tcp::FOUR_READY);
+    let (twin_send_view, twin_recv_view) = four_views[3];
     let handshake6_started = now();
     if let Err(status) = tcp::expect(SERVICE, CONNECTION6) {
         report(14, outcome::REFUSED, status << 8);
         exit();
     }
-    if let Err(error) = tcp::leg6(SERVICE, LOOPBACK, LISTEN_PORT as u16, None, 2) {
+    if let Err(error) = tcp::leg6(SERVICE, LOOPBACK, abi_tcp::CLIENT_TWIN_PORT, None, 2) {
         let detail = match error {
             LegError::Stuck => {
                 report(14, outcome::STUCK, 0);
@@ -921,7 +959,7 @@ extern "C" fn tcpc_main(hertz: u64) -> ! {
     // in this number -- it is the stack's own cost, twice over.
     report_word(10, now().wrapping_sub(handshake6_started));
 
-    // The accepted twin, from this program's own listener.
+    // The accepted twin, from its own listener.
     if let Err(status) = tcp::expect(SERVICE, INBOUND6) {
         report(16, outcome::REFUSED, status << 8);
         exit();
@@ -929,7 +967,7 @@ extern "C" fn tcpc_main(hertz: u64) -> ! {
     report(16, outcome::STARTING, 2);
     let mut accepted6 = false;
     for _ in 0..300u32 {
-        match tcp::accept(LISTENER) {
+        match tcp::accept(TWIN_LISTENER) {
             AcceptPoll::Accepted { .. } => {
                 accepted6 = true;
                 break;
@@ -945,9 +983,10 @@ extern "C" fn tcpc_main(hertz: u64) -> ! {
         report(16, outcome::NOBODY, 0);
         exit();
     }
-    // **That it is the twin**, asked rather than assumed: the listener may hold
-    // other pending connections, and step 17 trusts this one to be the client
-    // this program just opened to `[::1]`.
+    // **That it is the twin**, asked rather than assumed: step 17 trusts this
+    // one to be the client this program just opened to `[::1]`. Kept since the
+    // twin's listener became its own, which no lane forwards to: a v4 peer here
+    // now says a host found the twin's port -- possible on a real network.
     match tcp::peer(INBOUND6) {
         Some(tcp::Peer::Loopback6 { .. }) => {}
         Some(tcp::Peer::V4 { port, .. }) => {
@@ -965,8 +1004,10 @@ extern "C" fn tcpc_main(hertz: u64) -> ! {
     // client send, server echo, client read -- so every sample is the
     // stack's own cost through the loopback, both crossings, no emulator.
     // The stream offsets are the new connection's own and start at zero;
-    // the ring bytes are the old story's leavings, overwritten, and the
-    // payload's final byte was chosen to differ from every one of them.
+    // the client's ring bytes are the old story's leavings, overwritten, and
+    // the payload's final byte was chosen to differ from every one of them.
+    // The accepted side's rings are the twin listener's, the second-listener
+    // act's pair, which nothing has used yet.
     report(17, outcome::STARTING, 3);
     let mut samples6 = [0u64; 8];
     let mut client_sent6 = 0u64;
@@ -1004,7 +1045,7 @@ extern "C" fn tcpc_main(hertz: u64) -> ! {
             exit();
         }
         for offset in served_told6..client_sent6 {
-            l_send_view.write(offset, l_recv_view.read(offset));
+            twin_send_view.write(offset, twin_recv_view.read(offset));
         }
         if let Err(status) = tcp::send(INBOUND6, client_sent6 - served_told6) {
             report(18, outcome::REFUSED, status << 8);
@@ -1077,7 +1118,7 @@ extern "C" fn tcpc_main(hertz: u64) -> ! {
             exit();
         }
         for offset in served_told6..client_sent6 {
-            l_send_view.write(offset, l_recv_view.read(offset));
+            twin_send_view.write(offset, twin_recv_view.read(offset));
         }
         if let Err(status) = tcp::send(INBOUND6, CHUNK6) {
             report(19, outcome::REFUSED, status << 8);
@@ -1100,6 +1141,33 @@ extern "C" fn tcpc_main(hertz: u64) -> ! {
     let _ = tcp::shutdown(CONNECTION6);
     let _ = tcp::shutdown(INBOUND6);
     let _ = tcp::release(INBOUND6);
+    // **The twin's listener stops, and its rings come back** -- RFC 0092, the
+    // way `bin/linuxd` closes one: asked until the service says it holds
+    // nothing. It answers `LATER` while the connection it accepted is still
+    // closing, and stops once that one is released and closed or in TIME_WAIT,
+    // so this does not sit out TIME_WAIT. Before the outcome below, because the
+    // second-listener act opens with these rings next, and the service must
+    // hold no copy of them by then.
+    let mut stopping = 0u32;
+    loop {
+        match tcp::stop_listening(TWIN_LISTENER) {
+            tcp::Stopping::Stopped | tcp::Stopping::Gone => break,
+            tcp::Stopping::Draining => {
+                stopping += 1;
+                if stopping > 300 {
+                    report(19, outcome::STUCK, 0x7007 << 32 | 1);
+                    exit();
+                }
+                news(L_WAKE, &pace);
+            }
+            tcp::Stopping::ServiceSaid(word) | tcp::Stopping::KernelSaid(word) => {
+                report(19, outcome::REFUSED, 0x7007 << 32 | (word & 0xffff_ffff));
+                exit();
+            }
+        }
+    }
+    let _ = call(syscall::INVOKE, TWIN_LISTENER, method::DELETE, [0; 4]);
+    report_word(abi_tcp::CLIENT_TWIN_STATE, abi_tcp::FOUR_DONE);
     report(19, outcome::LOOPED6, 0);
     let extra = [four_views[0], four_views[1], four_views[2]];
     if four_at_once(l_send_view, l_recv_view, extra, &pace) {
