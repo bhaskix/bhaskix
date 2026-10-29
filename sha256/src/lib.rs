@@ -134,6 +134,11 @@ const H0: [u32; 8] = [
 /// Streaming exists because the install path hashes a payload as it copies
 /// it page by page — holding the whole file to hash it would make the
 /// verify-before-record promise cost a second buffer.
+///
+/// `Clone`, so a caller hashing many inputs that share a prefix compresses the
+/// prefix once and clones the state: SLH-DSA's tweakable hashes all begin with
+/// the same 64-byte block (RFC 0091).
+#[derive(Clone)]
 pub struct Sha256 {
     state: [u32; 8],
     /// Bytes not yet forming a full block.
