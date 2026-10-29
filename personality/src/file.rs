@@ -799,6 +799,17 @@ pub fn plan_fcntl(command: u64, argument: u64) -> Result<Fcntl, i64> {
 pub mod ioctl {
     /// Read terminal attributes. What `isatty` actually calls.
     pub const TCGETS: u64 = 0x5401;
+    /// Read terminal attributes with both line speeds -- `struct termios2`.
+    ///
+    /// **What `isatty` calls in a newer C library, and it was refused here
+    /// until 2026-10-29.** Ubuntu 26.04's BusyBox 1.37.0 asks this and never
+    /// `TCGETS`, so the adapter's `ENOTTY` told it the console was no terminal,
+    /// and its shell ran with no prompt (`TRACKER.md` §7, that day).
+    ///
+    /// `_IOR('T', 0x2A, struct termios2)` in `asm-generic/ioctls.h` on the
+    /// build host, read 2026-10-29: direction "read" (2) in bits 30-31, the
+    /// size, 44, in bits 16-29, then `'T'` and `0x2A`.
+    pub const TCGETS2: u64 = 0x802C_542A;
     /// Read the window size.
     pub const TIOCGWINSZ: u64 = 0x5413;
 }
@@ -829,11 +840,27 @@ pub const fn console_termios() -> [u8; TERMIOS_BYTES] {
     [0; TERMIOS_BYTES]
 }
 
+/// Bytes in the `termios2` a `TCGETS2` fills: a `termios`, then the input and
+/// output speeds as two 32-bit words (`asm-generic/termbits.h` on the build
+/// host, read 2026-10-29).
+pub const TERMIOS2_BYTES: usize = 44;
+
+/// The same settings as [`console_termios`], with both speeds zero.
+///
+/// Zero is what the `B0` in the flag words already says, so the two answers
+/// cannot disagree about this console.
+#[must_use]
+pub const fn console_termios2() -> [u8; TERMIOS2_BYTES] {
+    [0; TERMIOS2_BYTES]
+}
+
 /// What an `ioctl` asks for, if this adapter answers it at all.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Ioctl {
     /// `isatty`: succeed for a console and refuse for everything else.
     AskIfTerminal,
+    /// `isatty` through `TCGETS2`: the same, answered with a `termios2`.
+    AskIfTerminalWithSpeeds,
     /// The window size, which this adapter answers as zeroes.
     WindowSize,
 }
@@ -853,6 +880,7 @@ pub fn plan_ioctl(request: u64, kind: Kind) -> Result<Ioctl, i64> {
     let terminal = kind == Kind::Console;
     match request {
         ioctl::TCGETS if terminal => Ok(Ioctl::AskIfTerminal),
+        ioctl::TCGETS2 if terminal => Ok(Ioctl::AskIfTerminalWithSpeeds),
         ioctl::TIOCGWINSZ if terminal => Ok(Ioctl::WindowSize),
         _ => Err(errno::ENOTTY),
     }
@@ -1228,6 +1256,41 @@ mod tests {
                 "{kind:?}"
             );
         }
+    }
+
+    #[test]
+    fn tcgets2_answers_a_terminal_only_for_a_console() {
+        // BusyBox 1.37.0's `isatty` asks only this: refused, its shell ran
+        // with no prompt on a console it could type at.
+        assert_eq!(
+            plan_ioctl(ioctl::TCGETS2, Kind::Console),
+            Ok(Ioctl::AskIfTerminalWithSpeeds)
+        );
+        for kind in [Kind::File, Kind::Pipe, Kind::Socket, Kind::Directory] {
+            assert_eq!(
+                plan_ioctl(ioctl::TCGETS2, kind),
+                Err(errno::ENOTTY),
+                "{kind:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn tcgets2_names_the_size_the_adapter_writes() {
+        // `_IOR` puts the length of what is read in bits 16-29: a number that
+        // disagreed with `TERMIOS2_BYTES` would be a write at the wrong length.
+        let size = u64::try_from(TERMIOS2_BYTES).unwrap_or(0);
+        assert_eq!(
+            ioctl::TCGETS2,
+            (2 << 30) | (size << 16) | (u64::from(b'T') << 8) | 0x2A
+        );
+    }
+
+    #[test]
+    fn a_termios2_is_the_same_settings_with_both_speeds_zero() {
+        let termios2 = console_termios2();
+        assert_eq!(&termios2[..TERMIOS_BYTES], &console_termios()[..]);
+        assert!(termios2.iter().all(|byte| *byte == 0));
     }
 
     #[test]

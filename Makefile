@@ -96,12 +96,18 @@ GO_FETCH     := tools/fetch-go.sh >/dev/null
 GO_ENV       := GOTOOLCHAIN=local CGO_ENABLED=0 GOOS=linux GOARCH=amd64
 GO_HELLO     := build/go-hello
 # The L1 corpus: a real static BusyBox, the first program in this project's
-# history that somebody else wrote, built by somebody else, for Linux. Taken
-# from the build machine if it has one and *statically linked* -- a dynamic one
-# would need the interpreter L2 is about, and would fail for that reason rather
-# than for anything this adapter does. Absent is reported, not fatal, exactly as
-# the Go corpus is.
-BUSYBOX_SRC  := $(shell for c in /bin/busybox /usr/bin/busybox; do                    if [ -x "$$c" ] && file -L "$$c" 2>/dev/null | grep -q 'statically linked';                    then echo "$$c"; break; fi; done)
+# history that somebody else wrote, built by somebody else, for Linux. *Statically
+# linked* -- a dynamic one would need the interpreter L2 is about, and would fail
+# for that reason rather than for anything this adapter does. Absent is
+# reported, not fatal, exactly as the Go corpus is.
+#
+# **Pinned since 2026-10-29** (`tools/fetch-busybox.sh`): Ubuntu's plain-amd64
+# `busybox-static`, checked against its sha256. ~~Taken from the build machine
+# if it has one~~ -- until CI's runner moved to 26.04, whose `/bin/busybox` is an
+# x86-64-v3 build that traps under Bhaskix at its first AVX instruction, and all
+# six boot lanes went red (run 874). `BUSYBOX_SRC=/path` stages another static
+# one instead; `BUSYBOX_SRC=` stages none, as the release does.
+BUSYBOX_SRC  := pinned
 BUSYBOX      := build/busybox
 # **The Go corpus is out of the image unless asked for, and the reason is a
 # hard ceiling rather than taste.** The root filesystem is read into *one
@@ -433,13 +439,20 @@ $(HELLO): $(HELLO_DIR)/src/main.rs $(HELLO_DIR)/link.ld $(HELLO_DIR)/Cargo.toml 
 # The BusyBox corpus, copied rather than built: this is deliberately somebody
 # else's binary, unmodified, so that what it asks for is not a thing this
 # project chose.
-$(BUSYBOX):
+#
+# The fetch script is a prerequisite so that moving the pin re-stages, and a
+# tree holding a copy from before the pin re-stages once.
+$(BUSYBOX): tools/fetch-busybox.sh
 	@mkdir -p $(dir $@)
-	@if [ -n "$(BUSYBOX_SRC)" ]; then \
-	    cp $(BUSYBOX_SRC) $@ && echo "staged $@ from $(BUSYBOX_SRC) ($$(stat -c%s $@) bytes)"; \
+	@src="$(BUSYBOX_SRC)"; \
+	if [ "$$src" = pinned ]; then \
+	    src="$$(tools/fetch-busybox.sh)" || src=; \
+	fi; \
+	if [ -n "$$src" ]; then \
+	    cp "$$src" $@ && echo "staged $@ from $$src ($$(stat -c%s $@) bytes)"; \
 	else \
 	    : > $@; \
-	    echo "no static busybox on this machine: $@ left empty, the corpus gate will say so"; \
+	    echo "no static busybox staged: $@ left empty, the corpus gate will say so"; \
 	fi
 
 $(GO_HELLO): corpus/hello.go tools/fetch-go.sh

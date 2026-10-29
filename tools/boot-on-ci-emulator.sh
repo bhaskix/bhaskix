@@ -13,7 +13,8 @@
 # `TRACKER.md` said, repeatedly and correctly, that **the boot lanes had never
 # been run on the emulator CI uses**. This machine has QEMU 4.2.1; the runner
 # installs `qemu-system-x86` from Ubuntu 24.04, which is 8.2.2 -- four major
-# versions apart. So when two boot lanes went red on docs-only commits in August
+# versions apart. (Six since 2026-10-29: the runner is 26.04, and its QEMU is
+# 10.2.1 -- see `BASE` below.) So when two boot lanes went red on docs-only commits in August
 # 2026 and would not reproduce locally, "it passes here" was carrying weight it
 # had not earned: it established that the gates pass on 4.2.1 and said very
 # little about a failure on 8.2.2.
@@ -56,12 +57,17 @@
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-IMAGE="${BHASKIX_CI_EMU_IMAGE:-bhaskix-qemu822}"
+IMAGE="${BHASKIX_CI_EMU_IMAGE:-bhaskix-qemu1021}"
 # Matches `runs-on: ubuntu-latest` at the time of writing. Pinned as a variable
 # rather than buried, because the day the runner moves this is the line that has
 # to move with it -- and a tool that silently tests the wrong emulator is worse
 # than one that does not exist.
-BASE="${BHASKIX_CI_EMU_BASE:-ubuntu:24.04}"
+#
+# **That day was 2026-10-29**: `ubuntu-latest` became 26.04, QEMU 8.2.2 became
+# 10.2.1, and CI run 874 went red on all six boot lanes. This line still said
+# 24.04, so until it moved the tool tested the emulator CI had stopped using.
+# The image name carries the QEMU version, so the old image is never reused.
+BASE="${BHASKIX_CI_EMU_BASE:-ubuntu:26.04}"
 
 RED=$'\033[1;31m'; GREEN=$'\033[1;32m'; YELLOW=$'\033[1;33m'; DIM=$'\033[2m'; RESET=$'\033[0m'
 

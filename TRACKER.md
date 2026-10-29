@@ -1010,6 +1010,7 @@ Phase 2 exit criterion**, and none was built when this table was written.
 | `readlinkat` and `/proc/self/exe` | step 8 | **L1** | the first program that needs its own path (step 8's record) | ⬜ |
 | `/proc/self/cmdline` and `environ` | unresolved question 3 | **L1** | the first program that reads them — the reason given for leaving them out went with RFC 0059 | ⬜ |
 | Asynchronous signal delivery: `SIGURG`, and `tgkill` beyond a fatal signal to oneself | step 6, corpus program 5 | [RFC 0083](docs/rfc/0083-a-signal-a-process-can-catch.md)'s recorded limit | RFC 0083's own: signals raised minus delivered non-zero on a boot that is not deliberately spinning | ⬜ |
+| **AVX state** — XSAVE and XCR0 enabled, so an x86-64-v3 Linux program runs | 2026-10-29, CI run 874 | **L1** | the first L1 program that needs AVX, or the first distribution whose packages assume x86-64-v3 | ⬜ — **the kernel never enables AVX state**: no `xsetbv`, no `CR4.OSXSAVE`. So a program built for x86-64-v3 traps at its first VEX instruction, on QEMU and on the SR550 alike. Ubuntu 26.04's `amd64v3` BusyBox does, at `vmovdqa` (rip 0x56df50), reproduced under QEMU 10.2.1. A program that checks `CPUID` and `XGETBV` first, as glibc's dispatch does, falls back and runs. Enabling it means an XSAVE area per thread and a context-switch cost to measure: an RFC. **This host's QEMU 4.2.1 cannot see the failure**: the same v3 binary runs to completion under it, which is consistent with the old TCG executing VEX-encoded SSE without checking (recalled, not verified), so only CI's emulator (`tools/boot-on-ci-emulator.sh`) shows it |
 | A futex contention stress test | step 6 | here | none written; a debt against the RFC's own plan | ⬜ |
 | A fuzz target over the system-call argument decoder | testing plan | here | none needed: `coding-style.md` §8 requires one for every parser of untrusted input — the two Linux targets cover the `dirent` encoder and `sockaddr` parsing only | ⬜ |
 | Rule 2's negative test, restated for the adapter — the capabilities are `bin/linuxd`'s, so "a domain holding no filesystem capability" is no longer the shape | security implications | here | none written | ⬜ |
@@ -1087,6 +1088,44 @@ the distinction is in the table rather than in somebody's head.
 ## 7. Changelog
 
 Newest first. One entry per meaningful change of project state.
+
+### 2026-10-29 (CI run 874: the runner's BusyBox became an x86-64-v3 build; the corpus is pinned, and `TCGETS2` answered)
+
+**All six boot lanes went red on `61bb353`, on one gate: `BusyBox's sh did not run`. RFC 0093
+was not the cause.** Between run 873 (2026-10-20, green) and run 874, GitHub's `ubuntu-latest`
+moved from 24.04 to **26.04**. QEMU went from 8.2.2 to 10.2.1, and `/bin/busybox` became
+Ubuntu's **x86-64-v3 variant** build, whose own package note says
+`"architectureVariant":"amd64v3"`. The boot lanes staged whatever static BusyBox the machine had.
+That build traps at `vmovdqa` (rip 0x56df50), because Bhaskix never enables AVX state.
+
+Each arm was run here, not inferred:
+- **The v3 binary, under QEMU 10.2.1** (`tools/boot-on-ci-emulator.sh`, base `ubuntu:26.04`):
+  bios `max` and bios `qemu64` both FAIL on that gate alone.
+- **Ubuntu's plain-amd64 `busybox-static` 1:1.37.0-7ubuntu1, under the same emulator**: both
+  cells ok, 175 checks each.
+- **CI's own ISO, under this host's QEMU 4.2.1**: BusyBox runs. No local lane could have seen
+  this.
+
+**The fix pins the corpus**: `tools/fetch-busybox.sh`, shaped like `tools/fetch-go.sh`. It fetches
+the plain-amd64 package from the Ubuntu archive and checks its sha256 before unpacking. It refuses
+a binary that is not static or whose note names an architecture variant. Each refusal was made to
+fire once: a wrong pinned hash, and the v3 binary. `make` stages it for local builds and CI alike,
+so every gate runs one known binary. `BUSYBOX_SRC=/path` still overrides, and the release still
+stages none. `tools/boot-on-ci-emulator.sh` now defaults to 26.04. Its own comment had said the
+day the runner moved was the line that had to move with it. The AVX gap is recorded under *Carried
+out of RFC 0005*, for an RFC when an L1 program needs it.
+
+**The pin found a second gap, fixed in the same change: `TCGETS2`.** Pinned, 1.37.0 passed every
+boot lane and failed `make test-busybox`, the interactive lane. Its `sh` printed no banner and no
+prompt. Typing with a newline showed it running **non-interactively**: one `ioctl`, where 1.30.1
+made several. 1.37.0's C library asks `isatty` with `TCGETS2` (`struct termios2`, 44 bytes), and
+`plan_ioctl`'s allow-list held only `TCGETS` and `TIOCGWINSZ`. So the adapter answered `ENOTTY`,
+and **every program on that C library found the console was no terminal**. The allow-list now
+answers `TCGETS2` on a console with the same all-zero settings at `termios2`'s length.
+`ioctl::TCGETS2` is `0x802C542A`, from `_IOR('T', 0x2A, struct termios2)` in the build host's
+headers. Three host tests cover it. The console one was watched red before the arm was added, and
+the size check went red once at a 36-byte `termios2`. `make test-busybox` then passed with 1.37.0,
+and the *Linux programs* guide's transcript was re-taken with it.
 
 ### 2026-10-29 (RFC 0091: the lead's decisions on questions 1–8)
 

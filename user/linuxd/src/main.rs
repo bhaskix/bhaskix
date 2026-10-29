@@ -5992,6 +5992,16 @@ fn answer_ioctl(request: &PersonalityCall) -> Answer {
             }
             Answer::ok(0)
         }
+        // The same answer at `termios2`'s length, both speeds zero: what a
+        // newer C library's `isatty` asks instead (BusyBox 1.37.0, whose shell
+        // ran with no prompt while this was refused).
+        Ok(Ioctl::AskIfTerminalWithSpeeds) => {
+            let termios2 = bhaskix_personality::file::console_termios2();
+            if !copy_out(request.domain, request.third(), &termios2) {
+                return Answer::error(-14); // EFAULT
+            }
+            Answer::ok(0)
+        }
         Ok(Ioctl::WindowSize) => {
             // Four `u16`s: rows, columns, and two pixel counts. Zeroes,
             // because this console's size is not something the adapter knows
