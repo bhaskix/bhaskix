@@ -30,6 +30,9 @@ bhaskix-fs = { path = "../fs" }
 bhaskix-arch-x86-64 = { path = "../arch/x86_64" }
 bhaskix-net = { path = "../net" }
 bhaskix-pkg = { path = "../pkg" }
+# RFC 0091: `boot.sig` and its signature check, read off a partition anybody
+# with the disk can write.
+bhaskix-bootsig = { path = "../bootsig" }
 # The one definition of a well-formed `ustar` header, behind the feature
 # gate that keeps a header *writer* out of anything that ships. The
 # `ustar_parse` and `pkg_package` targets need it for the same reason
@@ -236,6 +239,13 @@ bench = false
 [[bin]]
 name = "tpm_response"
 path = "fuzz_targets/tpm_response.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "bootsig"
+path = "fuzz_targets/bootsig.rs"
 test = false
 doc = false
 bench = false
