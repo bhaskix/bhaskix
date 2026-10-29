@@ -280,7 +280,7 @@ OVMF_SUFFIX  := $(if $(wildcard /usr/share/OVMF/OVMF_CODE_4M.fd),_4M,)
 OVMF_CODE    := $(firstword $(wildcard $(OVMF_DIR)OVMF_CODE$(OVMF_SUFFIX).fd))
 OVMF_VARS    := $(firstword $(wildcard $(OVMF_DIR)OVMF_VARS$(OVMF_SUFFIX).fd))
 
-.PHONY: FORCE all kernel iso demo run run-uefi release-dist progress test test-host test-boot test-boot-uefi test-boot-uefi-qemu64 test-boot-iommu test-keyboard \
+.PHONY: FORCE all kernel iso demo run run-uefi release-dist release-finish ceremony-kit progress test test-host test-boot test-boot-uefi test-boot-uefi-qemu64 test-boot-iommu test-keyboard \
         test-boot-iommu-off test-boot-qemu64 test-boot-native test-boot-native-full test-boot-native-tpm \
         test-boot-native-tpm-tis test-boot-secureboot test-placements mkfs bootsign test-shell test-faults test-usb-keyboard test-lacp test-bond test-http fmt clippy gates hooks clean distclean help
 
@@ -708,7 +708,22 @@ release-dist:
 	cd $(BOOTEFI_DIR) && BHASKIX_BOOT_KEYS=$(RELEASE_BOOT_KEYS) \
 	    CARGO_TARGET_DIR=$(CURDIR)/$(RELEASE_LOADER_DIR) \
 	    $(CARGO) build --release --target x86_64-unknown-uefi
-	tools/release-dist.sh $(RELEASE_ISO) $(RELEASE_LOADER) build/toolchain/go$(GO_VERSION)/LICENSE dist $(TAG)
+	RELEASE_BOOT_KEYS=$(RELEASE_BOOT_KEYS) \
+	    tools/release-dist.sh $(RELEASE_ISO) $(RELEASE_LOADER) build/toolchain/go$(GO_VERSION)/LICENSE dist $(TAG)
+
+# **What the offline machine signed, taken back and checked** (RFC 0091 step
+# 6). `make release-dist` with release keys writes dist/to-sign/; the lead signs
+# it with `tools/release-keys.sh sign` (docs/release-keys.md) and brings SIGNED
+# back. This verifies both signatures against the committed public halves in
+# boot/keys/, checks the signed loader is the one built here, and assembles.
+# The removable medium for that ceremony: bootsign, the script, the procedure,
+# and the one package a fresh Ubuntu 26.04 LTS install lacks, pinned.
+ceremony-kit: bootsign
+	tools/ceremony-kit.sh $(or $(KIT),build/ceremony-kit)
+
+release-finish: bootsign
+	@[ -n "$(SIGNED)" ] || { echo "release-finish: SIGNED=DIR names what tools/release-keys.sh sign wrote"; exit 2; }
+	tools/release-finish.sh dist $(SIGNED) $(or $(RELEASE_PUBLIC),boot/keys)
 
 # --- run -----------------------------------------------------------------
 

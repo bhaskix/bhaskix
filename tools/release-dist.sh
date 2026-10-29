@@ -8,8 +8,17 @@
 #   bhaskixboot.efi  the native loader
 #   LICENSE-go       Go's licence, because the server carries Go's runtime
 #   SHA256SUMS       over the two binaries
+#   to-sign/         only with release keys (RFC 0091 step 6): the loader and
+#                    the boot set, for the offline machine to sign
 #
 #   tools/release-dist.sh ISO EFI GO_LICENSE OUT [TAG]
+#
+# RELEASE_BOOT_KEYS, from the environment, names the boot-set public keys the
+# loader was built with, `:`-separated, or `none` -- the preview's. With keys,
+# the loader must hold every one of them, and to-sign/ is written: the
+# unsigned loader, the kernel and initrd read out of the ISO, a canonical
+# boot.conf, and SHA256SUMS. `tools/release-keys.sh sign` signs it on the
+# offline machine, and `make release-finish` checks what comes back.
 #
 # `make release-dist` runs it. With TAG, the tag must name the version both
 # Cargo.toml files carry -- the workspace's, and the loader's, which is its own
@@ -83,6 +92,25 @@ then
     fail "the loader trusts the published test key; build it with RELEASE_BOOT_KEYS naming release keys, or none"
 fi
 
+# RFC 0091 step 6: and with release keys named, **the loader holds each of
+# them** -- the same question asked the other way, of the same file.
+keys=${RELEASE_BOOT_KEYS:-none}
+key_files=()
+if [[ $keys != none ]]; then
+    IFS=: read -ra key_files <<< "$keys"
+    for key in "${key_files[@]}"; do
+        [[ -s $key ]] || fail "RELEASE_BOOT_KEYS names $key, which is not there"
+        python3 -I - "$efi" "$key" <<'PY' || fail "the loader does not hold $key, which RELEASE_BOOT_KEYS names"
+import sys
+image = open(sys.argv[1], "rb").read()
+key = open(sys.argv[2], "rb").read()
+sys.exit(0 if len(key) == 32 and key in image else 1)
+PY
+    done
+    xorriso -osirrox on -indev "$iso" -extract /boot/bhaskix "$work/kernel" >/dev/null 2>&1 ||
+        fail "could not read the kernel out of $iso"
+fi
+
 rm -rf "$out"
 mkdir -p "$out"
 cp "$iso" "$out/bhaskix.iso"
@@ -90,6 +118,20 @@ cp "$efi" "$out/bhaskixboot.efi"
 cp "$go_license" "$out/LICENSE-go"
 (cd "$out" && sha256sum bhaskix.iso bhaskixboot.efi > SHA256SUMS && sha256sum -c --quiet SHA256SUMS) ||
     fail "the sums did not check"
+
+# What the offline machine signs: the loader for the firmware, and the boot set
+# -- the kernel and initrd the ISO carries, and the boot.conf a signed boot
+# uses -- for boot.sig. Its own sums, checked again there before anything is
+# signed.
+if (( ${#key_files[@]} > 0 )); then
+    mkdir -p "$out/to-sign/bhaskix"
+    cp "$efi" "$out/to-sign/bhaskixboot.efi"
+    cp "$work/kernel" "$out/to-sign/bhaskix/kernel"
+    cp "$work/initrd.tar" "$out/to-sign/bhaskix/initrd.tar"
+    printf 'cmdline=\n' > "$out/to-sign/bhaskix/boot.conf"
+    (cd "$out/to-sign" && sha256sum bhaskixboot.efi bhaskix/kernel bhaskix/initrd.tar bhaskix/boot.conf > SHA256SUMS)
+    echo "release-dist: $out/to-sign/ is for the offline machine: tools/release-keys.sh sign $out/to-sign SIGNED"
+fi
 
 echo "release-dist: ${tag:-untagged} in $out/ -- BusyBox ${busybox:-absent}, Go server $httpd bytes, the loader trusting no test key"
 (cd "$out" && ls -l bhaskix.iso bhaskixboot.efi LICENSE-go SHA256SUMS | awk '{ printf "  %10s  %s\n", $5, $9 }')
