@@ -47,6 +47,11 @@ bhaskix-ahci = { path = "../ahci" }
 bhaskix-tcglog = { path = "../tcglog" }
 # RFC 0089 step 5b: what a TPM answers.
 bhaskix-tpm = { path = "../tpm" }
+# The nucleus's range constructor, which `linux_decoder` hands every range
+# the personality's decoder accepts -- the two together are where a hosted
+# `munmap` panicked the nucleus (2026-10-29).
+bhaskix-mm = { path = "../mm" }
+bhaskix-boot = { path = "../boot/handoff" }
 
 [[bin]]
 name = "elf_parse"
@@ -178,6 +183,16 @@ bench = false
 [[bin]]
 name = "linux_sockaddr"
 path = "fuzz_targets/linux_sockaddr.rs"
+test = false
+doc = false
+bench = false
+
+# RFC 0005's testing plan's mandatory target: the system-call argument decoder,
+# six registers a hosted program chose, fuzzed together with the nucleus's
+# constructor for every range it accepts. See the target's own documentation.
+[[bin]]
+name = "linux_decoder"
+path = "fuzz_targets/linux_decoder.rs"
 test = false
 doc = false
 bench = false

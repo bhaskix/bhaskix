@@ -55,10 +55,12 @@ version = "0.0.0"
 dependencies = [
  "bhaskix-ahci",
  "bhaskix-arch-x86-64",
+ "bhaskix-boot",
  "bhaskix-bootsig",
  "bhaskix-elf",
  "bhaskix-fs",
  "bhaskix-kernel",
+ "bhaskix-mm",
  "bhaskix-net",
  "bhaskix-personality",
  "bhaskix-pkg",
