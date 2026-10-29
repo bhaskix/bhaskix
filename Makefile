@@ -282,7 +282,7 @@ OVMF_VARS    := $(firstword $(wildcard $(OVMF_DIR)OVMF_VARS$(OVMF_SUFFIX).fd))
 
 .PHONY: FORCE all kernel iso demo run run-uefi release-dist release-finish ceremony-kit progress test test-host test-boot test-boot-uefi test-boot-uefi-qemu64 test-boot-iommu test-keyboard \
         test-boot-iommu-off test-boot-qemu64 test-boot-native test-boot-native-full test-boot-native-tpm \
-        test-boot-native-tpm-tis test-boot-secureboot test-placements mkfs bootsign test-shell test-faults test-usb-keyboard test-lacp test-bond test-http fmt clippy gates hooks clean distclean help
+        test-boot-native-tpm-tis test-boot-secureboot test-release-keys test-placements mkfs bootsign test-shell test-faults test-usb-keyboard test-lacp test-bond test-http fmt clippy gates hooks clean distclean help
 
 all: iso
 
@@ -809,7 +809,7 @@ run-uefi: $(ISO)
 # one, and `gave up after 0.255s` says nothing about an image at all.
 test: fmt clippy test-host gates test-boot test-boot-uefi test-boot-iommu test-boot-iommu-off \
       test-boot-qemu64 test-boot-uefi-qemu64 test-boot-native test-boot-native-full test-boot-native-tpm \
-      test-boot-native-tpm-tis test-boot-secureboot test-placements test-shell \
+      test-boot-native-tpm-tis test-boot-secureboot test-release-keys test-placements test-shell \
       test-keyboard test-usb-keyboard test-busybox test-bond test-lacp test-faults test-http
 	@echo
 	@echo "  all checks passed"
@@ -1001,6 +1001,15 @@ test-boot-native-tpm-tis: $(BOOTEFI) $(ISO) bootsign
 # without them, unless BHASKIX_REQUIRE=1, as CI sets.
 test-boot-secureboot: $(BOOTEFI) $(ISO) bootsign
 	tests/qemu/secureboot-test.sh
+
+# RFC 0091 step 6, rehearsed: the key ceremony with throwaway keys, in Ubuntu
+# 26.04 -- the offline machine's -- natively or in a pinned container, then five
+# boots under Secure Boot with the rehearsal CA in `db`: a leaf's loader, a
+# rotated leaf's, the leaf in `dbx`, the loader's hash in `dbx`, and a stranger's.
+# And the release recipe's check on what the ceremony signed. $(ISO) for the
+# kernel and initrd it builds; $(BOOTEFI) for the loader that is not the one.
+test-release-keys: $(BOOTEFI) $(ISO) bootsign
+	tests/qemu/release-keys-test.sh
 
 
 # Types at the machine over the serial line and asserts on the replies. The

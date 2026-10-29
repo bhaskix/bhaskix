@@ -291,6 +291,16 @@ jobs:
         run: |
           sudo apt-get install -y -qq sbsigntool
           make test-boot-secureboot
+      # RFC 0091 step 6, rehearsed: the key ceremony with throwaway keys on this
+      # runner's Ubuntu 26.04 -- the offline machine's -- then a CA in `db`, a
+      # leaf's loader, a rotated leaf's, both kinds of `dbx` entry, a stranger,
+      # and the release recipe's check on what was signed.
+      - name: Rehearse the release-key ceremony, and boot what it signed
+        env:
+          BHASKIX_REQUIRE: 1
+        run: |
+          sudo apt-get install -y -qq sbsigntool python3-virt-firmware pesign
+          make test-release-keys
 
       - name: Upload the logs on failure
         if: failure()
