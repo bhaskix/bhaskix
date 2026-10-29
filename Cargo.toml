@@ -110,6 +110,10 @@ members = [
     # RFC 0091 -- SHA-256 as a leaf, so the loader's signature check reaches the
     # hash without the package format.
     "sha256",
+
+    # RFC 0091 -- the boot set's signature: SLH-DSA-SHA2-128s verification and
+    # the statement `boot.sig` carries, pure and fuzzed.
+    "bootsig",
 ]
 
 # The negative fixture for `tools/check-placements.sh`: a service that reaches

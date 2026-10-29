@@ -55,6 +55,10 @@ named rather than hidden:
 - **Adapted third-party source** in [`third_party/`](third_party/), each with
   its own `PROVENANCE.md` naming the upstream, the version, the copyright
   holder and what changed. Everything there is listed in [`NOTICE`](NOTICE).
+- **NIST's ACVP test vectors** for SLH-DSA, in
+  [`third_party/acvp-slh-dsa/`](third_party/acvp-slh-dsa/): what the boot
+  chain's signature verifier is proven against. The verifier is this
+  project's; the vectors that say it is right are NIST's.
 - **The Rust toolchain and LLVM**, and the build tools — `xorriso`, `mkfs.vfat`,
   QEMU — which run on the build machine and ship nothing into the image.
 

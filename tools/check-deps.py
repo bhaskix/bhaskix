@@ -127,6 +127,9 @@ LAYERS = {
     # SHA-256, moved out of the package format for RFC 0091: the loader's
     # signature check needs the hash and nothing above it.
     "bhaskix-sha256": -3,
+    # RFC 0091's boot-set signature check: SHA-256 below it and nothing else,
+    # and the native loader above it.
+    "bhaskix-bootsig": -2,
     # The package format, RFC 0030: manifest, archive walk, SHA-256. A rung
     # above the leaves because it reads archives through `bhaskix-ustar`;
     # nothing below the programs and the host tools depends on it.

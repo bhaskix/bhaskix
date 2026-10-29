@@ -1,0 +1,29 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# RFC 0091 step 1: the boot set's signature. SLH-DSA-SHA2-128s verification
+# and the 128-byte statement `boot.sig` carries -- pure, host-tested against
+# NIST's ACVP vectors, and fuzzed. The native loader links it at step 3.
+[package]
+name = "bhaskix-bootsig"
+description = "The boot set's signature: SLH-DSA-SHA2-128s verification and the boot.sig statement."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[lib]
+name = "bhaskix_bootsig"
+path = "src/lib.rs"
+
+[dependencies]
+bhaskix-sha256 = { path = "../sha256" }
+
+[lints]
+workspace = true
+
+[package.metadata.bhaskix]
+# Hashing and comparing public data, and parsing a file at fixed offsets.
+# Arithmetic and untrusted input, with no `unsafe` that could be justified.
+unsafe_budget = 0
