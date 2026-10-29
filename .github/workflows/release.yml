@@ -56,4 +56,5 @@ jobs:
         run: |
           gh release create "$GITHUB_REF_NAME" --draft --prerelease \
             --title "Bhaskix $GITHUB_REF_NAME" --notes-file dist/body.md \
-            dist/bhaskix.iso dist/bhaskixboot.efi dist/SHA256SUMS dist/LICENSE-go
+            dist/bhaskix.iso dist/bhaskixboot.efi dist/SHA256SUMS \
+            dist/LICENSE dist/NOTICE dist/LICENSE-go dist/LICENSE-limine

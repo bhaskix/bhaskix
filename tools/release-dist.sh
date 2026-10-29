@@ -7,6 +7,11 @@
 #   bhaskix.iso      the Go server in, BusyBox out -- read back out of the ISO
 #   bhaskixboot.efi  the native loader
 #   LICENSE-go       Go's licence, because the server carries Go's runtime
+#   LICENSE-limine   Limine's, because its binaries boot the ISO (BSD 2-Clause
+#                    asks a binary redistribution to carry the notice; missing
+#                    until 2026-10-29)
+#   LICENSE, NOTICE  the project's own, which Apache-2.0 s4 asks a
+#                    redistribution to carry
 #   SHA256SUMS       over the two binaries
 #   to-sign/         only with release keys (RFC 0091 step 6): the loader and
 #                    the boot set, for the offline machine to sign
@@ -41,6 +46,8 @@ fail() {
 [[ -s $iso ]] || fail "no ISO at $iso"
 [[ -s $efi ]] || fail "no loader at $efi"
 [[ -s $go_license ]] || fail "no Go licence at $go_license"
+limine_license=boot/limine/limine/LICENSE
+[[ -s $limine_license ]] || fail "no Limine licence at $limine_license -- tools/setup-dev.sh fetches Limine"
 
 # The version a TOML table declares, read without a TOML library: the first
 # `version = "..."` line after the table's header and before the next one.
@@ -116,6 +123,9 @@ mkdir -p "$out"
 cp "$iso" "$out/bhaskix.iso"
 cp "$efi" "$out/bhaskixboot.efi"
 cp "$go_license" "$out/LICENSE-go"
+cp "$limine_license" "$out/LICENSE-limine"
+cp LICENSE "$out/LICENSE"
+cp NOTICE "$out/NOTICE"
 (cd "$out" && sha256sum bhaskix.iso bhaskixboot.efi > SHA256SUMS && sha256sum -c --quiet SHA256SUMS) ||
     fail "the sums did not check"
 
@@ -134,5 +144,5 @@ if (( ${#key_files[@]} > 0 )); then
 fi
 
 echo "release-dist: ${tag:-untagged} in $out/ -- BusyBox ${busybox:-absent}, Go server $httpd bytes, the loader trusting no test key"
-(cd "$out" && ls -l bhaskix.iso bhaskixboot.efi LICENSE-go SHA256SUMS | awk '{ printf "  %10s  %s\n", $5, $9 }')
+(cd "$out" && ls -l bhaskix.iso bhaskixboot.efi LICENSE LICENSE-go LICENSE-limine NOTICE SHA256SUMS | awk '{ printf "  %10s  %s\n", $5, $9 }')
 sed 's/^/  /' "$out/SHA256SUMS"

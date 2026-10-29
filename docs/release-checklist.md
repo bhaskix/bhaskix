@@ -71,6 +71,9 @@ that does it, with the date.
     that already holds a copy, emptying `BUSYBOX_SRC` alone changes nothing and the old binary ships
     (read in the Makefile 2026-10-19). The workflow asserts the ISO's `bin/busybox` is empty;
   - ship Go's `LICENSE` beside the binaries, because the server carries Go's runtime;
+    and, since 2026-10-29, Limine's as `LICENSE-limine` — its binaries boot the ISO, and BSD
+    2-Clause asks a binary redistribution to carry the notice, which no release file did — with
+    the project's own `LICENSE` and `NOTICE`. `tools/release-dist.sh` copies all four;
   - **pin Limine to the tag `v8.7.0-binary`**, not the moving `v8.x-binary` branch that setup and CI
     follow, and record that tag in the release note;
   - write `SHA256SUMS` over both binaries;

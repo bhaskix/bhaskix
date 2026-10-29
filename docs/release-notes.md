@@ -57,7 +57,10 @@ the counts come from `make test` and `cargo test --workspace`.
 A **developer preview**: an ISO you can boot in QEMU, the source, the RFC
 record, and this list of what does not work. Beside the ISO the release carries
 **`bhaskixboot.efi`**, Bhaskix's own UEFI loader, and a `SHA256SUMS` file. All
-three are built by CI from the tagged commit.
+three are built by CI from the tagged commit. With them come the project's
+`LICENSE` and `NOTICE`, and the licences of the two things the ISO carries from
+others: `LICENSE-go`, for the Go runtime inside its web server, and
+`LICENSE-limine`, for the bootloader that boots it.
 
 It is not a product, not an installer for a machine you rely on, and not a claim
 of production readiness. The word for it is *preview*, and this document uses
