@@ -2766,6 +2766,18 @@ else
     status=1
 fi
 
+# 2026-10-29: the last two pages below 2^64, asked for by a hosted program four
+# ways -- munmap, mmap(MAP_FIXED), mprotect, madvise -- each panicked the nucleus
+# on the CPU running bin/linuxd, because VirtRange::from_pages added without
+# checking. The whole line, with the four answers bin/linuxd gives the nucleus's
+# refusals, so a change to any of them is looked at rather than passed.
+if grep -qE "linux range +munmap, mmap\(MAP_FIXED\), mprotect and madvise of the last two pages below 2\^64 were refused \(-22, -12, -22, -12\) -- once each panicked the nucleus$" <(tr -d '\r' < "$LOG" | sed 's/\x1b\[[0-9;]*m//g'); then
+    pass "a hosted program asking for the top of the address space is refused four ways, and the nucleus runs on"
+else
+    fail "the top-of-address-space refusals: $(grep -aE 'linux range' "$LOG" | head -1 | tr -d '\r')"
+    status=1
+fi
+
 # RFC 0036 step 2's measurement, printed on every boot that runs a hosted exec.
 # The RFC's question 1 -- who chooses a hosted program's load address -- turns
 # on whether the adapter could load an image itself through the supervisor

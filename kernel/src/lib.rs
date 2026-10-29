@@ -6671,8 +6671,41 @@ const MEMORY_REPORT_AT: u64 = 0x0000_0000_4002_0000;
 /// runtime builds on. The kernel refused every discard for a day — its method
 /// was missing from a whitelist — and Go reused the memory with its old bytes;
 /// this is the boot-time check that would have said so on every lane.
-const MEMORY_CODE: [u8; 151] = [
+const MEMORY_CODE: [u8; 274] = [
     0x49, 0x89, 0xff, // mov r15, rdi          ; report page
+    // **The last two pages below 2^64, asked for four ways** (2026-10-29).
+    // Each passes the personality's decoder -- page-aligned, two pages -- and
+    // reaches the nucleus as a range whose end wraps. `VirtRange::from_pages`
+    // added without checking, and release kernels keep overflow checks on, so
+    // the first of these panicked the machine: a hosted program could stop
+    // everything with one `munmap`. Each must be refused, and the rest of
+    // this probe run on after them.
+    0x48, 0xc7, 0xc7, 0x00, 0xf0, 0xff, 0xff, // mov rdi, -4096        ; 0xffff_ffff_ffff_f000
+    0xbe, 0x00, 0x20, 0x00, 0x00, // mov esi, 8192
+    0xb8, 0x0b, 0x00, 0x00, 0x00, // mov eax, 11           ; munmap
+    0x0f, 0x05, // syscall
+    0x49, 0x89, 0x47, 0x30, // mov [r15+48], rax     ; word 6
+    0x48, 0xc7, 0xc7, 0x00, 0xf0, 0xff, 0xff, // mov rdi, -4096
+    0xbe, 0x00, 0x20, 0x00, 0x00, // mov esi, 8192
+    0xba, 0x01, 0x00, 0x00, 0x00, // mov edx, 1            ; PROT_READ
+    0x41, 0xba, 0x32, 0x00, 0x00, 0x00, // mov r10d, 0x32        ; PRIVATE|FIXED|ANONYMOUS
+    0x49, 0xc7, 0xc0, 0xff, 0xff, 0xff, 0xff, // mov r8, -1            ; fd
+    0x4d, 0x31, 0xc9, // xor r9, r9            ; offset
+    0xb8, 0x09, 0x00, 0x00, 0x00, // mov eax, 9            ; mmap
+    0x0f, 0x05, // syscall
+    0x49, 0x89, 0x47, 0x38, // mov [r15+56], rax     ; word 7
+    0x48, 0xc7, 0xc7, 0x00, 0xf0, 0xff, 0xff, // mov rdi, -4096
+    0xbe, 0x00, 0x20, 0x00, 0x00, // mov esi, 8192
+    0xba, 0x01, 0x00, 0x00, 0x00, // mov edx, 1            ; PROT_READ
+    0xb8, 0x0a, 0x00, 0x00, 0x00, // mov eax, 10           ; mprotect
+    0x0f, 0x05, // syscall
+    0x49, 0x89, 0x47, 0x40, // mov [r15+64], rax     ; word 8
+    0x48, 0xc7, 0xc7, 0x00, 0xf0, 0xff, 0xff, // mov rdi, -4096
+    0xbe, 0x00, 0x20, 0x00, 0x00, // mov esi, 8192
+    0xba, 0x04, 0x00, 0x00, 0x00, // mov edx, 4            ; MADV_DONTNEED
+    0xb8, 0x1c, 0x00, 0x00, 0x00, // mov eax, 28           ; madvise
+    0x0f, 0x05, // syscall
+    0x49, 0x89, 0x47, 0x48, // mov [r15+72], rax     ; word 9
     0x31, 0xff, // xor edi, edi          ; addr = NULL
     0xbe, 0x00, 0x20, 0x00, 0x00, // mov esi, 8192         ; length
     0xba, 0x03, 0x00, 0x00, 0x00, // mov edx, 3            ; PROT_READ|WRITE
@@ -7027,7 +7060,7 @@ fn memory_self_test(hhdm_base: u64, cpus: u32) -> bool {
         return false;
     }
 
-    let mut answers = [0u64; 6];
+    let mut answers = [0u64; 10];
     let mut report_pa = 0;
     for _ in 0..400 {
         report_pa = MEMORY_REPORT_PA.load(Ordering::Acquire);
@@ -7068,7 +7101,32 @@ fn memory_self_test(hhdm_base: u64, cpus: u32) -> bool {
     // is, exactly as the IOMMU lines do, instead of implying the stronger one.
     let drawn = answers[0] != 0x0000_7000_0000_0000;
     const ENOMEM: u64 = -12i64 as u64;
-    if report_pa != 0
+
+    // **The last two pages below 2^64, asked for four ways** -- words 6 to 9,
+    // written before anything else the probe does (2026-10-29). Each used to
+    // panic the nucleus on the CPU running `bin/linuxd`; that this line prints
+    // at all is half the claim, and each answer being a refusal is the other.
+    let range = [answers[6], answers[7], answers[8], answers[9]];
+    let range_refused = report_pa != 0
+        && range
+            .iter()
+            .all(|&answer| (-4095..0).contains(&(answer as i64)));
+    if range_refused {
+        println!(
+            "    linux range    munmap, mmap(MAP_FIXED), mprotect and madvise of the last two \
+             pages below 2^64 were refused ({}, {}, {}, {}) -- once each panicked the nucleus",
+            range[0] as i64, range[1] as i64, range[2] as i64, range[3] as i64
+        );
+    } else {
+        println!(
+            "\x1b[91m    linux range    FAILED: the last two pages below 2^64 answered munmap \
+             {:#x}, mmap(MAP_FIXED) {:#x}, mprotect {:#x}, madvise {:#x} -- each must be a \
+             refusal\x1b[0m",
+            range[0], range[1], range[2], range[3]
+        );
+    }
+
+    let memory_ok = if report_pa != 0
         && mapped_somewhere
         && answers[1] == 42
         && answers[2] == 0
@@ -7120,7 +7178,8 @@ fn memory_self_test(hhdm_base: u64, cpus: u32) -> bool {
         });
         println!("\x1b[0m");
         false
-    }
+    };
+    range_refused && memory_ok
 }
 
 /// Where the signal probe's report page lands physically.
