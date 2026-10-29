@@ -113,6 +113,19 @@ This is also the way to give the kernel options. The ISO's command line is
 fixed, but the loader reads one from `esp/bhaskix/boot.conf`, a line of the form
 `cmdline=<options>`. The other guides use it.
 
+**The loader also checks a signature** over the kernel, the initrd and
+`boot.conf` ([RFC 0091](../rfc/0091-a-boot-its-owner-signed.md)), and the report
+says what it found. This release's loader trusts no key yet — signed boot arrives
+with release keys — so booted as above it reports, in red:
+
+```
+    boot signature  NOT VERIFIED (there is no boot.sig), NOT ENFORCED: Secure Boot is off
+```
+
+That is expected, and it is red so that a boot nobody checked is never mistaken
+for one that was. (Seen 2026-10-29 with the release recipe's loader, booted
+exactly as above.) With Secure Boot on, this loader refuses to boot at all.
+
 ## What you will see
 
 A banner, then the **boot report**: the machine testing itself, one line per

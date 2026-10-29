@@ -55,6 +55,11 @@ that does it, with the date.
 - [x] **A release workflow** — *engineering*, rehearsed 2026-10-20. `.github/workflows/release.yml`, run on a pushed tag
       `v*`:
   - build `make iso` and `boot/bhaskixboot/target/x86_64-unknown-uefi/release/bhaskixboot.efi`;
+    ~~the loader the lanes boot~~ **since 2026-10-29 the release's loader is its own build**
+    (`build/release-loader`, `RELEASE_BOOT_KEYS`, default `none`; RFC 0091 step 5), and
+    `tools/release-dist.sh` refuses any loader holding the published test key. **The preview's
+    loader trusts no key** (the lead's decision of 2026-10-29); a release with keys names their
+    public files in `RELEASE_BOOT_KEYS` after step 6's ceremony;
   - **choose the ISO's Linux programs explicitly** (decided 2026-10-19): the Go `net/http` server
     in (`HTTPD_IN_IMAGE=1`), BusyBox out (`BUSYBOX_SRC= BUSYBOX=build/no-busybox`). BusyBox is
     GPL-2.0, and shipping its binary would oblige publishing its source; without the explicit

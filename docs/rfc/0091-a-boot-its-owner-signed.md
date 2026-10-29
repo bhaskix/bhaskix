@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | ⬜ **Draft 2026-10-12 — ~~nothing built~~ steps 1–4 built 2026-10-29** (`bhaskix-sha256` and `bhaskix-bootsig`; the signer and `bootsign`; the loader's check and the kernel's report line; the native-lane gates, Secure Boot off; step 0's QEMU halves measured the same day). Steps 5–7 remain: the Secure Boot lane, release keys, the SR550. The project lead chose the scope (firmware → loader → kernel; package and update signing stay with the secure-update RFC) and asked for a draft that lays the decisions out. ~~**The signature algorithm, the enforcement policy and every key-custody question below are the lead's to decide** before step 1 starts.~~ **The lead decided questions 1–8 on 2026-10-29, each as recommended**: SLH-DSA-SHA2-128s for link 2; refuse only with Secure Boot on, handing back to the boot manager; the lead alone holds the release keys, on an offline machine, under an offline CA with a signing leaf; `dbx` for revocation, rollback left to T7; owner keys outside the tree; the verdict in PCR 8. Question 9, the SR550, stays for step 7, on the lead's word at the time. Step 0 may start. |
+| **Status** | ⬜ **Draft 2026-10-12 — ~~nothing built~~ steps 1–5 built 2026-10-29** (`bhaskix-sha256` and `bhaskix-bootsig`; the signer and `bootsign`; the loader's check and the kernel's report line; the native-lane gates, Secure Boot off; the Secure Boot lane and the recipe's test-key refusal; step 0's QEMU halves measured the same day). Steps 6 and 7 remain: release keys, and the SR550. **The preview's loader trusts no key**, the lead's decision of 2026-10-29 (*Step 5, as built*). The project lead chose the scope (firmware → loader → kernel; package and update signing stay with the secure-update RFC) and asked for a draft that lays the decisions out. ~~**The signature algorithm, the enforcement policy and every key-custody question below are the lead's to decide** before step 1 starts.~~ **The lead decided questions 1–8 on 2026-10-29, each as recommended**: SLH-DSA-SHA2-128s for link 2; refuse only with Secure Boot on, handing back to the boot manager; the lead alone holds the release keys, on an offline machine, under an offline CA with a signing leaf; `dbx` for revocation, rollback left to T7; owner keys outside the tree; the verdict in PCR 8. Question 9, the SR550, stays for step 7, on the lead's word at the time. Step 0 may start. |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | boot (`bhaskixboot.efi`, `bhaskix_boot::Handoff`), a new `bootsig` crate and a `sha256` leaf crate, kernel (boot report), tools (a signer), tests, governance (key custody) |
 | **Milestone** | Phase 3 — *Secure boot chain*, the roadmap's first row; [security.md](../security.md) §1 **T6** and gap 1 |
@@ -420,7 +420,8 @@ no custody decision; step 6 does, and questions 3–7 were decided the same day.
    and serial, the return to the boot manager, the PCR 8 event, handoff version 4; the kernel's report
    line; the hashing cost measured. **Done 2026-10-29**, recorded below *Step 2, as built*.
 4. **The native-lane gates**, Secure Boot off. **Done 2026-10-29**, with step 3.
-5. **The Secure Boot lane**, QEMU and CI, with the release recipe's test-key refusal gated.
+5. **The Secure Boot lane**, QEMU and CI, with the release recipe's test-key refusal gated. **Done
+   2026-10-29**, recorded below *Steps 3 and 4, as built*.
 6. **Release keys and the first signed loader** — ~~**blocked on questions 3–7**~~ (decided 2026-10-29), and GOVERNANCE.md §5
    updated in the same change.
 7. **The SR550** — question 9, on the lead's word at the time.
@@ -569,6 +570,44 @@ no custody decision; step 6 does, and questions 3–7 were decided the same day.
   - A kernel byte changed after signing: `refusing to boot: the kernel is not the one boot.sig
     names (Secure Boot is on)`, then the return. The firmware logged `failed to start Boot0001 …:
     Security Violation`.
+
+### Step 5, as built (2026-10-29)
+
+- **The preview's loader trusts no key** — the project lead's decision of 2026-10-29, asked because
+  this RFC's recipe refuses a test-key loader and release keys come only with step 6's ceremony.
+  - `BHASKIX_BOOT_KEYS=none` compiles an empty key list. Every `boot.sig` is then refused as naming a
+    key the loader does not hold, and a missing one as missing.
+  - With Secure Boot off the boot goes on, saying *NOT VERIFIED … NOT ENFORCED*. With it on, the
+    loader refuses.
+  - Booted as *Get started* stages it, with no `boot.sig`, the release loader says
+    `NOT VERIFIED (there is no boot.sig), NOT ENFORCED: Secure Boot is off`.
+  - Signed boot arrives with release keys.
+- **The recipe**: `make release-dist` builds its loader apart (`build/release-loader`,
+  `RELEASE_BOOT_KEYS`, default `none`), so it never overwrites the lanes' test-key loader, which was
+  byte-identical before and after.
+  - `tools/release-dist.sh` refuses a `bhaskixboot.efi` that holds the test key's 32 public bytes,
+    read from the file that ships.
+  - **Armed**: the lanes' loader, handed to it, is refused.
+- **The Secure Boot lane**: `tests/qemu/secureboot-test.sh` (`make test-boot-secureboot`), in
+  `make test` and in CI's native-loader job. It uses OVMF's Secure Boot build with the snakeoil
+  variable store; the loader is `sbsign`ed with the key that store enrolls, and the boot set is
+  signed with the test key. Three boots:
+  1. the unsigned loader is refused by the firmware, and never speaks;
+  2. a signed loader verifies a signed set: `SecureBoot reads 1`, *verified … Secure Boot on*, and
+     the kernel's red test-key line;
+  3. a kernel byte changed after signing is refused, nothing jumps, and the boot manager, handed
+     the machine back, calls the disk's option failed.
+
+  It passed on both firmwares:
+  - this host's 2 MiB build under QEMU 4.2.1, in 19.5 s;
+  - CI's 4 MiB build (OVMF 2025.11, QEMU 10.2.1) in a 26.04 container with `sbsigntool` 0.9.4.
+    There the unsigned refusal reads `Access Denied`, and the returned boot `Security Violation --
+    rejected probably by Secure Boot`.
+
+  Every gate matches the disk's boot option, because the 2 MiB build first refuses its own shell
+  with the same words.
+  - **Armed**: the loader left unsigned, the byte left alone, and the signed loader in the unsigned
+    boot. Each went red where it should.
 
 ## Sources
 

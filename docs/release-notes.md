@@ -142,9 +142,16 @@ Stated as plainly as the list above, because that is what criterion R7 asks for.
   the log against the PCRs~~ was this line's wording until 2026-10-19. But
   checking a record is not refusing a kernel: nothing stops a kernel whose
   digest is wrong from running. Signing is
-  [RFC 0091](rfc/0091-a-boot-its-owner-signed.md), a draft of 2026-10-12 with
-  nothing built, which sets key custody out as decisions for the project lead. A
-  preview a stranger boots in QEMU is where that omission costs least, which is
+  [RFC 0091](rfc/0091-a-boot-its-owner-signed.md). ~~a draft of 2026-10-12 with
+  nothing built~~ Its steps 1–5 were built on 2026-10-29: the native loader checks
+  a signed `boot.sig` naming the kernel, the initrd and `boot.conf`, and with
+  Secure Boot on refuses a set that does not verify (tested under OVMF's Secure
+  Boot build, on QEMU and in CI). **This release's loader trusts no key** — the
+  project lead's decision of 2026-10-29, because release keys come only with the
+  key ceremony, step 6. So with Secure Boot off every boot reports `boot
+  signature  NOT VERIFIED … NOT ENFORCED`, in red, and with it on the loader
+  refuses to boot. Signed boot arrives with release keys. A preview a stranger
+  boots in QEMU is where that omission costs least, which is
   an argument for shipping it *said out loud*, not for leaving it unsaid.
 - **This release's binaries are not signed either.** `SHA256SUMS` sits beside
   them and detects a damaged download. It does not detect a malicious one,
