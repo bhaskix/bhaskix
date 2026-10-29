@@ -11,6 +11,7 @@ why the system is shaped the way it is; the guides say what to type.
 | [Get started](get-started.md) | Download and check the release, boot it in QEMU three ways, try your first commands, and leave |
 | [The shell and packages](shell-and-packages.md) | Every shell command, what holding a capability means, installing a package, and the kernel's own shell |
 | [Linux programs](linux-programs.md) | What "hosted" means, an unmodified Go web server answering your browser, BusyBox for source builds, and what is refused and why |
+| [Sign your own boot](secure-boot.md) | A boot only you can change: your own key for the loader's check, your own certificate for Secure Boot, and what the project's keys will add |
 
 ## How these are written
 
