@@ -47,7 +47,7 @@ nothing in the tree implements it yet.
 | T3 | A compromised or malicious **device driver** | IOMMU-enforced DMA windows; per-device capabilities; relocatable-service isolation | ✅ **built**, under the three conditions the note below states — and on a machine with no IOMMU a domain-hosted driver is refused outright rather than run unprotected |
 | T4 | A malicious peripheral performing DMA (evil maid, malicious PCIe/Thunderbolt device) | IOMMU on by default; devices default-denied until enumerated and granted | ✅ **built**, same three conditions; interrupt remapping is on by default and gated |
 | T5 | A guest VM escaping to the host | Domain isolation is the same mechanism as containers; EPT/NPT; no shared hypervisor codebase to diverge | ⬜ **planned** — domains exist and are the mechanism; **VMX/SVM and EPT/NPT do not**. There are no guests yet, so nothing has escaped and nothing has been prevented. Phase 3 |
-| T6 | Persistence across reboot (bootkit, tampered kernel or initrd) | UEFI Secure Boot chain; measured boot into TPM PCRs; signed, immutable system image | ⬜ **planned, not built** — no Secure Boot chain, ~~no TPM measurement,~~ no signed image. **Measured since 2026-10-08** on the native loader's path (RFC 0089): a replaced kernel now boots *recorded* in PCR 9, which detects and does not prevent. The loader refuses a kernel that fails the ELF *parser*, which is corruption-detection, not authenticity. **Whoever can write the ESP owns ring 0.** Phase 3 |
+| T6 | Persistence across reboot (bootkit, tampered kernel or initrd) | UEFI Secure Boot chain; measured boot into TPM PCRs; signed, immutable system image | ⬜ **planned, ~~not built~~ verification built, no release key** — ~~no Secure Boot chain,~~ ~~no TPM measurement,~~ no signed image. **Verified since 2026-10-29** ([RFC 0091](rfc/0091-a-boot-its-owner-signed.md) steps 1–5): the native loader checks `boot.sig`, an SLH-DSA signature over the kernel, the initrd and `boot.conf`, and with Secure Boot on refuses a set that fails it and returns to the boot manager; with it off it boots and says *NOT ENFORCED*, in red and in PCR 8. **No key the project holds exists yet** — the preview's loader trusts none, and release keys wait on step 6's ceremony — so today only an owner who builds a loader with their own key and enrols their own certificate is protected. **Measured since 2026-10-08** on the native loader's path (RFC 0089): a replaced kernel now boots *recorded* in PCR 9, which detects and does not prevent. The loader refuses a kernel that fails the ELF *parser*, which is corruption-detection, not authenticity. **Whoever can write the ESP owns ring 0** — unless its owner has enrolled their own keys with Secure Boot on. Phase 3 |
 | T7 | Tampering with an update in transit or at rest | Signed A/B images; rollback protection via monotonic counter; verified before switch | ⬜ **planned, not built** — no signing, no A/B slots, no rollback counter. There is no update mechanism at all yet, which is why nothing has been tampered with. Specified in §7; Phase 3 |
 | T8 | Undetected compromise | Tamper-evident audit log; remote attestation; the telemetry plane is the audit source | 🔨 **partial** — the telemetry plane is built ([RFC 0026](rfc/0026-telemetry-plane.md)); the `Audit` class in it is **reserved and refused**, not served — emitting it is counted and dropped, because a best-effort audit event is false assurance with a checksum (§8). The backpressure ring, the hash chain, and remote attestation are a future RFC and are Phase 3. **This cell claimed backpressure when it was first written, on 2026-08-20, and §8 four sections below already said otherwise** — an error introduced by the same edit that added this column to stop exactly that |
 | T9 | Memory-safety bugs in kernel code | Rust; `unsafe` budget tracked per crate; every `unsafe` block justified and reviewed | 🔨 **partial, and permanently so** — Rust, `forbid(unsafe_op_in_unsafe_fn)`, `deny(undocumented_unsafe_blocks)`, and a per-crate budget enforced by the build. **4,465 lines of `unsafe` in tree, 3,108 of them (70%) linked into the kernel binary** — `tools/check-unsafe-budget.py --share`, which derives the ring 0 set from `cargo tree` rather than a list somebody maintains. This cell read *"4,170 lines … 2,740 of them (66%) in ring 0"* until 2026-08-26, hand-computed once with an unstated set of crates and stale by then; a figure in a security document that nobody can reproduce is the same defect as a claim nobody checks. The discipline is built; the exposure is structural and does not go to zero |
@@ -407,7 +407,7 @@ found by reading the tree rather than the documents, and each names what is true
 
 | | Gap | Why it ranks here |
 |---|---|---|
-| 1 | **The kernel image has no authenticity check** | The whole of T6. It became *this project's* problem when `bhaskixboot.efi` replaced a shipped loader, and it is the only gap on this list that hands an attacker ring 0 outright |
+| 1 | **The kernel image has no authenticity check** ~~—~~ **— that a release can rely on: the check is built (RFC 0091, 2026-10-29), the project's keys are not** | The whole of T6. It became *this project's* problem when `bhaskixboot.efi` replaced a shipped loader, and it is the only gap on this list that hands an attacker ring 0 outright |
 | 2 | **`bin/linuxd` is the concentration point, and it is growing fastest** — *capped 2026-08-21* | It holds `DomainControl`, a read-only directory capability and every hosted process's descriptors, it parses attacker-controlled arguments, and its `unsafe` went **42 → 85 in one day** with L1 barely begun. This has no completion state — it is a property, not a task — so what is actionable is the number, and the number is now **capped rather than merely bounded**: `unsafe_budget_exact = true`, so the build fails if it grows *or* shrinks without somebody editing the line. **Headroom is permission nobody is using.** The audit that set it removed thirteen lines by making twenty repetitions of `&mut` to a `static mut` into eight accessors — one per table, each making the single-threaded promise once — so the cap is **72**, and both directions were watched red |
 | 3 | ~~No ASLR for user programs~~ **— the hosted half done 2026-08-21** | A hosted process's `mmap` region is now **drawn per process** from `RDRAND`, 28 bits page-granular: three consecutive boots gave `0x707c9b39a000`, `0x70b501870000` and `0x70718f4f2000`. It replaced **one global bump allocator shared by every hosted process**, which was worse than fixed — each process's addresses were predictable from any other's. `fork` inherits the layout and `execve` redraws it, which is Linux's split and is host-tested. **Partial, and the split is stated**: the *image* stays where its ELF says, because the loader refuses `ET_DYN` on purpose to keep relocation processing out of the program loader — **that is [RFC 0036](rfc/0036-a-relocatable-program-in-ring-3.md), drafted 2026-08-21**, whose own first step is to seed `elf_parse` for relocations, since the audit measured that the relocation-applied path is never reached. Bhaskix's own programs keep their fixed per-program bases — a deliberate 2026-08-13 debuggability decision, and two boot gates assert those addresses. A machine with no entropy gets the floor **and the boot says so**; the gate accepts either line and refuses silence |
 | 4 | ~~The kernel's user-pointer copy path has one missing invariant~~ **— done 2026-08-21** | The pass found the surface is **smaller than the bug count suggested**: only six kernel operations touch a space that is not loaded, and exactly one of them writes bytes. Everything else either writes through the CPU — where a lazily mapped page **faults** and the handler services it — or writes into a region mapped eagerly, where there is nothing to commit. The invariant now lives in `vm::frame_for_write`, which commits, beside `vm::frame_for_read`, which deliberately does not; a caller picks by saying which it is doing, and the next supervisor write gets the rule without being told. A boot gate asserts both directions, and **both were watched failing** — a write that does not commit (the original bug, put back) and a read that does |
@@ -584,8 +584,13 @@ nothing about roles, users, or organisations. This means:
 > ([RFC 0089](rfc/0089-a-boot-the-tpm-records.md), steps 1–3): the native loader measures the
 > kernel and initrd into PCR 9 and the command line into PCR 8 through the firmware's
 > `EFI_TCG2_PROTOCOL`, and the event log reaches the kernel in `Handoff.measurement`, which the boot
-> report reads. **Nothing verifies, attests, seals or refuses anything** — there is still no
-> signature verification and no TPM driver of this project's own. What follows is the intended
+> report reads. ~~**Nothing verifies, attests, seals or refuses anything** — there is still no
+> signature verification and no TPM driver of this project's own.~~ **Verification is built since
+> 2026-10-29** ([RFC 0091](rfc/0091-a-boot-its-owner-signed.md), steps 1–5): the native loader checks
+> `boot.sig` over the kernel, the initrd and `boot.conf`, records its verdict in PCR 8, and with
+> Secure Boot on refuses a set that fails it. This blockquote kept saying nothing verifies for the
+> rest of that day, until it was corrected. **Nothing attests or seals**, there is no TPM driver of
+> this project's own, and no key the project holds exists yet (RFC 0091 step 6). What follows is the intended
 > chain, written in the present tense throughout, which is how one of its bullets came to describe a
 > handoff field that had never existed. Read it as a design.
 
@@ -593,10 +598,11 @@ nothing about roles, users, or organisations. This means:
 UEFI firmware (Secure Boot)
    │  verifies signature  ─────────────────────────► PCR 0-7  (firmware, config)
    ▼
-bhaskixboot.efi (signed, once key custody is decided)
+bhaskixboot.efi (signed by an owner's key today; by the project's once step 6 makes its keys)
    │  measures kernel + initrd, then the cmdline ──► PCR 9, PCR 8
+   │  verifies boot.sig over kernel, initrd, boot.conf; the verdict ──► PCR 8
    ▼
-Bhaskix kernel (signed)
+Bhaskix kernel (covered by boot.sig)
    │  measures the service set and boot policy ────► PCR 10-11
    ▼
 Domain 0 / init (measured)
@@ -634,7 +640,8 @@ release builds are governance questions — see [../GOVERNANCE.md](../GOVERNANCE
 release-signing key in a git repository.** [RFC 0091](rfc/0091-a-boot-its-owner-signed.md) (a Draft,
 2026-10-12) proposes the two signing links — Secure Boot over the loader, the loader over the kernel,
 initrd and `boot.conf` — and sets those questions out as decisions for the project lead, each with a
-recommendation; nothing of it is built.
+recommendation; ~~nothing of it is built~~ the lead decided them on 2026-10-29, and steps 1–5 built
+the verification that day. Custody is GOVERNANCE.md §5's.
 
 ---
 
@@ -984,8 +991,12 @@ We commit to:
   mitigation for cross-domain SMT side channels, meaningful throughput cost. Default on or off?
 - **Attestation format:** align with an existing standard (TCG DICE, IETF RATS/EAT) or define our
   own? Strong lean toward an existing standard — see the open-standards principle.
-- **Signing and key custody** for release builds. A governance decision with technical consequences.
-  [RFC 0091](rfc/0091-a-boot-its-owner-signed.md)'s questions 3–7 lay it out (Draft, 2026-10-12).
-- Do we allow unsigned kernels in developer mode, and how is that state made unmistakable to the
+- ~~**Signing and key custody** for release builds. A governance decision with technical consequences.
+  [RFC 0091](rfc/0091-a-boot-its-owner-signed.md)'s questions 3–7 lay it out (Draft, 2026-10-12).~~
+  **Decided 2026-10-29** (RFC 0091 questions 3–7): the lead alone holds the release keys, on an offline
+  machine; GOVERNANCE.md §5 states it.
+- ~~Do we allow unsigned kernels in developer mode, and how is that state made unmistakable to the
   user and to a remote verifier? RFC 0091's question 2 recommends booting with Secure Boot off and
-  saying so in red, in the boot report and in PCR 8 — undecided.
+  saying so in red, in the boot report and in PCR 8 — undecided.~~ **Decided and built 2026-10-29**
+  (RFC 0091 question 2, steps 3–4): with Secure Boot off an unsigned or unverified set boots, and the
+  report and PCR 8 say *NOT ENFORCED*, in red.

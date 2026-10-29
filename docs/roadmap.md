@@ -373,8 +373,8 @@ cost* and is not a schedule.
   because ~~the TPM event log has no path into the kernel~~ the TPM event log had no path into the
   kernel (corrected 2026-10-12: it has had one since 2026-10-08, `Handoff.measurement`, version 3)
   and carrying one means a new handoff field;
-  and **key custody, which is an open governance question** ([GOVERNANCE.md](../GOVERNANCE.md), and
-  `security.md` §10). [RFC 0030](rfc/0030-packages.md) already refused package signatures for
+  and **key custody, ~~which is an open governance question~~ decided by the lead on 2026-10-29**
+  ([GOVERNANCE.md](../GOVERNANCE.md) §5, and `security.md` §10). [RFC 0030](rfc/0030-packages.md) already refused package signatures for
   exactly that reason — *a signature without key storage, distribution or revocation is theatre
   that trains reviewers to see green checkmarks* — and signing a kernel while the key story is open
   would reproduce that refusal one layer down. The trigger is
@@ -383,8 +383,10 @@ cost* and is not a schedule.
   [RFC 0089](rfc/0089-a-boot-the-tpm-records.md), accepted 2026-10-11, measures the kernel, initrd
   and command line, carries the event log to the kernel, and reads the TPM from `bin/tpmd`; the boot
   is *recorded*, not refused. [RFC 0091](rfc/0091-a-boot-its-owner-signed.md), a Draft of
-  2026-10-12, proposes the signing and sets key custody out as the lead's decisions; nothing of it
-  is built
+  2026-10-12, proposes the signing and sets key custody out as the lead's decisions; ~~nothing of it
+  is built~~ **the lead decided its questions 1–8 on 2026-10-29, and steps 1–5 built the
+  verification that day** — the loader checks `boot.sig` and, with Secure Boot on, refuses. What is
+  left is the project's own keys (step 6's ceremony, the lead's) and the SR550 (step 7)
 - **Secure update** — immutable root, A/B slots, rollback protection. Second because it needs the
   same key infrastructure the row above builds, and because RFC 0030's deferred package signatures
   are discharged here rather than separately. `security.md` §7 is its specification, written in

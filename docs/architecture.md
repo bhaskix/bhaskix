@@ -141,6 +141,7 @@ pub struct Handoff {
     pub regions_truncated: bool,      // must be reported, never ignored
     pub initrd: Option<&'static [u8]>,
     pub measurement: Measurement,     // RFC 0089, version 3: what the loader recorded in the TPM
+    pub signature: Signature,         // RFC 0091, version 4: what the loader decided about boot.sig
 }
 
 /// Releases every secondary CPU, returning the local APIC identifier of each.
@@ -153,7 +154,19 @@ pub enum Measurement {
     NoTpm,                                               // asked; no TCG2 protocol
     Measured { log: &'static [u8], truncated: bool },    // untrusted, as `initrd` is
 }
+
+/// The same discipline for the signature: a loader that never looked is not one
+/// that looked and refused.
+pub enum Signature {
+    NotChecked,                                          // the Limine path
+    Verified { key_id: KeyId, secure_boot: bool },       // and whether the firmware enforces it
+    NotVerified(Unverified),                             // Missing, Unreadable, or Refused(why)
+}
 ```
+
+~~The listing above stopped at `measurement` until 2026-10-29~~ -- RFC 0091 step 3 added
+`signature` and moved `HANDOFF_VERSION` to **4** that day, and this listing should have moved with
+it; it was brought up to date afterwards, the same day.
 
 Three things are load-bearing and easy to read past. **Every variable-length payload is a borrowed
 slice**, not an address and a length, so the kernel cannot read past one by arithmetic. **No

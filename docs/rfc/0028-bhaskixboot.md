@@ -182,7 +182,9 @@ recorded beside the Limine lanes' as a curiosity, not a gate.
    derives its own from `CPUID` instead). This road works for **any** loader that cannot
    start secondaries, which is a stronger property than the sketch had.
 3. **Secure Boot signing** — deliberately out of scope; revisited when physical hardware
-   (M1-17) makes it concrete.
+   (M1-17) makes it concrete. **Taken up by [RFC 0091](0091-a-boot-its-owner-signed.md)**
+   (2026-10-12; its verification built 2026-10-29): the firmware checks this loader, and this loader
+   checks the kernel, the initrd and `boot.conf` against `boot.sig`.
 
 ## Implementation plan
 

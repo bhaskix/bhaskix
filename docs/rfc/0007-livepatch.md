@@ -330,4 +330,6 @@ painful to add to a shipped, certified system.
    itself undecided.
 5. **Who signs?** The same root as secure boot, or a separate patch-signing key
    that can be rotated without re-signing the image? Separate is better
-   operationally and adds a key to manage.
+   operationally and adds a key to manage. **A candidate since 2026-10-29**:
+   [RFC 0091](0091-a-boot-its-owner-signed.md)'s boot-set key and its custody
+   (GOVERNANCE.md §5), or a separate patch key held under the same rules.
