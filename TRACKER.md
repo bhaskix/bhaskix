@@ -1092,6 +1092,28 @@ the distinction is in the table rather than in somebody's head.
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-10-30 (the knowledgebase: thirteen pages, every command run)
+
+**`docs/guide/` is now a knowledgebase**, and the website renders it as one:
+- **The index** has sections: Start here, Install and run, Use, Secure, Understand, Develop and
+  Help. The guide gate now refuses a guide the index does not list.
+- **Eight new pages:** *What Bhaskix is*, *Build from source*, *Run it on a real machine*, *How
+  Bhaskix works*, *The security model*, *Write a program*, *Troubleshooting* and *Questions and
+  answers*.
+- **Every command in them was run** for its transcript — in a fresh clone from GitHub, at
+  `make demo`'s prompt, on QEMU booting a USB-stick image under BIOS and UEFI, and on the SR550.
+
+**Writing them found, before any reader did:**
+- `bin/ahcid` wrote to the last sector of any SATA disk (§3, fixed).
+- `make demo`'s *Ctrl-A then x* never left, because it used `-serial stdio` (fixed).
+- `held` is not "what the shell holds"; `caps` is.
+- KVM made a boot slower, not faster (measured, and said so).
+- Ubuntu 26.04 has no `OVMF_CODE.fd` at all.
+- The setup script needs a C compiler it does not check for.
+- `GOVERNANCE.md` §1 still says Phase 0 — a governance text, flagged and not edited.
+
+The foreign-disk lane also joins CI's IOMMU job.
+
 ### 2026-10-30 (a boot no longer writes to a disk that is not the project's)
 
 **`bin/ahcid` wrote into the last sector of any SATA disk it could read**, on every boot: a
