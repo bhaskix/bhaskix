@@ -26,6 +26,11 @@ what: a line `**Verified** <YYYY-MM-DD> against <commit or tag>`. A guide is a
 transcript of something that was run, and a transcript without a date is a
 claim nobody can re-check.
 
+And since 2026-10-30, when the guides became the website's knowledgebase: the
+index (`docs/guide/README.md`) lists every guide in one of its `##` sections,
+and lists none that does not exist. The site builds its sidebar from those
+sections, so a guide missing from the index would be a page nobody can find.
+
 `--only FILE...` checks just those files, as guides, whether git tracks them or
 not. `make gates` uses it to watch the check refuse a fixture.
 """
@@ -108,6 +113,36 @@ def check_guide(path: str, text: str) -> list[str]:
     return problems
 
 
+# A row of the index's tables: `| [Title](file.md) | what it covers |`.
+INDEX_ROW = re.compile(r"^\|\s*\[[^\]]+\]\(([^)#]+\.md)(?:#[^)]*)?\)\s*\|", re.MULTILINE)
+
+
+def check_index(guides: list[str]) -> list[str]:
+    """Every guide is listed under a `##` section of the index, and every
+    listed guide exists."""
+    text = (ROOT / INDEX).read_text(encoding="utf-8")
+    listed = set()
+    section = None
+    for line in text.splitlines():
+        if line.startswith("## "):
+            section = line[3:].strip()
+            continue
+        row = INDEX_ROW.match(line)
+        if row and section:
+            listed.add(f"docs/guide/{row.group(1)}")
+    problems = [
+        f"{INDEX}: {path} is not listed in any section, so the site's sidebar would miss it"
+        for path in guides
+        if path != INDEX and path not in listed
+    ]
+    problems += [
+        f"{INDEX}: lists {path}, which does not exist"
+        for path in sorted(listed)
+        if not (ROOT / path).exists()
+    ]
+    return problems
+
+
 def main(argv: list[str]) -> int:
     user = arms(USER_SHELL, "fn run(line: &[u8])")
     pkg = arms(USER_SHELL, "fn pkg(")
@@ -127,6 +162,7 @@ def main(argv: list[str]) -> int:
         if path in guides:
             problems += check_guide(path, text)
     if argv[:1] != ["--only"]:
+        problems += check_index(guides)
         demo = (ROOT / DEMO).read_text(encoding="utf-8")
         for command in DEMO_SUGGESTION.findall(demo):
             commands += 1
@@ -134,11 +170,11 @@ def main(argv: list[str]) -> int:
                 problems.append(f"{DEMO}: the banner suggests '{command}', which the user-mode shell does not have")
 
     if problems:
-        print("FAILED  a document names a shell that does not exist:", file=sys.stderr)
+        print("FAILED  a document names a shell that does not exist, or the index misses a guide:", file=sys.stderr)
         for problem in problems:
             print(f"          {problem}", file=sys.stderr)
         print(
-            "        Run it before writing it down. Fix the document, or the shell.",
+            "        Run it before writing it down. Fix the document, the shell, or the index.",
             file=sys.stderr,
         )
         return 1
