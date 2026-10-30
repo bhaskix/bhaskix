@@ -221,9 +221,16 @@ Deliberate design points:
 
 - **Caller-saved registers are not saved.** The compiler already spilled anything live across the
   call. Saving them is wasted work — a mistake many hand-written switchers make.
-- **FPU/SSE/AVX state is switched lazily** via `CR0.TS` / `XSAVE`, not eagerly. AVX-512 state is
+- ~~**FPU/SSE/AVX state is switched lazily** via `CR0.TS` / `XSAVE`, not eagerly. AVX-512 state is
   2.5 KiB; switching it on every context switch for threads that never touch it is a large,
-  invisible cost.
+  invisible cost.~~ **Wrong since 2026-08-19, corrected 2026-10-30.** The code never did this:
+  SSE arrived that day (`233834b`) with an **eager** `FXSAVE`/`FXRSTOR` of every thread's 512-byte
+  area on every switch (`kernel/src/sched.rs`), and this line was not changed with it. Eager is
+  also the right answer. Lazy switching leaks one process's FPU, SSE and AVX registers to another
+  through speculation on affected Intel CPUs (CVE-2018-3665, *LazyFP*), and Intel's guidance is
+  eager restore. AVX is not enabled at all yet. [RFC 0094](rfc/0094-a-programs-vector-registers-are-its-own.md)
+  (draft) proposes `XSAVEOPT`/`XRSTOR`, still eager, and measures the cost: about 36 ns a switch
+  over `FXSAVE` on a Xeon Silver 4314.
 - **The switch path allocates nothing and can take no locks that may sleep.** Enforced by type.
 - **Kernel stacks have guard pages.** Stack overflow in the kernel becomes a clean panic with a
   backtrace instead of silent corruption of whatever was allocated below.
