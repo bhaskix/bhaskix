@@ -214,9 +214,33 @@ def theme(subsystem: str, title: str) -> str:
     )
 
 
+def tracked_rfc_files() -> list[Path]:
+    """The RFC files git knows about -- committed, or staged to be.
+
+    **Not every file in the directory, and CI run 886 is why** (2026-10-30).
+    An RFC drafted but not yet staged sat in `docs/rfc/` while the chart was
+    regenerated for a commit that did not include it: the chart gained its
+    row, the commit carried the chart without the file, and CI -- whose
+    checkout has only what was committed -- regenerated a chart without the
+    row and failed. A staged file is in the index and still counts, so the
+    rule above about dating an uncommitted file today keeps working; a file
+    nobody has added is not part of the change and is not charted.
+    """
+    listed = run("git", "ls-files", "--", str(RFC_DIR))
+    if not listed:
+        # No git, or a tree git does not know: every file, as before.
+        return sorted(RFC_DIR.glob("[0-9][0-9][0-9][0-9]-*.md"))
+    names = {line.strip() for line in listed.splitlines() if line.strip()}
+    return sorted(
+        path
+        for path in RFC_DIR.glob("[0-9][0-9][0-9][0-9]-*.md")
+        if str(path.relative_to(ROOT)) in names
+    )
+
+
 def read_rfcs() -> list[Rfc]:
     found: list[Rfc] = []
-    for path in sorted(RFC_DIR.glob("[0-9][0-9][0-9][0-9]-*.md")):
+    for path in tracked_rfc_files():
         number = path.name[:4]
         if number == "0000":
             continue  # the template is not work

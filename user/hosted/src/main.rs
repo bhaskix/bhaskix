@@ -371,10 +371,14 @@ extern "C" fn hosted_main(stack: *const u64) -> ! {
 /// its **shell**, so the vector this kernel built is the one a foreign program
 /// expected to read; that shell **parses** `argv[3]`, so what was reached is a
 /// shell and not an applet; and the command it finds is a **path** rather than
-/// a builtin, so the shell `fork`s, `execve`s a child and waits for it.
+/// a builtin, so the shell `execve`s it.
 ///
-/// The text is printed by a process the shell created. An earlier version ran
-/// `echo` as a builtin, which proved the first two.
+/// **Corrected 2026-10-30**: this said the shell `fork`s, `execve`s a child and
+/// waits for it. Given a single command, `sh -c` replaces itself with it and
+/// never forks -- `strace` of the pinned binary on the build host. A fork
+/// would be glibc's `clone`, which this system refuses (RFC 0096). The text is
+/// printed by the program the shell became; an earlier version ran `echo` as a
+/// builtin, which proved the first two.
 fn exec_busybox() {
     const PATH: &[u8] = b"/busybox\0";
     const ARG0: &[u8] = b"busybox\0";

@@ -4099,14 +4099,20 @@ fi
 #      expected to read -- argv, envp and the auxiliary vector included.
 #   2. That shell **parses** the string in `argv[3]`, so what was reached is a
 #      shell rather than an applet that happens to echo.
-#   3. The command it finds is a **path**, not a builtin, so the shell `fork`s
-#      and `execve`s a child and waits for it. The text is printed by a process
-#      the shell created, not by the shell.
+#   3. The command it finds is a **path**, not a builtin, so the shell
+#      `execve`s it. ~~so the shell `fork`s and `execve`s a child and waits for
+#      it~~ -- **wrong, corrected 2026-10-30**: given a single command, `sh -c`
+#      replaces itself with it and never forks, as `strace` of the pinned
+#      binary shows on the build host. A fork happens only for a command with
+#      another after it, and glibc's fork is a `clone` this system refuses --
+#      RFC 0096, drafted that day. The text is printed by the program `sh`
+#      became, which still proves more than a builtin did.
 #
-# Three is why the string says "forked": an earlier version ran `echo` as a
-# builtin, which proved the first two and was written up as proving only those.
+# Three is why the string says "forked", which it was not: an earlier version
+# ran `echo` as a builtin and proved the first two. The string is kept because
+# changing it means changing the probe and this gate together for no gain.
 if grep -qF "bhaskix-busybox-forked" "$LOG"; then
-    pass "L1: a hosted execve ran BusyBox's sh, which forked and exec'd a child that printed"
+    pass "L1: a hosted execve ran BusyBox's sh, which exec'd the command it was given, and it printed"
 elif grep -qE "busybox disk +[0-9]+ bytes of BusyBox staged" "$LOG"; then
     fail "BusyBox was staged but the hosted execve of it produced no output"
     grep -aE "hosted exec busybox|busybox disk" "$LOG" | sed 's/^/                   /'
