@@ -91,8 +91,9 @@ without the workload; it is no longer an acceptance gate.
   needs its own path.
 - **Asynchronous signal delivery** — `SIGURG`, and `tgkill` beyond a fatal signal to oneself —
   is [RFC 0083](0083-a-signal-a-process-can-catch.md)'s recorded limit, under its trigger.
-- **A futex contention stress test** (step 6), **a fuzz target over the argument decoder** (the
-  testing plan; the two targets that exist cover the `dirent` encoder and `sockaddr` parsing),
+- **A futex contention stress test** (step 6), ~~**a fuzz target over the argument decoder** (the
+  testing plan; the two targets that exist cover the `dirent` encoder and `sockaddr` parsing)~~
+  (**done 2026-10-29**: `linux_decoder`, which found a nucleus panic on the way -- TRACKER §3),
   **rule 2's negative test restated for the adapter** (the capabilities are the adapter's, not
   the hosted domain's, so "a domain holding no filesystem capability" is not the shape any
   more), and **the 2× comparison with Linux** (Performance implications) → `TRACKER.md` rows.

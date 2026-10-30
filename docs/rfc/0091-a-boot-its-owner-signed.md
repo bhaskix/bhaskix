@@ -685,6 +685,33 @@ no custody decision; step 6 does, and questions 3–7 were decided the same day.
 
 Step 7 (the SR550) follows, on the lead's word.
 
+### Step 7, first half: the SR550, read only (2026-10-30)
+
+**On the lead's word**, the SR550 (host3) was booted once from a native-loader ISO through its BMC's
+virtual CD. Secure Boot stayed off, no firmware setting changed and nothing was enrolled; then it was
+unmounted and rebooted into its own OS. Its own GRUB came back on serial-over-LAN, as on 2026-10-11.
+Read off serial-over-LAN:
+
+- **The verdict on real firmware:** `bhaskixboot: boot signature verified: key a6c913d8a0e2476e
+  TEST KEY, NOT ENFORCED: Secure Boot is off`. Then `handoff assembled: version 4`, and the kernel's
+  red `boot signature  verified: key a6c913d8a0e2476e TEST KEY, but NOT ENFORCED: Secure Boot is
+  off`.
+- **The boot finished:** `Bring-up complete. Nothing left to do at this milestone.` and the
+  `bhaskix$` prompt, 79,337 ms to services up. The new `linux range` line, the top of the address
+  space refused four ways, was green on hardware. The only red lines were the known networking gaps
+  there: `dhcp client` and `tcp client`.
+- **The raw `SecureBoot` value was not visible.** The loader writes `SecureBoot reads …` and its
+  hashing-cost line with `serial::write`, to COM1 only; its other lines go through `diag`, to the
+  firmware console as well. This machine's BMC redirects COM2, not COM1. So the value is constrained
+  but not read: the loader treated it as off, and Redfish reports `SecureBootEnable: false` (mode
+  `UserMode`). Telling *reads 0* from *absent* or *unreadable* needs those two lines through `diag`.
+  That is recommended, not done, and the next boot there reads it.
+- **Found staging it:** `tools/native-iso.sh` did not sign its ESP, which step 4 had taught every
+  QEMU lane to do; it does now.
+- **Still open:** question 9's enrolment half (append a certificate to `db`, boot with Secure Boot
+  on, turn it off again), each step on the lead's word. It needs a certificate worth enrolling, which
+  is step 6's ceremony.
+
 ## Sources
 
 Read for this draft on 2026-10-12. uefi.org and trustedcomputinggroup.org refused this build host
