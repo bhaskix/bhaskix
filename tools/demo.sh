@@ -28,7 +28,7 @@ bold=$'\033[1m'; dim=$'\033[2m'; green=$'\033[92m'; cyan=$'\033[96m'; off=$'\033
     "$bold" "${ISO#"$REPO_ROOT"/}" "$off" >&2; exit 1; }
 
 command -v qemu-system-x86_64 >/dev/null || {
-    printf '%squmu-system-x86_64 is not installed%s\n' "$bold" "$off" >&2
+    printf '%sqemu-system-x86_64 is not installed%s\n' "$bold" "$off" >&2
     printf 'On Debian or Ubuntu: %ssudo apt install qemu-system-x86%s\n' "$cyan" "$off" >&2
     exit 1
 }
@@ -70,9 +70,14 @@ ${bold}Bhaskix${off} ${dim}-- a capability operating system, booting in QEMU${of
 
 BANNER
 
-# `-serial stdio` and no display: the console *is* this terminal, which is
+# The serial console and no display: the console *is* this terminal, which is
 # also how every harness talks to the machine. No timeout, because a person
 # is driving.
+#
+# **`mon:stdio`, not `stdio`** (2026-10-30). The banner above says Ctrl-A then x
+# leaves, and that key reaches QEMU only when its monitor shares the terminal;
+# with plain `-serial stdio` the two keys went to the guest and QEMU ran on --
+# measured that day, as were both halves of this sentence.
 exec qemu-system-x86_64 \
     -M "$MACHINE" -cpu "${QEMU_CPU:-max}" -smp "${QEMU_SMP:-4}" -m 256M -no-reboot \
     -drive "file=$DISK,format=raw,if=none,id=disk0,readonly=on" \
@@ -80,4 +85,4 @@ exec qemu-system-x86_64 \
     "${VIRTIO_ARGS[@]}" \
     "${IOMMU_ARGS[@]}" \
     -cdrom "$ISO" -boot d \
-    -serial stdio -display none
+    -serial mon:stdio -display none
