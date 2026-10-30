@@ -496,6 +496,19 @@ jobs:
           BHASKIX_BOOT_LOG: boot-iommu.log
         run: tests/qemu/boot-test.sh iommu
 
+      # 2026-10-30: the same machine with a SATA disk that is not the project's
+      # test disk. bin/ahcid used to write a pattern into the last sector of any
+      # disk it could read; it must now read this one and write nothing, and the
+      # lane compares the disk's last sector before and after.
+      - name: Boot with a SATA disk that is not the project's, and check nothing is written to it
+        env:
+          QEMU_CPU: max
+          BOOT_TEST_TIMEOUT: 300
+          BHASKIX_BOOT_LOG: boot-ahci-foreign.log
+          BHASKIX_SATA_FOREIGN: 1
+          BHASKIX_LANE: ahci-foreign
+        run: tests/qemu/boot-test.sh iommu
+
       - name: Upload the boot log and image on failure
         if: failure()
         uses: actions/upload-artifact@v7
