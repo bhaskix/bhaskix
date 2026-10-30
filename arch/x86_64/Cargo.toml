@@ -32,7 +32,11 @@ workspace = true
 # 40 on 2026-10-08: three sites for write protection -- `CR0` read and
 # written in `enable_supervisor_protections`, and read in `protections_live`.
 # 43 on 2026-10-10: `enable_caching`'s `CR0` read and write and its `wbinvd`.
-asm_budget = 43
+# 49 on 2026-10-30, RFC 0094 step 2: `xstate`'s CR4 write for OSXSAVE, its
+# `xsetbv` and `xgetbv`, and the `xsaveopt`, `xsave` and `xrstor` a switch
+# uses where the CPU offers them. `cpuid_count` moved `cpuid`'s block rather
+# than adding one.
+asm_budget = 49
 # `arch` is one of the places `unsafe` is permitted (docs/coding-style.md §3):
 # port I/O and CPU control instructions cannot be expressed any other way.
 #
@@ -182,7 +186,11 @@ asm_budget = 43
 # the shared layout in every CPU's PAT, and the one MSR read the MTRR reader
 # makes for the capability, the default type and each variable range. The
 # decoding is safe code with host tests.
-unsafe_budget = 1204
+# 1267 on 2026-10-30, RFC 0094 steps 1-2: `xstate` -- `CR4.OSXSAVE` written to
+# the plan, `XSETBV` and `XGETBV`, and the `XSAVEOPT`/`XSAVE`/`XRSTOR` a switch
+# uses, each an `asm!` that rustfmt spreads over its operands, plus the one
+# `FXSAVE` that reads `MXCSR_MASK`. Instructions with no safe spelling.
+unsafe_budget = 1267
 # Raised from 1070 for ECAM -- one volatile read of configuration space as
 # memory -- and for counting the bytes the transmitter gives up on. The second
 # is two lines and bought a silent data loss becoming a visible number.

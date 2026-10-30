@@ -2876,6 +2876,57 @@ else
     status=1
 fi
 
+# RFC 0094 step 0: a caught signal gives the interrupted code its vector
+# registers back, as Linux's frame does. The handler overwrites all sixteen,
+# and the code it returns to checks its own -- so a frame that carried only the
+# general-purpose registers reads 32 wrong quadwords here, which it did until
+# step 3. The handler's edit to xmm15 in the frame must stick -- the frame is
+# what rt_sigreturn restores -- and it starts from the initial state, as
+# Linux's does.
+if grep -qE "linux sig fp +a handler that overwrote all sixteen xmm registers returned, and the code it interrupted found its own: 0 of 32 quadwords wrong, xmm15 as the handler edited it in the frame; the handler began with xmm0 zero" "$LOG"; then
+    pass "a signal handler's use of the vector registers did not reach the code it interrupted"
+elif grep -qE "linux sig fp +skipped, needs a second cpu" "$LOG"; then
+    pass "the vector-register signal probe needs a second cpu, and said so"
+else
+    fail "a signal handler's vector registers reached the code it interrupted"
+    grep -E "linux sig fp" "$LOG" || true
+    status=1
+fi
+
+# RFC 0094 steps 1 and 2: what the CPU offers and what the plan enabled, read on
+# every lane -- `qemu64` has no XSAVE and keeps FXSAVE; TCG `max` and KVM have it
+# -- and the plan applied and read back on every CPU, so a thread migrated
+# between them cannot meet a different XCR0.
+if grep -qE "xstate +(offered [a-z0-9_ ]+ \(0x[0-9a-f]+, [0-9]+ bytes for all\); enabled x87 sse \(0x3\), 576 bytes, saved by (xsaveopt|xsave)|no xsave on this cpu: x87 and sse, 512 bytes, saved by fxsave); CR4.OSXSAVE at entry [01]" "$LOG"; then
+    pass "the floating-point plan: $(grep -oE 'saved by [a-z]+; CR4.OSXSAVE at entry [01]' "$LOG" | head -1)"
+else
+    fail "no xstate line, or a plan this kernel does not make"
+    grep -E "xstate " "$LOG" || true
+    status=1
+fi
+# The two counts compared here rather than with a back-reference, which not
+# every `grep` a developer's shell resolves to accepts.
+xstate_counts=$(grep -oE "xstate live +(fxsave|xsave|xsaveopt) with xcr0 0x[0-9a-f]+ on [0-9]+ of [0-9]+ cpus" "$LOG" | grep -oE '[0-9]+ of [0-9]+' | head -1)
+if [[ -n "$xstate_counts" && "${xstate_counts%% of *}" == "${xstate_counts##* of }" ]]; then
+    pass "every CPU applied the same floating-point plan and read it back ($xstate_counts)"
+else
+    fail "a CPU did not apply the floating-point plan"
+    grep -E "xstate live" "$LOG" || true
+    status=1
+fi
+
+# RFC 0094 step 0: two threads in two domains on one CPU, each holding its own
+# pattern in all sixteen xmm registers through a thousand switches. The switch
+# saving and restoring the file is what CR4.OSFXSR promises; this is the first
+# check of it on a running machine.
+if grep -qE "vector state +two threads in two domains on one cpu kept xmm0-xmm15 through 1000 switches each: 0 of 64000 quadwords wrong, saved by (fxsave|xsaveopt|xsave)" "$LOG"; then
+    pass "a thread's vector registers are its own across switches: $(grep -oE 'saved by [a-z]+' "$LOG" | head -1)"
+else
+    fail "a thread's vector registers did not survive switches to another domain's"
+    grep -E "vector state" "$LOG" || true
+    status=1
+fi
+
 # RFC 0005 step 3: the initial process image. A Linux program walks the
 # stack this kernel built -- argv, envp, the auxiliary vector -- and finds
 # the entropy AT_RANDOM promised, which Go's runtime treats as not optional.

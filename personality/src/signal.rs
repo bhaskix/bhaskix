@@ -484,9 +484,23 @@ pub mod sigcontext {
     /// address from `siginfo`'s `si_addr`; a C handler reading `REG_CR2`
     /// read zero.
     pub const CR2: usize = 176;
+    /// Where the frame's floating-point image is, or zero for none --
+    /// RFC 0094 step 3. Compiled from `<asm/sigcontext.h>` on 2026-10-30.
+    pub const FPSTATE: usize = 184;
     /// Bytes in the whole structure.
     pub const SIZE: usize = 256;
 }
+
+/// The least stack a signal delivery needs, as `AT_MINSIGSTKSZ` tells a
+/// program -- RFC 0094 step 3.
+///
+/// The frame `bin/linuxd` builds is eight bytes of return address, a 128-byte
+/// `siginfo` and a 304-byte `ucontext`, below a floating-point image of up to
+/// 836 bytes (832 and `FP_XSTATE_MAGIC2`), each aligned -- 1,276 bytes and up
+/// to 78 of alignment. 2,048 covers that with room, and is the `MINSIGSTKSZ`
+/// this host's `<asm/signal.h>` declares, so a program that reads the constant
+/// instead of the auxiliary vector gets the same answer.
+pub const MIN_SIGNAL_STACK: u64 = 2048;
 
 /// The register file a delivery saves and a `rt_sigreturn` restores.
 ///
@@ -709,10 +723,11 @@ mod tests {
         assert_eq!(at(176), 0xdead, "cr2, the fault address");
         assert_eq!(at(168), 0, "oldmask, which this frame leaves zero");
         assert_eq!(
-            at(184),
+            at(sigcontext::FPSTATE),
             0,
-            "fpstate: zero, no floating-point state carried (RFC 0094 step 3)"
+            "fpstate: left for the delivery to fill, which places the image (RFC 0094 step 3)"
         );
+        assert_eq!(sigcontext::FPSTATE, 184, "as `<asm/sigcontext.h>` puts it");
     }
 
     #[test]

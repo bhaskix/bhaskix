@@ -427,7 +427,33 @@ fn deliver_signal(domain: u32, slot: u64, signal: u64, address: u64, handler: Ha
     // and the return address then leaves `rsp % 16 == 8` at the handler's
     // first instruction, exactly as a `call` would.
     let top = dispositions_of(domain).delivery_stack(signal, registers.rsp);
-    let frame_at = (top - FRAME_BYTES as u64) & !15;
+
+    // **The interrupted code's floating-point state, carried as Linux carries
+    // it** -- RFC 0094 step 3. Until then the frame held the general-purpose
+    // registers only, and a handler that used a vector register returned the
+    // interrupted code a register file it never had: the `linux sig fp` probe
+    // read 32 of 32 quadwords wrong. The image goes above the frame, 64-byte
+    // aligned for `XSAVE`, and an `XSAVE` one is marked with Linux's two magic
+    // numbers so a handler -- and `rt_sigreturn` -- can tell which it is.
+    //
+    // **A delivery that cannot carry it is not made**, as one whose frame
+    // cannot be written is not: the process ends with the signal. Delivering
+    // without it would hand the handler's registers to the interrupted code
+    // silently, which is the defect this exists to end.
+    let mut carried = [0u8; FP_IMAGE];
+    let Some((xcr0, bytes)) = fp_take(slot, &mut carried) else {
+        return FAULT_END;
+    };
+    let fp_len = if xcr0 == 0 {
+        bytes
+    } else {
+        if bhaskix_personality::fpstate::mark(&mut carried, xcr0, bytes as u32).is_err() {
+            return FAULT_END;
+        }
+        bytes + 4
+    };
+    let fp_at = (top - fp_len as u64) & !63;
+    let frame_at = (fp_at - FRAME_BYTES as u64) & !15;
 
     let mut frame = [0u8; FRAME_BYTES];
     frame[..8].copy_from_slice(&handler.restorer.to_le_bytes());
@@ -445,9 +471,18 @@ fn deliver_signal(domain: u32, slot: u64, signal: u64, address: u64, handler: Ha
     // `rt_sigreturn` must put back rather than what this delivery imposed.
     let previous = dispositions_of(domain).block_for_delivery(signal, handler.mask);
     frame[8 + SIGINFO_BYTES + UCONTEXT_SIGMASK..][..8].copy_from_slice(&previous.to_le_bytes());
+    // Where the image is, in the frame's own `fpstate`.
+    let fpstate = 8 + SIGINFO_BYTES + UCONTEXT_MCONTEXT + signal::sigcontext::FPSTATE;
+    frame[fpstate..fpstate + 8].copy_from_slice(&fp_at.to_le_bytes());
     // Into the hosted process's own stack. A process whose stack is unmapped
     // gets an ending rather than a delivery, which is what the kernel did.
-    if !copy_out(domain, frame_at, &frame) {
+    if !copy_out(domain, fp_at, &carried[..fp_len]) || !copy_out(domain, frame_at, &frame) {
+        return FAULT_END;
+    }
+    // **And the handler starts from the initial state**, as Linux's does: the
+    // interrupted code's is in the frame now, and what the handler finds in
+    // its registers is nobody's.
+    if fp_give(slot, &fp_initial()[..bytes]) != Some(0) {
         return FAULT_END;
     }
 
@@ -1036,6 +1071,25 @@ fn answer_with_frame(domain: u32, slot: u64, number: u64) -> (u64, Answer) {
             let Ok(registers) = Registers::read_sigcontext(&bytes) else {
                 return (REPLY_VALUE, Answer::error(memory::errno::EINVAL));
             };
+            // **The floating-point state the frame carries, put back** --
+            // RFC 0094 step 3 -- and checked by the kernel before it is: the
+            // image came off this program's stack, where the handler may have
+            // written anything. One the processor would not load ends the
+            // program with SIGSEGV, as Linux ends one whose frame is bad.
+            match restore_fp(domain, slot, &bytes) {
+                Some(0) => {}
+                Some(_refused) => {
+                    note_exit(
+                        domain,
+                        Exit::Signalled {
+                            signal: signal::number::SIGSEGV as u8,
+                            core: false,
+                        },
+                    );
+                    return (REPLY_END_DOMAIN, Answer::ok(0));
+                }
+                None => return (REPLY_VALUE, Answer::error(memory::errno::EINVAL)),
+            }
             // **The blocked set this frame was built with, put back** — RFC
             // 0083 step 7. Read out of the frame rather than from a stack this
             // program keeps, so nesting of any depth unwinds by construction
@@ -1115,6 +1169,150 @@ fn read_slot(slot: u64, out: &mut [u64; FAULT_REGISTERS]) -> bool {
         *word = unsafe { core::ptr::read_volatile((at + index as u64 * 8) as *const u64) };
     }
     true
+}
+
+/// Bytes of a slot's floating-point image region -- RFC 0094 step 3.
+const FP_IMAGE: usize = bhaskix_abi::adapter::fp::IMAGE_BYTES as usize;
+
+/// Where slot `slot`'s floating-point image lives in this program's mapping
+/// of the fault object.
+const fn fp_region(slot: u64) -> u64 {
+    FAULTS_AT + bhaskix_abi::adapter::fp::AT + slot * bhaskix_abi::adapter::fp::IMAGE_BYTES
+}
+
+/// One of a slot's words after its registers, where `FP_READ` says what it
+/// read.
+fn slot_word(slot: u64, word: u64) -> u64 {
+    // SAFETY: inside the fault page this program mapped; `slot` is below
+    // eight and the word is inside the slot's 512 bytes.
+    unsafe {
+        core::ptr::read_volatile((FAULTS_AT + slot * FAULT_SLOT_BYTES + word * 8) as *const u64)
+    }
+}
+
+/// How many times a floating-point call is asked again while the stopped
+/// thread is still on its CPU. It is about to leave it -- it is blocked on
+/// this program's answer -- so this is a bound, not a wait anyone expects.
+const FP_TRIES: u32 = 10_000;
+
+/// The stopped thread's floating-point image, into `into`, with the `XCR0`
+/// its layout is for (zero for `FXSAVE`) and the bytes it uses -- RFC 0094
+/// step 3. `None` if the kernel would not give it.
+fn fp_take(slot: u64, into: &mut [u8; FP_IMAGE]) -> Option<(u64, usize)> {
+    if slot >= 8 {
+        return None;
+    }
+    for _ in 0..FP_TRIES {
+        let answered = call(
+            syscall::INVOKE,
+            FAULTS,
+            bhaskix_abi::method::FP_READ,
+            [slot, 0, 0, 0],
+        );
+        if answered.status == status::CONGESTED {
+            let _ = call(syscall::YIELD, 0, 0, [0; 4]);
+            continue;
+        }
+        if answered.status != status::OK {
+            return None;
+        }
+        // SAFETY: the image region of the fault object this program mapped,
+        // `FP_IMAGE` bytes of it, which the kernel has just filled.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                fp_region(slot) as *const u8,
+                into.as_mut_ptr(),
+                FP_IMAGE,
+            );
+        }
+        let xcr0 = slot_word(slot, bhaskix_abi::adapter::fp::XCR0_WORD);
+        let bytes = slot_word(slot, bhaskix_abi::adapter::fp::BYTES_WORD) as usize;
+        return Some((xcr0, bytes.min(FP_IMAGE)));
+    }
+    None
+}
+
+/// Installs `image` as the stopped thread's floating-point state: zero when
+/// installed, one of `adapter::fp::refused` when the kernel judged it an image
+/// the processor would not load, `None` if it would not answer.
+fn fp_give(slot: u64, image: &[u8]) -> Option<u64> {
+    if slot >= 8 || image.len() > FP_IMAGE {
+        return None;
+    }
+    // SAFETY: the image region of the fault object this program mapped,
+    // written before the kernel is asked to read it.
+    unsafe {
+        core::ptr::copy_nonoverlapping(image.as_ptr(), fp_region(slot) as *mut u8, image.len());
+    }
+    for _ in 0..FP_TRIES {
+        let answered = call(
+            syscall::INVOKE,
+            FAULTS,
+            bhaskix_abi::method::FP_WRITE,
+            [slot, 0, 0, 0],
+        );
+        if answered.status == status::CONGESTED {
+            let _ = call(syscall::YIELD, 0, 0, [0; 4]);
+            continue;
+        }
+        return (answered.status == status::OK).then_some(answered.args[0]);
+    }
+    None
+}
+
+/// `rt_sigreturn`'s half of RFC 0094 step 3: the image the frame's
+/// `fpstate` names, installed as the thread's state.
+///
+/// * `fpstate` zero: the initial image, which is what a frame carrying none
+///   leaves on Linux (recalled from its `restore_sigcontext`, not read).
+/// * an image marked with both magics and the size this machine's plan uses:
+///   that image, whole.
+/// * an unmarked one: its 512-byte legacy region -- x87, `MXCSR`, `xmm0`-
+///   `xmm15` -- with every extended component in its initial state, which is
+///   what Linux restores from an `FXSAVE`-only frame.
+///
+/// Answers `FP_WRITE`'s answer: zero when installed, a refusal code when the
+/// kernel judged the image one the processor would not load.
+fn restore_fp(domain: u32, slot: u64, context: &[u8]) -> Option<u64> {
+    use bhaskix_personality::fpstate;
+    let at = signal::sigcontext::FPSTATE;
+    let fpstate_at = u64::from_le_bytes(context.get(at..at + 8)?.try_into().ok()?);
+    // The layout this machine uses, from the kernel: the image itself is not
+    // needed, only its words.
+    let mut scratch = [0u8; FP_IMAGE];
+    let (xcr0, bytes) = fp_take(slot, &mut scratch)?;
+    if fpstate_at == 0 {
+        return fp_give(slot, &fp_initial()[..bytes]);
+    }
+    let mut image = [0u8; FP_IMAGE];
+    if !copy_in(domain, fpstate_at, &mut image[..fpstate::LEGACY]) {
+        return None;
+    }
+    if xcr0 == 0 {
+        return fp_give(slot, &image[..fpstate::LEGACY]);
+    }
+    // Marked, and the size this plan uses: read the rest and check both ends.
+    let marked = image.get(fpstate::SW_RESERVED..fpstate::SW_RESERVED + 4)
+        == Some(&fpstate::MAGIC1.to_le_bytes()[..]);
+    if marked
+        && bytes + 4 <= FP_IMAGE
+        && copy_in(domain, fpstate_at, &mut image[..bytes + 4])
+        && fpstate::marked_size(&image[..bytes + 4]) == Some(bytes)
+    {
+        return fp_give(slot, &image[..bytes]);
+    }
+    // Unmarked: the legacy region, and the rest initial -- `XSTATE_BV` names
+    // x87 and SSE, which the legacy region holds, and nothing else.
+    image[fpstate::LEGACY..].fill(0);
+    image[fpstate::XSTATE_BV] = (xcr0 & 0x3) as u8;
+    fp_give(slot, &image[..bytes])
+}
+
+/// The image a thread starts with, and a handler is entered with.
+fn fp_initial() -> [u8; FP_IMAGE] {
+    let mut image = [0u8; FP_IMAGE];
+    bhaskix_personality::fpstate::initial(&mut image);
+    image
 }
 
 /// Writes a fault slot's register image back.

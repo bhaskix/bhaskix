@@ -264,3 +264,10 @@ path = "fuzz_targets/bootsig.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "fpstate"
+path = "fuzz_targets/fpstate.rs"
+test = false
+doc = false
+bench = false

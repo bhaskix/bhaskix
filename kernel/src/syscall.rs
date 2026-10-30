@@ -122,6 +122,8 @@ const _: () = {
     assert!(Kind::Exit as u64 == bhaskix_abi::syscall::EXIT);
     assert!(method::FILL == bhaskix_abi::method::FILL);
     assert!(method::ATTACH == bhaskix_abi::method::ATTACH);
+    assert!(method::FP_READ == bhaskix_abi::method::FP_READ);
+    assert!(method::FP_WRITE == bhaskix_abi::method::FP_WRITE);
     assert!(method::MAP == bhaskix_abi::method::MAP);
     assert!(method::ACK == bhaskix_abi::method::ACK);
     assert!(method::WAIT == bhaskix_abi::method::WAIT);
@@ -330,6 +332,10 @@ pub mod method {
     pub const MAY_DIAL: u64 = 77;
     /// See `bhaskix_abi::method::GRANT_DIAL`.
     pub const GRANT_DIAL: u64 = 78;
+    /// See `bhaskix_abi::method::FP_READ`.
+    pub const FP_READ: u64 = 79;
+    /// See `bhaskix_abi::method::FP_WRITE`.
+    pub const FP_WRITE: u64 = 80;
     /// Map the memory this capability names into the caller's address space.
     ///
     /// Only on a `Memory` capability. `arg0` = where, page-aligned; `arg1`
@@ -1427,6 +1433,38 @@ fn dispatch_inner(frame: &mut SyscallFrame) -> Outcome {
             // the notification was destroyed, reported as it is for a waiter.
             Err(crate::notify::NotifyError::EmptyBadge) => Outcome::err(Status::WrongObject),
             Err(_) => Outcome::err(Status::Revoked),
+        };
+    }
+
+    // RFC 0094 step 3: a stopped thread's floating-point image, out of and
+    // into the fault object -- which is the only object these answer on, so
+    // the authority is exactly the one that already reads and edits the
+    // thread's general-purpose registers.
+    if kind == Some(Kind::Invoke)
+        && (frame.method == method::FP_READ || frame.method == method::FP_WRITE)
+    {
+        let resolved = match resolve_for_ipc(frame.capability, ObjectKind::Memory) {
+            Ok(resolved) => resolved,
+            Err(status) => return Outcome::err(status),
+        };
+        if !resolved.rights.contains(crate::cap::Rights::READ)
+            || !resolved.rights.contains(crate::cap::Rights::WRITE)
+        {
+            return Outcome::err(Status::InsufficientRights);
+        }
+        if !crate::fault::is_the_object(resolved.object) {
+            return Outcome::err(Status::WrongObject);
+        }
+        let slot = frame.arg0 as usize;
+        let answer = if frame.method == method::FP_READ {
+            crate::fault::fp_read(slot)
+        } else {
+            crate::fault::fp_write(slot)
+        };
+        return match answer {
+            Ok(value) => Outcome::ok(value),
+            Err(crate::fault::FpError::Busy) => Outcome::err(Status::Congested),
+            Err(crate::fault::FpError::NoSlot) => Outcome::err(Status::SlotUnavailable),
         };
     }
 

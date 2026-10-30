@@ -49,6 +49,7 @@ pub mod trap;
 pub mod tsc;
 pub mod uaccess;
 pub mod vtd;
+pub mod xstate;
 
 pub use context::Context;
 pub use serial::{Presence, SerialPort};

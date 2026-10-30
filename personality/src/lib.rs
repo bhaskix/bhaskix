@@ -24,6 +24,7 @@ pub mod event;
 pub mod eventfd;
 pub mod exec;
 pub mod file;
+pub mod fpstate;
 pub mod limit;
 pub mod memory;
 pub mod pipe;

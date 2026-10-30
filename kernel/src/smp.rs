@@ -66,6 +66,18 @@ static MADT_REPORTED: AtomicU32 = AtomicU32::new(0);
 /// processor has them — SMEP and SMAP. See [`note_protections`].
 static PROTECTED: AtomicU32 = AtomicU32::new(0);
 
+/// CPUs that applied RFC 0094's plan and read it back.
+static XSTATE_LIVE: AtomicU32 = AtomicU32::new(0);
+/// Secondaries that arrived with `CR4.OSXSAVE` already set.
+static OSXSAVE_ON_ARRIVAL: AtomicU32 = AtomicU32::new(0);
+
+/// Counts a CPU whose floating-point plan reads back as applied.
+pub fn note_xstate(live: bool) {
+    if live {
+        XSTATE_LIVE.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
 /// CPUs whose PAT holds `memtype::PAT_LAYOUT` -- 2026-10-12. A write-combining
 /// mapping means WC only on a CPU whose entry 5 says so, so the framebuffer's
 /// window is made only once this counts every CPU online.
@@ -161,6 +173,16 @@ extern "C" fn secondary_main(lapic_id: u32) -> ! {
         // simply never arrives -- which is what the native lane reported
         // as "the cpus line is missing or short of 4 online of 4".
         bhaskix_arch::cpu::enable_sse();
+        // RFC 0094: the plan the bootstrap CPU chose, applied here too, before
+        // anything is scheduled -- a thread migrated to a CPU with a different
+        // `XCR0` would fault on its own state. Whatever the firmware left in
+        // `CR4.OSXSAVE` is counted first, then replaced.
+        if bhaskix_arch::xstate::osxsave_live() {
+            OSXSAVE_ON_ARRIVAL.fetch_add(1, Ordering::AcqRel);
+        }
+        // Inside this function's `unsafe` block: init, after `enable_sse`,
+        // nothing scheduled here yet.
+        note_xstate(bhaskix_arch::xstate::enable());
 
         // Only now: the GDT load above cleared GS.base, so pointing GS at the
         // per-CPU area has to happen after it rather than before.
@@ -669,6 +691,23 @@ pub fn report(handoff: &bhaskix_boot::Handoff) {
     } else {
         println!(
             "\x1b[91m    supervisor     FAILED: wp, smep and smap live on {protected} of {online} cpus\x1b[0m"
+        );
+    }
+    let xstate = XSTATE_LIVE.load(Ordering::Acquire);
+    let plan = bhaskix_arch::xstate::plan();
+    if xstate == online {
+        println!(
+            "    xstate live    {} with xcr0 {:#x} on {xstate} of {online} cpus; {} secondary \
+             cpu(s) arrived with CR4.OSXSAVE already set",
+            plan.switch.name(),
+            plan.xcr0,
+            OSXSAVE_ON_ARRIVAL.load(Ordering::Acquire)
+        );
+    } else {
+        println!(
+            "\x1b[91m    xstate live    FAILED: {} with xcr0 {:#x} read back on {xstate} of {online} cpus\x1b[0m",
+            plan.switch.name(),
+            plan.xcr0
         );
     }
 }

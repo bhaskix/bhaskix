@@ -269,19 +269,21 @@ pub struct Thread {
     /// domains on one CPU did, and the only reason it had never happened is
     /// that there had never been two user programs on one CPU at once.
     pub space_root: u64,
-    /// This thread's floating-point and SSE register file, saved when it
-    /// leaves a CPU and restored when it arrives.
+    /// This thread's floating-point and vector register file, saved when it
+    /// leaves a CPU and restored when it arrives -- by `XSAVEOPT` and
+    /// `XRSTOR` where the CPU offers them, `FXSAVE` and `FXRSTOR` where it
+    /// does not (RFC 0094).
     ///
-    /// **`CR4.OSFXSR` is the OS promising to do exactly this**, and the
-    /// promise is what makes enabling SSE safe: the register file is per
-    /// CPU and threads are not, so two threads sharing one would otherwise
-    /// read each other's floating-point values — silently, and only
-    /// sometimes, which is the worst shape a bug can have.
+    /// **`CR4.OSFXSR` and `CR4.OSXSAVE` are the OS promising to do exactly
+    /// this**, and the promise is what makes enabling them safe: the
+    /// register file is per CPU and threads are not, so two threads sharing
+    /// one would otherwise read each other's values -- silently, and only
+    /// sometimes, which is the worst shape a bug can have. The boot's
+    /// `vector state` line checks it.
     ///
-    /// Starts as the image `FXSAVE` produced of the machine's own initial
-    /// state, not as zeroes: a zeroed area is not a valid state image, and
-    /// `FXRSTOR` of one sets a control word no program asked for.
-    pub fx: FxArea,
+    /// Starts as an image written from constants, not as zeroes and not as
+    /// a copy of the running CPU's: see [`FpArea::initial`].
+    pub fx: FpArea,
     /// The thread-local base this thread asked for with Linux's
     /// `arch_prctl(ARCH_SET_FS)`, or zero.
     ///
@@ -1001,7 +1003,7 @@ pub fn init_cpu(name: &'static str, policy: Policy) {
         held_count: 0,
         space_root: 0,
         fs_base: 0,
-        fx: FxArea::initial(),
+        fx: FpArea::initial(),
         reply_to: None,
         receive_slot: None,
         staged_gift: None,
@@ -1217,7 +1219,7 @@ pub fn spawn_on_with(
         held_count: 0,
         space_root: 0,
         fs_base: 0,
-        fx: FxArea::initial(),
+        fx: FpArea::initial(),
         reply_to: None,
         receive_slot: None,
         staged_gift: None,
@@ -1364,13 +1366,14 @@ pub fn deliver(thread: u32, message: crate::ipc::Message, from: u32) -> bool {
     false
 }
 
-/// A thread's `FXSAVE` area: 512 bytes, 16-byte aligned as the instruction
-/// requires.
+/// A thread's floating-point area: [`bhaskix_arch::xstate::CAPACITY`] bytes,
+/// 64-byte aligned as `XSAVE` requires (`FXSAVE` needs 16, and uses the first
+/// 512) -- RFC 0094.
 #[derive(Clone, Copy)]
-#[repr(align(16))]
-pub struct FxArea([u8; 512]);
+#[repr(align(64))]
+pub struct FpArea(pub [u8; bhaskix_arch::xstate::CAPACITY as usize]);
 
-impl FxArea {
+impl FpArea {
     /// An area holding a valid initial state image, **built from constants
     /// rather than taken from the machine**.
     ///
@@ -1386,13 +1389,17 @@ impl FxArea {
     ///
     /// So the image is written: `FCW` = `0x037f` (the x87 control word after
     /// `FNINIT`) and `MXCSR` = `0x1f80` (all SSE exceptions masked, round to
-    /// nearest), everything else zero. That is what a process starts with on
-    /// any system, and it depends on no instruction having been enabled yet.
+    /// nearest), everything else zero. For `XSAVE` that zero includes the
+    /// header, whose `XSTATE_BV` of zero makes `XRSTOR` *initialise* every
+    /// component rather than read it -- while still loading `MXCSR` from the
+    /// legacy region, which it does whenever SSE is requested (checked
+    /// 2026-10-30 against the instruction reference). That is what a process
+    /// starts with on any system, and it depends on no instruction having
+    /// been enabled yet.
     #[must_use]
     pub const fn initial() -> Self {
-        let mut area = [0u8; 512];
-        // `FCW` at 0, `MXCSR` at 24 — the layout `FXSAVE` writes and
-        // `FXRSTOR` reads.
+        let mut area = [0u8; bhaskix_arch::xstate::CAPACITY as usize];
+        // `FCW` at 0, `MXCSR` at 24 -- the layout both instructions use.
         area[0] = 0x7f;
         area[1] = 0x03;
         area[24] = 0x80;
@@ -1496,6 +1503,54 @@ pub(crate) fn base_reach(
 /// thread runs in user mode with its old base until then.
 pub static FS_BASE_SET_ELSEWHERE: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
+
+/// Copies a **stopped** thread's floating-point area into `into` -- RFC 0094
+/// step 3, for a signal frame.
+///
+/// `Err(true)` while the thread is still the current one on its CPU: its
+/// state is in the registers, not the area, until its switch saves it, and
+/// the save and the change of `current` happen under the same queue lock this
+/// takes -- so a thread this finds not current has been saved. `Err(false)`
+/// for a thread on no queue.
+pub fn fp_area_read(thread: u32, into: &mut [u8]) -> Result<(), bool> {
+    for queue in QUEUES.iter().take(percpu::online_count() as usize) {
+        let queue = queue.lock();
+        let running = queue.threads[queue.current].as_ref().map(|t| t.id);
+        if let Some(target) = queue.threads.iter().flatten().find(|t| t.id == thread) {
+            if running == Some(thread) {
+                return Err(true);
+            }
+            let take = into.len().min(target.fx.0.len());
+            into[..take].copy_from_slice(&target.fx.0[..take]);
+            return Ok(());
+        }
+    }
+    Err(false)
+}
+
+/// Installs `from` as a stopped thread's floating-point area -- RFC 0094
+/// step 3. The caller has checked it is an image the processor loads. Busy
+/// and absent as [`fp_area_read`].
+///
+/// Sound with `XSAVEOPT`'s "modified" optimisation, which may skip saving a
+/// component unchanged since the last `XRSTOR` *from the same address*: the
+/// thread is off every CPU, and it can only run again through an `XRSTOR`
+/// from this area, which loads what is written here.
+pub fn fp_area_write(thread: u32, from: &[u8]) -> Result<(), bool> {
+    for queue in QUEUES.iter().take(percpu::online_count() as usize) {
+        let mut queue = queue.lock();
+        let running = queue.threads[queue.current].as_ref().map(|t| t.id);
+        if let Some(target) = queue.threads.iter_mut().flatten().find(|t| t.id == thread) {
+            if running == Some(thread) {
+                return Err(true);
+            }
+            let take = from.len().min(target.fx.0.len());
+            target.fx.0[..take].copy_from_slice(&from[..take]);
+            return Ok(());
+        }
+    }
+    Err(false)
+}
 
 /// Records a thread's `FS` base and loads it now, so the call that asked
 /// for it sees it on return.
@@ -3448,13 +3503,16 @@ fn preempt_reporting() -> bool {
         // says it should -- see `FS_BASE_LOADED`.
         let leaving_base = fs_base_loaded();
         if let Some(from_thread) = queue.threads[current].as_mut() {
-            // SAFETY: 512 aligned bytes belonging to the thread being
-            // switched away from, and this is its last instant on the CPU.
-            unsafe { bhaskix_arch::cpu::fx_save(from_thread.fx.0.as_mut_ptr()) };
+            // SAFETY: a 64-aligned area of `CAPACITY` bytes belonging to the
+            // thread being switched away from, and this is its last instant
+            // on the CPU; every CPU applied the plan before scheduling.
+            unsafe { bhaskix_arch::xstate::save(from_thread.fx.0.as_mut_ptr()) };
         }
         if let Some(to_thread) = queue.threads[next].as_ref() {
-            // SAFETY: an image `FXSAVE` wrote — every area starts as one.
-            unsafe { bhaskix_arch::cpu::fx_restore(to_thread.fx.0.as_ptr()) };
+            // SAFETY: an image the save wrote, or the constant initial one,
+            // or one RFC 0094 step 3's check accepted -- nothing else is
+            // ever put in an area.
+            unsafe { bhaskix_arch::xstate::restore(to_thread.fx.0.as_ptr()) };
             crate::telemetry::note_domain(to_thread.domain);
             // The thread-local base travels with the thread, because the
             // register does not: it is one per CPU, and a hosted program
@@ -4741,11 +4799,11 @@ pub fn block_self(who: u32) {
                 let leaving_base = fs_base_loaded();
                 if let Some(from_thread) = queue.threads[current].as_mut() {
                     // SAFETY: as the other switch site.
-                    unsafe { bhaskix_arch::cpu::fx_save(from_thread.fx.0.as_mut_ptr()) };
+                    unsafe { bhaskix_arch::xstate::save(from_thread.fx.0.as_mut_ptr()) };
                 }
                 if let Some(to_thread) = queue.threads[next].as_ref() {
                     // SAFETY: as the other switch site.
-                    unsafe { bhaskix_arch::cpu::fx_restore(to_thread.fx.0.as_ptr()) };
+                    unsafe { bhaskix_arch::xstate::restore(to_thread.fx.0.as_ptr()) };
                     crate::telemetry::note_domain(to_thread.domain);
                     // As the other site: the arriving thread's base, zero
                     // included, against what the CPU already holds.
@@ -6372,7 +6430,7 @@ mod tests {
             held_count: 0,
             space_root: 0,
             fs_base: 0,
-            fx: FxArea::initial(),
+            fx: FpArea::initial(),
             reply_to: None,
             receive_slot: None,
             staged_gift: None,

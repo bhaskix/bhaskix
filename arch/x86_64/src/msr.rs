@@ -87,6 +87,14 @@ pub struct CpuidResult {
 /// must check the maximum leaf first where that matters.
 #[must_use]
 pub fn cpuid(leaf: u32) -> CpuidResult {
+    cpuid_count(leaf, 0)
+}
+
+/// Executes `cpuid` for `leaf` and `subleaf` (`ecx`), for the leaves whose
+/// answer depends on it -- 0xD, the `XSAVE` state components, above all
+/// (RFC 0094). Safe for the reason [`cpuid`] gives.
+#[must_use]
+pub fn cpuid_count(leaf: u32, subleaf: u32) -> CpuidResult {
     let (eax, ebx, ecx, edx);
     // SAFETY: `cpuid` is unprivileged, cannot fault, and has no memory
     // effects. RBX is callee-saved in the SysV ABI and cannot be named
@@ -99,7 +107,7 @@ pub fn cpuid(leaf: u32) -> CpuidResult {
             "xchg {tmp:r}, rbx",
             tmp = out(reg) ebx,
             inout("eax") leaf => eax,
-            inout("ecx") 0u32 => ecx,
+            inout("ecx") subleaf => ecx,
             out("edx") edx,
             options(nostack, preserves_flags),
         );

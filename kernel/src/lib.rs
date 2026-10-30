@@ -147,6 +147,9 @@ pub fn kernel_main(handoff: &Handoff) -> ! {
     // any paging structure is touched, and refuses with a sentence instead.
     // SAFETY: reading CR4 at CPL 0.
     let cr4 = unsafe { bhaskix_arch::cpu::read_cr4() };
+    // RFC 0094: whether whatever ran before this kernel left `CR4.OSXSAVE`
+    // set. Kept for the `xstate` line, because nothing had read it.
+    OSXSAVE_AT_ENTRY.store(cr4 & (1 << 18) != 0, core::sync::atomic::Ordering::Relaxed);
     if bhaskix_arch::cpu::five_level_paging_live(cr4) {
         println!(
             "  FATAL: this machine entered the kernel with five-level paging (CR4.LA57) live, \
@@ -326,6 +329,16 @@ pub fn kernel_main(handoff: &Handoff) -> ! {
             // SAFETY: init, before anything enters ring 3 here, and the
             // switch path keeps `OSFXSR`'s promise.
             unsafe { cpu::enable_sse() };
+            // RFC 0094 steps 1 and 2: what this CPU offers, the plan every CPU
+            // will apply, and this one applying it -- here, before any other
+            // CPU starts and before anything is scheduled.
+            let offered = bhaskix_arch::xstate::offered();
+            // SAFETY: the bootstrap CPU, after `enable_sse`, before anything
+            // else starts.
+            unsafe { bhaskix_arch::xstate::adopt(bhaskix_arch::xstate::choose(&offered)) };
+            // SAFETY: init, after `enable_sse`, nothing scheduled yet.
+            smp::note_xstate(unsafe { bhaskix_arch::xstate::enable() });
+            report_xstate(&offered);
             bhaskix_arch::uaccess::set_smap_enabled(smap);
             println!(
                 "    supervisor     smep {}  smap {}  ({} exception-table {})",
@@ -1163,6 +1176,18 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
         bhaskix_arch::percpu::online_count(),
     ) {
         println!("\x1b[91m    linux signal   FAILED\x1b[0m");
+    }
+    if !signal_fp_self_test(
+        handoff.hhdm_base.as_u64(),
+        bhaskix_arch::percpu::online_count(),
+    ) {
+        println!("\x1b[91m    linux sig fp   FAILED\x1b[0m");
+    }
+    if !vector_self_test(
+        handoff.hhdm_base.as_u64(),
+        bhaskix_arch::percpu::online_count(),
+    ) {
+        println!("\x1b[91m    vector state   FAILED\x1b[0m");
     }
     if !poll_self_test(
         handoff.hhdm_base.as_u64(),
@@ -7381,6 +7406,503 @@ fn signal_self_test(hhdm_base: u64, cpus: u32) -> bool {
             "\x1b[91m    linux signal   FAILED: cr2 {:#x}, resumed {}, delivered {delivered}, \
              returned {returned}, {foreign} foreign calls\x1b[0m",
             answers[0], answers[1]
+        );
+        false
+    }
+}
+
+/// Builds a probe's space -- one code page at `at`, four stack pages
+/// 0x1_0000 above it, one report page 0x2_0000 above it -- copies `code` in,
+/// publishes the report page's frame through `report_pa`, and enters ring 3
+/// with `[report, argument]` in `rdi` and `rsi`.
+///
+/// The shape every hand-assembled probe in this file repeats inline; RFC
+/// 0094's two are the first written through it, so that two probes did not
+/// mean two more copies of it.
+fn enter_probe(
+    hhdm_base: u64,
+    code: &[u8],
+    at: u64,
+    report_pa: &core::sync::atomic::AtomicU64,
+    argument: u64,
+) -> ! {
+    use bhaskix_boot::VirtAddr;
+    use bhaskix_mm::{Protection, VirtRange};
+    use vm::AddressSpace;
+
+    let stop = || -> ! { sched::exit() };
+    let (stack_at, report_at) = (at + 0x1_0000, at + 0x2_0000);
+    if code.len() > 4096 {
+        stop()
+    }
+    let Ok(mut space) = AddressSpace::new(hhdm_base) else {
+        stop()
+    };
+    for (where_, pages, protection) in [
+        (at, 1, Protection::ReadExecute),
+        (stack_at, 4, Protection::ReadWrite),
+        (report_at, 1, Protection::ReadWrite),
+    ] {
+        let Some(range) = VirtRange::from_pages(VirtAddr(where_), pages) else {
+            stop()
+        };
+        if space.map_anonymous(range, protection).is_err() {
+            stop()
+        }
+    }
+    let (Some(code_pa), Some(page_pa)) = (
+        space.translate(VirtAddr(at)),
+        space.translate(VirtAddr(report_at)),
+    ) else {
+        stop()
+    };
+    // SAFETY: a freshly mapped anonymous frame this space owns, filled
+    // through the direct map -- the executable mapping is never writable.
+    unsafe {
+        core::ptr::copy_nonoverlapping(code.as_ptr(), (hhdm_base + code_pa) as *mut u8, code.len());
+    }
+    report_pa.store(page_pa, core::sync::atomic::Ordering::Release);
+    // SAFETY: the higher half is copied from the running table.
+    unsafe { vm::install(space) };
+    // The domain note, for the reason `ring3_signal` gives.
+    if let Some(domain) = sched::current_domain() {
+        telemetry::note_domain(domain.as_u32());
+    }
+    // SAFETY: the entry is inside the user-executable page just written;
+    // `rsp` is one past four user-writable stack pages.
+    unsafe { bhaskix_arch::syscall::enter_ring3(at, stack_at + 4 * 4096, [report_at, argument]) }
+}
+
+/// The vector probe -- RFC 0094 step 0. Assembled from
+/// [`tools/probes/vector.s`](../../tools/probes/vector.s) by
+/// [`tools/probe-bytes.sh`](../../tools/probe-bytes.sh): two of these, in two
+/// domains on one CPU, each hold their own pattern in all sixteen `xmm`
+/// registers and yield to each other a thousand times, and count every
+/// quadword that comes back as anything else.
+#[rustfmt::skip]
+const VECTOR_CODE: [u8; 442] = [
+    0x49, 0x89, 0xff,                         // mov %rdi,%r15
+    0x49, 0x89, 0xf6,                         // mov %rsi,%r14
+    0x4c, 0x89, 0xf0,                         // mov %r14,%rax
+    0x66, 0x48, 0x0f, 0x6e, 0xc0,             // movq %rax,%xmm0
+    0x66, 0x0f, 0x6c, 0xc0,                   // punpcklqdq %xmm0,%xmm0
+    0x48, 0xff, 0xc0,                         // inc %rax
+    0x66, 0x48, 0x0f, 0x6e, 0xc8,             // movq %rax,%xmm1
+    0x66, 0x0f, 0x6c, 0xc9,                   // punpcklqdq %xmm1,%xmm1
+    0x48, 0xff, 0xc0,                         // inc %rax
+    0x66, 0x48, 0x0f, 0x6e, 0xd0,             // movq %rax,%xmm2
+    0x66, 0x0f, 0x6c, 0xd2,                   // punpcklqdq %xmm2,%xmm2
+    0x48, 0xff, 0xc0,                         // inc %rax
+    0x66, 0x48, 0x0f, 0x6e, 0xd8,             // movq %rax,%xmm3
+    0x66, 0x0f, 0x6c, 0xdb,                   // punpcklqdq %xmm3,%xmm3
+    0x48, 0xff, 0xc0,                         // inc %rax
+    0x66, 0x48, 0x0f, 0x6e, 0xe0,             // movq %rax,%xmm4
+    0x66, 0x0f, 0x6c, 0xe4,                   // punpcklqdq %xmm4,%xmm4
+    0x48, 0xff, 0xc0,                         // inc %rax
+    0x66, 0x48, 0x0f, 0x6e, 0xe8,             // movq %rax,%xmm5
+    0x66, 0x0f, 0x6c, 0xed,                   // punpcklqdq %xmm5,%xmm5
+    0x48, 0xff, 0xc0,                         // inc %rax
+    0x66, 0x48, 0x0f, 0x6e, 0xf0,             // movq %rax,%xmm6
+    0x66, 0x0f, 0x6c, 0xf6,                   // punpcklqdq %xmm6,%xmm6
+    0x48, 0xff, 0xc0,                         // inc %rax
+    0x66, 0x48, 0x0f, 0x6e, 0xf8,             // movq %rax,%xmm7
+    0x66, 0x0f, 0x6c, 0xff,                   // punpcklqdq %xmm7,%xmm7
+    0x48, 0xff, 0xc0,                         // inc %rax
+    0x66, 0x4c, 0x0f, 0x6e, 0xc0,             // movq %rax,%xmm8
+    0x66, 0x45, 0x0f, 0x6c, 0xc0,             // punpcklqdq %xmm8,%xmm8
+    0x48, 0xff, 0xc0,                         // inc %rax
+    0x66, 0x4c, 0x0f, 0x6e, 0xc8,             // movq %rax,%xmm9
+    0x66, 0x45, 0x0f, 0x6c, 0xc9,             // punpcklqdq %xmm9,%xmm9
+    0x48, 0xff, 0xc0,                         // inc %rax
+    0x66, 0x4c, 0x0f, 0x6e, 0xd0,             // movq %rax,%xmm10
+    0x66, 0x45, 0x0f, 0x6c, 0xd2,             // punpcklqdq %xmm10,%xmm10
+    0x48, 0xff, 0xc0,                         // inc %rax
+    0x66, 0x4c, 0x0f, 0x6e, 0xd8,             // movq %rax,%xmm11
+    0x66, 0x45, 0x0f, 0x6c, 0xdb,             // punpcklqdq %xmm11,%xmm11
+    0x48, 0xff, 0xc0,                         // inc %rax
+    0x66, 0x4c, 0x0f, 0x6e, 0xe0,             // movq %rax,%xmm12
+    0x66, 0x45, 0x0f, 0x6c, 0xe4,             // punpcklqdq %xmm12,%xmm12
+    0x48, 0xff, 0xc0,                         // inc %rax
+    0x66, 0x4c, 0x0f, 0x6e, 0xe8,             // movq %rax,%xmm13
+    0x66, 0x45, 0x0f, 0x6c, 0xed,             // punpcklqdq %xmm13,%xmm13
+    0x48, 0xff, 0xc0,                         // inc %rax
+    0x66, 0x4c, 0x0f, 0x6e, 0xf0,             // movq %rax,%xmm14
+    0x66, 0x45, 0x0f, 0x6c, 0xf6,             // punpcklqdq %xmm14,%xmm14
+    0x48, 0xff, 0xc0,                         // inc %rax
+    0x66, 0x4c, 0x0f, 0x6e, 0xf8,             // movq %rax,%xmm15
+    0x66, 0x45, 0x0f, 0x6c, 0xff,             // punpcklqdq %xmm15,%xmm15
+    0x49, 0xc7, 0xc5, 0xe8, 0x03, 0x00, 0x00, // mov $0x3e8,%r13
+    0x45, 0x31, 0xe4,                         // xor %r12d,%r12d
+    0xb8, 0x04, 0x00, 0x00, 0x00,             // mov $0x4,%eax
+    0x0f, 0x05,                               // syscall
+    0xf3, 0x41, 0x0f, 0x7f, 0x47, 0x40,       // movdqu %xmm0,0x40(%r15)
+    0xf3, 0x41, 0x0f, 0x7f, 0x4f, 0x50,       // movdqu %xmm1,0x50(%r15)
+    0xf3, 0x41, 0x0f, 0x7f, 0x57, 0x60,       // movdqu %xmm2,0x60(%r15)
+    0xf3, 0x41, 0x0f, 0x7f, 0x5f, 0x70,       // movdqu %xmm3,0x70(%r15)
+    0xf3, 0x41, 0x0f, 0x7f, 0xa7, 0x80, 0x00, 0x00, 0x00, // movdqu %xmm4,0x80(%r15)
+    0xf3, 0x41, 0x0f, 0x7f, 0xaf, 0x90, 0x00, 0x00, 0x00, // movdqu %xmm5,0x90(%r15)
+    0xf3, 0x41, 0x0f, 0x7f, 0xb7, 0xa0, 0x00, 0x00, 0x00, // movdqu %xmm6,0xa0(%r15)
+    0xf3, 0x41, 0x0f, 0x7f, 0xbf, 0xb0, 0x00, 0x00, 0x00, // movdqu %xmm7,0xb0(%r15)
+    0xf3, 0x45, 0x0f, 0x7f, 0x87, 0xc0, 0x00, 0x00, 0x00, // movdqu %xmm8,0xc0(%r15)
+    0xf3, 0x45, 0x0f, 0x7f, 0x8f, 0xd0, 0x00, 0x00, 0x00, // movdqu %xmm9,0xd0(%r15)
+    0xf3, 0x45, 0x0f, 0x7f, 0x97, 0xe0, 0x00, 0x00, 0x00, // movdqu %xmm10,0xe0(%r15)
+    0xf3, 0x45, 0x0f, 0x7f, 0x9f, 0xf0, 0x00, 0x00, 0x00, // movdqu %xmm11,0xf0(%r15)
+    0xf3, 0x45, 0x0f, 0x7f, 0xa7, 0x00, 0x01, 0x00, 0x00, // movdqu %xmm12,0x100(%r15)
+    0xf3, 0x45, 0x0f, 0x7f, 0xaf, 0x10, 0x01, 0x00, 0x00, // movdqu %xmm13,0x110(%r15)
+    0xf3, 0x45, 0x0f, 0x7f, 0xb7, 0x20, 0x01, 0x00, 0x00, // movdqu %xmm14,0x120(%r15)
+    0xf3, 0x45, 0x0f, 0x7f, 0xbf, 0x30, 0x01, 0x00, 0x00, // movdqu %xmm15,0x130(%r15)
+    0x49, 0x8d, 0x77, 0x40,                   // lea 0x40(%r15),%rsi
+    0x4c, 0x89, 0xf0,                         // mov %r14,%rax
+    0xb9, 0x10, 0x00, 0x00, 0x00,             // mov $0x10,%ecx
+    0x48, 0x8b, 0x16,                         // mov (%rsi),%rdx
+    0x48, 0x39, 0xc2,                         // cmp %rax,%rdx
+    0x74, 0x07,                               // je 17e <check+0xf>
+    0x49, 0xff, 0xc4,                         // inc %r12
+    0x49, 0x89, 0x57, 0x10,                   // mov %rdx,0x10(%r15)
+    0x48, 0x8b, 0x56, 0x08,                   // mov 0x8(%rsi),%rdx
+    0x48, 0x39, 0xc2,                         // cmp %rax,%rdx
+    0x74, 0x07,                               // je 18e <check+0x1f>
+    0x49, 0xff, 0xc4,                         // inc %r12
+    0x49, 0x89, 0x57, 0x10,                   // mov %rdx,0x10(%r15)
+    0x48, 0x83, 0xc6, 0x10,                   // add $0x10,%rsi
+    0x48, 0xff, 0xc0,                         // inc %rax
+    0xff, 0xc9,                               // dec %ecx
+    0x75, 0xd6,                               // jne 16f <check>
+    0x49, 0xff, 0x07,                         // incq (%r15)
+    0x4d, 0x89, 0x67, 0x08,                   // mov %r12,0x8(%r15)
+    0x49, 0xff, 0xcd,                         // dec %r13
+    0x0f, 0x85, 0x2f, 0xff, 0xff, 0xff,       // jne d8 <round>
+    0x49, 0xc7, 0x47, 0x18, 0x01, 0x00, 0x00, 0x00, // movq $0x1,0x18(%r15)
+    0xb8, 0x04, 0x00, 0x00, 0x00,             // mov $0x4,%eax
+    0x0f, 0x05,                               // syscall
+    0xeb, 0xf7,                               // jmp 1b1 <done>
+];
+
+/// Where the two vector probes' report pages land, and the seeds that make
+/// their patterns differ.
+static VECTOR_REPORT_PA: [core::sync::atomic::AtomicU64; 2] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; 2];
+const VECTOR_SEEDS: [u64; 2] = [0x1111_1111_0000_0000, 0x2222_2222_0000_0000];
+const VECTOR_AT: u64 = 0x0000_0000_3400_0000;
+/// The direct map's base, for the probes' entry, which takes one argument.
+static PROBE_HHDM: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+extern "C" fn ring3_vector(which: u64) -> ! {
+    let which = (which as usize).min(1);
+    let hhdm = PROBE_HHDM.load(core::sync::atomic::Ordering::Acquire);
+    enter_probe(
+        hhdm,
+        &VECTOR_CODE,
+        VECTOR_AT,
+        &VECTOR_REPORT_PA[which],
+        VECTOR_SEEDS[which],
+    )
+}
+
+/// RFC 0094 step 0: **whether a thread's vector registers are its own.**
+///
+/// `CR4.OSFXSR` -- and, from step 2, `CR4.OSXSAVE` -- is the kernel's promise
+/// that a switch saves and restores them. Nothing checked it on a running
+/// machine: the property was argued from the switch path's code. Two native
+/// programs in two domains are pinned to one CPU and yield to each other a
+/// thousand times each, every register holding a pattern of its own; a switch
+/// that dropped any of it would hand one the other's values, and they count.
+fn vector_self_test(hhdm_base: u64, cpus: u32) -> bool {
+    use core::sync::atomic::Ordering;
+
+    let cpu = cpus.saturating_sub(1);
+    PROBE_HHDM.store(hhdm_base, Ordering::Release);
+    let mut realms = [None, None];
+    for (which, name) in [(0usize, "vector-a"), (1, "vector-b")] {
+        VECTOR_REPORT_PA[which].store(0, Ordering::Release);
+        let Ok(realm) = domain::create(name, domain::ResourceEnvelope::new()) else {
+            println!("\x1b[91m    vector state   FAILED: no domain\x1b[0m");
+            realms.iter().flatten().for_each(|r| retire_probe(*r));
+            return false;
+        };
+        realms[which] = Some(realm);
+        let options = sched::SpawnOptions::new()
+            .pinned()
+            .in_domain(realm.as_u32());
+        if sched::spawn_on_with(cpu, name, ring3_vector, which as u64, hhdm_base, options).is_err()
+        {
+            println!("\x1b[91m    vector state   FAILED: a probe would not spawn\x1b[0m");
+            realms.iter().flatten().for_each(|r| retire_probe(*r));
+            return false;
+        }
+    }
+
+    // Words: rounds, wrong quadwords, the last wrong value, done.
+    let read = |which: usize| -> [u64; 4] {
+        let page = VECTOR_REPORT_PA[which].load(Ordering::Acquire);
+        if page == 0 {
+            return [0; 4];
+        }
+        // SAFETY: a frame the probe's space owns, through the direct map.
+        unsafe {
+            [0, 8, 16, 24].map(|at| core::ptr::read_volatile((hhdm_base + page + at) as *const u64))
+        }
+    };
+    let mut reports = [[0u64; 4]; 2];
+    for _ in 0..2000 {
+        reports = [read(0), read(1)];
+        if reports[0][3] == 1 && reports[1][3] == 1 {
+            break;
+        }
+        wait_millis(5);
+    }
+    realms.iter().flatten().for_each(|r| retire_probe(*r));
+
+    let rounds = reports[0][0] + reports[1][0];
+    let wrong = reports[0][1] + reports[1][1];
+    let saved_by = bhaskix_arch::xstate::plan().switch.name();
+    if reports[0][3] == 1 && reports[1][3] == 1 && rounds == 2000 && wrong == 0 {
+        println!(
+            "    vector state   two threads in two domains on one cpu kept xmm0-xmm15 through \
+             1000 switches each: 0 of 64000 quadwords wrong, saved by {saved_by}"
+        );
+        true
+    } else {
+        println!(
+            "\x1b[91m    vector state   FAILED: rounds {} and {}, {wrong} quadword(s) wrong \
+             (last {:#x}), finished {} and {}, saved by {saved_by}\x1b[0m",
+            reports[0][0],
+            reports[1][0],
+            reports[0][2].max(reports[1][2]),
+            reports[0][3],
+            reports[1][3]
+        );
+        false
+    }
+}
+
+/// The signal probe for the vector registers -- RFC 0094 step 0. Assembled
+/// from [`tools/probes/linux-signal-fp.s`](../../tools/probes/linux-signal-fp.s):
+/// a hosted program holds a pattern in all sixteen `xmm` registers, faults on
+/// purpose, and its handler overwrites every one before returning; the code
+/// it returns to then checks its own. Linux's frame carries the registers and
+/// `rt_sigreturn` puts them back, so a handler may use any it likes.
+#[rustfmt::skip]
+const SIGNAL_FP_CODE: [u8; 674] = [
+    0x49, 0x89, 0xff,                         // mov %rdi,%r15
+    0x6a, 0x00,                               // pushq $0x0
+    0x48, 0x8d, 0x05, 0x8d, 0x02, 0x00, 0x00, // lea 0x28d(%rip),%rax # 299 <restorer>
+    0x50,                                     // push %rax
+    0xb8, 0x04, 0x00, 0x00, 0x04,             // mov $0x4000004,%eax
+    0x50,                                     // push %rax
+    0x48, 0x8d, 0x05, 0xef, 0x01, 0x00, 0x00, // lea 0x1ef(%rip),%rax # 209 <handler>
+    0x50,                                     // push %rax
+    0x48, 0x89, 0xe6,                         // mov %rsp,%rsi
+    0xbf, 0x0b, 0x00, 0x00, 0x00,             // mov $0xb,%edi
+    0x31, 0xd2,                               // xor %edx,%edx
+    0x41, 0xba, 0x08, 0x00, 0x00, 0x00,       // mov $0x8,%r10d
+    0xb8, 0x0d, 0x00, 0x00, 0x00,             // mov $0xd,%eax
+    0x0f, 0x05,                               // syscall
+    0x48, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x5a, 0x5a, 0x5a, 0x5a, // movabs $0x5a5a5a5a00000000,%rax
+    0x66, 0x48, 0x0f, 0x6e, 0xc0,             // movq %rax,%xmm0
+    0x66, 0x0f, 0x6c, 0xc0,                   // punpcklqdq %xmm0,%xmm0
+    0x48, 0xff, 0xc0,                         // inc %rax
+    0x66, 0x48, 0x0f, 0x6e, 0xc8,             // movq %rax,%xmm1
+    0x66, 0x0f, 0x6c, 0xc9,                   // punpcklqdq %xmm1,%xmm1
+    0x48, 0xff, 0xc0,                         // inc %rax
+    0x66, 0x48, 0x0f, 0x6e, 0xd0,             // movq %rax,%xmm2
+    0x66, 0x0f, 0x6c, 0xd2,                   // punpcklqdq %xmm2,%xmm2
+    0x48, 0xff, 0xc0,                         // inc %rax
+    0x66, 0x48, 0x0f, 0x6e, 0xd8,             // movq %rax,%xmm3
+    0x66, 0x0f, 0x6c, 0xdb,                   // punpcklqdq %xmm3,%xmm3
+    0x48, 0xff, 0xc0,                         // inc %rax
+    0x66, 0x48, 0x0f, 0x6e, 0xe0,             // movq %rax,%xmm4
+    0x66, 0x0f, 0x6c, 0xe4,                   // punpcklqdq %xmm4,%xmm4
+    0x48, 0xff, 0xc0,                         // inc %rax
+    0x66, 0x48, 0x0f, 0x6e, 0xe8,             // movq %rax,%xmm5
+    0x66, 0x0f, 0x6c, 0xed,                   // punpcklqdq %xmm5,%xmm5
+    0x48, 0xff, 0xc0,                         // inc %rax
+    0x66, 0x48, 0x0f, 0x6e, 0xf0,             // movq %rax,%xmm6
+    0x66, 0x0f, 0x6c, 0xf6,                   // punpcklqdq %xmm6,%xmm6
+    0x48, 0xff, 0xc0,                         // inc %rax
+    0x66, 0x48, 0x0f, 0x6e, 0xf8,             // movq %rax,%xmm7
+    0x66, 0x0f, 0x6c, 0xff,                   // punpcklqdq %xmm7,%xmm7
+    0x48, 0xff, 0xc0,                         // inc %rax
+    0x66, 0x4c, 0x0f, 0x6e, 0xc0,             // movq %rax,%xmm8
+    0x66, 0x45, 0x0f, 0x6c, 0xc0,             // punpcklqdq %xmm8,%xmm8
+    0x48, 0xff, 0xc0,                         // inc %rax
+    0x66, 0x4c, 0x0f, 0x6e, 0xc8,             // movq %rax,%xmm9
+    0x66, 0x45, 0x0f, 0x6c, 0xc9,             // punpcklqdq %xmm9,%xmm9
+    0x48, 0xff, 0xc0,                         // inc %rax
+    0x66, 0x4c, 0x0f, 0x6e, 0xd0,             // movq %rax,%xmm10
+    0x66, 0x45, 0x0f, 0x6c, 0xd2,             // punpcklqdq %xmm10,%xmm10
+    0x48, 0xff, 0xc0,                         // inc %rax
+    0x66, 0x4c, 0x0f, 0x6e, 0xd8,             // movq %rax,%xmm11
+    0x66, 0x45, 0x0f, 0x6c, 0xdb,             // punpcklqdq %xmm11,%xmm11
+    0x48, 0xff, 0xc0,                         // inc %rax
+    0x66, 0x4c, 0x0f, 0x6e, 0xe0,             // movq %rax,%xmm12
+    0x66, 0x45, 0x0f, 0x6c, 0xe4,             // punpcklqdq %xmm12,%xmm12
+    0x48, 0xff, 0xc0,                         // inc %rax
+    0x66, 0x4c, 0x0f, 0x6e, 0xe8,             // movq %rax,%xmm13
+    0x66, 0x45, 0x0f, 0x6c, 0xed,             // punpcklqdq %xmm13,%xmm13
+    0x48, 0xff, 0xc0,                         // inc %rax
+    0x66, 0x4c, 0x0f, 0x6e, 0xf0,             // movq %rax,%xmm14
+    0x66, 0x45, 0x0f, 0x6c, 0xf6,             // punpcklqdq %xmm14,%xmm14
+    0x48, 0xff, 0xc0,                         // inc %rax
+    0x66, 0x4c, 0x0f, 0x6e, 0xf8,             // movq %rax,%xmm15
+    0x66, 0x45, 0x0f, 0x6c, 0xff,             // punpcklqdq %xmm15,%xmm15
+    0x31, 0xc0,                               // xor %eax,%eax
+    0x48, 0x8b, 0x40, 0x10,                   // mov 0x10(%rax),%rax
+    0x49, 0xc7, 0x07, 0x01, 0x00, 0x00, 0x00, // movq $0x1,(%r15)
+    0xf3, 0x41, 0x0f, 0x7f, 0x47, 0x40,       // movdqu %xmm0,0x40(%r15)
+    0xf3, 0x41, 0x0f, 0x7f, 0x4f, 0x50,       // movdqu %xmm1,0x50(%r15)
+    0xf3, 0x41, 0x0f, 0x7f, 0x57, 0x60,       // movdqu %xmm2,0x60(%r15)
+    0xf3, 0x41, 0x0f, 0x7f, 0x5f, 0x70,       // movdqu %xmm3,0x70(%r15)
+    0xf3, 0x41, 0x0f, 0x7f, 0xa7, 0x80, 0x00, 0x00, 0x00, // movdqu %xmm4,0x80(%r15)
+    0xf3, 0x41, 0x0f, 0x7f, 0xaf, 0x90, 0x00, 0x00, 0x00, // movdqu %xmm5,0x90(%r15)
+    0xf3, 0x41, 0x0f, 0x7f, 0xb7, 0xa0, 0x00, 0x00, 0x00, // movdqu %xmm6,0xa0(%r15)
+    0xf3, 0x41, 0x0f, 0x7f, 0xbf, 0xb0, 0x00, 0x00, 0x00, // movdqu %xmm7,0xb0(%r15)
+    0xf3, 0x45, 0x0f, 0x7f, 0x87, 0xc0, 0x00, 0x00, 0x00, // movdqu %xmm8,0xc0(%r15)
+    0xf3, 0x45, 0x0f, 0x7f, 0x8f, 0xd0, 0x00, 0x00, 0x00, // movdqu %xmm9,0xd0(%r15)
+    0xf3, 0x45, 0x0f, 0x7f, 0x97, 0xe0, 0x00, 0x00, 0x00, // movdqu %xmm10,0xe0(%r15)
+    0xf3, 0x45, 0x0f, 0x7f, 0x9f, 0xf0, 0x00, 0x00, 0x00, // movdqu %xmm11,0xf0(%r15)
+    0xf3, 0x45, 0x0f, 0x7f, 0xa7, 0x00, 0x01, 0x00, 0x00, // movdqu %xmm12,0x100(%r15)
+    0xf3, 0x45, 0x0f, 0x7f, 0xaf, 0x10, 0x01, 0x00, 0x00, // movdqu %xmm13,0x110(%r15)
+    0xf3, 0x45, 0x0f, 0x7f, 0xb7, 0x20, 0x01, 0x00, 0x00, // movdqu %xmm14,0x120(%r15)
+    0xf3, 0x45, 0x0f, 0x7f, 0xbf, 0x30, 0x01, 0x00, 0x00, // movdqu %xmm15,0x130(%r15)
+    0x49, 0x8d, 0x77, 0x40,                   // lea 0x40(%r15),%rsi
+    0x48, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x5a, 0x5a, 0x5a, 0x5a, // movabs $0x5a5a5a5a00000000,%rax
+    0xb9, 0x0f, 0x00, 0x00, 0x00,             // mov $0xf,%ecx
+    0x45, 0x31, 0xe4,                         // xor %r12d,%r12d
+    0x48, 0x8b, 0x16,                         // mov (%rsi),%rdx
+    0x48, 0x39, 0xc2,                         // cmp %rax,%rdx
+    0x74, 0x07,                               // je 1b7 <check+0xf>
+    0x49, 0xff, 0xc4,                         // inc %r12
+    0x49, 0x89, 0x57, 0x10,                   // mov %rdx,0x10(%r15)
+    0x48, 0x8b, 0x56, 0x08,                   // mov 0x8(%rsi),%rdx
+    0x48, 0x39, 0xc2,                         // cmp %rax,%rdx
+    0x74, 0x07,                               // je 1c7 <check+0x1f>
+    0x49, 0xff, 0xc4,                         // inc %r12
+    0x49, 0x89, 0x57, 0x10,                   // mov %rdx,0x10(%r15)
+    0x48, 0x83, 0xc6, 0x10,                   // add $0x10,%rsi
+    0x48, 0xff, 0xc0,                         // inc %rax
+    0xff, 0xc9,                               // dec %ecx
+    0x75, 0xd6,                               // jne 1a8 <check>
+    0x48, 0xb8, 0x7e, 0x7e, 0x7e, 0x7e, 0x7e, 0x7e, 0x7e, 0x7e, // movabs $0x7e7e7e7e7e7e7e7e,%rax
+    0x48, 0x8b, 0x16,                         // mov (%rsi),%rdx
+    0x48, 0x39, 0xc2,                         // cmp %rax,%rdx
+    0x74, 0x07,                               // je 1eb <check+0x43>
+    0x49, 0xff, 0xc4,                         // inc %r12
+    0x49, 0x89, 0x57, 0x10,                   // mov %rdx,0x10(%r15)
+    0x48, 0x8b, 0x56, 0x08,                   // mov 0x8(%rsi),%rdx
+    0x48, 0x39, 0xc2,                         // cmp %rax,%rdx
+    0x74, 0x07,                               // je 1fb <check+0x53>
+    0x49, 0xff, 0xc4,                         // inc %r12
+    0x49, 0x89, 0x57, 0x10,                   // mov %rdx,0x10(%r15)
+    0x4d, 0x89, 0x67, 0x08,                   // mov %r12,0x8(%r15)
+    0x49, 0xc7, 0x47, 0x20, 0x01, 0x00, 0x00, 0x00, // movq $0x1,0x20(%r15)
+    0xeb, 0xfe,                               // jmp 207 <done>
+    0x66, 0x48, 0x0f, 0x7e, 0xc0,             // movq %xmm0,%rax
+    0x49, 0x89, 0x47, 0x18,                   // mov %rax,0x18(%r15)
+    0x48, 0x8b, 0x8a, 0xe0, 0x00, 0x00, 0x00, // mov 0xe0(%rdx),%rcx
+    0x48, 0x85, 0xc9,                         // test %rcx,%rcx
+    0x74, 0x20,                               // je 23e <handler+0x35>
+    0x49, 0xc7, 0x47, 0x28, 0x01, 0x00, 0x00, 0x00, // movq $0x1,0x28(%r15)
+    0x48, 0xb8, 0x7e, 0x7e, 0x7e, 0x7e, 0x7e, 0x7e, 0x7e, 0x7e, // movabs $0x7e7e7e7e7e7e7e7e,%rax
+    0x48, 0x89, 0x81, 0x90, 0x01, 0x00, 0x00, // mov %rax,0x190(%rcx)
+    0x48, 0x89, 0x81, 0x98, 0x01, 0x00, 0x00, // mov %rax,0x198(%rcx)
+    0x66, 0x0f, 0x76, 0xc0,                   // pcmpeqd %xmm0,%xmm0
+    0x66, 0x0f, 0x76, 0xc9,                   // pcmpeqd %xmm1,%xmm1
+    0x66, 0x0f, 0x76, 0xd2,                   // pcmpeqd %xmm2,%xmm2
+    0x66, 0x0f, 0x76, 0xdb,                   // pcmpeqd %xmm3,%xmm3
+    0x66, 0x0f, 0x76, 0xe4,                   // pcmpeqd %xmm4,%xmm4
+    0x66, 0x0f, 0x76, 0xed,                   // pcmpeqd %xmm5,%xmm5
+    0x66, 0x0f, 0x76, 0xf6,                   // pcmpeqd %xmm6,%xmm6
+    0x66, 0x0f, 0x76, 0xff,                   // pcmpeqd %xmm7,%xmm7
+    0x66, 0x45, 0x0f, 0x76, 0xc0,             // pcmpeqd %xmm8,%xmm8
+    0x66, 0x45, 0x0f, 0x76, 0xc9,             // pcmpeqd %xmm9,%xmm9
+    0x66, 0x45, 0x0f, 0x76, 0xd2,             // pcmpeqd %xmm10,%xmm10
+    0x66, 0x45, 0x0f, 0x76, 0xdb,             // pcmpeqd %xmm11,%xmm11
+    0x66, 0x45, 0x0f, 0x76, 0xe4,             // pcmpeqd %xmm12,%xmm12
+    0x66, 0x45, 0x0f, 0x76, 0xed,             // pcmpeqd %xmm13,%xmm13
+    0x66, 0x45, 0x0f, 0x76, 0xf6,             // pcmpeqd %xmm14,%xmm14
+    0x66, 0x45, 0x0f, 0x76, 0xff,             // pcmpeqd %xmm15,%xmm15
+    0x48, 0x8b, 0x82, 0xa8, 0x00, 0x00, 0x00, // mov 0xa8(%rdx),%rax
+    0x48, 0x83, 0xc0, 0x04,                   // add $0x4,%rax
+    0x48, 0x89, 0x82, 0xa8, 0x00, 0x00, 0x00, // mov %rax,0xa8(%rdx)
+    0xc3,                                     // retq
+    0xb8, 0x0f, 0x00, 0x00, 0x00,             // mov $0xf,%eax
+    0x0f, 0x05,                               // syscall
+    0xeb, 0xf7,                               // jmp 299 <restorer>
+];
+
+static SIGNAL_FP_REPORT_PA: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+const SIGNAL_FP_AT: u64 = 0x0000_0000_3500_0000;
+
+extern "C" fn ring3_signal_fp(hhdm_base: u64) -> ! {
+    enter_probe(
+        hhdm_base,
+        &SIGNAL_FP_CODE,
+        SIGNAL_FP_AT,
+        &SIGNAL_FP_REPORT_PA,
+        0,
+    )
+}
+
+/// RFC 0094 step 0: **whether a caught signal gives the interrupted code its
+/// vector registers back** -- the defect filed 2026-10-30, shown rather than
+/// argued. Red until step 3 makes the frame carry them.
+fn signal_fp_self_test(hhdm_base: u64, cpus: u32) -> bool {
+    use core::sync::atomic::Ordering;
+
+    if cpus < 2 {
+        println!("\x1b[93m    linux sig fp   skipped, needs a second cpu\x1b[0m");
+        return true;
+    }
+    let cpu = cpus.saturating_sub(1);
+    SIGNAL_FP_REPORT_PA.store(0, Ordering::Release);
+    let Ok(realm) = domain::create("sigfp", domain::ResourceEnvelope::new()) else {
+        println!("\x1b[91m    linux sig fp   FAILED: no domain\x1b[0m");
+        return false;
+    };
+    if !tag_linux(realm, "linux sig fp   ") {
+        return false;
+    }
+    let options = sched::SpawnOptions::new()
+        .pinned()
+        .in_domain(realm.as_u32());
+    if sched::spawn_on_with(cpu, "sigfp", ring3_signal_fp, hhdm_base, hhdm_base, options).is_err() {
+        println!("\x1b[91m    linux sig fp   FAILED: the probe would not spawn\x1b[0m");
+        retire_probe(realm);
+        return false;
+    }
+    // Words: resumed, wrong quadwords, the last wrong value, the handler's
+    // xmm0 on entry, done, and whether the frame had an image to edit.
+    let mut words = [0u64; 6];
+    for _ in 0..400 {
+        let page = SIGNAL_FP_REPORT_PA.load(Ordering::Acquire);
+        if page != 0 {
+            // SAFETY: a frame the probe's space owns, through the direct map.
+            words = unsafe {
+                [0, 8, 16, 24, 32, 40]
+                    .map(|at| core::ptr::read_volatile((hhdm_base + page + at) as *const u64))
+            };
+            if words[4] == 1 {
+                break;
+            }
+        }
+        wait_millis(5);
+    }
+    retire_probe(realm);
+
+    let [resumed, wrong, last, handed, done, image] = words;
+    if done == 1 && resumed == 1 && wrong == 0 && handed == 0 && image == 1 {
+        println!(
+            "    linux sig fp   a handler that overwrote all sixteen xmm registers returned, and \
+             the code it interrupted found its own: 0 of 32 quadwords wrong, xmm15 as the handler \
+             edited it in the frame; the handler began with xmm0 zero, as Linux's does"
+        );
+        true
+    } else {
+        println!(
+            "\x1b[91m    linux sig fp   FAILED: resumed {resumed}, {wrong} of 32 quadwords \
+             wrong (last {last:#x}), the handler was handed xmm0 {handed:#x}, an image in the \
+             frame {image}, finished {done}\x1b[0m"
         );
         false
     }
@@ -19655,7 +20177,7 @@ fn start_linux_domain(cpu: u32, hhdm_base: u64) -> Result<(), &'static str> {
     // Slot 2: the page a hosted program's fault is handed over in. One slot
     // per fault in flight -- see `fault.rs` for why a single buffer would give
     // one faulting CPU another's registers.
-    let faults = shared::create(realm, fault::SLOTS as u64 * fault::SLOT_BYTES)
+    let faults = shared::create(realm, bhaskix_abi::adapter::fp::OBJECT_BYTES)
         .map_err(|_| "the adapter's fault page would not be created")?;
     let fault_named =
         shared::name(faults).map_err(|_| "the adapter's fault page would not be named")?;
@@ -20898,6 +21420,69 @@ fn block_service_self_test(hhdm: u64) -> bool {
 /// boot report and a struct would need a lock on a path that has no reason to
 /// take one.
 static DISK_JOURNAL: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// Whether `CR4.OSXSAVE` was set when this kernel was entered -- RFC 0094.
+static OSXSAVE_AT_ENTRY: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// A line assembled before it is printed, so that a list of names reaches the
+/// console as one line.
+struct Names {
+    bytes: [u8; 96],
+    len: usize,
+}
+
+impl Names {
+    fn of(mask: u64) -> Self {
+        let mut names = Self {
+            bytes: [0; 96],
+            len: 0,
+        };
+        bhaskix_arch::xstate::names(mask, |name| {
+            let take = name.len().min(names.bytes.len() - names.len - 1);
+            if names.len != 0 && names.len < names.bytes.len() {
+                names.bytes[names.len] = b' ';
+                names.len += 1;
+            }
+            names.bytes[names.len..names.len + take].copy_from_slice(&name.as_bytes()[..take]);
+            names.len += take;
+        });
+        names
+    }
+
+    fn as_str(&self) -> &str {
+        core::str::from_utf8(&self.bytes[..self.len]).unwrap_or("?")
+    }
+}
+
+/// The `xstate` line -- RFC 0094 step 1: what this CPU offers, what the plan
+/// enables, how it is saved, and what `CR4.OSXSAVE` held when this kernel was
+/// entered. Read on every lane and every machine, so the figures the RFC could
+/// only take from another CPU are read where the kernel runs.
+fn report_xstate(offered: &bhaskix_arch::xstate::Offered) {
+    let plan = bhaskix_arch::xstate::plan();
+    let at_entry = u8::from(OSXSAVE_AT_ENTRY.load(core::sync::atomic::Ordering::Relaxed));
+    if offered.xsave {
+        println!(
+            "    xstate         offered {} ({:#x}, {} bytes for all); enabled {} ({:#x}), {} bytes, \
+             saved by {}; CR4.OSXSAVE at entry {at_entry}",
+            Names::of(offered.components).as_str(),
+            offered.components,
+            offered.all_bytes,
+            Names::of(plan.xcr0).as_str(),
+            plan.xcr0,
+            plan.bytes,
+            plan.switch.name()
+        );
+    } else {
+        println!(
+            "    xstate         no xsave on this cpu: x87 and sse, {} bytes, saved by {}; \
+             CR4.OSXSAVE at entry {at_entry}",
+            plan.bytes,
+            plan.switch.name()
+        );
+    }
+}
 
 /// What the domain disk's first block allows a boot to do with it -- RFC 0095.
 ///

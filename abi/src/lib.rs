@@ -131,8 +131,45 @@ pub mod adapter {
     pub const ENDPOINT: usize = 0;
     /// One page to report through.
     pub const REPORT: usize = 1;
-    /// The page a hosted program's fault is handed over in.
+    /// The page a hosted program's fault is handed over in. Since RFC 0094
+    /// step 3, three pages: the slots' registers, then each slot's
+    /// floating-point image ([`fp`]).
     pub const FAULTS: usize = 2;
+
+    /// Where a stopped thread's floating-point image travels in the fault
+    /// object -- RFC 0094 step 3.
+    pub mod fp {
+        /// Bytes of registers per slot, before any image.
+        pub const SLOT_BYTES: u64 = 512;
+        /// Slots in the object.
+        pub const SLOTS: u64 = 8;
+        /// Where the images begin: after every slot's registers.
+        pub const AT: u64 = SLOTS * SLOT_BYTES;
+        /// Bytes each slot's image may occupy.
+        pub const IMAGE_BYTES: u64 = 1024;
+        /// The whole object.
+        pub const OBJECT_BYTES: u64 = AT + SLOTS * IMAGE_BYTES;
+        /// Words of a slot, after its registers, where `FP_READ` says what it
+        /// read: the `XCR0` the image is laid out for (zero for `FXSAVE`), its
+        /// size, and the processor's `MXCSR_MASK`.
+        pub const XCR0_WORD: u64 = 21;
+        /// See [`XCR0_WORD`].
+        pub const BYTES_WORD: u64 = 22;
+        /// See [`XCR0_WORD`].
+        pub const MXCSR_MASK_WORD: u64 = 23;
+
+        /// What `FP_WRITE` answers for an image it would not install.
+        pub mod refused {
+            /// Shorter than the layout needs.
+            pub const SHORT: u64 = 1;
+            /// `MXCSR` sets a reserved bit.
+            pub const MXCSR: u64 = 2;
+            /// `XSTATE_BV` names a component `XCR0` does not enable.
+            pub const COMPONENT: u64 = 3;
+            /// The header's bytes 8..24 are not zero.
+            pub const HEADER: u64 = 4;
+        }
+    }
     /// The console, **write-only** — RFC 0032 step 10.
     pub const CONSOLE: usize = 3;
 
@@ -689,6 +726,22 @@ pub mod method {
     /// domain**: a program does not grant itself the network. A grant ends
     /// with its domain, and there is no withdrawing one before that.
     pub const GRANT_DIAL: u64 = 78;
+
+    /// RFC 0094 step 3: copy the floating-point image of the thread stopped in
+    /// fault slot `arg0` into that slot's image region of the fault object
+    /// (see [`super::adapter::fp`]). Only on the fault object, read and write.
+    /// Answers the bytes copied; [`super::status::CONGESTED`] while the thread
+    /// is still running on its CPU -- its state is saved only once it is off,
+    /// so the caller asks again -- and `SLOT_UNAVAILABLE` for a slot nobody
+    /// holds.
+    pub const FP_READ: u64 = 79;
+    /// RFC 0094 step 3: install the image in slot `arg0`'s region as the
+    /// stopped thread's floating-point state, **after checking it is one the
+    /// processor will load**: an image it refused would fault in the switch
+    /// path, long after this call. Answers zero when installed, or one of
+    /// [`super::adapter::fp::refused`] -- the image is not installed and the
+    /// thread's state is unchanged. Busy and absent as [`FP_READ`].
+    pub const FP_WRITE: u64 = 80;
 
     /// Map the memory this capability names into the caller's address space.
     ///

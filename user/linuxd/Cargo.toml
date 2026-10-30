@@ -282,7 +282,11 @@ asm_budget = 3
 # 127 on 2026-10-01, up one: the write that publishes the copy totals to the
 # report page's load record (RFC 0086's per-run copy cost). The totals live in
 # atomics, so the one line is the store into the page.
-unsafe_budget = 127
+# 140 on 2026-10-30, up thirteen: RFC 0094 step 3's floating-point image
+# travels through the fault object's mapping -- one copy out of it, one copy
+# into it, and the word `FP_READ` writes beside the registers. Seven lines as
+# written, thirteen once rustfmt laid the three blocks out.
+unsafe_budget = 140
 # Up five for RFC 0005 step 9's datagram page: the volatile writes that stage
 # a payload into it, the volatile reads that take one back out, and the static
 # that remembers whether it has been mapped.

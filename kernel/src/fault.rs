@@ -180,6 +180,141 @@ pub mod word {
 
 /// Which slots are taken. One bit each, claimed with a compare-and-swap.
 static CLAIMED: AtomicU64 = AtomicU64::new(0);
+/// Which thread claimed each slot -- RFC 0094 step 3, so that `FP_READ` and
+/// `FP_WRITE` reach the thread a slot belongs to and no other. Written by the
+/// claiming thread itself, which is the stopped one.
+static SLOT_THREAD: [core::sync::atomic::AtomicU32; SLOTS] =
+    [const { core::sync::atomic::AtomicU32::new(u32::MAX) }; SLOTS];
+
+const _: () = assert!(SLOTS as u64 == bhaskix_abi::adapter::fp::SLOTS);
+const _: () = assert!(SLOT_BYTES == bhaskix_abi::adapter::fp::SLOT_BYTES);
+const _: () =
+    assert!(bhaskix_arch::xstate::CAPACITY as u64 <= bhaskix_abi::adapter::fp::IMAGE_BYTES);
+
+/// Records the calling thread as the one a freshly claimed slot belongs to.
+fn note_owner(slot: usize) {
+    let thread = crate::sched::current_thread_id().unwrap_or(u32::MAX);
+    SLOT_THREAD[slot].store(thread, Ordering::Release);
+}
+
+/// Whether `object` is the fault object -- the only one `FP_READ` and
+/// `FP_WRITE` answer on.
+pub fn is_the_object(object: crate::cap::ObjectRef) -> bool {
+    let page = PAGE.load(Ordering::Acquire);
+    page != u64::MAX && object.kind == crate::cap::ObjectKind::Memory && object.id == page
+}
+
+/// Why a floating-point call was not answered.
+pub enum FpError {
+    /// The thread is still on its CPU, so its state is not saved yet: ask
+    /// again.
+    Busy,
+    /// No slot of that number is held, or its thread is gone.
+    NoSlot,
+}
+
+/// The thread holding `slot`, if the slot is held.
+fn slot_owner(slot: usize) -> Result<u32, FpError> {
+    if slot >= SLOTS || CLAIMED.load(Ordering::Acquire) & (1 << slot) == 0 {
+        return Err(FpError::NoSlot);
+    }
+    match SLOT_THREAD[slot].load(Ordering::Acquire) {
+        u32::MAX => Err(FpError::NoSlot),
+        thread => Ok(thread),
+    }
+}
+
+/// Where `slot`'s image lives in the object.
+fn image_at(slot: usize) -> usize {
+    (bhaskix_abi::adapter::fp::AT + slot as u64 * bhaskix_abi::adapter::fp::IMAGE_BYTES) as usize
+}
+
+/// `FP_READ` -- RFC 0094 step 3: the stopped thread's image into the slot's
+/// region, and the layout it is in into the slot's words after its
+/// registers. Answers the bytes the layout uses.
+pub fn fp_read(slot: usize) -> Result<u64, FpError> {
+    let thread = slot_owner(slot)?;
+    let mut image = [0u8; bhaskix_arch::xstate::CAPACITY as usize];
+    crate::sched::fp_area_read(thread, &mut image)
+        .map_err(|busy| if busy { FpError::Busy } else { FpError::NoSlot })?;
+    let plan = bhaskix_arch::xstate::plan();
+    let object = crate::shared::MemoryId::from_u64(PAGE.load(Ordering::Acquire));
+    let mut written = 0usize;
+    crate::shared::fill_from(
+        object,
+        image_at(slot),
+        image.len(),
+        &mut |into: &mut [u8]| {
+            let take = into.len().min(image.len() - written);
+            into[..take].copy_from_slice(&image[written..written + take]);
+            written += take;
+            take
+        },
+    )
+    .ok_or(FpError::NoSlot)?;
+    let mut words = [0u8; 24];
+    words[..8].copy_from_slice(&plan.xcr0.to_le_bytes());
+    words[8..16].copy_from_slice(&u64::from(plan.bytes).to_le_bytes());
+    words[16..].copy_from_slice(&u64::from(bhaskix_arch::xstate::mxcsr_mask()).to_le_bytes());
+    let at = slot * SLOT_BYTES as usize + bhaskix_abi::adapter::fp::XCR0_WORD as usize * 8;
+    let mut put = 0usize;
+    crate::shared::fill_from(object, at, words.len(), &mut |into: &mut [u8]| {
+        let take = into.len().min(words.len() - put);
+        into[..take].copy_from_slice(&words[put..put + take]);
+        put += take;
+        take
+    })
+    .ok_or(FpError::NoSlot)?;
+    Ok(u64::from(plan.bytes))
+}
+
+/// `FP_WRITE` -- RFC 0094 step 3: the slot's image installed as the stopped
+/// thread's state, **if the processor would load it**. An image it refused
+/// would fault in the switch path, long after this call, so it is checked
+/// here by the rules `bhaskix_personality::fpstate` encodes and answered with
+/// the rule it broke. Zero when installed.
+pub fn fp_write(slot: usize) -> Result<u64, FpError> {
+    use bhaskix_abi::adapter::fp::refused;
+    use bhaskix_personality::fpstate::Refused;
+
+    let thread = slot_owner(slot)?;
+    let mut image = [0u8; bhaskix_arch::xstate::CAPACITY as usize];
+    let start = image_at(slot);
+    let object = crate::shared::MemoryId::from_u64(PAGE.load(Ordering::Acquire));
+    let mut seen = 0usize;
+    crate::shared::drain_into(object, start + image.len(), &mut |chunk: &[u8]| {
+        // `drain_into` walks the object from its start; keep what lies in
+        // `start..start + image.len()`.
+        let chunk_start = seen;
+        let chunk_end = seen + chunk.len();
+        let from = chunk_start.max(start);
+        let to = chunk_end.min(start + image.len());
+        if from < to {
+            image[from - start..to - start]
+                .copy_from_slice(&chunk[from - chunk_start..to - chunk_start]);
+        }
+        seen = chunk_end;
+        chunk.len()
+    })
+    .ok_or(FpError::NoSlot)?;
+    let plan = bhaskix_arch::xstate::plan();
+    let checked = bhaskix_personality::fpstate::check(
+        &image[..plan.bytes as usize],
+        plan.xcr0,
+        bhaskix_arch::xstate::mxcsr_mask(),
+    );
+    if let Err(why) = checked {
+        return Ok(match why {
+            Refused::Short => refused::SHORT,
+            Refused::Mxcsr => refused::MXCSR,
+            Refused::Component => refused::COMPONENT,
+            Refused::Header => refused::HEADER,
+        });
+    }
+    crate::sched::fp_area_write(thread, &image)
+        .map_err(|busy| if busy { FpError::Busy } else { FpError::NoSlot })?;
+    Ok(0)
+}
 
 /// The object the slots live in, or `u64::MAX` before the adapter exists.
 pub static PAGE: AtomicU64 = AtomicU64::new(u64::MAX);
@@ -306,6 +441,7 @@ pub fn hand_over(frame: &mut bhaskix_arch::trap::TrapFrame, address: u64) -> boo
         CROWDED.fetch_add(1, Ordering::Relaxed);
         return false;
     };
+    note_owner(slot);
 
     let object = crate::shared::MemoryId::from_u64(page);
     let at = slot as u64 * SLOT_BYTES;
@@ -416,6 +552,7 @@ pub fn stage_frame(frame: &bhaskix_arch::syscall::SyscallFrame) -> Option<usize>
         return None;
     }
     let slot = claim()?;
+    note_owner(slot);
     let mut image = [0u64; REGISTERS];
     image[0] = frame.kind; //        rax
     image[1] = frame.rbx;

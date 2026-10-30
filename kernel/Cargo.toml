@@ -929,7 +929,10 @@ asm_budget = 10
 # pages through `finished_report` -- the finishing word first, then the
 # answers, through the one reader `report_page_word` -- instead of each its
 # own `unsafe` loop that read the finishing word last.
-unsafe_budget = 2069
+# 2079 on 2026-10-30, RFC 0094 step 0: `enter_probe`, the probe builder both new
+# probes use -- the code copy, `vm::install` and `enter_ring3` it cannot avoid
+# -- and the two report pages read through the direct map.
+unsafe_budget = 2079
 # Up thirty-one for RFC 0005 step 9's socket probe -- `ring3_socketeer`, which
 # is `ring3_lister` with a `sockaddr_in6` copied in beside its code instead of
 # two filenames. The same two blocks every hosted probe has: one

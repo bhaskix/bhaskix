@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | ⬜ **Draft 2026-10-30 — nothing built. Both questions decided by the lead the same day, each as recommended**: AVX only, AVX-512 waiting on its trigger; the signal half in this RFC, and first (§*Unresolved questions*). Drafted at the lead's request, **ahead of its recorded trigger**: TRACKER's row asks for this RFC when an L1 program needs AVX or a distribution's packages assume x86-64-v3, and neither has happened — Ubuntu 26.04 still ships plain amd64 builds, and the pinned corpus uses one. |
+| **Status** | ⬜ **Draft 2026-10-30 — ~~nothing built~~ steps 0-3 built and gated the same day; AVX itself (step 4) and steps 5-8 open. Both questions decided by the lead the same day, each as recommended**: AVX only, AVX-512 waiting on its trigger; the signal half in this RFC, and first (§*Unresolved questions*). Drafted at the lead's request, **ahead of its recorded trigger**: TRACKER's row asks for this RFC when an L1 program needs AVX or a distribution's packages assume x86-64-v3, and neither has happened — Ubuntu 26.04 still ships plain amd64 builds, and the pinned corpus uses one. |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | arch / sched / userspace (`bin/linuxd`, `personality`) |
 | **Milestone** | L1 ([roadmap.md](../roadmap.md)) — an unmodified x86-64-v3 Linux program runs |
@@ -208,9 +208,12 @@ At both switch sites, `XSAVEOPT` into the leaving thread's area and `XRSTOR` fro
 thread's, with the instruction mask set to `XCR0`. `XSAVE` is used where `CPUID.(0Dh,1):EAX[0]`
 says `XSAVEOPT` is absent.
 
-**One rule makes `XSAVEOPT` sound here**, recalled from the SDM and to be checked against it in
-step 2. Its "modified" optimisation may skip writing a component the CPU believes unchanged
-since the last `XRSTOR` from the same address. So software may write an area only while its
+**One rule makes `XSAVEOPT` sound here**, ~~recalled from the SDM and to be checked against it in
+step 2~~ **checked 2026-10-30 against the instruction reference derived from the SDM**: its
+"modified" optimisation may skip saving a component that has not been modified since the last
+`XRSTOR`, when that `XRSTOR`'s CPL, VMX mode and area address match this save's (`XRSTOR_INFO`).
+In short, it may skip a component the CPU believes unchanged since the last `XRSTOR` from the
+same address. So software may write an area only while its
 thread is off every CPU, and an `XRSTOR` from that area must come before its next `XSAVEOPT`.
 Every path that writes an area (the initial image, and step 3's `rt_sigreturn`) writes it while
 the thread is stopped, and the thread can only run again through an `XRSTOR` from that area. So
@@ -251,10 +254,18 @@ and are unaffected.
    validator is a pure function in a host-tested crate. It requires:
    - `XSTATE_BV` within `XCR0`;
    - `XCOMP_BV` zero, since this is the standard format;
-   - the header's reserved bytes zero;
+   - ~~the header's reserved bytes zero~~ **header bytes 8..24 zero** -- `XCOMP_BV` and the word
+     after it;
    - `MXCSR`'s reserved bits clear against the CPU's `MXCSR_MASK`.
 
-   These are `XRSTOR`'s `#GP` conditions as recalled from the SDM; step 3 checks each against it.
+   These are `XRSTOR`'s `#GP` conditions ~~as recalled from the SDM; step 3 checks each against
+   it~~ — **checked 2026-10-30 against the instruction reference, and one was wrong as recalled**:
+   the standard form checks header bytes 8..24, not the whole reserved remainder to byte 64.
+   Refusing bytes 24..64 too would have refused frames the processor and Linux accept, so the
+   check follows the instruction exactly, and its host test asserts byte 40 is not refused.
+   `MXCSR` is loaded whenever SSE or AVX is requested, whatever `XSTATE_BV` says, which is why the
+   initial image carries `0x1f80`. The default mask for a processor reporting zero (`0xffbf`)
+   is still recalled; every processor met reports its own, read at boot.
    A refused image ends the program with `SIGSEGV`, as Linux does with a bad frame (recalled).
 3. **`AT_MINSIGSTKSZ` (51)** joins the auxiliary vector, sized for the frame with its image.
    `FRAME_BYTES` grows by the image and its alignment, at most 900 bytes with AVX.
@@ -393,6 +404,14 @@ the design rests on.
 0. **Arms first.** The static gate (no vector register in the nucleus), green today. The vector
    probe and the signal probe written, and seen red where they should be: the signal probe today,
    and the vector probe with `XCR0` forced to `0x7` over the `FXSAVE` switch.
+   **Done 2026-10-30.** `tools/check-vector-registers.py` in `make gates`: the release kernel
+   names no vector, MMX, mask or x87 register outside its save and restore, and the gate's
+   self-test refuses seven kinds of violation. The **signal probe was red on the unchanged tree**
+   -- `resumed 1, 32 of 32 quadwords wrong (last 0xffffffffffffffff), the handler was handed xmm0
+   0x5a5a5a5a00000000` -- the filed defect shown rather than argued. The **vector probe** passed
+   under `FXSAVE`; its arm was not the one planned here (`XCR0` `0x7` cannot be seen by a probe
+   that uses `xmm` alone, which waits for step 4) but the switch's save skipped at the site
+   `yield` takes: `54528 quadword(s) wrong`.
 1. **Print what each CPU offers.** An `xstate` line on every boot:
    - the components offered;
    - the size `CPUID` reports;
@@ -400,16 +419,37 @@ the design rests on.
    - `CR4.OSXSAVE` as found at entry.
 
    The choice function is host-tested. This reads the native loader's and the SR550's `CR4`,
-   which nothing has yet.
+   which nothing has yet. **Done 2026-10-30**, six host tests. Read on the lanes: QEMU 4.2.1's
+   TCG `max` offers `x87 sse bndregs bndcsr pkru (0x21b)`; KVM on the Xeon Silver 4314 offers
+   `0x2e7` (AVX, AVX-512, PKRU, 2,696 bytes); `qemu64` offers no `XSAVE`. `CR4.OSXSAVE` at entry
+   0 on all of them; the native loader's lane and the SR550 are still unread.
 2. **Enable, and switch with `XSAVE`.** `FpArea`, the per-CPU enable with its read-back, and
    both switch sites. The vector probe is green on every lane, and its arm is red. The
-   `XSAVEOPT` rule above is checked against the SDM.
+   `XSAVEOPT` rule above is checked against the SDM. **Done 2026-10-30**: `xstate live
+   xsaveopt with xcr0 0x3 on 4 of 4 cpus` on TCG `max` and KVM, `fxsave` on `qemu64`; the vector
+   probe green on all three and on CI's QEMU 10.2.1 (`tools/boot-on-ci-emulator.sh`: four cells,
+   181 gates each).
 3. **Signal frames carry the state.**
    - First the `FXSAVE` format, which closes the filed defect on today's path. Then the `XSAVE`
      format.
    - The two calls, the validator and its fuzz target, and `AT_MINSIGSTKSZ`.
    - The signal probe is green and armed: a skipped restore turns it red.
    - A handler that edits the frame's state sees the edit stick.
+
+   **Done 2026-10-30**, both formats at once rather than one after the other: `FP_READ` and
+   `FP_WRITE` (methods 79, 80) on the fault object, which grew to three pages; the image placed
+   64-aligned above the frame and marked as Linux marks one; the handler entered with the initial
+   state; `rt_sigreturn` installing the frame's image after the kernel's check, or ending the
+   program with `SIGSEGV` when the check refuses it; `AT_MINSIGSTKSZ` 2,048. The signal probe's
+   handler also writes a new `xmm15` into the frame, and the interrupted code finds it -- on
+   `XSAVEOPT` (BIOS, KVM) and `FXSAVE` (`qemu64`) alike. With the restore skipped: `32 of 32
+   quadwords wrong`, the handler handed `xmm0 0x0`. **The check, against the instruction**: a
+   harness that loaded every image the check accepts with the real `XRSTOR`/`FXRSTOR` on the build
+   host ran 50,056,776 times in 121 s, clean, and with the check's `MXCSR` rule removed found the
+   processor's `#GP` at once. That harness is **not in the tree**: it needs `unsafe`, and the fuzz
+   crate's budget is zero by rule. The fuzz target in the tree (`fpstate`) is the pure half --
+   every accepted image checked against the rules restated independently -- 26,871,526 runs in
+   61 s, clean, and with the header rule removed it caught `accepted a dirty header`.
 4. **AVX on.** `XCR0` `0x7` where offered. The vector probe checks the upper halves on CI `max`
    lanes and KVM.
 5. **The v3 BusyBox lane.** Pinned and staged on `max` lanes: `BusyBox's sh ran`, the line run

@@ -1216,6 +1216,14 @@ gates:
 # runtime, until 2026-10-29. And watched refusing, in throwaway repositories.
 	tools/check-notice.py --self-test
 	tools/check-notice.py
+# The nucleus names no vector or x87 register outside its save and restore --
+# RFC 0094 step 0. The property the switch path rests on: a user thread's
+# floating-point state stays in the registers, untouched, while the kernel runs,
+# and only because the kernel's own code never uses them. Disassembled, so a
+# dependency or a compiler that started to would fail here, not in a program.
+	tools/check-vector-registers.py --self-test
+	@$(MAKE) --no-print-directory kernel >/dev/null
+	tools/check-vector-registers.py $(KERNEL)
 	tools/check-unsafe-budget.py --self-test
 	tools/check-unsafe-budget.py
 	tools/check-instruction-containment.py

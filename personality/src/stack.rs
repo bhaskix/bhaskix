@@ -53,6 +53,10 @@ pub mod auxv {
     /// Pointer to sixteen random bytes — the runtime's startup entropy, and
     /// not optional: Go seeds its hash and its scheduler from it.
     pub const RANDOM: u64 = 25;
+    /// The least stack a signal delivery needs -- RFC 0094 step 3. 51 in
+    /// glibc's `bits/auxv.h` on the build host (2026-10-30); glibc answers
+    /// `sysconf(_SC_MINSIGSTKSZ)` from it.
+    pub const MINSIGSTKSZ: u64 = 51;
 }
 
 /// Bytes in the `AT_RANDOM` block.
@@ -114,10 +118,11 @@ impl<'a> Builder<'a> {
         Self { args, env, info }
     }
 
-    /// The seven `(type, value)` auxv pairs this builds, in order, before the
+    /// The eight `(type, value)` auxv pairs this builds, in order, before the
     /// terminating `AT_NULL`. `random_addr` is where the `AT_RANDOM` block
-    /// will live.
-    fn auxv_pairs(&self, random_addr: u64) -> [(u64, u64); 7] {
+    /// will live. `AT_MINSIGSTKSZ` joined them with RFC 0094 step 3, when a
+    /// signal frame began to carry the floating-point state.
+    fn auxv_pairs(&self, random_addr: u64) -> [(u64, u64); 8] {
         [
             (auxv::PAGESZ, self.info.page_size),
             (auxv::PHDR, self.info.phdr),
@@ -126,6 +131,7 @@ impl<'a> Builder<'a> {
             (auxv::ENTRY, self.info.entry),
             (auxv::HWCAP, self.info.hwcap),
             (auxv::RANDOM, random_addr),
+            (auxv::MINSIGSTKSZ, crate::signal::MIN_SIGNAL_STACK),
         ]
     }
 
