@@ -701,11 +701,19 @@ Read off serial-over-LAN:
   space refused four ways, was green on hardware. The only red lines were the known networking gaps
   there: `dhcp client` and `tcp client`.
 - **The raw `SecureBoot` value was not visible.** The loader writes `SecureBoot reads …` and its
-  hashing-cost line with `serial::write`, to COM1 only; its other lines go through `diag`, to the
-  firmware console as well. This machine's BMC redirects COM2, not COM1. So the value is constrained
+  hashing-cost line with `serial::write`, ~~to COM1 only~~ — **corrected 2026-10-30**: "COM1 only"
+  was imprecise. `serial::write` writes COM1, and COM2 when COM2 answers its scratch register; but
+  between `adopt_firmware_port` and `release_firmware_port`, which is when these two lines are
+  written, it goes through the firmware's serial protocol and nothing else. Its other lines go
+  through `diag`, to the firmware console as well, and the firmware console is what this
+  machine's BMC showed. So the value is constrained
   but not read: the loader treated it as off, and Redfish reports `SecureBootEnable: false` (mode
   `UserMode`). Telling *reads 0* from *absent* or *unreadable* needs those two lines through `diag`.
-  That is recommended, not done, and the next boot there reads it.
+  ~~That is recommended, not done~~ **Done 2026-10-30**: both lines are assembled whole and go
+  through `diag`; the native lane reads both (`SecureBoot reads 0`, and `boot set hashed and
+  checked: 16462083 bytes in 1020149326 ticks, ~422 ms`). The next boot on the SR550 reads the
+  value. The loader's per-file `measured … into PCR …` lines take the same `serial::write` path
+  and are not visible there either; they are left as they are.
 - **Found staging it:** `tools/native-iso.sh` did not sign its ESP, which step 4 had taught every
   QEMU lane to do; it does now.
 - **Still open:** question 9's enrolment half (append a certificate to `db`, boot with Secure Boot

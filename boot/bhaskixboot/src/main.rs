@@ -455,24 +455,32 @@ fn tsc() -> u64 {
     unsafe { core::arch::x86_64::_rdtsc() }
 }
 
-/// What the firmware said about Secure Boot, on the wire.
+/// What the firmware said about Secure Boot, on the wire **and the firmware
+/// console** -- through [`diag`], whole.
+///
+/// Until 2026-10-30 this line and [`report_cost`]'s went out with
+/// `serial::write` alone, which while boot services run is the firmware's
+/// serial protocol and nothing else. The SR550's service processor shows the
+/// firmware *console*, so on that machine both lines were missing while every
+/// `diag` line around them arrived (RFC 0091 step 7, 2026-10-30), and the raw
+/// value could not be told apart from *absent* or *unreadable*.
 fn report_secure_boot(state: efi::SecureBoot) {
+    let mut line = Line::new();
     match state {
-        efi::SecureBoot::On => serial::write(
-            "bhaskixboot: SecureBoot reads 1 -- the firmware verified this loader\r\n",
-        ),
+        efi::SecureBoot::On => {
+            line.push("bhaskixboot: SecureBoot reads 1 -- the firmware verified this loader\r\n")
+        }
         efi::SecureBoot::Off => {
-            serial::write("bhaskixboot: SecureBoot reads 0 -- nothing verified this loader\r\n")
+            line.push("bhaskixboot: SecureBoot reads 0 -- nothing verified this loader\r\n")
         }
-        efi::SecureBoot::Absent => {
-            serial::write("bhaskixboot: SecureBoot is absent; read as off\r\n")
-        }
+        efi::SecureBoot::Absent => line.push("bhaskixboot: SecureBoot is absent; read as off\r\n"),
         efi::SecureBoot::Unreadable(status) => {
-            serial::write("bhaskixboot: SecureBoot unreadable, status ");
-            serial::write_hex(status as u64);
-            serial::write("; read as off\r\n");
+            line.push("bhaskixboot: SecureBoot unreadable, status ");
+            line.push_hex(status as u64);
+            line.push("; read as off\r\n");
         }
     }
+    diag(line.as_str());
 }
 
 /// How long hashing the boot set and checking `boot.sig` took, in TSC ticks
@@ -482,19 +490,22 @@ fn report_cost(table: *mut SystemTable, ticks: u64, bytes: usize) {
     let before = tsc();
     efi::stall(table, 10_000);
     let per_ms = tsc().wrapping_sub(before) / 10;
-    serial::write("bhaskixboot: boot set hashed and checked: ");
-    serial::write_dec(bytes as u64);
-    serial::write(" bytes in ");
-    serial::write_dec(ticks);
-    serial::write(" ticks");
+    // Whole, through `diag`, for the reason `report_secure_boot` gives.
+    let mut line = Line::new();
+    line.push("bhaskixboot: boot set hashed and checked: ");
+    line.push_dec(bytes as u64);
+    line.push(" bytes in ");
+    line.push_dec(ticks);
+    line.push(" ticks");
     if let Some(ms) = ticks.checked_div(per_ms) {
-        serial::write(", ~");
-        serial::write_dec(ms);
-        serial::write(" ms at ");
-        serial::write_dec(per_ms);
-        serial::write(" ticks/ms");
+        line.push(", ~");
+        line.push_dec(ms);
+        line.push(" ms at ");
+        line.push_dec(per_ms);
+        line.push(" ticks/ms");
     }
-    serial::write("\r\n");
+    line.push("\r\n");
+    diag(line.as_str());
 }
 
 /// The PCR 8 event's bytes: the verdict (0 verified, 1 not), the key id that
@@ -574,6 +585,35 @@ impl Line {
         let take = text.len().min(self.bytes.len() - self.len);
         self.bytes[self.len..self.len + take].copy_from_slice(&text.as_bytes()[..take]);
         self.len += take;
+    }
+
+    /// Appends a decimal number, as `serial::write_dec` writes one.
+    fn push_dec(&mut self, mut value: u64) {
+        let mut digits = [0u8; 20];
+        let mut at = digits.len();
+        loop {
+            at -= 1;
+            digits[at] = b'0' + (value % 10) as u8;
+            value /= 10;
+            if value == 0 {
+                break;
+            }
+        }
+        self.push(core::str::from_utf8(&digits[at..]).unwrap_or("?"));
+    }
+
+    /// Appends `0x` and sixteen hex digits, as `serial::write_hex` writes them.
+    fn push_hex(&mut self, value: u64) {
+        let mut digits = *b"0x0000000000000000";
+        for (at, shift) in (0..16).rev().enumerate() {
+            let nibble = ((value >> (shift * 4)) & 0xF) as u8;
+            digits[2 + at] = if nibble < 10 {
+                b'0' + nibble
+            } else {
+                b'a' + nibble - 10
+            };
+        }
+        self.push(core::str::from_utf8(&digits).unwrap_or("?"));
     }
 
     fn as_str(&self) -> &str {

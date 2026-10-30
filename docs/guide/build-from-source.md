@@ -15,7 +15,8 @@ boots the release without building anything.
   project's CI builds on Ubuntu 26.04.
 - **Disk:** a build uses a few hundred megabytes; the full test suite about 3 GB.
 - **Git**, to fetch the source, and **a C compiler** (`gcc`): the setup script
-  builds Limine's small installer with it, and `--check` does not look for one.
+  builds Limine's small installer with it. `--check` has looked for one since
+  2026-10-30 (`cc`, package `build-essential`); before that it did not.
 
 Everything else — Rust at the version the tree pins, QEMU, xorriso, mtools, the
 Limine bootloader and OVMF — is installed or checked by one script.

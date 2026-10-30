@@ -42,6 +42,11 @@ declare -A PKGS=(
     [git]="git"
     [make]="make"
     [curl]="curl"
+    # A C compiler, because step 3 builds Limine's small installer with
+    # `make -C`. Until 2026-10-30 nothing here checked for one, so `--check`
+    # passed on a machine that then failed at that step (found writing the
+    # build-from-source guide).
+    [cc]="build-essential"
 )
 
 apt_pkgs=()
@@ -61,8 +66,8 @@ if (( ${#apt_pkgs[@]} > 0 && CHECK_ONLY == 0 )); then
         sudo apt-get install -y "${apt_pkgs[@]}"
     else
         die "Missing packages and no apt-get. Install manually: ${apt_pkgs[*]}
-     Fedora:  sudo dnf install qemu-system-x86 xorriso mtools git make curl
-     Arch:    sudo pacman -S qemu-system-x86 xorriso mtools git make curl
+     Fedora:  sudo dnf install qemu-system-x86 xorriso mtools git make curl gcc
+     Arch:    sudo pacman -S qemu-system-x86 xorriso mtools git make curl gcc
      macOS:   brew install qemu xorriso mtools"
     fi
 fi
