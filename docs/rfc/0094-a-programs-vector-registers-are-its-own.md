@@ -422,7 +422,11 @@ the design rests on.
    which nothing has yet. **Done 2026-10-30**, six host tests. Read on the lanes: QEMU 4.2.1's
    TCG `max` offers `x87 sse bndregs bndcsr pkru (0x21b)`; KVM on the Xeon Silver 4314 offers
    `0x2e7` (AVX, AVX-512, PKRU, 2,696 bytes); `qemu64` offers no `XSAVE`. `CR4.OSXSAVE` at entry
-   0 on all of them; the native loader's lane and the SR550 are still unread.
+   0 on all of them, ~~the native loader's lane and the SR550 are still unread~~ the native
+   loader's lane included (read once its stack defect, below, was fixed); the SR550 is unread.
+   **Step 2 uncovered a defect in the native loader**: it entered the kernel with the stack eight
+   bytes off the ABI's alignment, and this step's `FXSAVE` into a local was the first thing in ten
+   weeks to need 16-byte alignment there. Fixed in the loader the same day (TRACKER §3).
 2. **Enable, and switch with `XSAVE`.** `FpArea`, the per-CPU enable with its read-back, and
    both switch sites. The vector probe is green on every lane, and its arm is red. The
    `XSAVEOPT` rule above is checked against the SDM. **Done 2026-10-30**: `xstate live

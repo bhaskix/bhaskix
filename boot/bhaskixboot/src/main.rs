@@ -1145,6 +1145,17 @@ extern "efiapi" fn efi_main(image_handle: usize, system_table: *mut SystemTable)
     serial::write(", handoff ");
     serial::write_hex(built.handoff);
     serial::write("\r\n");
+    // **A zero return address, so the kernel is entered as a `call`
+    // enters a function** (2026-10-30). The System V ABI promises a
+    // function `rsp % 16 == 8` at its first instruction, the return
+    // address having just been pushed, and the compiler lays every
+    // frame out on that promise. A `jmp` with `rsp` on the page-aligned
+    // stack top broke it by eight on every native boot, invisibly while
+    // the kernel used nothing that needs 16-byte alignment on its
+    // stack -- until RFC 0094's first `FXSAVE` into a local raised
+    // `#GP` (rip at `fxsave (%rbx)`, `rbx = rsp + 0x150`, `rsp` ending
+    // in 0x948), before the first report line. The zero is also where
+    // a backtrace stops.
     // SAFETY: RFC 0028's entry contract, held by construction above: the
     // root maps the identity view (this code keeps running), the kernel's
     // segments at the entry's addresses W^X, and the handoff block; the
@@ -1159,6 +1170,7 @@ extern "efiapi" fn efi_main(image_handle: usize, system_table: *mut SystemTable)
             "wrmsr",
             "mov cr3, r8",
             "mov rsp, r9",
+            "push 0",
             "xor ebp, ebp",
             "jmp r10",
             in("r8") world.root,

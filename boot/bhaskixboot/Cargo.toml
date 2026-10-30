@@ -111,4 +111,7 @@ asm_budget = 6
 # rustfmt lays one to a line (ten); the boot services read and the `Stall` that
 # holds a refusal on screen (two); and `rdtsc` for the cost line (one). The
 # check itself is `bhaskix-bootsig`'s, at budget zero.
-unsafe_budget = 161
+# 162 on 2026-10-30: the `push 0` in the jump to the kernel, so the kernel is
+# entered with the stack a call leaves -- the ABI's alignment, which the jump
+# alone had been eight bytes off since the loader was written.
+unsafe_budget = 162

@@ -59,7 +59,12 @@ the same base the kernel expects, (b) the kernel's segments mapped at its linked
 virtual base with W^X honoured, and (c) the `Handoff` and everything it references — memory
 map, initrd, strings — in memory marked `BootloaderReclaimable`, exactly as the Limine path
 marks them; a 64 KiB stack; no secondary CPU started unless `start_secondaries` says the
-loader can. The shim's Limine door stays as it is; the two doors converge on `kernel_main`
+loader can. **And the stack as a call leaves it** -- `rsp % 16 == 8`, a zero return address on
+top -- which this contract did not say until 2026-10-30. The loader set `rsp` to the stack top
+and jumped, eight bytes off what the System V ABI promises every function; nothing noticed for
+ten weeks because the kernel kept nothing on its stack that needs 16-byte alignment, until RFC
+0094's first `FXSAVE` into a local raised `#GP` on every native boot. The loader now pushes the
+zero before it jumps. The shim's Limine door stays as it is; the two doors converge on `kernel_main`
 within a dozen lines, and the `loader` field says which door was used, which is what makes the
 lanes distinguishable in every report.
 
