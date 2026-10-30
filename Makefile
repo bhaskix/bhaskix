@@ -282,7 +282,7 @@ OVMF_VARS    := $(firstword $(wildcard $(OVMF_DIR)OVMF_VARS$(OVMF_SUFFIX).fd))
 
 .PHONY: FORCE all kernel iso demo run run-uefi release-dist release-finish ceremony-kit progress test test-host test-boot test-boot-uefi test-boot-uefi-qemu64 test-boot-iommu test-keyboard \
         test-boot-iommu-off test-boot-qemu64 test-boot-native test-boot-native-full test-boot-native-tpm \
-        test-boot-native-tpm-tis test-boot-secureboot test-release-keys test-placements mkfs bootsign test-shell test-faults test-usb-keyboard test-lacp test-bond test-http fmt clippy gates hooks clean distclean help
+        test-boot-native-tpm-tis test-boot-secureboot test-release-keys test-ahci-foreign test-placements mkfs bootsign test-shell test-faults test-usb-keyboard test-lacp test-bond test-http fmt clippy gates hooks clean distclean help
 
 all: iso
 
@@ -810,7 +810,7 @@ run-uefi: $(ISO)
 test: fmt clippy test-host gates test-boot test-boot-uefi test-boot-iommu test-boot-iommu-off \
       test-boot-qemu64 test-boot-uefi-qemu64 test-boot-native test-boot-native-full test-boot-native-tpm \
       test-boot-native-tpm-tis test-boot-secureboot test-release-keys test-placements test-shell \
-      test-keyboard test-usb-keyboard test-busybox test-bond test-lacp test-faults test-http
+      test-ahci-foreign test-keyboard test-usb-keyboard test-busybox test-bond test-lacp test-faults test-http
 	@echo
 	@echo "  all checks passed"
 
@@ -922,6 +922,14 @@ test-boot-uefi: $(ISO)
 # be a constant for a milestone.
 test-boot-iommu: $(ISO)
 	tests/qemu/boot-test.sh iommu
+
+# The same machine with a SATA disk that is **not** the project's test disk
+# (2026-10-30): bin/ahcid must read it and write nothing. It used to write a
+# pattern into the last sector of any disk it could read -- on a real machine,
+# where a GPT disk keeps its backup header. The lane checks the report and
+# compares the disk's last sector before and after.
+test-ahci-foreign: $(ISO)
+	BHASKIX_SATA_FOREIGN=1 BHASKIX_LANE=ahci-foreign tests/qemu/boot-test.sh iommu
 
 # RFC 0041 step 7, and the counterpart to `test-keyboard`.
 #

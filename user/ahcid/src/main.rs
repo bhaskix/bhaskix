@@ -61,8 +61,13 @@ const FIRST_BYTES: usize = 32;
 
 /// Whether the write self-test ran: 0 not attempted, 1 the bytes came back
 /// identical, 2 they came back different, 3 the write or the read-back was
-/// refused.
+/// refused, and 4 ([`block::AHCI_WRITE_NOT_TEST_DISK`]) not attempted because
+/// the disk is not the project's test disk.
 static WRITE_STATE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Whether sector zero carried [`block::SATA_TEST_DISK_MARKER`] -- the only
+/// disk this driver will write to at boot (2026-10-30).
+static TEST_DISK: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 /// Which sector it used, so the report can name it.
 static WRITE_LBA: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
@@ -877,6 +882,10 @@ fn identify(
                     core::sync::atomic::Ordering::Relaxed,
                 );
             }
+            TEST_DISK.store(
+                sector.starts_with(block::SATA_TEST_DISK_MARKER),
+                core::sync::atomic::Ordering::Relaxed,
+            );
             READ_STATE.store(1, core::sync::atomic::Ordering::Relaxed);
         }
         Err(why) => {
@@ -904,8 +913,21 @@ fn identify(
     // The pattern is derived from the sector number rather than constant, so a
     // driver that wrote to the wrong sector and read back the wrong sector
     // cannot agree with itself.
+    //
+    // **And only on the project's own test disk** (2026-10-30). Until then this
+    // ran on any disk whose first sector it could read, so a real machine's
+    // SATA disk lost its last sector on every boot -- where a GPT disk keeps its
+    // backup header. A disk whose sector zero does not carry the test disk's
+    // marker is read and never written, and the report says so.
     if read_state_is_good() {
-        verify_write(registers, port, &identity, clock, device_base, list, table);
+        if TEST_DISK.load(core::sync::atomic::Ordering::Relaxed) {
+            verify_write(registers, port, &identity, clock, device_base, list, table);
+        } else {
+            WRITE_STATE.store(
+                block::AHCI_WRITE_NOT_TEST_DISK,
+                core::sync::atomic::Ordering::Relaxed,
+            );
+        }
     }
 
     Some(Ok(identity))

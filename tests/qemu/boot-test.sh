@@ -501,6 +501,22 @@ cp -f "$REPO_ROOT/build/sata-disk.img" \
       "$REPO_ROOT/build/sata-disk-${BHASKIX_LANE}.img" 2>/dev/null || true
 flock -u 9 2>/dev/null || true
 
+# **A disk that is not the project's**, on purpose (2026-10-30):
+# `BHASKIX_SATA_FOREIGN=1` replaces this lane's SATA disk with one whose sector
+# zero carries no test-disk marker -- what any real machine's disk looks like
+# to `bin/ahcid`. Until that day the driver wrote a pattern into the last sector
+# of every disk it could read, which on a GPT disk is the backup header. The
+# last sector's fingerprint is taken now and compared after the boot.
+FOREIGN_SECTOR0="FOREIGN-DISK-SECTOR-0-NOT-OURS"
+if [[ "${BHASKIX_SATA_FOREIGN:-0}" == 1 ]]; then
+    FOREIGN_DISK="$REPO_ROOT/build/sata-disk-${BHASKIX_LANE}.img"
+    {
+        printf '%s' "$FOREIGN_SECTOR0"
+        head -c $(( 262144 - ${#FOREIGN_SECTOR0} )) /dev/urandom
+    } > "$FOREIGN_DISK"
+    FOREIGN_LAST_BEFORE="$(tail -c 512 "$FOREIGN_DISK" | sha256sum | cut -d' ' -f1)"
+fi
+
 # RFC 0020 step 5's inbound driver: a host-side client that connects *into*
 # the guest through hostfwd, sends sixteen bytes, and demands them back.
 # The guest's listener arms only after its outbound demonstration completes,
@@ -1544,7 +1560,9 @@ if [[ "$MODE" == "iommu" || "$MODE" == "fsd" ]]; then
     # `BHASKIX-SATA-DISK-SECTOR-0` and the *domain* disk with
     # `BHASKIX-DOMAIN-DISK-SECTOR-0`, so a driver that read the wrong device
     # fails here rather than passing plausibly.
-    if grep -qa 'ahci read      sector 0 begins "BHASKIX-SATA-DISK-SECTOR-0' "$LOG"; then
+    sector0="BHASKIX-SATA-DISK-SECTOR-0"
+    [[ "${BHASKIX_SATA_FOREIGN:-0}" == 1 ]] && sector0="$FOREIGN_SECTOR0"
+    if grep -qa "ahci read      sector 0 begins \"$sector0" "$LOG"; then
         pass "sector 0 is read through the AHCI driver and holds that disk's own bytes"
     else
         fail "sector 0 was not read, or did not hold what that disk holds"
@@ -1559,7 +1577,17 @@ if [[ "$MODE" == "iommu" || "$MODE" == "fsd" ]]; then
     # writes by destroying another gate's subject would be trading one proof for
     # another. The pattern the driver writes is derived from the sector number,
     # so writing sector N and reading sector M cannot agree with itself and pass.
-    if grep -qaE 'ahci write +sector [0-9]+ written and read back byte-for-byte' "$LOG"; then
+    if [[ "${BHASKIX_SATA_FOREIGN:-0}" == 1 ]]; then
+        # The foreign disk: refused in the report, and untouched on the host.
+        after="$(tail -c 512 "$FOREIGN_DISK" | sha256sum | cut -d' ' -f1)"
+        if grep -qaE "ahci write +not attempted: sector 0 does not carry the project's test-disk marker, so nothing was written to this disk" "$LOG" \
+            && [[ "$after" == "$FOREIGN_LAST_BEFORE" ]]; then
+            pass "a disk that is not the project's test disk was read and not written: its last sector is unchanged"
+        else
+            fail "the foreign disk: $(grep -a 'ahci write' "$LOG" | head -1 | tr -d '\r'); last sector ${FOREIGN_LAST_BEFORE:0:12} before, ${after:0:12} after"
+            status=1
+        fi
+    elif grep -qaE 'ahci write +sector [0-9]+ written and read back byte-for-byte' "$LOG"; then
         pass "a sector is written through the AHCI driver and reads back byte-for-byte"
     else
         fail "the write self-test did not confirm"
@@ -1580,7 +1608,9 @@ if [[ "$MODE" == "iommu" || "$MODE" == "fsd" ]]; then
     # `ahci::plan_read`, the same bound every other transfer this driver makes
     # goes through -- a disk refuses an out-of-range read too, so a service
     # without the check would look identical from outside.
-    if grep -qaE 'ahci service +512 bytes of sector 0 through the block interface, and they are the SATA disk.s own; a sector past the end is refused' "$LOG"; then
+    service='ahci service +512 bytes of sector 0 through the block interface, and they are the SATA disk.s own; a sector past the end is refused'
+    [[ "${BHASKIX_SATA_FOREIGN:-0}" == 1 ]] && service="ahci service +512 bytes of sector 0 through the block interface, the same the driver read itself -- not the project's test disk, so not held to its marker; a sector past the end is refused"
+    if grep -qaE "$service" "$LOG"; then
         pass "the AHCI driver answers block::READ with that disk's own sector, and refuses one past the end"
     else
         fail "the AHCI block service did not answer, or answered wrongly"

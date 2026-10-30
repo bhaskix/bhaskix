@@ -2291,6 +2291,23 @@ pub mod block_ring {
 /// shape the filesystem's `READ_INTO` uses, because a block that travelled
 /// sixteen bytes at a time would be slower than the disk.
 pub mod block {
+    /// What the project's own SATA test disk carries at the start of sector
+    /// zero -- the Makefile writes it into `build/sata-disk.img`.
+    ///
+    /// **The one thing that lets `bin/ahcid` write at boot** (2026-10-30). Its
+    /// write self-test puts a pattern in a disk's last sector, and until that
+    /// day it did so on *any* SATA disk whose sector zero it could read: on a
+    /// real machine, the last sector of someone's disk -- a GPT disk's backup
+    /// header lives there, and some RAID formats keep their metadata there. A
+    /// disk without this string is now read and never written, and the kernel
+    /// checks it against what the driver itself read rather than against this.
+    pub const SATA_TEST_DISK_MARKER: &[u8] = b"BHASKIX-SATA-DISK-SECTOR-0";
+
+    /// `bin/ahcid`'s write self-test, as its report word 54 states it: the
+    /// disk's sector zero did not carry [`SATA_TEST_DISK_MARKER`], so it is not
+    /// the project's test disk and nothing was written to it.
+    pub const AHCI_WRITE_NOT_TEST_DISK: u64 = 4;
+
     /// Read sectors into memory the caller names.
     ///
     /// `args[0]` = first sector, `args[1]` = how many, `args[2]` = the slot in

@@ -21596,13 +21596,40 @@ fn ahci_disks(hhdm: u64) -> Option<usize> {
     Some(bhaskix_ahci::disks_reported(ports, started))
 }
 
+/// The first bytes of sector zero `bin/ahcid` read, **if it found a disk that
+/// is not the project's test disk** -- `None` for the test disk, and for a
+/// driver that has not said (2026-10-30).
+fn ahci_sector_zero(hhdm: u64) -> Option<[u8; 32]> {
+    use core::sync::atomic::Ordering;
+    let raw = AHCI_MEMORY.load(Ordering::Acquire);
+    if raw == 0 || raw == u64::MAX {
+        return None;
+    }
+    let (frames, count) = shared::frames_of(shared::MemoryId::from_u64(raw))?;
+    if count <= AHCID_REPORT_PAGE {
+        return None;
+    }
+    let base = hhdm + frames[AHCID_REPORT_PAGE];
+    // SAFETY: a frame this object owns, through the direct map; the driver
+    // writes it and this only reads.
+    let word = |index: usize| unsafe { core::ptr::read_volatile((base as *const u64).add(index)) };
+    if word(0) != AHCID_MARKER || word(54) != bhaskix_abi::block::AHCI_WRITE_NOT_TEST_DISK {
+        return None;
+    }
+    let mut first = [0u8; 32];
+    for (index, chunk) in first.chunks_mut(8).enumerate() {
+        chunk.copy_from_slice(&word(56 + index).to_le_bytes());
+    }
+    Some(first)
+}
+
 fn ahci_service_self_test(hhdm: u64) -> bool {
     use core::sync::atomic::Ordering;
 
     /// What the Makefile puts in sector zero of the AHCI disk. **Not** the
     /// domain disk's string: a service answering from the wrong device fails
     /// here rather than passing plausibly.
-    const EXPECTED: &[u8] = b"BHASKIX-SATA-DISK-SECTOR-0";
+    const EXPECTED: &[u8] = bhaskix_abi::block::SATA_TEST_DISK_MARKER;
 
     let raw = AHCI_ENDPOINT.load(Ordering::Acquire);
     if raw == 0 {
@@ -21680,12 +21707,22 @@ fn ahci_service_self_test(hhdm: u64) -> bool {
     }
 
     let refused = AHCI_REFUSED.load(Ordering::Acquire) == 0;
+    // **A disk that is not the project's test disk is a fact, not a failure**
+    // (2026-10-30). On a real machine every SATA disk is one, and holding it to
+    // the test disk's marker printed FAILED for a correct read. The driver says
+    // which it found; for any other disk, the service's bytes are held to the
+    // ones the driver read itself, which still fails a service answering from
+    // the wrong device.
+    let foreign = ahci_sector_zero(hhdm);
     let matches = match shared::frames_of(object) {
         Some((frames, count)) if count > 0 && landed == 512 => {
             // SAFETY: a frame this object owns, through the direct map.
             let bytes =
                 unsafe { core::slice::from_raw_parts((hhdm + frames[0]) as *const u8, 512) };
-            bytes.starts_with(EXPECTED)
+            match foreign {
+                Some(first) => bytes.starts_with(&first),
+                None => bytes.starts_with(EXPECTED),
+            }
         }
         _ => false,
     };
@@ -21695,7 +21732,13 @@ fn ahci_service_self_test(hhdm: u64) -> bool {
     domain::destroy(keeper);
 
     let ok = matches && refused;
-    if ok {
+    if ok && foreign.is_some() {
+        println!(
+            "    ahci service   {landed} bytes of sector 0 through the block interface, the same \
+             the driver read itself -- not the project's test disk, so not held to its marker; \
+             a sector past the end is refused"
+        );
+    } else if ok {
         println!(
             "    ahci service   {landed} bytes of sector 0 through the block interface, and \
              they are the SATA disk's own; a sector past the end is refused"
@@ -22025,6 +22068,14 @@ fn report_ahci_domain(hhdm: u64) -> bool {
                     "\x1b[91m    ahci write     FAILED: sector {} read back different from what \
                      was written\x1b[0m",
                     word(55)
+                ),
+                // **Not the project's test disk, so nothing was written** --
+                // 2026-10-30. The driver wrote a pattern to the last sector of
+                // any disk it could read until then; on a real machine that is
+                // someone's disk, and a GPT disk's backup header lives there.
+                bhaskix_abi::block::AHCI_WRITE_NOT_TEST_DISK => println!(
+                    "    ahci write     not attempted: sector 0 does not carry the project's \
+                     test-disk marker, so nothing was written to this disk"
                 ),
                 _ => println!(
                     "\x1b[91m    ahci write     FAILED: the write or its read-back was \
