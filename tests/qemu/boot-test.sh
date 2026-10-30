@@ -2857,7 +2857,7 @@ fi
 # link is load-bearing: a wrong ucontext offset reads the wrong field, a
 # wrong rip slot resumes into the fault again, a broken sigreturn never
 # resumes at all.
-if grep -qE "linux signal +a Linux program faulted on purpose, its SIGSEGV handler read cr2 0x0 out of the ucontext, edited the saved rip, and rt_sigreturn resumed it where it said: 1 delivered, 1 returned" "$LOG"; then
+if grep -qE "linux signal +a Linux program faulted on purpose, its SIGSEGV handler read cr2 0x10 out of the ucontext, edited the saved rip, and rt_sigreturn resumed it where it said: 1 delivered, 1 returned" "$LOG"; then
     pass "a Linux fault becomes a signal, and the handler's edit takes effect"
 else
     fail "the signal round trip did not complete"

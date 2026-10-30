@@ -7190,7 +7190,11 @@ static SIGNAL_REPORT_PA: core::sync::atomic::AtomicU64 = core::sync::atomic::Ato
 ///
 /// 1. installs a `SIGSEGV` handler with `rt_sigaction`, `SA_RESTORER`
 ///    pointing at its own two-instruction restorer;
-/// 2. dereferences null on purpose;
+/// 2. dereferences `0x10` on purpose -- inside the null page, which is never
+///    mapped, but **not null itself**: the frame starts zeroed, so a `cr2`
+///    read from the wrong word reads zero, and a probe that faulted at zero
+///    could not tell the two apart. It faulted at null, and read `cr2` from
+///    `oldmask`'s word, until 2026-10-30;
 /// 3. in the handler, reads `cr2` out of the `ucontext` it was handed,
 ///    stores it, then **edits the saved `rip`** to point past the faulting
 ///    instruction and returns through the restorer;
@@ -7199,14 +7203,14 @@ static SIGNAL_REPORT_PA: core::sync::atomic::AtomicU64 = core::sync::atomic::Ato
 /// If any link is wrong the probe never reaches step 4: a wrong `ucontext`
 /// offset stores the wrong `cr2`, a wrong `rip` slot resumes into the fault
 /// again, and a broken `rt_sigreturn` never resumes at all.
-const SIGNAL_CODE: [u8; 103] = [
+const SIGNAL_CODE: [u8; 104] = [
     0x49, 0x89, 0xff, // mov r15, rdi          ; the report page
     0x6a, 0x00, // push 0                ; sa_mask
-    0x48, 0x8d, 0x05, 0x52, 0x00, 0x00, 0x00, // lea rax, [rip+restorer]
+    0x48, 0x8d, 0x05, 0x53, 0x00, 0x00, 0x00, // lea rax, [rip+restorer]
     0x50, // push rax              ; sa_restorer
     0xb8, 0x04, 0x00, 0x00, 0x04, // mov eax, SA_SIGINFO|SA_RESTORER
     0x50, // push rax              ; sa_flags
-    0x48, 0x8d, 0x05, 0x27, 0x00, 0x00, 0x00, // lea rax, [rip+handler]
+    0x48, 0x8d, 0x05, 0x28, 0x00, 0x00, 0x00, // lea rax, [rip+handler]
     0x50, // push rax              ; sa_handler
     0x48, 0x89, 0xe6, // mov rsi, rsp          ; act
     0xbf, 0x0b, 0x00, 0x00, 0x00, // mov edi, 11           ; SIGSEGV
@@ -7215,13 +7219,14 @@ const SIGNAL_CODE: [u8; 103] = [
     0xb8, 0x0d, 0x00, 0x00, 0x00, // mov eax, 13           ; rt_sigaction
     0x0f, 0x05, // syscall
     0x31, 0xc0, // xor eax, eax
-    0x48, 0x8b, 0x00, // mov rax, [rax]        ; #PF at null, 3 bytes
+    0x48, 0x8b, 0x40, 0x10, // mov rax, [rax+0x10]   ; #PF at 0x10, 4 bytes
     0x49, 0xc7, 0x47, 0x08, 0x01, 0x00, 0x00, 0x00, // mov qword [r15+8], 1  ; resumed
     0xeb, 0xfe, // jmp $
-    0x48, 0x8b, 0x82, 0xd0, 0x00, 0x00, 0x00, // mov rax, [rdx+0xd0]   ; ucontext cr2
+    0x48, 0x8b, 0x82, 0xd8, 0x00, 0x00,
+    0x00, // mov rax, [rdx+0xd8]   ; ucontext cr2, glibc's REG_CR2
     0x49, 0x89, 0x07, // mov [r15], rax        ; report it
     0x48, 0x8b, 0x82, 0xa8, 0x00, 0x00, 0x00, // mov rax, [rdx+0xa8]   ; saved rip
-    0x48, 0x83, 0xc0, 0x03, // add rax, 3            ; past the faulting mov
+    0x48, 0x83, 0xc0, 0x04, // add rax, 4            ; past the faulting mov
     0x48, 0x89, 0x82, 0xa8, 0x00, 0x00, 0x00, // mov [rdx+0xa8], rax   ; edit it
     0xc3, // ret                   ; into the restorer
     0xb8, 0x0f, 0x00, 0x00, 0x00, // mov eax, 15           ; rt_sigreturn
@@ -7363,10 +7368,10 @@ fn signal_self_test(hhdm_base: u64, cpus: u32) -> bool {
 
     let delivered = fault::RESUMED.load(Ordering::Relaxed) - delivered_before;
     let returned = syscall::RESTORED.load(Ordering::Relaxed) - returned_before;
-    if report_pa != 0 && answers[0] == 0 && answers[1] == 1 && delivered == 1 && returned == 1 {
+    if report_pa != 0 && answers[0] == 0x10 && answers[1] == 1 && delivered == 1 && returned == 1 {
         println!(
             "    linux signal   a Linux program faulted on purpose, its SIGSEGV handler read \
-             cr2 0x0 out of the ucontext, edited the saved rip, and rt_sigreturn resumed it \
+             cr2 0x10 out of the ucontext, edited the saved rip, and rt_sigreturn resumed it \
              where it said: 1 delivered, 1 returned"
         );
         true

@@ -477,8 +477,13 @@ pub mod sigcontext {
     pub const EFLAGS: usize = 136;
     /// `cs`, `gs`, `fs`, `ss` packed as four `u16`s in one word.
     pub const SEGMENTS: usize = 144;
-    /// The faulting address, for `SIGSEGV`.
-    pub const CR2: usize = 168;
+    /// The faulting address, for `SIGSEGV`. **176: after `err` (152),
+    /// `trapno` (160) and `oldmask` (168).** This read 168, `oldmask`'s word,
+    /// until 2026-10-30, and the test that checked it asserted the same 168,
+    /// so neither could see it. Go never noticed, because it takes the
+    /// address from `siginfo`'s `si_addr`; a C handler reading `REG_CR2`
+    /// read zero.
+    pub const CR2: usize = 176;
     /// Bytes in the whole structure.
     pub const SIZE: usize = 256;
 }
@@ -682,9 +687,13 @@ mod tests {
 
     #[test]
     fn the_registers_land_where_linux_puts_them() {
-        // Spot-checked against `struct sigcontext_64`: the general-purpose
-        // block starts at r8 and runs to rip, and cr2 is the last field of
-        // the structure Go reads for a fault address. Reading a *byte* slice
+        // **The expected offsets are transcribed from Linux's
+        // `struct sigcontext_64` (`<asm/sigcontext.h>`), compiled with `gcc`
+        // on 2026-10-30, not copied from the constants above**: r8 at 0
+        // through rip at 128, then eflags 136, the segment word 144, err 152,
+        // trapno 160, oldmask 168, cr2 176 and fpstate 184. The previous
+        // version took its cr2 figure from the constant, asserted 168 --
+        // `oldmask`'s word -- and so could not fail. Reading a *byte* slice
         // at these offsets is what a handler does, so the test does too.
         let mut frame = std::vec![0u8; sigcontext::SIZE];
         registers().write_sigcontext(&mut frame).unwrap();
@@ -697,7 +706,13 @@ mod tests {
         assert_eq!(at(56), 15, "r15 eighth");
         assert_eq!(at(128), 0x4141, "rip where Go writes it");
         assert_eq!(at(120), 0x5b, "rsp just below rip");
-        assert_eq!(at(168), 0xdead, "cr2, the fault address");
+        assert_eq!(at(176), 0xdead, "cr2, the fault address");
+        assert_eq!(at(168), 0, "oldmask, which this frame leaves zero");
+        assert_eq!(
+            at(184),
+            0,
+            "fpstate: zero, no floating-point state carried (RFC 0094 step 3)"
+        );
     }
 
     #[test]
