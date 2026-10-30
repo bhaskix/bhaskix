@@ -918,6 +918,59 @@ impl<'f, S: Store> Volume<'f, S> {
         self.commit(&[])
     }
 
+    /// Removes everything inside `directory` and leaves it there, empty: its
+    /// files, and its directories once they have been emptied the same way, at
+    /// most `depth` levels below it. Answers how many entries went.
+    ///
+    /// **`/tmp`'s rule, and the reason this exists** -- RFC 0095. A disk that
+    /// keeps what was written keeps every earlier boot's scratch files too, and
+    /// a program that makes `/tmp/made` each time it runs meets the one the
+    /// last boot made. The filesystem service empties the writable scratch
+    /// directory when it mounts it, as a Linux system's `/tmp` starts empty.
+    ///
+    /// One transaction per entry, through [`Volume::remove`], so an
+    /// interruption leaves a directory with fewer entries and never a
+    /// half-removed one. A directory nested deeper than `depth` is refused
+    /// with [`FsError::WrongKind`] and stays where it is, along with its
+    /// parent; whatever was removed before it is gone.
+    ///
+    /// # Errors
+    ///
+    /// [`FsError::WrongKind`] if `directory` is not a directory or holds one
+    /// nested deeper than `depth`, and whatever [`Volume::remove`] returns.
+    pub fn empty(&mut self, directory: u32, depth: u32) -> Result<u32, FsError> {
+        let mut removed = 0;
+        loop {
+            // The first entry, taken afresh each time round: `remove` moves the
+            // directory's last entry into the hole it leaves, so an index
+            // carried across a removal would name a different entry.
+            let first = {
+                let mut reader = self.reader();
+                let inode = reader.inode(directory)?;
+                if inode.kind != Kind::Directory {
+                    return Err(FsError::WrongKind);
+                }
+                let mut first = None;
+                reader.list(&inode, |entry| {
+                    if first.is_none() {
+                        first = Some(*entry);
+                    }
+                });
+                first
+            };
+            let Some(entry) = first else {
+                return Ok(removed);
+            };
+            let victim = self.inode(entry.inode)?;
+            if victim.kind == Kind::Directory && victim.size != 0 {
+                let below = depth.checked_sub(1).ok_or(FsError::WrongKind)?;
+                removed += self.empty(entry.inode, below)?;
+            }
+            self.remove(directory, entry.name())?;
+            removed += 1;
+        }
+    }
+
     /// Frees every block a file holds: the direct ones, whatever the indirect
     /// table names, and the table itself.
     ///
@@ -1590,6 +1643,94 @@ mod tests {
                 Err(FsError::Full),
                 "past the table is refused, not truncated"
             );
+        });
+    }
+
+    #[test]
+    fn emptying_a_directory_removes_files_and_emptied_directories_and_keeps_it() {
+        // What `/tmp` holds after the hosted probes run: files, a directory
+        // they made, and something inside a directory -- RFC 0095.
+        let mut bytes = image(256);
+        run(&mut bytes, FRAMES, None, |volume| {
+            let root = volume.superblock().root;
+            let tmp = volume.create(root, b"tmp", Kind::Directory).expect("tmp");
+            let file = volume.create(tmp, b"hosted.txt", Kind::File).expect("file");
+            volume
+                .write(file, 0, b"from an earlier boot")
+                .expect("written");
+            volume
+                .create(tmp, b"made", Kind::Directory)
+                .expect("an empty directory");
+            let full = volume
+                .create(tmp, b"full", Kind::Directory)
+                .expect("a full one");
+            volume
+                .create(full, b"inner", Kind::File)
+                .expect("inside it");
+            let kept = volume
+                .create(root, b"kept", Kind::File)
+                .expect("beside tmp");
+
+            assert_eq!(
+                volume.empty(tmp, 1),
+                Ok(4),
+                "three entries and the one inside `full`"
+            );
+
+            let (index, inode) = volume.lookup(root, b"tmp").expect("tmp itself stays");
+            assert_eq!(index, tmp);
+            assert_eq!(inode.kind, Kind::Directory);
+            assert_eq!(inode.size, 0, "and is empty");
+            assert_eq!(
+                volume.lookup(tmp, b"made").map(|_| ()),
+                Err(FsError::NotFound)
+            );
+            assert_eq!(
+                volume.lookup(root, b"kept").map(|(at, _)| at),
+                Ok(kept),
+                "nothing outside it was touched"
+            );
+            // Emptying what is already empty removes nothing and is not an error.
+            assert_eq!(volume.empty(tmp, 1), Ok(0));
+        });
+    }
+
+    #[test]
+    fn emptying_refuses_a_tree_deeper_than_it_was_allowed() {
+        let mut bytes = image(256);
+        run(&mut bytes, FRAMES, None, |volume| {
+            let root = volume.superblock().root;
+            let tmp = volume.create(root, b"tmp", Kind::Directory).expect("tmp");
+            let a = volume.create(tmp, b"a", Kind::Directory).expect("a");
+            let b = volume.create(a, b"b", Kind::Directory).expect("b");
+            volume
+                .create(b, b"deep", Kind::File)
+                .expect("two levels down");
+
+            assert_eq!(
+                volume.empty(tmp, 1),
+                Err(FsError::WrongKind),
+                "`b` is a level too deep"
+            );
+            assert!(
+                volume.lookup(b, b"deep").is_ok(),
+                "and what was refused is still there"
+            );
+            assert_eq!(
+                volume.empty(tmp, 2),
+                Ok(3),
+                "allowed two levels, all of it goes"
+            );
+        });
+    }
+
+    #[test]
+    fn emptying_a_file_is_refused() {
+        let mut bytes = image(256);
+        run(&mut bytes, FRAMES, None, |volume| {
+            let root = volume.superblock().root;
+            let file = volume.create(root, b"plain", Kind::File).expect("a file");
+            assert_eq!(volume.empty(file, 4), Err(FsError::WrongKind));
         });
     }
 

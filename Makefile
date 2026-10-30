@@ -280,9 +280,9 @@ OVMF_SUFFIX  := $(if $(wildcard /usr/share/OVMF/OVMF_CODE_4M.fd),_4M,)
 OVMF_CODE    := $(firstword $(wildcard $(OVMF_DIR)OVMF_CODE$(OVMF_SUFFIX).fd))
 OVMF_VARS    := $(firstword $(wildcard $(OVMF_DIR)OVMF_VARS$(OVMF_SUFFIX).fd))
 
-.PHONY: FORCE all kernel iso demo run run-uefi release-dist release-finish ceremony-kit progress test test-host test-boot test-boot-uefi test-boot-uefi-qemu64 test-boot-iommu test-keyboard \
+.PHONY: FORCE all kernel iso demo demo-fresh run run-uefi release-dist release-finish ceremony-kit progress test test-host test-boot test-boot-uefi test-boot-uefi-qemu64 test-boot-iommu test-keyboard \
         test-boot-iommu-off test-boot-qemu64 test-boot-native test-boot-native-full test-boot-native-tpm \
-        test-boot-native-tpm-tis test-boot-secureboot test-release-keys test-ahci-foreign test-placements mkfs bootsign test-shell test-faults test-usb-keyboard test-lacp test-bond test-http fmt clippy gates hooks clean distclean help
+        test-boot-native-tpm-tis test-boot-secureboot test-release-keys test-ahci-foreign test-disk-keeps test-placements mkfs bootsign test-shell test-faults test-usb-keyboard test-lacp test-bond test-http fmt clippy gates hooks clean distclean help
 
 all: iso
 
@@ -347,8 +347,13 @@ $(DOMAIN_DISK):
 # The rest of the margin is the filesystem's own metadata and the room a package
 # install needs, which is the same reason the last raise left one.
 #
-# Costs nothing on a boot that does not stage BusyBox: the kernel formats a
-# fixed 128 blocks whatever the disk's size, and `dd` writes sparse zeroes.
+# Costs little on a boot that does not stage BusyBox: the kernel writes only
+# the filesystem's metadata (thirteen blocks of a thousand, RFC 0069 -- this
+# said "a fixed 128 blocks" until 2026-10-30), and `dd` writes sparse zeroes.
+#
+# **The marker is what lets a boot format this disk at all** (RFC 0095). A disk
+# carrying it is formatted on its first boot and kept on every boot after; a
+# disk carrying neither it nor this system's filesystem is never written.
 	@dd if=/dev/zero bs=1 count=4194276 >> $@ 2>/dev/null
 	@echo "built $@"
 
@@ -734,6 +739,11 @@ release-finish: bootsign
 demo: $(ISO)
 	@tools/demo.sh
 
+# The demo keeps its writable disk from one run to the next (RFC 0095); this
+# one starts from a new disk, as every demo did until 2026-10-30.
+demo-fresh: $(ISO)
+	@DEMO_FRESH=1 tools/demo.sh
+
 run: $(ISO)
 	$(QEMU) $(QEMU_COMMON) -cdrom $(ISO) -boot d -serial stdio
 
@@ -810,7 +820,8 @@ run-uefi: $(ISO)
 test: fmt clippy test-host gates test-boot test-boot-uefi test-boot-iommu test-boot-iommu-off \
       test-boot-qemu64 test-boot-uefi-qemu64 test-boot-native test-boot-native-full test-boot-native-tpm \
       test-boot-native-tpm-tis test-boot-secureboot test-release-keys test-placements test-shell \
-      test-ahci-foreign test-keyboard test-usb-keyboard test-busybox test-bond test-lacp test-faults test-http
+      test-ahci-foreign test-disk-keeps test-keyboard test-usb-keyboard test-busybox test-bond test-lacp \
+      test-faults test-http
 	@echo
 	@echo "  all checks passed"
 
@@ -930,6 +941,15 @@ test-boot-iommu: $(ISO)
 # compares the disk's last sector before and after.
 test-ahci-foreign: $(ISO)
 	BHASKIX_SATA_FOREIGN=1 BHASKIX_LANE=ahci-foreign tests/qemu/boot-test.sh iommu
+
+# RFC 0095: the domain disk is formatted only when it carries the project's
+# marker. Four boots -- a marked disk formatted and a package installed; the
+# same file again under `boot-test.sh`, every gate it applies passing on the
+# kept disk; a third time, the package still listed and running; and a disk
+# that is not the project's, whose sha256 must not change. Every other lane
+# starts from a fresh marked disk, so none of them can see any of this.
+test-disk-keeps: $(ISO)
+	tests/qemu/disk-keeps-test.sh
 
 # RFC 0041 step 7, and the counterpart to `test-keyboard`.
 #

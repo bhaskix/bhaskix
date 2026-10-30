@@ -159,12 +159,15 @@ Stated as plainly as the list above, because that is what criterion R7 asks for.
 - **This release's binaries are not signed either.** `SHA256SUMS` sits beside
   them and detects a damaged download. It does not detect a malicious one,
   because anyone who could replace a binary could replace the sums.
-- **Nothing written survives a reboot.** The writable filesystem is formatted
-  at every boot: a package installed on one boot is gone on the next. Measured
-  2026-10-19 — two boots on one disk image, `1 installed` and then `0 installed`.
-  The format also writes over the marker the next boot's self-test reads, so a
-  disk image must be remade for each boot, or that boot reports
-  `block service FAILED`; [the guides](guide/README.md) say how.
+- ~~**Nothing written survives a reboot.**~~ **Removed from this list
+  2026-10-30, [RFC 0095](rfc/0095-a-disk-that-keeps-what-was-written.md).** Until
+  then the writable filesystem was formatted at every boot (measured 2026-10-19:
+  two boots on one disk image, `1 installed` and then `0 installed`). A boot now
+  formats the disk only when it carries the project's marker, which a new disk
+  does, and mounts and keeps one that holds Bhaskix's filesystem: measured
+  2026-10-30, `1 installed` on the second boot, and the package runs. **A disk
+  carrying neither is never written**, not even formatted, which until that day
+  it would have been.
 - **No package repository, no signatures, no ABI stability.** Nothing here is
   promised to keep working across versions.
 - **No desktop, no graphical environment.**
@@ -233,7 +236,7 @@ the table below~~ and closed the same day, so it is in the second table.
 | A `poll` probe says "not ready" for a domain with no console grant | 1 sighting (2026-10-12) | parked until the next one; the cause is an inference |
 | The native TPM lane's second serial log comes back empty | 1 in 9 runs (2026-10-11) | instrumented, not explained |
 | The LACP test's report ends with no state line | 1 sighting (2026-10-16) | not explained |
-| A second boot on the same disk image reports `block service FAILED` | every such boot (2026-10-19) | not fixed: the boot's format writes over the marker its self-test reads. Remake the image before each boot, as the guides say |
+| ~~A second boot on the same disk image reports `block service FAILED`~~ | every such boot (2026-10-19) | **fixed 2026-10-30** ([RFC 0095](rfc/0095-a-disk-that-keeps-what-was-written.md)): a boot keeps a disk holding Bhaskix's filesystem, and the block service reads it as that; `make test-disk-keeps` boots twice on one disk |
 | BusyBox `sh` faults at `0x48` | ~2% of harness runs; 0 of 8,443 CI boots (2026-10-04) | likely fixed 2026-10-02, not proven |
 | A per-CPU hold count underflows (the remainder of the old "445 ms wake" row) | no specimen in 450 boots of one image (2026-08-28) | a cause guarded 2026-09-03; not shown to be *the* cause |
 

@@ -509,6 +509,18 @@ jobs:
           BHASKIX_LANE: ahci-foreign
         run: tests/qemu/boot-test.sh iommu
 
+      # RFC 0095, 2026-10-30: a disk that keeps what was written. Four boots: a
+      # marked disk formatted and a package installed; the same file under every
+      # boot-test.sh gate, kept; a third boot, the package still there; and a
+      # disk that is not the project's, whose sha256 must not change.
+      - name: Boot twice on one disk and keep it; leave a foreign disk untouched
+        env:
+          QEMU_CPU: max
+          DISK_KEEPS_TIMEOUT: 300
+          BOOT_TEST_TIMEOUT: 300
+          BHASKIX_KEEP_LOGS: disk-keeps-logs
+        run: tests/qemu/disk-keeps-test.sh
+
       - name: Upload the boot log and image on failure
         if: failure()
         uses: actions/upload-artifact@v7
@@ -517,6 +529,7 @@ jobs:
           path: |
             boot-iommu.log
             ci-env-iommu.txt
+            disk-keeps-logs/
             build/bhaskix.iso
             target/x86_64-unknown-none/release/bhaskix
           retention-days: 7

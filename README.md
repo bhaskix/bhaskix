@@ -201,7 +201,10 @@ bhaskix$ dmesg
 ```
 
 `Ctrl-A` then `x` to leave. It is an emulator with two disk images under
-`build/`; nothing touches your machine, and closing it discards everything.
+`build/`; nothing touches your machine. The writable one is kept from one demo
+to the next, so what you install is still there next time (since 2026-10-30,
+[RFC 0095](docs/rfc/0095-a-disk-that-keeps-what-was-written.md));
+`make demo-fresh` starts from a new one.
 
 `make demo` boots the machine the gates run against — two disks, a network, an
 IOMMU containing them, a USB keyboard. `make run` boots a bare one instead: a

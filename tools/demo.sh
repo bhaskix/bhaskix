@@ -20,7 +20,11 @@ set -uo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ISO="$REPO_ROOT/build/bhaskix.iso"
 DISK="$REPO_ROOT/build/initrd.tar"
-DOMAIN_DISK="$REPO_ROOT/build/domain-disk.img"
+# **The demo's own disk, not the tests' master** (2026-10-30). The harnesses
+# delete and rebuild `build/domain-disk.img` before every run, which was
+# harmless while every demo started fresh; now that a demo keeps its disk, a
+# `make test` in between would quietly erase what a reader installed.
+DOMAIN_DISK="$REPO_ROOT/build/demo-disk.img"
 
 bold=$'\033[1m'; dim=$'\033[2m'; green=$'\033[92m'; cyan=$'\033[96m'; off=$'\033[0m'
 
@@ -33,14 +37,30 @@ command -v qemu-system-x86_64 >/dev/null || {
     exit 1
 }
 
-# **A fresh writable disk, for the reason the Makefile gives about it.** The
-# domain disk is *written to* -- the filesystem service formats and journals on
-# it -- so a second run starts from wherever the last one left off, and the
-# block service's own self-test compares what it reads against what it wrote
-# and reports FAILED. Every harness regenerates it; a demo that did not would
-# show a newcomer two red lines caused by nothing but a previous demo.
-rm -f "$DOMAIN_DISK"
-make -C "$REPO_ROOT" "${DOMAIN_DISK#"$REPO_ROOT"/}" >/dev/null 2>&1 || true
+# **The writable disk is kept from one demo to the next** (RFC 0095, the
+# lead's choice, 2026-10-30). Until that day every boot formatted it, so this
+# script deleted it first: a second boot on a formatted disk reported two red
+# lines caused by nothing but the previous demo. A boot now formats a disk only
+# when it carries the project's marker and keeps one that holds this system's
+# filesystem -- so a package installed in one demo is there in the next, which
+# is the behaviour a newcomer should see. `make demo-fresh` (DEMO_FRESH=1)
+# deletes it first, for a demo that starts from nothing.
+if [[ -n ${DEMO_FRESH:-} ]]; then
+    rm -f "$DOMAIN_DISK"
+fi
+if [[ -f "$DOMAIN_DISK" ]]; then
+    disk_note="build/demo-disk.img, kept from your last demo, so what you
+  installed is still there; \`make demo-fresh\` starts from a new one"
+else
+    # Made here, as the guides tell a reader to make theirs: the marker is
+    # what lets a boot format it. Not copied from the tests' master, which
+    # `shell-test.sh` boots and so may hold a filesystem rather than a marker.
+    mkdir -p "$(dirname "$DOMAIN_DISK")"
+    printf 'BHASKIX-DOMAIN-DISK-SECTOR-0' > "$DOMAIN_DISK"
+    truncate -s 4M "$DOMAIN_DISK"
+    disk_note="build/demo-disk.img, new: this boot formats it, and later
+  demos keep it"
+fi
 
 # shellcheck source=tests/qemu/devices.sh
 source "$REPO_ROOT/tests/qemu/devices.sh"
@@ -51,9 +71,11 @@ cat <<BANNER
 ${bold}Bhaskix${off} ${dim}-- a capability operating system, booting in QEMU${off}
 
   ${dim}This is the same machine the gates run against: two disks, a network,
-  an IOMMU containing them, and a USB keyboard. Boot takes a few seconds
-  under emulation, and the report you are about to watch is the system
-  checking itself -- every line is a claim it just tested.${off}
+  an IOMMU containing them, and a USB keyboard. Boot takes about half a
+  minute under emulation, and the report you are about to watch is the
+  system checking itself -- every line is a claim it just tested.${off}
+
+  ${dim}Its writable disk is ${disk_note}.${off}
 
   ${bold}At the ${green}bhaskix\$${off}${bold} prompt, try:${off}
 
@@ -66,7 +88,7 @@ ${bold}Bhaskix${off} ${dim}-- a capability operating system, booting in QEMU${of
 
   ${dim}To leave: press ${off}${bold}Ctrl-A${off}${dim} then ${off}${bold}x${off}${dim}.
   Nothing here touches your machine -- it is an emulator with two disk
-  images under build/, and closing it discards everything.${off}
+  images under build/; closing it keeps the writable one for next time.${off}
 
 BANNER
 

@@ -283,6 +283,12 @@ DISK="$REPO_ROOT/build/initrd.tar"
 BHASKIX_LANE="${BHASKIX_LANE:-${MODE}-${QEMU_CPU:-max}}"
 export BHASKIX_LANE
 DOMAIN_DISK="$REPO_ROOT/build/domain-disk-${BHASKIX_LANE}.img"
+# RFC 0095: `BHASKIX_DOMAIN_DISK_KEEP=<file>` boots on that disk *as it is* --
+# not a fresh copy of the master -- and expects the boot to keep it: the block
+# service and the journal must say so, and every other gate in this file must
+# pass exactly as it does on a fresh disk. `make test-disk-keeps` uses it for
+# the second boot on a disk the first one formatted and installed onto.
+[[ -n ${BHASKIX_DOMAIN_DISK_KEEP:-} ]] && DOMAIN_DISK="$BHASKIX_DOMAIN_DISK_KEEP"
 
 # RFC 0012's escape hatch, and it is tested on a machine that **has** an IOMMU
 # -- turning off a unit that is not there proves nothing. The image is built
@@ -486,7 +492,10 @@ exec 9>"$REPO_ROOT/build/.disk-master.lock"
 flock 9 2>/dev/null || true
 make -C "$REPO_ROOT" build/domain-disk.img >/dev/null 2>&1 || true
 # The lane's own copy: QEMU write-locks it, so a shared one serialises lanes.
-cp -f "$REPO_ROOT/build/domain-disk.img" "$DOMAIN_DISK" 2>/dev/null || true
+# Not over a disk the caller asked to keep.
+if [[ -z ${BHASKIX_DOMAIN_DISK_KEEP:-} ]]; then
+    cp -f "$REPO_ROOT/build/domain-disk.img" "$DOMAIN_DISK" 2>/dev/null || true
+fi
 
 # And the SATA disk, for the same reason and since RFC 0046 step 6: the AHCI
 # driver now *writes* to it -- a pattern into its last sector, read back to
@@ -2356,7 +2365,10 @@ fi
 # drives, so the kernel knows what must come back without being able to read
 # that disk itself -- it drives the other one. The refusal is asserted beside
 # it, because a service that answers every question is not answering any.
-if grep -qE "block service +512 bytes of sector 0 through the service, and they are the domain disk's own; a sector past the end is refused" "$LOG"; then
+block_line="block service +512 bytes of sector 0 through the service, and they are the domain disk's own; a sector past the end is refused"
+# RFC 0095: a kept disk begins with this system's filesystem, not the marker.
+[[ -n ${BHASKIX_DOMAIN_DISK_KEEP:-} ]] && block_line="block service +512 bytes of sector 0 through the service, and they begin this system's filesystem, kept from an earlier boot; a sector past the end is refused"
+if grep -qE "$block_line" "$LOG"; then
     pass "a block service in ring 3 answered a request for a sector, and refused one that is not there"
 elif grep -qE "block domain +no second device" "$LOG"; then
     pass "no second device, so no block service to ask"
@@ -3375,7 +3387,11 @@ if [[ "$MODE" == "iommu" || "$MODE" == "fsd" ]]; then
     # says nothing about a disk size. What is being checked here is that a
     # ring-3 driver drove a device and said how far; how large the test disk
     # happens to be is a number this file should not be repeating.
-    if grep -qE 'block domain +ring 3 driver: .*drove it to 15, .*[0-9]+ sectors, sector 0 begins "BHASKIX-", woken by the device, and says it is 1af4:1042 from its own configuration space' "$LOG"; then
+    # The first eight bytes of sector 0: the marker's on a fresh disk, and on a
+    # kept one (RFC 0095) the filesystem's magic, which the format put there.
+    sector0_begins='BHASKIX-'
+    [[ -n ${BHASKIX_DOMAIN_DISK_KEEP:-} ]] && sector0_begins='BHASKIXF'
+    if grep -qE "block domain +ring 3 driver: .*drove it to 15, .*[0-9]+ sectors, sector 0 begins \"$sector0_begins\", woken by the device, and says it is 1af4:1042 from its own configuration space" "$LOG"; then
         # `1af4:1042` is the virtio vendor and the modern block device, read
         # by the driver out of its *own* configuration space with no help from
         # the kernel. It is only reported when the same page was **refused** a
@@ -4914,7 +4930,17 @@ fi
 #
 # The exhaustive harness stays on the host, where stopping at every write of
 # every operation costs milliseconds rather than a round trip each.
-if grep -qE "disk journal +a filesystem on the virtio disk, through the block service: a create takes [1-9][0-9]* device writes to commit, the machine was stopped one write later, and mounting replayed [1-9][0-9]* blocks" "$LOG"; then
+if [[ -n ${BHASKIX_DOMAIN_DISK_KEEP:-} ]]; then
+    # RFC 0095: a kept disk is mounted and exercised, not formatted and
+    # interrupted -- the interruption is for a disk nobody's data is on.
+    if grep -qE "disk journal +kept: this disk already held this system's filesystem, so it was mounted and not formatted -- mounting replayed [0-9]+ blocks, a file was written, read back and removed through the journal in [1-9][0-9]* device writes, and the programs this boot stages were replaced" "$LOG"; then
+        pass "a kept disk was mounted, not formatted, and a journalled write on it read back and removed"
+    else
+        fail "the kept disk was not reported as kept"
+        grep -E "disk journal " "$LOG" || true
+        status=1
+    fi
+elif grep -qE "disk journal +a filesystem on the virtio disk, through the block service: a create takes [1-9][0-9]* device writes to commit, the machine was stopped one write later, and mounting replayed [1-9][0-9]* blocks" "$LOG"; then
     pass "a journal on a real device survived being interrupted after its commit"
 elif grep -qE "disk journal +no block service on this machine" "$LOG"; then
     pass "no block service on this machine, so no device to put a filesystem on"

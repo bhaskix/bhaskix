@@ -770,6 +770,10 @@ extern "C" fn fsd_main() -> ! {
     // only name what is inside the directory it was granted; a writable
     // directory anywhere else would be one it could not reach, and moving its
     // root to reach it would make everything else writable too.
+    /// How deep a tree under `tmp` is emptied. The hosted probes make one
+    /// directory there; four levels is room for what a program might nest
+    /// without making a boot's cost unbounded.
+    const TMP_DEPTH: u32 = 4;
     let tmp = {
         let Ok((mut volume, _)) = Volume::mount(cache) else {
             report(blocks, entries, read as u64, matched, sectors, 0, 0, 0, 0);
@@ -778,9 +782,17 @@ extern "C" fn fsd_main() -> ! {
         let root_index = volume.superblock().root;
         let made = volume.lookup(root_index, b"sub").and_then(|(sub, _)| {
             match volume.lookup(sub, b"tmp") {
-                Ok((index, inode)) if inode.kind == Kind::Directory => {
-                    Ok((index, inode.generation))
-                }
+                // **Emptied before it is handed out** -- RFC 0095. Since a
+                // boot keeps the disk it found, `tmp` would otherwise carry
+                // every earlier boot's scratch files, and a program that makes
+                // `/tmp/made` each time it runs would meet the last one's. A
+                // Linux system's `/tmp` starts empty; this one does too. If it
+                // cannot be emptied, no writable directory is handed out at
+                // all, which a hosted `open` reports as `EROFS` -- visible,
+                // rather than a `/tmp` quietly holding yesterday.
+                Ok((index, inode)) if inode.kind == Kind::Directory => volume
+                    .empty(index, TMP_DEPTH)
+                    .map(|_| (index, inode.generation)),
                 // A *file* called `tmp` is not a directory this may hand out,
                 // and creating over it would destroy somebody's data. Left
                 // alone; the handle stays zero and the adapter simply holds no

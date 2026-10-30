@@ -20718,6 +20718,35 @@ fn disk_journal_self_test(hhdm: u64) -> bool {
         );
         return false;
     }
+    // RFC 0095's two answers that are not a format, checked before the
+    // format's own bit.
+    if verdict & DISK_LEFT_ALONE != 0 {
+        if verdict & 0xff == DomainDisk::OursUnreadable as u64 {
+            println!(
+                "    disk journal   left alone: sector 0 carries this system's filesystem magic \
+                 but not a superblock this boot can mount (another version of the format, or \
+                 damage) -- nothing was written to it; remake the disk to start again"
+            );
+        } else {
+            println!(
+                "    disk journal   left alone: sector 0 holds neither the domain disk's marker \
+                 nor this system's filesystem, so this is not the project's disk -- nothing was \
+                 written to it, and nothing will be mounted from it"
+            );
+        }
+        return true;
+    }
+    if verdict & DISK_KEPT != 0 {
+        let replayed = (verdict >> 8) & 0xff_ffff;
+        let writes = verdict & 0xff;
+        println!(
+            "    disk journal   kept: this disk already held this system's filesystem, so it was \
+             mounted and not formatted -- mounting replayed {replayed} blocks, a file was written, \
+             read back and removed through the journal in {writes} device writes, and the \
+             programs this boot stages were replaced; /pkg is as the last boot left it"
+        );
+        return true;
+    }
     if verdict & 0x1_0000_0000 == 0 {
         println!(
             "    disk journal   FAILED at stage {verdict}: a filesystem on the device did not \
@@ -20738,8 +20767,6 @@ fn disk_journal_self_test(hhdm: u64) -> bool {
 fn block_service_self_test(hhdm: u64) -> bool {
     use core::sync::atomic::Ordering;
 
-    /// What the Makefile puts in sector zero of the domain's disk.
-    const EXPECTED: &[u8] = b"BHASKIX-DOMAIN-DISK-SECTOR-0";
     const BADGE: u64 = 0x00b2_0000;
 
     let raw = BLOCK_ENDPOINT.load(Ordering::Acquire);
@@ -20812,33 +20839,56 @@ fn block_service_self_test(hhdm: u64) -> bool {
     }
 
     let refused = BLOCK_REFUSED.load(Ordering::Acquire) == 0;
-    let matches = match shared::frames_of(object) {
+    // **Which of three things sector 0 is -- RFC 0095.** It was one: the
+    // marker, or a failure, so the second boot on any disk failed here because
+    // the first had formatted it. One sector cannot hold a whole superblock,
+    // so a filesystem is recognised here by its magic and checked in full by
+    // the journal's own read. The lanes still prove this read path: each gate
+    // demands the line for the disk its harness attached, so a read that
+    // returned the wrong bytes would print a line no gate accepts.
+    let sector = match shared::frames_of(object) {
         Some((frames, count)) if count > 0 && landed == 512 => {
             // SAFETY: a frame this object owns, through the direct map.
             let bytes =
                 unsafe { core::slice::from_raw_parts((hhdm + frames[0]) as *const u8, 512) };
-            bytes.starts_with(EXPECTED)
+            Some(
+                if bytes.starts_with(bhaskix_abi::block::DOMAIN_DISK_MARKER) {
+                    DomainDisk::Marked
+                } else if bytes.starts_with(&bhaskix_fs::MAGIC.to_le_bytes()) {
+                    DomainDisk::Ours
+                } else {
+                    DomainDisk::Foreign
+                },
+            )
         }
-        _ => false,
+        _ => None,
     };
 
     shared::revoke(object);
     domain::destroy(owner);
     domain::destroy(keeper);
 
-    let ok = matches && refused;
-    if ok {
-        println!(
+    match (sector, refused) {
+        (Some(DomainDisk::Marked), true) => println!(
             "    block service  {landed} bytes of sector 0 through the service, and they are \
              the domain disk's own; a sector past the end is refused"
-        );
-    } else {
-        println!(
-            "    block service  FAILED: {landed} bytes, contents match {matches}, \
-             past the end refused {refused}"
-        );
+        ),
+        (Some(DomainDisk::Ours), true) => println!(
+            "    block service  {landed} bytes of sector 0 through the service, and they begin \
+             this system's filesystem, kept from an earlier boot; a sector past the end is \
+             refused"
+        ),
+        (Some(_), true) => println!(
+            "    block service  {landed} bytes of sector 0 through the service: neither the \
+             domain disk's marker nor this system's filesystem, so this is not the project's \
+             disk and nothing will be written to it; a sector past the end is refused"
+        ),
+        _ => {
+            println!("    block service  FAILED: {landed} bytes, past the end refused {refused}");
+            return false;
+        }
     }
-    ok
+    true
 }
 
 /// The domain the block self-test asks from, and what came back.
@@ -20848,6 +20898,159 @@ fn block_service_self_test(hhdm: u64) -> bool {
 /// boot report and a struct would need a lock on a path that has no reason to
 /// take one.
 static DISK_JOURNAL: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// What the domain disk's first block allows a boot to do with it -- RFC 0095.
+///
+/// Until 2026-10-30 there was one answer: format it. That threw away whatever
+/// the last boot wrote, and it formatted whatever the second virtio disk
+/// happened to be, the project's or not.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u8)]
+enum DomainDisk {
+    /// [`bhaskix_abi::block::DOMAIN_DISK_MARKER`]: a disk made for this, so it
+    /// is formatted and the whole journal self-test runs on it.
+    Marked = 1,
+    /// This system's filesystem, its superblock intact: mounted and kept.
+    Ours = 2,
+    /// This system's magic, and a superblock this boot cannot accept --
+    /// another version of the format, or damage. Read, never written.
+    OursUnreadable = 3,
+    /// Anything else, a blank disk included. Read, never written.
+    Foreign = 4,
+}
+
+/// Decides [`DomainDisk`] from a disk's first block. `blocks` is the device's
+/// size, which a superblock must not claim to exceed.
+///
+/// Pure, so the rule is host-tested rather than only booted: the cost of
+/// getting it wrong is formatting somebody's disk.
+fn classify_domain_disk(head: &[u8], blocks: u64) -> DomainDisk {
+    if head.starts_with(bhaskix_abi::block::DOMAIN_DISK_MARKER) {
+        DomainDisk::Marked
+    } else if bhaskix_fs::Superblock::read_head(head, blocks).is_ok() {
+        DomainDisk::Ours
+    } else if head.get(..8) == Some(&bhaskix_fs::MAGIC.to_le_bytes()[..]) {
+        DomainDisk::OursUnreadable
+    } else {
+        DomainDisk::Foreign
+    }
+}
+
+#[cfg(test)]
+mod domain_disk_tests {
+    use super::{DomainDisk, classify_domain_disk};
+    use alloc::vec;
+    use alloc::vec::Vec;
+
+    /// The device's size in blocks, as a 4 MiB domain disk has.
+    const BLOCKS: u64 = 1024;
+
+    /// The first block of a disk this system formatted.
+    fn formatted() -> Vec<u8> {
+        let mut image = vec![0u8; 64 * bhaskix_fs::BLOCK];
+        bhaskix_fs::format_sized(&mut image, 128, BLOCKS).expect("formatted");
+        image.truncate(bhaskix_fs::BLOCK);
+        image
+    }
+
+    fn starting_with(prefix: &[u8]) -> Vec<u8> {
+        let mut head = vec![0u8; bhaskix_fs::BLOCK];
+        head[..prefix.len()].copy_from_slice(prefix);
+        head
+    }
+
+    #[test]
+    fn the_marker_is_what_may_be_formatted() {
+        let head = starting_with(bhaskix_abi::block::DOMAIN_DISK_MARKER);
+        assert_eq!(classify_domain_disk(&head, BLOCKS), DomainDisk::Marked);
+    }
+
+    #[test]
+    fn this_systems_filesystem_is_kept() {
+        assert_eq!(classify_domain_disk(&formatted(), BLOCKS), DomainDisk::Ours);
+    }
+
+    #[test]
+    fn a_damaged_superblock_is_ours_and_left_alone() {
+        // One byte inside the checksummed region: the magic still says this
+        // system's, and the checksum says not as written.
+        let mut head = formatted();
+        head[20] ^= 0x40;
+        assert_eq!(
+            classify_domain_disk(&head, BLOCKS),
+            DomainDisk::OursUnreadable
+        );
+        // And a filesystem larger than the device it is on.
+        assert_eq!(
+            classify_domain_disk(&formatted(), BLOCKS / 2),
+            DomainDisk::OursUnreadable
+        );
+    }
+
+    #[test]
+    fn anything_else_is_left_alone() {
+        let blank = vec![0u8; bhaskix_fs::BLOCK];
+        assert_eq!(
+            classify_domain_disk(&blank, BLOCKS),
+            DomainDisk::Foreign,
+            "a blank disk"
+        );
+        let sata = starting_with(bhaskix_abi::block::SATA_TEST_DISK_MARKER);
+        assert_eq!(
+            classify_domain_disk(&sata, BLOCKS),
+            DomainDisk::Foreign,
+            "the other test disk"
+        );
+        let mut late = vec![0u8; bhaskix_fs::BLOCK];
+        late[1..1 + bhaskix_abi::block::DOMAIN_DISK_MARKER.len()]
+            .copy_from_slice(bhaskix_abi::block::DOMAIN_DISK_MARKER);
+        assert_eq!(
+            classify_domain_disk(&late, BLOCKS),
+            DomainDisk::Foreign,
+            "the marker, not at 0"
+        );
+        let data = starting_with(b"\x7fELF and then somebody's bytes");
+        assert_eq!(
+            classify_domain_disk(&data, BLOCKS),
+            DomainDisk::Foreign,
+            "somebody's data"
+        );
+    }
+}
+
+/// What [`journal_on_disk`] found, as a [`DomainDisk`] discriminant, or zero
+/// before it has looked. Read by the filesystem service's start, which has
+/// nothing to mount from a disk that was left alone.
+static DISK_KIND: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// `DISK_JOURNAL`'s answer for a disk that was kept: this bit, the blocks the
+/// mount replayed in bits 8.., and the device writes the check took in 0..8.
+const DISK_KEPT: u64 = 0x2_0000_0000;
+/// `DISK_JOURNAL`'s answer for a disk left alone: this bit and its kind.
+const DISK_LEFT_ALONE: u64 = 0x4_0000_0000;
+
+/// The name of the file a kept disk's check writes, reads back and removes.
+const BOOT_CHECK: &[u8] = b"boot-check";
+/// What it holds while it exists.
+const BOOT_CHECK_BYTES: &[u8] = b"a write this boot made, read back and then removed\n";
+
+/// Makes `name` in `directory` with `contents` where it is missing, and leaves
+/// it as it is where it is not -- a kept disk's files are its owner's.
+fn ensure_file<S: bhaskix_fs::Store>(
+    volume: &mut bhaskix_fs::Volume<'_, S>,
+    directory: u32,
+    name: &[u8],
+    contents: &[u8],
+) -> Option<()> {
+    if volume.lookup(directory, name).is_ok() {
+        return Some(());
+    }
+    let index = volume
+        .create(directory, name, bhaskix_fs::Kind::File)
+        .ok()?;
+    volume.write(index, 0, contents).ok()?;
+    Some(())
+}
 
 /// The program a hosted `execve` loads, as it is named in the archive.
 const HOSTED_PROGRAM: &[u8] = b"bin/hosted";
@@ -21083,7 +21286,51 @@ extern "C" fn journal_on_disk(endpoint: u64) -> ! {
         Err(_) => 0,
     };
 
-    // What a write refuses, before anything is written for real.
+    // SAFETY: this thread is the only one that reaches these pages, and it is
+    // spawned once.
+    let (image, frames) = unsafe {
+        (
+            &mut *core::ptr::addr_of_mut!(JOURNAL_IMAGE),
+            &mut *core::ptr::addr_of_mut!(DISK_FRAMES),
+        )
+    };
+    let store = |budget: u32| DiskStore {
+        endpoint,
+        slot: 0,
+        frame,
+        hhdm,
+        sectors,
+        budget,
+        writes: 0,
+    };
+
+    // **Sector 0 decides what this boot may do with the disk -- RFC 0095.**
+    // Read before anything is written, by the same store everything after it
+    // uses. A disk carrying the project's marker is formatted, as every disk
+    // was until 2026-10-30; one carrying this system's filesystem is mounted
+    // and kept; anything else -- somebody's data disk in the second place, a
+    // blank one, a filesystem of another version -- is left exactly as it was.
+    let kind = {
+        let head = &mut image[..bhaskix_fs::BLOCK];
+        if bhaskix_fs::Store::read(&mut store(u32::MAX), 0, head).is_err() {
+            DISK_JOURNAL.store(16, Ordering::Release);
+            sched::exit()
+        }
+        classify_domain_disk(head, sectors / 8)
+    };
+    DISK_KIND.store(kind as u8, Ordering::Release);
+    match kind {
+        DomainDisk::Marked => {}
+        DomainDisk::Ours => keep_the_disk(store(u32::MAX), frames),
+        DomainDisk::OursUnreadable | DomainDisk::Foreign => {
+            DISK_JOURNAL.store(DISK_LEFT_ALONE | kind as u64, Ordering::Release);
+            sched::exit()
+        }
+    }
+
+    // What a write refuses, before anything is written for real -- and only
+    // here, on a disk made to be written: one of these names sector 0, and if
+    // the refusal it tests ever regressed, the write would land.
     //
     // A sector past the end, which must be refused *here* rather than asked of
     // the hardware: a device is entitled to do anything with a sector that
@@ -21109,24 +21356,6 @@ extern "C" fn journal_on_disk(endpoint: u64) -> ! {
         DISK_JOURNAL.store(13, Ordering::Release);
         sched::exit()
     }
-    let store = |budget: u32| DiskStore {
-        endpoint,
-        slot: 0,
-        frame,
-        hhdm,
-        sectors,
-        budget,
-        writes: 0,
-    };
-
-    // SAFETY: this thread is the only one that reaches these pages, and it is
-    // spawned once.
-    let (image, frames) = unsafe {
-        (
-            &mut *core::ptr::addr_of_mut!(JOURNAL_IMAGE),
-            &mut *core::ptr::addr_of_mut!(DISK_FRAMES),
-        )
-    };
 
     // Formatted in memory and then *put on the disk block by block*, which is
     // what `mkfs` does from a developer's machine. Formatting through the
@@ -21286,91 +21515,7 @@ extern "C" fn journal_on_disk(endpoint: u64) -> ! {
             volume
                 .write(inner, 0, b"only reachable through the subdirectory\n")
                 .ok()?;
-            // **And a program, in the one directory the Linux adapter holds**
-            // — RFC 0059. `sub` is what `bin/linuxd` is granted as a hosted
-            // process's whole filesystem, so this is where a program a hosted
-            // `execve` can reach has to be. It is copied out of the archive
-            // rather than built here: the archive is where every other program
-            // on this machine comes from, and a program the kernel synthesised
-            // would prove less than one that was compiled, linked and shipped.
-            //
-            // A machine whose image has no `bin/hosted` gets the tree without
-            // it, and the gate says `skipped` rather than failing — the same
-            // rule the corpus programs live under.
-            if let Ok(file) = vfs::open(HOSTED_PROGRAM) {
-                let bytes = file.bytes();
-                if !bytes.is_empty()
-                    && let Ok(hosted) = volume.create(sub, b"hosted", Kind::File)
-                {
-                    // **One block per call**, which is what `Volume::write`
-                    // documents and answers with: a write spanning blocks is
-                    // several transactions, and the loop belongs to whoever
-                    // wants them all rather than being hidden inside one that
-                    // implies a single commit.
-                    // **Priced, because the next question about this path is
-                    // "how large a program could be staged here?"** RFC 0064
-                    // and RFC 0065 removed the two limits that stopped a hosted
-                    // `execve` of BusyBox; what is left is that every block of
-                    // this write is one journal transaction, and BusyBox is 531
-                    // of them. A number beats an estimate, and the roadmap has
-                    // been quoting estimates.
-                    let began = bhaskix_arch::tsc::read();
-                    // **One commit for many blocks** — RFC 0066. This was
-                    // `volume.write` in a loop, one journal transaction per 4
-                    // KiB, which the line below prices. `write_run` stages the
-                    // same three metadata blocks whatever the run's length and
-                    // falls back to the single-block path for the tail.
-                    let mut done = 0usize;
-                    while done < bytes.len() {
-                        match volume.write_run(hosted, done as u64, &bytes[done..]) {
-                            Ok(0) | Err(_) => break,
-                            Ok(moved) => done += moved,
-                        }
-                    }
-                    HOSTED_STAGED.store(done as u64, Ordering::Release);
-                    HOSTED_WANTED.store(bytes.len() as u64, Ordering::Release);
-                    HOSTED_STAGE_CYCLES.store(
-                        bhaskix_arch::tsc::read().saturating_sub(began),
-                        Ordering::Release,
-                    );
-                }
-            }
-
-            // **BusyBox, when this boot was asked for it — RFC 0068 step 2.**
-            //
-            // The same write, to the same directory, by the same loop. What
-            // stopped it until 2026-09-04 was the disk: 1 MiB against a
-            // 2,172,376-byte program. The disk is 4 MiB now and every other
-            // limit went earlier -- RFC 0064 took the loader's 64 KiB window
-            // away, RFC 0065 took the filesystem's ten-block file away, and
-            // RFC 0059 made `execve` resolve a real path.
-            //
-            // Off unless `bhaskix.busybox=1`, because it costs 2.1 to 3.4
-            // seconds on the lanes that have a filesystem and paying that
-            // everywhere is a scope decision rather than an engineering one.
-            if STAGE_BUSYBOX.load(Ordering::Relaxed)
-                && let Ok(file) = vfs::open(BUSYBOX_PROGRAM)
-            {
-                let bytes = file.bytes();
-                BUSYBOX_WANTED.store(bytes.len() as u64, Ordering::Release);
-                if !bytes.is_empty()
-                    && let Ok(busybox) = volume.create(sub, b"busybox", Kind::File)
-                {
-                    let began = bhaskix_arch::tsc::read();
-                    let mut done = 0usize;
-                    while done < bytes.len() {
-                        match volume.write_run(busybox, done as u64, &bytes[done..]) {
-                            Ok(0) | Err(_) => break,
-                            Ok(moved) => done += moved,
-                        }
-                    }
-                    BUSYBOX_STAGED.store(done as u64, Ordering::Release);
-                    BUSYBOX_STAGE_CYCLES.store(
-                        bhaskix_arch::tsc::read().saturating_sub(began),
-                        Ordering::Release,
-                    );
-                }
-            }
+            stage_programs(&mut volume, sub);
             Some(())
         })();
         if made.is_none() {
@@ -21442,6 +21587,192 @@ extern "C" fn journal_on_disk(endpoint: u64) -> ! {
         Ordering::Release,
     );
     sched::exit()
+}
+
+/// A disk that already holds this system's filesystem: mounted, not
+/// formatted -- RFC 0095.
+///
+/// What a boot owes the gates is put back where it is missing (the files the
+/// shell's checks read, and `sub`), the programs the boot carries are replaced,
+/// and nothing else is touched: `/pkg` is as the last boot left it. The
+/// journal is exercised without being tested to destruction -- a file is
+/// written, read back and removed -- because the deliberate interruption the
+/// format path stages is for a disk nobody's data is on.
+fn keep_the_disk(store: DiskStore, frames: &mut [u8]) -> ! {
+    use bhaskix_fs::{Cache, Kind, Volume};
+    use core::sync::atomic::Ordering;
+
+    let Ok(cache) = Cache::new(frames, store) else {
+        DISK_JOURNAL.store(20, Ordering::Release);
+        sched::exit()
+    };
+    // Replays a commit an earlier boot was interrupted after, which is the
+    // journal doing on a real disk what the format path stages.
+    let Ok((mut volume, replayed)) = Volume::mount(cache) else {
+        DISK_JOURNAL.store(21, Ordering::Release);
+        sched::exit()
+    };
+    let root = volume.superblock().root;
+    let ensured = (|| {
+        ensure_file(
+            &mut volume,
+            root,
+            b"on-a-disk",
+            b"written through a service\n",
+        )?;
+        ensure_file(
+            &mut volume,
+            root,
+            b"greeting",
+            b"a file in a filesystem this kernel defined\n",
+        )?;
+        let sub = match volume.lookup(root, b"sub") {
+            Ok((index, inode)) if inode.kind == Kind::Directory => index,
+            // A *file* called `sub` is somebody's, and creating over it would
+            // destroy it.
+            Ok(_) => return None,
+            Err(_) => volume.create(root, b"sub", Kind::Directory).ok()?,
+        };
+        ensure_file(
+            &mut volume,
+            sub,
+            b"inner",
+            b"only reachable through the subdirectory\n",
+        )?;
+        stage_programs(&mut volume, sub);
+        Some(())
+    })();
+    if ensured.is_none() {
+        DISK_JOURNAL.store(22, Ordering::Release);
+        sched::exit()
+    }
+
+    // A write through the journal, read back off the disk and removed. Left
+    // over from a boot interrupted inside this check, the file is removed
+    // first rather than refused as a name already taken.
+    let before = volume.cache().store().writes;
+    let _ = volume.remove(root, BOOT_CHECK);
+    let checked = (|| {
+        let index = volume.create(root, BOOT_CHECK, Kind::File).ok()?;
+        volume.write(index, 0, BOOT_CHECK_BYTES).ok()?;
+        let (_, inode) = volume.lookup(root, BOOT_CHECK).ok()?;
+        let mut back = [0u8; 64];
+        let got = volume.reader().read(&inode, 0, &mut back);
+        (back.get(..got)? == BOOT_CHECK_BYTES).then_some(())?;
+        volume.remove(root, BOOT_CHECK).ok()?;
+        volume.lookup(root, BOOT_CHECK).is_err().then_some(())
+    })();
+    let writes = volume.cache().store().writes.saturating_sub(before);
+    if checked.is_none() {
+        DISK_JOURNAL.store(23, Ordering::Release);
+        sched::exit()
+    }
+    DISK_JOURNAL.store(
+        DISK_KEPT | (u64::from(replayed.min(0xff_ffff)) << 8) | u64::from(writes.min(0xff)),
+        Ordering::Release,
+    );
+    sched::exit()
+}
+
+/// Copies the programs a boot carries onto the disk, under `sub` -- the
+/// directory the Linux adapter is granted. Lifted out of the format path by
+/// RFC 0095 so that a kept disk gets the same programs, replaced, as a fresh
+/// one gets created.
+fn stage_programs<S: bhaskix_fs::Store>(volume: &mut bhaskix_fs::Volume<'_, S>, sub: u32) {
+    use bhaskix_fs::Kind;
+    use core::sync::atomic::Ordering;
+
+    // **And a program, in the one directory the Linux adapter holds**
+    // — RFC 0059. `sub` is what `bin/linuxd` is granted as a hosted
+    // process's whole filesystem, so this is where a program a hosted
+    // `execve` can reach has to be. It is copied out of the archive
+    // rather than built here: the archive is where every other program
+    // on this machine comes from, and a program the kernel synthesised
+    // would prove less than one that was compiled, linked and shipped.
+    //
+    // A machine whose image has no `bin/hosted` gets the tree without
+    // it, and the gate says `skipped` rather than failing — the same
+    // rule the corpus programs live under.
+    if let Ok(file) = vfs::open(HOSTED_PROGRAM) {
+        let bytes = file.bytes();
+        // **Replaced, not added to** -- RFC 0095. On a kept disk the copy
+        // there is an earlier boot's, built from an earlier image; on a fresh
+        // one there is nothing to remove and the lookup inside writes nothing.
+        let _ = volume.remove(sub, b"hosted");
+        if !bytes.is_empty()
+            && let Ok(hosted) = volume.create(sub, b"hosted", Kind::File)
+        {
+            // **One block per call**, which is what `Volume::write`
+            // documents and answers with: a write spanning blocks is
+            // several transactions, and the loop belongs to whoever
+            // wants them all rather than being hidden inside one that
+            // implies a single commit.
+            // **Priced, because the next question about this path is
+            // "how large a program could be staged here?"** RFC 0064
+            // and RFC 0065 removed the two limits that stopped a hosted
+            // `execve` of BusyBox; what is left is that every block of
+            // this write is one journal transaction, and BusyBox is 531
+            // of them. A number beats an estimate, and the roadmap has
+            // been quoting estimates.
+            let began = bhaskix_arch::tsc::read();
+            // **One commit for many blocks** — RFC 0066. This was
+            // `volume.write` in a loop, one journal transaction per 4
+            // KiB, which the line below prices. `write_run` stages the
+            // same three metadata blocks whatever the run's length and
+            // falls back to the single-block path for the tail.
+            let mut done = 0usize;
+            while done < bytes.len() {
+                match volume.write_run(hosted, done as u64, &bytes[done..]) {
+                    Ok(0) | Err(_) => break,
+                    Ok(moved) => done += moved,
+                }
+            }
+            HOSTED_STAGED.store(done as u64, Ordering::Release);
+            HOSTED_WANTED.store(bytes.len() as u64, Ordering::Release);
+            HOSTED_STAGE_CYCLES.store(
+                bhaskix_arch::tsc::read().saturating_sub(began),
+                Ordering::Release,
+            );
+        }
+    }
+
+    // **BusyBox, when this boot was asked for it — RFC 0068 step 2.**
+    //
+    // The same write, to the same directory, by the same loop. What
+    // stopped it until 2026-09-04 was the disk: 1 MiB against a
+    // 2,172,376-byte program. The disk is 4 MiB now and every other
+    // limit went earlier -- RFC 0064 took the loader's 64 KiB window
+    // away, RFC 0065 took the filesystem's ten-block file away, and
+    // RFC 0059 made `execve` resolve a real path.
+    //
+    // Off unless `bhaskix.busybox=1`, because it costs 2.1 to 3.4
+    // seconds on the lanes that have a filesystem and paying that
+    // everywhere is a scope decision rather than an engineering one.
+    if STAGE_BUSYBOX.load(Ordering::Relaxed)
+        && let Ok(file) = vfs::open(BUSYBOX_PROGRAM)
+    {
+        let bytes = file.bytes();
+        BUSYBOX_WANTED.store(bytes.len() as u64, Ordering::Release);
+        // Replaced, as `hosted` is above.
+        let _ = volume.remove(sub, b"busybox");
+        if !bytes.is_empty()
+            && let Ok(busybox) = volume.create(sub, b"busybox", Kind::File)
+        {
+            let began = bhaskix_arch::tsc::read();
+            let mut done = 0usize;
+            while done < bytes.len() {
+                match volume.write_run(busybox, done as u64, &bytes[done..]) {
+                    Ok(0) | Err(_) => break,
+                    Ok(moved) => done += moved,
+                }
+            }
+            BUSYBOX_STAGED.store(done as u64, Ordering::Release);
+            BUSYBOX_STAGE_CYCLES.store(
+                bhaskix_arch::tsc::read().saturating_sub(began),
+                Ordering::Release,
+            );
+        }
+    }
 }
 
 /// The filesystem service's endpoint, once it is answering.
@@ -27441,6 +27772,16 @@ fn start_fs_domain(hhdm: u64) -> bool {
     let raw = BLOCK_ENDPOINT.load(Ordering::Acquire);
     if raw == u64::MAX {
         println!("    fs domain      no block service on this machine, so no disk to mount");
+        return true;
+    }
+    // RFC 0095: a disk the journal left alone is one this boot may not write,
+    // and `bin/fsd` writes -- `pkg` and `sub/tmp` where they are missing.
+    let kind = DISK_KIND.load(Ordering::Acquire);
+    if kind == DomainDisk::Foreign as u8 || kind == DomainDisk::OursUnreadable as u8 {
+        println!(
+            "    fs domain      not started: the disk was left alone, so there is nothing this \
+             boot may mount"
+        );
         return true;
     }
     let endpoint = ipc::EndpointId::from_u32(raw as u32);

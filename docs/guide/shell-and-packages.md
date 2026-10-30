@@ -156,30 +156,41 @@ bhaskix$ pkg list
 Nothing ran and nothing was granted: the refusal comes before any domain
 exists.
 
-**Nothing installed survives a reboot.** Bhaskix formats the writable
-filesystem every time it starts. Installed on one boot:
+**What you install stays.** The writable filesystem is kept from one boot to
+the next, so a package installed once is there afterwards. (Until 2026-10-30
+every boot formatted it and nothing survived a reboot;
+[RFC 0095](../rfc/0095-a-disk-that-keeps-what-was-written.md) changed that.)
+Re-run that day with `make demo` twice, the second run on the disk the first
+one left. Installed on the first:
 
 ```
 bhaskix$ pkg install hello.bpk
   verified   hello 0.1.0 -- 1 files, 20480 bytes, digests good
-  installed  /pkg/hello -- 15408 payload bytes through the journal in 5 writes, 453509080 cycles
+  installed  /pkg/hello -- 15408 payload bytes through the journal in 5 writes, 3416387972 cycles
 bhaskix$ pkg list
   hello
   1 installed
 ```
 
-and on the next boot, from the same `domain.img`:
+and on the second, whose boot report says the disk was kept rather than
+formatted:
+
+```
+    disk journal   kept: this disk already held this system's filesystem, so it was mounted and not formatted -- mounting replayed 0 blocks, a file was written, read back and removed through the journal in 21 device writes, and the programs this boot stages were replaced; /pkg is as the last boot left it
+```
 
 ```
 bhaskix$ pkg list
-  0 installed
+  hello
+  1 installed
+bhaskix$ pkg run hello
+  running    hello (15408 bytes, grants from its manifest)
+namaste from an installed package
+  it ended cleanly
 ```
 
-That second boot also reports `block service FAILED`, because the format wrote
-over the marker its self-test reads — which is why
-[*A fuller machine*](get-started.md#a-fuller-machine-a-disk-and-a-network) says
-to remake the disk images before every boot. A system that keeps what you
-install is later work, not this preview.
+`make demo-fresh` starts from a new disk. `/tmp` is the exception: it is
+emptied at every boot, as a Linux system's is.
 
 ## The rest of the commands
 

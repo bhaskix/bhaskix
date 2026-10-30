@@ -315,9 +315,10 @@ is why the machine above has neither. QEMU provides one with
 `-device intel-iommu`.
 
 **Its disks are made the way the project's own tests make theirs.** Each begins
-with a marker that the boot's self-tests read back, and a disk without its
-marker is reported as a `FAILED` check: this preview's self-tests were written
-against these disks, and say so rather than guess. Two small files:
+with a marker, and **the marker is what allows a boot to write to it**: Bhaskix
+does not format, or write a test pattern onto, a disk it was not given for that.
+A disk without one is read and left alone, and the parts of the boot's
+self-test that need a writable disk cannot run. Two small files:
 
 ```sh
 printf 'BHASKIX-DOMAIN-DISK-SECTOR-0' > domain.img && truncate -s 4M domain.img
@@ -325,11 +326,15 @@ printf 'BHASKIX-SATA-DISK-SECTOR-0' > sata.img && truncate -s 256K sata.img
 ```
 
 `domain.img` holds the writable filesystem — packages are installed onto it,
-and Linux programs write their files there. **Remake both files before every
-boot.** Bhaskix formats `domain.img` each time it starts, so nothing written to
-it survives a reboot, and the format writes over the marker — so the next boot,
-on the same file, reports `block service FAILED`. `sata.img` sits on the SATA
-controller, ahead of the loader's partition.
+and Linux programs write their files there. **Make it once.** The first boot
+finds the marker and formats the disk; every boot after that finds Bhaskix's
+filesystem on it and keeps it, so what you install stays. To start again,
+remake the file. (Until 2026-10-30 every boot formatted it, and this page said
+to remake both files before every boot;
+[RFC 0095](../rfc/0095-a-disk-that-keeps-what-was-written.md) changed that.)
+`sata.img` sits on the SATA controller, ahead of the loader's partition;
+because it carries its marker, each boot writes a test pattern into its last
+sector and reads it back.
 
 This machine boots through Bhaskix's own loader, from the `esp/` directory of
 [*Through Bhaskix's own loader*](#through-bhaskixs-own-loader), and reads the

@@ -2303,6 +2303,18 @@ pub mod block {
     /// checks it against what the driver itself read rather than against this.
     pub const SATA_TEST_DISK_MARKER: &[u8] = b"BHASKIX-SATA-DISK-SECTOR-0";
 
+    /// What the project's domain disk carries at the start of sector zero --
+    /// the Makefile writes it into `build/domain-disk.img`, and the guides tell
+    /// a reader to write it into theirs.
+    ///
+    /// **The one thing that lets a boot format the domain disk** (RFC 0095,
+    /// 2026-10-30). Until that day every boot formatted whatever the second
+    /// virtio disk was, so a machine started with a real data disk in that
+    /// place lost it. A disk carrying this is formatted; one carrying this
+    /// system's filesystem is mounted and kept; anything else is read and never
+    /// written.
+    pub const DOMAIN_DISK_MARKER: &[u8] = b"BHASKIX-DOMAIN-DISK-SECTOR-0";
+
     /// `bin/ahcid`'s write self-test, as its report word 54 states it: the
     /// disk's sector zero did not carry [`SATA_TEST_DISK_MARKER`], so it is not
     /// the project's test disk and nothing was written to it.

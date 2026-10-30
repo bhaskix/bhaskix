@@ -11,7 +11,7 @@
 | | |
 |---|---|
 | RFCs accepted | **63** |
-| RFCs open | 29 |
+| RFCs open | 31 |
 | RFCs closed without shipping | 2 |
 | Milestone rows done | **92 of 95** |
 | Phase 2 bullets done | **13 of 13** |
@@ -44,6 +44,7 @@ gantt
     RFC 0068 a disk that can hold BusyBox :active, r0068, 2026-09-04, 2026-10-30
     RFC 0069 a format that need not hold the filesystem :active, r0069, 2026-09-04, 2026-10-30
     RFC 0077 a file that can be emptied :done, r0077, 2026-09-13, 1d
+    RFC 0095 A disk that keeps what was written :active, r0095, 2026-10-30, 2026-10-30
     section Capabilities & IPC
     RFC 0008 The shape of the system-call and IPC interface :done, r0008, 2026-08-04, 1d
     RFC 0009 Shared memory and the objects that name it :done, r0009, 2026-08-04, 1d
@@ -113,6 +114,7 @@ gantt
     RFC 0085 A futex sleeper comes back for its answer :done, r0085, 2026-09-29, 2026-10-04
     RFC 0086 The motivating workload — a Go HTTP server under... :done, r0086, 2026-09-30, 2026-10-04
     RFC 0094 A program's vector registers are its own :active, r0094, 2026-10-30, 2026-10-30
+    RFC 0096 A fork glibc can make :active, r0096, 2026-10-30, 2026-10-30
     section Process & tooling
     RFC 0001 License — Apache-2.0 :done, r0001, 2026-08-03, 1d
     RFC 0007 Live patching the nucleus :active, r0007, 2026-08-04, 2026-10-30
@@ -201,6 +203,8 @@ gantt
 | 0088 | A clock a process reads itself | 2026-10-02 |
 | 0091 | A boot its owner signed | 2026-10-12 |
 | 0094 | A program's vector registers are its own | 2026-10-30 |
+| 0095 | A disk that keeps what was written | 2026-10-30 |
+| 0096 | A fork glibc can make | 2026-10-30 |
 
 ## Annexes
 
