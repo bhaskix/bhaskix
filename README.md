@@ -207,14 +207,22 @@ bhaskix$ dmesg
 IOMMU containing them, a USB keyboard. `make run` boots a bare one instead: a
 single read-only disk and no network, which starts faster and can do much less.
 
-**Guides**, step by step, where every command shown was run and every output is
-a transcript of that run:
-- [Get started](docs/guide/get-started.md) — download and check the release,
-  boot it in QEMU three ways, and a fuller machine with a disk and a network;
-- [The shell and packages](docs/guide/shell-and-packages.md) — every command,
-  what holding a capability means, installing a package;
-- [Linux programs](docs/guide/linux-programs.md) — an unmodified Go web server
-  answering your browser, and what is refused and why.
+**The docs** — a knowledgebase of thirteen pages, where every command shown was
+run and every output is a transcript of that run — start at
+[docs/guide/](docs/guide/README.md):
+- **Start here:** [What Bhaskix is](docs/guide/overview.md) and
+  [Get started](docs/guide/get-started.md);
+- **Install and run:** [Build from source](docs/guide/build-from-source.md) and
+  [Run it on a real machine](docs/guide/real-hardware.md) — there is no
+  installer, and that page says what a boot writes;
+- **Use:** [The shell and packages](docs/guide/shell-and-packages.md) and
+  [Linux programs](docs/guide/linux-programs.md);
+- **Secure:** [The security model](docs/guide/security-model.md) and
+  [Sign your own boot](docs/guide/secure-boot.md);
+- **Understand, Develop, Help:** [How Bhaskix works](docs/guide/how-it-works.md),
+  [Write a program](docs/guide/write-a-program.md),
+  [Troubleshooting](docs/guide/troubleshooting.md) and
+  [Questions and answers](docs/guide/faq.md).
 
 **The first release** is a developer preview, `v0.1.0-preview`, planned for
 **29 November 2026**: an ISO, Bhaskix's own UEFI loader, and a
