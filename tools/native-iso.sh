@@ -33,8 +33,10 @@ CMDLINE=${2:-}
 LOADER="$ROOT/boot/bhaskixboot/target/x86_64-unknown-uefi/release/bhaskixboot.efi"
 KERNEL="$ROOT/target/x86_64-unknown-none/release/bhaskix"
 INITRD="$ROOT/build/initrd.tar"
+BOOTSIGN="$ROOT/target/x86_64-unknown-linux-gnu/release/bootsign"
+TEST_KEY="$ROOT/tests/keys/bootsig-TEST-KEY.secret"
 
-for f in "$LOADER" "$KERNEL" "$INITRD"; do
+for f in "$LOADER" "$KERNEL" "$INITRD" "$BOOTSIGN"; do
     [ -f "$f" ] || { echo "native-iso: $f is missing; build with make first" >&2; exit 1; }
 done
 for tool in mkfs.vfat mcopy xorriso; do
@@ -51,6 +53,13 @@ cp "$INITRD" "$ESP/bhaskix/initrd.tar"
 if [ -n "$CMDLINE" ]; then
     printf 'cmdline=%s\n' "$CMDLINE" > "$ESP/bhaskix/boot.conf"
 fi
+# **Signed, as every native lane's ESP is since RFC 0091 step 4** -- with the
+# published test key the lanes' loader trusts, so a machine booted from this
+# reports the verdict a signed boot gets rather than "there is no boot.sig".
+# Step 4 taught the QEMU lanes and missed this script; found 2026-10-29,
+# staging step 7's boot on the SR550.
+"$BOOTSIGN" sign --key "$TEST_KEY" "$ESP" >/dev/null ||
+    { echo "native-iso: bootsign could not sign the ESP" >&2; exit 1; }
 
 bytes=$(du -sb "$ESP" | cut -f1)
 mib=$(( bytes * 5 / 4 / 1048576 + 2 ))
@@ -61,4 +70,4 @@ mkfs.vfat -F 16 -n BHASKIX "$IMG" >/dev/null
 mcopy -s -i "$IMG" "$ESP/EFI" "$ESP/bhaskix" ::/
 xorriso -as mkisofs -quiet -R -J -e esp.img -no-emul-boot -o "$OUT" "$WORK/iso"
 
-echo "native-iso: $OUT ($(stat -c %s "$OUT") bytes; a ${mib} MiB ESP holding kernel $(stat -L -c %s "$KERNEL"), initrd $(stat -L -c %s "$INITRD")${CMDLINE:+, cmdline \"$CMDLINE\"})"
+echo "native-iso: $OUT ($(stat -c %s "$OUT") bytes; a ${mib} MiB ESP holding kernel $(stat -L -c %s "$KERNEL"), initrd $(stat -L -c %s "$INITRD"), boot.sig by the test key${CMDLINE:+, cmdline \"$CMDLINE\"})"
