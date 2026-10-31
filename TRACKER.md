@@ -1109,6 +1109,28 @@ the distinction is in the table rather than in somebody's head.
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-10-31 (the release workflow, rehearsed on GitHub again)
+
+**On the lead's word, after CI run 894 was green**, the tag `v0.0.0-rehearsal2` on `ae4281e` ran
+`.github/workflows/release.yml` (run 41220551644, about two minutes). It was rehearsed again
+because the path had changed since 2026-10-20: a separate release loader that refuses the test
+key, and seven files where there were four. `make release-dist` had been run locally first, and
+passed.
+
+The draft, inspected from an empty directory, by hand:
+- **a draft pre-release with all seven files**, `sha256sum -c` OK;
+- the ISO carries 0 BusyBox bytes and the 5,779,616-byte Go server;
+- the downloaded loader holds no test key;
+- the body is 37,039 characters with no relative link left;
+- **the downloaded ISO booted to `bhaskix$` in 24 s, nothing `FAILED`**.
+
+The draft and tag were deleted at once and confirmed gone. Nothing was published.
+
+**One fact found, not a defect:** CI's `bhaskix.iso` and a local build of the same commit differ
+(`8d034805…` against `aec85584…`). Nothing claims a release is reproducible across machines --
+only the initrd is built byte-identical, twice on one machine. Recorded in the checklist as where
+that would start.
+
 ### 2026-10-31 (RFC 0097 and 0098 accepted; RFC 0099 built; secure update and audit designed)
 
 - **RFC 0097 and RFC 0098 accepted by the lead** on CI run 893's green: 67 RFCs accepted of 101

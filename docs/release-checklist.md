@@ -94,6 +94,26 @@ that does it, with the date.
   server, Go's licence beside them, and a 32,927-character body with no relative link left. The
   downloaded ISO booted to `bhaskix$` in 24 s with nothing `FAILED`. The draft and the tag were
   deleted the same hour; nothing was published.
+  **Rehearsed on GitHub again 2026-10-31**, on the lead's word, because the release path had
+  changed since: the release loader built apart and refusing the test key, and three more files
+  (`LICENSE`, `NOTICE`, `LICENSE-limine`). Local first: `make release-dist
+  TAG=v0.0.0-rehearsal2` passed its checks, and its ISO booted with the guide's command in 24 s.
+  Then the tag on `ae4281e`, after CI run 894 was green; `release.yml` run 41220551644 succeeded
+  in about two minutes. Its draft, inspected from an empty directory:
+  - **a draft pre-release with all seven files**;
+  - `sha256sum -c` OK for both binaries;
+  - 0 BusyBox bytes and the 5,779,616-byte server in the ISO;
+  - no test key in the downloaded loader;
+  - a 37,039-character body with no relative link left;
+  - the downloaded ISO booted to `bhaskix$` in 24 s with nothing `FAILED`.
+
+  Draft and tag deleted at once ("release not found", no tag on the remote); nothing was
+  published.
+
+  **Found doing it, and not claimed anywhere:** CI's binaries and a local build of the same
+  commit differ (`bhaskix.iso` `8d034805…` against `aec85584…`). Only the initrd is built
+  byte-identical, twice on one machine; a reproducible release across machines is not promised,
+  and if it is ever wanted, this is where it starts.
 
 ## Two weeks before — 15 November: the freeze
 
