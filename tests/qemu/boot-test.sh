@@ -2883,7 +2883,17 @@ fi
 # step 3. The handler's edit to xmm15 in the frame must stick -- the frame is
 # what rt_sigreturn restores -- and it starts from the initial state, as
 # Linux's does.
-if grep -qE "linux sig fp +a handler that overwrote all sixteen xmm registers returned, and the code it interrupted found its own: 0 of 32 quadwords wrong, xmm15 as the handler edited it in the frame; the handler began with xmm0 zero" "$LOG"; then
+# RFC 0094 step 4: where this boot's plan enabled AVX, the probes must have
+# checked the upper halves of the ymm registers too -- the xmm form alone would
+# pass a switch that dropped them. Read off the boot's own xstate line.
+avx_on=0
+grep -qE "xstate +offered .*; enabled x87 sse avx \(0x7\), 832 bytes" "$LOG" && avx_on=1
+if (( avx_on )); then
+    sig_fp_line="linux sig fp +a handler that overwrote all sixteen ymm registers returned, and the code it interrupted found its own: 0 of 64 quadwords wrong, xmm15 as the handler edited it in the frame; the handler began with xmm0 zero"
+else
+    sig_fp_line="linux sig fp +a handler that overwrote all sixteen xmm registers returned, and the code it interrupted found its own: 0 of 32 quadwords wrong, xmm15 as the handler edited it in the frame; the handler began with xmm0 zero"
+fi
+if grep -qE "$sig_fp_line" "$LOG"; then
     pass "a signal handler's use of the vector registers did not reach the code it interrupted"
 elif grep -qE "linux sig fp +skipped, needs a second cpu" "$LOG"; then
     pass "the vector-register signal probe needs a second cpu, and said so"
@@ -2897,7 +2907,7 @@ fi
 # every lane -- `qemu64` has no XSAVE and keeps FXSAVE; TCG `max` and KVM have it
 # -- and the plan applied and read back on every CPU, so a thread migrated
 # between them cannot meet a different XCR0.
-if grep -qE "xstate +(offered [a-z0-9_ ]+ \(0x[0-9a-f]+, [0-9]+ bytes for all\); enabled x87 sse \(0x3\), 576 bytes, saved by (xsaveopt|xsave)|no xsave on this cpu: x87 and sse, 512 bytes, saved by fxsave); CR4.OSXSAVE at entry [01]" "$LOG"; then
+if grep -qE "xstate +(offered [a-z0-9_ ]+ \(0x[0-9a-f]+, [0-9]+ bytes for all\); enabled (x87 sse \(0x3\), 576|x87 sse avx \(0x7\), 832) bytes, saved by (xsaveopt|xsave)|no xsave on this cpu: x87 and sse, 512 bytes, saved by fxsave); CR4.OSXSAVE at entry [01]" "$LOG"; then
     pass "the floating-point plan: $(grep -oE 'saved by [a-z]+; CR4.OSXSAVE at entry [01]' "$LOG" | head -1)"
 else
     fail "no xstate line, or a plan this kernel does not make"
@@ -2919,7 +2929,12 @@ fi
 # pattern in all sixteen xmm registers through a thousand switches. The switch
 # saving and restoring the file is what CR4.OSFXSR promises; this is the first
 # check of it on a running machine.
-if grep -qE "vector state +two threads in two domains on one cpu kept xmm0-xmm15 through 1000 switches each: 0 of 64000 quadwords wrong, saved by (fxsave|xsaveopt|xsave)" "$LOG"; then
+if (( avx_on )); then
+    vector_line="vector state +two threads in two domains on one cpu kept xmm0-xmm15 and the upper halves of ymm0-ymm15 through 1000 switches each: 0 of 128000 quadwords wrong, saved by (xsaveopt|xsave)"
+else
+    vector_line="vector state +two threads in two domains on one cpu kept xmm0-xmm15 through 1000 switches each: 0 of 64000 quadwords wrong, saved by (fxsave|xsaveopt|xsave)"
+fi
+if grep -qE "$vector_line" "$LOG"; then
     pass "a thread's vector registers are its own across switches: $(grep -oE 'saved by [a-z]+' "$LOG" | head -1)"
 else
     fail "a thread's vector registers did not survive switches to another domain's"

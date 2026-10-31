@@ -19,8 +19,9 @@ question — but that adapter is a program running on Bhaskix, not part of it.
 
 **Some, today.** Static x86-64 Linux binaries run unmodified when they keep to
 what the adapter answers: a Go `net/http` server serving sixteen clients, and
-BusyBox's `sh`, run on every test run. Dynamically linked programs, programs
-built for AVX-capable CPUs (x86-64-v3) and databases do not run yet. The
+BusyBox's `sh`, run on every test run. Programs built for AVX-capable CPUs
+(x86-64-v3) run where the CPU has AVX, since 2026-10-31. Dynamically linked
+programs and databases do not run yet. The
 compatibility milestones, L1 to L4, are all unmet; [Linux programs](linux-programs.md)
 shows what runs and what is refused.
 

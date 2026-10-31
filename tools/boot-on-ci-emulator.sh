@@ -173,6 +173,12 @@ for cell in "${cells[@]}"; do
             envs=(-e BHASKIX_BOOT_LOG=/tmp/lane.log
                   -e BOOT_TEST_TIMEOUT="${BOOT_TEST_TIMEOUT:-300}"
                   -e QEMU_CPU="$cpu")
+            # An image other than `build/bhaskix.iso`, built on the host --
+            # RFC 0094 step 5's v3 image is why. It must be under the repo,
+            # which is what the container sees.
+            if [[ -n ${BHASKIX_ISO:-} ]]; then
+                envs+=(-e BHASKIX_ISO="/repo/${BHASKIX_ISO#"$REPO_ROOT"/}")
+            fi
         fi
         # **`seccomp=unconfined`, and it is not laziness.** Under Docker's
         # default profile QEMU's slirp cannot `fork_exec`, and says so once, in

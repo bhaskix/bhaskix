@@ -1,0 +1,27 @@
+# RFC 0094 step 3's check, held against the instruction it stands in front of.
+#
+# Its own workspace, like `fuzz/`, because it is a host binary that executes
+# `XRSTOR` and `FXRSTOR` on the build machine -- and **not in `fuzz/`**, whose
+# `unsafe` budget is zero by rule (the lead's decision of 2026-10-31): a fuzz
+# target that can produce its own crashes makes a finding mean nothing until
+# its cause is known. Here a crash has exactly one cause, and the budget below
+# says where it lives.
+[package]
+name = "bhaskix-fpstate-hw"
+version = "0.0.0"
+edition = "2024"
+publish = false
+authors = ["Tarun Kumar Kushwaha"]
+license = "Apache-2.0"
+
+[package.metadata.bhaskix]
+# The one block that loads an image with the real instruction, between a save
+# and a restore of this process's own state, and the `XGETBV` that asks which
+# layouts the host enables. Nothing else here is `unsafe`.
+unsafe_budget = 40
+asm_budget = 4
+
+[dependencies]
+bhaskix-personality = { path = "../../personality" }
+
+[workspace]

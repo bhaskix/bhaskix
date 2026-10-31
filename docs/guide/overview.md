@@ -52,8 +52,10 @@ afternoon here deserves to know:
 - **It has run on one physical machine.** On that one, its disks sit behind a
   RAID controller Bhaskix does not drive, and its network answers a ping but
   gets no address and opens no TCP connection.
-- **Linux programs are limited** to static x86-64 binaries without AVX: no
-  dynamic linking, and no database has ever run here. The Linux-compatibility
+- **Linux programs are limited** to static x86-64 binaries: no dynamic
+  linking, and no database has ever run here. A program built for x86-64-v3,
+  which uses AVX, runs on a CPU that has AVX (since 2026-10-31; before that
+  Bhaskix enabled no AVX at all). The Linux-compatibility
   milestones, L1 to L4, are all unmet.
 - **The project's own signing keys do not exist yet.** The developer preview's
   loader trusts no key; you can sign your own boot today

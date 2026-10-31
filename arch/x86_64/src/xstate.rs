@@ -17,13 +17,14 @@ use core::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
 
 use crate::msr::{cpuid, cpuid_count};
 
-/// The components this kernel enables where they are offered: x87 and SSE.
+/// The components this kernel enables where they are offered: x87, SSE and
+/// AVX -- RFC 0094 step 4 (2026-10-31), so a program built for x86-64-v3 runs.
 ///
-/// AVX is step 4's (bit 2), and AVX-512 waits on its trigger by the lead's
-/// decision of 2026-10-30. Enabling `XSAVE` for x87 and SSE alone buys nothing
-/// a program can see; it is done so that the `XSAVE` path runs on every lane
-/// that offers it before anything depends on it.
-pub const WANTED: u64 = 0x3;
+/// AVX-512 (bits 5-7) waits on its trigger by the lead's decision of
+/// 2026-10-30: the first program or distribution that assumes x86-64-v4. A
+/// CPU that offers `XSAVE` without AVX -- QEMU 4.2.1's TCG `max` -- gets x87
+/// and SSE through `XSAVE`, as step 2 gave every CPU.
+pub const WANTED: u64 = 0x7;
 
 /// Bytes a thread's area holds: the standard format with x87, SSE and AVX --
 /// 512 of legacy region, 64 of header, 256 of AVX upper halves at 576, as
@@ -374,10 +375,29 @@ mod tests {
     }
 
     #[test]
-    fn a_cpu_with_xsave_gets_x87_and_sse_through_xsaveopt() {
+    fn a_cpu_with_avx_gets_x87_sse_and_avx_through_xsaveopt() {
         let plan = choose(&ice_lake());
         assert_eq!(
             plan,
+            Plan {
+                switch: Switch::Xsaveopt,
+                xcr0: 0x7,
+                bytes: 832
+            }
+        );
+    }
+
+    #[test]
+    fn a_cpu_with_xsave_and_no_avx_keeps_x87_and_sse() {
+        // QEMU 4.2.1's TCG `max`, as its `xstate` line read on 2026-10-30:
+        // x87, SSE, MPX and PKRU, and no AVX.
+        let offered = Offered {
+            components: 0x21b,
+            ends: [0; 8],
+            ..ice_lake()
+        };
+        assert_eq!(
+            choose(&offered),
             Plan {
                 switch: Switch::Xsaveopt,
                 xcr0: 0x3,

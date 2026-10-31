@@ -165,6 +165,10 @@ LAYERS = {
     # links it, so nothing may ever depend on it -- which the layer rule already
     # enforces by giving it the highest number.
     "bhaskix-fuzz": 6,
+    # RFC 0094's floating-point check held against the real instruction -- a
+    # host binary in its own workspace, like the fuzz target, and kept out of
+    # it because it needs `unsafe` and the fuzz crate's budget is zero by rule.
+    "bhaskix-fpstate-hw": 6,
 
     # User programs. Layer -1 because they are not in the kernel's graph at
     # all: they run in ring 3 and reach it only through system calls, so a

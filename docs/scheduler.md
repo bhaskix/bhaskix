@@ -233,7 +233,8 @@ Deliberate design points:
   over `FXSAVE` on a Xeon Silver 4314.
 - **FPU/SSE state is switched eagerly, with `XSAVEOPT`/`XRSTOR` where the CPU offers `XSAVE`**
   (RFC 0094 steps 0-3, built 2026-10-30). The bootstrap CPU chooses the plan from `CPUID` --
-  `XCR0` of x87 and SSE today, AVX being step 4 -- and every CPU applies it and reads it back
+  `XCR0` of x87, SSE and AVX where offered since step 4 (2026-10-31), x87 and SSE where AVX is
+  not, AVX-512 by decision not yet -- and every CPU applies it and reads it back
   before it schedules anything; a CPU without `XSAVE` keeps `FXSAVE`, and `CR4.OSXSAVE` is cleared
   there rather than left as the firmware found it. Each thread carries a 64-byte-aligned 832-byte
   area inline. The boot prints the plan (`xstate`) and checks it (`vector state`).

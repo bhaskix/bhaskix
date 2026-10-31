@@ -138,9 +138,11 @@ binary would oblige the project to publish its source. A build from source
 fetches one: Ubuntu's `busybox-static` 1:1.37.0-7ubuntu1, the plain amd64
 build, checked against the sha256 in `tools/fetch-busybox.sh` before it is
 unpacked. `make iso BUSYBOX_SRC=/path/to/busybox` uses another statically
-linked one instead — but not an x86-64-v3 build, such as Ubuntu 26.04's
-`amd64v3` variant. Bhaskix does not enable AVX, and that build stops at its
-first AVX instruction.
+linked one instead. An x86-64-v3 build, such as Ubuntu 26.04's `amd64v3`
+variant, runs on a CPU that has AVX: Bhaskix enables it since 2026-10-31, and
+`make test-busybox-v3` boots exactly that build. On a CPU without AVX it stops
+at its first AVX instruction, as it would on Linux; until 2026-10-31 it
+stopped there on every CPU.
 
 To try it, build from source, then boot the ISO
 you built through Bhaskix's own loader, as in

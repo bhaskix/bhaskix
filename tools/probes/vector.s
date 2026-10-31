@@ -13,11 +13,19 @@
         #
         # SSE2 only, so it runs on every lane, `qemu64` included.
         #
+        # **And the upper halves of `ymm0`-`ymm15`, where AVX is on** -- RFC
+        # 0094 step 4. Whether it is, the probe asks the CPU itself, as Go and
+        # glibc do: `CPUID.1:ECX.OSXSAVE`, then `XGETBV` for x87|SSE|AVX. Where
+        # it is, each register's pattern is copied into its upper half and the
+        # upper halves are checked too. AVX1 instructions only (`vinsertf128`,
+        # `vextractf128`): `XCR0` promises AVX, not AVX2.
+        #
         # The page: word 0 the rounds completed, word 1 the quadwords that came
-        # back wrong, word 2 the last wrong value seen, word 3 one once done.
-        # Bytes 64..320 are where each round stores the sixteen registers to
-        # compare them -- in memory, because comparing in a register would need
-        # a seventeenth.
+        # back wrong, word 2 the last wrong value seen, word 3 one once done,
+        # word 4 one if the upper halves were checked. Bytes 64..320 are where
+        # each round stores the sixteen registers to compare them -- in memory,
+        # because comparing in a register would need a seventeenth -- and
+        # 320..576 where it stores their upper halves.
 _start:
         mov     %rdi, %r15              # the report page
         mov     %rsi, %r14              # the seed
@@ -72,6 +80,37 @@ _start:
         movq    %rax, %xmm15
         punpcklqdq %xmm15, %xmm15
 
+        # Is AVX on? rbp says, for the rest of the probe: the system call
+        # preserves it, and nothing else here uses it.
+        xor     %ebp, %ebp
+        mov     $1, %eax
+        cpuid                           # clobbers rbx, rcx, rdx
+        bt      $27, %ecx               # OSXSAVE
+        jnc     6f
+        xor     %ecx, %ecx
+        xgetbv                          # XCR0 into edx:eax
+        and     $6, %eax
+        cmp     $6, %eax                # SSE and AVX both enabled
+        jne     6f
+        mov     $1, %ebp
+        vinsertf128 $1, %xmm0, %ymm0, %ymm0
+        vinsertf128 $1, %xmm1, %ymm1, %ymm1
+        vinsertf128 $1, %xmm2, %ymm2, %ymm2
+        vinsertf128 $1, %xmm3, %ymm3, %ymm3
+        vinsertf128 $1, %xmm4, %ymm4, %ymm4
+        vinsertf128 $1, %xmm5, %ymm5, %ymm5
+        vinsertf128 $1, %xmm6, %ymm6, %ymm6
+        vinsertf128 $1, %xmm7, %ymm7, %ymm7
+        vinsertf128 $1, %xmm8, %ymm8, %ymm8
+        vinsertf128 $1, %xmm9, %ymm9, %ymm9
+        vinsertf128 $1, %xmm10, %ymm10, %ymm10
+        vinsertf128 $1, %xmm11, %ymm11, %ymm11
+        vinsertf128 $1, %xmm12, %ymm12, %ymm12
+        vinsertf128 $1, %xmm13, %ymm13, %ymm13
+        vinsertf128 $1, %xmm14, %ymm14, %ymm14
+        vinsertf128 $1, %xmm15, %ymm15, %ymm15
+        movq    $1, 32(%r15)            # word 4: the upper halves are checked
+6:
         mov     $1000, %r13             # rounds to go
         xor     %r12d, %r12d            # wrong quadwords seen
 round:
@@ -116,6 +155,46 @@ check:
         dec     %ecx
         jnz     check
 
+        # The upper halves, where they are being kept.
+        test    %rbp, %rbp
+        jz      7f
+        vextractf128 $1, %ymm0, 320(%r15)
+        vextractf128 $1, %ymm1, 336(%r15)
+        vextractf128 $1, %ymm2, 352(%r15)
+        vextractf128 $1, %ymm3, 368(%r15)
+        vextractf128 $1, %ymm4, 384(%r15)
+        vextractf128 $1, %ymm5, 400(%r15)
+        vextractf128 $1, %ymm6, 416(%r15)
+        vextractf128 $1, %ymm7, 432(%r15)
+        vextractf128 $1, %ymm8, 448(%r15)
+        vextractf128 $1, %ymm9, 464(%r15)
+        vextractf128 $1, %ymm10, 480(%r15)
+        vextractf128 $1, %ymm11, 496(%r15)
+        vextractf128 $1, %ymm12, 512(%r15)
+        vextractf128 $1, %ymm13, 528(%r15)
+        vextractf128 $1, %ymm14, 544(%r15)
+        vextractf128 $1, %ymm15, 560(%r15)
+        lea     320(%r15), %rsi
+        mov     %r14, %rax
+        mov     $16, %ecx
+upper:
+        mov     (%rsi), %rdx
+        cmp     %rax, %rdx
+        je      3f
+        inc     %r12
+        mov     %rdx, 16(%r15)
+3:
+        mov     8(%rsi), %rdx
+        cmp     %rax, %rdx
+        je      4f
+        inc     %r12
+        mov     %rdx, 16(%r15)
+4:
+        add     $16, %rsi
+        inc     %rax
+        dec     %ecx
+        jnz     upper
+7:
         incq    (%r15)                  # one more round, whatever it found
         mov     %r12, 8(%r15)
         dec     %r13

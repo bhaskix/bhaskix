@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | ⬜ **Draft 2026-10-30 — ~~nothing built~~ steps 0-3 built and gated the same day; AVX itself (step 4) and steps 5-8 open. Both questions decided by the lead the same day, each as recommended**: AVX only, AVX-512 waiting on its trigger; the signal half in this RFC, and first (§*Unresolved questions*). Drafted at the lead's request, **ahead of its recorded trigger**: TRACKER's row asks for this RFC when an L1 program needs AVX or a distribution's packages assume x86-64-v3, and neither has happened — Ubuntu 26.04 still ships plain amd64 builds, and the pinned corpus uses one. |
+| **Status** | ⬜ **Draft 2026-10-30 — ~~nothing built~~ steps 0-3 built and gated the same day, steps 4-5 on 2026-10-31 (AVX on; the x86-64-v3 BusyBox runs); steps 6-8 open. Both questions decided by the lead the same day, each as recommended**: AVX only, AVX-512 waiting on its trigger; the signal half in this RFC, and first (§*Unresolved questions*). Drafted at the lead's request, **ahead of its recorded trigger**: TRACKER's row asks for this RFC when an L1 program needs AVX or a distribution's packages assume x86-64-v3, and neither has happened — Ubuntu 26.04 still ships plain amd64 builds, and the pinned corpus uses one. |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | arch / sched / userspace (`bin/linuxd`, `personality`) |
 | **Milestone** | L1 ([roadmap.md](../roadmap.md)) — an unmodified x86-64-v3 Linux program runs |
@@ -453,11 +453,35 @@ the design rests on.
    processor's `#GP` at once. That harness is **not in the tree**: it needs `unsafe`, and the fuzz
    crate's budget is zero by rule. The fuzz target in the tree (`fpstate`) is the pure half --
    every accepted image checked against the rules restated independently -- 26,871,526 runs in
-   61 s, clean, and with the header rule removed it caught `accepted a dirty header`.
+   61 s, clean, and with the header rule removed it caught `accepted a dirty header`. **The harness
+   joined the tree on 2026-10-31, the lead's choice, as its own crate** -- `tools/fpstate-hw`,
+   `make check-fpstate-hw` in `make test` and CI -- so the fuzz crate keeps its zero: two million
+   near-boundary images per run, every accepted one loaded by `FXRSTOR`, `XRSTOR` x87|SSE and,
+   where the host enables it, x87|SSE|AVX. Its first version never offered a reserved `MXCSR` bit
+   -- the bit and the decision to flip were drawn from correlated bits of one number -- which its
+   own counts showed (every image accepted for `FXRSTOR`); fixed before it was armed. Armed: the
+   check without its `MXCSR` rule kills the run with `SIGSEGV`.
 4. **AVX on.** `XCR0` `0x7` where offered. The vector probe checks the upper halves on CI `max`
-   lanes and KVM.
+   lanes and KVM. **Done 2026-10-31.** `WANTED` is `0x7`; a CPU offering no AVX keeps `0x3`
+   (host test, QEMU 4.2.1's `0x21b`). Both probes ask the CPU whether AVX is on (`CPUID`
+   `OSXSAVE`, then `XGETBV`) and, where it is, check the upper halves with AVX1 instructions;
+   the kernel holds their answer to the plan's, and the gates demand the `ymm` form wherever the
+   boot's `xstate` line enabled AVX. KVM on the Xeon Silver 4314: `enabled x87 sse avx (0x7), 832
+   bytes`, `0 of 128000 quadwords wrong`, the signal probe `0 of 64`. **Armed** with the switch's
+   mask forced to `0x3` under `XCR0` `0x7`: the vector probe read `32000 quadword(s) wrong (last
+   0x222222220000000f)` -- the other domain's pattern in this one's upper halves, the leak the
+   probe exists to see -- and the signal probe `32 of 64`.
 5. **The v3 BusyBox lane.** Pinned and staged on `max` lanes: `BusyBox's sh ran`, the line run
-   874 lost. The guides' three limits are rewritten.
+   874 lost. The guides' three limits are rewritten. **Done 2026-10-31.**
+   `BUSYBOX_VARIANT=amd64v3 tools/fetch-busybox.sh` pins Ubuntu's
+   `busybox-static_1.37.0-7ubuntu1_amd64v3.deb` by a hash read from the 26.04 index, whose own
+   hash was checked against the archive's signed `InRelease`; the mode requires the variant note,
+   and a pin moved to the plain package is refused by name. `tests/qemu/busybox-v3-test.sh`
+   (`make test-busybox-v3`, CI's `max` cells) judges only where the boot's `xstate` line enabled
+   AVX, and skips out loud elsewhere -- on this host's QEMU 4.2.1, which runs the v3 binary with
+   no AVX at all. On CI's QEMU 10.2.1: `bios max` 181 gates, BusyBox's `sh` ran; `bios qemu64`
+   fails as it would on Linux (no AVX). **Armed**: with AVX off again, `bios max` reproduces run
+   874 -- `BusyBox's sh did not run`.
 6. **The cost, in the kernel.** Save-and-restore ticks per switch on the `cost` line, on every
    lane, and through KVM.
 7. **The SR550.** Its `xstate` line, its `CR4` at entry, the v3 BusyBox, and the cost: the

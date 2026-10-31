@@ -104,8 +104,11 @@ GO_HELLO     := build/go-hello
 # **Pinned since 2026-10-29** (`tools/fetch-busybox.sh`): Ubuntu's plain-amd64
 # `busybox-static`, checked against its sha256. ~~Taken from the build machine
 # if it has one~~ -- until CI's runner moved to 26.04, whose `/bin/busybox` is an
-# x86-64-v3 build that traps under Bhaskix at its first AVX instruction, and all
-# six boot lanes went red (run 874). `BUSYBOX_SRC=/path` stages another static
+# x86-64-v3 build that trapped under Bhaskix at its first AVX instruction, and all
+# six boot lanes went red (run 874) -- it runs since RFC 0094 step 4 enabled AVX
+# (2026-10-31), on a CPU that has it, and `make test-busybox-v3` boots it; the
+# corpus stays pinned to the plain build so every lane, `qemu64` included, runs
+# one known binary. `BUSYBOX_SRC=/path` stages another static
 # one instead; `BUSYBOX_SRC=` stages none, as the release does.
 BUSYBOX_SRC  := pinned
 BUSYBOX      := build/busybox
@@ -280,7 +283,7 @@ OVMF_SUFFIX  := $(if $(wildcard /usr/share/OVMF/OVMF_CODE_4M.fd),_4M,)
 OVMF_CODE    := $(firstword $(wildcard $(OVMF_DIR)OVMF_CODE$(OVMF_SUFFIX).fd))
 OVMF_VARS    := $(firstword $(wildcard $(OVMF_DIR)OVMF_VARS$(OVMF_SUFFIX).fd))
 
-.PHONY: FORCE all kernel iso demo demo-fresh run run-uefi release-dist release-finish ceremony-kit progress test test-host test-boot test-boot-uefi test-boot-uefi-qemu64 test-boot-iommu test-keyboard \
+.PHONY: FORCE all kernel iso demo demo-fresh test-busybox-v3 check-fpstate-hw run run-uefi release-dist release-finish ceremony-kit progress test test-host test-boot test-boot-uefi test-boot-uefi-qemu64 test-boot-iommu test-keyboard \
         test-boot-iommu-off test-boot-qemu64 test-boot-native test-boot-native-full test-boot-native-tpm \
         test-boot-native-tpm-tis test-boot-secureboot test-release-keys test-ahci-foreign test-disk-keeps test-placements mkfs bootsign test-shell test-faults test-usb-keyboard test-lacp test-bond test-http fmt clippy gates hooks clean distclean help
 
@@ -817,7 +820,7 @@ run-uefi: $(ISO)
 # Serial is about 590 s here and the parallel prize is real -- but a suite that
 # fails for a reason that has nothing to do with the code is worse than a slow
 # one, and `gave up after 0.255s` says nothing about an image at all.
-test: fmt clippy test-host gates test-boot test-boot-uefi test-boot-iommu test-boot-iommu-off \
+test: fmt clippy test-host check-fpstate-hw gates test-boot test-boot-uefi test-boot-iommu test-boot-iommu-off \
       test-boot-qemu64 test-boot-uefi-qemu64 test-boot-native test-boot-native-full test-boot-native-tpm \
       test-boot-native-tpm-tis test-boot-secureboot test-release-keys test-placements test-shell \
       test-ahci-foreign test-disk-keeps test-keyboard test-usb-keyboard test-busybox test-bond test-lacp \
@@ -847,6 +850,14 @@ progress:
 
 test-host:
 	$(CARGO) test --target $(HOST_TARGET) --workspace --exclude bhaskix-boot-shim
+
+# RFC 0094 step 3: every floating-point image `fpstate::check` accepts is one
+# the processor loads -- two million near-boundary images, each loaded by the
+# real `FXRSTOR`/`XRSTOR` on this machine. A crate of its own, outside `fuzz/`,
+# whose `unsafe` budget is zero by rule. A refused load kills the run with
+# `SIGSEGV`, which is the failure this exists to catch.
+check-fpstate-hw:
+	$(CARGO) run --release -q --target $(HOST_TARGET) --manifest-path tools/fpstate-hw/Cargo.toml
 
 # Every service that has two placements, in both of them, every build.
 #
@@ -950,6 +961,15 @@ test-ahci-foreign: $(ISO)
 # starts from a fresh marked disk, so none of them can see any of this.
 test-disk-keeps: $(ISO)
 	tests/qemu/disk-keeps-test.sh
+
+# RFC 0094 step 5: an image carrying Ubuntu's x86-64-v3 BusyBox -- the build
+# that turned CI run 874 red -- booted to show it runs now that AVX is enabled.
+# **Not in `make test`**, because this host's QEMU 4.2.1 offers no AVX and runs
+# the v3 binary anyway, so here the lane can only say it skipped. CI's `max`
+# cells judge it on QEMU 10.2.1, and locally so does
+# `BHASKIX_ISO=build/iso-v3.iso tools/boot-on-ci-emulator.sh bios` after this.
+test-busybox-v3:
+	tests/qemu/busybox-v3-test.sh bios
 
 # RFC 0041 step 7, and the counterpart to `test-keyboard`.
 #

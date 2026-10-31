@@ -28,27 +28,59 @@
 # Idempotent: a binary already unpacked and passing both checks is used as it
 # is. Prints the binary's path on success.
 #
+# **`BUSYBOX_VARIANT=amd64v3` fetches the other one** -- RFC 0094 step 5
+# (2026-10-31): the same version built for x86-64-v3, the build run 874 met,
+# for the lane that proves it now runs. Its hash was read on 2026-10-31 from
+# the 26.04 `binary-amd64v3` index, whose own hash was checked against the
+# archive's signed `InRelease` (`gpgv`, the Ubuntu archive key). The binary
+# check is turned round for it: it must carry the variant note, so a plain
+# build cannot stand in for it and make the lane prove nothing.
+#
 #   tools/fetch-busybox.sh [destination-root]      (default: build/toolchain)
+#   BUSYBOX_VARIANT=amd64v3 tools/fetch-busybox.sh [destination-root]
 # NOTICE: BusyBox
 set -euo pipefail
 
 VERSION=1.37.0-7ubuntu1
-SHA256=fd605342f62268753076aa7d9321ff098b36ba53e47434145a9aedc28fd141a4
-DEB="busybox-static_${VERSION}_amd64.deb"
+VARIANT=${BUSYBOX_VARIANT:-}
+case "$VARIANT" in
+    "")
+        SHA256=fd605342f62268753076aa7d9321ff098b36ba53e47434145a9aedc28fd141a4
+        DEB="busybox-static_${VERSION}_amd64.deb"
+        suffix=""
+        ;;
+    amd64v3)
+        SHA256=b51a2bcb9dd0484f7920441937dda97da2752df94964126dffe59a8332775b4c
+        DEB="busybox-static_${VERSION}_amd64v3.deb"
+        suffix="-amd64v3"
+        ;;
+    *)
+        echo "fetch-busybox: no pinned build for variant '$VARIANT'" >&2
+        exit 1
+        ;;
+esac
 URL="http://archive.ubuntu.com/ubuntu/pool/main/b/busybox/$DEB"
 
 root=${1:-build/toolchain}
-dest="$root/busybox-$VERSION"
+dest="$root/busybox-$VERSION$suffix"
 busybox="$dest/usr/bin/busybox"
 
-# Statically linked, and built for the plain x86-64 baseline. Prints why not.
+# Statically linked, and built for the variant asked for: the plain x86-64
+# baseline unless one was named. Prints why not.
 unsuitable() {
+    local note
     if ! [[ -f "$1" ]]; then
         echo "the package holds no such file"
+        return
     elif ! file -L "$1" 2>/dev/null | grep -q 'statically linked'; then
         echo "it is not statically linked"
-    elif strings -a "$1" | grep -qF '"architectureVariant"'; then
-        echo "its package note names an architecture variant: $(strings -a "$1" | grep -oE '"architectureVariant":"[^"]*"' | head -1)"
+        return
+    fi
+    note="$(strings -a "$1" | grep -oE '"architectureVariant":"[^"]*"' | head -1 || true)"
+    if [[ -z "$VARIANT" && -n "$note" ]]; then
+        echo "its package note names an architecture variant: $note"
+    elif [[ -n "$VARIANT" && "$note" != "\"architectureVariant\":\"$VARIANT\"" ]]; then
+        echo "its package note does not name $VARIANT: ${note:-no variant at all}"
     fi
 }
 

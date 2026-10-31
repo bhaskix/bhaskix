@@ -17,12 +17,11 @@
 //! logic shows up as a disagreement between the two.
 //!
 //! **What this cannot see is a rule restated wrongly in both places.** That is
-//! what loading every accepted image with the real `XRSTOR` would catch, and it
-//! was done once, on 2026-10-30, outside the tree: 50,056,776 runs clean, and
-//! with the check's `MXCSR` rule removed the processor's `#GP` found at once.
-//! It is not in this target because this crate's `unsafe` budget is zero by
-//! rule -- a target that can produce its own crashes makes a finding mean
-//! nothing until its cause is known.
+//! what loading every accepted image with the real `XRSTOR` catches, and it is
+//! `tools/fpstate-hw` (`make check-fpstate-hw`, in `make test` and CI): a crate
+//! of its own, because this one's `unsafe` budget is zero by rule -- a target
+//! that can produce its own crashes makes a finding mean nothing until its
+//! cause is known.
 //!
 //! The first byte chooses the layout: even for `FXSAVE` (`XCR0` of zero), odd
 //! for `XSAVE` with x87 and SSE; the next four, the `MXCSR_MASK` a processor

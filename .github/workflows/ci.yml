@@ -76,6 +76,9 @@ jobs:
       - uses: actions/checkout@v7
       - run: rustup show active-toolchain
       - run: make test-host
+      # RFC 0094 step 3's floating-point check against the real XRSTOR and
+      # FXRSTOR on the runner's own CPU: every image it accepts must load.
+      - run: make check-fpstate-hw
 
   # --- does it actually boot ---------------------------------------------
 
@@ -189,6 +192,20 @@ jobs:
           BHASKIX_BOOT_LOG: boot-${{ matrix.firmware }}-${{ matrix.cpu }}.log
         run: tests/qemu/boot-test.sh ${{ matrix.firmware }}
 
+      # RFC 0094 step 5, 2026-10-31: the x86-64-v3 BusyBox that turned run 874
+      # red, booted again now that the kernel enables AVX. Only on `max`: QEMU's
+      # `qemu64` has no AVX, and a v3 binary fails there as it would on Linux.
+      # The lane checks the boot's own xstate line and judges only where AVX
+      # was enabled, so a runner whose QEMU stops offering AVX makes it skip
+      # out loud rather than pass.
+      - name: Boot the x86-64-v3 BusyBox with AVX enabled
+        if: matrix.cpu == 'max'
+        env:
+          QEMU_CPU: max
+          BOOT_TEST_TIMEOUT: 300
+          BHASKIX_BOOT_LOG: boot-v3-${{ matrix.firmware }}.log
+        run: tests/qemu/busybox-v3-test.sh ${{ matrix.firmware }}
+
       - name: Upload the boot log and image on failure
         if: failure()
         uses: actions/upload-artifact@v7
@@ -202,6 +219,7 @@ jobs:
           # could say which of the 107 assertions that was.
           path: |
             boot-${{ matrix.firmware }}-${{ matrix.cpu }}.log
+            boot-v3-${{ matrix.firmware }}.log
             ci-env-${{ matrix.firmware }}-${{ matrix.cpu }}.txt
             build/bhaskix.iso
             target/x86_64-unknown-none/release/bhaskix
