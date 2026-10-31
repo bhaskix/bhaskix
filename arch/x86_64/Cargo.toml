@@ -36,7 +36,9 @@ workspace = true
 # `xsetbv` and `xgetbv`, and the `xsaveopt`, `xsave` and `xrstor` a switch
 # uses where the CPU offers them. `cpuid_count` moved `cpuid`'s block rather
 # than adding one.
-asm_budget = 49
+# 50 on 2026-10-31, RFC 0094 step 6: `tsc::read_ordered`'s `lfence; rdtsc;
+# lfence`, which times a switch's save and restore.
+asm_budget = 50
 # `arch` is one of the places `unsafe` is permitted (docs/coding-style.md §3):
 # port I/O and CPU control instructions cannot be expressed any other way.
 #
@@ -190,7 +192,11 @@ asm_budget = 49
 # the plan, `XSETBV` and `XGETBV`, and the `XSAVEOPT`/`XSAVE`/`XRSTOR` a switch
 # uses, each an `asm!` that rustfmt spreads over its operands, plus the one
 # `FXSAVE` that reads `MXCSR_MASK`. Instructions with no safe spelling.
-unsafe_budget = 1267
+# 1277 on 2026-10-31, RFC 0094 step 6: `tsc::read_ordered`, `lfence; rdtsc;
+# lfence` -- one `asm!`, which rustfmt spreads over ten lines. Timing a switch's
+# save and restore, a few hundred ticks, needs the fences, and the kernel
+# target has no SSE2 intrinsic for `lfence` to spell it without one.
+unsafe_budget = 1277
 # Raised from 1070 for ECAM -- one volatile read of configuration space as
 # memory -- and for counting the bytes the transmitter gives up on. The second
 # is two lines and bought a silent data loss becoming a visible number.

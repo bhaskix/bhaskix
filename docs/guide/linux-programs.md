@@ -156,9 +156,10 @@ printf 'cmdline=busybox=sh\n' > esp/bhaskix/boot.conf
 `busybox=sh` hands the keyboard to BusyBox's own `sh`, in a Linux domain,
 before the Bhaskix shell starts. Its prompt is `/ #`. `exit` gives the keyboard
 back, and the boot goes on to `bhaskix$`. This section was re-verified on
-2026-10-31 with the pinned BusyBox 1.37.0, on the change that built RFC 0096, by
-typing every command shown (2026-10-29's run, before that change, ended
-`sh: can't fork`; `7d710cc` on 2026-10-20 used the build machine's 1.30.1):
+2026-10-31 with the pinned BusyBox 1.37.0, on the change after RFC 0096 that
+gave `uname`'s version field its whole text, by typing every command shown
+(2026-10-29's run, before RFC 0096, ended `sh: can't fork`; `7d710cc` on
+2026-10-20 used the build machine's 1.30.1):
 
 ```
 BusyBox v1.37.0 (Ubuntu 1:1.37.0-7ubuntu1) built-in shell (ash)
@@ -170,7 +171,7 @@ hello from busybox
 / # pwd
 /
 / # uname -a
-Linux bhaskix 3.2.0-bhaskix Bhaskix, a capability system; Linux is the ABI and not the kerne x86_64 GNU/Linux
+Linux bhaskix 3.2.0-bhaskix Bhaskix, a capability system; Linux is the ABI, not the kernel x86_64 GNU/Linux
 / # exit
     busybox      306 calls, asked: 12 12 158 218 273 334 302 318 228 228 267 12 12 12 10 157 102 39 13 110 63 79 16 16 13 13 13 13 13 13 13 5 16 1 1 1 1 1 257 16 72 16 1 1 1 3 262 16 16 16 16 107 257 107 1 7 1 13 7 0 7 0 7 0 (and 242 more)
 ```
@@ -191,8 +192,6 @@ Linux, with its parent's registers, floating-point state and thread-local base.
 What is still missing: no `SIGCHLD` is sent when a child ends, so job control
 would not work (and `sh` turns it off anyway, saying `can't access tty` above);
 and the `vfork` shape a Go program uses to start another program is refused.
-The version field `uname -a` prints is cut one character short, `...not the
-kerne` -- the text is a character too long for its field, and that is filed.
 
 Until 2026-10-20 `sh` did not even get that far: the kernel put it down two
 seconds after starting it, at its second prompt, which a person reading the

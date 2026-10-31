@@ -766,6 +766,80 @@ static NEXT_THREAD: AtomicU64 = AtomicU64::new(0);
 /// Context switches performed, across every CPU.
 static SWITCHES: AtomicU64 = AtomicU64::new(0);
 
+/// **What a switch's vector-state save and restore cost** -- RFC 0094 step 6.
+///
+/// Timed only on the CPU named here, and only while something has named one:
+/// the vector probe does, around its two pinned threads' 2,000 switches, where
+/// both threads' state is live and `XSAVEOPT` has nothing to skip. Every other
+/// switch pays one load and a compare. `u32::MAX` names none.
+///
+/// One CPU rather than all of them, because a switch between two threads that
+/// never touched a vector register is cheaper -- the processor skips state
+/// still in its initial configuration -- and a floor taken over those would
+/// describe them instead.
+static XSTATE_COST_CPU: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(u32::MAX);
+/// Switches timed, ticks spent across them, the least, and those dropped as
+/// interrupted -- the `FOREIGN_*` figures' shape in `syscall.rs`.
+static XSTATE_COST_SAMPLES: AtomicU64 = AtomicU64::new(0);
+static XSTATE_COST_TICKS: AtomicU64 = AtomicU64::new(0);
+static XSTATE_COST_FLOOR: AtomicU64 = AtomicU64::new(u64::MAX);
+static XSTATE_COST_DROPPED: AtomicU64 = AtomicU64::new(0);
+
+/// Starts timing the vector-state save and restore at every switch on `cpu`,
+/// or stops (`None`). The figures accumulate across windows.
+pub fn time_xstate_switches(cpu: Option<u32>) {
+    XSTATE_COST_CPU.store(cpu.unwrap_or(u32::MAX), Ordering::Release);
+}
+
+/// The figures so far: switches timed, the least ticks, the mean, and how many
+/// were dropped as interrupted.
+#[must_use]
+pub fn xstate_cost() -> (u64, u64, u64, u64) {
+    let samples = XSTATE_COST_SAMPLES.load(Ordering::Relaxed);
+    let floor = XSTATE_COST_FLOOR.load(Ordering::Relaxed);
+    (
+        samples,
+        if floor == u64::MAX { 0 } else { floor },
+        XSTATE_COST_TICKS
+            .load(Ordering::Relaxed)
+            .checked_div(samples)
+            .unwrap_or(0),
+        XSTATE_COST_DROPPED.load(Ordering::Relaxed),
+    )
+}
+
+/// The moment before a switch's save, if this switch is being timed.
+#[inline]
+fn xstate_cost_began() -> Option<u64> {
+    let timed = XSTATE_COST_CPU.load(Ordering::Relaxed);
+    // CPU: masked -- a switch runs with interrupts off, so the CPU compared
+    // with the one being timed is still this one at `xstate_cost_ended`.
+    (timed != u32::MAX && percpu::cpu_id() == timed).then(bhaskix_arch::tsc::read_ordered)
+}
+
+/// The moment after a switch's restore: one sample, if `began` started one.
+///
+/// A million ticks is the cap, as for a foreign call: a save and restore is
+/// hundreds, so anything near a million was interrupted by something that is
+/// not what is being measured.
+#[inline]
+fn xstate_cost_ended(began: Option<u64>) {
+    let Some(began) = began else {
+        return;
+    };
+    match bhaskix_arch::tsc::read_ordered().checked_sub(began) {
+        Some(spent) if spent <= 1_000_000 => {
+            XSTATE_COST_SAMPLES.fetch_add(1, Ordering::Relaxed);
+            XSTATE_COST_TICKS.fetch_add(spent, Ordering::Relaxed);
+            XSTATE_COST_FLOOR.fetch_min(spent, Ordering::Relaxed);
+        }
+        _ => {
+            XSTATE_COST_DROPPED.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
 /// Vector used to tell another CPU that its runqueue changed.
 ///
 /// One above the shootdown vector, and for the same reason that one exists:
@@ -3502,17 +3576,25 @@ fn preempt_reporting() -> bool {
         // What the *register* holds, not what the departing thread's record
         // says it should -- see `FS_BASE_LOADED`.
         let leaving_base = fs_base_loaded();
+        // Timed only while the vector probe names this CPU, and only when both
+        // halves happen -- RFC 0094 step 6, see `XSTATE_COST_CPU`.
+        let timed = xstate_cost_began();
+        let mut saved = false;
         if let Some(from_thread) = queue.threads[current].as_mut() {
             // SAFETY: a 64-aligned area of `CAPACITY` bytes belonging to the
             // thread being switched away from, and this is its last instant
             // on the CPU; every CPU applied the plan before scheduling.
             unsafe { bhaskix_arch::xstate::save(from_thread.fx.0.as_mut_ptr()) };
+            saved = true;
         }
         if let Some(to_thread) = queue.threads[next].as_ref() {
             // SAFETY: an image the save wrote, or the constant initial one,
             // or one RFC 0094 step 3's check accepted -- nothing else is
             // ever put in an area.
             unsafe { bhaskix_arch::xstate::restore(to_thread.fx.0.as_ptr()) };
+            if saved {
+                xstate_cost_ended(timed);
+            }
             crate::telemetry::note_domain(to_thread.domain);
             // The thread-local base travels with the thread, because the
             // register does not: it is one per CPU, and a hosted program
@@ -4797,13 +4879,20 @@ pub fn block_self(who: u32) {
                 // As above: the floating-point file travels with the thread.
                 // As the other site: the register, not a record of it.
                 let leaving_base = fs_base_loaded();
+                // Timed as at the other switch site.
+                let timed = xstate_cost_began();
+                let mut saved = false;
                 if let Some(from_thread) = queue.threads[current].as_mut() {
                     // SAFETY: as the other switch site.
                     unsafe { bhaskix_arch::xstate::save(from_thread.fx.0.as_mut_ptr()) };
+                    saved = true;
                 }
                 if let Some(to_thread) = queue.threads[next].as_ref() {
                     // SAFETY: as the other switch site.
                     unsafe { bhaskix_arch::xstate::restore(to_thread.fx.0.as_ptr()) };
+                    if saved {
+                        xstate_cost_ended(timed);
+                    }
                     crate::telemetry::note_domain(to_thread.domain);
                     // As the other site: the arriving thread's base, zero
                     // included, against what the CPU already holds.

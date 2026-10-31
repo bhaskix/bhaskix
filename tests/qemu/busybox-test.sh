@@ -82,13 +82,16 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# **`BUSYBOX_IN_IMAGE=1`, because it is no longer in the image by default.**
+# ~~**`BUSYBOX_IN_IMAGE=1`, because it is no longer in the image by default.**
 # The root filesystem is read into one contiguous allocation and the buddy
 # allocator caps that at four megabytes; BusyBox is 2,121 KiB of it, and on
 # 2026-09-13 that put the image over the ceiling on CI, where the read was
 # clamped in silence. This is the lane that needs it, so this is the lane that
-# asks for it.
-if ! make -C "$REPO_ROOT" iso CMDLINE="busybox=sh" BUSYBOX_IN_IMAGE=1 \
+# asks for it.~~ **Corrected 2026-10-31: the flag was read by nothing.** The
+# Makefile has no such variable; every image carries `bin/busybox` through
+# `$(INITRD)`'s rule, and the lane that leaves it out is `httpd`'s, with
+# `BUSYBOX_SRC= BUSYBOX=build/no-busybox`. This lane needs nothing extra.
+if ! make -C "$REPO_ROOT" iso CMDLINE="busybox=sh" \
         ISO="$ISO" ISO_ROOT="$REPO_ROOT/build/iso_root_busybox" >/dev/null 2>&1; then
     fail "could not build an image with busybox=sh"
     exit 1

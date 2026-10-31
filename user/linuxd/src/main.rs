@@ -4682,6 +4682,13 @@ fn processes() -> &'static mut Processes {
     unsafe { &mut *core::ptr::addr_of_mut!(PROCESSES) }
 }
 
+/// The live process in `domain`, if there is one -- **looked up, never
+/// admitted**, unlike [`process_for`]. For the paths that clean up after a
+/// domain, where admitting a record for it would invent a process.
+fn live_process(domain: u32) -> Option<&'static mut Process> {
+    processes().by_domain_mut(domain, incarnation_of(domain))
+}
+
 /// The Linux tid of every hosted thread -- RFC 0096.
 fn threads() -> &'static mut Threads {
     // SAFETY: single-threaded, as the note above.
@@ -7285,7 +7292,12 @@ fn release_sockets_of(domain: u32) {
     clone::forget_domain(domain);
     threads().forget_domain(domain);
     fork_fp_forget(domain);
-    let Some(process) = process_for(domain) else {
+    // **Looked up, not admitted** (2026-10-31). `process_for` admits a record
+    // when it finds no live one, and `FORGET` reaches here for a domain whose
+    // process has often already ended -- so this made a stray record, reaped a
+    // few lines later in `forget`, costing a pid number and an admission each
+    // time. `forget` had been corrected the same way for itself.
+    let Some(process) = live_process(domain) else {
         return;
     };
     for descriptor in 0..bhaskix_personality::file::MAX_DESCRIPTORS {
@@ -7304,7 +7316,7 @@ fn release_sockets_of(domain: u32) {
             if process.descriptors.holders(&entry) == 1 {
                 stream::close(&entry);
             }
-            if let Some(process) = process_for(domain)
+            if let Some(process) = live_process(domain)
                 && let Some(entry) = process.descriptors.get_mut(number)
             {
                 entry.handle = u64::MAX;
@@ -7326,7 +7338,7 @@ fn release_sockets_of(domain: u32) {
             //
             // Found by the socket probe answering `EADDRINUSE` on the boot
             // after this function gained its second caller.
-            if let Some(process) = process_for(domain)
+            if let Some(process) = live_process(domain)
                 && let Some(entry) = process.descriptors.get_mut(number)
             {
                 entry.handle = u64::MAX;

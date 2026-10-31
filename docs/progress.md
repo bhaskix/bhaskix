@@ -10,8 +10,8 @@
 
 | | |
 |---|---|
-| RFCs accepted | **63** |
-| RFCs open | 31 |
+| RFCs accepted | **64** |
+| RFCs open | 30 |
 | RFCs closed without shipping | 2 |
 | Milestone rows done | **92 of 95** |
 | Phase 2 bullets done | **13 of 13** |
@@ -114,7 +114,7 @@ gantt
     RFC 0085 A futex sleeper comes back for its answer :done, r0085, 2026-09-29, 2026-10-04
     RFC 0086 The motivating workload — a Go HTTP server under... :done, r0086, 2026-09-30, 2026-10-04
     RFC 0094 A program's vector registers are its own :active, r0094, 2026-10-30, 2026-10-31
-    RFC 0096 A fork glibc can make :active, r0096, 2026-10-30, 2026-10-31
+    RFC 0096 A fork glibc can make :done, r0096, 2026-10-30, 2026-10-31
     section Process & tooling
     RFC 0001 License — Apache-2.0 :done, r0001, 2026-08-03, 1d
     RFC 0007 Live patching the nucleus :active, r0007, 2026-08-04, 2026-10-31
@@ -204,7 +204,6 @@ gantt
 | 0091 | A boot its owner signed | 2026-10-12 |
 | 0094 | A program's vector registers are its own | 2026-10-30 |
 | 0095 | A disk that keeps what was written | 2026-10-30 |
-| 0096 | A fork glibc can make | 2026-10-30 |
 
 ## Annexes
 

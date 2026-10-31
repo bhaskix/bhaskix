@@ -648,6 +648,27 @@ pub const UTSNAME_FIELD: usize = 65;
 /// The whole of it.
 pub const UTSNAME_BYTES: usize = UTSNAME_FIELD * 6;
 
+/// The six fields [`write_utsname`] answers, in the struct's order.
+///
+/// **Each must fit whole**, sixty-four bytes and the terminator. The version
+/// field was sixty-five -- `...Linux is the ABI and not the kernel` -- and
+/// every `uname -a` printed `...not the kerne` until 2026-10-31, the day the
+/// first one ran; the truncation below was doing its job on a text that was
+/// wrong. A test holds every field to the width now.
+pub const UTSNAME: [&str; 6] = [
+    // The ABI, which is the question being asked.
+    "Linux",
+    "bhaskix",
+    // The least version a glibc program will start against, and not one
+    // digit more. See `write_utsname` for why both halves matter.
+    "3.2.0-bhaskix",
+    "Bhaskix, a capability system; Linux is the ABI, not the kernel",
+    "x86_64",
+    // No NIS domain, which Linux itself reports as this exact string rather
+    // than as empty.
+    "(none)",
+];
+
 /// What `uname` answers, and the one field that is a judgement rather than a
 /// fact.
 ///
@@ -688,20 +709,7 @@ pub fn write_utsname(out: &mut [u8]) -> Result<(), i64> {
         return Err(errno::EINVAL);
     }
     out[..UTSNAME_BYTES].fill(0);
-    let fields = [
-        // The ABI, which is the question being asked.
-        "Linux",
-        "bhaskix",
-        // The least version a glibc program will start against, and not one
-        // digit more. See above for why both halves matter.
-        "3.2.0-bhaskix",
-        "Bhaskix, a capability system; Linux is the ABI and not the kernel",
-        "x86_64",
-        // No NIS domain, which Linux itself reports as this exact string
-        // rather than as empty.
-        "(none)",
-    ];
-    for (index, field) in fields.iter().enumerate() {
+    for (index, field) in UTSNAME.iter().enumerate() {
         let at = index * UTSNAME_FIELD;
         let bytes = field.as_bytes();
         // Every field is truncated to leave a terminator, because a caller
@@ -1159,6 +1167,25 @@ mod tests {
         // adapter has not got, which is the worry the original comment had and
         // which has not gone away.
         assert!(field(2).starts_with("3.2."), "release: {}", field(2));
+        // **And each field reads back whole.** `contains("Bhaskix")` above held
+        // while the version field was a character too long and every `uname
+        // -a` printed `...not the kerne`; a field equal to its text is what
+        // says nothing was cut.
+        for (index, text) in UTSNAME.iter().enumerate() {
+            assert_eq!(field(index), *text, "field {index} was cut");
+        }
+    }
+
+    #[test]
+    fn every_uname_field_fits_its_sixty_four_bytes() {
+        for text in UTSNAME {
+            assert!(
+                text.len() < UTSNAME_FIELD,
+                "{text:?} is {} bytes; a field holds {} and its terminator",
+                text.len(),
+                UTSNAME_FIELD - 1
+            );
+        }
     }
 
     #[test]

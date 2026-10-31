@@ -7681,11 +7681,16 @@ fn vector_self_test(hhdm_base: u64, cpus: u32) -> bool {
 
     let cpu = cpus.saturating_sub(1);
     PROBE_HHDM.store(hhdm_base, Ordering::Release);
+    // **The switch's cost, timed on this probe's CPU while it runs** -- RFC
+    // 0094 step 6. Both threads hold live vector state, so every save and
+    // restore between them does the whole of its work.
+    sched::time_xstate_switches(Some(cpu));
     let mut realms = [None, None];
     for (which, name) in [(0usize, "vector-a"), (1, "vector-b")] {
         VECTOR_REPORT_PA[which].store(0, Ordering::Release);
         let Ok(realm) = domain::create(name, domain::ResourceEnvelope::new()) else {
             println!("\x1b[91m    vector state   FAILED: no domain\x1b[0m");
+            sched::time_xstate_switches(None);
             realms.iter().flatten().for_each(|r| retire_probe(*r));
             return false;
         };
@@ -7696,6 +7701,7 @@ fn vector_self_test(hhdm_base: u64, cpus: u32) -> bool {
         if sched::spawn_on_with(cpu, name, ring3_vector, which as u64, hhdm_base, options).is_err()
         {
             println!("\x1b[91m    vector state   FAILED: a probe would not spawn\x1b[0m");
+            sched::time_xstate_switches(None);
             realms.iter().flatten().for_each(|r| retire_probe(*r));
             return false;
         }
@@ -7722,6 +7728,7 @@ fn vector_self_test(hhdm_base: u64, cpus: u32) -> bool {
         }
         wait_millis(5);
     }
+    sched::time_xstate_switches(None);
     realms.iter().flatten().for_each(|r| retire_probe(*r));
 
     let rounds = reports[0][0] + reports[1][0];
@@ -7735,7 +7742,8 @@ fn vector_self_test(hhdm_base: u64, cpus: u32) -> bool {
     let upper = u64::from(avx);
     let agreed = reports[0][4] == upper && reports[1][4] == upper;
     let quadwords = if avx { 128_000 } else { 64_000 };
-    if reports[0][3] == 1 && reports[1][3] == 1 && rounds == 2000 && wrong == 0 && agreed {
+    let kept = if reports[0][3] == 1 && reports[1][3] == 1 && rounds == 2000 && wrong == 0 && agreed
+    {
         if avx {
             println!(
                 "    vector state   two threads in two domains on one cpu kept xmm0-xmm15 and \
@@ -7763,6 +7771,36 @@ fn vector_self_test(hhdm_base: u64, cpus: u32) -> bool {
             reports[1][4]
         );
         false
+    };
+    report_xstate_cost(&plan);
+    kept
+}
+
+/// RFC 0094 step 6's line: what a switch's save and restore of vector state
+/// cost, timed on the vector probe's CPU while its two threads switched.
+///
+/// **The figure is reported and not asserted**, as every cost in this report
+/// is: under emulation it is the emulator's, and a gate on it would be a flaky
+/// test wearing a budget's clothes. What is gated is that it was measured --
+/// a population, and a floor that is not zero.
+fn report_xstate_cost(plan: &bhaskix_arch::xstate::Plan) {
+    let (samples, floor, mean, dropped) = sched::xstate_cost();
+    let saved_by = plan.switch.name();
+    let bytes = plan.bytes;
+    let nanos = |ticks: u64| {
+        bhaskix_arch::tsc::hertz().map(|hertz| ticks.saturating_mul(1_000_000_000) / hertz)
+    };
+    match nanos(floor) {
+        Some(ns) => println!(
+            "    xstate cost    save and restore at a switch: least {floor} ticks ({ns} ns), \
+             mean {mean}, over {samples} switches on the vector probe's cpu while it ran; \
+             {dropped} dropped as interrupted -- {saved_by}, {bytes} bytes"
+        ),
+        None => println!(
+            "    xstate cost    save and restore at a switch: least {floor} ticks (no calibrated \
+             timer), mean {mean}, over {samples} switches on the vector probe's cpu while it \
+             ran; {dropped} dropped as interrupted -- {saved_by}, {bytes} bytes"
+        ),
     }
 }
 

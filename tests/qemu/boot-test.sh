@@ -2965,6 +2965,20 @@ else
     status=1
 fi
 
+# RFC 0094 step 6: what a switch's save and restore of vector state cost, timed
+# on the vector probe's cpu while its two threads switched -- both with live
+# state, so neither half has anything to skip. **Reported and not asserted**,
+# as every cost here is; what is gated is that it was measured: a thousand
+# switches or more, a floor and a mean that are not zero, and the mechanism and
+# size the plan chose.
+if grep -qE "xstate cost +save and restore at a switch: least [1-9][0-9]* ticks \((no calibrated timer|[0-9]+ ns)\), mean [1-9][0-9]*, over [0-9]{4,} switches on the vector probe's cpu while it ran; [0-9]+ dropped as interrupted -- (xsaveopt|xsave|fxsave), (512|576|832) bytes" "$LOG"; then
+    pass "a switch's vector-state save and restore was timed: $(grep -oE 'least [0-9]+ ticks \([^)]*\), mean [0-9]+, over [0-9]+ switches' "$LOG" | head -1)"
+else
+    fail "no measured cost for a switch's vector-state save and restore"
+    grep -E "xstate cost" "$LOG" || true
+    status=1
+fi
+
 # RFC 0005 step 3: the initial process image. A Linux program walks the
 # stack this kernel built -- argv, envp, the auxiliary vector -- and finds
 # the entropy AT_RANDOM promised, which Go's runtime treats as not optional.

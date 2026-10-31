@@ -53,6 +53,36 @@ pub fn read() -> u64 {
     (u64::from(high) << 32) | u64::from(low)
 }
 
+/// Reads the time-stamp counter **in order**: after every earlier instruction
+/// has executed, and before any later one starts -- `lfence; rdtsc; lfence`.
+///
+/// The note above says a short sequence must serialise for itself, and RFC
+/// 0094 step 6 times one: a vector-state save and restore at a switch, a few
+/// hundred ticks that an unordered read could move by tens. The fences are
+/// placed as the instruction reference's `RDTSC` entry says, read 2026-10-31:
+/// `LFENCE` immediately before for "only after all previous instructions have
+/// executed", immediately after for "prior to execution of any subsequent
+/// instruction".
+#[must_use]
+#[inline]
+pub fn read_ordered() -> u64 {
+    let low: u32;
+    let high: u32;
+    // SAFETY: `rdtsc` as in `read`; `lfence` orders execution on this CPU and
+    // has no operands and no other effect.
+    unsafe {
+        core::arch::asm!(
+            "lfence",
+            "rdtsc",
+            "lfence",
+            out("eax") low,
+            out("edx") high,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+    (u64::from(high) << 32) | u64::from(low)
+}
+
 /// Records the measured tick rate.
 ///
 /// Called once, by the APIC calibration, which already holds the PIT for long

@@ -2753,7 +2753,14 @@ fn adapter_call(frame: &mut SyscallFrame, call: &PersonalityCall) -> Option<u64>
             // which is the point -- teaching it would be Linux knowledge arriving
             // by the back door -- and only the calls that need it pay for it.
             crate::fault::reply::NEED_FRAME => {
-                let slot = crate::fault::stage_frame(frame)?;
+                // **No slot to stage the frame in: answered, and not priced
+                // again** (2026-10-31) -- the twin of the failed retry below.
+                // The first ask was counted when it was answered, so handing
+                // back `None` sent the call on to be priced as one nobody
+                // answered. The program is told `ENOSYS`, as before.
+                let Some(slot) = crate::fault::stage_frame(frame) else {
+                    return Some(bhaskix_personality::call::ENOSYS.value);
+                };
                 let again = ask_adapter_full(
                     u64::from(call.domain),
                     crate::fault::FRAME_METHOD,

@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | ⬜ **Draft 2026-10-30 — ~~nothing built~~ steps 1-4 built and gated 2026-10-31.** ~~Four questions for the lead~~ All four decided by the lead on 2026-10-31, each as recommended (§*Unresolved questions*). |
+| **Status** | ✅ **ACCEPTED 2026-10-31 by the project lead**, on CI run 891's green. Drafted 2026-10-30; ~~nothing built~~ steps 1-4 built and gated 2026-10-31. ~~Four questions for the lead~~ All four decided by the lead on 2026-10-31, each as recommended (§*Unresolved questions*). |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | userspace (`bin/linuxd`, `personality`) |
 | **Milestone** | L1 ([roadmap.md](../roadmap.md)) — an interactive BusyBox `sh` runs a command that is not one of its builtins |

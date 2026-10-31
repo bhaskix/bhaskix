@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | ⬜ **Draft 2026-10-30 — ~~nothing built~~ steps 0-3 built and gated the same day, steps 4-5 on 2026-10-31 (AVX on; the x86-64-v3 BusyBox runs); ~~steps 6-8 open~~ step 7 read on the SR550 the same day, all but the cost, which waits on step 6's line; steps 6 and 8 open. Both questions decided by the lead the same day, each as recommended**: AVX only, AVX-512 waiting on its trigger; the signal half in this RFC, and first (§*Unresolved questions*). Drafted at the lead's request, **ahead of its recorded trigger**: TRACKER's row asks for this RFC when an L1 program needs AVX or a distribution's packages assume x86-64-v3, and neither has happened — Ubuntu 26.04 still ships plain amd64 builds, and the pinned corpus uses one. |
+| **Status** | ⬜ **Draft 2026-10-30 — ~~nothing built~~ steps 0-3 built and gated the same day, steps 4-5 on 2026-10-31 (AVX on; the x86-64-v3 BusyBox runs); ~~steps 6-8 open~~ step 7 read on the SR550 the same day, all but the cost, which waits on step 6's line; ~~steps 6 and 8 open~~ step 6 built the same day (the `xstate cost` line); step 7's cost and step 8 open. Both questions decided by the lead the same day, each as recommended**: AVX only, AVX-512 waiting on its trigger; the signal half in this RFC, and first (§*Unresolved questions*). Drafted at the lead's request, **ahead of its recorded trigger**: TRACKER's row asks for this RFC when an L1 program needs AVX or a distribution's packages assume x86-64-v3, and neither has happened — Ubuntu 26.04 still ships plain amd64 builds, and the pinned corpus uses one. |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | arch / sched / userspace (`bin/linuxd`, `personality`) |
 | **Milestone** | L1 ([roadmap.md](../roadmap.md)) — an unmodified x86-64-v3 Linux program runs |
@@ -483,7 +483,21 @@ the design rests on.
    fails as it would on Linux (no AVX). **Armed**: with AVX off again, `bios max` reproduces run
    874 -- `BusyBox's sh did not run`.
 6. **The cost, in the kernel.** Save-and-restore ticks per switch on the `cost` line, on every
-   lane, and through KVM.
+   lane, and through KVM. **Built 2026-10-31 -- on a line of its own, `xstate cost`, not the
+   `cost` line**: that one is the placement figure, in a fixed format a gate reads, and every other
+   cost here has its own line. The save and restore at both switch sites are timed with
+   `tsc::read_ordered` (`lfence; rdtsc; lfence`, placed as the instruction reference's `RDTSC`
+   entry says), **only on the vector probe's CPU while its two threads switch** -- both with live
+   state, so neither half has anything to skip; every other switch pays one load and a compare.
+   Floor, mean, count and dropped, the `FOREIGN_*` shape; reported and not asserted. Read:
+   - QEMU 4.2.1 TCG, no AVX (`0x3`, 576 bytes): least **1,890 ticks (786 ns)**, mean 3,953,
+     over 1,317 switches -- the emulator's figure, not a CPU's.
+   - KVM on this host's Xeon Silver 4314 (`0x7`, 832 bytes): least **208 ticks (86 ns)**, mean
+     321, over 3,687 switches.
+   
+   The count is every switch on that CPU in the window, the probe's two threads and whatever else
+   ran there, and the line says so. **Armed**: with the window never opened the line reads `0
+   switches` and its gate goes red.
 7. **The SR550.** Its `xstate` line, its `CR4` at entry, the v3 BusyBox, and the cost: the
    figures this draft could only take from another CPU. **Read 2026-10-31, all but the cost**, in
    one boot through the native loader from an image whose initrd carried the v3 BusyBox
