@@ -2774,6 +2774,19 @@ fn adapter_call(frame: &mut SyscallFrame, call: &PersonalityCall) -> Option<u64>
                         note_delivery(call.number, answered_first);
                         return Some(frame.kind);
                     }
+                    // **A park, on the frame path too** -- RFC 0099. A vfork's
+                    // parent is held until its child execs or ends, and the call
+                    // that holds it is a `clone`, answered here. The frame goes
+                    // back, the thread parks as the main path parks it, and the
+                    // whole question is asked again -- which stages a fresh frame,
+                    // so nothing here outlives the park.
+                    Some((crate::fault::reply::BLOCK_ON_RETRY, word, _)) => {
+                        crate::fault::give_back(slot);
+                        if let Err(value) = park_for_retry(word, call.domain) {
+                            return Some(value);
+                        }
+                        continue;
+                    }
                     Some((_, value, _)) => Some(value),
                     // **The retry failed, and the call was counted already** --
                     // when its first ask was answered. Handing back `None` sent
@@ -2867,40 +2880,8 @@ fn adapter_call(frame: &mut SyscallFrame, call: &PersonalityCall) -> Option<u64>
                 continue;
             }
             crate::fault::reply::BLOCK_ON_RETRY => {
-                if !may_park_on(answer.1, call.domain) {
-                    PARK_UNGRANTED.fetch_add(1, Ordering::Relaxed);
-                    return Some(-11i64 as u64); // EAGAIN
-                }
-                // **Park, and then ask the same question again** -- RFC 0033 step
-                // 7. The difference from `BLOCK_ON` is what the caller gets when it
-                // wakes: a `futex` is answered zero, which is what Linux's futex
-                // returns, but a `read` answered zero has been told *end of file*.
-                // So this shape resumes the call rather than completing it, and the
-                // adapter answers the second time with the bytes that woke it.
-                let Some(notification) = adapter_notification(answer.1) else {
-                    PARK_UNNAMED.fetch_add(1, Ordering::Relaxed);
-                    return Some(-11i64 as u64); // EAGAIN
-                };
-                if crate::datagram_bell_id() == Some(notification) {
-                    PARKED_ON_BELL.fetch_add(1, Ordering::Relaxed);
-                }
-                BLOCKED.fetch_add(1, Ordering::Relaxed);
-                if crate::notify::wait(notification).is_err() {
-                    // **A caller that is being killed is not a refusal.**
-                    // `notify::wait` answers `Gone` both for a notification
-                    // that has been destroyed and for a thread that has been
-                    // told to stop, and the second is the ordinary end of a
-                    // domain somebody ended. Counting them together made the
-                    // report cry wolf on a boot where the corpus killed a
-                    // parked BusyBox: one yellow line about a lost wake, for a
-                    // thread that was going away anyway.
-                    if crate::sched::should_die() {
-                        PARK_ENDED.fetch_add(1, Ordering::Relaxed);
-                    } else {
-                        PARK_REFUSED.fetch_add(1, Ordering::Relaxed);
-                        PARK_REFUSED_SLOT.store(answer.1, Ordering::Relaxed);
-                    }
-                    return Some(-11i64 as u64);
+                if let Err(value) = park_for_retry(answer.1, call.domain) {
+                    return Some(value);
                 }
                 continue;
             }
@@ -3595,6 +3576,48 @@ fn install_adapter_handle(domain: u32) -> Option<AdapterHandle> {
         index,
         replaced: held != 0,
     })
+}
+
+/// **Park, and then ask the same question again** -- `BLOCK_ON_RETRY`'s park,
+/// shared since RFC 0099 by the main path and the frame path. `Err` carries the
+/// value the caller is answered instead, when the park was refused or cut short.
+fn park_for_retry(word: u64, domain: u32) -> Result<(), u64> {
+    if !may_park_on(word, domain) {
+        PARK_UNGRANTED.fetch_add(1, Ordering::Relaxed);
+        return Err(-11i64 as u64); // EAGAIN
+    }
+    // **Park, and then ask the same question again** -- RFC 0033 step
+    // 7. The difference from `BLOCK_ON` is what the caller gets when it
+    // wakes: a `futex` is answered zero, which is what Linux's futex
+    // returns, but a `read` answered zero has been told *end of file*.
+    // So this shape resumes the call rather than completing it, and the
+    // adapter answers the second time with the bytes that woke it.
+    let Some(notification) = adapter_notification(word) else {
+        PARK_UNNAMED.fetch_add(1, Ordering::Relaxed);
+        return Err(-11i64 as u64); // EAGAIN
+    };
+    if crate::datagram_bell_id() == Some(notification) {
+        PARKED_ON_BELL.fetch_add(1, Ordering::Relaxed);
+    }
+    BLOCKED.fetch_add(1, Ordering::Relaxed);
+    if crate::notify::wait(notification).is_err() {
+        // **A caller that is being killed is not a refusal.**
+        // `notify::wait` answers `Gone` both for a notification
+        // that has been destroyed and for a thread that has been
+        // told to stop, and the second is the ordinary end of a
+        // domain somebody ended. Counting them together made the
+        // report cry wolf on a boot where the corpus killed a
+        // parked BusyBox: one yellow line about a lost wake, for a
+        // thread that was going away anyway.
+        if crate::sched::should_die() {
+            PARK_ENDED.fetch_add(1, Ordering::Relaxed);
+        } else {
+            PARK_REFUSED.fetch_add(1, Ordering::Relaxed);
+            PARK_REFUSED_SLOT.store(word, Ordering::Relaxed);
+        }
+        return Err(-11i64 as u64);
+    }
+    Ok(())
 }
 
 /// Records what one foreign call cost.

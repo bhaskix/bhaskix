@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | ⬜ **Draft 2026-10-31 — built and gated the same day.** The one question decided by the lead the same day, as recommended (§*Unresolved questions*). Drafted at the lead's request. |
+| **Status** | ✅ **ACCEPTED 2026-10-31 by the project lead**, on CI run 893's green. Drafted, built and gated the same day. The one question decided by the lead the same day, as recommended (§*Unresolved questions*). Drafted at the lead's request. |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | userspace (`bin/linuxd`, `personality`) |
 | **Milestone** | L1 ([roadmap.md](../roadmap.md)) |

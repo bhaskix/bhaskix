@@ -41,6 +41,9 @@ pub mod clone {
     /// Not a flag: the low byte is the signal a child process's parent is
     /// sent when it ends (`CSIGNAL`).
     pub const EXIT_SIGNAL: u64 = 0x0000_00ff;
+    /// Hold the parent until the child execs or exits -- `vfork`'s promise,
+    /// and Go's `os/exec` asks for it (RFC 0099).
+    pub const VFORK: u64 = 0x0000_4000;
     /// A new pid namespace -- refused. ~~A new process rather than a thread~~
     /// **corrected 2026-10-31**: this said `NEWPID` asked for a new process,
     /// and refused it because a process is a domain. It asks for a new pid
@@ -93,6 +96,12 @@ pub enum ClonePlan {
         /// Where to write the child's tid in the **parent's** memory
         /// (`CLONE_PARENT_SETTID`).
         parent_tid: Option<u64>,
+        /// Whether the parent is held until the child execs or exits --
+        /// `CLONE_VFORK`, RFC 0099. The child is a copy, not a sharer: Go's
+        /// child writes only its own stack frame before it execs, and a copy
+        /// keeps that from the parent, so the hold is what is left of vfork's
+        /// contract to honour.
+        hold: bool,
     },
     /// Refuse with this `errno`.
     Refuse(i64),
@@ -122,7 +131,13 @@ pub fn plan_clone(flags: u64, stack: u64, parent_tid: u64, child_tid: u64, tls: 
     // keeps that for an RFC of its own.
     const PROCESS: u64 =
         clone::EXIT_SIGNAL | clone::CHILD_SETTID | clone::CHILD_CLEARTID | clone::PARENT_SETTID;
-    if flags & !PROCESS == 0 {
+    // **The vfork shape** -- RFC 0099: `CLONE_VFORK`, with or without
+    // `CLONE_VM`, which Go's `os/exec` passes together. `CLONE_VM` alone is a
+    // process sharing memory with no hold, which is nothing either honours.
+    let vfork = flags & clone::VFORK != 0;
+    let shares_memory = flags & clone::VM != 0;
+    let extras = if vfork { clone::VFORK | clone::VM } else { 0 };
+    if flags & !(PROCESS | extras) == 0 && (vfork || !shares_memory) {
         // A child process on a stack of its own is a `clone` Linux allows and
         // nothing here has asked for: refused, rather than half-honoured.
         if stack != 0 {
@@ -133,6 +148,7 @@ pub fn plan_clone(flags: u64, stack: u64, parent_tid: u64, child_tid: u64, tls: 
             child_tid: (flags & clone::CHILD_SETTID != 0).then_some(child_tid),
             clear_tid: (flags & clone::CHILD_CLEARTID != 0).then_some(child_tid),
             parent_tid: (flags & clone::PARENT_SETTID != 0).then_some(parent_tid),
+            hold: vfork,
         };
     }
     // Every share Go asks for must be present. `CLONE_THREAD` without
@@ -571,6 +587,7 @@ mod tests {
                 child_tid: Some(0x2a1b_5690),
                 clear_tid: Some(0x2a1b_5690),
                 parent_tid: None,
+                hold: false,
             }
         );
     }
@@ -586,6 +603,7 @@ mod tests {
                 child_tid: None,
                 clear_tid: None,
                 parent_tid: None,
+                hold: false,
             }
         );
         assert_eq!(
@@ -595,18 +613,19 @@ mod tests {
                 child_tid: None,
                 clear_tid: None,
                 parent_tid: Some(0x1000),
+                hold: false,
             }
         );
     }
 
     #[test]
-    fn a_process_with_a_stack_a_share_or_vfork_is_still_refused() {
+    fn a_process_with_a_stack_or_a_share_is_still_refused() {
         assert_eq!(
             plan_clone(0x0120_0011, 0x7000, 0, 0x1000, 0),
             ClonePlan::Refuse(errno::ENOSYS)
         );
-        // Each share alone, and `CLONE_VFORK` -- Go's `os/exec` shape keeps
-        // `CLONE_VM` with it, and RFC 0096 question 1 leaves both for later.
+        // Each share alone. ~~And `CLONE_VFORK`~~ -- accepted since RFC 0099;
+        // `CLONE_VM` *without* it is still refused, a sharer with no hold.
         for extra in [
             clone::VM,
             clone::FS,
@@ -615,7 +634,6 @@ mod tests {
             clone::THREAD,
             clone::SYSVSEM,
             clone::SETTLS,
-            0x4000,
         ] {
             assert_eq!(
                 plan_clone(0x0120_0011 | extra, 0, 0, 0x1000, 0),
@@ -623,6 +641,40 @@ mod tests {
                 "{extra:#x}"
             );
         }
+    }
+
+    #[test]
+    fn gos_vfork_is_a_process_whose_parent_is_held() {
+        // RFC 0099: Go 1.27.1's `os/exec` (`syscall/exec_linux.go`) passes
+        // `CLONE_VFORK | CLONE_VM | SIGCHLD`, no stack -- `0x4111` -- read in
+        // the pinned toolchain's source on 2026-10-31.
+        assert_eq!(
+            plan_clone(0x4111, 0, 0, 0, 0),
+            ClonePlan::Process {
+                exit_signal: 17,
+                child_tid: None,
+                clear_tid: None,
+                parent_tid: None,
+                hold: true,
+            }
+        );
+        // `CLONE_VFORK` alone holds too; with a stack, a share or `CLONE_PIDFD`
+        // (`0x1000`, which Go asks for only once `pidfd_open` works) it is refused.
+        assert!(matches!(
+            plan_clone(clone::VFORK | 17, 0, 0, 0, 0),
+            ClonePlan::Process { hold: true, .. }
+        ));
+        for refused in [clone::FILES, clone::SETTLS, 0x1000] {
+            assert_eq!(
+                plan_clone(0x4111 | refused, 0, 0, 0, 0),
+                ClonePlan::Refuse(errno::ENOSYS),
+                "{refused:#x}"
+            );
+        }
+        assert_eq!(
+            plan_clone(0x4111, 0x7000, 0, 0, 0),
+            ClonePlan::Refuse(errno::ENOSYS)
+        );
     }
 
     #[test]

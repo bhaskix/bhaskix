@@ -390,13 +390,19 @@ cost* and is not a schedule.
 - **Secure update** — immutable root, A/B slots, rollback protection. Second because it needs the
   same key infrastructure the row above builds, and because RFC 0030's deferred package signatures
   are discharged here rather than separately. `security.md` §7 is its specification, written in
-  advance
+  advance. **Where it stands, 2026-10-31**: [RFC 0100](rfc/0100-an-update-that-cannot-go-back.md)
+  drafted, nothing built. The lead decided four of its five questions that day: slots on raw
+  partitions read through UEFI Block I/O, a TPM NV counter advanced by the loader after a good
+  boot, the verified in-memory initrd as the immutable root for now, and a package key of its own
 - **Audit framework** — hash-chained log over the telemetry plane, remote attestation. Third
   because the plane it consumes **already exists** ([RFC 0026](rfc/0026-telemetry-plane.md),
   Phase 2), which makes this the cheapest of the three to start and the one that moves T8 off
   *partial*. What is owed is precise: the `Audit` class is **reserved and refused** today —
   emitting it is counted and dropped — and this row is the backpressure ring, the hash chain, and
-  audit-grade naming
+  audit-grade naming. **Where it stands, 2026-10-31**:
+  [RFC 0101](rfc/0101-a-log-that-cannot-be-quietly-edited.md) drafted, nothing built, and all four
+  questions decided by the lead that day: fail closed, the chain in a ring-3 `auditd`, the anchor
+  and attestation in a later RFC, and capability and domain events first, kept on the disk
 - **Hosted-process address-space randomisation** — **before the L1 row below, and that is the
   point.** Bhaskix's own services are Rust; the software L1–L4 brings is C, and a hosted process at
   a fixed image base with a fixed stack turns any bug in BusyBox or `curl` into a reliable exploit.

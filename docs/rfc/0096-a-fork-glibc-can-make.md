@@ -142,6 +142,9 @@ base; `SIGCHLD` later.
 4. **`SIGCHLD`: now or later?** Nothing sends it today, and `wait4` does not need it. An
    interactive shell's job control does. *Recommended: later*, with that as its trigger.
 
+**Questions 1 and 4, taken up 2026-10-31:** the vfork shape and `SIGCHLD` are
+[RFC 0099](0099-children-a-shell-and-go-can-start-and-hear-from.md), built that day.
+
 **Recorded, not in scope:**
 - **`pthread_join`'s wait on `CLONE_CHILD_CLEARTID` for threads.** `linuxd` discards the thread
   tid addresses (`user/linuxd/src/main.rs:1006`).

@@ -33,6 +33,10 @@ pub mod number {
     /// Asks a process to end, and *can* be caught, which is the whole point
     /// of [RFC 0083](../../docs/rfc/0083-a-signal-a-process-can-catch.md).
     pub const SIGTERM: u64 = 15;
+    /// A child ended -- RFC 0099. Its default is to be *ignored*, not to end
+    /// anything, and a parent that sets it to `SIG_IGN` has its children
+    /// reaped for it.
+    pub const SIGCHLD: u64 = 17;
     /// The highest signal number this personality knows.
     pub const MAX: usize = 64;
 }
@@ -49,6 +53,59 @@ pub mod flags {
     /// The handler returns through a restorer the caller supplies, which is
     /// how every real libc and the Go runtime do it.
     pub const RESTORER: u64 = 0x0400_0000;
+}
+
+/// `sa_handler`'s two values that are not addresses.
+pub mod action {
+    /// The default disposition.
+    pub const SIG_DFL: u64 = 0;
+    /// Ignore the signal.
+    pub const SIG_IGN: u64 = 1;
+}
+
+/// What a signal does to a process -- RFC 0099.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Disposition {
+    /// Its default: to end the process, for every signal this personality
+    /// raises but `SIGCHLD`, whose default is to be ignored.
+    Default,
+    /// `SIG_IGN`: nothing happens.
+    Ignore,
+    /// A handler the process installed.
+    Handler(Handler),
+}
+
+/// What a parent is told when its child ends -- RFC 0099.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ChildEnded {
+    /// Raise the child's exit signal at the parent, whose handler runs.
+    Raise,
+    /// Reap the child now: the parent set `SIGCHLD` to `SIG_IGN`, and its
+    /// `wait4` then finds no such child, as on Linux.
+    Reap,
+    /// Nothing: `SIGCHLD`'s default is to be ignored, and the child stays to
+    /// be collected by `wait4`.
+    Nothing,
+}
+
+/// Decides what a parent whose disposition for the child's exit signal is
+/// `disposition` is told when that child ends -- RFC 0099.
+///
+/// **The reap is `SIGCHLD`'s alone**: Linux reaps a child for its parent only
+/// when the exit signal is `SIGCHLD` and the parent ignores it (recalled from
+/// its `do_notify_parent`, not read here). An exit signal other than `SIGCHLD`
+/// reaches a handler and nothing else -- its default is not acted on, a limit
+/// RFC 0099 states rather than a parent this ends.
+#[must_use]
+pub fn on_child_end(disposition: Disposition, exit_signal: u64) -> ChildEnded {
+    if exit_signal == 0 {
+        return ChildEnded::Nothing;
+    }
+    match disposition {
+        Disposition::Handler(_) => ChildEnded::Raise,
+        Disposition::Ignore if exit_signal == number::SIGCHLD => ChildEnded::Reap,
+        Disposition::Ignore | Disposition::Default => ChildEnded::Nothing,
+    }
 }
 
 /// One installed handler.
@@ -387,7 +444,32 @@ impl Dispositions {
     pub fn handler(&self, signal: u64) -> Option<Handler> {
         let index = usize::try_from(signal).ok()?;
         let handler = self.handlers.get(index)?;
-        (handler.entry != 0).then_some(*handler)
+        // **`SIG_IGN` is not an address** -- RFC 0099, 2026-10-31. This read
+        // `entry != 0`, so a process that set a signal to `SIG_IGN` had a
+        // "handler" at address 1: a `SIGTERM` it had asked to ignore was made
+        // pending and delivered to a jump to 1.
+        (handler.entry > action::SIG_IGN).then_some(*handler)
+    }
+
+    /// What `signal` does to this process: its default, ignored, or a handler
+    /// -- RFC 0099. `SIGKILL` is always its default, as [`Self::raise`] says.
+    #[must_use]
+    pub fn disposition(&self, signal: u64) -> Disposition {
+        if signal == number::SIGKILL {
+            return Disposition::Default;
+        }
+        let Some(entry) = usize::try_from(signal)
+            .ok()
+            .filter(|index| *index != 0 && *index < number::MAX)
+            .and_then(|index| self.handlers.get(index))
+        else {
+            return Disposition::Default;
+        };
+        match entry.entry {
+            action::SIG_DFL => Disposition::Default,
+            action::SIG_IGN => Disposition::Ignore,
+            _ => Disposition::Handler(*entry),
+        }
     }
 
     /// Records an alternate stack, returning the previous one.
@@ -856,6 +938,71 @@ mod tests {
         // for one signal.
         assert!(!dispositions.has_pending());
         assert_eq!(dispositions.take_pending(), None);
+    }
+
+    #[test]
+    fn a_signal_set_to_sig_ign_is_ignored_and_never_delivered_to_address_one() {
+        // RFC 0099: until 2026-10-31 `handler` counted `SIG_IGN`'s entry of 1
+        // as a handler, so this raise made the signal pending and delivery
+        // would have jumped to 1.
+        let mut dispositions = Dispositions::new();
+        let ignore = Handler {
+            entry: action::SIG_IGN,
+            ..Handler::default()
+        };
+        dispositions.install(number::SIGTERM, ignore).unwrap();
+        assert_eq!(
+            dispositions.disposition(number::SIGTERM),
+            Disposition::Ignore
+        );
+        assert_eq!(dispositions.handler(number::SIGTERM), None);
+        assert!(!dispositions.raise(number::SIGTERM));
+        assert!(!dispositions.has_pending());
+        // And the three dispositions read as they are.
+        assert_eq!(
+            dispositions.disposition(number::SIGCHLD),
+            Disposition::Default
+        );
+        let caught = Handler {
+            entry: 0x4000,
+            ..Handler::default()
+        };
+        dispositions.install(number::SIGCHLD, caught).unwrap();
+        assert_eq!(
+            dispositions.disposition(number::SIGCHLD),
+            Disposition::Handler(caught)
+        );
+        // `SIGKILL` is its default whatever was written for it.
+        dispositions.install(number::SIGKILL, ignore).unwrap();
+        assert_eq!(
+            dispositions.disposition(number::SIGKILL),
+            Disposition::Default
+        );
+    }
+
+    #[test]
+    fn a_childs_end_is_raised_to_a_handler_reaped_under_sig_ign_and_otherwise_left() {
+        let caught = Disposition::Handler(Handler {
+            entry: 0x4000,
+            ..Handler::default()
+        });
+        assert_eq!(on_child_end(caught, number::SIGCHLD), ChildEnded::Raise);
+        assert_eq!(
+            on_child_end(Disposition::Ignore, number::SIGCHLD),
+            ChildEnded::Reap
+        );
+        // SIGCHLD's default is to be ignored: the child waits for `wait4`.
+        assert_eq!(
+            on_child_end(Disposition::Default, number::SIGCHLD),
+            ChildEnded::Nothing
+        );
+        // No exit signal, no news; and the reap is SIGCHLD's alone.
+        assert_eq!(on_child_end(caught, 0), ChildEnded::Nothing);
+        assert_eq!(
+            on_child_end(Disposition::Ignore, number::SIGTERM),
+            ChildEnded::Nothing
+        );
+        assert_eq!(on_child_end(caught, number::SIGTERM), ChildEnded::Raise);
     }
 
     #[test]

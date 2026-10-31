@@ -4,7 +4,8 @@
 
 **Status: DRAFT.** Written 2026-08-30 for the release dated **29 November 2026**
 ([roadmap.md](roadmap.md#first-release--29-november-2026), criterion R7),
-**refreshed 2026-10-08 and again 2026-10-19**. The release is tagged
+**refreshed 2026-10-08 and again 2026-10-19**, and its stale figures and
+statuses on 2026-10-31, the day of a release rehearsal. The release is tagged
 **`v0.1.0-preview`**, and how it gets out the door is
 [release-checklist.md](release-checklist.md). Every number below is a
 measurement, and every measurement has a date. **They must be re-taken on the
@@ -83,7 +84,7 @@ document, release note or README may state or imply that it works."*
 
 | It does this | Proven by |
 |---|---|
-| Boots on BIOS, on UEFI, and on its own loader `bhaskixboot.efi` | the boot lanes; **173 passing checks** on the BIOS lane alone (`ok` lines, measured 2026-10-19; 162 on 2026-10-08, 119 on 2026-08-30). ~~**CI runs no native-loader lane**; locally it runs three.~~ **Wrong since 2026-10-11, corrected 2026-10-19**: CI runs four native-loader lanes, two of them with an emulated TPM. On the one physical machine, **it boots through its own loader to the user-mode shell** — sixteen CPUs, observed 2026-10-11 (see [the hardware](#what-the-one-piece-of-hardware-told-us)) |
+| Boots on BIOS, on UEFI, and on its own loader `bhaskixboot.efi` | the boot lanes; **184 passing checks** on the BIOS lane alone (`ok` lines, measured 2026-10-31 on `c847297`; 173 on 2026-10-19, 162 on 2026-10-08, 119 on 2026-08-30). ~~**CI runs no native-loader lane**; locally it runs three.~~ **Wrong since 2026-10-11, corrected 2026-10-19**: CI runs four native-loader lanes, two of them with an emulated TPM. On the one physical machine, **it boots through its own loader to the user-mode shell** — sixteen CPUs, observed 2026-10-11 (see [the hardware](#what-the-one-piece-of-hardware-told-us)) |
 | Starts its CPUs with its own INIT-SIPI and schedules across them | boot lanes, `threads`/`migration` gates — four CPUs in the lanes, eight in the soaks, and **16 of 16** on the SR550 |
 | Runs ring 3 programs holding capabilities and nothing else | boot lanes, `ring 3` and fault-injection gates |
 | Answers a user-mode shell from services in separate domains — block driver, console, filesystem | `shell-test.sh`; **23 gates** (`user` mode), **54** (`iommu` mode), measured 2026-10-19 (22 and 53 on 2026-08-30) |
@@ -94,14 +95,15 @@ document, release note or README may state or imply that it works."*
 | Installs, runs and removes packages with manifest-derived grants | RFC 0030 |
 | Programs an IOMMU and confines device DMA | `iommu` lanes; four units programmed on real hardware, 2026-08-25 |
 | Loads and runs real static Linux binaries; BusyBox `sh` reaches a prompt and answers what is typed at it -- since 2026-10-31 including a command that is not one of its builtins, through glibc's `fork()` ([RFC 0096](rfc/0096-a-fork-glibc-can-make.md)) | `busybox-test.sh`, locally (CI does not run it — see [Running it](#running-it)). **This release's ISO does not carry BusyBox**: it is GPL-2.0, and shipping its binary would oblige publishing its source. A build from source fetches it: Ubuntu's plain-amd64 `busybox-static` 1.37.0, pinned by sha256 in `tools/fetch-busybox.sh` since 2026-10-29 (it was the build machine's own until then) |
-| **Runs an unmodified Go `net/http` server** as a hosted Linux process: 16 keep-alive clients for 300 s, **61,447 responses, every body checked, 0 errors** (2026-10-01); for 30 s on every push, **5,717 responses, 0 errors** (2026-10-19) | `make test-http` (30 s) in `make test` and CI; RFC 0086, accepted 2026-10-04. **This release's ISO carries the server** |
+| **Runs an unmodified Go `net/http` server** as a hosted Linux process: 16 keep-alive clients for 300 s, **61,447 responses, every body checked, 0 errors** (2026-10-01); for 30 s on every push, **5,516 responses, 0 errors** (2026-10-31 on `c847297`; 5,717 on 2026-10-19) | `make test-http` (30 s) in `make test` and CI; RFC 0086, accepted 2026-10-04. **This release's ISO carries the server** |
 | Hosted Linux processes `fork` (a copy the kernel makes), wait on futexes, send, take and catch signals, are ended while running, and write and truncate files on disk | the gates of RFC 0079, 0080, 0083, 0084 and 0085, and of RFC 0060, 0065 and 0077 — all accepted |
+| **Since 2026-10-31: the fork glibc makes, threads glibc can join, a program that can find itself, and the vfork Go starts programs with.** A forked child starts with its parent's whole register file, floating-point state and thread-local base; a thread made by `pthread_create` can be joined; `readlink("/proc/self/exe")`, `cmdline` and `environ` answer for a program the adapter exec'd; `SIGCHLD` reaches a handler, and `SIG_IGN` reaps children | the probes `linux fork reg`, `linux join`, `linux vfork` and the hosted program's line, each armed; [RFC 0096](rfc/0096-a-fork-glibc-can-make.md), [0097](rfc/0097-threads-glibc-can-join.md) and [0098](rfc/0098-a-program-that-can-find-itself.md) accepted, [0099](rfc/0099-children-a-shell-and-go-can-start-and-hear-from.md) built and a draft |
 | **Records what it booted in a TPM, and checks the record.** The native loader measures the kernel and initrd into PCR 9 and the command line into PCR 8. The event log reaches the kernel, and `bin/tpmd` **replays it against the TPM**: `log and TPM agree on PCRs 0-9` (2026-10-19), and a log that lies about the kernel is caught | `make test-boot-native-tpm` and `-tpm-tis`, against an emulated TPM (swtpm) over CRB and TIS. ~~**locally only** — it needs Docker, and CI does not run it yet. RFC 0089 is a **draft**, and nothing *verifies* the measurements~~ — **wrong since 2026-10-11, corrected 2026-10-19**: CI runs both lanes, and RFC 0089 was accepted 2026-10-11. On the SR550's own TPM: `log and TPM agree on PCRs 0-7, 9 ... over FIFO` (2026-10-11). **Recorded, not refused**: see below |
 | **Boots on physical hardware** — a Lenovo SR550, read over serial-over-LAN | 2026-08-23 through Limine; through its own loader to the user-mode shell since 2026-10-11 |
 
-Alongside, **as measured on 2026-10-29**: **63 of 93 RFCs accepted** (61 of 93 on
-2026-10-20, before the lead accepted RFC 0092 and RFC 0093; 61 of 92 on
-2026-10-19, before RFC 0093 was drafted), each
+Alongside, **as measured on 2026-10-31**: **67 of 101 RFCs accepted** (63 of 93
+on 2026-10-29; 61 of 93 on 2026-10-20, before the lead accepted RFC 0092 and RFC
+0093; 61 of 92 on 2026-10-19, before RFC 0093 was drafted), each
 accepted one implemented and measured rather than merely written. The command:
 
 ```sh
@@ -109,12 +111,13 @@ for f in docs/rfc/0*.md; do grep -m1 Status "$f"; done \
   | grep -ciE '^\| \*\*Status\*\* \| *(✅ *)?\*\*accepted'
 ```
 
-`docs/rfc/` holds 95 files: the template, `0040-libcrux-inspection.md` (RFC
-0040's step-1 output rather than an RFC), and 93 RFCs. ~~`grep -ci accepted`~~
+`docs/rfc/` holds 103 files: the template, `0040-libcrux-inspection.md` (RFC
+0040's step-1 output rather than an RFC), and 101 RFCs (95 files and 93 RFCs on
+2026-10-29). ~~`grep -ci accepted`~~
 was this note's command until 2026-10-19, and it reads 62 from that day, because
 RFC 0092's status says "connections nobody accepted". Host unit tests:
-**1,414** (`cargo test --workspace`, summed across one `make test` run,
-2026-10-29 on `18985db`; 1,411 on 2026-10-20 on `61bb353`, 1,407 earlier that day on `a8c0df0`, 1,398 on
+**1,488** (`make test-host`, summed, 2026-10-31 on the change that carries this
+refresh; 1,414 on 2026-10-29 on `18985db`; 1,411 on 2026-10-20 on `61bb353`, 1,407 earlier that day on `a8c0df0`, 1,398 on
 2026-10-19, 1,339 on 2026-10-08).
 
 > **Dated 2026-09-23, because this line was the only measurement in the document
@@ -160,7 +163,8 @@ Stated as plainly as the list above, because that is what criterion R7 asks for.
   them and detects a damaged download. It does not detect a malicious one,
   because anyone who could replace a binary could replace the sums.
 - ~~**Nothing written survives a reboot.**~~ **Removed from this list
-  2026-10-30, [RFC 0095](rfc/0095-a-disk-that-keeps-what-was-written.md).** Until
+  2026-10-30, [RFC 0095](rfc/0095-a-disk-that-keeps-what-was-written.md)**,
+  built and gated, and still a draft for the lead to accept (2026-10-31). Until
   then the writable filesystem was formatted at every boot (measured 2026-10-19:
   two boots on one disk image, `1 installed` and then `0 installed`). A boot now
   formats the disk only when it carries the project's marker, which a new disk
@@ -178,8 +182,8 @@ Stated as plainly as the list above, because that is what criterion R7 asks for.
   buffers stay held for the rest of the boot. A server that closes and listens
   again is refused, and the adapter holds three listeners per boot.~~
   **Corrected 2026-10-20: a hosted listener can be closed**
-  ([RFC 0092](rfc/0092-a-listener-that-can-be-closed.md), built and gated, for
-  the lead to accept). Its port is free the moment it closes, and connections
+  ([RFC 0092](rfc/0092-a-listener-that-can-be-closed.md), built and gated,
+  ~~for the lead to accept~~ accepted by the lead on 2026-10-29). Its port is free the moment it closes, and connections
   it took and nobody accepted are reset, as on Linux. What remains: the adapter
   holds **three listeners at once**, and a closed one keeps its place until
   every connection it accepted has ended. Its step 0 measured the old refusal,
@@ -424,8 +428,9 @@ fresh checkout may build against a later 8.x; the release build pins the tag.
 - [TRACKER.md](../TRACKER.md) — what is *proven* versus what merely compiles,
   the open defects, and a changelog that records the mistakes as well as the
   results.
-- [docs/rfc/](rfc/) — 93 RFCs; the 61 accepted ones were each built and measured
-  before acceptance (2026-10-20).
+- [docs/rfc/](rfc/) — 101 RFCs; the 67 accepted ones were each built and measured
+  before acceptance (2026-10-31; ~~93 and 61 on 2026-10-20~~, which contradicted
+  the 63 of 93 above until this line was corrected the same day).
 - [docs/security.md](security.md) — the threat model, and which threats are
   mitigated versus merely named.
 - [docs/roadmap.md](roadmap.md) — scope, and the release criteria this note is

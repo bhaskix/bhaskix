@@ -10,8 +10,8 @@
 
 | | |
 |---|---|
-| RFCs accepted | **65** |
-| RFCs open | 31 |
+| RFCs accepted | **67** |
+| RFCs open | 32 |
 | RFCs closed without shipping | 2 |
 | Milestone rows done | **92 of 95** |
 | Phase 2 bullets done | **13 of 13** |
@@ -33,6 +33,7 @@ gantt
     RFC 0088 A clock a process reads itself :active, r0088, 2026-10-02, 2026-10-31
     RFC 0089 A boot the TPM records :done, r0089, 2026-10-08, 2026-10-11
     RFC 0091 A boot its owner signed :active, r0091, 2026-10-12, 2026-10-31
+    RFC 0100 An update that cannot go back :active, r0100, 2026-10-31, 2026-10-31
     section Filesystem & storage
     RFC 0003 Storage architecture :active, r0003, 2026-08-03, 2026-10-31
     RFC 0006 Kosh — unified storage from one node to many :active, r0006, 2026-08-03, 2026-10-31
@@ -63,6 +64,7 @@ gantt
     RFC 0081 a thread belongs to an incarnation not a slot :crit, r0081, 2026-09-16, 1d
     RFC 0082 a domain's own memory is charged to its envelope :done, r0082, 2026-09-19, 2026-10-04
     RFC 0084 a fork the kernel copies :done, r0084, 2026-09-23, 2026-10-04
+    RFC 0101 A log that cannot be quietly edited :active, r0101, 2026-10-31, 2026-10-31
     section Networking
     RFC 0018 A network stack outside the kernel and a socket... :done, r0018, 2026-08-12, 2026-08-13
     RFC 0020 TCP as a state machine that can be tested... :done, r0020, 2026-08-14, 2026-08-16
@@ -115,8 +117,9 @@ gantt
     RFC 0086 The motivating workload — a Go HTTP server under... :done, r0086, 2026-09-30, 2026-10-04
     RFC 0094 A program's vector registers are its own :done, r0094, 2026-10-30, 2026-10-31
     RFC 0096 A fork glibc can make :done, r0096, 2026-10-30, 2026-10-31
-    RFC 0097 Threads glibc can join :active, r0097, 2026-10-31, 2026-10-31
-    RFC 0098 A program that can find itself :active, r0098, 2026-10-31, 2026-10-31
+    RFC 0097 Threads glibc can join :done, r0097, 2026-10-31, 1d
+    RFC 0098 A program that can find itself :done, r0098, 2026-10-31, 1d
+    RFC 0099 Children a shell and Go can start and hear from :active, r0099, 2026-10-31, 2026-10-31
     section Process & tooling
     RFC 0001 License — Apache-2.0 :done, r0001, 2026-08-03, 1d
     RFC 0007 Live patching the nucleus :active, r0007, 2026-08-04, 2026-10-31
@@ -205,8 +208,9 @@ gantt
 | 0088 | A clock a process reads itself | 2026-10-02 |
 | 0091 | A boot its owner signed | 2026-10-12 |
 | 0095 | A disk that keeps what was written | 2026-10-30 |
-| 0097 | Threads glibc can join | 2026-10-31 |
-| 0098 | A program that can find itself | 2026-10-31 |
+| 0099 | Children a shell and Go can start and hear from | 2026-10-31 |
+| 0100 | An update that cannot go back | 2026-10-31 |
+| 0101 | A log that cannot be quietly edited | 2026-10-31 |
 
 ## Annexes
 

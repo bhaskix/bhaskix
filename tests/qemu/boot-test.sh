@@ -2942,6 +2942,20 @@ else
     status=1
 fi
 
+# RFC 0099: a vfork with Go's flags holds its parent until the child has ended,
+# so wait4(WNOHANG) collects it the moment clone returns; the child's SIGCHLD
+# reaches the parent's handler once; SIG_IGN on SIGCHLD reaps a child for its
+# parent, so wait4 answers ECHILD; and SIGTERM set to SIG_IGN is ignored.
+if grep -qE "linux vfork +a vfork held its parent until the child had ended: wait4 with WNOHANG collected pid [1-9][0-9]* at once, status 0x700; its SIGCHLD reached the parent's handler once; with SIGCHLD set to SIG_IGN a forked child reaped itself and wait4 answered ECHILD; SIGTERM set to SIG_IGN was ignored" "$LOG"; then
+    pass "a vfork held its parent, SIGCHLD reached a handler, and SIG_IGN reaped a child and ignored a SIGTERM"
+elif grep -qE "linux vfork +skipped, needs a second cpu" "$LOG"; then
+    pass "the vfork probe needs a second cpu, and said so"
+else
+    fail "the vfork, SIGCHLD and SIG_IGN probe"
+    grep -E "linux vfork" "$LOG" || true
+    status=1
+fi
+
 # RFC 0094 steps 1 and 2: what the CPU offers and what the plan enabled, read on
 # every lane -- `qemu64` has no XSAVE and keeps FXSAVE; TCG `max` and KVM have it
 # -- and the plan applied and read back on every CPU, so a thread migrated

@@ -1195,6 +1195,12 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
     ) {
         println!("\x1b[91m    linux join     FAILED\x1b[0m");
     }
+    if !vfork_self_test(
+        handoff.hhdm_base.as_u64(),
+        bhaskix_arch::percpu::online_count(),
+    ) {
+        println!("\x1b[91m    linux vfork    FAILED\x1b[0m");
+    }
     if !vector_self_test(
         handoff.hhdm_base.as_u64(),
         bhaskix_arch::percpu::online_count(),
@@ -8635,6 +8641,216 @@ fn thread_join_self_test(hhdm_base: u64, cpus: u32) -> bool {
             "\x1b[91m    linux join     FAILED: tid {tid}, the word at once {at_once:#x}, {waits} \
              wait(s), the last answered {}, the word after {after:#x}, finished {done}\x1b[0m",
             last as i64
+        );
+        false
+    }
+}
+
+/// The vfork-and-SIGCHLD probe -- RFC 0099. Assembled from
+/// [`tools/probes/linux-vfork-sigchld.s`](../../tools/probes/linux-vfork-sigchld.s)
+/// by [`tools/probe-bytes.sh`](../../tools/probe-bytes.sh): a vfork with Go's
+/// flags that must hold its parent until the child has ended, a SIGCHLD that
+/// must reach the parent's handler, SIG_IGN that must reap a child for it, and
+/// a SIGTERM set to SIG_IGN that must be ignored.
+#[rustfmt::skip]
+const VFORK_SIGCHLD_CODE: [u8; 354] = [
+    0x49, 0x89, 0xff,                         // mov %rdi,%r15
+    0x6a, 0x00,                               // pushq $0x0
+    0x48, 0x8d, 0x05, 0x4d, 0x01, 0x00, 0x00, // lea 0x14d(%rip),%rax # 159 <restorer>
+    0x50,                                     // push %rax
+    0xb8, 0x04, 0x00, 0x00, 0x04,             // mov $0x4000004,%eax
+    0x50,                                     // push %rax
+    0x48, 0x8d, 0x05, 0x33, 0x01, 0x00, 0x00, // lea 0x133(%rip),%rax # 14d <handler>
+    0x50,                                     // push %rax
+    0x48, 0x89, 0xe6,                         // mov %rsp,%rsi
+    0xbf, 0x11, 0x00, 0x00, 0x00,             // mov $0x11,%edi
+    0x31, 0xd2,                               // xor %edx,%edx
+    0x41, 0xba, 0x08, 0x00, 0x00, 0x00,       // mov $0x8,%r10d
+    0xb8, 0x0d, 0x00, 0x00, 0x00,             // mov $0xd,%eax
+    0x0f, 0x05,                               // syscall
+    0x48, 0x83, 0xc4, 0x20,                   // add $0x20,%rsp
+    0xbf, 0x11, 0x41, 0x00, 0x00,             // mov $0x4111,%edi
+    0x31, 0xf6,                               // xor %esi,%esi
+    0x31, 0xd2,                               // xor %edx,%edx
+    0x45, 0x31, 0xd2,                         // xor %r10d,%r10d
+    0x45, 0x31, 0xc0,                         // xor %r8d,%r8d
+    0xb8, 0x38, 0x00, 0x00, 0x00,             // mov $0x38,%eax
+    0x0f, 0x05,                               // syscall
+    0x48, 0x85, 0xc0,                         // test %rax,%rax
+    0x0f, 0x84, 0xcf, 0x00, 0x00, 0x00,       // je 124 <vchild>
+    0x49, 0x89, 0x47, 0x08,                   // mov %rax,0x8(%r15)
+    0x48, 0x89, 0xc7,                         // mov %rax,%rdi
+    0x49, 0x8d, 0x77, 0x18,                   // lea 0x18(%r15),%rsi
+    0xba, 0x01, 0x00, 0x00, 0x00,             // mov $0x1,%edx
+    0x45, 0x31, 0xd2,                         // xor %r10d,%r10d
+    0xb8, 0x3d, 0x00, 0x00, 0x00,             // mov $0x3d,%eax
+    0x0f, 0x05,                               // syscall
+    0x49, 0x89, 0x47, 0x10,                   // mov %rax,0x10(%r15)
+    0xb8, 0x27, 0x00, 0x00, 0x00,             // mov $0x27,%eax
+    0x0f, 0x05,                               // syscall
+    0x49, 0x8b, 0x4f, 0x48,                   // mov 0x48(%r15),%rcx
+    0x49, 0x89, 0x4f, 0x20,                   // mov %rcx,0x20(%r15)
+    0x6a, 0x00,                               // pushq $0x0
+    0x6a, 0x00,                               // pushq $0x0
+    0x6a, 0x00,                               // pushq $0x0
+    0x6a, 0x01,                               // pushq $0x1
+    0x48, 0x89, 0xe6,                         // mov %rsp,%rsi
+    0xbf, 0x11, 0x00, 0x00, 0x00,             // mov $0x11,%edi
+    0x31, 0xd2,                               // xor %edx,%edx
+    0x41, 0xba, 0x08, 0x00, 0x00, 0x00,       // mov $0x8,%r10d
+    0xb8, 0x0d, 0x00, 0x00, 0x00,             // mov $0xd,%eax
+    0x0f, 0x05,                               // syscall
+    0x48, 0x83, 0xc4, 0x20,                   // add $0x20,%rsp
+    0xb8, 0x39, 0x00, 0x00, 0x00,             // mov $0x39,%eax
+    0x0f, 0x05,                               // syscall
+    0x48, 0x85, 0xc0,                         // test %rax,%rax
+    0x0f, 0x84, 0x8d, 0x00, 0x00, 0x00,       // je 142 <fchild>
+    0x48, 0xc7, 0xc7, 0xff, 0xff, 0xff, 0xff, // mov $0xffffffffffffffff,%rdi
+    0x31, 0xf6,                               // xor %esi,%esi
+    0x31, 0xd2,                               // xor %edx,%edx
+    0x45, 0x31, 0xd2,                         // xor %r10d,%r10d
+    0xb8, 0x3d, 0x00, 0x00, 0x00,             // mov $0x3d,%eax
+    0x0f, 0x05,                               // syscall
+    0x49, 0x89, 0x47, 0x28,                   // mov %rax,0x28(%r15)
+    0x6a, 0x00,                               // pushq $0x0
+    0x6a, 0x00,                               // pushq $0x0
+    0x6a, 0x00,                               // pushq $0x0
+    0x6a, 0x01,                               // pushq $0x1
+    0x48, 0x89, 0xe6,                         // mov %rsp,%rsi
+    0xbf, 0x0f, 0x00, 0x00, 0x00,             // mov $0xf,%edi
+    0x31, 0xd2,                               // xor %edx,%edx
+    0x41, 0xba, 0x08, 0x00, 0x00, 0x00,       // mov $0x8,%r10d
+    0xb8, 0x0d, 0x00, 0x00, 0x00,             // mov $0xd,%eax
+    0x0f, 0x05,                               // syscall
+    0x48, 0x83, 0xc4, 0x20,                   // add $0x20,%rsp
+    0xb8, 0x27, 0x00, 0x00, 0x00,             // mov $0x27,%eax
+    0x0f, 0x05,                               // syscall
+    0x48, 0x89, 0xc7,                         // mov %rax,%rdi
+    0xbe, 0x0f, 0x00, 0x00, 0x00,             // mov $0xf,%esi
+    0xb8, 0x3e, 0x00, 0x00, 0x00,             // mov $0x3e,%eax
+    0x0f, 0x05,                               // syscall
+    0x49, 0x89, 0x47, 0x30,                   // mov %rax,0x30(%r15)
+    0x49, 0xc7, 0x47, 0x38, 0x01, 0x00, 0x00, 0x00, // movq $0x1,0x38(%r15)
+    0x49, 0x8b, 0x4f, 0x48,                   // mov 0x48(%r15),%rcx
+    0x49, 0x89, 0x4f, 0x40,                   // mov %rcx,0x40(%r15)
+    0x49, 0xc7, 0x07, 0x01, 0x00, 0x00, 0x00, // movq $0x1,(%r15)
+    0xeb, 0xfe,                               // jmp 122 <_start+0x122>
+    0xbb, 0x64, 0x00, 0x00, 0x00,             // mov $0x64,%ebx
+    0xb8, 0x18, 0x00, 0x00, 0x00,             // mov $0x18,%eax
+    0x0f, 0x05,                               // syscall
+    0xff, 0xcb,                               // dec %ebx
+    0x75, 0xf5,                               // jne 129 <vchild+0x5>
+    0xbf, 0x07, 0x00, 0x00, 0x00,             // mov $0x7,%edi
+    0xb8, 0xe7, 0x00, 0x00, 0x00,             // mov $0xe7,%eax
+    0x0f, 0x05,                               // syscall
+    0xeb, 0xfe,                               // jmp 140 <vchild+0x1c>
+    0x31, 0xff,                               // xor %edi,%edi
+    0xb8, 0xe7, 0x00, 0x00, 0x00,             // mov $0xe7,%eax
+    0x0f, 0x05,                               // syscall
+    0xeb, 0xfe,                               // jmp 14b <fchild+0x9>
+    0x48, 0x8d, 0x05, 0xac, 0xfe, 0x01, 0x00, // lea 0x1feac(%rip),%rax # 20000 <restorer+0x1fea7>
+    0x48, 0xff, 0x40, 0x48,                   // incq 0x48(%rax)
+    0xc3,                                     // retq
+    0xb8, 0x0f, 0x00, 0x00, 0x00,             // mov $0xf,%eax
+    0x0f, 0x05,                               // syscall
+    0xeb, 0xf7,                               // jmp 159 <restorer>
+];
+
+/// Where the vfork probe's report page lands physically.
+static VFORK_REPORT_PA: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Where the vfork probe runs, in [`enter_probe`]'s layout.
+const VFORK_AT: u64 = 0x0000_0000_3800_0000;
+
+extern "C" fn ring3_vfork(hhdm_base: u64) -> ! {
+    enter_probe(
+        hhdm_base,
+        &VFORK_SIGCHLD_CODE,
+        VFORK_AT,
+        &VFORK_REPORT_PA,
+        0,
+    )
+}
+
+/// RFC 0099: **children a shell and Go can start and hear from.** A vfork
+/// holds its parent until the child has ended, so `wait4(WNOHANG)` collects it
+/// the moment `clone` returns; the child's SIGCHLD reaches the parent's
+/// handler once; SIG_IGN reaps a child for its parent, so `wait4` answers
+/// ECHILD; and SIGTERM set to SIG_IGN is ignored rather than delivered to
+/// address 1.
+fn vfork_self_test(hhdm_base: u64, cpus: u32) -> bool {
+    use core::sync::atomic::Ordering;
+
+    if cpus < 2 {
+        println!("\x1b[93m    linux vfork    skipped, needs a second cpu\x1b[0m");
+        return true;
+    }
+    let cpu = cpus.saturating_sub(1);
+    VFORK_REPORT_PA.store(0, Ordering::Release);
+    let Ok(realm) = domain::create("vfork", domain::ResourceEnvelope::new()) else {
+        println!("\x1b[91m    linux vfork    FAILED: no domain\x1b[0m");
+        return false;
+    };
+    if !tag_linux(realm, "linux vfork    ") {
+        return false;
+    }
+    let options = sched::SpawnOptions::new()
+        .pinned()
+        .in_domain(realm.as_u32());
+    if sched::spawn_on_with(cpu, "vfork", ring3_vfork, hhdm_base, hhdm_base, options).is_err() {
+        println!("\x1b[91m    linux vfork    FAILED: the probe would not spawn\x1b[0m");
+        retire_probe(realm);
+        return false;
+    }
+    // Words as the probe's note lists them. Word 0 is its last store, so it
+    // is read first -- see `finished_report`.
+    let mut words = [0u64; 10];
+    for _ in 0..1000 {
+        let report_pa = VFORK_REPORT_PA.load(Ordering::Acquire);
+        if let Some(read) = finished_report(hhdm_base, report_pa, &[0]) {
+            words = read;
+            break;
+        }
+        wait_millis(5);
+    }
+    retire_probe(realm);
+
+    let [
+        done,
+        pid,
+        collected,
+        status,
+        handled,
+        ignored_wait,
+        killed,
+        survived,
+        handled_end,
+        _,
+    ] = words;
+    let echild = -10i64 as u64;
+    if done == 1
+        && pid > 0
+        && collected == pid
+        && status & 0xffff == 0x700
+        && handled == 1
+        && ignored_wait == echild
+        && killed == 0
+        && survived == 1
+        && handled_end == 1
+    {
+        println!(
+            "    linux vfork    a vfork held its parent until the child had ended: wait4 with \
+             WNOHANG collected pid {pid} at once, status 0x700; its SIGCHLD reached the parent's \
+             handler once; with SIGCHLD set to SIG_IGN a forked child reaped itself and wait4 \
+             answered ECHILD; SIGTERM set to SIG_IGN was ignored"
+        );
+        true
+    } else {
+        println!(
+            "\x1b[91m    linux vfork    FAILED: pid {pid}, WNOHANG wait4 answered {} (status \
+             {status:#x}), the handler ran {handled} time(s) then {handled_end}, wait4 under \
+             SIG_IGN answered {}, kill answered {}, survived {survived}, finished {done}\x1b[0m",
+            collected as i64, ignored_wait as i64, killed as i64
         );
         false
     }

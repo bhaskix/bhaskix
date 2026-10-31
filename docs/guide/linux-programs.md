@@ -201,9 +201,16 @@ until [RFC 0096](../rfc/0096-a-fork-glibc-can-make.md), answering
 `sh: can't fork: Function not implemented`. The child starts as it would on
 Linux, with its parent's registers, floating-point state and thread-local base.
 
-What is still missing: no `SIGCHLD` is sent when a child ends, so job control
-would not work (and `sh` turns it off anyway, saying `can't access tty` above);
-and the `vfork` shape a Go program uses to start another program is refused.
+~~What is still missing: no `SIGCHLD` is sent when a child ends, so job control
+would not work; and the `vfork` shape a Go program uses to start another program
+is refused.~~ *Both since 2026-10-31*
+([RFC 0099](../rfc/0099-children-a-shell-and-go-can-start-and-hear-from.md)): a
+parent that installs a `SIGCHLD` handler hears when a child ends, and one that
+sets `SIGCHLD` to `SIG_IGN` has its children reaped for it; and a `vfork`, the
+way Go starts a program, holds the parent until the child has started its new
+program or ended, as on Linux. Checked by the project's own tests -- no program
+in this guide starts one. `sh` still turns job control off, saying `can't access
+tty` above.
 
 Until 2026-10-20 `sh` did not even get that far: the kernel put it down two
 seconds after starting it, at its second prompt, which a person reading the

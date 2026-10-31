@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | ⬜ **Draft 2026-10-31 — built and gated the same day.** No questions: the one rule that decides it is RFC 0005's. Drafted at the lead's request, ahead of its recorded trigger. |
+| **Status** | ✅ **ACCEPTED 2026-10-31 by the project lead**, on CI run 893's green. Drafted, built and gated the same day. No questions: the one rule that decides it is RFC 0005's. Drafted at the lead's request, ahead of its recorded trigger. |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | userspace (`bin/linuxd`, `personality`) |
 | **Milestone** | L1 ([roadmap.md](../roadmap.md)) — two rows of TRACKER §4's *Carried out of RFC 0005* |

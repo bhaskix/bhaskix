@@ -181,6 +181,10 @@ pub struct Process {
     /// What it was exec'd as -- RFC 0098 -- or `None` for a process this
     /// adapter did not exec, whose path it does not know and will not invent.
     pub image: Option<Image>,
+    /// The signal its parent is sent when it ends -- RFC 0099: 17, `SIGCHLD`,
+    /// for a `fork` or a vfork; the low byte of a `clone`'s flags otherwise;
+    /// zero for a process nothing hosted started, which has no parent to tell.
+    pub exit_signal: u8,
 }
 
 /// How long an exec'd path may be: `bin/linuxd`'s own `MAX_NAME`.
@@ -335,6 +339,8 @@ impl Process {
             state: State::Live,
             // Nothing exec'd it yet; a process the kernel started never has one.
             image: None,
+            // Nobody hosted started it, so nobody is told when it ends.
+            exit_signal: 0,
         }
     }
 
@@ -562,6 +568,8 @@ impl Process {
             // **The child is the same program**, with its strings at the same
             // addresses in its copy of the memory -- Linux's fork keeps both.
             image: self.image,
+            // Set by whoever forked it, from the `clone` that asked.
+            exit_signal: 0,
         }
     }
 }

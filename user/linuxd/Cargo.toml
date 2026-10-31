@@ -292,7 +292,11 @@ asm_budget = 3
 # forbids `unsafe`), and the forked children's floating-point images waiting
 # for their first call. The fork writes the child's trampoline and tid word
 # through `COPY_OUT`, which costs nothing new.
-unsafe_budget = 142
+# 143 later on 2026-10-31, up one: RFC 0099's table of vfork parents held until
+# their child execs or ends -- one accessor, the same single-threaded statement.
+# The park reuses the wake pool, and the decision about a child's end is
+# `bhaskix-personality`'s, which forbids `unsafe`.
+unsafe_budget = 143
 # Up five for RFC 0005 step 9's datagram page: the volatile writes that stage
 # a payload into it, the volatile reads that take one back out, and the static
 # that remembers whether it has been mapped.

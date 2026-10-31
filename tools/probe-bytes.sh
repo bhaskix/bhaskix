@@ -27,6 +27,16 @@ work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 
 as --64 -o "$work/probe.o" "$source"
+# **No relocations: the bytes are copied, never linked** (2026-10-31). A
+# reference to a global symbol -- `lea _start+0x20000(%rip)` -- assembles as a
+# zero displacement and a relocation, and the copy below would have shipped the
+# zero: RFC 0099's handler wrote into its own code until a local label replaced
+# `_start`. Refused here, so it cannot be shipped quietly again.
+if readelf -r "$work/probe.o" | grep -q 'R_X86_64'; then
+    echo "probe-bytes: $source assembles with relocations, which a copy cannot apply:" >&2
+    readelf -r "$work/probe.o" | grep 'R_X86_64' >&2
+    exit 1
+fi
 objcopy -O binary --only-section=.text "$work/probe.o" "$work/probe.bin"
 objdump -d "$work/probe.o" > "$work/probe.dis"
 

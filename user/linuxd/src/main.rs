@@ -1088,23 +1088,26 @@ fn answer_with_frame(domain: u32, thread: u32, slot: u64, number: u64) -> (u64, 
                 // **glibc's `fork()`** -- RFC 0096: the fork below, with the
                 // tid words it asked for.
                 ClonePlan::Process {
+                    exit_signal,
                     child_tid,
                     clear_tid,
                     parent_tid,
-                    ..
-                } => (
-                    REPLY_VALUE,
-                    answer_fork(
-                        &request,
-                        &image,
-                        slot,
-                        TidWords {
-                            child: child_tid,
-                            clear: clear_tid,
-                            parent: parent_tid,
-                        },
-                    ),
-                ),
+                    hold,
+                } => {
+                    let words = TidWords {
+                        child: child_tid,
+                        clear: clear_tid,
+                        parent: parent_tid,
+                    };
+                    if hold {
+                        answer_vfork(&request, &image, slot, words, exit_signal)
+                    } else {
+                        (
+                            REPLY_VALUE,
+                            answer_fork(&request, &image, slot, words, exit_signal),
+                        )
+                    }
+                }
                 ClonePlan::Refuse(errno) => (REPLY_VALUE, Answer::error(errno)),
             }
         }
@@ -1197,6 +1200,7 @@ fn answer_with_frame(domain: u32, thread: u32, slot: u64, number: u64) -> (u64, 
                 &image,
                 slot,
                 TidWords::default(),
+                bhaskix_personality::signal::number::SIGCHLD as u8,
             ),
         ),
         _ => (REPLY_VALUE, bhaskix_personality::call::ENOSYS),
@@ -1964,6 +1968,15 @@ fn answer_kill(request: &PersonalityCall) -> (u64, Answer) {
         if dispositions_of(domain).blocked() & (1u64 << (signal & 63)) != 0 {
             SIGNALS_RAISED_BLOCKED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         }
+        // **`SIG_IGN` is honoured** -- RFC 0099: a process that asked to
+        // ignore the signal is neither interrupted nor ended. Until
+        // 2026-10-31 its `SIG_IGN` read as a handler at address 1.
+        if dispositions_of(domain).disposition(signal)
+            == bhaskix_personality::signal::Disposition::Ignore
+        {
+            caught += 1;
+            continue;
+        }
         if dispositions_of(domain).raise(signal) {
             SIGNALS_RAISED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             // **The pid, here, where it is still true** — see [`RAISED_AS_PID`].
@@ -2025,7 +2038,12 @@ fn answer_kill(request: &PersonalityCall) -> (u64, Answer) {
         if dispositions_of(request.domain).blocked() & (1u64 << (signal & 63)) != 0 {
             SIGNALS_RAISED_BLOCKED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         }
-        if dispositions_of(request.domain).raise(signal) {
+        if dispositions_of(request.domain).disposition(signal)
+            == bhaskix_personality::signal::Disposition::Ignore
+        {
+            // Ignored, as at another process above -- RFC 0099.
+            caught += 1;
+        } else if dispositions_of(request.domain).raise(signal) {
             SIGNALS_RAISED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             publish_signals();
             caught += 1;
@@ -4433,6 +4451,114 @@ struct ForkFp {
 /// Same justification again.
 static mut FORK_FP: [Option<ForkFp>; FORK_FP_WAITING] = [None; FORK_FP_WAITING];
 
+/// How many vfork parents may be held at once -- RFC 0099. A vfork past it is
+/// told `EAGAIN` before anything is made.
+const VFORK_HOLDS: usize = 4;
+
+/// A vfork parent held until its child execs or ends -- RFC 0099.
+#[derive(Clone, Copy)]
+struct VforkHold {
+    domain: u32,
+    thread: u32,
+    child: u32,
+    slot: usize,
+    released: bool,
+}
+
+/// Same justification again.
+static mut HOLDS: [Option<VforkHold>; VFORK_HOLDS] = [None; VFORK_HOLDS];
+
+/// The held vfork parents.
+fn holds() -> &'static mut [Option<VforkHold>; VFORK_HOLDS] {
+    // SAFETY: single-threaded, as the note at `processes`.
+    unsafe { &mut *core::ptr::addr_of_mut!(HOLDS) }
+}
+
+/// Lets go of the parent held for `child`, if one is -- its child has exec'd
+/// or ended (RFC 0099). Marked and woken; the parent's retry takes the answer.
+fn release_vfork(child: u32) {
+    for hold in holds().iter_mut().flatten() {
+        if hold.child == child && !hold.released {
+            hold.released = true;
+            let _ = call(
+                syscall::INVOKE,
+                WAKE_SLOT + hold.slot as u64,
+                method::SIGNAL,
+                [0; 4],
+            );
+        }
+    }
+}
+
+/// A domain is gone: any hold its threads were under goes with it.
+fn vfork_forget(domain: u32) {
+    for slot in holds().iter_mut() {
+        if slot.is_some_and(|hold| hold.domain == domain) {
+            *slot = None;
+        }
+    }
+}
+
+/// **`clone` with `CLONE_VFORK`** -- RFC 0099: the fork RFC 0096 finished, a
+/// copy, and the parent held until the child execs or ends, which is vfork's
+/// promise. Go's `os/exec` asks for exactly this.
+///
+/// The first time the parent asks, the child is built and started and the
+/// parent parks; the kernel asks again once the child lets it go, and the
+/// second answer is the child's pid. A wake that comes early parks it again.
+fn answer_vfork(
+    request: &PersonalityCall,
+    image: &[u64; FAULT_REGISTERS],
+    slot: u64,
+    words: TidWords,
+    exit_signal: u8,
+) -> (u64, Answer) {
+    let (domain, thread) = (request.domain, request.thread);
+    if let Some(index) = holds()
+        .iter()
+        .position(|hold| hold.is_some_and(|hold| hold.domain == domain && hold.thread == thread))
+    {
+        let Some(hold) = holds()[index] else {
+            return (REPLY_VALUE, Answer::error(-11));
+        };
+        let held = take_slot(ParkKind::Vfork, domain, thread);
+        if hold.released || held.is_none() {
+            holds()[index] = None;
+            if let Some(wake) = held {
+                release_wake(wake);
+            }
+            return (REPLY_VALUE, Answer::ok(u64::from(hold.child)));
+        }
+        hold_slot(ParkKind::Vfork, domain, thread, hold.slot);
+        return (
+            REPLY_BLOCK_ON_RETRY,
+            Answer::ok(WAKE_SLOT + hold.slot as u64),
+        );
+    }
+    // Room to hold the parent, before anything is made.
+    let Some(free) = holds().iter().position(Option::is_none) else {
+        return (REPLY_VALUE, Answer::error(-11)); // EAGAIN
+    };
+    let Some(wake) = claim_wake() else {
+        return (REPLY_VALUE, Answer::error(-11)); // EAGAIN
+    };
+    let made = answer_fork(request, image, slot, words, exit_signal);
+    // A pid is positive; an errno arrives negative.
+    let Some(child) = u32::try_from(made.value as i64).ok().filter(|pid| *pid > 0) else {
+        release_wake(wake);
+        return (REPLY_VALUE, made);
+    };
+    holds()[free] = Some(VforkHold {
+        domain,
+        thread,
+        child,
+        slot: wake,
+        released: false,
+    });
+    hold_slot(ParkKind::Vfork, domain, thread, wake);
+    (REPLY_BLOCK_ON_RETRY, Answer::ok(WAKE_SLOT + wake as u64))
+}
+
 /// Whether a forked child in `domain` has an image waiting.
 fn fork_fp_waiting(domain: u32) -> bool {
     fork_fp()
@@ -4936,6 +5062,8 @@ enum ParkKind {
     Futex = 3,
     /// A `read` of an eventfd at zero -- RFC 0086 step 5.
     EventFd = 4,
+    /// A vfork's parent, held until its child execs or ends -- RFC 0099.
+    Vfork = 5,
 }
 
 /// The wake slots parked callers hold, keyed by **thread**: `slot + 1` in bits
@@ -7407,7 +7535,48 @@ fn note_exit(domain: u32, exit: Exit) {
     // SAFETY: single-threaded by construction, as elsewhere here.
     let processes = processes();
     let _ = processes.ended(pid, exit);
+    child_ended(pid, parent);
     wake_waiter(parent);
+}
+
+/// **A child ended: what its parent is told** -- RFC 0099. Its exit signal,
+/// raised at a handler the parent installed and waking it if it is parked; or,
+/// where the parent set `SIGCHLD` to `SIG_IGN`, the child reaped now, so the
+/// parent's `wait4` finds no such child, as on Linux; or nothing, `SIGCHLD`'s
+/// default. And a vfork parent held for this child is let go.
+fn child_ended(child: u32, parent: u32) {
+    use bhaskix_personality::signal::{ChildEnded, on_child_end};
+    release_vfork(child);
+    if parent == 0 {
+        return;
+    }
+    let processes = processes();
+    let Some(signal) = processes
+        .by_pid(child)
+        .map(|record| u64::from(record.exit_signal))
+    else {
+        return;
+    };
+    let Some(parent_domain) = processes
+        .by_pid(parent)
+        .filter(|record| record.state == bhaskix_personality::process::State::Live)
+        .map(|record| record.domain)
+    else {
+        return;
+    };
+    match on_child_end(dispositions_of(parent_domain).disposition(signal), signal) {
+        ChildEnded::Raise => {
+            if dispositions_of(parent_domain).raise(signal) {
+                SIGNALS_RAISED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                publish_signals();
+                wake_parked(parent_domain);
+            }
+        }
+        ChildEnded::Reap => {
+            let _ = processes.collect(parent, bhaskix_personality::process::WaitFor::Pid(child));
+        }
+        ChildEnded::Nothing => {}
+    }
 }
 
 /// Gives back every socket a domain still holds.
@@ -7428,6 +7597,7 @@ fn release_sockets_of(domain: u32) {
     clone::forget_domain(domain);
     threads().forget_domain(domain);
     fork_fp_forget(domain);
+    vfork_forget(domain);
     // **Looked up, not admitted** (2026-10-31). `process_for` admits a record
     // when it finds no live one, and `FORGET` reaches here for a domain whose
     // process has often already ended -- so this made a stray record, reaped a
@@ -7662,6 +7832,7 @@ fn answer_fork(
     image: &[u64; FAULT_REGISTERS],
     slot: u64,
     words: TidWords,
+    exit_signal: u8,
 ) -> Answer {
     // **What the child starts with is its parent's**: the registers out of the
     // frame the kernel staged, the floating-point image out of the same slot,
@@ -7806,6 +7977,8 @@ fn answer_fork(
             // The capability kept above, recorded where the process is — RFC
             // 0079. `fork_into` deliberately does not carry the parent's.
             child.domain_slot = kept;
+            // And what its parent is to be sent when it ends -- RFC 0099.
+            child.exit_signal = exit_signal;
         }
         pid
     };
@@ -8114,6 +8287,9 @@ fn answer_execve(request: &PersonalityCall) -> (u64, Answer) {
             process.exec_into(child, generation, drawn_base(), |entry, last| {
                 give_back_descriptor(entry, last, from);
             });
+            // **A vfork parent held for this process is let go** -- RFC 0099:
+            // it has exec'd, which is the first of the two things vfork waits for.
+            release_vfork(pid);
             // **What it was exec'd as** -- RFC 0098: the path, and where its
             // new stack holds its strings.
             if let Ok(Some((arguments, environment))) = built {
@@ -8709,6 +8885,8 @@ fn forget(domain: u32) {
             },
         );
         let _ = processes.discard(pid);
+        // Its parent is told, as for any child that ends -- RFC 0099.
+        child_ended(pid, parent);
         // **And its parent told**, as `note_exit` tells it. A record with a
         // parent is kept as a zombie by `discard`, and a parent parked in
         // `wait4` is parked on a slot only this program signals -- without
