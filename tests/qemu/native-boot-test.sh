@@ -777,7 +777,7 @@ if [[ "${BHASKIX_TPM:-0}" != 1 ]]; then
         fi
     }
     echo "the signature arms: four ways a boot set fails its check, up to ${TIMEOUT}s each..."
-    printf '\377' | dd of="$ESP/bhaskix/initrd.tar" bs=1 seek=4096 conv=notrunc 2>/dev/null
+    "$REPO_ROOT/tools/flip-byte.sh" "$ESP/bhaskix/initrd.tar" 4096
     expect_unverified "one initrd byte changed" "the initrd is not the one boot.sig names"
     cp "$INITRD" "$ESP/bhaskix/initrd.tar"
     printf 'cmdline=kaslr=show quiet\n' > "$ESP/bhaskix/boot.conf"

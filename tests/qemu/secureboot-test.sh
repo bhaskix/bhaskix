@@ -168,7 +168,9 @@ fi
 # 3. The same, with one kernel byte changed after signing: link 2 refuses it,
 # and hands the machine back to the boot manager.
 stage "$WORK/bent" "$WORK/signed.efi"
-printf '\377' | dd of="$WORK/bent/bhaskix/kernel" bs=1 seek=100000 conv=notrunc 2>/dev/null
+# The complement of whatever is there, so the kernel really differs: a fixed
+# 0xff was a no-op on 2026-10-31, when that byte already held it.
+"$REPO_ROOT/tools/flip-byte.sh" "$WORK/bent/bhaskix/kernel" 100000
 # Until the loader hands back, and then the boot manager's answer about our disk,
 # past the five seconds the refusal stays on the screen.
 boot "$WORK/bent" "$WORK/bent.log" "returning to the boot manager" "failed to start $DISK"

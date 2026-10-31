@@ -81,7 +81,7 @@ else
     fail "OpenSSL did not verify a boot.sig signature bootsign made"
 fi
 cp "$WORK/statement" "$WORK/statement.bent"
-printf '\001' | dd of="$WORK/statement.bent" bs=1 seek=40 conv=notrunc status=none
+"$REPO_ROOT/tools/flip-byte.sh" "$WORK/statement.bent" 40
 if openssl pkeyutl -verify -pubin -keyform DER -inkey bootsign-pub.der -rawin \
         -in statement.bent -sigfile bootsign.sig >/dev/null 2>&1; then
     fail "OpenSSL verified bootsign's signature over a statement with a byte changed"
@@ -107,7 +107,7 @@ if "$BOOTSIGN" show "$WORK/esp" --public "$WORK/openssl.public" >/dev/null 2>&1;
 else
     fail "bootsign did not verify a signature OpenSSL made"
 fi
-printf '\001' | dd of="$WORK/esp/bhaskix/boot.sig" bs=1 seek=4000 conv=notrunc status=none
+"$REPO_ROOT/tools/flip-byte.sh" "$WORK/esp/bhaskix/boot.sig" 4000
 if "$BOOTSIGN" show "$WORK/esp" --public "$WORK/openssl.public" >/dev/null 2>&1; then
     fail "bootsign verified OpenSSL's signature with a byte of it changed"
 else
