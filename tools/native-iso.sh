@@ -32,7 +32,9 @@ OUT=${1:-$ROOT/build/bhaskix-native.iso}
 CMDLINE=${2:-}
 LOADER="$ROOT/boot/bhaskixboot/target/x86_64-unknown-uefi/release/bhaskixboot.efi"
 KERNEL="$ROOT/target/x86_64-unknown-none/release/bhaskix"
-INITRD="$ROOT/build/initrd.tar"
+# `NATIVE_INITRD` stages another -- the x86-64-v3 BusyBox's, for RFC 0094 step
+# 7's reading on the SR550 (2026-10-31). The default is the one every lane boots.
+INITRD="${NATIVE_INITRD:-$ROOT/build/initrd.tar}"
 BOOTSIGN="$ROOT/target/x86_64-unknown-linux-gnu/release/bootsign"
 TEST_KEY="$ROOT/tests/keys/bootsig-TEST-KEY.secret"
 

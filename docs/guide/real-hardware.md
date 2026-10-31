@@ -80,8 +80,9 @@ tools/native-iso.sh build/bhaskix-native.iso
 ```
 
 It is how the project boots its one physical test machine, a Lenovo
-ThinkSystem SR550. On 2026-10-30, mounted through its BMC and booted once with
-Secure Boot off, it said over serial-over-LAN:
+ThinkSystem SR550. On 2026-10-31, mounted through its BMC and booted once with
+Secure Boot off, its initrd carrying the x86-64-v3 BusyBox, it said over
+serial-over-LAN:
 
 ```
 bhaskixboot 0.0.0: the machine entered through our own door
@@ -90,12 +91,17 @@ bhaskixboot: console adopted; diagnostics go to both
 bhaskixboot: opening the boot volume
 bhaskixboot: allocating the kernel buffer
 bhaskixboot: the command line is empty; not measured
+bhaskixboot: SecureBoot reads 0 -- nothing verified this loader
+bhaskixboot: boot set hashed and checked: 16878408 bytes in 294217958 ticks, ~140 ms at 2095410 ticks/ms
 bhaskixboot: boot signature verified: key a6c913d8a0e2476e TEST KEY, NOT ENFORCED: Secure Boot is off
-bhaskixboot: memory map 47 descriptors, 200493448 KiB usable, 358976 KiB reclaimable; truncated: no
+bhaskixboot: memory map 45 descriptors, 200493232 KiB usable, 359192 KiB reclaimable; truncated: no
 bhaskixboot: boot services exited; the machine is ours
 …
-    boot cost      79337.447 ms to services up, console=domain vfs=domain
+    xstate         offered x87 sse avx bndregs bndcsr opmask zmm_hi256 hi16_zmm pkru (0x2ff, 2696 bytes for all); enabled x87 sse avx (0x7), 832 bytes, saved by xsaveopt; CR4.OSXSAVE at entry 0
+…
+    boot cost      79939.113 ms to services up, console=domain vfs=domain
   Bring-up complete. Nothing left to do at this milestone.
+  a user-mode shell. 'help' lists what it can do.
 bhaskix$
 ```
 
@@ -107,7 +113,7 @@ only you can change, sign it yourself: [Sign your own boot](secure-boot.md).
 
 | Machine | What works | What does not |
 |---|---|---|
-| Lenovo ThinkSystem SR550, one Xeon Silver 4110, 192 GiB | Boots to its shell through Limine (since 2026-08-22) and through its own loader (since 2026-10-11); its IOMMU confines every device; its TPM 2.0 records the boot; the keyboard through the BMC's remote console | Its disks sit behind a RAID 530-8i adapter Bhaskix does not drive; nothing is attached to its onboard SATA; its X722 network answers a ping but gets no address and opens no TCP connection; the USB keyboard port does not complete enumeration |
+| Lenovo ThinkSystem SR550, one Xeon Silver 4110, 192 GiB | Boots to its shell through Limine (since 2026-08-22) and through its own loader (since 2026-10-11); its IOMMU confines every device; its TPM 2.0 records the boot; AVX is enabled and each program's vector registers, the upper halves of `ymm` included, are kept across switches and signals, and an x86-64-v3 BusyBox runs (read 2026-10-31); the keyboard through the BMC's remote console | Its disks sit behind a RAID 530-8i adapter Bhaskix does not drive; nothing is attached to its onboard SATA; its X722 network answers a ping but gets no address and opens no TCP connection; the USB keyboard port does not complete enumeration |
 | QEMU (`q35`, from 4.2.1 to 10.2.1) | Everything the project's tests check | — |
 
 No other physical machine has been tried. If you boot one, the boot report says

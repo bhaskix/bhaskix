@@ -711,9 +711,12 @@ Read off serial-over-LAN:
   `UserMode`). Telling *reads 0* from *absent* or *unreadable* needs those two lines through `diag`.
   ~~That is recommended, not done~~ **Done 2026-10-30**: both lines are assembled whole and go
   through `diag`; the native lane reads both (`SecureBoot reads 0`, and `boot set hashed and
-  checked: 16462083 bytes in 1020149326 ticks, ~422 ms`). The next boot on the SR550 reads the
-  value. The loader's per-file `measured … into PCR …` lines take the same `serial::write` path
-  and are not visible there either; they are left as they are.
+  checked: 16462083 bytes in 1020149326 ticks, ~422 ms`). ~~The next boot on the SR550 reads the
+  value.~~ **Read on the SR550 2026-10-31:** `SecureBoot reads 0 -- nothing verified this loader`,
+  a value read rather than absent, agreeing with Redfish's `SecureBootEnable: false`; and `boot set
+  hashed and checked: 16878408 bytes in 294217958 ticks, ~140 ms at 2095410 ticks/ms`. The loader's
+  per-file `measured … into PCR …` lines take the same `serial::write` path and are not visible
+  there either (none in the 2026-10-31 capture); they are left as they are.
 - **Found staging it:** `tools/native-iso.sh` did not sign its ESP, which step 4 had taught every
   QEMU lane to do; it does now.
 - **Still open:** question 9's enrolment half (append a certificate to `db`, boot with Secure Boot

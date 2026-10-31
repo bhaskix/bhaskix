@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | ⬜ **Draft 2026-10-30 — ~~nothing built~~ steps 0-3 built and gated the same day, steps 4-5 on 2026-10-31 (AVX on; the x86-64-v3 BusyBox runs); steps 6-8 open. Both questions decided by the lead the same day, each as recommended**: AVX only, AVX-512 waiting on its trigger; the signal half in this RFC, and first (§*Unresolved questions*). Drafted at the lead's request, **ahead of its recorded trigger**: TRACKER's row asks for this RFC when an L1 program needs AVX or a distribution's packages assume x86-64-v3, and neither has happened — Ubuntu 26.04 still ships plain amd64 builds, and the pinned corpus uses one. |
+| **Status** | ⬜ **Draft 2026-10-30 — ~~nothing built~~ steps 0-3 built and gated the same day, steps 4-5 on 2026-10-31 (AVX on; the x86-64-v3 BusyBox runs); ~~steps 6-8 open~~ step 7 read on the SR550 the same day, all but the cost, which waits on step 6's line; steps 6 and 8 open. Both questions decided by the lead the same day, each as recommended**: AVX only, AVX-512 waiting on its trigger; the signal half in this RFC, and first (§*Unresolved questions*). Drafted at the lead's request, **ahead of its recorded trigger**: TRACKER's row asks for this RFC when an L1 program needs AVX or a distribution's packages assume x86-64-v3, and neither has happened — Ubuntu 26.04 still ships plain amd64 builds, and the pinned corpus uses one. |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | arch / sched / userspace (`bin/linuxd`, `personality`) |
 | **Milestone** | L1 ([roadmap.md](../roadmap.md)) — an unmodified x86-64-v3 Linux program runs |
@@ -485,6 +485,20 @@ the design rests on.
 6. **The cost, in the kernel.** Save-and-restore ticks per switch on the `cost` line, on every
    lane, and through KVM.
 7. **The SR550.** Its `xstate` line, its `CR4` at entry, the v3 BusyBox, and the cost: the
-   figures this draft could only take from another CPU.
+   figures this draft could only take from another CPU. **Read 2026-10-31, all but the cost**, in
+   one boot through the native loader from an image whose initrd carried the v3 BusyBox
+   (`NATIVE_INITRD=build/initrd-v3.tar tools/native-iso.sh`), on its Xeon Silver 4110:
+   - `xstate`: offered `x87 sse avx bndregs bndcsr opmask zmm_hi256 hi16_zmm pkru (0x2ff, 2696
+     bytes for all)`; enabled `x87 sse avx (0x7), 832 bytes, saved by xsaveopt`. `CR4.OSXSAVE at
+     entry 0`: the firmware handed over a CPU with it clear, and the kernel set it.
+   - `xstate live`: `xsaveopt with xcr0 0x7 on 16 of 16 cpus`, none arriving with `OSXSAVE`
+     already set.
+   - `vector state`: the `ymm` form, `0 of 128000 quadwords wrong`.
+   - `linux sig fp`: a handler overwrote all sixteen `ymm` registers, `0 of 64 quadwords wrong`.
+   - The v3 BusyBox: `hi from sh`.
+
+   **Not read: the cost.** No line prices a switch until step 6 adds one. The boot's two `FAILED`
+   lines, `dhcp client` (`nobody answered`) and `tcp client`, are this machine's known network
+   gap, not this RFC's.
 8. **Documents.** `scheduler.md` §6 states the `XSAVE` design, `security.md` gets its line, and
    TRACKER's rows close.
