@@ -156,9 +156,9 @@ printf 'cmdline=busybox=sh\n' > esp/bhaskix/boot.conf
 `busybox=sh` hands the keyboard to BusyBox's own `sh`, in a Linux domain,
 before the Bhaskix shell starts. Its prompt is `/ #`. `exit` gives the keyboard
 back, and the boot goes on to `bhaskix$`. This section was re-verified on
-2026-10-29 with the pinned BusyBox 1.37.0, on the change that pinned it (it was
-`7d710cc` on 2026-10-20, with the build machine's 1.30.1, after the fix
-described below):
+2026-10-31 with the pinned BusyBox 1.37.0, on the change that built RFC 0096, by
+typing every command shown (2026-10-29's run, before that change, ended
+`sh: can't fork`; `7d710cc` on 2026-10-20 used the build machine's 1.30.1):
 
 ```
 BusyBox v1.37.0 (Ubuntu 1:1.37.0-7ubuntu1) built-in shell (ash)
@@ -170,9 +170,9 @@ hello from busybox
 / # pwd
 /
 / # uname -a
-sh: can't fork: Function not implemented
+Linux bhaskix 3.2.0-bhaskix Bhaskix, a capability system; Linux is the ABI and not the kerne x86_64 GNU/Linux
 / # exit
-    busybox      297 calls, asked: 12 12 158 218 273 334 302 318 228 228 267 12 12 12 10 157 102 39 13 110 63 79 16 16 13 13 13 13 13 13 13 5 16 1 1 1 1 1 257 16 72 16 1 1 1 3 262 16 16 16 16 107 257 107 1 7 1 13 7 0 7 0 7 0 (and 233 more)
+    busybox      306 calls, asked: 12 12 158 218 273 334 302 318 228 228 267 12 12 12 10 157 102 39 13 110 63 79 16 16 13 13 13 13 13 13 13 5 16 1 1 1 1 1 257 16 72 16 1 1 1 3 262 16 16 16 16 107 257 107 1 7 1 13 7 0 7 0 7 0 (and 242 more)
 ```
 
 **A newer BusyBox needed one more answer.** 1.37.0's C library asks whether
@@ -181,11 +181,18 @@ the console is a terminal with `TCGETS2` rather than `TCGETS`. Until
 terminal and ran with no banner and no prompt, waiting for whole lines. The
 adapter now answers both requests the same way.
 
-**`sh`'s own commands run; a command that needs a new process does not, yet.**
-`echo` and `pwd` above are two of `sh`'s builtins. `uname` is not, and is refused
-— `sh: can't fork: Function not implemented` — because `sh` asks the adapter for
-a kind of `clone` that makes a process, and the adapter so far makes only
-threads. That is filed in TRACKER as L1 work.
+**A command that needs a new process runs too, since 2026-10-31.** `echo` and
+`pwd` above are two of `sh`'s builtins; `uname` is not, so `sh` makes a new
+process for it with glibc's `fork()` -- a kind of `clone` the adapter refused
+until [RFC 0096](../rfc/0096-a-fork-glibc-can-make.md), answering
+`sh: can't fork: Function not implemented`. The child starts as it would on
+Linux, with its parent's registers, floating-point state and thread-local base.
+
+What is still missing: no `SIGCHLD` is sent when a child ends, so job control
+would not work (and `sh` turns it off anyway, saying `can't access tty` above);
+and the `vfork` shape a Go program uses to start another program is refused.
+The version field `uname -a` prints is cut one character short, `...not the
+kerne` -- the text is a character too long for its field, and that is filed.
 
 Until 2026-10-20 `sh` did not even get that far: the kernel put it down two
 seconds after starting it, at its second prompt, which a person reading the

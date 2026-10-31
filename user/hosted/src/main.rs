@@ -376,15 +376,20 @@ extern "C" fn hosted_main(stack: *const u64) -> ! {
 /// **Corrected 2026-10-30**: this said the shell `fork`s, `execve`s a child and
 /// waits for it. Given a single command, `sh -c` replaces itself with it and
 /// never forks -- `strace` of the pinned binary on the build host. A fork
-/// would be glibc's `clone`, which this system refuses (RFC 0096). The text is
-/// printed by the program the shell became; an earlier version ran `echo` as a
-/// builtin, which proved the first two.
+/// would be glibc's `clone`, which this system refused until RFC 0096.
+///
+/// **Two commands since 2026-10-31, so the first forks** -- RFC 0096. The
+/// shell runs the first in a child made by glibc's `fork()`, waits for it, and
+/// runs the second; the two lines in that order are the fork, its `execve` and
+/// its `wait4` all working. An earlier version ran `echo` as a builtin, which
+/// proved the first two of the three things above.
 fn exec_busybox() {
     const PATH: &[u8] = b"/busybox\0";
     const ARG0: &[u8] = b"busybox\0";
     const ARG1: &[u8] = b"sh\0";
     const ARG2: &[u8] = b"-c\0";
-    const ARG3: &[u8] = b"/busybox echo bhaskix-busybox-forked\0";
+    const ARG3: &[u8] =
+        b"/busybox echo bhaskix-busybox-first; /busybox echo bhaskix-busybox-forked\0";
 
     let argv = [
         ARG0.as_ptr() as u64,

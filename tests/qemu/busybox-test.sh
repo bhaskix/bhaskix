@@ -280,6 +280,64 @@ else
     pass "poll was answered, so nothing complained about it"
 fi
 
+# **A command that is not a builtin** -- RFC 0096 (2026-10-31). `/ # uname -a`
+# answered `sh: can't fork: Function not implemented` until then: its trace of
+# 2026-10-20 showed `clone` (56), glibc's `fork()`, which this system refused.
+# The same command is typed here and must print this machine's `uname` answer.
+#
+# The answer is counted before and after, because `await` would also be
+# satisfied by a line that merely contained it -- and BusyBox asks where the
+# cursor is at a new prompt, which is answered first or the command is read as
+# the reply (the note on the second line above).
+#
+# **Plain `uname`, not `/busybox uname`**, and that was found rather than
+# planned: this lane's shell runs before the machine has a disk, and on a
+# machine with no IOMMU, so there is no `/busybox` to exec -- typed, it answers
+# `sh: /busybox: not found` (where it used to answer `can't fork`). A bare name
+# is BusyBox's own applet, which needs no file. The two-command `sh -c` from the
+# disk is the `iommu` boot lane's, which has one.
+cursor_asked() { grep -ao $'\033\\[6n' "$LOG" 2>/dev/null | wc -l; }
+answered=$(cursor_asked)
+(( answered > 2 )) && answered=2
+reply_if_asked() {
+    local tries=0
+    while ((tries < 12)); do
+        if (( $(cursor_asked) > answered )); then
+            printf '\033[1;3R' >&3
+            answered=$((answered + 1))
+            sleep 1
+            return 0
+        fi
+        sleep 0.25
+        ((tries++))
+    done
+    return 1
+}
+uname_line='Linux bhaskix 3\.2\.0-bhaskix .*x86_64'
+uname_count() { grep -acE "$uname_line" "$LOG" 2>/dev/null; }
+await_more() {
+    local before="$1" tries=0
+    while ((tries < 120)); do
+        (( $(uname_count) > before )) && return 0
+        kill -0 "$qemu" 2>/dev/null || return 1
+        sleep 0.25
+        ((tries++))
+    done
+    return 1
+}
+reply_if_asked || true
+before=$(uname_count)
+forks_refused=$(grep -ac "can't fork" "$LOG")
+printf 'uname -a\r' >&3
+if await_more "$before" && (( $(grep -ac "can't fork" "$LOG") == forks_refused )); then
+    pass "BusyBox's sh forked and ran a command that is not a builtin: $(grep -aoE "$uname_line" "$LOG" | tail -1 | cut -c1-60)..."
+else
+    fail "a typed uname -a printed no uname line -- the shell could not fork, or its child did not run"
+    grep -aE "can't fork|not found|uname" "$LOG" | tail -3 | sed 's/^/      /'
+    status=1
+fi
+reply_if_asked || true
+
 # And give it back. `exit` ends the shell, its domain ends, and the grant is
 # released with it -- which the next assertion is what checks.
 printf 'exit\r' >&3

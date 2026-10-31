@@ -319,11 +319,19 @@ fi
 # boot says `bhaskix.clients`, because a network is not a client -- see
 # `HOST_CLIENTS` in the kernel -- and this lane is the one whose drivers below
 # connect to ports 10 and 11.
+#
+# **And BusyBox, staged onto its disk** -- RFC 0096, 2026-10-31. Staging needs
+# BusyBox in the image, which every image carries as `bin/busybox`, and a block
+# service to write it through -- and a block service needs the IOMMU this lane
+# has: without one the ring 3 driver is given registers and no DMA window. So
+# this is the lane where the hosted program's two-command `sh -c` can run, for
+# about three seconds of staging; the interactive lane has no disk until after
+# its shell has gone.
 if [[ "$MODE" == "iommu" ]]; then
     ISO="$REPO_ROOT/build/iso-iommu-clients.iso"
-    make -C "$REPO_ROOT" iso CMDLINE="bhaskix.clients" \
+    make -C "$REPO_ROOT" iso CMDLINE="bhaskix.clients bhaskix.busybox=1" \
         ISO="$ISO" ISO_ROOT="$REPO_ROOT/build/iso_root_iommu_clients" >/dev/null 2>&1 || {
-        fail "could not build an image with bhaskix.clients"
+        fail "could not build an image with bhaskix.clients and BusyBox staged"
         exit 1
     }
 fi
@@ -2903,6 +2911,21 @@ else
     status=1
 fi
 
+# RFC 0096: a forked child starts with its parent's registers -- twelve general,
+# its stack, its TLS base, all sixteen xmm registers and MXCSR -- where it used
+# to start with all but rax, rip and rsp zero. And glibc's fork() shape, a clone
+# with CLONE_CHILD_SETTID, is a fork whose child's tid is its pid, written in
+# the child's copy of the word and not its parent's.
+if grep -qE "linux fork reg +a forked child started with its parent's registers -- twelve general, its stack, its TLS base, xmm0-xmm15 and MXCSR: 0 of 47 wrong \(pid [1-9][0-9]*\); glibc's fork, a clone with CLONE_CHILD_SETTID, gave a child whose tid is its pid \([1-9][0-9]*\), written in its own memory and not its parent's" "$LOG"; then
+    pass "a forked child started with its parent's registers, and glibc's fork shape wrote its tid -- its pid -- where it asked"
+elif grep -qE "linux fork reg +skipped, needs a second cpu" "$LOG"; then
+    pass "the fork-register probe needs a second cpu, and said so"
+else
+    fail "a forked child did not start with its parent's registers, or glibc's fork shape was not answered"
+    grep -E "linux fork reg" "$LOG" || true
+    status=1
+fi
+
 # RFC 0094 steps 1 and 2: what the CPU offers and what the plan enabled, read on
 # every lane -- `qemu64` has no XSAVE and keeps FXSAVE; TCG `max` and KVM have it
 # -- and the plan applied and read back on every CPU, so a thread migrated
@@ -4175,13 +4198,28 @@ fi
 #      became, which still proves more than a builtin did.
 #
 # Three is why the string says "forked", which it was not: an earlier version
-# ran `echo` as a builtin and proved the first two. The string is kept because
-# changing it means changing the probe and this gate together for no gain.
-if grep -qF "bhaskix-busybox-forked" "$LOG"; then
-    pass "L1: a hosted execve ran BusyBox's sh, which exec'd the command it was given, and it printed"
+# ran `echo` as a builtin and proved the first two. ~~The string is kept because
+# changing it means changing the probe and this gate together for no gain.~~
+# **It is true since 2026-10-31** (RFC 0096): the command is two commands, and
+# the shell runs the first in a child glibc's `fork()` makes -- so both lines,
+# in order, are the fork, its exec and its wait. The interactive lane stages
+# BusyBox and asserts the same; here it is asserted wherever BusyBox is staged.
+busybox_first=$(grep -an "bhaskix-busybox-first" "$LOG" | grep -v ';' | head -1 | cut -d: -f1)
+busybox_second=$(grep -an "bhaskix-busybox-forked" "$LOG" | grep -v ';' | head -1 | cut -d: -f1)
+if [[ -n "$busybox_first" && -n "$busybox_second" ]] && (( busybox_first < busybox_second )); then
+    pass "L1: BusyBox's sh ran two commands, the first in a child glibc's fork() made, and both printed in order"
+elif [[ -n "$busybox_second" ]]; then
+    fail "BusyBox's sh printed its second command's line but not the first's before it -- the fork did not run it"
+    status=1
 elif grep -qE "busybox disk +[0-9]+ bytes of BusyBox staged" "$LOG"; then
     fail "BusyBox was staged but the hosted execve of it produced no output"
     grep -aE "hosted exec busybox|busybox disk" "$LOG" | sed 's/^/                   /'
+    status=1
+elif [[ "$MODE" == "iommu" ]]; then
+    # The lane that asks for staging must not pass on a machine that skipped it:
+    # that would be the order check above never having been asked.
+    fail "this lane stages BusyBox, and nothing was staged"
+    grep -aE "busybox disk|fs domain" "$LOG" | head -3 | sed 's/^/                   /'
     status=1
 else
     pass "no BusyBox staged on this machine, so no hosted execve of it was tried"

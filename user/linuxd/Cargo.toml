@@ -286,7 +286,13 @@ asm_budget = 3
 # travels through the fault object's mapping -- one copy out of it, one copy
 # into it, and the word `FP_READ` writes beside the registers. Seven lines as
 # written, thirteen once rustfmt laid the three blocks out.
-unsafe_budget = 140
+# 142 on 2026-10-31, up two: RFC 0096's two tables, each one accessor with the
+# single-threaded statement every table here makes -- the Linux tid of each
+# hosted thread (the arithmetic is `bhaskix-personality`'s `Threads`, which
+# forbids `unsafe`), and the forked children's floating-point images waiting
+# for their first call. The fork writes the child's trampoline and tid word
+# through `COPY_OUT`, which costs nothing new.
+unsafe_budget = 142
 # Up five for RFC 0005 step 9's datagram page: the volatile writes that stage
 # a payload into it, the volatile reads that take one back out, and the static
 # that remembers whether it has been mapped.

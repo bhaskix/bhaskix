@@ -48,7 +48,7 @@ use bhaskix_personality::process::layout;
 use bhaskix_personality::process::{Exit, Process, Processes, Region};
 use bhaskix_personality::report;
 use bhaskix_personality::signal::{self, Dispositions, Handler, Registers, number::SIGSEGV};
-use bhaskix_personality::thread::{self, ClonePlan};
+use bhaskix_personality::thread::{self, ClonePlan, Threads};
 
 mod clone;
 mod epoll;
@@ -940,7 +940,7 @@ fn take_awaited_frame(domain: u32) -> Option<u64> {
 /// The register file is in `slot`, in the kernel's order — which is the one
 /// place both sides must agree and the reason that order is written down on
 /// each of them.
-fn answer_with_frame(domain: u32, slot: u64, number: u64) -> (u64, Answer) {
+fn answer_with_frame(domain: u32, thread: u32, slot: u64, number: u64) -> (u64, Answer) {
     // **A signal on the way out of a completed call**, RFC 0083. This frame
     // was asked for by the main loop rather than by a call that needs six
     // arguments, so it is answered here before `number` is looked at: the
@@ -981,6 +981,32 @@ fn answer_with_frame(domain: u32, slot: u64, number: u64) -> (u64, Answer) {
     // Linux's argument registers, out of the frame: rdi, rsi, rdx, r10, r8.
     let (rdi, rsi, rdx, r10, r8, r9) = (image[5], image[4], image[3], image[9], image[7], image[8]);
 
+    // **A forked child's first call** -- RFC 0096. Its parent's
+    // floating-point image goes in now, while the child is stopped in its
+    // trampoline's first call and before any of its parent's code runs, and
+    // the call is then answered as it would have been. `answer` asked for
+    // this frame for exactly these two numbers; see the top of it.
+    if matches!(number, ARCH_PRCTL | GETTID)
+        && let Some(waiting) = fork_fp_take(domain)
+    {
+        // The image came out of the parent through `FP_READ`, so the kernel's
+        // check passes it. If it ever did not, the child would run on with the
+        // initial state -- what every fork had before this RFC -- and the fork
+        // register probe is what says so.
+        let _ = fp_give(slot, &waiting.image[..waiting.bytes]);
+        let request = PersonalityCall::new(
+            Dialect::Linux,
+            number,
+            [rdi, rsi, rdx, r10, r8, r9],
+            thread,
+            domain,
+        );
+        // A value, and only a value: the kernel honours nothing else from the
+        // answer to a staged frame, and both calls answer one.
+        let (_, reply) = answer(&request);
+        return (REPLY_VALUE, reply);
+    }
+
     match number {
         // Five arguments, RFC 0086 step 3b. A stream records what it keeps
         // (`IPV6_V6ONLY`); a datagram socket has the known options accepted
@@ -990,7 +1016,7 @@ fn answer_with_frame(domain: u32, slot: u64, number: u64) -> (u64, Answer) {
                 Dialect::Linux,
                 number,
                 [rdi, rsi, rdx, r10, r8, r9],
-                0,
+                thread,
                 domain,
             );
             let stream = stream_fd(&request, rdi);
@@ -1013,7 +1039,7 @@ fn answer_with_frame(domain: u32, slot: u64, number: u64) -> (u64, Answer) {
                 Dialect::Linux,
                 number,
                 [rdi, rsi, rdx, r10, r8, r9],
-                0,
+                thread,
                 domain,
             );
             // On a stream the address is ignored, as Linux ignores it on a
@@ -1037,13 +1063,6 @@ fn answer_with_frame(domain: u32, slot: u64, number: u64) -> (u64, Answer) {
             )
         }
         CLONE => {
-            let plan = thread::plan_clone(rdi, rsi, rdx, r10, r8);
-            let ClonePlan::Thread { stack, tls, .. } = plan else {
-                let ClonePlan::Refuse(errno) = plan else {
-                    return (REPLY_VALUE, Answer::error(memory::errno::EINVAL));
-                };
-                return (REPLY_VALUE, Answer::error(errno));
-            };
             // ~~**The entry is `r9`, and that is this personality's own
             // contract rather than Linux's.**~~ Retired 2026-10-01 (RFC 0086
             // step 5): the child now starts as Linux starts it, just after the
@@ -1053,10 +1072,35 @@ fn answer_with_frame(domain: u32, slot: u64, number: u64) -> (u64, Answer) {
                 Dialect::Linux,
                 number,
                 [rdi, rsi, rdx, r10, r8, r9],
-                0,
+                thread,
                 domain,
             );
-            (REPLY_VALUE, clone::spawn(&request, &image, stack, tls))
+            match thread::plan_clone(rdi, rsi, rdx, r10, r8) {
+                ClonePlan::Thread { stack, tls, .. } => {
+                    (REPLY_VALUE, clone::spawn(&request, &image, stack, tls))
+                }
+                // **glibc's `fork()`** -- RFC 0096: the fork below, with the
+                // tid words it asked for.
+                ClonePlan::Process {
+                    child_tid,
+                    clear_tid,
+                    parent_tid,
+                    ..
+                } => (
+                    REPLY_VALUE,
+                    answer_fork(
+                        &request,
+                        &image,
+                        slot,
+                        TidWords {
+                            child: child_tid,
+                            clear: clear_tid,
+                            parent: parent_tid,
+                        },
+                    ),
+                ),
+                ClonePlan::Refuse(errno) => (REPLY_VALUE, Answer::error(errno)),
+            }
         }
         RT_SIGRETURN => {
             // The handler was entered with `rsp` at the frame base; the `ret`
@@ -1141,10 +1185,12 @@ fn answer_with_frame(domain: u32, slot: u64, number: u64) -> (u64, Answer) {
                     Dialect::Linux,
                     number,
                     [0; bhaskix_personality::call::ARGUMENTS],
-                    0,
+                    thread,
                     domain,
                 ),
                 &image,
+                slot,
+                TidWords::default(),
             ),
         ),
         _ => (REPLY_VALUE, bhaskix_personality::call::ENOSYS),
@@ -1775,7 +1821,7 @@ fn answer_tgkill(request: &PersonalityCall) -> (u64, Answer) {
     const SIGSEGV: u64 = 11;
 
     let (tid, signal) = (request.second(), request.third());
-    let itself = u32::try_from(tid).is_ok_and(|tid| tid == request.thread);
+    let itself = tid == tid_of(request);
     let fatal = matches!(signal, SIGABRT | SIGKILL | SIGSEGV);
     if itself && fatal {
         note_exit(
@@ -2049,6 +2095,15 @@ fn invoke(capability: u64, what: u64, args: [u64; 4]) -> Answer {
 /// report prints that count on every boot, so the progress is a number rather
 /// than a claim.
 fn answer(request: &PersonalityCall) -> (u64, Answer) {
+    // **A forked child's first call wants its frame** -- RFC 0096. Its
+    // parent's floating-point image is waiting, and a thread's state can be
+    // written only while it is stopped in a staged frame. The first call is
+    // always its trampoline's own, `arch_prctl` or `gettid`, before any of its
+    // parent's code runs; `answer_with_frame` installs the image and answers
+    // the call. Before `clone::seen`, so that is counted once, on the retry.
+    if matches!(request.number, ARCH_PRCTL | GETTID) && fork_fp_waiting(request.domain) {
+        return (REPLY_NEED_FRAME, Answer::ok(0));
+    }
     // A clone child's trampoline slot is freed on its second call -- see
     // `clone.rs` for the race its first call left open.
     clone::seen(request.domain, request.thread);
@@ -2159,7 +2214,12 @@ fn answer(request: &PersonalityCall) -> (u64, Answer) {
         CLOSE => return (REPLY_VALUE, answer_close(request)),
         DUP | DUP2 | DUP3 => return (REPLY_VALUE, answer_dup(request)),
         SCHED_YIELD => return (REPLY_YIELD, Answer::ok(0)),
-        EXIT => return (REPLY_END_THREAD, Answer::ok(0)),
+        EXIT => {
+            // The thread's number goes with it -- RFC 0096 -- because the
+            // nucleus may give its id to the next thread it starts.
+            threads().forget(request.domain, request.thread);
+            return (REPLY_END_THREAD, Answer::ok(0));
+        }
         // A Linux thread group's exit is every thread of it, and a hosted
         // process is a domain.
         //
@@ -2484,10 +2544,27 @@ fn answer_from_message(request: &PersonalityCall) -> Answer {
             Answer::ok(0)
         }
         // A thread id a hosted program can tell apart from its neighbours,
-        // and stable for the life of the thread. **It arrives in the badge**,
-        // whose high half the kernel stamps with the calling thread — a
-        // caller cannot supply one, which is why it can be believed.
-        GETTID => Answer::ok(u64::from(request.thread)),
+        // and stable for the life of the thread. **The thread arrives in the
+        // badge**, whose high half the kernel stamps with the calling thread —
+        // a caller cannot supply one, which is why it can be believed.
+        //
+        // ~~The badge's number is the answer~~ -- **the tid is its process's
+        // pid for a first thread since 2026-10-31** (RFC 0096 question 2), so
+        // that glibc's cached tid, `getpid()` and `gettid()` agree. See
+        // [`tid_of`].
+        GETTID => Answer::ok(tid_of(request)),
+        // `set_tid_address(tidptr)` -- RFC 0096. glibc keeps the answer as the
+        // thread's own tid and `raise()` sends to it, so it is what `gettid`
+        // answers; until this it was `ENOSYS`, and glibc kept `-38` as its
+        // tid. The address is recorded, and not acted on (the RFC's
+        // `pthread_join` gap).
+        SET_TID_ADDRESS => {
+            let tid = tid_of(request);
+            if let Some(record) = threads().get_mut(request.domain, request.thread) {
+                record.clear_tid = request.first();
+            }
+            Answer::ok(tid)
+        }
         // **The two older `stat` forms, mapped onto the one path resolution.**
         // BusyBox's `sh` stats `.` and `/tmp` before it does anything else, and
         // `ls` stats every name it lists. Both are `newfstatat` with `AT_FDCWD`
@@ -2646,6 +2723,15 @@ fn answer_from_message(request: &PersonalityCall) -> Answer {
                 [nucleus_thread(request), request.second(), 0, 0],
             );
             if set.status == status::OK {
+                // **Recorded, for a `fork`** -- RFC 0096 question 3: a forked
+                // child starts with its parent's base, and the nucleus cannot
+                // be asked for it back. The trampoline's own `arch_prctl` comes
+                // through here too, so a `CLONE_SETTLS` base is recorded the
+                // same way.
+                let _ = tid_of(request);
+                if let Some(record) = threads().get_mut(request.domain, request.thread) {
+                    record.fs_base = request.second();
+                }
                 Answer::ok(0)
             } else {
                 bhaskix_personality::call::ENOSYS
@@ -4225,6 +4311,8 @@ const WRITE: u64 = 1;
 const WRITE_BYTES: usize = 256;
 /// `gettid()`.
 const GETTID: u64 = 186;
+/// `set_tid_address(tidptr)`.
+const SET_TID_ADDRESS: u64 = 218;
 /// `sched_yield()`.
 const SCHED_YIELD: u64 = 24;
 /// `exit(status)` — this thread only.
@@ -4288,6 +4376,67 @@ static mut ARRIVALS: u64 = 0;
 /// Same `static mut` justification as [`DISPOSITIONS`]: one thread, one
 /// request at a time.
 static mut PROCESSES: Processes = Processes::new();
+
+/// Which Linux tid each hosted thread answers to -- RFC 0096. Same
+/// justification.
+static mut THREADS: Threads = Threads::new();
+
+/// How many forked children may be waiting for their first call at once. A
+/// `fork` past it is told `EAGAIN`; a child's first call follows its fork as
+/// soon as it is scheduled, so this is a bound, not a queue.
+const FORK_FP_WAITING: usize = 4;
+
+/// A forked child's floating-point image, taken from its parent at the fork
+/// and installed at the child's first call -- RFC 0096.
+#[derive(Clone, Copy)]
+struct ForkFp {
+    domain: u32,
+    bytes: usize,
+    image: [u8; FP_IMAGE],
+}
+
+/// Same justification again.
+static mut FORK_FP: [Option<ForkFp>; FORK_FP_WAITING] = [None; FORK_FP_WAITING];
+
+/// Whether a forked child in `domain` has an image waiting.
+fn fork_fp_waiting(domain: u32) -> bool {
+    fork_fp()
+        .iter()
+        .flatten()
+        .any(|waiting| waiting.domain == domain)
+}
+
+/// Takes `domain`'s waiting image, if it has one.
+fn fork_fp_take(domain: u32) -> Option<ForkFp> {
+    fork_fp()
+        .iter_mut()
+        .find(|slot| slot.is_some_and(|waiting| waiting.domain == domain))?
+        .take()
+}
+
+/// A domain is gone: an image that never reached its child goes with it.
+fn fork_fp_forget(domain: u32) {
+    let _ = fork_fp_take(domain);
+}
+
+/// The Linux tid of the calling thread -- RFC 0096: its process's pid for a
+/// process's first thread, a number drawn from the pid space for any other.
+///
+/// A thread is numbered the first time anything asks, which is soon enough
+/// because the one way a second thread comes to exist is a `clone`, and
+/// `clone::spawn` asks for its caller's first.
+fn tid_of(request: &PersonalityCall) -> u64 {
+    let Some(pid) = process_for(request.domain).map(|process| process.pid) else {
+        // No process to number it from -- the table is full. The nucleus's
+        // own number, which is what every tid was before RFC 0096.
+        return u64::from(request.thread);
+    };
+    threads()
+        .tid_for(request.domain, request.thread, pid, || {
+            processes().draw().ok()
+        })
+        .map_or(u64::from(request.thread), u64::from)
+}
 
 /// How many times each domain slot has been handed to this program.
 ///
@@ -4531,6 +4680,18 @@ fn sleepers() -> &'static mut [Sleeper; WAKES] {
 fn processes() -> &'static mut Processes {
     // SAFETY: single-threaded, as the note above.
     unsafe { &mut *core::ptr::addr_of_mut!(PROCESSES) }
+}
+
+/// The Linux tid of every hosted thread -- RFC 0096.
+fn threads() -> &'static mut Threads {
+    // SAFETY: single-threaded, as the note above.
+    unsafe { &mut *core::ptr::addr_of_mut!(THREADS) }
+}
+
+/// Forked children's floating-point images, waiting for their first call.
+fn fork_fp() -> &'static mut [Option<ForkFp>; FORK_FP_WAITING] {
+    // SAFETY: single-threaded, as the note above.
+    unsafe { &mut *core::ptr::addr_of_mut!(FORK_FP) }
 }
 
 /// The pipes this adapter holds for hosted processes.
@@ -7122,6 +7283,8 @@ fn release_sockets_of(domain: u32) {
     epoll::forget_domain(domain);
     eventfd::forget_domain(domain);
     clone::forget_domain(domain);
+    threads().forget_domain(domain);
+    fork_fp_forget(domain);
     let Some(process) = process_for(domain) else {
         return;
     };
@@ -7322,33 +7485,56 @@ fn inherit_dial(from: u32) {
 /// bytes moved through an object this program owns, a kilobyte at a time,
 /// with no new kernel mechanism at all.
 ///
-/// The child's first instruction is a **trampoline**, three instructions this
-/// program writes into a page of the child's own memory: zero `rax`, and jump
-/// to where the parent's `fork` returns. That is what makes `fork` answer
-/// **0 in the child and the child's pid in the parent** without the kernel
-/// having to start a thread from a register image.
+/// The child's first instruction is a **trampoline** this program writes into
+/// a page of the child's own memory, ending in a jump to where the parent's
+/// `fork` returns with `rax` zero. That is what makes `fork` answer **0 in
+/// the child and the child's pid in the parent** without the kernel having to
+/// start a thread from a register image.
 ///
-/// ## What this fork does not carry, said plainly
+/// ## ~~What this fork does not carry, said plainly~~ What it carries -- RFC 0096
 ///
-/// The child arrives with `rax` zero, the parent's stack pointer, and the
-/// parent's instruction pointer. **Every other register is empty**, because
-/// the only place the parent's registers exist is the CPU and the entry stub
-/// saves the caller-saved set alone (RFC 0032 step 8 recorded that narrowing
-/// and named its price: widening the stub means widening the hottest path in
-/// the system). A hand-written program that expects nothing else survives it;
-/// a compiled one does not, because a Linux `syscall` preserves the
-/// callee-saved registers and its caller relies on that.
+/// ~~The child arrives with `rax` zero, the parent's stack pointer, and the
+/// parent's instruction pointer. **Every other register is empty**~~ --
+/// **true until 2026-10-31**, when RFC 0096 finished it. The trampoline was
+/// three instructions, and the child arrived with every register but `rax`,
+/// `rip` and `rsp` zero, its floating-point state and TLS base the initial
+/// ones: a fork that copied an address space correctly and handed the child a
+/// register file a compiled program could not accept, because a Linux
+/// `syscall` preserves everything but `rax`, `rcx` and `r11` and glibc's
+/// inline `fork` relies on that.
 ///
-/// So this is a fork that **copies an address space correctly** and hands the
-/// child a register file it should not have to accept. The measurement is
-/// real; the call is not yet one a real program can use, and L2 is where that
-/// has to be true.
-fn answer_fork(request: &PersonalityCall, image: &[u64; FAULT_REGISTERS]) -> Answer {
-    // The parent's own `rip` and `rsp`, out of the frame the kernel staged --
-    // the same two words `rt_sigreturn` reads, at the same offsets, because
-    // there is one register order and both sides write it down.
-    let rip = image[15];
-    let rsp = image[17];
+/// Now the child starts on `clone`'s trampoline with the parent's **whole
+/// register file** from the staged frame, its **TLS base** as this program
+/// recorded it at `arch_prctl`, and its **floating-point image** read out of
+/// the parent's slot here and installed at the child's first call. The same
+/// function answers `fork` (57) and glibc's `clone` shape, which adds the tid
+/// words in [`TidWords`].
+fn answer_fork(
+    request: &PersonalityCall,
+    image: &[u64; FAULT_REGISTERS],
+    slot: u64,
+    words: TidWords,
+) -> Answer {
+    // **What the child starts with is its parent's**: the registers out of the
+    // frame the kernel staged, the floating-point image out of the same slot,
+    // and the TLS base this program recorded when the parent set it.
+    let registers = clone::registers_of(image);
+    let tls = threads()
+        .get(request.domain, request.thread)
+        .map(|record| record.fs_base)
+        .filter(|base| *base != 0);
+    let mut fp = [0u8; FP_IMAGE];
+    let Some((_, fp_bytes)) = fp_take(slot, &mut fp) else {
+        return Answer::error(-11); // EAGAIN
+    };
+    // Somewhere for the image to wait, a record for the child's thread and a
+    // pid to give it, all before anything is made.
+    if fork_fp().iter().all(Option::is_some)
+        || !threads().has_room()
+        || processes().next_pid().is_none()
+    {
+        return Answer::error(-11); // EAGAIN
+    }
 
     let made = call(
         syscall::INVOKE,
@@ -7374,7 +7560,15 @@ fn answer_fork(request: &PersonalityCall, image: &[u64; FAULT_REGISTERS]) -> Ans
     // **And its right to dial, if it had one** — RFC 0090 step 7. Before the
     // child's first thread starts, so it cannot reach `connect` ungranted.
     inherit_dial(request.domain);
-    let outcome = build_fork_child(request, rip, rsp);
+    // **The child's pid, read before it is built** -- RFC 0096: its tid is
+    // that pid, and `CLONE_CHILD_SETTID` writes it into the child before the
+    // child runs. Read here, after `took_spawned`, because forgetting a reused
+    // slot can admit a record; nothing from here to `admit` below does.
+    let child_pid = processes().next_pid();
+    let outcome = match child_pid {
+        Some(pid) => build_fork_child(request, &registers, tls, words.child.map(|at| (at, pid))),
+        None => Err(-11), // EAGAIN
+    };
     // **Keep a capability to the child before letting go of the build slot** —
     // RFC 0079. `CHILD` is one slot, reused by the next fork, and until now it
     // was simply deleted here: this program then named no running hosted
@@ -7440,8 +7634,9 @@ fn answer_fork(request: &PersonalityCall, image: &[u64; FAULT_REGISTERS]) -> Ans
         return Answer::error(-11); // EAGAIN
     };
     let _ = kept;
-    let Some(copied) = outcome else {
-        return Answer::error(-12); // ENOMEM
+    let (copied, child_thread) = match outcome {
+        Ok(built) => built,
+        Err(errno) => return Answer::error(errno),
     };
 
     // The record last, so that a child which fails to build leaves none.
@@ -7466,17 +7661,60 @@ fn answer_fork(request: &PersonalityCall, image: &[u64; FAULT_REGISTERS]) -> Ans
         }
         pid
     };
+    // The number written into the child is this one: nothing admitted a
+    // record between the read and the admission.
+    debug_assert_eq!(Some(pid), child_pid);
+    // **The child's thread, numbered as its pid, with its parent's base** --
+    // and its parent's floating-point image, waiting for its first call. The
+    // child cannot be answered before this program returns to its loop, so
+    // both are in place before it asks.
+    if let Ok(record) = threads().record(child_domain, child_thread, pid) {
+        record.fs_base = tls.unwrap_or(0);
+        record.clear_tid = words.clear.unwrap_or(0);
+    }
+    if let Some(free) = fork_fp().iter_mut().find(|waiting| waiting.is_none()) {
+        *free = Some(ForkFp {
+            domain: child_domain,
+            bytes: fp_bytes,
+            image: fp,
+        });
+    }
+    // `CLONE_PARENT_SETTID`, in the parent's memory. A word that cannot be
+    // written is not a reason to unmake a child that exists: the pid is still
+    // the answer.
+    if let Some(at) = words.parent {
+        let _ = copy_out(request.domain, at, &pid.to_le_bytes());
+    }
     trace_fork(pid, copied);
     Answer::ok(u64::from(pid))
+}
+
+/// The tid words a `fork` was asked to write -- RFC 0096. None for `fork`
+/// (57), which asks for none.
+#[derive(Clone, Copy, Default)]
+struct TidWords {
+    /// `CLONE_CHILD_SETTID`: in the child's memory, before it runs.
+    child: Option<u64>,
+    /// `CLONE_CHILD_CLEARTID`: recorded for the child, not acted on.
+    clear: Option<u64>,
+    /// `CLONE_PARENT_SETTID`: in the parent's memory.
+    parent: Option<u64>,
 }
 
 /// Builds the child of a `fork`: its space, its memory, its first thread.
 ///
 /// Answers how many bytes were copied, which is the number step 8 exists to
-/// produce.
-fn build_fork_child(request: &PersonalityCall, rip: u64, rsp: u64) -> Option<u64> {
+/// produce, and the badge's name for the child's thread; or the `errno` the
+/// fork is to answer.
+fn build_fork_child(
+    request: &PersonalityCall,
+    registers: &Registers,
+    tls: Option<u64>,
+    child_tid: Option<(u64, u32)>,
+) -> Result<(u64, u32), i64> {
+    const ENOMEM: i64 = -12;
     if call(syscall::INVOKE, CHILD, method::PERSONALITY, [1, 0, 0, 0]).status != status::OK {
-        return None;
+        return Err(ENOMEM);
     }
 
     // **The kernel copies the space** — RFC 0084. `MAKE_SPACE` and the region
@@ -7495,7 +7733,7 @@ fn build_fork_child(request: &PersonalityCall, rip: u64, rsp: u64) -> Option<u64
     // line of it was written.
     let parent = handle_of(request.domain);
     if parent == NO_HANDLE {
-        return None;
+        return Err(ENOMEM);
     }
     let done = call(
         syscall::INVOKE,
@@ -7504,7 +7742,7 @@ fn build_fork_child(request: &PersonalityCall, rip: u64, rsp: u64) -> Option<u64
         [parent, 0, 0, 0],
     );
     if done.status != status::OK {
-        return None;
+        return Err(ENOMEM);
     }
     // Frames in the low thirty-two, regions above them, skipped at the top.
     // The bytes are what step 8 asks for and the only one of the three this
@@ -7514,18 +7752,14 @@ fn build_fork_child(request: &PersonalityCall, rip: u64, rsp: u64) -> Option<u64
     // policy they describe lives.
     let copied = (done.args[0] & 0xffff_ffff) * 4096;
 
-    // The trampoline: `xor eax, eax; movabs rcx, rip; jmp rcx`, in a page of
-    // the child's own memory. Three instructions rather than a kernel method
-    // to start a thread from a register image -- and `rcx` because a `syscall`
-    // destroys it anyway, so no program can be relying on what is in it here.
-    let mut code = [0u8; 16];
-    code[0] = 0x31;
-    code[1] = 0xc0; // xor eax, eax
-    code[2] = 0x48;
-    code[3] = 0xb9; // movabs rcx, imm64
-    code[4..12].copy_from_slice(&rip.to_le_bytes());
-    code[12] = 0xff;
-    code[13] = 0xe1; // jmp rcx
+    // The trampoline, in a page of the child's own memory, rather than a
+    // kernel method to start a thread from a register image. ~~`xor eax, eax;
+    // movabs rcx, rip; jmp rcx`~~ -- **`clone`'s trampoline since RFC 0096**:
+    // a first call (`arch_prctl` with the parent's TLS base, or `gettid`),
+    // then every general register the parent had, its stack, `rax` zero and a
+    // jump to where its call returns. The three instructions left the rest
+    // zero.
+    let (code, length) = thread::clone_trampoline(registers, registers.rsp, tls);
     // Somewhere the child does not already have — and after RFC 0084 the child
     // has **everything its parent had**, including the regions this program
     // never recorded. `free_page` consults the regions this program remembers
@@ -7534,28 +7768,42 @@ fn build_fork_child(request: &PersonalityCall, rip: u64, rsp: u64) -> Option<u64
     // than turned into an `ENOMEM` naming nothing the caller can act on. That
     // failure has happened once here already, when this address was a constant
     // a hosted `MAP_FIXED` could take.
-    let mut trampoline = process_for(request.domain)?.free_page(FORK_TRAMPOLINE_AT)?;
+    let mut trampoline = process_for(request.domain)
+        .and_then(|process| process.free_page(FORK_TRAMPOLINE_AT))
+        .ok_or(ENOMEM)?;
     let mut placed = false;
     for _ in 0..FORK_TRAMPOLINE_TRIES {
         if map_at_eager(CHILD, trampoline, 1, PROT_READ_EXECUTE) {
             placed = true;
             break;
         }
-        trampoline = trampoline.checked_add(FORK_TRAMPOLINE_STRIDE)?;
+        trampoline = trampoline
+            .checked_add(FORK_TRAMPOLINE_STRIDE)
+            .ok_or(ENOMEM)?;
     }
-    if !placed || !copy_out_through(CHILD, trampoline, &code) {
-        return None;
+    if !placed || !copy_out_through(CHILD, trampoline, &code[..length]) {
+        return Err(ENOMEM);
+    }
+    // **`CLONE_CHILD_SETTID`** -- RFC 0096: the child's tid, which is its pid,
+    // in the child's own copy of the word and before it runs. glibc reads that
+    // word as the thread's tid. A word the child does not have mapped is the
+    // caller's mistake, and answered as one.
+    if let Some((at, tid)) = child_tid
+        && !copy_out_through(CHILD, at, &tid.to_le_bytes())
+    {
+        return Err(bhaskix_personality::socket::errno::EFAULT);
     }
     let started = call(
         syscall::INVOKE,
         CHILD,
         method::SPAWN_THREAD,
-        [trampoline, rsp, 0, 0],
+        [trampoline, registers.rsp, 0, 0],
     );
     if started.status != status::OK {
-        return None;
+        return Err(ENOMEM);
     }
-    Some(copied)
+    // The nucleus's id plus one, as every badge from it will say.
+    Ok((copied, started.args[0] as u32 + 1))
 }
 
 /// Answers a hosted `execve` — [RFC 0033](../../../docs/rfc/0033-what-a-hosted-process-is.md) step 5.
@@ -7701,6 +7949,9 @@ fn answer_execve(request: &PersonalityCall) -> (u64, Answer) {
             process.exec_into(child, generation, drawn_base(), |entry, last| {
                 give_back_descriptor(entry, last, from);
             });
+            // The old domain's threads end with it; the new program's first
+            // thread is numbered as the pid when it first asks -- RFC 0096.
+            threads().forget_domain(from);
             trace_exec(pid, from, child);
         }
     }
@@ -8902,7 +9153,12 @@ extern "C" fn linuxd_main(hertz: u64) -> ! {
         }
         // The retry, carrying the register frame this program asked for.
         if received.method == FRAME_METHOD {
-            let (how, reply) = answer_with_frame(received.badge as u32, args[0], args[1]);
+            let (how, reply) = answer_with_frame(
+                received.badge as u32,
+                (received.badge >> 32) as u32,
+                args[0],
+                args[1],
+            );
             // The deadline too: a call that needed its register frame can still
             // answer a park, and a `BLOCK_ON_UNTIL` replied from here without
             // one would ask the nucleus to arm a timer for the epoch.

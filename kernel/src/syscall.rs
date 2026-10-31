@@ -2768,7 +2768,16 @@ fn adapter_call(frame: &mut SyscallFrame, call: &PersonalityCall) -> Option<u64>
                         return Some(frame.kind);
                     }
                     Some((_, value, _)) => Some(value),
-                    None => None,
+                    // **The retry failed, and the call was counted already** --
+                    // when its first ask was answered. Handing back `None` sent
+                    // it on to be priced as a call nobody answered, so it was
+                    // counted twice: "1036 of 1034 accounted" on 2026-10-31,
+                    // the first boot on which a forked child's first call takes
+                    // this path (RFC 0096) and a probe that kills its child at
+                    // once caught two between the ask and the retry, their
+                    // callers dying. The program is told `ENOSYS`, as the
+                    // unanswered path would have told it; it is not priced.
+                    None => Some(bhaskix_personality::call::ENOSYS.value),
                 };
                 crate::fault::give_back(slot);
                 return value;

@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | ⬜ **Draft 2026-10-30 — nothing built.** Four questions for the lead (§*Unresolved questions*). |
+| **Status** | ⬜ **Draft 2026-10-30 — ~~nothing built~~ steps 1-4 built and gated 2026-10-31.** ~~Four questions for the lead~~ All four decided by the lead on 2026-10-31, each as recommended (§*Unresolved questions*). |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | userspace (`bin/linuxd`, `personality`) |
 | **Milestone** | L1 ([roadmap.md](../roadmap.md)) — an interactive BusyBox `sh` runs a command that is not one of its builtins |
@@ -84,7 +84,8 @@ draft's own change.
    no one else maps, and is gone when the child ends or execs. *Not* so for threads:
    `pthread_join` waits on exactly that word. That is a separate gap, recorded below.
 5. **`set_tid_address`** records the pointer and answers the caller's tid.
-6. **Which number is the tid** (question 2).
+6. **Which number is the tid** (question 2): a process's first thread answers its pid, and any
+   other thread a number drawn from the same space (`bhaskix_personality::thread::Threads`).
 
 ## Alternatives considered
 
@@ -121,6 +122,10 @@ copy, one floating-point image (512–832 bytes), and one word written.
 
 ## Unresolved questions
 
+**All four decided by the lead on 2026-10-31, each as recommended**: the fork shape now and the
+vfork shape when its trigger arrives; a first thread's tid is its pid; `linuxd` records the TLS
+base; `SIGCHLD` later.
+
 1. **Scope: glibc's fork shape only, or the vfork shape too?** *Recommended: the fork shape
    now.* Go's `os/exec` starts a child with `clone(CLONE_VFORK | CLONE_VM | SIGCHLD)`
    (`syscall/exec_linux.go:305-341`, Go 1.25.0, read on the build host). So a Go program that runs
@@ -144,8 +149,45 @@ copy, one floating-point image (512–832 bytes), and one word written.
 
 ## Implementation plan
 
-1. `plan_clone`'s second shape and its tests.
+1. `plan_clone`'s second shape and its tests. **Done 2026-10-31**: `ClonePlan::Process`, with
+   glibc's `0x01200011` as the literal of the first test; a stack, any share, `CLONE_VFORK` or
+   `CLONE_NEWPID` beside it is still `ENOSYS`. `CLONE_NEWPID`'s doc said it asked for a new process;
+   it asks for a new pid *namespace* (`sched.h`, read on the build host), corrected in place.
 2. The fork's full register file, floating-point state (after RFC 0094 step 3) and TLS base, for
-   both entry points; the register probe, armed.
-3. `CHILD_SETTID`/`PARENT_SETTID` and `set_tid_address`.
+   both entry points; the register probe, armed. **Done 2026-10-31**: the child starts on
+   `clone_trampoline` with the staged frame's registers and the base `linuxd` recorded at
+   `arch_prctl`; the parent's image is read from its slot at the fork and installed by `FP_WRITE` at
+   the child's first call, which is always its trampoline's own (`arch_prctl` or `gettid`) and is
+   asked for with its frame for that purpose. The probe (`tools/probes/linux-fork-registers.s`,
+   `linux fork reg`): twelve general registers, the stack, the TLS base, `xmm0`-`xmm15` and
+   `MXCSR`, **0 of 47 wrong**. **Armed twice**: the three-instruction trampoline back, and both
+   children die of `SIGSEGV` through a zero TLS base and a zero `r15`; the image not installed,
+   and **33 of 47** -- the 32 `xmm` quadwords and `MXCSR`, nothing else.
+3. `CHILD_SETTID`/`PARENT_SETTID` and `set_tid_address`. **Done 2026-10-31**, with the tid
+   numbering of question 2: the `linux futex` probe now reads `tid (36) and pid (36)`. The probe's
+   `clone` child checks its tid is its pid and that the word it named holds it; the parent checks
+   its own copy still holds `-1`. **Armed three times**, each red on its own bit: `gettid` back to
+   the nucleus's number (`tid is not the pid`); the word not written (`the word does not hold
+   it`); the word written in the parent's memory instead (the parent's word read `0x21`, the
+   child's pid).
 4. The BusyBox gates: two commands under `sh -c`, and `uname -a` typed. TRACKER's row closes.
+   **Done 2026-10-31**, in two places, because building it found the planned one could not hold
+   both:
+   - **`uname -a` typed at the interactive shell** (`busybox-test.sh`) prints `Linux bhaskix
+     3.2.0-bhaskix ... x86_64`, where it answered `sh: can't fork`. Typed as `/busybox uname -a` it
+     answers `sh: /busybox: not found`: that lane's shell runs before the machine has a disk, on a
+     machine without an IOMMU, so nothing is staged there.
+   - **The two-command `sh -c`** runs on the `iommu` boot lane, which has a block service and now
+     stages BusyBox (`bhaskix.busybox=1`, 2,190,672 bytes in 3,020 ms): the hosted program's
+     `sh -c '/busybox echo bhaskix-busybox-first; /busybox echo bhaskix-busybox-forked'` prints
+     both lines in order. That lane fails if nothing was staged, so the check cannot pass unasked.
+   - **Armed**: with the fork shape refused again, both are red, and the logs say `sh: can't fork`.
+
+**Found building it, and fixed in the same change.** The kernel's boundary instrument counted a
+frame-needing call twice when its caller died between the question and the retry with the frame:
+the first ask was counted as answered, and the failed retry then priced it as a call nobody
+answered. The first boot of this change read `1036 of 1034 accounted`, with two callers killed --
+probes that kill a child straight after forking it now catch the child in its first call, which
+takes the frame path. The failed retry is answered `ENOSYS`, as it was, and not priced again:
+`993 of 993` on the next boot. **The same mistake one line earlier, a frame that cannot be staged
+because no slot is free, is left as it was** -- nothing here made it likelier -- and filed.

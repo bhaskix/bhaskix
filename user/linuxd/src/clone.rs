@@ -79,7 +79,7 @@ fn table() -> &'static mut [Option<Page>; PAGES] {
 
 /// The registers a `syscall` frame image carries, in the order the frame is
 /// staged (see the fault path in `main.rs`).
-fn registers_of(image: &[u64]) -> Registers {
+pub(crate) fn registers_of(image: &[u64]) -> Registers {
     Registers {
         rax: image[0],
         rbx: image[1],
@@ -147,6 +147,21 @@ pub(crate) fn spawn(
     let Some(slot) = page.owners.iter().position(|owner| *owner == 0) else {
         return Answer::error(EAGAIN);
     };
+    // **The caller is numbered first** -- RFC 0096. A process's first thread
+    // answers its pid, and it must be recorded as that before a second thread
+    // exists to be mistaken for the first. A child that could not be given a
+    // record would have no stable tid, so it is not started.
+    let _ = super::tid_of(request);
+    if super::threads()
+        .get(request.domain, request.thread)
+        .is_none()
+        || !super::threads().has_room()
+    {
+        return Answer::error(EAGAIN);
+    }
+    let Ok(tid) = super::processes().draw() else {
+        return Answer::error(EAGAIN);
+    };
     let parent = registers_of(image);
     // Linux: a stack of zero is the parent's own.
     let stack = if stack == 0 { parent.rsp } else { stack };
@@ -164,12 +179,19 @@ pub(crate) fn spawn(
     if made.status != status::OK {
         return Answer::error(EAGAIN);
     }
-    // The tid this program hands out is the nucleus's plus one; it is also
-    // what the child's first call will arrive carrying.
-    let tid = made.args[0] as u32 + 1;
+    // The nucleus's id plus one is what the child's calls will arrive
+    // carrying, and the slot waits for that. ~~It is also the tid this program
+    // hands out~~ -- since RFC 0096 the tid is drawn from the pid space,
+    // above, and recorded against it.
+    let thread = made.args[0] as u32 + 1;
     if let Some(Some(page)) = table().get_mut(index) {
-        page.owners[slot] = tid;
+        page.owners[slot] = thread;
         page.started[slot] = false;
+    }
+    if let Ok(record) = super::threads().record(request.domain, thread, tid)
+        && let Some(base) = tls
+    {
+        record.fs_base = base;
     }
     Answer::ok(u64::from(tid))
 }

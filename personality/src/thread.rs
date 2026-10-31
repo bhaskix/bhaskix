@@ -9,10 +9,11 @@
 //! machine with more cores than the one it was tested on."*
 //!
 //! What is decided here, and therefore host-tested: which `clone` flag set is
-//! a thread of the current group (as against a request this personality
-//! refuses), which futex operations are recognised, and how a thread id maps
-//! onto a thread group. What the kernel does with those answers is the
-//! kernel's.
+//! a thread of the current group, which is a new process -- glibc's `fork()`,
+//! [RFC 0096](../../docs/rfc/0096-a-fork-glibc-can-make.md) -- and which this
+//! personality refuses; which futex operations are recognised; and which Linux
+//! tid each hosted thread answers to ([`Threads`]). What the kernel does with
+//! those answers is the kernel's.
 
 /// `clone` flags, from Linux's `sched.h`.
 pub mod clone {
@@ -34,9 +35,18 @@ pub mod clone {
     pub const PARENT_SETTID: u64 = 0x0010_0000;
     /// Clear the child's tid at this address on exit, and futex-wake it.
     pub const CHILD_CLEARTID: u64 = 0x0020_0000;
-    /// A new process rather than a thread — refused: a Linux process maps
-    /// onto a domain, and creating one is `START`'s business and its
-    /// holder's authority, not a flag's.
+    /// Write the new child's id at this address in the child's own memory --
+    /// glibc's `fork()` asks for it (RFC 0096).
+    pub const CHILD_SETTID: u64 = 0x0100_0000;
+    /// Not a flag: the low byte is the signal a child process's parent is
+    /// sent when it ends (`CSIGNAL`).
+    pub const EXIT_SIGNAL: u64 = 0x0000_00ff;
+    /// A new pid namespace -- refused. ~~A new process rather than a thread~~
+    /// **corrected 2026-10-31**: this said `NEWPID` asked for a new process,
+    /// and refused it because a process is a domain. It asks for a new pid
+    /// *namespace* (`sched.h`: "New pid namespace", read on the build host);
+    /// a new process is a `clone` that shares nothing, and since RFC 0096 the
+    /// one glibc makes is accepted.
     pub const NEWPID: u64 = 0x2000_0000;
 }
 
@@ -64,24 +74,66 @@ pub enum ClonePlan {
         /// Where the child's id is cleared and futex-woken on exit.
         child_tid: Option<u64>,
     },
+    /// A new process, as `fork` (57) makes one -- the shape glibc's `fork()`
+    /// passes, RFC 0096. Nothing is shared and there is no stack of its own:
+    /// the child is a copy of its parent and resumes where it called.
+    Process {
+        /// The signal its parent is sent when it ends. Recorded; nothing sends
+        /// `SIGCHLD` yet (RFC 0096 question 4: later, when job control needs
+        /// it).
+        exit_signal: u8,
+        /// Where to write the child's tid in the **child's** memory
+        /// (`CLONE_CHILD_SETTID`).
+        child_tid: Option<u64>,
+        /// Where the child's tid is to be cleared when it ends
+        /// (`CLONE_CHILD_CLEARTID`): recorded, not acted on -- the word is in
+        /// memory only the child has, and it is gone when the child ends or
+        /// execs (RFC 0096, design item 4).
+        clear_tid: Option<u64>,
+        /// Where to write the child's tid in the **parent's** memory
+        /// (`CLONE_PARENT_SETTID`).
+        parent_tid: Option<u64>,
+    },
     /// Refuse with this `errno`.
     Refuse(i64),
 }
 
 /// Decides what a `clone(flags, stack, parent_tid, child_tid, tls)` means.
 ///
-/// The rule is deliberately narrow: **the flags must say "a thread of this
-/// group, sharing everything"**, because that is the only shape this
-/// personality can honour over a domain — and a partial share (a thread with
-/// its own address space, say) is not something to approximate. Anything
-/// else is `ENOSYS`, which is a refusal a runtime can see, rather than a
-/// thread that shares less than it was promised.
+/// The rule is deliberately narrow: **two shapes, and nothing between them.**
+/// The flags must say "a thread of this group, sharing everything", or --
+/// since RFC 0096 -- "a new process, sharing nothing", which is what glibc's
+/// `fork()` passes and what `fork` (57) already makes. Those are the shapes
+/// this personality can honour over a domain, and a partial share (a thread
+/// with its own address space, a process that shares its parent's memory until
+/// it execs) is not something to approximate. Anything else is `ENOSYS`,
+/// which is a refusal a runtime can see, rather than a child that shares less
+/// or more than it was promised.
 #[must_use]
 pub fn plan_clone(flags: u64, stack: u64, parent_tid: u64, child_tid: u64, tls: u64) -> ClonePlan {
     use crate::memory::errno;
 
     if flags & clone::NEWPID != 0 {
         return ClonePlan::Refuse(errno::ENOSYS);
+    }
+    // **A process: the exit signal and the three tid flags, and nothing
+    // else.** Any other bit is a share, or a namespace, or `CLONE_VFORK`'s
+    // promise to stop the parent until the child execs -- RFC 0096 question 1
+    // keeps that for an RFC of its own.
+    const PROCESS: u64 =
+        clone::EXIT_SIGNAL | clone::CHILD_SETTID | clone::CHILD_CLEARTID | clone::PARENT_SETTID;
+    if flags & !PROCESS == 0 {
+        // A child process on a stack of its own is a `clone` Linux allows and
+        // nothing here has asked for: refused, rather than half-honoured.
+        if stack != 0 {
+            return ClonePlan::Refuse(errno::ENOSYS);
+        }
+        return ClonePlan::Process {
+            exit_signal: (flags & clone::EXIT_SIGNAL) as u8,
+            child_tid: (flags & clone::CHILD_SETTID != 0).then_some(child_tid),
+            clear_tid: (flags & clone::CHILD_CLEARTID != 0).then_some(child_tid),
+            parent_tid: (flags & clone::PARENT_SETTID != 0).then_some(parent_tid),
+        };
     }
     // Every share Go asks for must be present. `CLONE_THREAD` without
     // `CLONE_VM` is a contradiction Linux itself rejects; the rest are what
@@ -257,6 +309,160 @@ pub fn clone_trampoline(
     (out, at)
 }
 
+/// How many hosted threads [`Threads`] numbers at once -- RFC 0096.
+///
+/// Every live thread of every hosted process. A `clone` that would need a
+/// record past it is told `EAGAIN`, which is Linux's answer to a thread it
+/// cannot make.
+pub const MAX_THREADS: usize = 128;
+
+/// What this personality knows about one hosted thread -- RFC 0096.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ThreadRecord {
+    /// The hosted domain it runs in.
+    pub domain: u32,
+    /// The nucleus's name for it, as the badge carries it: the thread id plus
+    /// one, so that zero can mean no thread.
+    pub thread: u32,
+    /// The tid it answers to in Linux's terms.
+    pub tid: u32,
+    /// The TLS base it last set -- `arch_prctl(ARCH_SET_FS)`, or `CLONE_SETTLS`
+    /// through its trampoline's own `arch_prctl` -- and zero until it sets one.
+    /// Those are the only two ways a hosted program sets it, because
+    /// `CR4.FSGSBASE` is not enabled, so this is the base it has (RFC 0096
+    /// question 3).
+    pub fs_base: u64,
+    /// What `set_tid_address` or `CLONE_CHILD_CLEARTID` named. Recorded, and
+    /// not yet acted on: `pthread_join`'s wait on it is a gap RFC 0096 records.
+    pub clear_tid: u64,
+}
+
+/// **Which Linux tid each hosted thread answers to** -- RFC 0096 question 2.
+///
+/// A process's first thread answers its process's **pid**, as on Linux, so
+/// that glibc's cached tid, `getpid()` and `gettid()` agree and `raise()`
+/// sends to the thread it means. Any other thread answers a number drawn from
+/// the **same space** as pids, so a tid never names some other process.
+///
+/// Until RFC 0096 every tid was the nucleus's thread id plus one, a number
+/// unrelated to the pid. Keyed by `(domain, thread)` as the badge gives them,
+/// and cleared when a thread exits or its domain goes.
+pub struct Threads {
+    slots: [Option<ThreadRecord>; MAX_THREADS],
+}
+
+impl Default for Threads {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Threads {
+    /// An empty table.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            slots: [None; MAX_THREADS],
+        }
+    }
+
+    /// The record of `thread` in `domain`, if it has one.
+    #[must_use]
+    pub fn get(&self, domain: u32, thread: u32) -> Option<&ThreadRecord> {
+        self.slots
+            .iter()
+            .flatten()
+            .find(|record| record.domain == domain && record.thread == thread)
+    }
+
+    /// The record of `thread` in `domain`, to change, if it has one.
+    pub fn get_mut(&mut self, domain: u32, thread: u32) -> Option<&mut ThreadRecord> {
+        self.slots
+            .iter_mut()
+            .flatten()
+            .find(|record| record.domain == domain && record.thread == thread)
+    }
+
+    /// Whether another thread can be recorded.
+    #[must_use]
+    pub fn has_room(&self) -> bool {
+        self.slots.iter().any(Option::is_none)
+    }
+
+    /// Records `thread` of `domain` as Linux tid `tid`, replacing whatever it
+    /// had: a thread's TLS base and tid address start at zero.
+    ///
+    /// # Errors
+    ///
+    /// [`errno::EAGAIN`](crate::process::errno::EAGAIN) when the table is full.
+    pub fn record(&mut self, domain: u32, thread: u32, tid: u32) -> Result<&mut ThreadRecord, i64> {
+        self.forget(domain, thread);
+        let free = self
+            .slots
+            .iter()
+            .position(Option::is_none)
+            .ok_or(crate::process::errno::EAGAIN)?;
+        self.slots[free] = Some(ThreadRecord {
+            domain,
+            thread,
+            tid,
+            fs_base: 0,
+            clear_tid: 0,
+        });
+        self.slots[free]
+            .as_mut()
+            .ok_or(crate::process::errno::EAGAIN)
+    }
+
+    /// The tid `thread` of `domain` answers to, numbering it on first sight.
+    ///
+    /// **A domain with no thread recorded is a process whose only thread is
+    /// asking**, because the one way another thread comes to exist is a
+    /// `clone`, and a `clone` records its caller before it starts anything --
+    /// so the answer is `pid`. A later thread nobody recorded is given what
+    /// `draw` gives, a number from the pid space.
+    ///
+    /// The answer stands even where it cannot be kept, for a table that is
+    /// full: `None` only when `draw` has nothing to give.
+    pub fn tid_for(
+        &mut self,
+        domain: u32,
+        thread: u32,
+        pid: u32,
+        draw: impl FnOnce() -> Option<u32>,
+    ) -> Option<u32> {
+        if let Some(record) = self.get(domain, thread) {
+            return Some(record.tid);
+        }
+        let first = !self
+            .slots
+            .iter()
+            .flatten()
+            .any(|record| record.domain == domain);
+        let tid = if first { pid } else { draw()? };
+        let _ = self.record(domain, thread, tid);
+        Some(tid)
+    }
+
+    /// Forgets `thread` of `domain` -- it exited.
+    pub fn forget(&mut self, domain: u32, thread: u32) {
+        for slot in &mut self.slots {
+            if slot.is_some_and(|record| record.domain == domain && record.thread == thread) {
+                *slot = None;
+            }
+        }
+    }
+
+    /// Forgets every thread of `domain` -- it ended, or its slot was reused.
+    pub fn forget_domain(&mut self, domain: u32) {
+        for slot in &mut self.slots {
+            if slot.is_some_and(|record| record.domain == domain) {
+                *slot = None;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -337,10 +543,143 @@ mod tests {
     }
 
     #[test]
-    fn a_new_process_is_refused_because_that_is_a_domain() {
+    fn a_new_pid_namespace_is_refused() {
         assert_eq!(
             plan_clone(GO_THREAD_FLAGS | clone::NEWPID, 0x7000, 0, 0, 0),
             ClonePlan::Refuse(errno::ENOSYS)
+        );
+        // On the fork shape too, which would otherwise be accepted.
+        assert_eq!(
+            plan_clone(0x0120_0011 | clone::NEWPID, 0, 0, 0x1000, 0),
+            ClonePlan::Refuse(errno::ENOSYS)
+        );
+    }
+
+    #[test]
+    fn glibcs_fork_is_a_process_whose_tid_is_written_in_the_child() {
+        // The flags `strace` read off the pinned BusyBox's `fork()` on
+        // 2026-10-30, as the literal they were: `CLONE_CHILD_CLEARTID |
+        // CLONE_CHILD_SETTID | SIGCHLD`, no stack, the tid word as `child_tid`.
+        assert_eq!(
+            plan_clone(0x0120_0011, 0, 0, 0x2a1b_5690, 0),
+            ClonePlan::Process {
+                exit_signal: 17,
+                child_tid: Some(0x2a1b_5690),
+                clear_tid: Some(0x2a1b_5690),
+                parent_tid: None,
+            }
+        );
+    }
+
+    #[test]
+    fn a_bare_fork_writes_nowhere_and_parent_settid_names_the_parents_word() {
+        // `SIGCHLD` alone: the addresses passed are not carried, so nothing is
+        // written to a pointer nobody asked to have written.
+        assert_eq!(
+            plan_clone(17, 0, 0x1000, 0x2000, 0x3000),
+            ClonePlan::Process {
+                exit_signal: 17,
+                child_tid: None,
+                clear_tid: None,
+                parent_tid: None,
+            }
+        );
+        assert_eq!(
+            plan_clone(17 | clone::PARENT_SETTID, 0, 0x1000, 0x2000, 0),
+            ClonePlan::Process {
+                exit_signal: 17,
+                child_tid: None,
+                clear_tid: None,
+                parent_tid: Some(0x1000),
+            }
+        );
+    }
+
+    #[test]
+    fn a_process_with_a_stack_a_share_or_vfork_is_still_refused() {
+        assert_eq!(
+            plan_clone(0x0120_0011, 0x7000, 0, 0x1000, 0),
+            ClonePlan::Refuse(errno::ENOSYS)
+        );
+        // Each share alone, and `CLONE_VFORK` -- Go's `os/exec` shape keeps
+        // `CLONE_VM` with it, and RFC 0096 question 1 leaves both for later.
+        for extra in [
+            clone::VM,
+            clone::FS,
+            clone::FILES,
+            clone::SIGHAND,
+            clone::THREAD,
+            clone::SYSVSEM,
+            clone::SETTLS,
+            0x4000,
+        ] {
+            assert_eq!(
+                plan_clone(0x0120_0011 | extra, 0, 0, 0x1000, 0),
+                ClonePlan::Refuse(errno::ENOSYS),
+                "{extra:#x}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_first_thread_answers_its_pid_and_a_later_one_a_drawn_number() {
+        let mut threads = Threads::new();
+        assert_eq!(threads.tid_for(3, 70, 31, || Some(99)), Some(31));
+        // Asked again, the same answer, and nothing drawn.
+        assert_eq!(threads.tid_for(3, 70, 31, || None), Some(31));
+        // A second thread of the same domain is not the first.
+        assert_eq!(threads.tid_for(3, 72, 31, || Some(32)), Some(32));
+        // Another domain's first thread is its own process's pid.
+        assert_eq!(threads.tid_for(4, 71, 33, || Some(99)), Some(33));
+        // Nothing to draw: no number rather than a reused one.
+        assert_eq!(threads.tid_for(3, 74, 31, || None), None);
+    }
+
+    #[test]
+    fn a_forgotten_domain_numbers_its_next_first_thread_as_the_pid_again() {
+        let mut threads = Threads::new();
+        assert_eq!(threads.tid_for(3, 70, 31, || None), Some(31));
+        assert_eq!(threads.tid_for(3, 72, 31, || Some(32)), Some(32));
+        // The domain's slot is reused by an exec'd program: first thread again.
+        threads.forget_domain(3);
+        assert_eq!(threads.get(3, 72), None);
+        assert_eq!(threads.tid_for(3, 75, 40, || Some(99)), Some(40));
+        // A thread that exits takes only its own record with it.
+        assert_eq!(threads.tid_for(3, 76, 40, || Some(41)), Some(41));
+        threads.forget(3, 76);
+        assert_eq!(threads.get(3, 76), None);
+        assert_eq!(threads.get(3, 75).map(|record| record.tid), Some(40));
+    }
+
+    #[test]
+    fn a_full_table_still_answers_a_first_thread_and_refuses_to_record_more() {
+        let mut threads = Threads::new();
+        for domain in 0..MAX_THREADS as u32 {
+            assert!(threads.record(domain, 1, domain + 100).is_ok());
+        }
+        assert!(!threads.has_room());
+        assert_eq!(
+            threads.record(500, 1, 9).map(|record| record.tid),
+            Err(crate::process::errno::EAGAIN)
+        );
+        // A process's only thread is its pid whether or not it can be kept.
+        assert_eq!(threads.tid_for(500, 1, 9, || None), Some(9));
+        // Re-recording a thread that has a record replaces it in place.
+        assert_eq!(threads.record(0, 1, 7).map(|record| record.tid), Ok(7));
+    }
+
+    #[test]
+    fn a_record_carries_a_tls_base_and_a_tid_address_once_set() {
+        let mut threads = Threads::new();
+        let record = threads.record(3, 70, 31).unwrap();
+        assert_eq!((record.fs_base, record.clear_tid), (0, 0));
+        record.fs_base = 0x7f00_0000;
+        threads.get_mut(3, 70).unwrap().clear_tid = 0x2a1b_5690;
+        assert_eq!(
+            threads
+                .get(3, 70)
+                .map(|record| (record.fs_base, record.clear_tid)),
+            Some((0x7f00_0000, 0x2a1b_5690))
         );
     }
 

@@ -569,6 +569,30 @@ impl Processes {
         Ok(pid)
     }
 
+    /// The pid the next [`admit`](Self::admit) will hand out, if it would
+    /// succeed -- RFC 0096. A `fork` writes its child's tid, which is that
+    /// pid, into the child's memory **before the child runs**, and admits the
+    /// child only once it is built: so it asks first and admits after, with
+    /// nothing in between that could take the number.
+    #[must_use]
+    pub fn next_pid(&self) -> Option<u32> {
+        let free = self.slots.iter().any(Option::is_none);
+        (free && self.next.checked_add(1).is_some()).then_some(self.next)
+    }
+
+    /// Draws a number from the pid space without admitting a process -- a
+    /// thread's tid, RFC 0096. Drawn rather than invented so that no tid is
+    /// ever a number some process has, or will be given.
+    ///
+    /// # Errors
+    ///
+    /// [`errno::EAGAIN`] when the counter is exhausted, as `admit` refuses.
+    pub fn draw(&mut self) -> Result<u32, i64> {
+        let drawn = self.next;
+        self.next = self.next.checked_add(1).ok_or(errno::EAGAIN)?;
+        Ok(drawn)
+    }
+
     /// The process with this pid, if it is one this adapter serves.
     #[must_use]
     pub fn by_pid(&self, pid: u32) -> Option<&Process> {
@@ -1078,6 +1102,39 @@ mod tests {
             "a reused pid is a kill delivered to a stranger"
         );
         assert_ne!(third, second);
+    }
+
+    #[test]
+    fn the_pid_read_before_a_fork_is_the_one_it_is_admitted_with() {
+        // RFC 0096: a fork writes its child's pid into the child before it
+        // admits the child, so the number read first must be the number given.
+        let mut table = Processes::new();
+        let parent = table.admit(0, 3, 1).expect("room");
+        let read = table.next_pid().expect("room");
+        assert_eq!(table.admit(parent, 4, 1), Ok(read));
+        // A full table has no next pid to read, as it has none to give.
+        let mut full = Processes::new();
+        for domain in 0..MAX_PROCESSES as u32 {
+            full.admit(0, domain, 1).expect("room");
+        }
+        assert_eq!(full.next_pid(), None);
+        assert_eq!(full.admit(0, 99, 1), Err(errno::EAGAIN));
+    }
+
+    #[test]
+    fn a_drawn_tid_is_never_a_pid_given_before_or_after() {
+        // RFC 0096: a thread's tid comes from the pid space, so no `kill` or
+        // `tgkill` naming one can reach a process by mistake.
+        let mut table = Processes::new();
+        let pid = table.admit(0, 3, 1).expect("room");
+        let tid = table.draw().expect("numbers left");
+        let next = table.admit(pid, 4, 1).expect("room");
+        assert_ne!(tid, pid);
+        assert_ne!(tid, next);
+        assert!(
+            table.by_pid(tid).is_none(),
+            "a drawn number names no process"
+        );
     }
 
     #[test]
