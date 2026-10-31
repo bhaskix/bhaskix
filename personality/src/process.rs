@@ -178,6 +178,56 @@ pub struct Process {
     pub regions: [Option<Region>; MAX_REGIONS],
     /// What it is doing.
     pub state: State,
+    /// What it was exec'd as -- RFC 0098 -- or `None` for a process this
+    /// adapter did not exec, whose path it does not know and will not invent.
+    pub image: Option<Image>,
+}
+
+/// How long an exec'd path may be: `bin/linuxd`'s own `MAX_NAME`.
+pub const IMAGE_PATH: usize = 64;
+
+/// What a process was exec'd as -- RFC 0098: the path its `execve` named, and
+/// where its own new stack holds its argument and environment strings, so that
+/// `/proc/self/exe`, `cmdline` and `environ` answer from it.
+///
+/// **Addresses, not copies.** The strings are read from the process's memory
+/// when asked for, between these bounds, as Linux reads `arg_start..arg_end`:
+/// a program that rewrites its argv changes its `cmdline` here as it would
+/// there, and the record stays small.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Image {
+    path: [u8; IMAGE_PATH],
+    length: u8,
+    /// `[start, end)` of the argument strings, each `NUL`-terminated.
+    pub arguments: (u64, u64),
+    /// `[start, end)` of the environment strings, likewise.
+    pub environment: (u64, u64),
+}
+
+impl Image {
+    /// The record for a program exec'd from `path`, or `None` for a path that
+    /// is empty or longer than [`IMAGE_PATH`] -- one this adapter could not
+    /// have exec'd.
+    #[must_use]
+    pub fn new(path: &[u8], arguments: (u64, u64), environment: (u64, u64)) -> Option<Self> {
+        if path.is_empty() || path.len() > IMAGE_PATH {
+            return None;
+        }
+        let mut stored = [0u8; IMAGE_PATH];
+        stored[..path.len()].copy_from_slice(path);
+        Some(Self {
+            path: stored,
+            length: u8::try_from(path.len()).ok()?,
+            arguments,
+            environment,
+        })
+    }
+
+    /// The path its `execve` named.
+    #[must_use]
+    pub fn path(&self) -> &[u8] {
+        &self.path[..usize::from(self.length)]
+    }
 }
 
 /// Linux's credentials.
@@ -283,6 +333,8 @@ impl Process {
             descriptors: Table::new(),
             regions: [None; MAX_REGIONS],
             state: State::Live,
+            // Nothing exec'd it yet; a process the kernel started never has one.
+            image: None,
         }
     }
 
@@ -456,6 +508,11 @@ impl Process {
         // in `make test` sets `bhaskix.busybox=1`.
         self.brk_base = 0;
         self.brk_current = 0;
+        // **And what it was exec'd as is the new image's** -- RFC 0098. The
+        // adapter sets it once the new image is built; until then there is
+        // nothing true to say about the old one's path or its strings, which
+        // were in the memory this exec replaced.
+        self.image = None;
         self.descriptors.close_on_exec(released)
     }
 
@@ -502,6 +559,9 @@ impl Process {
             // same contents.
             regions: self.regions,
             state: State::Live,
+            // **The child is the same program**, with its strings at the same
+            // addresses in its copy of the memory -- Linux's fork keeps both.
+            image: self.image,
         }
     }
 }
@@ -1102,6 +1162,32 @@ mod tests {
             "a reused pid is a kill delivered to a stranger"
         );
         assert_ne!(third, second);
+    }
+
+    #[test]
+    fn a_fork_keeps_what_it_was_execd_as_and_an_exec_forgets_it() {
+        // RFC 0098: the child is the same program at the same addresses; a new
+        // image has said nothing yet about its own path or strings.
+        let mut table = Processes::new();
+        let pid = table.admit(0, 3, 1).expect("room");
+        let image = Image::new(b"/hosted", (0x7000, 0x700e), (0x700e, 0x701f)).expect("fits");
+        table.by_pid_mut(pid).expect("admitted").image = Some(image);
+        let parent = *table.by_pid(pid).expect("admitted");
+        let child = parent.fork_into(9, 4, 1);
+        assert_eq!(child.image, Some(image));
+        assert_eq!(
+            child.image.map(|image| image.path().to_vec()),
+            Some(b"/hosted".to_vec())
+        );
+        let mut execd = child;
+        execd.exec_into(5, 1, 0x4000_0000, |_, _| {});
+        assert_eq!(execd.image, None);
+        // A process nobody exec'd starts with none, and a path that could not
+        // have been exec'd makes none.
+        assert_eq!(Process::new(1, 0, 3, 1).image, None);
+        assert_eq!(Image::new(b"", (0, 0), (0, 0)), None);
+        assert_eq!(Image::new(&[b'a'; IMAGE_PATH + 1], (0, 0), (0, 0)), None);
+        assert!(Image::new(&[b'a'; IMAGE_PATH], (0, 0), (0, 0)).is_some());
     }
 
     #[test]

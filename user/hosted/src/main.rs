@@ -48,6 +48,8 @@ mod nr {
     pub const FTRUNCATE: u64 = 46;
     /// `execve(path, argv, envp)`.
     pub const EXECVE: u64 = 59;
+    /// `readlink(path, buf, size)`.
+    pub const READLINK: u64 = 89;
 }
 
 /// `open` flags, from this machine's own headers.
@@ -333,6 +335,7 @@ extern "C" fn hosted_main(stack: *const u64) -> ! {
             b" auxv BAD".as_slice()
         },
     );
+    find_myself(&mut line);
 
     line.put(b"\n");
     line.flush();
@@ -358,6 +361,71 @@ extern "C" fn hosted_main(stack: *const u64) -> ! {
     // only honest thing left.
     #[allow(clippy::empty_loop)]
     loop {}
+}
+
+/// **What this program was exec'd as, asked the three ways a program asks**
+/// -- RFC 0098: `readlink("/proc/self/exe")`, and its `cmdline` and `environ`
+/// read back. `bin/linuxd` exec'd it as `/hosted` with `hosted one two` and
+/// `GREETING=namaste`, so each answer is known exactly, and the line says what
+/// came back rather than whether it matched.
+fn find_myself(line: &mut Line) {
+    let mut path = [0u8; 64];
+    let read = syscall(
+        nr::READLINK,
+        c"/proc/self/exe".as_ptr() as u64,
+        path.as_mut_ptr() as u64,
+        path.len() as u64,
+    ) as i64;
+    line.put(b" exe ");
+    match usize::try_from(read) {
+        Ok(length) if length <= path.len() => line.put(&path[..length]),
+        _ => {
+            line.put(b"errno ");
+            line.number(read.unsigned_abs());
+        }
+    }
+    line.put(
+        if reads_back(b"/proc/self/cmdline\0", b"hosted\0one\0two\0") {
+            b" cmdline ok".as_slice()
+        } else {
+            b" cmdline BAD".as_slice()
+        },
+    );
+    line.put(
+        if reads_back(b"/proc/self/environ\0", b"GREETING=namaste\0") {
+            b" environ ok".as_slice()
+        } else {
+            b" environ BAD".as_slice()
+        },
+    );
+}
+
+/// Whether the file at `path` reads back as exactly `expected`, read to its
+/// end however many calls that takes.
+fn reads_back(path: &[u8], expected: &[u8]) -> bool {
+    let descriptor = syscall(nr::OPEN, path.as_ptr() as u64, open::RDONLY, 0);
+    if (descriptor as i64) < 0 {
+        return false;
+    }
+    let mut buffer = [0u8; 64];
+    let mut have = 0usize;
+    while have < buffer.len() {
+        let read = syscall(
+            nr::READ,
+            descriptor,
+            buffer[have..].as_mut_ptr() as u64,
+            (buffer.len() - have) as u64,
+        ) as i64;
+        let Ok(read) = usize::try_from(read) else {
+            break;
+        };
+        if read == 0 {
+            break;
+        }
+        have += read;
+    }
+    let _ = syscall(nr::CLOSE, descriptor, 0, 0);
+    &buffer[..have] == expected
 }
 
 /// Replaces this program with BusyBox, running one command.

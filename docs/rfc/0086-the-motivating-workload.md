@@ -78,7 +78,7 @@ seconds.
 | 2 | | `openat`, `getpid`, `tgkill` | ✅ |
 | 1 | | `listen` | ❌ |
 | 1 | | `epoll_create1` | ❌ |
-| 1 | | `readlinkat` | ❌ — no handler, answers `ENOSYS`; Go reads `/proc/self/exe` at start, and whether it tolerates the refusal is to be seen on the machine, not assumed |
+| 1 | | `readlinkat` | ❌ — no handler, answers `ENOSYS`; ~~Go reads `/proc/self/exe` at start, and whether it tolerates the refusal is to be seen on the machine, not assumed~~ **corrected 2026-10-31: this server does not ask.** Its `refused -ENOSYS` list, traced from before its first call, reads `157 234` on CI run 892 -- no `267` -- so the expectation was wrong, not the tolerance. Answered since RFC 0098 (`ENOENT` for a process nothing exec'd, which this server is) |
 | 1 | | `sched_getaffinity`, `execve` | ✅ |
 
 Thirty distinct calls; **eight are missing outright, two (`socket`, `bind`) are UDP-only, and two more (`read`, `write`) work for everything but a TCP stream.**

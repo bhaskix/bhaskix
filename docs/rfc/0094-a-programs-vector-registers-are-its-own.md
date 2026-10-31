@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | ⬜ **Draft 2026-10-30 — ~~nothing built~~ steps 0-3 built and gated the same day, steps 4-5 on 2026-10-31 (AVX on; the x86-64-v3 BusyBox runs); ~~steps 6-8 open~~ step 7 read on the SR550 the same day, all but the cost, which waits on step 6's line; ~~steps 6 and 8 open~~ step 6 built the same day (the `xstate cost` line); step 7's cost and step 8 open. Both questions decided by the lead the same day, each as recommended**: AVX only, AVX-512 waiting on its trigger; the signal half in this RFC, and first (§*Unresolved questions*). Drafted at the lead's request, **ahead of its recorded trigger**: TRACKER's row asks for this RFC when an L1 program needs AVX or a distribution's packages assume x86-64-v3, and neither has happened — Ubuntu 26.04 still ships plain amd64 builds, and the pinned corpus uses one. |
+| **Status** | ✅ **ACCEPTED 2026-10-31 by the project lead**, with every step built and gated: the lead's choice of 2026-10-31 was to accept it once steps 6-8 were done and the SR550 had read the cost. *Drafted 2026-10-30.* The record of the way here, kept: ⬜ **Draft 2026-10-30 — ~~nothing built~~ steps 0-3 built and gated the same day, steps 4-5 on 2026-10-31 (AVX on; the x86-64-v3 BusyBox runs); ~~steps 6-8 open~~ step 7 read on the SR550 the same day, all but the cost, which waits on step 6's line; ~~steps 6 and 8 open~~ step 6 built the same day (the `xstate cost` line); step 7's cost and step 8 open. Both questions decided by the lead the same day, each as recommended**: AVX only, AVX-512 waiting on its trigger; the signal half in this RFC, and first (§*Unresolved questions*). Drafted at the lead's request, **ahead of its recorded trigger**: TRACKER's row asks for this RFC when an L1 program needs AVX or a distribution's packages assume x86-64-v3, and neither has happened — Ubuntu 26.04 still ships plain amd64 builds, and the pinned corpus uses one. |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | arch / sched / userspace (`bin/linuxd`, `personality`) |
 | **Milestone** | L1 ([roadmap.md](../roadmap.md)) — an unmodified x86-64-v3 Linux program runs |
@@ -511,8 +511,12 @@ the design rests on.
    - `linux sig fp`: a handler overwrote all sixteen `ymm` registers, `0 of 64 quadwords wrong`.
    - The v3 BusyBox: `hi from sh`.
 
-   **Not read: the cost.** No line prices a switch until step 6 adds one. The boot's two `FAILED`
-   lines, `dhcp client` (`nobody answered`) and `tcp client`, are this machine's known network
-   gap, not this RFC's.
+   ~~**Not read: the cost.** No line prices a switch until step 6 adds one.~~ **The cost, read
+   2026-10-31 on a second boot from `184ff6a`**: `xstate cost` least **474 ticks (226 ns)**, mean
+   612, over 1,691 switches -- `xsaveopt`, 832 bytes. The boot's two `FAILED` lines, `dhcp client`
+   (`nobody answered`) and `tcp client`, are this machine's known network gap, not this RFC's.
 8. **Documents.** `scheduler.md` §6 states the `XSAVE` design, `security.md` gets its line, and
-   TRACKER's rows close.
+   TRACKER's rows close. **Done 2026-10-31**: §6 carries the measured cost; `security.md`'s
+   Registers row, already there, gains the upper halves the checks have covered since step 4; VEC1
+   closes. CI's QEMU 10.2.1 cells (run 892) read least 806 to 2,107 ticks -- the emulator's, as
+   every TCG figure here is.

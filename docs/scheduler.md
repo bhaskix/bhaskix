@@ -228,16 +228,21 @@ Deliberate design points:
   area on every switch (`kernel/src/sched.rs`), and this line was not changed with it. Eager is
   also the right answer. Lazy switching leaks one process's FPU, SSE and AVX registers to another
   through speculation on affected Intel CPUs (CVE-2018-3665, *LazyFP*), and Intel's guidance is
-  eager restore. AVX is not enabled at all yet. [RFC 0094](rfc/0094-a-programs-vector-registers-are-its-own.md)
+  eager restore. ~~AVX is not enabled at all yet. [RFC 0094](rfc/0094-a-programs-vector-registers-are-its-own.md)
   (draft) proposes `XSAVEOPT`/`XRSTOR`, still eager, and measures the cost: about 36 ns a switch
-  over `FXSAVE` on a Xeon Silver 4314.
+  over `FXSAVE` on a Xeon Silver 4314.~~ Superseded by the bullet below: RFC 0094 was built and
+  accepted on 2026-10-31.
 - **FPU/SSE state is switched eagerly, with `XSAVEOPT`/`XRSTOR` where the CPU offers `XSAVE`**
   (RFC 0094 steps 0-3, built 2026-10-30). The bootstrap CPU chooses the plan from `CPUID` --
   `XCR0` of x87, SSE and AVX where offered since step 4 (2026-10-31), x87 and SSE where AVX is
   not, AVX-512 by decision not yet -- and every CPU applies it and reads it back
   before it schedules anything; a CPU without `XSAVE` keeps `FXSAVE`, and `CR4.OSXSAVE` is cleared
   there rather than left as the firmware found it. Each thread carries a 64-byte-aligned 832-byte
-  area inline. The boot prints the plan (`xstate`) and checks it (`vector state`).
+  area inline. The boot prints the plan (`xstate`), checks it (`vector state`), and since step 6
+  prices it (`xstate cost`): a switch's save and restore, timed with `lfence; rdtsc; lfence` on
+  the vector probe's CPU while its two threads switch with live state. Least **208 ticks (86 ns)**
+  under KVM on a Xeon Silver 4314 and **474 ticks (226 ns)** on the SR550's Xeon Silver 4110, both
+  with AVX and 832 bytes (2026-10-31); emulator figures run to thousands and are not the CPU's.
 - **The switch path allocates nothing and can take no locks that may sleep.** Enforced by type.
 - **Kernel stacks have guard pages.** Stack overflow in the kernel becomes a clean panic with a
   backtrace instead of silent corruption of whatever was allocated below.

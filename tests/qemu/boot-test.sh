@@ -2779,7 +2779,9 @@ fi
 # RFC 0005 step 6: the futex contract's edges, which is where the RFC says a
 # subtle mistake does not produce an error but a deadlock under load. A WAIT
 # whose word has already changed must refuse to sleep; a WAKE with nobody
-# asleep must wake none; a shared futex and a clone are refused with reasons.
+# asleep must wake none; ~~a shared futex and a clone are refused with
+# reasons~~ a shared WAIT refuses a stale word as a private one does (RFC 0097,
+# 2026-10-31: it was refused outright), and a clone is refused with a reason.
 # And RFC 0032 step 10's `write`: **both halves are demanded**, because
 # neither can stand alone. The count says the adapter answered sixteen; the
 # string says those sixteen bytes reached the machine's console out of a
@@ -2923,6 +2925,20 @@ elif grep -qE "linux fork reg +skipped, needs a second cpu" "$LOG"; then
 else
     fail "a forked child did not start with its parent's registers, or glibc's fork shape was not answered"
     grep -E "linux fork reg" "$LOG" || true
+    status=1
+fi
+
+# RFC 0097: a thread glibc can join. Made with pthread_create's flags, its tid
+# word must hold its tid as soon as clone returns (CLONE_PARENT_SETTID), and its
+# creator's shared FUTEX_WAIT on the word must end because the thread's exit
+# cleared the word and woke it (CLONE_CHILD_CLEARTID) -- not because it gave up.
+if grep -qE "linux join +a thread made with glibc's flags \(0x3d0f00\) found its tid \([1-9][0-9]*\) where its creator asked, at once, and its exit cleared the word and woke the creator from a shared futex wait: [0-9]+ wait\(s\), the last answered (0|-11)" "$LOG"; then
+    pass "a thread glibc's way was joined: $(grep -oE '[0-9]+ wait\(s\), the last answered -?[0-9]+' "$LOG" | head -1)"
+elif grep -qE "linux join +skipped, needs a second cpu" "$LOG"; then
+    pass "the join probe needs a second cpu, and said so"
+else
+    fail "a thread made with glibc's flags could not be joined"
+    grep -E "linux join" "$LOG" || true
     status=1
 fi
 
@@ -3837,14 +3853,20 @@ fi
 # **The exact string, not a pattern that would accept less.** A gate that
 # matched `hosted pid [0-9]*` would pass an exec that lost every argument.
 if grep -qE "hosted exec    a Linux program execed [1-9][0-9]* bytes read off the filesystem" "$LOG"; then
-    line=$(grep -aoE 'hosted pid [0-9]+ args hosted one two env GREETING=namaste auxv [a-zA-Z]+' "$LOG" | tail -1)
+    line=$(grep -aoE 'hosted pid [0-9]+ args hosted one two env GREETING=namaste auxv [a-zA-Z]+ exe [^ ]+( [0-9]+)? cmdline [a-zA-Z]+ environ [a-zA-Z]+' "$LOG" | tail -1)
     hosted_pid=$(sed -n 's/^hosted pid \([0-9]*\) .*/\1/p' <<<"$line")
     if [[ -z $line ]]; then
         fail "the exec'd program printed no line, or not the one it was given: $(grep -aoE 'hosted pid .*' "$LOG" | head -1)"
         grep -a "hosted" "$LOG" | sed 's/^/      /'
         status=1
-    elif [[ $line != *"auxv ok" ]]; then
+    elif [[ $line != *"auxv ok exe "* ]]; then
         fail "the exec'd program ran but its initial image is wrong: $line"
+        status=1
+    # RFC 0098: it can find itself -- `readlink("/proc/self/exe")` answers the
+    # path it was exec'd from, and its `cmdline` and `environ` read back from
+    # its own memory exactly as its exec gave them.
+    elif [[ $line != *" exe /hosted cmdline ok environ ok" ]]; then
+        fail "the exec'd program could not find itself (RFC 0098): $line"
         status=1
     elif ! grep -qF "hosted exec    pid $hosted_pid kept across an exec" "$LOG"; then
         fail "the exec'd program printed pid $hosted_pid and the adapter kept a different one: $(grep -aoE 'hosted exec    pid [0-9]+ kept across an exec.*' "$LOG" | tail -1)"

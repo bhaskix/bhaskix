@@ -162,9 +162,15 @@ pub mod futex {
     pub const WAIT: u64 = 0;
     /// Wake up to `count` sleepers.
     pub const WAKE: u64 = 1;
-    /// Private to this address space — Go always sets it, and it is the only
-    /// kind this personality can honour: a shared futex would need a name
-    /// for memory across domains, which is a capability, not an address.
+    /// Private to this address space — Go always sets it. ~~It is the only
+    /// kind this personality can honour: a shared futex would need a name for
+    /// memory across domains, which is a capability, not an address.~~
+    /// **Corrected 2026-10-31, RFC 0097**: glibc's `pthread_join` waits
+    /// *without* it, so a shared futex is now honoured -- keyed by the
+    /// caller's domain and the address, exactly as a private one is, which is
+    /// right for every thread of one process. What still needs a name for
+    /// memory across domains is a waiter in *another* domain on memory the two
+    /// share, and that one is not woken; see the RFC for its trigger.
     pub const PRIVATE: u64 = 128;
     /// Absolute rather than relative timeouts.
     pub const CLOCK_REALTIME: u64 = 256;
@@ -196,13 +202,11 @@ pub enum FutexPlan {
 pub fn plan_futex(address: u64, operation: u64, value: u64) -> FutexPlan {
     use crate::memory::errno;
 
-    // The flags come off first: `PRIVATE` is required (see its note), and a
-    // realtime-clock timeout is honoured only in that it does not change
-    // what the operation *is*.
+    // The flags come off first. ~~`PRIVATE` is required (see its note)~~ --
+    // not since RFC 0097: a shared operation is keyed as a private one is (see
+    // its note). A realtime-clock timeout is honoured only in that it does not
+    // change what the operation *is*.
     let bare = operation & !(futex::PRIVATE | futex::CLOCK_REALTIME);
-    if operation & futex::PRIVATE == 0 {
-        return FutexPlan::Refuse(errno::ENOSYS);
-    }
     // A futex word is a `u32` and must be aligned: an unaligned one would
     // straddle nothing useful, and Linux refuses it too.
     if !address.is_multiple_of(4) || address == 0 {
@@ -722,10 +726,25 @@ mod tests {
     }
 
     #[test]
-    fn a_shared_futex_is_refused_because_sharing_here_is_a_capability() {
+    fn a_shared_futex_is_keyed_as_a_private_one_is() {
+        // RFC 0097: glibc's `pthread_join` waits with op 0, no `PRIVATE`. It
+        // was refused here with `ENOSYS` until 2026-10-31, and glibc 2.31 then
+        // spins on the refusal (5,752 refused waits in 200 ms, traced).
+        for (shared, private) in [
+            (futex::WAIT, futex::WAIT | futex::PRIVATE),
+            (futex::WAKE, futex::WAKE | futex::PRIVATE),
+        ] {
+            assert_eq!(
+                plan_futex(0x4000, shared, 7),
+                plan_futex(0x4000, private, 7)
+            );
+        }
         assert_eq!(
-            plan_futex(0x4000, futex::WAIT, 0),
-            FutexPlan::Refuse(errno::ENOSYS)
+            plan_futex(0x4000, futex::WAIT, 7),
+            FutexPlan::Wait {
+                address: 0x4000,
+                expected: 7
+            }
         );
     }
 

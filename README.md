@@ -19,7 +19,9 @@ compromised system. → [RFC 0031](docs/rfc/0031-linux-compatibility-as-an-adapt
 > shell utility, web server or database has ever run here.~~ **Stale since 2026-08-27, corrected
 > 2026-09-30:** a static BusyBox nobody here built runs its `echo` applet and its `sh`, gated on
 > every boot -- and since 2026-10-31 that `sh` forks, so `uname -a` typed at it runs
-> ([RFC 0096](docs/rfc/0096-a-fork-glibc-can-make.md)); ~~no web server or database has ever run here. The web server that will be tried first
+> ([RFC 0096](docs/rfc/0096-a-fork-glibc-can-make.md)), a thread made glibc's way can be joined
+> ([RFC 0097](docs/rfc/0097-threads-glibc-can-join.md)), and an exec'd program can read its own path
+> ([RFC 0098](docs/rfc/0098-a-program-that-can-find-itself.md)); ~~no web server or database has ever run here. The web server that will be tried first
 > is named — a static Go `net/http` server under sixteen concurrent clients
 > ([RFC 0086](docs/rfc/0086-the-motivating-workload.md)) — and it does not run yet.~~ **Since
 > 2026-10-01 a static Go 1.27.1 `net/http` server runs** in a Linux domain and serves sixteen

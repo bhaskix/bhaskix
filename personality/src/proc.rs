@@ -19,10 +19,13 @@
 //! `status` and `maps` are what a program actually reads about itself: a
 //! runtime asks `status` for its own pid when it cannot trust `getpid` across
 //! a `clone`, and `maps` is what every allocator, garbage collector and crash
-//! handler walks to learn where its own memory is. `cmdline` and `environ`
+//! handler walks to learn where its own memory is. ~~`cmdline` and `environ`
 //! wait for an `execve` that carries argv, which this personality does not yet
-//! have — an empty file would be a lie, and a missing one is a refusal a
-//! program can see.
+//! have~~ -- stale from RFC 0059, which gave `execve` argv and an environment;
+//! **since RFC 0098 they are served** for a process this personality exec'd,
+//! read from its own memory, with `exe` as the one link. A process it did not
+//! exec has none of the three: an empty file would be a lie, and a missing one
+//! is a refusal a program can see.
 
 use crate::process::Region;
 
@@ -33,6 +36,52 @@ pub enum File {
     Status,
     /// `/proc/self/maps` — what the process has mapped, in Linux's format.
     Maps,
+    /// `/proc/self/cmdline` — its argument strings, read from its own memory
+    /// (RFC 0098).
+    Cmdline,
+    /// `/proc/self/environ` — its environment strings, likewise.
+    Environ,
+}
+
+/// A link under `/proc/self` this personality answers `readlink` for — RFC
+/// 0098. One: `exe`, the program's own path.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Link {
+    /// `/proc/self/exe`.
+    Exe,
+}
+
+impl Link {
+    /// The link a path names, `None` for anything else -- a path that is not
+    /// under `/proc/self/` and one that is but names no link here alike. The
+    /// path arrives as C sees it, as [`File::from_path`]'s does.
+    #[must_use]
+    pub fn from_path(path: &[u8]) -> Option<Self> {
+        let end = path
+            .iter()
+            .position(|byte| *byte == 0)
+            .unwrap_or(path.len());
+        (strip(&path[..end], b"/proc/self/")? == b"exe").then_some(Self::Exe)
+    }
+}
+
+/// Whether a path is under `/proc/self/` at all -- the part of the namespace
+/// this personality answers for, where a name it does not serve is `ENOENT`.
+#[must_use]
+pub fn is_proc_self(path: &[u8]) -> bool {
+    let end = path
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(path.len());
+    strip(&path[..end], b"/proc/self/").is_some()
+}
+
+/// What `readlink` copies out for `/proc/self/exe`: the exec'd path, cut to the
+/// caller's buffer with no terminator -- `readlink(2)`'s own contract, "does
+/// not append a null byte ... (silently) truncate".
+#[must_use]
+pub fn readlink_bytes(path: &[u8], size: usize) -> &[u8] {
+    &path[..path.len().min(size)]
 }
 
 impl File {
@@ -57,6 +106,8 @@ impl File {
         match rest {
             b"status" => Some(Self::Status),
             b"maps" => Some(Self::Maps),
+            b"cmdline" => Some(Self::Cmdline),
+            b"environ" => Some(Self::Environ),
             _ => None,
         }
     }
@@ -224,7 +275,14 @@ mod tests {
     fn a_path_this_personality_does_not_serve_is_not_guessed_at() {
         assert_eq!(File::from_path(b"/proc/self/status"), Some(File::Status));
         assert_eq!(File::from_path(b"/proc/self/maps"), Some(File::Maps));
-        assert_eq!(File::from_path(b"/proc/self/cmdline"), None);
+        assert_eq!(File::from_path(b"/proc/self/cmdline"), Some(File::Cmdline));
+        assert_eq!(File::from_path(b"/proc/self/environ"), Some(File::Environ));
+        assert_eq!(
+            File::from_path(b"/proc/self/exe"),
+            None,
+            "a link, not a file"
+        );
+        assert_eq!(File::from_path(b"/proc/self/fd/0"), None);
         assert_eq!(File::from_path(b"/proc/1/status"), None, "somebody else");
         assert_eq!(File::from_path(b"/proc/self"), None);
         assert_eq!(File::from_path(b"status"), None);
@@ -233,6 +291,21 @@ mod tests {
         buffer[..15].copy_from_slice(b"/proc/self/maps");
         buffer[40] = b'x';
         assert_eq!(File::from_path(&buffer), Some(File::Maps));
+    }
+
+    #[test]
+    fn exe_is_the_one_link_and_readlink_truncates_without_a_terminator() {
+        assert_eq!(Link::from_path(b"/proc/self/exe"), Some(Link::Exe));
+        assert_eq!(Link::from_path(b"/proc/self/exe\0junk"), Some(Link::Exe));
+        assert_eq!(Link::from_path(b"/proc/self/cwd"), None);
+        assert_eq!(Link::from_path(b"/proc/1/exe"), None, "somebody else");
+        assert_eq!(Link::from_path(b"/hosted"), None);
+        assert!(is_proc_self(b"/proc/self/cwd"));
+        assert!(!is_proc_self(b"/hosted"));
+        assert!(!is_proc_self(b"/proc/1/exe"));
+        assert_eq!(readlink_bytes(b"/hosted", 64), b"/hosted");
+        assert_eq!(readlink_bytes(b"/hosted", 3), b"/ho");
+        assert_eq!(readlink_bytes(b"/hosted", 0), b"");
     }
 
     /// **The leak test, and it is the reason this module exists.**

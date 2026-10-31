@@ -100,6 +100,10 @@ pub enum StackError {
     },
 }
 
+/// Where an image's argument strings and environment strings lie: two
+/// `[start, end)` ranges -- see [`Builder::string_ranges`].
+pub type StringRanges = ((u64, u64), (u64, u64));
+
 /// Builds an initial-stack image into a caller's buffer.
 ///
 /// `base` is the virtual address the *lowest* byte of the buffer will map at
@@ -154,6 +158,33 @@ impl<'a> Builder<'a> {
         }
         let aligned_vectors = (vector_bytes + 15) & !15;
         aligned_vectors + strings + RANDOM_BYTES
+    }
+
+    /// Where the argument strings and then the environment strings land in
+    /// an image built at `base`: two `[start, end)` ranges, each string
+    /// `NUL`-terminated, back to back -- RFC 0098.
+    ///
+    /// **The layout `build` writes, computed the same way**: the strings begin
+    /// at the sixteen-byte boundary after the vectors. A process's
+    /// `/proc/self/cmdline` and `environ` are read from these ranges in its own
+    /// memory, as Linux reads them from `arg_start..arg_end`.
+    #[must_use]
+    pub fn string_ranges(&self, base: u64) -> StringRanges {
+        let start = base + self.strings_start() as u64;
+        let arguments: u64 = self.args.iter().map(|arg| arg.len() as u64 + 1).sum();
+        let environment: u64 = self.env.iter().map(|var| var.len() as u64 + 1).sum();
+        (
+            (start, start + arguments),
+            (start + arguments, start + arguments + environment),
+        )
+    }
+
+    /// Where the strings begin, from the image's lowest byte: after `argc`, both
+    /// vectors and the auxiliary vector, rounded up to sixteen.
+    fn strings_start(&self) -> usize {
+        let words =
+            1 + (self.args.len() + 1) + (self.env.len() + 1) + (self.auxv_pairs(0).len() * 2 + 2);
+        (words * 8 + 15) & !15
     }
 
     /// Writes the image into `buffer`, whose lowest byte maps at `base`.
@@ -345,6 +376,23 @@ mod tests {
         // AT_RANDOM points at the sixteen entropy bytes, inside the image.
         let random_at = (pair(&found, auxv::RANDOM) - base) as usize;
         assert_eq!(&buffer[random_at..random_at + 16], b"0123456789abcdef");
+    }
+
+    #[test]
+    fn the_string_ranges_are_where_build_put_the_strings() {
+        let args: [&[u8]; 3] = [b"hosted", b"one", b"two"];
+        let env: [&[u8]; 1] = [b"GREETING=namaste"];
+        let builder = Builder::new(&args, &env, info());
+        let base = 0x7fff_0000_0000;
+        let mut buffer = alloc_zeroed(builder.size());
+        builder.build(&mut buffer, base).unwrap();
+        let ((arg_start, arg_end), (env_start, env_end)) = builder.string_ranges(base);
+        let at = |address: u64| (address - base) as usize;
+        assert_eq!(&buffer[at(arg_start)..at(arg_end)], b"hosted\0one\0two\0");
+        assert_eq!(&buffer[at(env_start)..at(env_end)], b"GREETING=namaste\0");
+        // And they are what argv[0] and envp[0] point at.
+        assert_eq!(word(&buffer, 1), arg_start);
+        assert_eq!(word(&buffer, 5), env_start);
     }
 
     #[test]

@@ -131,12 +131,16 @@ fn page_of(request: &PersonalityCall) -> Option<usize> {
 }
 
 /// Starts a `clone` child as Linux would: see the module note. `image` is
-/// the parent's staged frame; `stack` and `tls` are `plan_clone`'s.
+/// the parent's staged frame; `stack`, `tls` and the two tid addresses are
+/// `plan_clone`'s -- `parent_tid` written before the thread starts, `child_tid`
+/// recorded for its `exit` (RFC 0097).
 pub(crate) fn spawn(
     request: &PersonalityCall,
     image: &[u64],
     stack: u64,
     tls: Option<u64>,
+    parent_tid: Option<u64>,
+    child_tid: Option<u64>,
 ) -> Answer {
     let Some(index) = page_of(request) else {
         return Answer::error(EAGAIN);
@@ -170,6 +174,16 @@ pub(crate) fn spawn(
     if !super::copy_out(request.domain, entry, &code[..length]) {
         return Answer::error(EAGAIN);
     }
+    // **`CLONE_PARENT_SETTID`, before the thread exists** -- RFC 0097. glibc
+    // names the thread's own tid word here and reads it back as soon as
+    // `clone` returns; it is in this domain's memory, which the new thread
+    // shares. A word that cannot be written refuses the `clone` before
+    // anything was started.
+    if let Some(at) = parent_tid
+        && !super::copy_out(request.domain, at, &tid.to_le_bytes())
+    {
+        return Answer::error(bhaskix_personality::socket::errno::EFAULT);
+    }
     let made = super::call(
         syscall::INVOKE,
         super::handle_of(request.domain),
@@ -188,10 +202,13 @@ pub(crate) fn spawn(
         page.owners[slot] = thread;
         page.started[slot] = false;
     }
-    if let Ok(record) = super::threads().record(request.domain, thread, tid)
-        && let Some(base) = tls
-    {
-        record.fs_base = base;
+    if let Ok(record) = super::threads().record(request.domain, thread, tid) {
+        if let Some(base) = tls {
+            record.fs_base = base;
+        }
+        // `CLONE_CHILD_CLEARTID`: the word this thread's `exit` clears, and
+        // whose waiter it wakes -- RFC 0097.
+        record.clear_tid = child_tid.unwrap_or(0);
     }
     Answer::ok(u64::from(tid))
 }

@@ -1076,9 +1076,15 @@ fn answer_with_frame(domain: u32, thread: u32, slot: u64, number: u64) -> (u64, 
                 domain,
             );
             match thread::plan_clone(rdi, rsi, rdx, r10, r8) {
-                ClonePlan::Thread { stack, tls, .. } => {
-                    (REPLY_VALUE, clone::spawn(&request, &image, stack, tls))
-                }
+                ClonePlan::Thread {
+                    stack,
+                    tls,
+                    parent_tid,
+                    child_tid,
+                } => (
+                    REPLY_VALUE,
+                    clone::spawn(&request, &image, stack, tls, parent_tid, child_tid),
+                ),
                 // **glibc's `fork()`** -- RFC 0096: the fork below, with the
                 // tid words it asked for.
                 ClonePlan::Process {
@@ -2211,10 +2217,35 @@ fn answer(request: &PersonalityCall) -> (u64, Answer) {
         IOCTL => return (REPLY_VALUE, answer_ioctl(request)),
         FSTAT => return (REPLY_VALUE, answer_fstat(request)),
         NEWFSTATAT => return (REPLY_VALUE, answer_newfstatat(request)),
+        READLINK => {
+            return (
+                REPLY_VALUE,
+                answer_readlink(request, request.first(), request.second(), request.third()),
+            );
+        }
+        READLINKAT => {
+            return (
+                REPLY_VALUE,
+                answer_readlink(request, request.second(), request.third(), request.fourth()),
+            );
+        }
         CLOSE => return (REPLY_VALUE, answer_close(request)),
         DUP | DUP2 | DUP3 => return (REPLY_VALUE, answer_dup(request)),
         SCHED_YIELD => return (REPLY_YIELD, Answer::ok(0)),
         EXIT => {
+            // **Its tid word, cleared, and whoever waits on it woken** -- RFC
+            // 0097, Linux's thread-exit contract, which glibc's `pthread_join`
+            // waits for: the word `CLONE_CHILD_CLEARTID` or `set_tid_address`
+            // named. A word that cannot be written is not woken for -- a waiter
+            // would only read the old value and wait again.
+            if let Some(clear) = threads()
+                .get(request.domain, request.thread)
+                .map(|record| record.clear_tid)
+                .filter(|address| *address != 0)
+                && copy_out(request.domain, clear, &0u32.to_le_bytes())
+            {
+                let _ = futex_wake(request.domain, clear, 1);
+            }
             // The thread's number goes with it -- RFC 0096 -- because the
             // nucleus may give its id to the next thread it starts.
             threads().forget(request.domain, request.thread);
@@ -3761,6 +3792,10 @@ const FSTAT: u64 = 5;
 /// `newfstatat(dirfd, path, statbuf, flags)` — `stat` and `lstat` as every
 /// current libc issues them.
 const NEWFSTATAT: u64 = 262;
+/// `readlink(path, buf, size)` -- RFC 0098.
+const READLINK: u64 = 89;
+/// `readlinkat(dirfd, path, buf, size)` -- RFC 0098.
+const READLINKAT: u64 = 267;
 /// `getdents64(fd, buffer, count)`.
 const GETDENTS64: u64 = 217;
 /// `uname(buf)`.
@@ -5432,9 +5467,21 @@ fn open_proc(request: &PersonalityCall, file: ProcFile, flags: u64) -> Answer {
     if flags & open::ACCMODE != open::RDONLY {
         return Answer::error(-30); // EROFS
     }
-    let mut bytes = [0u8; bhaskix_personality::proc::MAX_BYTES];
-    let Some(size) = generate_proc(request.domain, file, &mut bytes) else {
-        return Answer::error(-11); // EAGAIN
+    let size = match file {
+        // **Sized by the record, read from the process's own memory** --
+        // RFC 0098. A process this adapter did not exec has neither file, and
+        // is told so rather than handed an empty one.
+        ProcFile::Cmdline | ProcFile::Environ => match own_strings(request.domain, file) {
+            Some((start, end)) => (end - start) as usize,
+            None => return Answer::error(-2), // ENOENT
+        },
+        ProcFile::Status | ProcFile::Maps => {
+            let mut bytes = [0u8; bhaskix_personality::proc::MAX_BYTES];
+            let Some(size) = generate_proc(request.domain, file, &mut bytes) else {
+                return Answer::error(-11); // EAGAIN
+            };
+            size
+        }
     };
     let entry = Entry {
         // Generated here and on no filesystem: a synthetic `/proc` file has
@@ -5444,6 +5491,8 @@ fn open_proc(request: &PersonalityCall, file: ProcFile, flags: u64) -> Answer {
         handle: match file {
             ProcFile::Status => 0,
             ProcFile::Maps => 1,
+            ProcFile::Cmdline => 2,
+            ProcFile::Environ => 3,
         },
         kind: Kind::Proc,
         close_on_exec: flags & open::CLOEXEC != 0,
@@ -5477,16 +5526,103 @@ fn generate_proc(domain: u32, file: ProcFile, out: &mut [u8]) -> Option<usize> {
         ProcFile::Maps => {
             bhaskix_personality::proc::write_maps(out, &process.regions, PROT_READ_EXECUTE)
         }
+        // Read from the process's own memory by `read_proc`, never generated.
+        ProcFile::Cmdline | ProcFile::Environ => 0,
     })
+}
+
+/// Where `domain`'s argument or environment strings are in its own memory --
+/// RFC 0098 -- or `None` for a process this adapter did not exec.
+fn own_strings(domain: u32, file: ProcFile) -> Option<(u64, u64)> {
+    let image = process_for(domain)?.image?;
+    match file {
+        ProcFile::Cmdline => Some(image.arguments),
+        ProcFile::Environ => Some(image.environment),
+        ProcFile::Status | ProcFile::Maps => None,
+    }
+}
+
+/// Reads `cmdline` or `environ` at the descriptor's offset, **straight out of
+/// the process's own memory** -- RFC 0098 -- as Linux reads `arg_start..arg_end`.
+/// Nothing is generated or copied ahead: a program that rewrote its argv reads
+/// what it wrote, and a long one is read a piece per call rather than cut.
+fn read_own_strings(request: &PersonalityCall, file: ProcFile, buffer: u64, count: u64) -> Answer {
+    let Some((start, end)) = own_strings(request.domain, file) else {
+        return Answer::error(-2); // ENOENT
+    };
+    let Ok(descriptor) = i32::try_from(request.first()) else {
+        return Answer::error(-9);
+    };
+    let Some(entry) = process_for(request.domain)
+        .and_then(|process| process.descriptors.get(descriptor).copied())
+    else {
+        return Answer::error(-9);
+    };
+    let length = end - start;
+    if entry.offset >= length {
+        return Answer::ok(0);
+    }
+    let mut bytes = [0u8; bhaskix_personality::proc::MAX_BYTES];
+    let take = count.min(length - entry.offset).min(bytes.len() as u64) as usize;
+    if !copy_in(request.domain, start + entry.offset, &mut bytes[..take]) {
+        return Answer::error(-5); // EIO: the range is no longer readable
+    }
+    if !copy_out(request.domain, buffer, &bytes[..take]) {
+        return Answer::error(-14); // EFAULT
+    }
+    if let Some(process) = process_for(request.domain)
+        && let Some(entry) = process.descriptors.get_mut(descriptor)
+    {
+        entry.offset += take as u64;
+    }
+    Answer::ok(take as u64)
+}
+
+/// `readlink` and `readlinkat` -- RFC 0098. One link is answered,
+/// `/proc/self/exe`, with the path this process was exec'd from, cut to the
+/// caller's buffer with no terminator as `readlink(2)` says. A process this
+/// adapter did not exec has no path to give and is told `ENOENT`, as RFC 0005
+/// decided; so is any other name under `/proc/self/`. **A path anywhere else
+/// keeps the answer it had**, `ENOSYS`: this RFC answers one link, and does
+/// not invent a symlink model for a filesystem that has not got one.
+fn answer_readlink(request: &PersonalityCall, path_at: u64, buffer: u64, size: u64) -> Answer {
+    use bhaskix_personality::proc::{Link, is_proc_self, readlink_bytes};
+    let mut path = [0u8; MAX_NAME];
+    if bhaskix_personality::exec::read_string(path_at, &mut path, &mut |at, out| {
+        copy_in(request.domain, at, out)
+    })
+    .is_err()
+    {
+        return bhaskix_personality::call::ENOSYS;
+    }
+    if Link::from_path(&path) != Some(Link::Exe) {
+        return if is_proc_self(&path) {
+            Answer::error(-2) // ENOENT
+        } else {
+            bhaskix_personality::call::ENOSYS
+        };
+    }
+    let Some(image) = process_for(request.domain).and_then(|process| process.image) else {
+        return Answer::error(-2); // ENOENT
+    };
+    let bytes = readlink_bytes(image.path(), usize::try_from(size).unwrap_or(usize::MAX));
+    if !copy_out(request.domain, buffer, bytes) {
+        return Answer::error(-14); // EFAULT
+    }
+    Answer::ok(bytes.len() as u64)
 }
 
 /// Reads from a `/proc` file, generating it afresh.
 fn read_proc(request: &PersonalityCall, handle: u64, buffer: u64, count: u64) -> Answer {
-    let file = if handle == 0 {
-        ProcFile::Status
-    } else {
-        ProcFile::Maps
+    let file = match handle {
+        0 => ProcFile::Status,
+        1 => ProcFile::Maps,
+        2 => ProcFile::Cmdline,
+        _ => ProcFile::Environ,
     };
+    if let ProcFile::Cmdline | ProcFile::Environ = file {
+        return read_own_strings(request, file, buffer, count);
+    }
     let mut bytes = [0u8; bhaskix_personality::proc::MAX_BYTES];
     let Some(length) = generate_proc(request.domain, file, &mut bytes) else {
         return Answer::error(-11);
@@ -7866,6 +8002,22 @@ fn answer_execve(request: &PersonalityCall) -> (u64, Answer) {
             Err(errno) => return (REPLY_VALUE, Answer::error(errno)),
         };
     let path = &path[..length];
+    // **`/proc/self/exe` is the program this process was exec'd from** -- RFC
+    // 0098 -- which is what a program re-executing itself asks for. One this
+    // adapter did not exec has no such path, and is told so.
+    let mut own = [0u8; MAX_NAME];
+    let path = if bhaskix_personality::proc::Link::from_path(path)
+        == Some(bhaskix_personality::proc::Link::Exe)
+    {
+        let Some(image) = process_for(request.domain).and_then(|process| process.image) else {
+            return (REPLY_VALUE, Answer::error(-2)); // ENOENT
+        };
+        let recorded = image.path();
+        own[..recorded.len()].copy_from_slice(recorded);
+        &own[..recorded.len()]
+    } else {
+        path
+    };
 
     // **The two vectors, before anything is created.** An `execve` refused for
     // its arguments must leave the caller running and unchanged, and the
@@ -7918,9 +8070,10 @@ fn answer_execve(request: &PersonalityCall) -> (u64, Answer) {
     // answering `ENOMEM` to either would send whoever is debugging it looking
     // for memory pressure that is not there.
     let built = match &staged {
-        None if build_exec_image() => Ok(()),
+        // The built-in image is not a file, so it records no path (RFC 0098).
+        None if build_exec_image() => Ok(None),
         None => Err(-12), // ENOMEM
-        Some(staged) => build_staged_image(staged, arguments),
+        Some(staged) => build_staged_image(staged, arguments).map(Some),
     };
     // The file handle outlives the build now, because the build is what reads
     // through it. Released here, on every path, so a refused exec does not
@@ -7938,7 +8091,7 @@ fn answer_execve(request: &PersonalityCall) -> (u64, Answer) {
     // prevent. The old slot's incarnation moves when the kernel says it has
     // been reused (`FORGET`), which is the only moment that is true.
     let outcome = match built {
-        Ok(()) => (REPLY_END_DOMAIN, Answer::ok(0)),
+        Ok(_) => (REPLY_END_DOMAIN, Answer::ok(0)),
         Err(errno) => (REPLY_VALUE, Answer::error(errno)),
     };
     if built.is_ok() {
@@ -7961,6 +8114,12 @@ fn answer_execve(request: &PersonalityCall) -> (u64, Answer) {
             process.exec_into(child, generation, drawn_base(), |entry, last| {
                 give_back_descriptor(entry, last, from);
             });
+            // **What it was exec'd as** -- RFC 0098: the path, and where its
+            // new stack holds its strings.
+            if let Ok(Some((arguments, environment))) = built {
+                process.image =
+                    bhaskix_personality::process::Image::new(path, arguments, environment);
+            }
             // The old domain's threads end with it; the new program's first
             // thread is numbered as the pid when it first asks -- RFC 0096.
             threads().forget_domain(from);
@@ -8126,10 +8285,13 @@ fn staged_bytes(length: u64) -> Result<&'static [u8], i64> {
 /// `ENOEXEC` for anything the ELF parser refuses or that would land on the
 /// stack this loader is about to map, `E2BIG` if the initial image does not
 /// fit its page, and `ENOMEM` for a kernel call that refuses.
+///
+/// Answers where the argument and environment strings landed in the new
+/// stack, for `/proc/self/cmdline` and `environ` (RFC 0098).
 fn build_staged_image(
     staged: &Staged,
     arguments: &bhaskix_personality::exec::Arguments,
-) -> Result<(), i64> {
+) -> Result<bhaskix_personality::stack::StringRanges, i64> {
     use bhaskix_personality::stack::{Builder, ProcessInfo};
 
     let bytes = staged_bytes(staged.head)?;
@@ -8268,7 +8430,7 @@ fn build_staged_image(
     {
         return Err(-12);
     }
-    Ok(())
+    Ok(builder.string_ranges(image_at))
 }
 
 /// Streams `length` bytes from the file at `from` into the child at `address`.
@@ -8706,39 +8868,10 @@ fn answer_futex(request: &PersonalityCall) -> (u64, Answer) {
             // given back, and which is a reply a pending signal can ride.
             (REPLY_BLOCK_ON_RETRY, Answer::ok(WAKE_SLOT + slot as u64))
         }
-        FutexPlan::Wake { address, count } => {
-            let table = sleepers();
-            let mut woken = 0u64;
-            while woken < u64::from(count) {
-                // The oldest sleeper on this word, so a contended futex does
-                // not starve whoever has been waiting longest.
-                let next = table
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, s)| s.domain == request.domain + 1 && s.address == address)
-                    .min_by_key(|(_, s)| s.arrived)
-                    .map(|(index, _)| index);
-                let Some(index) = next else { break };
-                let signalled = call(
-                    syscall::INVOKE,
-                    WAKE_SLOT + index as u64,
-                    method::SIGNAL,
-                    [0; 4],
-                );
-                // **Marked, not freed** -- RFC 0085. The sleeper owns its slot
-                // until it comes back; freeing it here is the defect the pipe
-                // and `wait4` wakes had. Out of the match either way, so a
-                // failed signal cannot be found again by this loop; if that
-                // sleeper does wake it is answered 0, which a futex may be.
-                table[index].domain = u32::MAX;
-                table[index].woken = true;
-                if signalled.status != status::OK {
-                    continue;
-                }
-                woken += 1;
-            }
-            (REPLY_VALUE, Answer::ok(woken))
-        }
+        FutexPlan::Wake { address, count } => (
+            REPLY_VALUE,
+            Answer::ok(futex_wake(request.domain, address, count)),
+        ),
         FutexPlan::Refuse(errno) => (REPLY_VALUE, Answer::error(errno)),
     }
 }
@@ -8751,6 +8884,43 @@ fn answer_futex(request: &PersonalityCall) -> (u64, Answer) {
 /// kernel's IPC gives a server exactly one outstanding reply, so there is no
 /// second caller inside this function and no interrupt that runs its code.
 /// A lock here would be a lock nothing can contend.
+/// Wakes up to `count` threads of `domain` sleeping on `address`, oldest
+/// first, and answers how many -- `FUTEX_WAKE`'s work, and since RFC 0097 a
+/// thread's `exit` too, for the waiter on its cleared tid word.
+fn futex_wake(domain: u32, address: u64, count: u32) -> u64 {
+    let table = sleepers();
+    let mut woken = 0u64;
+    while woken < u64::from(count) {
+        // The oldest sleeper on this word, so a contended futex does
+        // not starve whoever has been waiting longest.
+        let next = table
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.domain == domain + 1 && s.address == address)
+            .min_by_key(|(_, s)| s.arrived)
+            .map(|(index, _)| index);
+        let Some(index) = next else { break };
+        let signalled = call(
+            syscall::INVOKE,
+            WAKE_SLOT + index as u64,
+            method::SIGNAL,
+            [0; 4],
+        );
+        // **Marked, not freed** -- RFC 0085. The sleeper owns its slot
+        // until it comes back; freeing it here is the defect the pipe
+        // and `wait4` wakes had. Out of the match either way, so a
+        // failed signal cannot be found again by this loop; if that
+        // sleeper does wake it is answered 0, which a futex may be.
+        table[index].domain = u32::MAX;
+        table[index].woken = true;
+        if signalled.status != status::OK {
+            continue;
+        }
+        woken += 1;
+    }
+    woken
+}
+
 fn dispositions_of(domain: u32) -> &'static mut Dispositions {
     let index = (domain as usize) % limits::MAX_DOMAINS;
     // SAFETY: single-threaded by construction, as above; the index is masked

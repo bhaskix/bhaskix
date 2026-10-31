@@ -1189,6 +1189,12 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
     ) {
         println!("\x1b[91m    linux fork reg FAILED\x1b[0m");
     }
+    if !thread_join_self_test(
+        handoff.hhdm_base.as_u64(),
+        bhaskix_arch::percpu::online_count(),
+    ) {
+        println!("\x1b[91m    linux join     FAILED\x1b[0m");
+    }
     if !vector_self_test(
         handoff.hhdm_base.as_u64(),
         bhaskix_arch::percpu::online_count(),
@@ -6442,10 +6448,16 @@ const THREAD_CODE: [u8; 251] = [
     0xb8, 0xca, 0x00, 0x00, 0x00, // mov eax, 202
     0x0f, 0x05, // syscall
     0x49, 0x89, 0x47, 0x20, // mov [r15+32], rax     ; expect 0
-    0xbe, 0x00, 0x00, 0x00, 0x00, // mov esi, 0            ; WAIT, not private
+    // **A shared WAIT, answered as a private one is since RFC 0097** -- it was
+    // refused with ENOSYS until 2026-10-31. It expects 0 on a word holding 1,
+    // so it refuses to sleep rather than sleeping for ever with no timeout;
+    // the same five bytes `mov esi, 0` took, so nothing after it moved.
+    0x31, 0xf6, // xor esi, esi          ; WAIT, not private
+    0x31, 0xd2, // xor edx, edx          ; expect 0, word is 1
+    0x90, // nop
     0xb8, 0xca, 0x00, 0x00, 0x00, // mov eax, 202
     0x0f, 0x05, // syscall
-    0x49, 0x89, 0x47, 0x28, // mov [r15+40], rax     ; expect -ENOSYS
+    0x49, 0x89, 0x47, 0x28, // mov [r15+40], rax     ; expect -EAGAIN
     0xbf, 0x00, 0x01, 0x0f, 0x00, // mov edi, 0xf0100      ; Go's flag set (low)
     0x81, 0xcf, 0x00, 0x00, 0x00, 0x00, // or edi, 0             ; (kept simple)
     0xbe, 0x00, 0x80, 0x00, 0x00, // mov esi, 0x8000       ; a stack
@@ -6633,7 +6645,7 @@ fn thread_self_test(hhdm_base: u64, cpus: u32) -> bool {
         && answers[2] == 0
         && answers[3] == eagain
         && answers[4] == 0
-        && answers[5] == enosys
+        && answers[5] == eagain
         && answers[6] == enosys
         && answers[7] == 0
         && answers[8] == WITNESS
@@ -6644,8 +6656,9 @@ fn thread_self_test(hhdm_base: u64, cpus: u32) -> bool {
         println!(
             "    linux futex    a Linux program asked its tid ({}) and pid ({}), yielded, and \
              met the futex contract's edges: a WAIT on a word that had already changed refused \
-             to sleep (EAGAIN), a WAKE with nobody asleep woke none, a shared futex and a clone \
-             were refused; then it set its TLS base, read {:#x} back through it, and wrote {} \
+             to sleep (EAGAIN), a WAKE with nobody asleep woke none, a shared WAIT refused a \
+             stale word as a private one does, and a clone was refused; then it set its TLS \
+             base, read {:#x} back through it, and wrote {} \
              bytes to the console through the adapter",
             answers[0], answers[1], answers[8], answers[9]
         );
@@ -8473,6 +8486,155 @@ fn fork_registers_self_test(hhdm_base: u64, cpus: u32) -> bool {
              clone child: status {cloned:#x} (exit bits 1 rdi, 2 r10, 4 tid is not the pid, 8 \
              the word does not hold it), pid {clone_pid}, collected {clone_waited}; the parent's \
              word {word:#x}, where it must stay 0xffffffff; finished {done}\x1b[0m"
+        );
+        false
+    }
+}
+
+/// The join probe -- RFC 0097. Assembled from
+/// [`tools/probes/linux-thread-join.s`](../../tools/probes/linux-thread-join.s)
+/// by [`tools/probe-bytes.sh`](../../tools/probe-bytes.sh): a thread made with
+/// glibc's `pthread_create` flags, its tid word written by `CLONE_PARENT_SETTID`
+/// and cleared at its `exit` by `CLONE_CHILD_CLEARTID`, and its creator waiting
+/// on the word with the shared `FUTEX_WAIT` glibc's `pthread_join` makes.
+#[rustfmt::skip]
+const THREAD_JOIN_CODE: [u8; 158] = [
+    0x49, 0x89, 0xff,                         // mov %rdi,%r15
+    0x41, 0xc7, 0x47, 0x40, 0x00, 0x00, 0x00, 0x00, // movl $0x0,0x40(%r15)
+    0xbf, 0x00, 0x0f, 0x3d, 0x00,             // mov $0x3d0f00,%edi
+    0x48, 0x8d, 0xb4, 0x24, 0x00, 0xe0, 0xff, 0xff, // lea -0x2000(%rsp),%rsi
+    0x48, 0x83, 0xe6, 0xf0,                   // and $0xfffffffffffffff0,%rsi
+    0x49, 0x8d, 0x57, 0x40,                   // lea 0x40(%r15),%rdx
+    0x4d, 0x8d, 0x57, 0x40,                   // lea 0x40(%r15),%r10
+    0x4d, 0x8d, 0x87, 0x00, 0x08, 0x00, 0x00, // lea 0x800(%r15),%r8
+    0xb8, 0x38, 0x00, 0x00, 0x00,             // mov $0x38,%eax
+    0x0f, 0x05,                               // syscall
+    0x48, 0x85, 0xc0,                         // test %rax,%rax
+    0x74, 0x4c,                               // je 83 <thread>
+    0x49, 0x89, 0x47, 0x08,                   // mov %rax,0x8(%r15)
+    0x41, 0x8b, 0x4f, 0x40,                   // mov 0x40(%r15),%ecx
+    0x49, 0x89, 0x4f, 0x10,                   // mov %rcx,0x10(%r15)
+    0x45, 0x31, 0xe4,                         // xor %r12d,%r12d
+    0x41, 0x8b, 0x57, 0x40,                   // mov 0x40(%r15),%edx
+    0x85, 0xd2,                               // test %edx,%edx
+    0x74, 0x20,                               // je 6e <joined>
+    0x49, 0x8d, 0x7f, 0x40,                   // lea 0x40(%r15),%rdi
+    0x31, 0xf6,                               // xor %esi,%esi
+    0x45, 0x31, 0xd2,                         // xor %r10d,%r10d
+    0xb8, 0xca, 0x00, 0x00, 0x00,             // mov $0xca,%eax
+    0x0f, 0x05,                               // syscall
+    0x49, 0x89, 0x47, 0x20,                   // mov %rax,0x20(%r15)
+    0x49, 0xff, 0xc4,                         // inc %r12
+    0x49, 0x81, 0xfc, 0xa0, 0x86, 0x01, 0x00, // cmp $0x186a0,%r12
+    0x72, 0xd8,                               // jb 46 <join>
+    0x4d, 0x89, 0x67, 0x18,                   // mov %r12,0x18(%r15)
+    0x41, 0x8b, 0x4f, 0x40,                   // mov 0x40(%r15),%ecx
+    0x49, 0x89, 0x4f, 0x28,                   // mov %rcx,0x28(%r15)
+    0x49, 0xc7, 0x07, 0x01, 0x00, 0x00, 0x00, // movq $0x1,(%r15)
+    0xeb, 0xfe,                               // jmp 81 <joined+0x13>
+    0xbb, 0xc8, 0x00, 0x00, 0x00,             // mov $0xc8,%ebx
+    0xb8, 0x18, 0x00, 0x00, 0x00,             // mov $0x18,%eax
+    0x0f, 0x05,                               // syscall
+    0xff, 0xcb,                               // dec %ebx
+    0x75, 0xf5,                               // jne 88 <thread+0x5>
+    0x31, 0xff,                               // xor %edi,%edi
+    0xb8, 0x3c, 0x00, 0x00, 0x00,             // mov $0x3c,%eax
+    0x0f, 0x05,                               // syscall
+    0xeb, 0xfe,                               // jmp 9c <thread+0x19>
+];
+
+/// Where the join probe's report page lands physically.
+static THREAD_JOIN_REPORT_PA: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Where the join probe runs, in [`enter_probe`]'s layout.
+const THREAD_JOIN_AT: u64 = 0x0000_0000_3700_0000;
+
+extern "C" fn ring3_thread_join(hhdm_base: u64) -> ! {
+    enter_probe(
+        hhdm_base,
+        &THREAD_JOIN_CODE,
+        THREAD_JOIN_AT,
+        &THREAD_JOIN_REPORT_PA,
+        0,
+    )
+}
+
+/// RFC 0097: **whether a thread glibc makes can be joined.** The tid word must
+/// hold the new thread's tid as soon as `clone` returns, and the creator's
+/// shared wait on it must end because the thread's `exit` cleared the word and
+/// woke it. Until the RFC the word was never written or cleared and a shared
+/// wait was refused with `ENOSYS`, which glibc 2.31 retries for ever.
+fn thread_join_self_test(hhdm_base: u64, cpus: u32) -> bool {
+    use core::sync::atomic::Ordering;
+
+    if cpus < 2 {
+        println!("\x1b[93m    linux join     skipped, needs a second cpu\x1b[0m");
+        return true;
+    }
+    let cpu = cpus.saturating_sub(1);
+    THREAD_JOIN_REPORT_PA.store(0, Ordering::Release);
+    let Ok(realm) = domain::create("join", domain::ResourceEnvelope::new()) else {
+        println!("\x1b[91m    linux join     FAILED: no domain\x1b[0m");
+        return false;
+    };
+    if !tag_linux(realm, "linux join     ") {
+        return false;
+    }
+    let options = sched::SpawnOptions::new()
+        .pinned()
+        .in_domain(realm.as_u32());
+    if sched::spawn_on_with(
+        cpu,
+        "join",
+        ring3_thread_join,
+        hhdm_base,
+        hhdm_base,
+        options,
+    )
+    .is_err()
+    {
+        println!("\x1b[91m    linux join     FAILED: the probe would not spawn\x1b[0m");
+        retire_probe(realm);
+        return false;
+    }
+    // Words: done; the tid `clone` answered; the tid word straight after
+    // `clone`; the waits the join made; the last wait's answer; the word after
+    // the join. Word 0 is the probe's last store, so it is read first.
+    let mut words = [0u64; 6];
+    for _ in 0..1000 {
+        let report_pa = THREAD_JOIN_REPORT_PA.load(Ordering::Acquire);
+        if let Some(read) = finished_report(hhdm_base, report_pa, &[0]) {
+            words = read;
+            break;
+        }
+        wait_millis(5);
+    }
+    retire_probe(realm);
+
+    let [done, tid, at_once, waits, last, after] = words;
+    let eagain = -11i64 as u64;
+    // The last wait answered 0 (woken) or EAGAIN (the word changed between the
+    // read and the wait); none at all if the thread had already gone.
+    let answered = waits == 0 || last == 0 || last == eagain;
+    if done == 1
+        && tid > 0
+        && at_once & 0xffff_ffff == tid
+        && after & 0xffff_ffff == 0
+        && answered
+        && waits < 100_000
+    {
+        println!(
+            "    linux join     a thread made with glibc's flags (0x3d0f00) found its tid ({tid}) \
+             where its creator asked, at once, and its exit cleared the word and woke the \
+             creator from a shared futex wait: {waits} wait(s), the last answered {}",
+            last as i64
+        );
+        true
+    } else {
+        println!(
+            "\x1b[91m    linux join     FAILED: tid {tid}, the word at once {at_once:#x}, {waits} \
+             wait(s), the last answered {}, the word after {after:#x}, finished {done}\x1b[0m",
+            last as i64
         );
         false
     }

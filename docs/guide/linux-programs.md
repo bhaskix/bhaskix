@@ -126,6 +126,18 @@ that the adapter answered with `ENOSYS`; Go carries on without it.
   project's own tests, not yet by a transcript in this guide). What remains:
   the adapter has **three listening sockets at once**, and one you closed keeps
   its place until every connection it accepted has ended.
+- **A shared futex is shared within one process, not between processes.**
+  Threads made with glibc's `pthread_create` can be joined since 2026-10-31
+  ([RFC 0097](../rfc/0097-threads-glibc-can-join.md); checked by the project's
+  own tests -- no threaded glibc program ships with this guide). A futex wait
+  without the private flag is keyed to the waiting process, so a waiter in
+  *another* process, on memory the two share, is not woken.
+- **`/proc/self/exe`, `cmdline` and `environ` answer only for a program the
+  adapter started with `execve`**
+  ([RFC 0098](../rfc/0098-a-program-that-can-find-itself.md)), because that is
+  the only kind whose path it knows. A program the kernel started directly --
+  the BusyBox shell and the Go server in this guide are two -- is told
+  `ENOENT` for all three, rather than given a path made up for it.
 - **No dynamic linking, and no application milestone.** The Linux
   compatibility milestones, L1 to L4, are all unmet: nginx, PostgreSQL, MariaDB
   and OpenSSH have never run here. See the
