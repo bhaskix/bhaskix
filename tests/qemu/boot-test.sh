@@ -1275,7 +1275,8 @@ fi
 # must exist (an instrument that measured nothing is a failure even where slow
 # is not), events must be nonzero (the scheduler emits on every switch, and a
 # boot performs thousands), and audit-refused must be zero, because nothing may
-# emit the reserved class until the audit RFC builds its backpressure ring.
+# emit the reserved class on this plane: audit records have a ring of their own
+# that never drops (RFC 0101), gated below the round trip.
 if grep -qE "telemetry +[1-9][0-9]* events across [1-9][0-9]* cpus, [0-9]+ dropped, 0 audit-refused; ~[0-9]+ cycles/emit over [0-9]+, ~[0-9]+ disabled; [1-9][0-9]* slots/cpu" "$LOG"; then
     pass "telemetry: events counted, drops said, the reserved class untouched"
 else
@@ -1292,6 +1293,18 @@ if grep -qE "traced +all [1-9][0-9]* probe events read back through granted ring
     pass "telemetry round trip: the marked set came back through capabilities"
 else
     fail "bin/traced did not read back the marked set"
+    status=1
+fi
+
+# RFC 0101 step 1: every path that moves authority asks the audit log first.
+# Until bin/auditd attaches (step 2) the log counts by kind and records nothing,
+# and nothing may be refused. Each kind must be nonzero: a boot grants, derives,
+# revokes, and makes and ends domains, so a zero is a site that stopped asking.
+if grep -qE "audit +inactive until auditd attaches: [1-9][0-9]* grant\(s\), [1-9][0-9]* derive\(s\), [1-9][0-9]* revocation\(s\), [1-9][0-9]* domain\(s\) created, [1-9][0-9]* ended -- counted, not recorded; 0 refused" "$LOG"; then
+    pass "audit: every kind of authority change was asked about, and none refused"
+else
+    fail "the audit line is missing, refused something, or a kind was never asked about"
+    sed 's/\x1b\[[0-9;]*m//g' "$LOG" | grep -a 'audit  ' | head -1 | sed 's/^/      /'
     status=1
 fi
 

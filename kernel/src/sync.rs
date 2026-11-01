@@ -243,8 +243,20 @@ pub enum Rank {
     /// while it is held. That ordering is the whole reason this rank sits where
     /// it does.
     UsbKeyboard = 16,
-    /// `console::CONSOLE` — the innermost lock. Anything may print.
+    /// `console::CONSOLE` — innermost but one. Anything may print, except
+    /// while holding the audit ring.
     Console = 17,
+    /// `audit::LEDGER` -- RFC 0101's ring, the innermost lock.
+    ///
+    /// Inside even the console, because the paths that move authority emit
+    /// while holding whatever they hold -- the domain table, the capability
+    /// arena -- and a record must be reserved before the operation and
+    /// committed after it, under those same locks. Nothing is taken and
+    /// nothing is printed while it is held: its section is arithmetic and
+    /// stores into the ring's own frames. Numbered after the console rather
+    /// than before it, because the numbers are an order and renumbering
+    /// would rewrite the meaning of every recorded violation.
+    Audit = 18,
 }
 
 impl Rank {
@@ -287,6 +299,7 @@ impl Rank {
             Self::UsbKeyboard => "usb-keyboard",
             Self::DmaWindow => "iommu::WINDOW",
             Self::Console => "console::CONSOLE",
+            Self::Audit => "audit::LEDGER",
         }
     }
 }
@@ -389,6 +402,14 @@ mod test_cpu {
                 )
                 .is_ok()
             {
+                // A thread that panicked holding a lock left its counts and
+                // guards in the slot it leased; the next thread to lease it
+                // inherited them and failed too, naming the wrong test.
+                super::HELD[free].store(0, Ordering::Relaxed);
+                super::HOLDS[free].store(0, Ordering::Relaxed);
+                for held in &super::OPEN_GUARDS_PER_CPU[free].held {
+                    held.store(0, Ordering::Relaxed);
+                }
                 return Lease(free);
             }
         }
@@ -872,6 +893,15 @@ pub fn reset_violations() {
     VIOLATIONS.store(0, Ordering::Relaxed);
 }
 
+/// Lets the next violation be sampled as the first, for a test that needs
+/// `record`'s sampling to run on its own violation rather than on whichever
+/// test's came first in the process.
+#[cfg(test)]
+fn rearm_first_violation() {
+    FIRST_READY.store(false, Ordering::Release);
+    FIRST_SITE.store(0, Ordering::Release);
+}
+
 /// Silences violation reports, for a test that provokes one on purpose.
 pub fn set_reporting(on: bool) {
     REPORT.store(on, Ordering::Relaxed);
@@ -959,7 +989,7 @@ static FIRST_READY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicB
 /// A rank added to the enum and not to this table degrades to
 /// `<unknown rank>`, which is honest rather than wrong; the host test below
 /// keeps the entries at their own discriminants.
-const ALL_RANKS: [Rank; 18] = [
+const ALL_RANKS: [Rank; 19] = [
     Rank::AddressSpace,
     Rank::AddressSpacePrevious,
     Rank::DmaWindow,
@@ -978,6 +1008,7 @@ const ALL_RANKS: [Rank; 18] = [
     Rank::Block,
     Rank::UsbKeyboard,
     Rank::Console,
+    Rank::Audit,
 ];
 
 /// The name of a rank given its discriminant.
@@ -1080,9 +1111,14 @@ fn record(held: u64, rank: Rank, site: &'static core::panic::Location<'static>) 
         let mut open_count = 0u64;
         let mut open_ranks = 0u64;
         // CPU: held -- `lock` records after its claim, so the caller counts as a holder and cannot move.
-        for_each_open_guard(percpu::cpu_id() as usize, |_at, guard_rank, _since| {
+        // `effective_cpu`, the table `open_guard` wrote: under `cfg(test)`
+        // `cpu_id` is 0 for every thread, and this sampled another test's
+        // guards (2026-11-01, the shift below panicked on one).
+        for_each_open_guard(effective_cpu(), |_at, guard_rank, _since| {
             open_count += 1;
-            open_ranks |= 1u64 << u64::from(guard_rank);
+            // `try_lock`'s guards carry 255, no rank: counted, and given no
+            // bit, since `1 << 255` overflows and overflow checks are on.
+            open_ranks |= 1u64.checked_shl(u32::from(guard_rank)).unwrap_or(0);
         });
         FIRST_HOLD_COUNT.store(u64::from(holds_count()), Ordering::Relaxed);
         FIRST_OPEN_COUNT.store(open_count, Ordering::Relaxed);
@@ -1132,7 +1168,7 @@ fn record(held: u64, rank: Rank, site: &'static core::panic::Location<'static>) 
     // holds are real; none means the mask is lying. Safe to call here, where
     // the comment above forbids taking a lock, because it only loads atomics.
     // CPU: held -- as above.
-    dump_open_guards(percpu::cpu_id() as usize);
+    dump_open_guards(effective_cpu());
 }
 
 /// A spinlock protecting a value.
@@ -1488,7 +1524,7 @@ impl<T> Drop for SpinLockGuard<'_, T> {
                         percpu::cpu_id(),
                     );
                     // CPU: diagnostic -- which CPU's guards are dumped, printed only.
-                    dump_open_guards(percpu::cpu_id() as usize);
+                    dump_open_guards(effective_cpu());
                     break;
                 }
                 match slot.compare_exchange_weak(
@@ -1791,6 +1827,36 @@ mod tests {
             mask,
             Rank::WaitQueue.bit(),
             "the mask recorded is the outer hold, without the inner lock's own bit"
+        );
+    }
+
+    #[test]
+    fn an_unranked_guard_open_at_a_violation_is_counted_without_a_rank_bit() {
+        // `try_lock` opens its guard with rank 255, meaning none. `record`
+        // sampled each open guard's rank as `1 << rank`, which overflows at
+        // 255 -- and overflow checks are on in the kernel's release profile,
+        // so the first violation of a boot taken while any `try_lock` was held
+        // panicked in the code meant to report it. Found 2026-11-01 as a host
+        // test flake: another thread's guard, read from the shared table 0.
+        let _serial = VIOLATION_COUNT.lock().unwrap_or_else(|e| e.into_inner());
+        set_held_mask(0);
+        reset_violations();
+        rearm_first_violation();
+        let unranked = SpinLock::new(Rank::Console, ());
+        let tried = unranked.try_lock().expect("free");
+        let outer = SpinLock::new(Rank::WaitQueue, ());
+        let inner = SpinLock::new(Rank::WaitQueue, ());
+        let held = outer.lock();
+        drop(inner.lock());
+        drop(held);
+        drop(tried);
+        assert_eq!(violations(), 1);
+        let (open, ranks) = first_open_guards().expect("sampled");
+        assert_eq!(open, 2, "the outer hold and the try_lock, both open");
+        assert_eq!(
+            ranks,
+            Rank::WaitQueue.bit(),
+            "the try_lock's guard is counted and carries no rank"
         );
     }
 

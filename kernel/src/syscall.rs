@@ -40,6 +40,8 @@
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
+use bhaskix_telemetry::audit::{Kind as AuditKind, Name as AuditName, Record as AuditRecord};
+
 use crate::cap::{Arena, CSpace, ObjectKind, SlotRef};
 use crate::{cap, domain, sched};
 
@@ -191,6 +193,7 @@ const _: () = {
     assert!(Status::QuotaExceeded as u64 == bhaskix_abi::status::QUOTA_EXCEEDED);
     assert!(Status::Exhausted as u64 == bhaskix_abi::status::EXHAUSTED);
     assert!(Status::Notified as u64 == bhaskix_abi::status::NOTIFIED);
+    assert!(Status::AuditFull as u64 == bhaskix_abi::status::AUDIT_FULL);
     assert!(method::SPAWN == bhaskix_abi::method::SPAWN);
     assert!(method::START == bhaskix_abi::method::START);
 };
@@ -504,6 +507,11 @@ pub enum Status {
     /// A blocking receive was woken by its bound notification rather than by a
     /// message. Not a failure. RFC 0010 question 1.
     Notified = 14,
+    /// The audit log has no room, and the operation would have given
+    /// authority without a record of it (RFC 0101). Refused, not delayed:
+    /// waiting inside a grant could deadlock the service the log's reader
+    /// needs.
+    AuditFull = 15,
 }
 
 impl Status {
@@ -609,12 +617,13 @@ pub fn dispatch_with(frame: &mut SyscallFrame, cspace: &CSpace, arena: &Arena) -
 /// the way the IPC calls did.
 fn invoke_capability(
     frame: &SyscallFrame,
-    owner: u32,
+    actor: AuditName,
     cspace: &mut CSpace,
     arena: &mut Arena,
     revoked: &mut [u32; crate::cap::MAX_OWNERS],
     unmapping: &mut Option<Unmapping>,
 ) -> Outcome {
+    let owner = actor.domain;
     let index = match usize::try_from(frame.capability) {
         Ok(index) => index,
         Err(_) => return Outcome::err(Status::NoSuchCapability),
@@ -672,10 +681,28 @@ fn invoke_capability(
             if cspace.get(destination).is_some() {
                 return Outcome::err(Status::SlotUnavailable);
             }
+            // The audit log's room before the derivation, so a refusal changes
+            // nothing (RFC 0101).
+            let Ok(audited) = crate::audit::reserve() else {
+                return Outcome::err(Status::AuditFull);
+            };
 
             match arena.derive_owned(slot, rights, frame.arg1, owner) {
                 Ok(derived) => match cspace.install_at(destination, derived) {
-                    Ok(()) => Outcome::ok(frame.arg2),
+                    Ok(()) => {
+                        audited.commit(AuditRecord {
+                            kind: AuditKind::Derive as u8,
+                            object_kind: object.kind as u8,
+                            rights: rights.bits(),
+                            actor,
+                            target: actor,
+                            subject: arena.serial_of(derived).unwrap_or(0),
+                            source: arena.serial_of(slot).unwrap_or(0),
+                            object: object.id,
+                            ..AuditRecord::default()
+                        });
+                        Outcome::ok(frame.arg2)
+                    }
                     Err(_) => {
                         arena.revoke_unchecked(derived);
                         Outcome::err(Status::SlotUnavailable)
@@ -710,8 +737,22 @@ fn invoke_capability(
             // and with it the only record of which object it named.
             let named = object;
             let before = *revoked;
+            // Never refused (RFC 0101): refusing a revocation would leave the
+            // authority in place. Its serial is read now, while it has one.
+            let audited = crate::audit::must();
+            let serial = arena.serial_of(slot).unwrap_or(0);
             match arena.revoke_tallied(slot, revoked) {
                 Ok(destroyed) => {
+                    audited.commit(AuditRecord {
+                        kind: AuditKind::Revoke as u8,
+                        object_kind: named.kind as u8,
+                        actor,
+                        target: actor,
+                        count: u32::try_from(destroyed).unwrap_or(u32::MAX),
+                        subject: serial,
+                        object: named.id,
+                        ..AuditRecord::default()
+                    });
                     // The revoked capability's own slot is now a dead
                     // reference. Clearing it is not required for safety --
                     // resolving it fails -- but leaving it occupies a slot the
@@ -3911,6 +3952,7 @@ fn spawn(frame: &SyscallFrame) -> Outcome {
         Err(crate::domain::DomainError::ChildEnvelopeExceeded { .. }) => {
             return Outcome::err(Status::QuotaExceeded);
         }
+        Err(crate::domain::DomainError::AuditFull) => return Outcome::err(Status::AuditFull),
         Err(_) => return Outcome::err(Status::Exhausted),
     };
 
@@ -4741,30 +4783,47 @@ fn grant_to_domain(frame: &SyscallFrame) -> Option<Outcome> {
     let destination = frame.arg1 as usize;
     let wanted = crate::cap::Rights::from_bits(frame.arg2 as u8);
 
+    // The audit log's room first, so a refusal changes nothing (RFC 0101).
+    let Ok(audited) = crate::audit::reserve() else {
+        return Some(Outcome::err(Status::AuditFull));
+    };
+
     // Stage one: derive from the giver's own CSpace, charged to the recipient,
     // because it is the recipient's to keep.
     let derived = domain::with(me, |owner| {
+        let actor = crate::audit::name(me.as_u32(), owner.generation());
         let cspace = core::mem::take(&mut owner.cspace);
         let result = cap::with_arena(|arena| {
             let index = usize::try_from(frame.arg0).map_err(|_| Status::NoSuchCapability)?;
             let slot = cspace.get(index).ok_or(Status::NoSuchCapability)?;
-            let (_, held) = arena.lookup(slot).ok_or(Status::Revoked)?;
+            let (source, held) = arena.lookup(slot).ok_or(Status::Revoked)?;
             if !held.contains(crate::cap::Rights::GRANT) {
                 return Err(Status::InsufficientRights);
             }
-            arena
+            let derived = arena
                 .derive_owned(slot, wanted, frame.arg3, recipient.as_u32())
                 .map_err(|error| match error {
                     crate::cap::CapError::RightsNotMonotone
                     | crate::cap::CapError::DeriveNotPermitted
                     | crate::cap::CapError::BadgeNotMonotone => Status::InsufficientRights,
                     _ => Status::QuotaExceeded,
-                })
+                })?;
+            let record = AuditRecord {
+                kind: AuditKind::Grant as u8,
+                object_kind: source.kind as u8,
+                rights: wanted.bits(),
+                actor,
+                subject: arena.serial_of(derived).unwrap_or(0),
+                source: arena.serial_of(slot).unwrap_or(0),
+                object: source.id,
+                ..AuditRecord::default()
+            };
+            Ok((derived, record))
         });
         owner.cspace = cspace;
         result
     });
-    let derived = match derived {
+    let (derived, record) = match derived {
         Some(Ok(derived)) => derived,
         Some(Err(status)) => return Some(Outcome::err(status)),
         None => return Some(Outcome::err(Status::NoDomain)),
@@ -4776,7 +4835,7 @@ fn grant_to_domain(frame: &SyscallFrame) -> Option<Outcome> {
             return Err(Status::QuotaExceeded);
         }
         match owner.cspace.install_at(destination, derived) {
-            Ok(()) => Ok(()),
+            Ok(()) => Ok(owner.generation()),
             Err(_) => {
                 owner.release_capability();
                 Err(Status::SlotUnavailable)
@@ -4784,7 +4843,13 @@ fn grant_to_domain(frame: &SyscallFrame) -> Option<Outcome> {
         }
     });
     Some(match installed {
-        Some(Ok(())) => Outcome::ok(destination as u64),
+        Some(Ok(generation)) => {
+            audited.commit(AuditRecord {
+                target: crate::audit::name(recipient.as_u32(), generation),
+                ..record
+            });
+            Outcome::ok(destination as u64)
+        }
         other => {
             // Nothing half-given. A derivation that could not be delivered is
             // revoked rather than left in the arena charged to a domain that
@@ -4976,6 +5041,12 @@ pub(crate) fn complete_gift(caller: u32, endpoint: u32, server: u32) -> Result<b
     let Some(gift) = crate::sched::take_staged_gift(caller, endpoint) else {
         return Ok(false);
     };
+    // The audit log's room, once there is a gift to record and before anything
+    // else is taken, so a refusal puts back only the gift (RFC 0101).
+    let Ok(audited) = crate::audit::reserve() else {
+        crate::sched::restore_staged_gift(caller, gift);
+        return Err(Status::AuditFull as u32);
+    };
 
     let Some(destination) = crate::sched::take_receive_slot(server, endpoint) else {
         // The service never declared. The security half of the design: a
@@ -5002,28 +5073,40 @@ pub(crate) fn complete_gift(caller: u32, endpoint: u32, server: u32) -> Result<b
     // exactly as `hand` does it and with its checks in its order.
     let rights = crate::cap::Rights::from_bits(gift.rights);
     let derived = domain::with(giver, |owner| {
+        let actor = crate::audit::name(giver.as_u32(), owner.generation());
         let cspace = core::mem::take(&mut owner.cspace);
         let result = cap::with_arena(|arena| {
             let index = gift.from_slot as usize;
             let slot = cspace.get(index).ok_or(Status::NoSuchCapability)?;
-            let (_, held) = arena.lookup(slot).ok_or(Status::Revoked)?;
+            let (source, held) = arena.lookup(slot).ok_or(Status::Revoked)?;
             // Holding a capability is not permission to pass it on.
             if !held.contains(crate::cap::Rights::GRANT) {
                 return Err(Status::InsufficientRights);
             }
-            arena
+            let derived = arena
                 .derive_owned(slot, rights, gift.badge, recipient.as_u32())
                 .map_err(|error| match error {
                     crate::cap::CapError::RightsNotMonotone
                     | crate::cap::CapError::DeriveNotPermitted
                     | crate::cap::CapError::BadgeNotMonotone => Status::InsufficientRights,
                     _ => Status::QuotaExceeded,
-                })
+                })?;
+            let record = AuditRecord {
+                kind: AuditKind::Grant as u8,
+                object_kind: source.kind as u8,
+                rights: rights.bits(),
+                actor,
+                subject: arena.serial_of(derived).unwrap_or(0),
+                source: arena.serial_of(slot).unwrap_or(0),
+                object: source.id,
+                ..AuditRecord::default()
+            };
+            Ok((derived, record))
         });
         owner.cspace = cspace;
         result
     });
-    let derived = match derived {
+    let (derived, record) = match derived {
         Some(Ok(derived)) => derived,
         Some(Err(status)) => {
             restore(gift);
@@ -5044,9 +5127,16 @@ pub(crate) fn complete_gift(caller: u32, endpoint: u32, server: u32) -> Result<b
             .cspace
             .install_at(destination as usize, derived)
             .map_err(|_| Status::SlotUnavailable)
+            .map(|()| owner.generation())
     });
     match installed {
-        Some(Ok(())) => Ok(true),
+        Some(Ok(generation)) => {
+            audited.commit(AuditRecord {
+                target: crate::audit::name(recipient.as_u32(), generation),
+                ..record
+            });
+            Ok(true)
+        }
         Some(Err(status)) => {
             restore(gift);
             Err(status as u32)
@@ -5121,6 +5211,12 @@ fn hand(frame: &SyscallFrame) -> Outcome {
         return Outcome::err(Status::NoDomain);
     };
 
+    // The audit log's room before the declaration is taken, so a refusal
+    // changes nothing (RFC 0101).
+    let Ok(audited) = crate::audit::reserve() else {
+        return Outcome::err(Status::AuditFull);
+    };
+
     // Where it goes, from the caller and from nowhere else. Taken rather than
     // read: a declaration admits one capability.
     // For *this* endpoint. A caller that invited some other service has not
@@ -5134,30 +5230,42 @@ fn hand(frame: &SyscallFrame) -> Outcome {
     // recipient, because it is the recipient's to keep.
     let rights = crate::cap::Rights::from_bits(frame.arg1 as u8);
     let derived = domain::with(server_domain, |owner| {
+        let actor = crate::audit::name(server_domain.as_u32(), owner.generation());
         let cspace = core::mem::take(&mut owner.cspace);
         let result = cap::with_arena(|arena| {
             let index = usize::try_from(frame.arg0).map_err(|_| Status::NoSuchCapability)?;
             let slot = cspace.get(index).ok_or(Status::NoSuchCapability)?;
-            let (_, held) = arena.lookup(slot).ok_or(Status::Revoked)?;
+            let (source, held) = arena.lookup(slot).ok_or(Status::Revoked)?;
             // Holding a capability is not the same as being allowed to pass it
             // on, and this is passing it on to a domain the server does not
             // otherwise reach.
             if !held.contains(crate::cap::Rights::GRANT) {
                 return Err(Status::InsufficientRights);
             }
-            arena
+            let derived = arena
                 .derive_owned(slot, rights, frame.arg2, recipient.as_u32())
                 .map_err(|error| match error {
                     crate::cap::CapError::RightsNotMonotone
                     | crate::cap::CapError::DeriveNotPermitted
                     | crate::cap::CapError::BadgeNotMonotone => Status::InsufficientRights,
                     _ => Status::QuotaExceeded,
-                })
+                })?;
+            let record = AuditRecord {
+                kind: AuditKind::Grant as u8,
+                object_kind: source.kind as u8,
+                rights: rights.bits(),
+                actor,
+                subject: arena.serial_of(derived).unwrap_or(0),
+                source: arena.serial_of(slot).unwrap_or(0),
+                object: source.id,
+                ..AuditRecord::default()
+            };
+            Ok((derived, record))
         });
         owner.cspace = cspace;
         result
     });
-    let derived = match derived {
+    let (derived, record) = match derived {
         Some(Ok(derived)) => derived,
         Some(Err(status)) => {
             // The declaration was taken and nothing arrived. Put it back, so a
@@ -5175,7 +5283,7 @@ fn hand(frame: &SyscallFrame) -> Outcome {
             return Err(Status::QuotaExceeded);
         }
         match owner.cspace.install_at(destination, derived) {
-            Ok(()) => Ok(()),
+            Ok(()) => Ok(owner.generation()),
             Err(_) => {
                 owner.release_capability();
                 Err(Status::SlotUnavailable)
@@ -5183,7 +5291,13 @@ fn hand(frame: &SyscallFrame) -> Outcome {
         }
     });
     match installed {
-        Some(Ok(())) => Outcome::ok(destination as u64),
+        Some(Ok(generation)) => {
+            audited.commit(AuditRecord {
+                target: crate::audit::name(recipient.as_u32(), generation),
+                ..record
+            });
+            Outcome::ok(destination as u64)
+        }
         other => {
             cap::with_arena(|arena| arena.revoke_unchecked(derived));
             crate::sched::set_receive_slot(caller, Some((destination as u32, endpoint)));
@@ -5209,12 +5323,13 @@ fn invoke(id: domain::DomainId, frame: &mut SyscallFrame) -> Outcome {
     // `REVOKE` whose object nobody mapped.
     let mut unmapping: Option<Unmapping> = None;
     let outcome = domain::with(id, |domain| {
+        let actor = crate::audit::name(owner, domain.generation());
         let mut cspace = core::mem::take(&mut domain.cspace);
         let before = cspace.occupied();
         let outcome = cap::with_arena(|arena| {
             invoke_capability(
                 frame,
-                owner,
+                actor,
                 &mut cspace,
                 arena,
                 &mut revoked,
@@ -5318,10 +5433,15 @@ fn invoke(id: domain::DomainId, frame: &mut SyscallFrame) -> Outcome {
 /// holds no capability to another cannot name it, so there is no way to
 /// express a grant to a stranger.
 fn grant(id: domain::DomainId, frame: &mut SyscallFrame) -> Outcome {
+    // The audit log's room first, so a refusal changes nothing (RFC 0101).
+    let Ok(audited) = crate::audit::reserve() else {
+        return Outcome::err(Status::AuditFull);
+    };
     // Stage one: resolve both capabilities in the caller's own space, and
     // derive the copy that will be handed over. The derived capability is
     // charged to the *recipient*, because it is the recipient's to keep.
     let resolved = domain::with(id, |domain| {
+        let actor = crate::audit::name(id.as_u32(), domain.generation());
         let cspace = core::mem::take(&mut domain.cspace);
         let result = cap::with_arena(|arena| {
             let target_index =
@@ -5337,7 +5457,7 @@ fn grant(id: domain::DomainId, frame: &mut SyscallFrame) -> Outcome {
 
             let source_index = usize::try_from(frame.arg0).map_err(|_| Status::NoSuchCapability)?;
             let source_slot = cspace.get(source_index).ok_or(Status::NoSuchCapability)?;
-            let (_, source_rights) = arena.lookup(source_slot).ok_or(Status::Revoked)?;
+            let (source, source_rights) = arena.lookup(source_slot).ok_or(Status::Revoked)?;
             if !source_rights.contains(crate::cap::Rights::GRANT) {
                 return Err(Status::InsufficientRights);
             }
@@ -5352,13 +5472,23 @@ fn grant(id: domain::DomainId, frame: &mut SyscallFrame) -> Outcome {
                     | crate::cap::CapError::BadgeNotMonotone => Status::InsufficientRights,
                     _ => Status::QuotaExceeded,
                 })?;
-            Ok((recipient, derived))
+            let record = AuditRecord {
+                kind: AuditKind::Grant as u8,
+                object_kind: source.kind as u8,
+                rights: rights.bits(),
+                actor,
+                subject: arena.serial_of(derived).unwrap_or(0),
+                source: arena.serial_of(source_slot).unwrap_or(0),
+                object: source.id,
+                ..AuditRecord::default()
+            };
+            Ok((recipient, derived, record))
         });
         domain.cspace = cspace;
         result
     });
 
-    let Some(Ok((recipient, derived))) = resolved else {
+    let Some(Ok((recipient, derived, record))) = resolved else {
         return match resolved {
             Some(Err(status)) => Outcome::err(status),
             _ => Outcome::err(Status::NoDomain),
@@ -5381,7 +5511,7 @@ fn grant(id: domain::DomainId, frame: &mut SyscallFrame) -> Outcome {
             return Err(Status::QuotaExceeded);
         }
         match target.cspace.install_at(destination, derived) {
-            Ok(()) => Ok(()),
+            Ok(()) => Ok(target.generation()),
             Err(_) => {
                 target.release_capability();
                 Err(Status::SlotUnavailable)
@@ -5390,7 +5520,13 @@ fn grant(id: domain::DomainId, frame: &mut SyscallFrame) -> Outcome {
     });
 
     match placed {
-        Some(Ok(())) => Outcome::ok(frame.arg3),
+        Some(Ok(generation)) => {
+            audited.commit(AuditRecord {
+                target: crate::audit::name(recipient, generation),
+                ..record
+            });
+            Outcome::ok(frame.arg3)
+        }
         Some(Err(status)) => {
             cap::with_arena(|arena| arena.revoke_unchecked(derived));
             Outcome::err(status)
@@ -5724,7 +5860,7 @@ mod tests {
                 method: method::DELETE,
                 ..SyscallFrame::default()
             },
-            0,
+            crate::audit::name(0, 0),
             &mut cspace,
             &mut arena,
             &mut revoked,
@@ -5761,7 +5897,7 @@ mod tests {
                 method: method::DELETE,
                 ..SyscallFrame::default()
             },
-            0,
+            crate::audit::name(0, 0),
             &mut cspace,
             &mut arena,
             &mut revoked,
@@ -5845,7 +5981,14 @@ mod tests {
                 ..SyscallFrame::default()
             };
             let mut revoked = [0u32; crate::cap::MAX_OWNERS];
-            let _ = invoke_capability(&f, 0, &mut cspace, &mut arena, &mut revoked, &mut None);
+            let _ = invoke_capability(
+                &f,
+                crate::audit::name(0, 0),
+                &mut cspace,
+                &mut arena,
+                &mut revoked,
+                &mut None,
+            );
 
             // The invariant that matters. A frame may legitimately *derive* a
             // capability -- that is what `Invoke` is for -- but every one it

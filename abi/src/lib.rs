@@ -1081,6 +1081,11 @@ pub mod status {
     /// squeezed into `OK`: a service must be able to tell "somebody called me"
     /// from "something happened", and both are success. RFC 0010 question 1.
     pub const NOTIFIED: u64 = 14;
+    /// The audit log has no room for the record this operation needs, so it
+    /// was refused (RFC 0101). Asked of operations that give authority: a
+    /// derive, a grant, a domain created. Taking authority away is never
+    /// refused for this.
+    pub const AUDIT_FULL: u64 = 15;
 }
 
 /// Methods the console service answers.

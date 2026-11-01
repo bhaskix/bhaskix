@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | ⬜ **Draft 2026-10-31 — built and gated the same day.** Its three questions decided by the lead that day, each as recommended (§*Unresolved questions*). |
+| **Status** | ✅ **ACCEPTED 2026-11-01 by the project lead**, on CI run 895's green. Drafted 2026-10-31, built and gated the same day. Its three questions decided by the lead that day, each as recommended (§*Unresolved questions*). |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | userspace (`bin/linuxd`, `personality`), and one branch of the kernel's adapter call |
 | **Milestone** | L1 ([roadmap.md](../roadmap.md)) |

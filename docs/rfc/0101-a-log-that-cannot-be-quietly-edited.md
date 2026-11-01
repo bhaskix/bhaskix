@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | ⬜ **Draft 2026-10-31 — nothing built.** ~~Questions for the lead~~ All four decided by the lead the same day, each as proposed (§*Unresolved questions*). Drafted at the lead's request, as Phase 3's third row. |
+| **Status** | ⬜ **Draft 2026-10-31 — ~~nothing built~~ step 1 built 2026-11-01** (naming, the record, the ledger, the eight sites; counted, not yet recorded). ~~Questions for the lead~~ All four decided by the lead the same day, each as proposed, and three more on 2026-11-01 (§*Implementation plan*). Drafted at the lead's request, as Phase 3's third row. |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | kernel (telemetry), userspace (an audit service), tpm |
 | **Milestone** | Phase 3, *audit framework* ([roadmap.md](../roadmap.md)): threat T8 |
@@ -91,7 +91,7 @@ holds that count at 0 until this RFC.
 
 ## Testing plan
 
-To be written once the questions are answered. At least:
+Each step's gate is in the implementation plan above. At least:
 - a record edited, removed or reordered breaks the chain at that record;
 - a full ring refuses the audited operation, and the gate holding `0 audit-refused` changes to
   what that means;
@@ -116,4 +116,85 @@ To be written once the questions are answered. At least:
 
 ## Implementation plan
 
-Written once the questions are answered.
+Written 2026-11-01, with three more decisions the lead made that day, each as recommended:
+- **a revocation or a domain's end always proceeds.** Refusing one would leave authority in place,
+  the opposite of failing safe. They draw on headroom a grant may not use, and if even that is
+  gone, the operation happens and a **gap** is counted, which the next record that fits states;
+- **auditing begins when `auditd` attaches.** Before that, the boot's self-tests create and end
+  many domains, and no ring-3 service exists to drain anything. Those operations are counted by
+  kind, not recorded, and the first record says how many there were;
+- **with no kept disk, the chain is kept in memory**, and the boot report says it is not
+  persisted.
+
+**Step 1 -- naming, the record, the ring, the events (kernel and `telemetry`).**
+- **A capability serial.** Every arena node carries a `u64` assigned from a per-boot counter when
+  it is made, root or derived, and never reused within a boot. A node's index and generation
+  already name it uniquely, until the generation wraps; the counter cannot.
+- **The record, `telemetry::audit::Record`**: 64 bytes, its wire form defined by its encoder,
+  host-tested. A sequence number, the TSC, a kind (attach, gap, grant, derive, revoke, domain
+  created, domain ended), the actor and the target each as **domain and generation**, the
+  capability's serial and the serial it came from, the object's kind and identity, the rights, and
+  a count.
+- **The ledger, `telemetry::audit::Ledger`**: every decision as arithmetic, host-tested, the way
+  RFC 0026's ring is. It decides:
+  - **reserve before act.** A grant, a derive or a domain creation reserves its slot before it
+    changes anything, and is **refused** when that would leave less than the headroom free;
+  - **commit after.** The record is stamped with its sequence when the operation succeeded, and
+    a reservation the operation did not use is given back;
+  - the headroom and the gap, as above.
+- **The ledger in the kernel, `kernel/src/audit.rs`**:
+  - sized for a ring of 512 records, 64 of them headroom;
+  - under its own lock, **rank 18**, inside even the console's: nothing is taken while holding
+    it, so it may be taken under any lock an emitting path holds.
+
+  ~~One global ring of 512 records in a `Memory` object, and a tail page~~ -- **moved to step 2
+  while building step 1**: before a reader can attach the ring is never written, so its memory
+  would have been code nothing could reach.
+- **The events**: the system call paths that move authority.
+  - `DERIVE` and `REVOKE`;
+  - `GRANT` and the three other ways a capability reaches another domain: a grant to a domain, a
+    `HAND`, and a gift at a rendezvous;
+  - every domain created and every domain ended, by whatever path.
+
+  **Not recorded**: capabilities the kernel itself mints, and its own revocations. A domain's
+  end is its revocation, and is recorded as that.
+- **A refusal has its own status**, `AUDIT_FULL` (15), so a caller can tell "the log is full" from
+  "you may not".
+- **The gate**: the boot report's `audit` line, and before `auditd` exists, the operations counted
+  by kind.
+
+  **Built 2026-11-01.** A boot reads `audit  inactive until auditd attaches: 16 grant(s), 17
+  derive(s), 1 revocation(s), 94 domain(s) created, 85 ended -- counted, not recorded; 0
+  refused`; the gate requires every kind nonzero and nothing refused, and went red with the
+  revocation site's commit removed (`0 revocation(s)`). Host tests: the record's wire form at every
+  offset; the ledger refusing a grant at the headroom, granting a revocation from it, counting a
+  gap and stating it first in the next record, giving back a cancelled reservation, and clamping a
+  hostile tail -- red with the headroom ignored (2 tests) and with a revocation refused like a
+  grant (3); a capability's serial never drawn twice, red with the serial taken from the reused
+  index.
+
+  **Found building it, recorded and not fixed**: a gift delivered at a rendezvous whose install
+  fails leaves its derived capability in the arena, installed nowhere and never revoked (TRACKER
+  §3). Such a node is reachable by nobody, and is not recorded.
+
+**Step 2 -- `bin/auditd` and the chain.**
+- **The ring's memory**: one global ring of 512 records in a `Memory` object a keeper domain
+  owns, and a tail page. The kernel performs the ledger's stores and publishes `head` behind a
+  release fence, as the telemetry plane does.
+- **Attaching.** `auditd` holds the ring read-only and its tail read-write. At attach the kernel
+  writes the first record: a 128-bit boot identity it draws, and the counts from before.
+- **The chain.** Each record is chained, `sha256(previous ‖ record)`, by `bhaskix-sha256`.
+- **Where it is kept.** On the kept disk, a file per boot in an `audit/` directory `bin/fsd`
+  makes and reports, appended a block per write; with no kept disk, in memory.
+- **The boot report** prints the records, the chain's head, and whether it is persisted.
+
+**Step 3 -- shown to fail closed, and checked by something other than the writer.**
+- **A fault, `bhaskix.fault=audit-stall`**: `auditd` stops draining. A grant is then refused
+  once the ring passes its headroom, while a revocation and a domain's end still happen, and the
+  gap is recorded.
+- **A host verifier, `tools/audit-verify`**: it reads the kept disk image and recomputes the
+  chain, naming the first record that breaks it.
+- **Armed:**
+  - a byte of a kept record flipped;
+  - the headroom removed, so a stalled ring grants anyway;
+  - a revocation refused like a grant.

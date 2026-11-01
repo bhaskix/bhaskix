@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | ⬜ **Draft 2026-10-30 — built and gated the same day.** The lead chose the behaviour before it was written: format only a disk that carries the project's marker, keep one that holds this system's filesystem, leave anything else untouched, and have `make demo` keep its disk. `make test-disk-keeps` boots three times and passes, and each of its two arms turns it red. |
+| **Status** | ✅ **ACCEPTED 2026-11-01 by the project lead**, on CI run 895's green. ~~Draft 2026-10-30~~ Drafted 2026-10-30, built and gated the same day. The lead chose the behaviour before it was written: format only a disk that carries the project's marker, keep one that holds this system's filesystem, leave anything else untouched, and have `make demo` keep its disk. `make test-disk-keeps` boots three times and passes, and each of its two arms turns it red. |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | kernel / fs / userspace (`bin/fsd`) / tools |
 | **Milestone** | the first release (`v0.1.0-preview`): one of its stated limits, removed |

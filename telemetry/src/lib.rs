@@ -28,7 +28,9 @@
 // iteration-count environment variable.
 #![cfg_attr(not(test), no_std)]
 #![forbid(unsafe_code)]
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
+pub mod audit;
 pub mod ring;
 pub mod schema;
 
@@ -64,11 +66,12 @@ pub enum EventClass {
     Cap = 5,
     /// Exceptions and faults.
     Fault = 6,
-    /// Audit. **Reserved and refused in Phase 2**: `security.md` §8 requires
-    /// audit events to apply backpressure rather than drop, and a
+    /// Audit. **Reserved and refused on this plane**: `security.md` §8
+    /// requires audit events to apply backpressure rather than drop, and a
     /// best-effort audit event is false assurance. The class exists so the
-    /// numbering is settled; emitting it is counted and dropped until the
-    /// audit RFC builds its ring.
+    /// numbering is settled; emitting it here is counted and dropped. Audit
+    /// records have a ring of their own, [`audit`] (RFC 0101), which never
+    /// drops.
     Audit = 7,
 }
 

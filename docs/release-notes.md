@@ -5,7 +5,9 @@
 **Status: DRAFT.** Written 2026-08-30 for the release dated **29 November 2026**
 ([roadmap.md](roadmap.md#first-release--29-november-2026), criterion R7),
 **refreshed 2026-10-08 and again 2026-10-19**, and its stale figures and
-statuses on 2026-10-31, the day of a release rehearsal. The release is tagged
+statuses on 2026-10-31, the day of a release rehearsal, and on 2026-11-01 its
+defects recounted, its boot commands re-run and its remaining 2026-10-19 figures
+re-measured. The release is tagged
 **`v0.1.0-preview`**, and how it gets out the door is
 [release-checklist.md](release-checklist.md). Every number below is a
 measurement, and every measurement has a date. **They must be re-taken on the
@@ -87,7 +89,7 @@ document, release note or README may state or imply that it works."*
 | Boots on BIOS, on UEFI, and on its own loader `bhaskixboot.efi` | the boot lanes; **184 passing checks** on the BIOS lane alone (`ok` lines, measured 2026-10-31 on `c847297`; 173 on 2026-10-19, 162 on 2026-10-08, 119 on 2026-08-30). ~~**CI runs no native-loader lane**; locally it runs three.~~ **Wrong since 2026-10-11, corrected 2026-10-19**: CI runs four native-loader lanes, two of them with an emulated TPM. On the one physical machine, **it boots through its own loader to the user-mode shell** — sixteen CPUs, observed 2026-10-11 (see [the hardware](#what-the-one-piece-of-hardware-told-us)) |
 | Starts its CPUs with its own INIT-SIPI and schedules across them | boot lanes, `threads`/`migration` gates — four CPUs in the lanes, eight in the soaks, and **16 of 16** on the SR550 |
 | Runs ring 3 programs holding capabilities and nothing else | boot lanes, `ring 3` and fault-injection gates |
-| Answers a user-mode shell from services in separate domains — block driver, console, filesystem | `shell-test.sh`; **23 gates** (`user` mode), **54** (`iommu` mode), measured 2026-10-19 (22 and 53 on 2026-08-30) |
+| Answers a user-mode shell from services in separate domains — block driver, console, filesystem | `shell-test.sh`; **23 gates** (`user` mode), **55** (`iommu` mode), measured 2026-10-31 on `9ec4fa2` (23 and 54 on 2026-10-19; 22 and 53 on 2026-08-30) |
 | Keeps a journalled writable filesystem with a page cache **outside** the nucleus | `disk` shell mode |
 | Speaks IPv4 and IPv6, UDP and TCP, both directions | RFC 0018, 0020, 0022, 0023, 0029 — each step measured before acceptance |
 | **Keeps loopback inside the host.** A hosted program sends itself a UDP datagram over `127.0.0.1` (2026-10-16), and dials its own TCP listener there (2026-10-19). A frame from a wire naming a loopback address is dropped, for either family | the `iommu` lane's loopback gates. The wire-side refusal is proven **on the host only**: no emulator lane can put such a frame on a wire |
@@ -97,12 +99,12 @@ document, release note or README may state or imply that it works."*
 | Loads and runs real static Linux binaries; BusyBox `sh` reaches a prompt and answers what is typed at it -- since 2026-10-31 including a command that is not one of its builtins, through glibc's `fork()` ([RFC 0096](rfc/0096-a-fork-glibc-can-make.md)) | `busybox-test.sh`, locally (CI does not run it — see [Running it](#running-it)). **This release's ISO does not carry BusyBox**: it is GPL-2.0, and shipping its binary would oblige publishing its source. A build from source fetches it: Ubuntu's plain-amd64 `busybox-static` 1.37.0, pinned by sha256 in `tools/fetch-busybox.sh` since 2026-10-29 (it was the build machine's own until then) |
 | **Runs an unmodified Go `net/http` server** as a hosted Linux process: 16 keep-alive clients for 300 s, **61,447 responses, every body checked, 0 errors** (2026-10-01); for 30 s on every push, **5,516 responses, 0 errors** (2026-10-31 on `c847297`; 5,717 on 2026-10-19) | `make test-http` (30 s) in `make test` and CI; RFC 0086, accepted 2026-10-04. **This release's ISO carries the server** |
 | Hosted Linux processes `fork` (a copy the kernel makes), wait on futexes, send, take and catch signals, are ended while running, and write and truncate files on disk | the gates of RFC 0079, 0080, 0083, 0084 and 0085, and of RFC 0060, 0065 and 0077 — all accepted |
-| **Since 2026-10-31: the fork glibc makes, threads glibc can join, a program that can find itself, and the vfork Go starts programs with.** A forked child starts with its parent's whole register file, floating-point state and thread-local base; a thread made by `pthread_create` can be joined; `readlink("/proc/self/exe")`, `cmdline` and `environ` answer for a program the adapter exec'd; `SIGCHLD` reaches a handler, and `SIG_IGN` reaps children | the probes `linux fork reg`, `linux join`, `linux vfork` and the hosted program's line, each armed; [RFC 0096](rfc/0096-a-fork-glibc-can-make.md), [0097](rfc/0097-threads-glibc-can-join.md) and [0098](rfc/0098-a-program-that-can-find-itself.md) accepted, [0099](rfc/0099-children-a-shell-and-go-can-start-and-hear-from.md) built and a draft |
+| **Since 2026-10-31: the fork glibc makes, threads glibc can join, a program that can find itself, and the vfork Go starts programs with.** A forked child starts with its parent's whole register file, floating-point state and thread-local base; a thread made by `pthread_create` can be joined; `readlink("/proc/self/exe")`, `cmdline` and `environ` answer for a program the adapter exec'd; `SIGCHLD` reaches a handler, and `SIG_IGN` reaps children | the probes `linux fork reg`, `linux join`, `linux vfork` and the hosted program's line, each armed; [RFC 0096](rfc/0096-a-fork-glibc-can-make.md), [0097](rfc/0097-threads-glibc-can-join.md) and [0098](rfc/0098-a-program-that-can-find-itself.md) accepted 2026-10-31, [0099](rfc/0099-children-a-shell-and-go-can-start-and-hear-from.md) accepted 2026-11-01 |
 | **Records what it booted in a TPM, and checks the record.** The native loader measures the kernel and initrd into PCR 9 and the command line into PCR 8. The event log reaches the kernel, and `bin/tpmd` **replays it against the TPM**: `log and TPM agree on PCRs 0-9` (2026-10-19), and a log that lies about the kernel is caught | `make test-boot-native-tpm` and `-tpm-tis`, against an emulated TPM (swtpm) over CRB and TIS. ~~**locally only** — it needs Docker, and CI does not run it yet. RFC 0089 is a **draft**, and nothing *verifies* the measurements~~ — **wrong since 2026-10-11, corrected 2026-10-19**: CI runs both lanes, and RFC 0089 was accepted 2026-10-11. On the SR550's own TPM: `log and TPM agree on PCRs 0-7, 9 ... over FIFO` (2026-10-11). **Recorded, not refused**: see below |
 | **Boots on physical hardware** — a Lenovo SR550, read over serial-over-LAN | 2026-08-23 through Limine; through its own loader to the user-mode shell since 2026-10-11 |
 
-Alongside, **as measured on 2026-10-31**: **67 of 101 RFCs accepted** (63 of 93
-on 2026-10-29; 61 of 93 on 2026-10-20, before the lead accepted RFC 0092 and RFC
+Alongside, **as measured on 2026-11-01**: **69 of 101 RFCs accepted** (67 of 101
+on 2026-10-31; 63 of 93 on 2026-10-29; 61 of 93 on 2026-10-20, before the lead accepted RFC 0092 and RFC
 0093; 61 of 92 on 2026-10-19, before RFC 0093 was drafted), each
 accepted one implemented and measured rather than merely written. The command:
 
@@ -164,7 +166,8 @@ Stated as plainly as the list above, because that is what criterion R7 asks for.
   because anyone who could replace a binary could replace the sums.
 - ~~**Nothing written survives a reboot.**~~ **Removed from this list
   2026-10-30, [RFC 0095](rfc/0095-a-disk-that-keeps-what-was-written.md)**,
-  built and gated, and still a draft for the lead to accept (2026-10-31). Until
+  built and gated, ~~and still a draft for the lead to accept (2026-10-31)~~
+  accepted by the lead 2026-11-01. Until
   then the writable filesystem was formatted at every boot (measured 2026-10-19:
   two boots on one disk image, `1 installed` and then `0 installed`). A boot now
   formats the disk only when it carries the project's marker, which a new disk
@@ -218,6 +221,13 @@ the two refreshes, and with the five found and fixed later the same day they are
 in the second table. **2026-10-20**: one more row filed, read from the code rather
 than seen — a hosted `write` after its connection has finished — ~~and added to
 the table below~~ and closed the same day, so it is in the second table.
+**Read row by row again on 2026-11-01, for the freeze: twenty-two rows not
+closed**, and twenty-three later that day, when building the audit log found one by
+reading (the last row below). Two of this table's rows closed since the refresh -- the LACP test's
+report (2026-10-29, the lane's own fault) and the second boot's `block service
+FAILED` (2026-10-30) -- and both are in the second table now, with the eleven
+other rows closed since 2026-10-20 that a user could have met. The table still
+groups one family and leaves out the `uefi, qemu64` lane, so it has twenty-one rows.
 
 | Defect — what you would see | Rate, as TRACKER states it | Fix |
 |---|---|---|
@@ -239,10 +249,9 @@ the table below~~ and closed the same day, so it is in the second table.
 | A boot stops printing partway through a test | 1 sighting, CI run 792 (2026-09-30) | unexplained, not yet instrumented |
 | A `poll` probe says "not ready" for a domain with no console grant | 1 sighting (2026-10-12) | parked until the next one; the cause is an inference |
 | The native TPM lane's second serial log comes back empty | 1 in 9 runs (2026-10-11) | instrumented, not explained |
-| The LACP test's report ends with no state line | 1 sighting (2026-10-16) | not explained |
-| ~~A second boot on the same disk image reports `block service FAILED`~~ | every such boot (2026-10-19) | **fixed 2026-10-30** ([RFC 0095](rfc/0095-a-disk-that-keeps-what-was-written.md)): a boot keeps a disk holding Bhaskix's filesystem, and the block service reads it as that; `make test-disk-keeps` boots twice on one disk |
 | BusyBox `sh` faults at `0x48` | ~2% of harness runs; 0 of 8,443 CI boots (2026-10-04) | likely fixed 2026-10-02, not proven |
 | A per-CPU hold count underflows (the remainder of the old "445 ms wake" row) | no specimen in 450 boots of one image (2026-08-28) | a cause guarded 2026-09-03; not shown to be *the* cause |
+| A capability passed with a call, which the receiving service cannot accept, is left in the kernel's capability table, reachable by nobody | not seen; found by reading the code (2026-11-01) | not fixed; recorded for the lead |
 
 **Several of these have fixes waiting on a count**, and the column says which.
 "Likely fixed, not proven" means exactly that: a clean run at the old rate is
@@ -252,6 +261,19 @@ not yet absence.
 
 | Defect | Closed |
 |---|---|
+| The first lock-order violation of a boot, if it came while that CPU held a lock taken by `try_lock`, panicked the kernel in the code meant to report it | **2026-11-01**, found as a host-test flake (1 run in 200): a guard with no rank was sampled as `1 << 255`, and overflow checks are on in the release kernel. A test now holds one open at a violation, and was red first |
+| `uname -a` cut its version field one character short | **2026-10-31**, the day it was found; a host test holds every field to its width |
+| Interactive BusyBox `sh` could not run a command that is not one of its builtins | **2026-10-31**, by [RFC 0096](rfc/0096-a-fork-glibc-can-make.md): `uname -a` runs from the prompt, gated |
+| `bin/ahcid` wrote a test pattern into the last sector of any SATA disk it could read -- on a GPT disk, the backup partition table | **2026-10-30**, the day it was found, before any release: only the project's own test disk is written |
+| A boot formatted whatever the second virtio disk was, the project's or not | **2026-10-30**, by [RFC 0095](rfc/0095-a-disk-that-keeps-what-was-written.md): only a disk carrying the project's marker is formatted; another's bytes are unchanged, measured by sha256 |
+| A second boot on the same disk image reported `block service FAILED`, and nothing written survived a reboot | **2026-10-30**, by [RFC 0095](rfc/0095-a-disk-that-keeps-what-was-written.md): a boot keeps a disk holding Bhaskix's filesystem |
+| The native loader entered the kernel with its stack eight bytes off the ABI's alignment | **2026-10-30**, the day it was found: latent for ten weeks, until the first instruction that needed it |
+| A caught signal's handler could change the interrupted code's vector registers | **2026-10-30**, by [RFC 0094](rfc/0094-a-programs-vector-registers-are-its-own.md) step 3, shown first by a probe on the unchanged tree |
+| A caught signal's frame put the fault address in the wrong word | **2026-10-30**, the day it was found |
+| A hosted program's `munmap`, `mmap(MAP_FIXED)`, `mprotect` or `madvise` at the top of the address space panicked the kernel | **2026-10-29**, the day it was found: reproduced on four boots, one per call, before the fix |
+| The LACP test's report ended with no state line | **2026-10-29** -- the lane stopped the guests on the wrong line; Bhaskix was not at fault |
+| An outbound TCP self-test accepted an IPv6 connection that was not its own | **2026-10-29** -- two tests shared a port; each has its own |
+| Interactive BusyBox `sh` ended at its second prompt | **2026-10-20** -- it did not exit; it was put down |
 | A hosted program's `write` on a connection the network service had already finished could land in the next connection's buffer | **2026-10-20**, the day it was filed, by [RFC 0093](rfc/0093-a-ring-pair-stays-with-its-connection.md): a connection keeps its buffers until the program closes it. Read from the code; its mechanism was seen once, on a test build that restored the old behaviour on purpose |
 | The shell's `pkg` messages printed `?[1;32minstalled?[0m`: it colours its output, and the console turned every escape from a ring-3 program into `?` | **2026-10-19**, by the lead's decision — colour passes, and nothing else does: clearing, cursor movement, blink, conceal and reverse are still refused, and a coloured line ends with a reset ([RFC 0052](rfc/0052-a-line-that-waits-for-its-newline.md), amended) |
 | A package's output and the shell's interleaved on the console, in sixteen-byte pieces, and the shell said `it ended cleanly` before the package had | **2026-10-19**, found typing `pkg run hello`. ~~the four line holders were given back only on a read, so writers that never read kept them; a finished line now gives its holder back, and a host test reproduces the boot's specimen against the old rule byte for byte~~ — that was this table's first explanation, the same day, and it was wrong: the boot printed the same line with that change in. **The cause**: `pkg run` took a notification the boot had left pending for `irq` as the package's ending, and the package writes with the shell's own console badge, so the two shared one line. Found by typing `irq` first, which took that notification — and the lines came out whole. `pkg run` and `spawn` now wait for the ending's own bits; the shell test types `irq` last and went red on the old shell |
@@ -330,8 +352,8 @@ One machine is one machine. Nothing here should be read as "runs on servers".
 ## Review status
 
 [roadmap.md](roadmap.md) criterion **R6** asks for the design documents to be
-reviewed by two people who did not write them. **As of 2026-10-19 that is
-unmet**, and it is Phase 0's own exit criterion, unmet since Phase 0. The
+reviewed by two people who did not write them. **As of 2026-11-01 that is
+unmet** (and was on 2026-10-19), and it is Phase 0's own exit criterion, unmet since Phase 0. The
 review packet is [review-guide.md](review-guide.md), about 3½ hours of reading.
 
 If it is still unmet on 29 November, the release ships and says so. A preview
@@ -381,7 +403,11 @@ qemu-system-x86_64 -M q35 -cpu max -smp 4 -m 512M -display none -serial mon:stdi
 ```
 
 All three were run on 2026-10-19, from copies of that day's build, under QEMU
-4.2.1, and typed at: `caps` answered, and `Ctrl-A x` ended QEMU. That needs
+4.2.1, and typed at: `caps` answered, and `Ctrl-A x` ended QEMU. **Run again
+on 2026-11-01**, as written, from a fresh directory holding the release build
+of `ae4281e` that the 2026-10-31 rehearsal made, under the same QEMU: the
+prompt in 24, 30 and 30 s, `caps` answered, `Ctrl-A x` ended QEMU, nothing
+`FAILED`. That needs
 `mon:stdio` — with plain `-serial stdio`, `Ctrl-A x` does nothing. The first runs
 left out `-smp 4`, and ~~two self-tests reported "skipped" for want of a second
 and a third CPU~~ **thirty-two self-tests reported `skipped` for want of CPUs,
@@ -416,8 +442,9 @@ TPM, and skip with a note without it. `tools/setup-dev.sh` does not install
 Docker.
 
 Builds on **stable Rust** — no nightly and no `#![feature]` anywhere in the
-tree. Verified 2026-10-19 with Rust 1.98.0 (pinned in `rust-toolchain.toml`),
-QEMU 4.2.1 here and 8.2.2 in CI, and Limine 8.7.0 (`v8.7.0-binary`).
+tree. Verified 2026-11-01 with Rust 1.98.0 (pinned in `rust-toolchain.toml`),
+QEMU 4.2.1 here and 10.2.1 in CI (~~8.2.2~~ until the runner moved to Ubuntu
+26.04, 2026-10-29), and Limine 8.7.0 (`v8.7.0-binary`).
 `setup-dev.sh` follows Limine's `v8.x-binary` branch rather than a tag, so a
 fresh checkout may build against a later 8.x; the release build pins the tag.
 
@@ -428,8 +455,8 @@ fresh checkout may build against a later 8.x; the release build pins the tag.
 - [TRACKER.md](../TRACKER.md) — what is *proven* versus what merely compiles,
   the open defects, and a changelog that records the mistakes as well as the
   results.
-- [docs/rfc/](rfc/) — 101 RFCs; the 67 accepted ones were each built and measured
-  before acceptance (2026-10-31; ~~93 and 61 on 2026-10-20~~, which contradicted
+- [docs/rfc/](rfc/) — 101 RFCs; the 69 accepted ones were each built and measured
+  before acceptance (2026-11-01; 67 on 2026-10-31; ~~93 and 61 on 2026-10-20~~, which contradicted
   the 63 of 93 above until this line was corrected the same day).
 - [docs/security.md](security.md) — the threat model, and which threats are
   mitigated versus merely named.

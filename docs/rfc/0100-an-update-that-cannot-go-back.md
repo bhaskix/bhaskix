@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | ⬜ **Draft 2026-10-31 — nothing built.** ~~Questions for the lead~~ Questions 1-4 decided by the lead the same day, each as proposed; question 5 open (§*Unresolved questions*). Drafted at the lead's request, as Phase 3's second row. |
+| **Status** | ⬜ **Draft 2026-10-31 — nothing built.** ~~Questions for the lead~~ Questions 1-4 decided by the lead the same day, each as proposed; ~~question 5 open~~ question 5 decided by the lead on 2026-11-01, as proposed (§*Unresolved questions*). Drafted at the lead's request, as Phase 3's second row. |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | boot (`boot/bhaskixboot`), userspace (an update service), tpm, tools |
 | **Milestone** | Phase 3, *secure update* ([roadmap.md](../roadmap.md)): threat T7 |
@@ -111,7 +111,8 @@ To be written once the questions are answered. At least:
 - **3:** the verified in-memory initrd is the immutable root for now;
 - **4:** separately installed packages get **a package key of their own**, not the boot-set key.
 
-**Question 5 is open.**
+~~**Question 5 is open.**~~ **Question 5 decided by the lead on 2026-11-01, as proposed:** an update
+arrives **from the kept disk first**, and from the network later, through the same verification.
 
 1. **Where the slots live:** raw partitions read through UEFI Block I/O (*proposed*), or
    directories on the ESP with a FAT writer, or a staged set the loader applies.

@@ -58,6 +58,7 @@
 use crate::cap::{self, CSpace, ObjectKind, ObjectRef, Rights, SlotRef};
 use crate::sched;
 use crate::sync::{Rank, SpinLock};
+use bhaskix_telemetry::audit::{Kind as AuditKind, Name as AuditName, Record as AuditRecord};
 
 /// Domains that can exist at once.
 ///
@@ -299,6 +300,9 @@ pub enum DomainError {
         /// The cap.
         limit: u32,
     },
+    /// The audit log had no room to record the creation (RFC 0101), so
+    /// nothing was created.
+    AuditFull,
 }
 
 /// A domain's identity. Dense, and reused after destruction.
@@ -1276,6 +1280,10 @@ pub fn create_under(
         }
     }
 
+    // The audit log's room, before anything is allocated, for the same reason
+    // as the envelope above: a refusal must change nothing (RFC 0101).
+    let audited = crate::audit::reserve().map_err(|_| DomainError::AuditFull)?;
+
     // A free slot is one with no live domain, no corpse waiting to be reaped,
     // **and no thread of its previous incarnation still running**. The third
     // condition is the one that is easy to miss and expensive to have missed:
@@ -1369,6 +1377,17 @@ pub fn create_under(
     {
         owner.children = owner.children.saturating_add(1);
     }
+    let actor = parent
+        .and_then(|parent| table.domains.get(parent as usize))
+        .map_or(AuditName::KERNEL, |owner| {
+            crate::audit::name(owner.id, owner.generation)
+        });
+    audited.commit(AuditRecord {
+        kind: AuditKind::DomainCreated as u8,
+        actor,
+        target: crate::audit::name(id, generation),
+        ..AuditRecord::default()
+    });
     Ok(DomainId(id))
 }
 
@@ -1392,6 +1411,12 @@ pub fn destroy(id: DomainId) -> bool {
 ///
 /// Returns whether the domain existed.
 pub fn end(id: DomainId, reason: Ending) -> bool {
+    // The audit log's room, which an ending is never refused (RFC 0101):
+    // refusing it would leave the domain's authority in place. And who ended
+    // it, read before any lock is held, because `current_domain` takes a
+    // runqueue lock, which ranks inside the table taken below.
+    let audited = crate::audit::must();
+    let ender = crate::sched::current_domain();
     // Memory objects first, and outside the table lock. A shared region does
     // not outlive the domain that made it (RFC 0009): the frames are charged
     // to this envelope, and leaving them would be a leak the frame gate would
@@ -1455,6 +1480,24 @@ pub fn end(id: DomainId, reason: Ending) -> bool {
 
     let root = {
         let mut table = TABLE.lock();
+        // The ender as the log names it. A thread can only be running in a
+        // slot's live incarnation or in the one that just ended, because a slot
+        // is not reused while threads of its last incarnation remain -- so for
+        // a slot no longer live, the incarnation that ran is the one before its
+        // current generation.
+        let actor = ender.map_or(AuditName::KERNEL, |ender| {
+            table
+                .domains
+                .get(ender.0 as usize)
+                .map_or(AuditName::KERNEL, |slot| {
+                    let generation = if slot.live {
+                        slot.generation
+                    } else {
+                        slot.generation.wrapping_sub(1)
+                    };
+                    crate::audit::name(ender.0, generation)
+                })
+        });
         let Some(domain) = table.domains.get_mut(id.0 as usize) else {
             return false;
         };
@@ -1493,6 +1536,13 @@ pub fn end(id: DomainId, reason: Ending) -> bool {
         // Captured before the increment below: the children still recorded
         // against this domain recorded *this* incarnation of it.
         let mine = domain.generation;
+        audited.commit(AuditRecord {
+            kind: AuditKind::DomainEnded as u8,
+            object_kind: reason as u8,
+            actor,
+            target: crate::audit::name(id.0, mine),
+            ..AuditRecord::default()
+        });
         domain.parent = u32::MAX;
         domain.live = false;
         domain.generation = domain.generation.wrapping_add(1);

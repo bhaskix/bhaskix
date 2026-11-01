@@ -25,10 +25,12 @@ that does it, with the date.
 
 ## Now — by 26 October
 
-- [ ] **R6: two reviewers asked** — *lead*. Two people who did not write the design documents, given
+- [ ] **R6: two reviewers asked** — *lead*. **Not done as of 2026-11-01, past this section's
+      date**; the release note says R6 is unmet. Two people who did not write the design documents, given
       [review-guide.md](review-guide.md) (about 3½ hours). Asked now, because six weeks is the whole
       window for a review to happen.
-- [ ] **Trademark policy** — *lead*. [GOVERNANCE.md](../GOVERNANCE.md) §5 promises it "before the
+- [ ] **Trademark policy** — *lead*. **Not done as of 2026-11-01, past this section's date.**
+      [GOVERNANCE.md](../GOVERNANCE.md) §5 promises it "before the
       first release", and no document has it yet. A short policy page and its link from GOVERNANCE
       is enough; the decision is the lead's.
 - [x] **The release note refreshed** — *2026-10-19*. Re-measured against TRACKER and that day's
@@ -117,12 +119,20 @@ that does it, with the date.
 
 ## Two weeks before — 15 November: the freeze
 
+**Where this stands on 2026-11-01:** the recount is done early. The freeze itself is a date, and
+engineering's; the 22nd's candidate and the 28th's re-measurement wait for their days, and
+nothing in them is blocked. The two items above that are the lead's are past their date.
+
 - [ ] **Freeze** — *engineering*. From here on only fixes, tests and documents land. Work that
       changes a service's lifecycle either lands before the 15th with its suite green, or waits
       until after the release. ~~RFC 0092's listener close is the one in flight~~ — it landed
       2026-10-20 with its suite green, and was accepted 2026-10-29.
-- [ ] **The defects table re-counted** against TRACKER §3, and any row closed since the refresh
-      moved to the note's "closed" table.
+- [x] **The defects table re-counted** against TRACKER §3, and any row closed since the refresh
+      moved to the note's "closed" table. **Done early, 2026-11-01**, row by row: twenty-two rows
+      not closed (twenty-four on the evening of 2026-10-19), and twenty-three that day when one was
+      filed from reading the code. The LACP and second-boot rows moved to
+      the closed table, with eleven more closed since 2026-10-20 that a user could have met; the open table has twenty-one rows (one family grouped, the `uefi, qemu64` lane left out).
+      **On the 15th, count again** if §3 has changed since.
 
 ## One week before — 22 November: the candidate
 

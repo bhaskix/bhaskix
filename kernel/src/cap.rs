@@ -299,6 +299,12 @@ struct CapNode {
     /// say which. `owner` narrows it to a domain; this names the line. Eight
     /// bytes a node, printed in the boot's `fixed tables` bill like the rest.
     site: Option<&'static core::panic::Location<'static>>,
+    /// Its name in the audit log (RFC 0101): drawn from [`Arena`]'s counter
+    /// when the node is made, and never drawn again in a boot. The index and
+    /// generation already name a node uniquely -- until the generation wraps;
+    /// a 64-bit counter does not, and a record must not come to mean another
+    /// capability.
+    serial: u64,
     live: bool,
 }
 
@@ -358,6 +364,9 @@ pub struct Arena {
     /// sweep that finds descendants is several calls deep and giving every
     /// one of them an optional out-parameter would obscure what they do.
     tally: Option<[u32; MAX_OWNERS]>,
+    /// The last serial drawn. Zero is never a serial, so a record can say
+    /// "no capability" with it.
+    serials: u64,
 }
 
 impl Default for Arena {
@@ -379,10 +388,12 @@ impl Arena {
                 generation: 0,
                 owner: OWNER_KERNEL,
                 site: None,
+                serial: 0,
                 live: false,
             }; MAX_CAPABILITIES],
             live: 0,
             tally: None,
+            serials: 0,
         }
     }
 
@@ -424,6 +435,7 @@ impl Arena {
     ) -> Result<SlotRef, CapError> {
         let index = self.free_index().ok_or(CapError::Exhausted)?;
         let generation = self.nodes[index].generation;
+        self.serials += 1;
         self.nodes[index] = CapNode {
             object,
             rights,
@@ -432,6 +444,7 @@ impl Arena {
             generation,
             owner,
             site: Some(core::panic::Location::caller()),
+            serial: self.serials,
             live: true,
         };
         self.live += 1;
@@ -454,6 +467,12 @@ impl Arena {
         } else {
             None
         }
+    }
+
+    /// The serial the audit log names `slot`'s capability by, if it is live.
+    #[must_use]
+    pub fn serial_of(&self, slot: SlotRef) -> Option<u64> {
+        self.resolve(slot).map(|index| self.nodes[index].serial)
     }
 
     /// Whether `slot` still names a live capability.
@@ -570,6 +589,7 @@ impl Arena {
 
         let free = self.free_index().ok_or(CapError::Exhausted)?;
         let generation = self.nodes[free].generation;
+        self.serials += 1;
         self.nodes[free] = CapNode {
             object: parent_node.object,
             rights,
@@ -578,6 +598,7 @@ impl Arena {
             generation,
             owner,
             site: Some(core::panic::Location::caller()),
+            serial: self.serials,
             live: true,
         };
         self.live += 1;
@@ -1176,6 +1197,29 @@ mod tests {
         let cap = root(&mut arena, Rights::READ);
         assert_eq!(arena.revoke(cap), Err(CapError::RevokeNotPermitted));
         assert!(arena.is_live(cap));
+    }
+
+    #[test]
+    fn a_serial_names_one_capability_for_the_whole_boot_even_when_its_entry_is_reused() {
+        // The audit log's name for a capability (RFC 0101). The arena entry
+        // is reused, and its index with it; the serial must not be.
+        let mut arena = Arena::new();
+        let first = root(&mut arena, Rights::ALL);
+        let first_serial = arena.serial_of(first).expect("live");
+        let child = arena.derive(first, Rights::READ, 0).unwrap();
+        let child_serial = arena.serial_of(child).expect("live");
+        assert_ne!(first_serial, child_serial);
+        assert_ne!(first_serial, 0, "zero is no capability");
+        arena.revoke(first).unwrap();
+        assert_eq!(arena.serial_of(first), None, "a dead capability has none");
+        let mut seen = [first_serial, child_serial].to_vec();
+        for _ in 0..3 {
+            let reused = root(&mut arena, Rights::ALL);
+            let serial = arena.serial_of(reused).unwrap();
+            assert!(!seen.contains(&serial), "serial {serial} drawn twice");
+            seen.push(serial);
+            arena.revoke(reused).unwrap();
+        }
     }
 
     #[test]

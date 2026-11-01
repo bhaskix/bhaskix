@@ -29,6 +29,7 @@
 extern crate alloc;
 
 pub mod ahci;
+pub mod audit;
 pub mod cap;
 pub mod console;
 pub mod domain;
@@ -30460,6 +30461,11 @@ fn user_shell(handoff: &Handoff) -> Result<(), &'static str> {
         Ok(()) => report_traced(hhdm),
         Err(why) => println!("\x1b[91m    traced         FAILED: {why}\x1b[0m"),
     }
+
+    // RFC 0101 step 1: what the audit log would have recorded, by kind, once
+    // every service has started and moved authority through the system calls
+    // that are audited. Counted, not recorded, until `bin/auditd` (step 2).
+    audit::report();
 
     // The network, at slot 16, and only if there is one. **A program either
     // holds this or cannot name the network at all** — RFC 0018 step 5's whole
