@@ -290,6 +290,13 @@ jobs:
           BOOT_TEST_TIMEOUT: 300
           BHASKIX_BOOT_LOG: native-full.log
         run: make test-boot-native-full
+      # RFC 0100 step 1: A/B slots on a second disk -- a trial spent and ended, a
+      # damaged slot refused with the other booted in the same boot, a damaged
+      # record not believed, and no slot disk read from the ESP as before.
+      - name: Boot the native loader from an A/B slot disk
+        env:
+          BHASKIX_KEEP_LOGS: slot-boot-logs
+        run: make test-boot-slots
       - name: Boot through the native loader with a TPM 2.0 (swtpm)
         env:
           BHASKIX_REQUIRE: 1

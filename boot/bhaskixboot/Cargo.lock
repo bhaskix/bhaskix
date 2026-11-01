@@ -29,6 +29,10 @@ name = "bhaskix-sha256"
 version = "0.0.0"
 
 [[package]]
+name = "bhaskix-slotdisk"
+version = "0.0.0"
+
+[[package]]
 name = "bhaskix-tcglog"
 version = "0.0.0"
 
@@ -41,5 +45,6 @@ dependencies = [
  "bhaskix-elf",
  "bhaskix-rand",
  "bhaskix-sha256",
+ "bhaskix-slotdisk",
  "bhaskix-tcglog",
 ]

@@ -26911,6 +26911,21 @@ fn report_auditd(hhdm: u64) {
         state.gaps,
         state.refused,
     );
+    // **Two readings, not gates**: what would explain a ring that filled. A
+    // write to the boot's file waits on `bin/fsd`, and the slots the reader
+    // has not yet read are all the room a grant has meanwhile (2026-11-01: a
+    // suite's boot refused 1,526).
+    let hertz = bhaskix_arch::tsc::hertz().unwrap_or(0);
+    let longest_ms = word(15)
+        .saturating_mul(1_000)
+        .checked_div(hertz)
+        .unwrap_or(0);
+    println!(
+        "    audit reader   the longest write to the boot's file took {longest_ms} ms; at most {} \
+         record(s) were waiting when a pass began, of {} slots",
+        word(16),
+        512
+    );
 }
 
 /// Where `bin/tcpc`'s report page is in the direct map, if it has one.

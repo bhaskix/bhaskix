@@ -29,6 +29,7 @@ mod efi;
 mod handoff;
 mod paging;
 mod serial;
+mod slots;
 
 use bhaskix_boot::{Signature, Unverified};
 use bhaskix_bootsig::statement::Digests;
@@ -143,6 +144,226 @@ fn read_fully(root: *mut File, path: &str, buffer: &mut [u8]) -> Result<usize, U
     serial::write("\r\n");
     efi::close(file);
     Ok(total)
+}
+
+/// One boot set's lengths, read into the loader's buffers.
+struct SetRead {
+    kernel_len: usize,
+    initrd_len: usize,
+    conf_len: usize,
+    conf_unreadable: bool,
+    sig_read: Result<usize, Unverified>,
+}
+
+/// Reads the set from the ESP, at the fixed paths, exactly as before RFC 0100:
+/// a kernel or initrd that will not read refuses the boot here.
+fn read_esp_set(
+    root: *mut File,
+    kernel_buffer: &mut [u8],
+    initrd_buffer: &mut [u8],
+    conf: &mut [u8; 4096],
+    sig: &mut [u8; 8192],
+) -> SetRead {
+    serial::write("bhaskixboot: reading bhaskix\\kernel ");
+    let kernel_len = match read_fully(root, KERNEL_PATH, kernel_buffer) {
+        Ok(len) => len,
+        Err(why) => refuse_unread("payload kernel REFUSED", KERNEL_BUFFER_PAGES, why),
+    };
+    report_payload("kernel", &kernel_buffer[..kernel_len]);
+    serial::write("bhaskixboot: reading bhaskix\\initrd.tar ");
+    let initrd_len = match read_fully(root, INITRD_PATH, initrd_buffer) {
+        Ok(len) => len,
+        Err(why) => refuse_unread("payload initrd REFUSED", INITRD_BUFFER_PAGES, why),
+    };
+    report_payload("initrd", &initrd_buffer[..initrd_len]);
+    // **Absent and unreadable are different now** (RFC 0091): `boot.sig` names
+    // the digest of every byte of `boot.conf`, so a file too large to read, or
+    // one the firmware refused, is not quietly an empty one. Both still boot
+    // with an empty command line when nothing is enforcing; the verdict says
+    // which happened.
+    let mut conf_unreadable = false;
+    let conf_len = match read_fully(root, CONFIG_PATH, conf) {
+        Ok(len) => {
+            report_payload("conf", &conf[..len]);
+            len
+        }
+        Err(Unread::Firmware(efi::NOT_FOUND)) => {
+            serial::write("bhaskixboot: payload conf absent; the command line is empty\r\n");
+            0
+        }
+        Err(_) => {
+            serial::write(
+                "bhaskixboot: payload conf unreadable; the command line is empty and boot.sig cannot verify\r\n",
+            );
+            conf_unreadable = true;
+            0
+        }
+    };
+    // The boot set's signature, read with the files it names and before the
+    // volume closes -- RFC 0091. Absent is a verdict, not a refusal: whether it
+    // stops the boot is the policy's to say.
+    let sig_read = match read_fully(root, SIG_PATH, sig) {
+        Ok(len) => {
+            report_payload("sig", &sig[..len]);
+            Ok(len)
+        }
+        Err(Unread::Firmware(efi::NOT_FOUND)) => Err(Unverified::Missing),
+        Err(_) => Err(Unverified::Unreadable),
+    };
+    SetRead {
+        kernel_len,
+        initrd_len,
+        conf_len,
+        conf_unreadable,
+        sig_read,
+    }
+}
+
+/// Reads the set in `slot` -- RFC 0100 step 1. Unlike the ESP's, a file that
+/// will not read is an answer, not a refusal: the caller falls back to the
+/// other slot.
+fn read_slot_set(
+    disk: &mut slots::SlotDisk,
+    slot: bhaskix_slotdisk::Slot,
+    kernel_buffer: &mut [u8],
+    initrd_buffer: &mut [u8],
+    conf: &mut [u8; 4096],
+    sig: &mut [u8; 8192],
+) -> Result<SetRead, &'static str> {
+    use bhaskix_slotdisk::File as SetFile;
+    let partition = disk.layout.slot(slot);
+    let header = disk
+        .header(partition)
+        .map_err(|_| "its header is not a boot set's")?;
+    let mut line = Line::new();
+    line.push("bhaskixboot: reading slot ");
+    line.push(slot.letter());
+    line.push("'s kernel ");
+    serial::write(line.as_str());
+    let kernel_len = disk
+        .read(partition, &header, SetFile::Kernel, kernel_buffer)
+        .map_err(|_| "its kernel would not read")?;
+    report_payload("kernel", &kernel_buffer[..kernel_len]);
+    serial::write("bhaskixboot: reading its initrd ");
+    let initrd_len = disk
+        .read(partition, &header, SetFile::Initrd, initrd_buffer)
+        .map_err(|_| "its initrd would not read")?;
+    report_payload("initrd", &initrd_buffer[..initrd_len]);
+    serial::write("bhaskixboot: reading its boot.conf ");
+    let conf_len = disk
+        .read(partition, &header, SetFile::Conf, conf)
+        .map_err(|_| "its boot.conf would not read")?;
+    report_payload("conf", &conf[..conf_len]);
+    serial::write("bhaskixboot: reading its boot.sig ");
+    let sig_read = match disk.read(partition, &header, SetFile::Sig, sig) {
+        Ok(len) => {
+            report_payload("sig", &sig[..len]);
+            Ok(len)
+        }
+        Err(_) => Err(Unverified::Unreadable),
+    };
+    Ok(SetRead {
+        kernel_len,
+        initrd_len,
+        conf_len,
+        conf_unreadable: false,
+        sig_read,
+    })
+}
+
+/// Says what the slot disk holds and what will boot, and writes the record if
+/// the plan says so: the one block this loader writes.
+///
+/// **A trial is only taken once its boot is recorded as spent.** If the write
+/// fails, the trial slot is not booted -- a set that hangs would otherwise be
+/// tried for ever -- and the active slot boots instead.
+fn plan_slots(disk: &mut slots::SlotDisk) -> bhaskix_slotdisk::Plan {
+    use bhaskix_slotdisk::{Plan, Why};
+    let mut line = Line::new();
+    line.push("bhaskixboot: slot disk: record at block ");
+    line.push_dec(disk.layout.record.first);
+    line.push(", slot A at ");
+    line.push_dec(disk.layout.a.first);
+    line.push(", slot B at ");
+    line.push_dec(disk.layout.b.first);
+    line.push("\r\n");
+    diag(line.as_str());
+    let record = disk.record.ok();
+    let mut line = Line::new();
+    match record {
+        Some(record) => {
+            line.push("bhaskixboot: slot record: ");
+            line.push(record.active.letter());
+            line.push(" active, ");
+            match record.trial {
+                Some((slot, tries)) => {
+                    line.push(slot.letter());
+                    line.push(" on trial with ");
+                    line.push_dec(u64::from(tries));
+                    line.push(" boot(s) left, ");
+                }
+                None => line.push("nothing on trial, "),
+            }
+            line.push_dec(record.writes);
+            line.push(" write(s)\r\n");
+        }
+        None => line.push(
+            "bhaskixboot: slot record damaged or unreadable: trying A, then B, and writing nothing\r\n",
+        ),
+    }
+    diag(line.as_str());
+    let plan = bhaskix_slotdisk::plan(record);
+    let mut line = Line::new();
+    match plan.why {
+        Why::NoRecord => {}
+        Why::Active => {
+            line.push("bhaskixboot: booting slot ");
+            line.push(plan.first.letter());
+            line.push(", the active slot\r\n");
+        }
+        Why::Trial { left } => {
+            line.push("bhaskixboot: booting slot ");
+            line.push(plan.first.letter());
+            line.push(" on trial; ");
+            line.push_dec(u64::from(left));
+            line.push(" boot(s) left after this one\r\n");
+        }
+        Why::TrialOver => {
+            line.push("bhaskixboot: the trial of slot ");
+            line.push(plan.first.other().letter());
+            line.push(" is over; booting slot ");
+            line.push(plan.first.letter());
+            line.push(", the active slot\r\n");
+        }
+    }
+    diag(line.as_str());
+    let Some(write) = plan.write else {
+        return plan;
+    };
+    match disk.write_record(&write) {
+        Ok(()) => {
+            diag("bhaskixboot: slot record written\r\n");
+            plan
+        }
+        Err(status) => {
+            let mut line = Line::new();
+            line.push("bhaskixboot: the slot record would not be written (status ");
+            line.push_hex(status as u64);
+            line.push(")");
+            let active = record.map_or(bhaskix_slotdisk::Slot::A, |record| record.active);
+            if matches!(plan.why, Why::Trial { .. }) {
+                line.push("; a trial whose boot is not recorded is not taken");
+            }
+            line.push("\r\n");
+            diag(line.as_str());
+            Plan {
+                first: active,
+                then: active.other(),
+                write: None,
+                why: Why::Active,
+            }
+        }
+    }
 }
 
 /// Prints one payload line in the exact shape the gate greps.
@@ -527,7 +748,9 @@ fn verdict_bytes(signature: Signature, secure_boot: efi::SecureBoot) -> [u8; 10]
 }
 
 /// The verdict, on the screen and the wire.
-fn report_signature(signature: Signature, secure_boot: efi::SecureBoot) {
+/// `falling_back` is RFC 0100's: a slot's set that did not verify is not booted when
+/// the other slot is tried next, and the line must not say it is.
+fn report_signature(signature: Signature, secure_boot: efi::SecureBoot, falling_back: bool) {
     let enforced = secure_boot == efi::SecureBoot::On;
     let mut line = Line::new();
     match signature {
@@ -554,6 +777,8 @@ fn report_signature(signature: Signature, secure_boot: efi::SecureBoot) {
             line.push(reason.describe());
             line.push(if enforced {
                 ")\r\n"
+            } else if falling_back {
+                "), NOT ENFORCED: Secure Boot is off -- not booted: the other slot is tried\r\n"
             } else {
                 "), NOT ENFORCED: Secure Boot is off -- booting\r\n"
             });
@@ -745,128 +970,186 @@ extern "efiapi" fn efi_main(image_handle: usize, system_table: *mut SystemTable)
     };
     // SAFETY: just allocated, sized as passed.
     let kernel_buffer = unsafe { pages_as_slice(kernel_base, KERNEL_BUFFER_PAGES) };
-    serial::write("bhaskixboot: reading bhaskix\\kernel ");
-    let kernel_len = match read_fully(root, KERNEL_PATH, kernel_buffer) {
-        Ok(len) => len,
-        Err(why) => refuse_unread("payload kernel REFUSED", KERNEL_BUFFER_PAGES, why),
-    };
-    report_payload("kernel", &kernel_buffer[..kernel_len]);
-
     let initrd_base = match efi::allocate_pages(table, efi::LOADER_CODE, INITRD_BUFFER_PAGES) {
         Ok(base) => base,
         Err(status) => refuse("the initrd buffer would not allocate", status as u64),
     };
     // SAFETY: just allocated, sized as passed.
     let initrd_buffer = unsafe { pages_as_slice(initrd_base, INITRD_BUFFER_PAGES) };
-    serial::write("bhaskixboot: reading bhaskix\\initrd.tar ");
-    let initrd_len = match read_fully(root, INITRD_PATH, initrd_buffer) {
-        Ok(len) => len,
-        Err(why) => refuse_unread("payload initrd REFUSED", INITRD_BUFFER_PAGES, why),
-    };
-    report_payload("initrd", &initrd_buffer[..initrd_len]);
 
-    // **Absent and unreadable are different now** (RFC 0091): `boot.sig` names
-    // the digest of every byte of `boot.conf`, so a file too large to read, or
-    // one the firmware refused, is not quietly an empty one. Both still boot
-    // with an empty command line when nothing is enforcing; the verdict says
-    // which happened.
-    let mut conf = [0u8; 4096];
-    let mut conf_unreadable = false;
-    let conf_len = match read_fully(root, CONFIG_PATH, &mut conf) {
-        Ok(len) => {
-            report_payload("conf", &conf[..len]);
-            len
-        }
-        Err(Unread::Firmware(efi::NOT_FOUND)) => {
-            serial::write("bhaskixboot: payload conf absent; the command line is empty\r\n");
-            0
-        }
-        Err(_) => {
-            serial::write(
-                "bhaskixboot: payload conf unreadable; the command line is empty and boot.sig cannot verify\r\n",
-            );
-            conf_unreadable = true;
-            0
-        }
+    // **RFC 0100 step 1: a slot disk, if the machine has one.** Without one the
+    // set is read from the ESP exactly as before; with one, the record says
+    // which slot boots, a trial spends one boot before it is taken, and a slot
+    // whose set does not read or verify falls back to the other in this boot.
+    diag("bhaskixboot: looking for a slot disk\r\n");
+    let mut slot_disk = slots::find(table);
+    let plan = slot_disk.as_mut().map(plan_slots);
+    let secure_boot = efi::secure_boot(table);
+
+    // The sources, in order: the ESP alone; or the first slot, the other, and
+    // -- only when neither verified and Secure Boot is off -- the first again,
+    // booted unverified and said so, as an unverified set on the ESP is.
+    let attempts = match plan {
+        None => [None; 3],
+        Some(plan) => [Some(plan.first), Some(plan.then), Some(plan.first)],
     };
+    let mut conf = [0u8; 4096];
+    let mut sig = [0u8; 8192];
+    let mut attempt = 0;
+    let (kernel_len, initrd_len, conf_len, tcg2, signature) = loop {
+        let slot = attempts[attempt];
+        let set = match (slot, slot_disk.as_mut()) {
+            (Some(slot), Some(disk)) => read_slot_set(
+                disk,
+                slot,
+                kernel_buffer,
+                initrd_buffer,
+                &mut conf,
+                &mut sig,
+            ),
+            _ => Ok(read_esp_set(
+                root,
+                kernel_buffer,
+                initrd_buffer,
+                &mut conf,
+                &mut sig,
+            )),
+        };
+        let set = match set {
+            Ok(set) => set,
+            Err(why) => {
+                // Only a slot's read can fail here; the ESP's refuses in place.
+                let slot = attempts[attempt].unwrap_or(bhaskix_slotdisk::Slot::A);
+                let mut line = Line::new();
+                line.push("bhaskixboot: slot ");
+                line.push(slot.letter());
+                line.push(" refused: ");
+                line.push(why);
+                line.push("\r\n");
+                diag(line.as_str());
+                if attempt == 0 {
+                    attempt = 1;
+                    continue;
+                }
+                refuse("no slot's set could be read", 0);
+            }
+        };
+        let conf_text = core::str::from_utf8(&conf[..set.conf_len]).unwrap_or("");
+        // The first line, `cmdline=<rest>`; anything else is an empty command
+        // line, from the shape of the parse rather than a guess. Later lines are
+        // options; one exists, a test option (RFC 0089 step 8).
+        let cmdline = conf_text
+            .lines()
+            .next()
+            .and_then(|line| line.strip_prefix("cmdline="))
+            .unwrap_or("");
+        let early_event_log = conf_text
+            .lines()
+            .skip(1)
+            .any(|line| line.trim() == "early-event-log");
+
+        // **Measured before anything interprets it** -- RFC 0089. The bytes as
+        // read, before the parse, the placement and the slide, so a verifier can
+        // predict the digest from the file alone. Each slot's set as it is
+        // read, so a set that is then refused is in the record too.
+        let tcg2 = measure(
+            table,
+            &kernel_buffer[..set.kernel_len],
+            &initrd_buffer[..set.initrd_len],
+            cmdline,
+            early_event_log,
+        );
+        // **RFC 0091 link 2: the boot set, checked after it was measured and before
+        // anything interprets it.** The loader hashes what it holds rather than
+        // reading digests back out of the event log, which the firmware wrote.
+        if attempt == 0 {
+            report_secure_boot(secure_boot);
+        }
+        let started = tsc();
+        let signature = match set.sig_read {
+            Err(why) => Signature::NotVerified(why),
+            Ok(_) if set.conf_unreadable => Signature::NotVerified(Unverified::Unreadable),
+            Ok(len) => {
+                let held = Digests {
+                    kernel: bhaskix_sha256::digest(&kernel_buffer[..set.kernel_len]),
+                    initrd: bhaskix_sha256::digest(&initrd_buffer[..set.initrd_len]),
+                    boot_conf: bhaskix_sha256::digest(&conf[..set.conf_len]),
+                };
+                match bhaskix_bootsig::check(&sig[..len], keys::KEYS, &held) {
+                    Ok(key_id) => Signature::Verified {
+                        key_id,
+                        secure_boot: secure_boot == efi::SecureBoot::On,
+                    },
+                    Err(refusal) => Signature::NotVerified(Unverified::Refused(refusal)),
+                }
+            }
+        };
+        report_cost(
+            table,
+            tsc().wrapping_sub(started),
+            set.kernel_len + set.initrd_len + set.conf_len,
+        );
+        // The verdict into PCR 8 -- question 8 -- *before* acting on it, so a
+        // refused boot is in the record too, and before the log is copied, so the
+        // copy holds it.
+        if let Some(tcg2) = tcg2 {
+            measure_one(
+                tcg2,
+                bhaskix_tcglog::measured::VERDICT,
+                "verdict",
+                &verdict_bytes(signature, secure_boot),
+            );
+        }
+        let verified = matches!(signature, Signature::Verified { .. });
+        // Whether this set is passed over for the other slot's: the first
+        // slot's always, and the second's only when Secure Boot is off and the
+        // first is about to be read again.
+        let falling_back = slot.is_some()
+            && !verified
+            && (attempt == 0 || (attempt == 1 && secure_boot != efi::SecureBoot::On));
+        report_signature(signature, secure_boot, falling_back);
+        let done = (
+            set.kernel_len,
+            set.initrd_len,
+            set.conf_len,
+            tcg2,
+            signature,
+        );
+        let Some(slot) = slot else {
+            break done;
+        };
+        if verified || attempt == 2 {
+            break done;
+        }
+        let mut line = Line::new();
+        line.push("bhaskixboot: slot ");
+        line.push(slot.letter());
+        if attempt == 0 {
+            line.push("'s set did not verify; falling back to slot ");
+            line.push(slot.other().letter());
+            line.push("\r\n");
+            diag(line.as_str());
+            attempt = 1;
+            continue;
+        }
+        if secure_boot == efi::SecureBoot::On {
+            // Neither verified: the policy below refuses, as for the ESP.
+            break done;
+        }
+        line.push("'s set did not verify either; Secure Boot is off, so slot ");
+        line.push(slot.other().letter());
+        line.push(" boots unverified, and says so\r\n");
+        diag(line.as_str());
+        attempt = 2;
+    };
+    efi::close(root);
+    // The command line the kernel is handed: the booted set's.
     let conf_text = core::str::from_utf8(&conf[..conf_len]).unwrap_or("");
-    // The first line, `cmdline=<rest>`; anything else is an empty command
-    // line, from the shape of the parse rather than a guess. Later lines are
-    // options; one exists, a test option (RFC 0089 step 8).
     let cmdline = conf_text
         .lines()
         .next()
         .and_then(|line| line.strip_prefix("cmdline="))
         .unwrap_or("");
-    let early_event_log = conf_text
-        .lines()
-        .skip(1)
-        .any(|line| line.trim() == "early-event-log");
-    // The boot set's signature, read with the files it names and before the
-    // volume closes -- RFC 0091. Absent is a verdict, not a refusal: whether it
-    // stops the boot is the policy's to say, below.
-    let mut sig = [0u8; 8192];
-    let sig_read = match read_fully(root, SIG_PATH, &mut sig) {
-        Ok(len) => {
-            report_payload("sig", &sig[..len]);
-            Ok(len)
-        }
-        Err(Unread::Firmware(efi::NOT_FOUND)) => Err(Unverified::Missing),
-        Err(_) => Err(Unverified::Unreadable),
-    };
-    efi::close(root);
-
-    // **Measured before anything interprets it** -- RFC 0089. The bytes as
-    // read, before the parse, the placement and the slide, so a verifier can
-    // predict the digest from the file alone.
-    let tcg2 = measure(
-        table,
-        &kernel_buffer[..kernel_len],
-        &initrd_buffer[..initrd_len],
-        cmdline,
-        early_event_log,
-    );
-    // **RFC 0091 link 2: the boot set, checked after it was measured and before
-    // anything interprets it.** The loader hashes what it holds rather than
-    // reading digests back out of the event log, which the firmware wrote.
-    let secure_boot = efi::secure_boot(table);
-    report_secure_boot(secure_boot);
-    let started = tsc();
-    let signature = match sig_read {
-        Err(why) => Signature::NotVerified(why),
-        Ok(_) if conf_unreadable => Signature::NotVerified(Unverified::Unreadable),
-        Ok(len) => {
-            let held = Digests {
-                kernel: bhaskix_sha256::digest(&kernel_buffer[..kernel_len]),
-                initrd: bhaskix_sha256::digest(&initrd_buffer[..initrd_len]),
-                boot_conf: bhaskix_sha256::digest(&conf[..conf_len]),
-            };
-            match bhaskix_bootsig::check(&sig[..len], keys::KEYS, &held) {
-                Ok(key_id) => Signature::Verified {
-                    key_id,
-                    secure_boot: secure_boot == efi::SecureBoot::On,
-                },
-                Err(refusal) => Signature::NotVerified(Unverified::Refused(refusal)),
-            }
-        }
-    };
-    report_cost(
-        table,
-        tsc().wrapping_sub(started),
-        kernel_len + initrd_len + conf_len,
-    );
-    // The verdict into PCR 8 -- question 8 -- *before* acting on it, so a
-    // refused boot is in the record too, and before the log is copied, so the
-    // copy holds it.
-    if let Some(tcg2) = tcg2 {
-        measure_one(
-            tcg2,
-            bhaskix_tcglog::measured::VERDICT,
-            "verdict",
-            &verdict_bytes(signature, secure_boot),
-        );
-    }
-    report_signature(signature, secure_boot);
     // **The policy** (question 2, decided 2026-10-29): with Secure Boot on, a
     // set that did not verify is refused -- said on the screen and the wire,
     // held long enough to read, and handed back to the boot manager, which

@@ -1,0 +1,31 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# RFC 0100 step 1: the slot disk as arithmetic -- the GPT that names a slot
+# record and two slots, each slot's header, the record, and the plan the native
+# loader boots by. Parsed from a disk anyone with the machine can rewrite, so
+# every parser is total and every refusal is named.
+#
+# Depends on nothing: the loader decides with it, the build tool writes the same
+# bytes from the other side, and a host test drives both.
+[package]
+name = "bhaskix-slotdisk"
+description = "The A/B slot disk: its GPT, its slots' headers, the slot record, and the boot plan, as arithmetic."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[lib]
+name = "bhaskix_slotdisk"
+path = "src/lib.rs"
+
+[dependencies]
+
+[lints]
+workspace = true
+
+[package.metadata.bhaskix]
+# Zero, and `forbid(unsafe_code)` says it again: the reads are the loader's.
+unsafe_budget = 0

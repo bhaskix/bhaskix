@@ -71,6 +71,10 @@ mod word {
     /// Records whose sequence was not the next one: the ring's order broken.
     pub const OUT_OF_ORDER: usize = 13;
     pub const BEFORE: usize = 14;
+    /// The longest one write to the boot's file took, in cycles.
+    pub const LONGEST_WRITE: usize = 15;
+    /// The most records waiting in the ring when a pass began.
+    pub const MOST_WAITING: usize = 16;
 }
 
 /// Why it stopped before draining, in [`word::STATE`].
@@ -168,6 +172,15 @@ struct Kept {
     entries: u64,
     /// The state word: see [`word::PERSISTED`].
     state: u64,
+    /// The longest one write took, in cycles -- what a ring that filled
+    /// while this program was writing would be explained by.
+    longest: u64,
+    /// Entries the last partial write covered, so an unchanged partial block
+    /// is not written again.
+    flushed: u64,
+    /// Entries on the disk: what the last successful write reached. What the
+    /// report says is kept, rather than what is waiting to be written.
+    written: u64,
 }
 
 impl Kept {
@@ -189,7 +202,13 @@ impl Kept {
             } else {
                 2
             };
-        Self { entries: 0, state }
+        Self {
+            entries: 0,
+            state,
+            longest: 0,
+            flushed: 0,
+            written: 0,
+        }
     }
 
     /// Places one entry in the transfer page, and writes the block when it
@@ -221,22 +240,32 @@ impl Kept {
         let start = (self.entries - 1) / PER_BLOCK * PER_BLOCK;
         let length = count * ENTRY_BYTES as u64;
         let offset = start * ENTRY_BYTES as u64;
+        let started = rdtsc();
         let wrote = ipc(FILE, dir::WRITE_FROM, [TRANSFER, length, offset, 0]);
+        self.longest = self.longest.max(rdtsc().wrapping_sub(started));
         if wrote.0 != status::OK || wrote.1[0] != dir::OK {
             self.state = 3;
+        } else {
+            self.written = self.written.max(start + count);
         }
     }
 
-    /// The pass ended: the partial block, if it holds anything new.
+    /// The partial block, if it holds anything new since it was last
+    /// written. Called at most once a second, not every pass: each write waits
+    /// on `bin/fsd`'s journal, 274 ms at the longest on an `iommu` boot, and
+    /// a reader writing every pass spent its time waiting rather than draining.
+    /// The price is stated: a crash loses at most a second of records -- and
+    /// the chain's head in the boot report still covers them.
     fn flush(&mut self) {
         let partial = self.entries % PER_BLOCK;
-        if self.state == 1 && partial != 0 {
+        if self.state == 1 && partial != 0 && self.entries != self.flushed {
             self.write(partial);
+            self.flushed = self.entries;
         }
     }
 
     fn bytes(&self) -> u64 {
-        self.entries * ENTRY_BYTES as u64
+        self.written * ENTRY_BYTES as u64
     }
 }
 
@@ -293,6 +322,7 @@ extern "C" fn auditd_main(hertz: u64, flags: u64) -> ! {
     let mut gaps = 0u64;
     let mut passes = 0u64;
     let mut out_of_order = 0u64;
+    let mut most_waiting = 0u64;
     report_word(word::STATE, if stall { stopped::STALLED } else { 1 });
 
     loop {
@@ -301,6 +331,7 @@ extern "C" fn auditd_main(hertz: u64, flags: u64) -> ! {
             core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
             let tail = word_at(TAIL_AT);
             let readable = ring::readable(head, tail, layout.slots());
+            most_waiting = most_waiting.max(readable);
             for sequence in tail..tail + readable {
                 let slot = RING_AT + layout.slot_offset(sequence) as u64;
                 let mut bytes = [0u8; RECORD_BYTES];
@@ -322,16 +353,23 @@ extern "C" fn auditd_main(hertz: u64, flags: u64) -> ! {
                     gaps += u64::from(record.count);
                 }
                 let entry = chain.append(&bytes);
+                // **The ring's slot is given back as soon as the record is
+                // chained**, before anything is written: from here the record
+                // lives in this program's memory, and a write that waits on
+                // `bin/fsd` must not keep the kernel's ring full -- a full ring
+                // refuses grants. Until 2026-11-01 the tail moved only after a
+                // pass's writes, and a suite caught a boot refusing 1,526.
+                // SAFETY: this program's own tail word, mapped read-write.
+                unsafe { core::ptr::write_volatile(TAIL_AT as *mut u64, sequence + 1) };
                 if let Some(kept) = kept.as_mut() {
                     kept.push(&entry.to_bytes());
                 }
             }
-            if readable > 0 {
-                if let Some(kept) = kept.as_mut() {
-                    kept.flush();
-                }
-                // SAFETY: this program's own tail word, mapped read-write.
-                unsafe { core::ptr::write_volatile(TAIL_AT as *mut u64, tail + readable) };
+            // Twenty passes is a second at this program's pace.
+            if passes.is_multiple_of(20)
+                && let Some(kept) = kept.as_mut()
+            {
+                kept.flush();
             }
         }
         passes += 1;
@@ -344,6 +382,11 @@ extern "C" fn auditd_main(hertz: u64, flags: u64) -> ! {
         report_word(word::GAPS, gaps);
         report_word(word::PASSES, passes);
         report_word(word::OUT_OF_ORDER, out_of_order);
+        report_word(
+            word::LONGEST_WRITE,
+            kept.as_ref().map_or(0, |kept| kept.longest),
+        );
+        report_word(word::MOST_WAITING, most_waiting);
 
         if hertz == 0 {
             break;

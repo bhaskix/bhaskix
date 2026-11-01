@@ -40,6 +40,9 @@ bhaskix-tcglog = { path = "../../tcglog" }
 # SHA-256 it hashes the three files with.
 bhaskix-bootsig = { path = "../../bootsig" }
 bhaskix-sha256 = { path = "../../sha256" }
+# RFC 0100 step 1: the slot disk -- its GPT, slot headers, record and the boot
+# plan -- as host-tested arithmetic; the loader performs the reads and the one write.
+bhaskix-slotdisk = { path = "../../slotdisk" }
 
 [profile.release]
 panic = "abort"
@@ -114,4 +117,10 @@ asm_budget = 6
 # 162 on 2026-10-30: the `push 0` in the jump to the kernel, so the kernel is
 # entered with the stack a call leaves -- the ABI's alignment, which the jump
 # alone had been eight bytes off since the loader was written.
-unsafe_budget = 162
+# 196 on 2026-11-01, RFC 0100 step 1: the slot disk, thirty-four lines --
+# `LocateHandleBuffer` for every Block I/O handle and the `FreePool` that gives
+# its buffer back; each handle's media read; `ReadBlocks`, and the one
+# `WriteBlocks` and `FlushBlocks` the slot record needs, each laid out by rustfmt
+# a few lines long; and the scratch pages `slots.rs` reads small structures into.
+# Every decision about those bytes is `bhaskix-slotdisk`'s, at budget zero.
+unsafe_budget = 196

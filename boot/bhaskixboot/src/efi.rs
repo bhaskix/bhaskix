@@ -42,6 +42,15 @@ const FILE_MODE_READ: u64 = 1;
 #[repr(C)]
 struct Guid(u32, u16, u16, [u8; 8]);
 
+/// `EFI_BLOCK_IO_PROTOCOL_GUID`, 964e5b21-6459-11d2-8e39-00a0c969723b (edk2
+/// `MdePkg/Include/Protocol/BlockIo.h`) -- RFC 0100 step 1.
+const BLOCK_IO: Guid = Guid(
+    0x964e_5b21,
+    0x6459,
+    0x11d2,
+    [0x8e, 0x39, 0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b],
+);
+
 /// `EFI_LOADED_IMAGE_PROTOCOL_GUID`.
 const LOADED_IMAGE: Guid = Guid(
     0x5B1B_31A1,
@@ -156,8 +165,10 @@ pub struct SimpleTextOutput {
 /// services and the first three protocol-interface services between
 /// `free_pool` and `handle_protocol`; the nine from the reserved slot
 /// through `unload_image` between `handle_protocol` and
-/// `exit_boot_services`; and the ten from `get_next_monotonic_count`
-/// through `locate_handle_buffer` before `locate_protocol`.
+/// `exit_boot_services`; and the seven from `set_watchdog_timer` through
+/// `protocols_per_handle` between `stall` and `locate_handle_buffer` (edk2
+/// `UefiSpec.h`). `free_pool` and `locate_handle_buffer` are named since
+/// RFC 0100 step 1, which looks for a slot disk among the firmware's disks.
 #[repr(C)]
 struct BootServices {
     hdr: TableHeader,
@@ -178,7 +189,8 @@ struct BootServices {
         descriptor_version: *mut u32,
     ) -> usize,
     allocate_pool: usize,
-    free_pool: usize,
+    /// `FreePool`: gives back the buffer `locate_handle_buffer` allocated.
+    free_pool: unsafe extern "efiapi" fn(buffer: *mut core::ffi::c_void) -> usize,
     events_and_installs: [usize; 9],
     handle_protocol: unsafe extern "efiapi" fn(
         handle: usize,
@@ -191,7 +203,16 @@ struct BootServices {
     /// `Stall`, slot 28 (edk2 `UefiSpec.h`): RFC 0091's refusal is held on the
     /// screen long enough to read before the boot manager moves on.
     stall: unsafe extern "efiapi" fn(microseconds: usize) -> usize,
-    through_locate_handle_buffer: [usize; 8],
+    through_protocols_per_handle: [usize; 7],
+    /// `LocateHandleBuffer`, slot 36: every handle carrying a protocol, in a
+    /// buffer the firmware allocates from pool.
+    locate_handle_buffer: unsafe extern "efiapi" fn(
+        search_type: u32,
+        protocol: *const Guid,
+        search_key: *mut core::ffi::c_void,
+        count: *mut usize,
+        buffer: *mut *mut usize,
+    ) -> usize,
     locate_protocol: unsafe extern "efiapi" fn(
         protocol: *const Guid,
         registration: *mut core::ffi::c_void,
@@ -305,7 +326,9 @@ struct SimpleFileSystem {
 
 /// The file protocol, down to `Read`. `delete` and `write` exist in the
 /// slot order and are deliberately opaque: this loader never deletes and
-/// never writes, and leaving the types unstated keeps that structural.
+/// never writes a file, and leaving the types unstated keeps that structural.
+/// ~~It never writes at all~~ -- since RFC 0100 step 1 it writes **one block**,
+/// the slot record, through [`Disk::write_and_flush`] and nothing else.
 #[repr(C)]
 pub struct File {
     revision: u64,
@@ -1070,4 +1093,171 @@ pub fn serial_io_write(protocol: *mut core::ffi::c_void, bytes: &[u8]) {
             bytes.as_ptr().cast::<core::ffi::c_void>(),
         );
     }
+}
+
+/// `EFI_LOCATE_SEARCH_TYPE`'s `ByProtocol` (edk2 `UefiSpec.h`: `AllHandles`,
+/// `ByRegisterNotify`, `ByProtocol`).
+const BY_PROTOCOL: u32 = 2;
+
+/// `EFI_BLOCK_IO_MEDIA`, down to `LastBlock` (edk2 `BlockIo.h`); the
+/// revision-2 fields after it are never read.
+#[repr(C)]
+struct BlockIoMedia {
+    media_id: u32,
+    removable_media: u8,
+    media_present: u8,
+    logical_partition: u8,
+    read_only: u8,
+    write_caching: u8,
+    block_size: u32,
+    io_align: u32,
+    last_block: u64,
+}
+
+/// `EFI_BLOCK_IO_PROTOCOL` (edk2 `BlockIo.h`). `Reset` is named so the offsets
+/// are right; nothing calls it.
+#[repr(C)]
+struct BlockIo {
+    revision: u64,
+    media: *const BlockIoMedia,
+    reset: usize,
+    read_blocks: unsafe extern "efiapi" fn(
+        this: *mut BlockIo,
+        media_id: u32,
+        lba: u64,
+        size: usize,
+        buffer: *mut core::ffi::c_void,
+    ) -> usize,
+    write_blocks: unsafe extern "efiapi" fn(
+        this: *mut BlockIo,
+        media_id: u32,
+        lba: u64,
+        size: usize,
+        buffer: *const core::ffi::c_void,
+    ) -> usize,
+    flush_blocks: unsafe extern "efiapi" fn(this: *mut BlockIo) -> usize,
+}
+
+/// A whole disk the firmware offers through Block I/O: not a partition of
+/// one, with media present, and 512-byte blocks.
+#[derive(Clone, Copy)]
+pub struct Disk {
+    io: *mut BlockIo,
+    media_id: u32,
+    /// The last block's address.
+    pub last_block: u64,
+}
+
+impl Disk {
+    /// Reads whole blocks from `lba` into `buffer`, which is a whole number
+    /// of blocks and page-aligned (every caller passes pages it allocated).
+    ///
+    /// # Errors
+    ///
+    /// The firmware's status.
+    pub fn read(&self, lba: u64, buffer: &mut [u8]) -> Result<(), usize> {
+        // SAFETY: `io` came from the firmware's own handle database and was
+        // null-checked by `whole_disks`; the buffer is ours, writable, and
+        // its length is what is passed.
+        let status = unsafe {
+            ((*self.io).read_blocks)(
+                self.io,
+                self.media_id,
+                lba,
+                buffer.len(),
+                buffer.as_mut_ptr().cast(),
+            )
+        };
+        if status == SUCCESS {
+            Ok(())
+        } else {
+            Err(status)
+        }
+    }
+
+    /// Writes one block and flushes it: **the one write this loader makes**,
+    /// the slot record (RFC 0100 step 1).
+    ///
+    /// # Errors
+    ///
+    /// The firmware's status, from the write or the flush.
+    pub fn write_and_flush(&self, lba: u64, block: &[u8]) -> Result<(), usize> {
+        // SAFETY: as in `read`; the buffer is only read by the firmware.
+        let status = unsafe {
+            ((*self.io).write_blocks)(
+                self.io,
+                self.media_id,
+                lba,
+                block.len(),
+                block.as_ptr().cast(),
+            )
+        };
+        if status != SUCCESS {
+            return Err(status);
+        }
+        // SAFETY: as above.
+        let status = unsafe { ((*self.io).flush_blocks)(self.io) };
+        if status == SUCCESS {
+            Ok(())
+        } else {
+            Err(status)
+        }
+    }
+}
+
+/// Calls `each` with every whole disk, until it answers `true`. Partitions
+/// the firmware made handles for are skipped: the slot disk is read whole,
+/// and its table parsed here, so nothing depends on how the firmware's
+/// partition driver read it.
+pub fn whole_disks(table: *mut SystemTable, mut each: impl FnMut(Disk) -> bool) {
+    // SAFETY: `table` passed `validate`.
+    let services = unsafe { (*table).boot_services };
+    if services.is_null() {
+        return;
+    }
+    let mut count = 0usize;
+    let mut handles: *mut usize = core::ptr::null_mut();
+    // SAFETY: the specification's signature; the firmware allocates the
+    // buffer from pool and writes its address and the count.
+    let status = unsafe {
+        ((*services).locate_handle_buffer)(
+            BY_PROTOCOL,
+            &BLOCK_IO,
+            core::ptr::null_mut(),
+            &raw mut count,
+            &raw mut handles,
+        )
+    };
+    if status != SUCCESS || handles.is_null() {
+        return;
+    }
+    for index in 0..count {
+        // SAFETY: `handles` holds `count` handles, as the firmware said.
+        let handle = unsafe { *handles.add(index) };
+        let Ok(io) = handle_protocol(services, handle, &BLOCK_IO) else {
+            continue;
+        };
+        let io = io.cast::<BlockIo>();
+        // SAFETY: the firmware answered the Block I/O ask with this
+        // interface; its media pointer is read and null-checked.
+        let media = unsafe { (*io).media };
+        if media.is_null() {
+            continue;
+        }
+        // SAFETY: non-null, and the firmware's own structure.
+        let media = unsafe { &*media };
+        if media.logical_partition != 0 || media.media_present == 0 || media.block_size != 512 {
+            continue;
+        }
+        let disk = Disk {
+            io,
+            media_id: media.media_id,
+            last_block: media.last_block,
+        };
+        if each(disk) {
+            break;
+        }
+    }
+    // SAFETY: the buffer `LocateHandleBuffer` allocated, given back once.
+    unsafe { ((*services).free_pool)(handles.cast()) };
 }

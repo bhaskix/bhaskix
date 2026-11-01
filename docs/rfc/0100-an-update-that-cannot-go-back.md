@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | ⬜ **Draft 2026-10-31 — nothing built.** ~~Questions for the lead~~ Questions 1-4 decided by the lead the same day, each as proposed; ~~question 5 open~~ question 5 decided by the lead on 2026-11-01, as proposed (§*Unresolved questions*). Drafted at the lead's request, as Phase 3's second row. |
+| **Status** | ⬜ **Draft 2026-10-31 — ~~nothing built~~ step 1 of 3 built 2026-11-01** (two slots on a GPT disk, the record, fallback, in the native loader); implementation plan written that day. ~~Questions for the lead~~ Questions 1-4 decided by the lead the same day, each as proposed; ~~question 5 open~~ question 5 decided by the lead on 2026-11-01, as proposed (§*Unresolved questions*). Drafted at the lead's request, as Phase 3's second row. |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | boot (`boot/bhaskixboot`), userspace (an update service), tpm, tools |
 | **Milestone** | Phase 3, *secure update* ([roadmap.md](../roadmap.md)): threat T7 |
@@ -125,4 +125,90 @@ arrives **from the kept disk first**, and from the network later, through the sa
 
 ## Implementation plan
 
-Written once the questions are answered.
+Written 2026-11-01, with two more decisions the lead made that day, each as recommended:
+- **the loader writes exactly one block**, the slot record, and nothing else ever. Its rule was
+  "this loader never deletes and never writes"; it becomes "writes nothing but the slot record";
+- **the slots live on a separate GPT disk** -- a record partition and slots A and B, found by
+  Bhaskix's own partition type GUIDs -- whose table the loader parses itself. The kept disk
+  (RFC 0095) is untouched; a GPT disk is foreign to its rule, and teaching that rule partitions
+  is later work.
+
+**Step 1 -- slots, the record, and fallback, in the loader.**
+- **`bhaskix-slotdisk`**, a host-tested crate of arithmetic:
+  - the GPT header and entry array, CRC-checked, and the three partitions found by type;
+  - a slot's header -- one block naming each file's offset and length, every file inside the
+    slot -- and the record (`BHXSLOT1`, the active slot, the slot on trial and its boots left, a
+    write count, a CRC);
+  - **the plan**: which slot first, which to fall back to, and the record to write.
+- **The record's rules**:
+  - a trial **spends a boot on the way in**, because a set that hangs never gets to say it failed;
+  - a trial with no boots left is over: the record clears it and the active slot boots;
+  - a damaged or unreadable record is not believed in part: A, then B, and nothing written.
+- **The loader**:
+  - binds Block I/O, `LocateHandleBuffer` and `FreePool`, and looks among the whole disks for a
+    slot disk;
+  - with none, reads its set from the ESP exactly as before;
+  - with one, reads the record, writes it if the plan says so, then reads, measures and verifies
+    the first slot's set.
+- **Falling back**:
+  - a set that does not read or does not verify sends the loader to the other slot, in the same
+    boot;
+  - **each set is measured as it is read**, so a refused slot is in the event log too;
+  - if neither verifies, the existing Secure Boot policy applies to the first: refused with
+    Secure Boot on; booted and said so with it off.
+- **`tools/slot-disk.py`** builds a slot disk from two signed sets and sets or shows the record.
+  Until step 3 it is how a slot is put on trial or marked good.
+- **A lane, `make test-boot-slots`**, on the native loader under OVMF, with each set's
+  `boot.conf` naming its slot on the command line the kernel prints:
+  - A active boots A;
+  - B on trial with two boots boots B twice, then A, with the trial cleared;
+  - B on trial and damaged is refused, and A boots in the same boot;
+  - a damaged record boots A;
+  - no slot disk reads the ESP.
+- **Armed**:
+  - no decrement, so the trial never ends;
+  - no fallback, so a damaged B boots;
+  - the record's CRC ignored, so a damaged record is believed.
+
+  **Built 2026-11-01.**
+  - `make test-boot-slots` passes all ten of its checks in about a minute:
+    - A active boots A;
+    - B on trial boots twice, the record reading `B on trial, 1 boot(s) left, 2 write(s)`
+      after the first, then A, with the trial cleared;
+    - a damaged B is refused -- `NOT VERIFIED (the kernel is not the one boot.sig names) ...
+      not booted: the other slot is tried` -- and A boots in the same boot;
+    - a damaged record boots A, and the disk's sha256 is unchanged;
+    - with no slot disk the ESP is read as before.
+  - Each arm turned it red, one at a time, and was restored:
+    - no decrement: the trial never ended, four checks;
+    - no fallback: the kernel was handed the damaged B;
+    - the record's CRC ignored: the B a damaged record named was booted.
+
+    The same two rules are host tests in `bhaskix-slotdisk`, red under the same changes.
+  - **The facts the bindings rest on were read from edk2's headers**, not recalled:
+    - Block I/O's GUID and layout;
+    - `LocateHandleBuffer` as the eighth slot after `Stall`, and `ByProtocol` as 2;
+    - the GPT header and entry offsets.
+
+    The CRC is checked across two implementations: the crate's, and zlib's in the Python tool
+    that writes the disk.
+  - **Two rules found while building it**, recorded here because they are policy:
+    - a trial whose spent boot cannot be written is not taken -- the active slot boots instead
+      -- since a set that hangs would otherwise be tried for ever;
+    - the verdict line of a set passed over for the other slot says so, instead of the ESP
+      path's `-- booting`.
+  - **Not built in step 1**:
+    - the running system cannot write a slot or mark one good; the tool stands in;
+    - no counter refuses an older signed set;
+    - the slot disk is a second disk, not partitions of the kept one.
+
+**Step 2 -- the counter.** `boot.sig`'s security version given its meaning in `bhaskix-bootsig`
+and `bootsign`; a TPM NV counter the loader reads, refusing a set below it, and advances to a
+slot's version only once that slot has been marked good; the NV commands in a crate `bin/tpmd`
+cannot link (RFC 0089's rule, reopened for this counter alone).
+
+**Step 3 -- the update service.** A ring-3 program holding the inactive slot's blocks and the
+record, and nothing else: it verifies a set found on the kept disk against the release's key,
+writes it into the inactive slot, puts that slot on trial, and -- after a boot of it has come
+up -- marks it good. Partition-scoped block capabilities come with it, since the block drivers
+grant whole disks today.

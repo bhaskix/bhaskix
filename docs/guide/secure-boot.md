@@ -4,7 +4,8 @@
 
 **Verified** 2026-10-29 against `579ab9b`, by running every command shown: part 1
 under QEMU 4.2.1 on Ubuntu 20.04, part 2 on Ubuntu 26.04 — QEMU 10.2.1,
-virt-firmware 25.12, sbsigntool 0.9.4 — in a container.
+virt-firmware 25.12, sbsigntool 0.9.4 — in a container. Part 4 on 2026-11-01, by
+`make test-boot-slots`, which runs its commands and boots each case under QEMU 4.2.1.
 
 Bhaskix's own loader, `bhaskixboot.efi`, checks a signature over the kernel, the
 initrd and `boot.conf` before it starts them, and says what it found in the boot
@@ -181,10 +182,51 @@ Secure Boot on. **Not yet**: the developer preview is unsigned, by decision, and
 this part is written now so it is not a surprise later. How the project keeps
 its keys is [GOVERNANCE.md](../../GOVERNANCE.md) §5.
 
+## 4. Two slots, and falling back
+
+Since 2026-11-01 the loader can boot from a **slot disk**: a second disk holding
+two complete boot sets, A and B, and a one-block record saying which is active
+and which, if any, is on trial. A set that does not verify is passed over for
+the other slot, in the same boot. It is step 1 of
+[RFC 0100](../rfc/0100-an-update-that-cannot-go-back.md): nothing in the running
+system writes a slot yet, so a script stands in.
+
+Sign two sets as in part 1, each in its own directory's `bhaskix/`, then build
+the disk and put B on trial for two boots:
+
+```sh
+python3 tools/slot-disk.py make slots.img --a set-a/bhaskix --b set-b/bhaskix
+python3 tools/slot-disk.py record slots.img --active a --trial b --tries 2
+```
+
+Boot as in part 1 with one more drive, `-drive if=ide,index=3,format=raw,file=slots.img`.
+The loader says what it found and what it chose, and **spends a trial's boot
+before taking it**, so a set that hangs cannot be tried for ever:
+
+```
+bhaskixboot: slot record: A active, B on trial with 2 boot(s) left, 1 write(s)
+bhaskixboot: booting slot B on trial; 1 boot(s) left after this one
+bhaskixboot: slot record written
+bhaskixboot: boot signature verified: key a6c913d8a0e2476e TEST KEY, NOT ENFORCED: Secure Boot is off
+```
+
+After two such boots the trial is over and A boots again. A slot whose set does
+not verify is refused and the other booted:
+
+```
+bhaskixboot: boot signature NOT VERIFIED (the kernel is not the one boot.sig names), NOT ENFORCED: Secure Boot is off -- not booted: the other slot is tried
+bhaskixboot: slot B's set did not verify; falling back to slot A
+```
+
+`python3 tools/slot-disk.py show slots.img` reads the record back. The record
+is the only block the loader ever writes; a damaged record is not believed, A
+is tried, then B, and nothing is written.
+
 ## What this does not protect against
 
-- **An older boot set you signed.** It still verifies; refusing old ones needs a
-  rollback counter the project has not built.
+- **An older boot set you signed.** It still verifies, from the ESP or from a
+  slot; refusing old ones needs a rollback counter the project has not built
+  (RFC 0100 step 2).
 - **The firmware itself**, or anyone who can put it in setup mode. Then
   `SecureBoot` reads 0, the report says *not enforced*, and the TPM's PCR 7
   records the change: noticed, not prevented.

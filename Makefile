@@ -289,7 +289,7 @@ OVMF_VARS    := $(firstword $(wildcard $(OVMF_DIR)OVMF_VARS$(OVMF_SUFFIX).fd))
 
 .PHONY: FORCE all kernel iso demo demo-fresh test-busybox-v3 check-fpstate-hw run run-uefi release-dist release-finish ceremony-kit progress test test-host test-boot test-boot-uefi test-boot-uefi-qemu64 test-boot-iommu test-keyboard \
         test-boot-iommu-off test-boot-qemu64 test-boot-native test-boot-native-full test-boot-native-tpm \
-        test-boot-native-tpm-tis test-boot-secureboot test-release-keys test-ahci-foreign test-disk-keeps test-audit-stall test-placements mkfs bootsign audit-verify test-shell test-faults test-usb-keyboard test-lacp test-bond test-http fmt clippy gates hooks clean distclean help
+        test-boot-native-tpm-tis test-boot-secureboot test-release-keys test-ahci-foreign test-disk-keeps test-audit-stall test-boot-slots test-placements mkfs bootsign audit-verify test-shell test-faults test-usb-keyboard test-lacp test-bond test-http fmt clippy gates hooks clean distclean help
 
 all: iso
 
@@ -671,6 +671,7 @@ $(BOOTEFI): $(wildcard $(BOOTEFI_DIR)/src/*.rs) $(BOOTEFI_DIR)/Cargo.toml \
             $(wildcard boot/handoff/src/*.rs) $(wildcard elf/src/*.rs) \
             $(wildcard rand/src/*.rs) $(wildcard tcglog/src/*.rs) \
             $(wildcard bootsig/src/*.rs) $(wildcard bootsig/src/*/*.rs) $(wildcard sha256/src/*.rs) \
+            $(wildcard slotdisk/src/*.rs) \
             $(BOOTEFI_DIR)/build.rs tests/keys/bootsig-TEST-KEY.public
 	cd $(BOOTEFI_DIR) && $(CARGO) build --release --target x86_64-unknown-uefi
 	@echo "built $@"
@@ -844,7 +845,7 @@ run-uefi: $(ISO)
 test: fmt clippy test-host check-fpstate-hw gates test-boot test-boot-uefi test-boot-iommu test-boot-iommu-off \
       test-boot-qemu64 test-boot-uefi-qemu64 test-boot-native test-boot-native-full test-boot-native-tpm \
       test-boot-native-tpm-tis test-boot-secureboot test-release-keys test-placements test-shell \
-      test-ahci-foreign test-disk-keeps test-audit-stall test-keyboard test-usb-keyboard test-busybox test-bond test-lacp \
+      test-ahci-foreign test-disk-keeps test-audit-stall test-boot-slots test-keyboard test-usb-keyboard test-busybox test-bond test-lacp \
       test-faults test-http
 	@echo
 	@echo "  all checks passed"
@@ -1056,6 +1057,12 @@ test-boot-native: $(BOOTEFI) $(ISO) bootsign
 # holds bhaskixboot to everything the incumbent is held to.
 test-boot-native-full: $(BOOTEFI) $(ISO) bootsign
 	tests/qemu/boot-test.sh native
+
+# RFC 0100 step 1: the native loader booting from an A/B slot disk -- a trial
+# spent and ended, a damaged slot refused and the other booted in the same boot,
+# a damaged record not believed, and no slot disk read from the ESP as before.
+test-boot-slots: $(BOOTEFI) $(ISO) bootsign
+	BHASKIX_KEEP_LOGS=build/slot-boot-logs tests/qemu/slot-boot-test.sh
 
 # RFC 0089: the native lane with a TPM 2.0 attached, through the emulator
 # `tools/swtpm.sh` runs in a container. In `make test` since step 2 gave it

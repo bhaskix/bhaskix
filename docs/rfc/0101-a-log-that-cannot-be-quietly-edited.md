@@ -204,6 +204,14 @@ Written 2026-11-01, with three more decisions the lead made that day, each as re
   - A kept entry is 128 bytes: the record, the link before it, its own link, where a link is
     `sha256("BHXAUDIT" ‖ previous ‖ record)`. 32 entries fill a block, and a partial block is
     rewritten until it fills, so a file is always whole entries.
+  - **Corrected the same day, after a suite's boot refused 1,526 grants** (TRACKER §3):
+    - the reader gives a record's ring slot back as soon as it is chained, not after the pass's
+      writes;
+    - it writes a full block as it fills and the partial one at most once a second.
+
+    **A crash therefore loses at most a second of records**, and the report's byte count is what
+    is on the disk. The longest write and the most records waiting print on every boot (`audit
+    reader`): 101 ms and 54 of 512 on an `iommu` boot.
   - `bin/fsd` makes `/audit` beside `/pkg` and reports its handle as a twelfth word.
 
 **Step 3 -- shown to fail closed, and checked by something other than the writer.**

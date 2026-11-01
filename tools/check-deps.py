@@ -127,6 +127,9 @@ LAYERS = {
     # SHA-256, moved out of the package format for RFC 0091: the loader's
     # signature check needs the hash and nothing above it.
     "bhaskix-sha256": -3,
+    # RFC 0100 step 1: the slot disk -- its GPT, slot headers, record and boot plan --
+    # as arithmetic the native loader decides with. A leaf: it depends on nothing.
+    "bhaskix-slotdisk": -3,
     # RFC 0091's boot-set signature check: SHA-256 below it and nothing else,
     # and the native loader above it.
     "bhaskix-bootsig": -2,

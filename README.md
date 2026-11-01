@@ -170,6 +170,17 @@ The `-ix` is the Unix lineage, the same suffix Minix and Linux carry.
 > signed release is the one after the preview. An owner can sign their own boot today —
 > [the guide](docs/guide/secure-boot.md).
 >
+> **Since 2026-11-01 two more of Phase 3's rows have begun, each with its limit stated.** An
+> **audit log** ([RFC 0101](docs/rfc/0101-a-log-that-cannot-be-quietly-edited.md)): every
+> capability grant, derivation and revocation made through a system call, and every domain created
+> or ended, is recorded in a hash chain `bin/auditd` keeps on the disk, a grant is refused when the
+> log is full, and a host tool names any record edited since -- but nothing anchors the chain's
+> head yet, so a log replaced whole is not detected. And **two boot slots**
+> ([RFC 0100](docs/rfc/0100-an-update-that-cannot-go-back.md), step 1 of 3): the loader boots from
+> a second disk holding sets A and B, spends a trial's boot before taking it, and falls back when
+> a set does not verify -- but nothing in the running system writes a slot yet, and no counter
+> refuses an older signed set.
+>
 > Nothing here should run anywhere that matters — see [SECURITY.md](SECURITY.md).
 >
 > **The design documents still have one author and no independent reviewers.** Phase 0's exit

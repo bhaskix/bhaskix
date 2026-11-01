@@ -393,7 +393,11 @@ cost* and is not a schedule.
   advance. **Where it stands, 2026-10-31**: [RFC 0100](rfc/0100-an-update-that-cannot-go-back.md)
   drafted, nothing built. The lead decided four of its five questions that day: slots on raw
   partitions read through UEFI Block I/O, a TPM NV counter advanced by the loader after a good
-  boot, the verified in-memory initrd as the immutable root for now, and a package key of its own
+  boot, the verified in-memory initrd as the immutable root for now, and a package key of its own.
+  **2026-11-01**: the fifth decided (an update arrives from the kept disk first), and step 1 of 3
+  built -- two slots on a second GPT disk, a trial that spends a boot before it is taken, and
+  fallback to the other slot in the same boot. Owed: the rollback counter (step 2) and the update
+  service (step 3)
 - **Audit framework** — hash-chained log over the telemetry plane, remote attestation. Third
   because the plane it consumes **already exists** ([RFC 0026](rfc/0026-telemetry-plane.md),
   Phase 2), which makes this the cheapest of the three to start and the one that moves T8 off

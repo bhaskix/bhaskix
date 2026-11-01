@@ -113,7 +113,7 @@ From [security.md](../security.md), in its words where they are short:
 | | Not yet |
 |---|---|
 | **Virtual machines** | Domains are meant to isolate guests too, but there is no hardware virtualisation yet, so there are no guests to isolate |
-| **Updates** | There is no update mechanism, so nothing signs, stages or rolls one back |
+| **Updates** | ~~There is no update mechanism, so nothing signs, stages or rolls one back~~ Since 2026-11-01 the loader boots from two slots and falls back to the other when one does not verify ([Sign your own boot](secure-boot.md), part 4); nothing in the running system writes a slot yet, and no counter refuses an older signed set |
 | **Audit** | ~~There is no tamper-evident audit log or remote attestation yet~~ The log is kept since 2026-11-01 (above), but nothing anchors it, so a log replaced whole is not detected; there is no remote attestation |
 | **Old signed boots** | An older signed boot set still verifies; refusing it needs a rollback counter not yet built |
 | **The Linux adapter** | `bin/linuxd` holds the authority for every hosted program, so a compromise of it reaches all of their files — the concentration point the design accepts, and states |
