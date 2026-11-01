@@ -691,6 +691,11 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
         }
         Err(why) => println!("\x1b[91m    telemetry      FAILED: {why}\x1b[0m"),
     }
+    // RFC 0101 step 2: the audit ring, made early so that it exists when its
+    // reader is started, and counting -- not recording -- until then.
+    if let Err(why) = audit::init(handoff.hhdm_base.as_u64()) {
+        println!("\x1b[91m    audit          FAILED: {why}\x1b[0m");
+    }
 
     // Retire the class-phase threads before measuring idle CPUs, or the
     // "idle" window measures three spinning threads.
@@ -18924,6 +18929,21 @@ const TRACED_PROBES_EACH: u64 = 8;
 static TRACED_REPORT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
 /// How many CPUs have finished their probe burst.
 static TRACED_PROBES_DONE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// The audit log's reader, RFC 0101 step 2: the ring read-only, its tail
+/// read-write, a page to write from, and `/audit` where the disk is kept.
+const AUDITD_STACK: u64 = 0x0000_0000_1810_0000;
+const AUDITD_STACK_PAGES: u64 = 4;
+const AUDITD_PROGRAM: &[u8] = b"bin/auditd";
+/// "AUDITD01", little-endian, as `bin/auditd` writes it.
+const AUDITD_MARKER: u64 = u64::from_le_bytes(*b"AUDITD01");
+/// `bin/auditd`'s second argument: keep the chain in the boot's file.
+const AUDITD_PERSIST: u64 = 1;
+/// `bin/auditd`'s second argument: attach and drain nothing --
+/// `bhaskix.fault=audit-stall`, the fail-closed lane (RFC 0101 step 3).
+const AUDITD_STALL: u64 = 2;
+static AUDITD_REPORT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
+static AUDITD_FLAGS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static TCP_CONFIG: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
 static IP_INBOX: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
@@ -23327,6 +23347,9 @@ static FS_PKG: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::ne
 /// writable directory and every hosted write answers `EROFS` — the honest
 /// state rather than a forged one, exactly as `pkg` behaves for the shell.
 static FS_TMP: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// `/audit`'s writable handle, from `bin/fsd`'s report -- RFC 0101 step 2. Zero
+/// when there is no kept disk, and `bin/auditd` then keeps its chain in memory.
+static FS_AUDIT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// Where the direct map is, for the thread above.
 static DISK_HHDM: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
@@ -26403,6 +26426,493 @@ fn report_traced(hhdm: u64) {
     }
 }
 
+/// Starts `bin/auditd` and attaches the audit ring -- RFC 0101 step 2.
+///
+/// The same shape as [`start_traced`]: a realm for the reader, a keeper for
+/// its report page, and nothing in its CSpace the reader does not need --
+/// the ring read-only, its tail read-write, a wake, one page of its own to
+/// write from, and, on a kept disk, `/audit`. The ring attaches **before** the
+/// reader runs, so the first record of the chain is the one that names the
+/// boot; from that moment an operation that gives authority is refused when
+/// the ring has no room, and nothing is recorded unless this reader drains.
+fn start_auditd(hhdm_base: u64, handoff: &Handoff) -> Result<(), &'static str> {
+    let ring = audit::ring_identity().ok_or("the audit ring never initialised")?;
+    let tail = audit::tail_identity().ok_or("the audit tail page is gone")?;
+    let realm = domain::create("auditd", domain::ResourceEnvelope::new())
+        .map_err(|_| "the auditd domain would not be created")?;
+    let install = |slot: usize, capability: cap::SlotRef| {
+        domain::with(realm, |owner| {
+            owner.cspace.install_at(slot, capability).is_ok()
+        }) == Some(true)
+    };
+
+    // The report page is a keeper's, as `traced`'s is: whatever happens to the
+    // reader, the kernel can still read what it last said.
+    let keeper = domain::create("auditd-keeper", domain::ResourceEnvelope::new())
+        .map_err(|_| "the auditd keeper would not be created")?;
+    let report = shared::create(keeper, bhaskix_mm::FRAME_SIZE)
+        .map_err(|_| "the auditd report page would not be created")?;
+    let named = shared::name(report).map_err(|_| "the auditd report would not be named")?;
+    if !install(1, named) {
+        return Err("the auditd report would not install");
+    }
+    let wake = crate::notify::create().map_err(|_| "the auditd wake would not be created")?;
+    let wake_root = crate::notify::name(wake).map_err(|_| "the auditd wake would not be named")?;
+    let wake_cap = cap::with_arena(|arena| arena.derive(wake_root, cap::Rights::ALL, 1).ok())
+        .ok_or("the auditd wake would not derive")?;
+    if !install(2, wake_cap) {
+        return Err("the auditd wake would not install");
+    }
+    let tail_root = shared::name(shared::MemoryId::from_u64(tail))
+        .map_err(|_| "the audit tail would not be named")?;
+    let tail_cap = cap::with_arena(|arena| {
+        arena
+            .derive(tail_root, cap::Rights::READ.union(cap::Rights::WRITE), 0)
+            .ok()
+    })
+    .ok_or("the audit tail would not derive")?;
+    if !install(7, tail_cap) {
+        return Err("the audit tail would not install");
+    }
+    // Read-only, so the reader cannot rewrite a record before it chains it.
+    let ring_root = shared::name(shared::MemoryId::from_u64(ring))
+        .map_err(|_| "the audit ring would not be named")?;
+    let ring_cap = cap::with_arena(|arena| arena.derive(ring_root, cap::Rights::READ, 0).ok())
+        .ok_or("the audit ring would not derive")?;
+    if !install(8, ring_cap) {
+        return Err("the audit ring would not install");
+    }
+    let transfer = shared::create(realm, bhaskix_mm::FRAME_SIZE)
+        .map_err(|_| "the auditd transfer page would not be created")?;
+    let transfer_cap =
+        shared::name(transfer).map_err(|_| "the auditd transfer page would not be named")?;
+    if !install(9, transfer_cap) {
+        return Err("the auditd transfer page would not install");
+    }
+
+    // `/audit`, writable, minted from what `bin/fsd` reported -- as
+    // `linuxd`'s `/tmp` is. Zero means no kept disk, or no directory on it.
+    let mut flags = 0;
+    let directory = FS_AUDIT.load(core::sync::atomic::Ordering::Acquire);
+    let endpoint = FS_ENDPOINT.load(core::sync::atomic::Ordering::Acquire);
+    if directory != 0 && endpoint != u64::MAX {
+        let handle = cap::with_arena(|arena| {
+            let root = arena
+                .insert_root(
+                    cap::ObjectRef::new(cap::ObjectKind::Endpoint, endpoint),
+                    cap::Rights::ALL,
+                    0,
+                )
+                .ok()?;
+            arena
+                .derive(
+                    root,
+                    cap::Rights::READ.union(cap::Rights::DERIVE),
+                    directory,
+                )
+                .ok()
+        });
+        if let Some(handle) = handle
+            && install(10, handle)
+        {
+            flags |= AUDITD_PERSIST;
+        }
+    }
+    if handoff
+        .cmdline
+        .split_ascii_whitespace()
+        .any(|word| word == "bhaskix.fault=audit-stall")
+    {
+        flags |= AUDITD_STALL;
+    }
+    AUDITD_FLAGS.store(flags, core::sync::atomic::Ordering::Release);
+
+    // The boot's identity: unpredictable where the machine can be, and only
+    // required to be unique, so the cycle counter stands in where it cannot.
+    let boot = [
+        bhaskix_rand::u64().unwrap_or_else(bhaskix_arch::tsc::read),
+        bhaskix_rand::u64().unwrap_or_else(|| bhaskix_arch::tsc::read().rotate_left(29)),
+    ];
+    if !audit::attach(boot) {
+        return Err("the audit ring would not attach");
+    }
+    let options = sched::SpawnOptions::new()
+        .pinned()
+        .in_domain(realm.as_u32());
+    sched::spawn_on_with(
+        0,
+        "auditd",
+        auditd_domain_entry,
+        hhdm_base,
+        hhdm_base,
+        options,
+    )
+    .map_err(|_| "the audit reader would not spawn")?;
+    AUDITD_REPORT.store(report.as_u64(), core::sync::atomic::Ordering::Release);
+    Ok(())
+}
+
+/// Loads `bin/auditd` into a fresh address space and enters it with the
+/// clock's rate and the flags [`start_auditd`] stored before spawning it.
+extern "C" fn auditd_domain_entry(hhdm_base: u64) -> ! {
+    use bhaskix_boot::VirtAddr;
+    use bhaskix_mm::{Protection, VirtRange};
+    use vm::AddressSpace;
+
+    let stop = |why: &str| -> ! {
+        println!("\x1b[91m    audit          FAILED: {why}\x1b[0m");
+        sched::exit()
+    };
+    let Ok(file) = vfs::open(AUDITD_PROGRAM) else {
+        stop("bin/auditd is not in the filesystem")
+    };
+    let Ok(image) = elf::parse(file.bytes()) else {
+        stop("bin/auditd is not an ELF this kernel will load")
+    };
+    let Ok(mut space) = AddressSpace::new(hhdm_base) else {
+        stop("the address space would not be created")
+    };
+    let Some(stack) = VirtRange::from_pages(VirtAddr(AUDITD_STACK), AUDITD_STACK_PAGES) else {
+        stop("the stack range is not a range")
+    };
+    if space.map_anonymous(stack, Protection::ReadWrite).is_err() {
+        stop("the stack would not map")
+    }
+    let Ok(entry) = elf::load_into(&image, file.bytes(), &mut space, hhdm_base) else {
+        stop("bin/auditd would not load")
+    };
+    // SAFETY: the higher half is copied from the running page table, so
+    // everything currently executing stays addressable.
+    unsafe { vm::install(space) };
+    let rsp = AUDITD_STACK + AUDITD_STACK_PAGES * bhaskix_mm::FRAME_SIZE;
+    let hertz = bhaskix_arch::tsc::hertz().unwrap_or(0);
+    let flags = AUDITD_FLAGS.load(core::sync::atomic::Ordering::Acquire);
+    // SAFETY: `entry` is inside a user-executable segment of the space just
+    // installed, `rsp` is one past user-writable memory in the same space,
+    // and `RSP0` was set before this thread was spawned.
+    unsafe { enter_user("auditd", entry, rsp, [hertz, flags]) }
+}
+
+/// A domain's records name its incarnation, and a capability's its serial --
+/// RFC 0101 step 2's gate on audit-grade naming.
+///
+/// Two probe domains, one after the other, each deriving and revoking a
+/// capability through the same path the `INVOKE` system call takes, and
+/// ending. Their records are then found in the ring by name: the second
+/// domain usually takes the first one's slot, and must not be named as it;
+/// the arena entry is usually reused, and the serial must not be.
+fn audit_names_self_test() {
+    let state = audit::state();
+    if !state.active {
+        println!(
+            "\x1b[91m    audit names    FAILED: no reader attached, so nothing is recorded\x1b[0m"
+        );
+        return;
+    }
+    let from = state.head;
+    let mut probes = [(0u32, 0u32, 0u64); 2];
+    for (index, probe) in probes.iter_mut().enumerate() {
+        let Ok(id) = domain::create("audit-probe", domain::ResourceEnvelope::new()) else {
+            println!(
+                "\x1b[91m    audit names    FAILED: probe {index} would not be created\x1b[0m"
+            );
+            return;
+        };
+        let generation = domain::with(id, |owner| owner.generation()).unwrap_or(u32::MAX);
+        let root = cap::with_arena(|arena| {
+            arena.insert_root_owned(
+                cap::ObjectRef::new(cap::ObjectKind::Notification, 0xA0D1),
+                cap::Rights::ALL,
+                0,
+                id.as_u32(),
+            )
+        });
+        let Ok(root) = root else {
+            println!("\x1b[91m    audit names    FAILED: probe {index} got no capability\x1b[0m");
+            domain::destroy(id);
+            return;
+        };
+        let placed = domain::with(id, |owner| {
+            owner.charge_capability().is_ok() && owner.cspace.install_at(0, root).is_ok()
+        });
+        let mut frame = bhaskix_arch::syscall::SyscallFrame {
+            kind: syscall::Kind::Invoke as u64,
+            capability: 0,
+            method: syscall::method::DERIVE,
+            arg0: u64::from(cap::Rights::ALL.bits()),
+            arg2: 1,
+            ..Default::default()
+        };
+        let derived = syscall::invoke(id, &mut frame);
+        // The slot under the domain table, released, and only then the serial
+        // under the arena: the table ranks outside the arena. The first
+        // version nested them the other way round, and a boot of the USB
+        // keyboard lane deadlocked on it (2026-11-01; TRACKER §3).
+        let slot = domain::with(id, |owner| owner.cspace.get(1)).flatten();
+        let serial = slot
+            .and_then(|slot| cap::with_arena(|arena| arena.serial_of(slot)))
+            .unwrap_or(0);
+        let mut frame = bhaskix_arch::syscall::SyscallFrame {
+            kind: syscall::Kind::Invoke as u64,
+            capability: 1,
+            method: syscall::method::REVOKE,
+            ..Default::default()
+        };
+        let revoked = syscall::invoke(id, &mut frame);
+        domain::destroy(id);
+        if placed != Some(true)
+            || derived.status != syscall::Status::Ok
+            || revoked.status != syscall::Status::Ok
+        {
+            println!(
+                "\x1b[91m    audit names    FAILED: probe {index} could not derive and revoke \
+                 ({:?}, {:?})\x1b[0m",
+                derived.status, revoked.status
+            );
+            return;
+        }
+        *probe = (id.as_u32(), generation, serial);
+    }
+    let to = audit::state().head;
+
+    // Each probe's four records, found by the name they carry and nothing
+    // else: created, derived, revoked, ended.
+    let mut found = [[false; 4]; 2];
+    for sequence in from..to {
+        let Some(record) = audit::record_at(sequence) else {
+            continue;
+        };
+        for (index, (slot, generation, serial)) in probes.iter().enumerate() {
+            // Built here, from what the domain table said, and **not** through
+            // `audit::name`: a test that named both sides with the same
+            // function passed with generations dropped from every record
+            // (2026-11-01, its arm).
+            let named = bhaskix_telemetry::audit::Name {
+                domain: *slot,
+                generation: *generation,
+            };
+            let kind = record.kind;
+            if kind == bhaskix_telemetry::audit::Kind::DomainCreated as u8 && record.target == named
+            {
+                found[index][0] = true;
+            } else if kind == bhaskix_telemetry::audit::Kind::Derive as u8
+                && record.actor == named
+                && record.subject == *serial
+            {
+                found[index][1] = true;
+            } else if kind == bhaskix_telemetry::audit::Kind::Revoke as u8
+                && record.actor == named
+                && record.subject == *serial
+            {
+                found[index][2] = true;
+            } else if kind == bhaskix_telemetry::audit::Kind::DomainEnded as u8
+                && record.target == named
+            {
+                found[index][3] = true;
+            }
+        }
+    }
+    let [(slot_a, gen_a, serial_a), (slot_b, gen_b, serial_b)] = probes;
+    let distinct = (slot_a, gen_a) != (slot_b, gen_b) && serial_a != serial_b && serial_a != 0;
+    if found.iter().all(|kinds| kinds.iter().all(|seen| *seen)) && distinct {
+        println!(
+            "    audit names    two probes' records found by name: domain {slot_a} generation \
+             {gen_a}, then domain {slot_b} generation {gen_b}{}; capability serials {serial_a} and \
+             {serial_b}",
+            if slot_a == slot_b {
+                ", the same slot"
+            } else {
+                ""
+            }
+        );
+    } else {
+        println!(
+            "\x1b[91m    audit names    FAILED: records found {found:?}; names ({slot_a}, {gen_a}) \
+             and ({slot_b}, {gen_b}), serials {serial_a} and {serial_b}\x1b[0m"
+        );
+    }
+}
+
+/// Fails closed, and only where it should -- RFC 0101 step 3, run only under
+/// `bhaskix.fault=audit-stall`, where `bin/auditd` attaches and drains nothing.
+///
+/// A probe domain derives and revokes through the system call's own path
+/// until a derive is refused; then a revocation and a domain's end must still
+/// happen, and once the headroom is spent too, an operation that takes
+/// authority away must proceed and be counted as a gap.
+fn audit_stall_self_test() {
+    let invoke = |id: domain::DomainId, capability: u64, method: u64, destination: u64| {
+        let mut frame = bhaskix_arch::syscall::SyscallFrame {
+            kind: syscall::Kind::Invoke as u64,
+            capability,
+            method,
+            arg0: u64::from(cap::Rights::ALL.bits()),
+            arg2: destination,
+            ..Default::default()
+        };
+        syscall::invoke(id, &mut frame).status
+    };
+    let mint = |id: domain::DomainId, slot: usize| {
+        let root = cap::with_arena(|arena| {
+            arena.insert_root_owned(
+                cap::ObjectRef::new(cap::ObjectKind::Notification, 0xA0D2),
+                cap::Rights::ALL,
+                0,
+                id.as_u32(),
+            )
+        });
+        root.is_ok_and(|root| {
+            domain::with(id, |owner| {
+                owner.charge_capability().is_ok() && owner.cspace.install_at(slot, root).is_ok()
+            }) == Some(true)
+        })
+    };
+    let Ok(probe) = domain::create("audit-stall", domain::ResourceEnvelope::new()) else {
+        println!("\x1b[91m    audit stall    FAILED: the probe would not be created\x1b[0m");
+        return;
+    };
+    if !mint(probe, 0) || invoke(probe, 0, syscall::method::DERIVE, 2) != syscall::Status::Ok {
+        println!(
+            "\x1b[91m    audit stall    FAILED: the probe could not hold two capabilities\x1b[0m"
+        );
+        domain::destroy(probe);
+        return;
+    }
+    // Grants -- derives -- until one is refused, each taken back at once so
+    // the CSpace does not fill before the ring does.
+    let mut recorded = 0u32;
+    let mut refused = false;
+    for _ in 0..1024 {
+        match invoke(probe, 0, syscall::method::DERIVE, 1) {
+            syscall::Status::Ok => {}
+            syscall::Status::AuditFull => {
+                refused = true;
+                break;
+            }
+            other => {
+                println!("\x1b[91m    audit stall    FAILED: a derive answered {other:?}\x1b[0m");
+                domain::destroy(probe);
+                return;
+            }
+        }
+        recorded += 1;
+        if invoke(probe, 1, syscall::method::REVOKE, 0) != syscall::Status::Ok {
+            println!("\x1b[91m    audit stall    FAILED: a revocation was refused\x1b[0m");
+            domain::destroy(probe);
+            return;
+        }
+    }
+    // Refused: now a revocation must still happen.
+    let revoked = refused && invoke(probe, 2, syscall::method::REVOKE, 0) == syscall::Status::Ok;
+    // And past the headroom: revocations of capabilities the kernel minted
+    // (minting is not audited), until one proceeds unrecorded.
+    let mut spent = 0u32;
+    while revoked && audit::state().gaps == 0 && spent < 256 {
+        if !mint(probe, 3) || invoke(probe, 3, syscall::method::REVOKE, 0) != syscall::Status::Ok {
+            break;
+        }
+        spent += 1;
+    }
+    let ended = domain::destroy(probe);
+    let state = audit::state();
+    if refused && revoked && ended && state.gaps > 0 && state.refused > 0 {
+        println!(
+            "    audit stall    a derive was refused with AUDIT_FULL after {recorded} were \
+             recorded; a revocation and a domain's end still happened after it, and {} \
+             operation(s) proceeded unrecorded and were counted; {} refused",
+            state.gaps, state.refused
+        );
+    } else {
+        println!(
+            "\x1b[91m    audit stall    FAILED: refused {refused}, revoked after {revoked}, ended \
+             {ended}; {} unrecorded, {} refused, after {recorded} derive(s)\x1b[0m",
+            state.gaps, state.refused
+        );
+    }
+}
+
+/// What `bin/auditd` reports, and the counts before it attached.
+fn report_auditd(hhdm: u64) {
+    let state = audit::state();
+    let [grants, derives, revokes, created, ended] = state.before;
+    let before = grants + derives + revokes + created + ended;
+    let raw = AUDITD_REPORT.load(core::sync::atomic::Ordering::Acquire);
+    if raw == u64::MAX {
+        println!(
+            "\x1b[91m    audit          FAILED: no reader was started; {before} operation(s) \
+             counted, not recorded\x1b[0m"
+        );
+        return;
+    }
+    let Some((pages, count)) = shared::frames_of(shared::MemoryId::from_u64(raw)) else {
+        println!("\x1b[91m    audit          FAILED: the reader's report page is gone\x1b[0m");
+        return;
+    };
+    if count == 0 {
+        println!("\x1b[91m    audit          FAILED: the reader's report page is empty\x1b[0m");
+        return;
+    }
+    let base = hhdm + pages[0];
+    let stalled = AUDITD_FLAGS.load(core::sync::atomic::Ordering::Acquire) & AUDITD_STALL != 0;
+    // Settled: the reader has run, and has chained everything published when
+    // this began -- bounded, since a reader that never drains is the failure.
+    let target = audit::state().head;
+    for _ in 0..60u32 {
+        let marked = report_page_word(base, 0) == AUDITD_MARKER;
+        let running = report_page_word(base, 1);
+        if marked && (stalled || (running == 1 && report_page_word(base, 2) >= target)) {
+            break;
+        }
+        wait_millis(50);
+    }
+    let word = |index| report_page_word(base, index);
+    println!(
+        "    audit before   {grants} grant(s), {derives} derive(s), {revokes} revocation(s), \
+         {created} domain(s) created, {ended} ended before bin/auditd attached -- counted, and \
+         the first record says {} of {before}",
+        word(14)
+    );
+    if word(0) != AUDITD_MARKER {
+        println!("\x1b[91m    audit          FAILED: bin/auditd never reported\x1b[0m");
+        return;
+    }
+    if stalled {
+        println!(
+            "    audit          stalled on purpose (bhaskix.fault=audit-stall): bin/auditd \
+             attached and drains nothing; state {}",
+            word(1)
+        );
+        return;
+    }
+    if word(1) != 1 {
+        println!(
+            "\x1b[91m    audit          FAILED: bin/auditd stopped before draining (state {})\x1b[0m",
+            word(1)
+        );
+        return;
+    }
+    let kept = match word(7) {
+        0 => alloc::string::String::from("in memory, not persisted (no kept disk)"),
+        1 => alloc::format!("kept in /audit/{:016x} ({} bytes)", word(10), word(8)),
+        2 => alloc::string::String::from(
+            "\x1b[91mFAILED: the boot's file would not be created\x1b[0m",
+        ),
+        _ => alloc::string::String::from(
+            "\x1b[91mFAILED: a write to the boot's file was refused\x1b[0m",
+        ),
+    };
+    let state = audit::state();
+    println!(
+        "    audit          recording: {} records chained by bin/auditd, head {:016x}..., {kept}; \
+         {} out of order, {} unrecorded, {} refused",
+        word(2),
+        word(3).swap_bytes(),
+        word(13),
+        state.gaps,
+        state.refused,
+    );
+}
+
 /// Where `bin/tcpc`'s report page is in the direct map, if it has one.
 fn tcpc_report_page(hhdm: u64) -> Option<u64> {
     let raw = TCPC_REPORT.load(core::sync::atomic::Ordering::Acquire);
@@ -29414,15 +29924,16 @@ fn start_fs_domain(hhdm: u64) -> bool {
     }
 
     // The report page is the object's last frame, read through the direct map.
-    let mut words = [0u64; 11];
+    let mut words = [0u64; 12];
     for _ in 0..200 {
         // SAFETY: a frame this object owns, through the direct map, read as
-        // the eleven little-endian words the service writes there. **Eighty-
+        // the twelve little-endian words the service writes there. **Eighty-
         // eight bytes, not eighty** — RFC 0060 added the writable directory's
         // handle as an eleventh word, and a length left at ten would have read
         // the array short and silently left `tmp` zero, which presents as "the
-        // adapter holds no writable directory" and not as a bug.
-        let raw = unsafe { core::slice::from_raw_parts((hhdm + frames[1]) as *const u8, 88) };
+        // adapter holds no writable directory" and not as a bug. Ninety-six
+        // since RFC 0101 step 2 added `/audit`'s handle as the twelfth.
+        let raw = unsafe { core::slice::from_raw_parts((hhdm + frames[1]) as *const u8, 96) };
         for (index, word) in words.iter_mut().enumerate() {
             let mut buffer = [0u8; 8];
             buffer.copy_from_slice(&raw[index * 8..index * 8 + 8]);
@@ -29454,6 +29965,7 @@ fn start_fs_domain(hhdm: u64) -> bool {
         stale,
         pkg,
         tmp,
+        audit,
     ] = words;
     // What the service says names `sub`. The kernel is the only thing that can
     // mint a capability, so the service supplies the badge and the kernel
@@ -29464,6 +29976,7 @@ fn start_fs_domain(hhdm: u64) -> bool {
     FS_STALE.store(stale, Ordering::Release);
     FS_PKG.store(pkg, Ordering::Release);
     FS_TMP.store(tmp, Ordering::Release);
+    FS_AUDIT.store(audit, Ordering::Release);
     let _ = (directory, stale);
     let ok = matched == 1 && read == EXPECTED.len() as u64 && blocks > 0 && entries > 0;
     if ok {
@@ -30462,10 +30975,11 @@ fn user_shell(handoff: &Handoff) -> Result<(), &'static str> {
         Err(why) => println!("\x1b[91m    traced         FAILED: {why}\x1b[0m"),
     }
 
-    // RFC 0101 step 1: what the audit log would have recorded, by kind, once
-    // every service has started and moved authority through the system calls
-    // that are audited. Counted, not recorded, until `bin/auditd` (step 2).
-    audit::report();
+    // RFC 0101 step 2: the audit log's reader, once every service that moves
+    // authority has started -- the counts before it go into its first record.
+    if let Err(why) = start_auditd(hhdm, handoff) {
+        println!("\x1b[91m    audit          FAILED: {why}\x1b[0m");
+    }
 
     // The network, at slot 16, and only if there is one. **A program either
     // holds this or cannot name the network at all** — RFC 0018 step 5's whole
@@ -31699,6 +32213,14 @@ fn user_shell(handoff: &Handoff) -> Result<(), &'static str> {
         }
         println!();
     }
+    // RFC 0101 steps 2 and 3, last, so the records they read back are this
+    // boot's and the chain they report has the services' records in it.
+    if AUDITD_FLAGS.load(core::sync::atomic::Ordering::Acquire) & AUDITD_STALL != 0 {
+        audit_stall_self_test();
+    } else {
+        audit_names_self_test();
+    }
+    report_auditd(hhdm);
     BRINGUP_DONE.store(true, core::sync::atomic::Ordering::Release);
     println!("\x1b[92m  Bring-up complete. Nothing left to do at this milestone.\x1b[0m");
 
@@ -32433,7 +32955,9 @@ fn expected_bin_entries() -> usize {
     // RFC 0086 step 5: only the HTTP lane's image carries it, and its first
     // boot failed this check exactly as the note in `vfs_self_test` promises.
     // 19 since 2026-10-08: `bin/tpmd`, RFC 0089 step 5c, in every image.
-    19 + usize::from(vfs::open(GO_PROGRAM).is_ok()) + usize::from(vfs::open(HTTPD_PROGRAM).is_ok())
+    // 20 since 2026-11-01: `bin/auditd`, RFC 0101 step 2 -- caught on its first
+    // boot, as this note promises.
+    20 + usize::from(vfs::open(GO_PROGRAM).is_ok()) + usize::from(vfs::open(HTTPD_PROGRAM).is_ok())
 }
 
 /// Largest filesystem image this will read off a disk.
@@ -35033,7 +35557,8 @@ fn vfs_self_test(handoff: &Handoff) -> bool {
             // **Nineteen** as of RFC 0059: `bin/hosted`, the program a hosted
             // `execve` loads off the filesystem. Nineteen for nineteen -- it
             // went red on the first boot of that change, before the change's
-            // own gate had ever run.
+            // own gate had ever run. And `bin/auditd`, RFC 0101 step 2, the
+            // same way on 2026-11-01.
             "a listing shows what is directly under a directory",
             entries >= 3 && bin == expected_bin_entries(),
         ),

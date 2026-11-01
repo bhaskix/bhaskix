@@ -935,7 +935,12 @@ asm_budget = 10
 # 2080 on 2026-10-31, RFC 0094 step 4: the vector probe's report read grew a
 # fifth word -- whether the ymm upper halves were checked -- and rustfmt laid
 # the read out over one more line.
-unsafe_budget = 2080
+# 2092 on 2026-11-01, RFC 0101 step 2: the audit ring, twelve lines in
+# `audit.rs` -- its header words, each record's words written into it, the
+# reader's tail read, the tail page zeroed when it is made, and a record read
+# back for the naming self-test. Every decision about those bytes is
+# `bhaskix_telemetry::audit::Ledger`'s safe arithmetic; this is the stores.
+unsafe_budget = 2092
 # Up thirty-one for RFC 0005 step 9's socket probe -- `ring3_socketeer`, which
 # is `ring3_lister` with a `sockaddr_in6` copied in beside its code instead of
 # two filenames. The same two blocks every hosted probe has: one

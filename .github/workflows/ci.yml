@@ -531,6 +531,11 @@ jobs:
       # marked disk formatted and a package installed; the same file under every
       # boot-test.sh gate, kept; a third boot, the package still there; and a
       # disk that is not the project's, whose sha256 must not change.
+      # RFC 0101 step 3 checks the audit logs those boots kept, with the host
+      # verifier, and a copy of the disk with one bit of a kept record changed.
+      - name: Build the audit log verifier
+        run: make audit-verify
+
       - name: Boot twice on one disk and keep it; leave a foreign disk untouched
         env:
           QEMU_CPU: max
@@ -538,6 +543,16 @@ jobs:
           BOOT_TEST_TIMEOUT: 300
           BHASKIX_KEEP_LOGS: disk-keeps-logs
         run: tests/qemu/disk-keeps-test.sh
+
+      # RFC 0101 step 3: an image whose bin/auditd drains nothing. A full log
+      # must refuse a grant with AUDIT_FULL, and a revocation and a domain's end
+      # must still happen after it.
+      - name: Fill the audit log, and check it fails closed only where it should
+        env:
+          QEMU_CPU: max
+          AUDIT_STALL_TIMEOUT: 300
+          BHASKIX_KEEP_LOGS: disk-keeps-logs
+        run: tests/qemu/audit-stall-test.sh
 
       - name: Upload the boot log and image on failure
         if: failure()

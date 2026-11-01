@@ -5309,7 +5309,9 @@ fn hand(frame: &SyscallFrame) -> Outcome {
     }
 }
 
-fn invoke(id: domain::DomainId, frame: &mut SyscallFrame) -> Outcome {
+/// `INVOKE` on `id`'s own CSpace. Also the way in for the audit self-tests
+/// (RFC 0101), which must reach the system call's own path, not a copy of it.
+pub(crate) fn invoke(id: domain::DomainId, frame: &mut SyscallFrame) -> Outcome {
     // A grant needs two domains' CSpaces and cannot hold both tables at once,
     // so it is resolved in stages rather than done in place.
     if frame.method == method::GRANT {

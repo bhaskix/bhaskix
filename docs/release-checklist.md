@@ -129,8 +129,8 @@ nothing in them is blocked. The two items above that are the lead's are past the
       2026-10-20 with its suite green, and was accepted 2026-10-29.
 - [x] **The defects table re-counted** against TRACKER §3, and any row closed since the refresh
       moved to the note's "closed" table. **Done early, 2026-11-01**, row by row: twenty-two rows
-      not closed (twenty-four on the evening of 2026-10-19), and twenty-three that day when one was
-      filed from reading the code. The LACP and second-boot rows moved to
+      not closed (twenty-four on the evening of 2026-10-19), twenty-three that day when one was
+      filed from reading the code, and twenty-four when a gap in the boot gates was filed. The LACP and second-boot rows moved to
       the closed table, with eleven more closed since 2026-10-20 that a user could have met; the open table has twenty-one rows (one family grouped, the `uefi, qemu64` lane left out).
       **On the 15th, count again** if §3 has changed since.
 

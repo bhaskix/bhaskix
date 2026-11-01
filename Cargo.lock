@@ -18,6 +18,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "bhaskix-auditlog"
+version = "0.0.0"
+dependencies = [
+ "bhaskix-fs",
+ "bhaskix-sha256",
+ "bhaskix-telemetry",
+]
+
+[[package]]
 name = "bhaskix-boot"
 version = "0.0.0"
 dependencies = [

@@ -134,6 +134,11 @@ LAYERS = {
     # above the leaves because it reads archives through `bhaskix-ustar`;
     # nothing below the programs and the host tools depends on it.
     "bhaskix-pkg": -2,
+    # RFC 0101: the audit log as it is kept, and its check. A rung above the
+    # leaves because it chains with `bhaskix-sha256`, reads records through
+    # `bhaskix-telemetry` and -- for its host tool only -- a kept disk through
+    # `bhaskix-fs`; `bin/auditd` is above it.
+    "bhaskix-auditlog": -2,
     # RFC 0027: the client side of the network, the rung *between* the leaf
     # crates and the programs -- it depends on the ABI, and programs depend
     # on it. The leaf layer renumbered from -2 to -3 to make this rung
@@ -241,6 +246,10 @@ LAYERS = {
     # network, and everything it observes arrives through two read-mostly
     # grants; a wider dependency list here should be a conversation.
     "bhaskix-user-traced": -1,
+    # RFC 0101 step 2: the audit log's reader and writer. Reaches the chain
+    # through `bhaskix-auditlog` and the ring's layout through
+    # `bhaskix-telemetry`, and nothing else beside the ABI.
+    "bhaskix-user-auditd": -1,
     # The supervisor places no service: it creates domains, starts programs in
     # them and reaps them, all through capability invocations. So it belongs
     # here with the other plain programs rather than in PLACEMENTS -- and that

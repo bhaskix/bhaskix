@@ -71,6 +71,7 @@ TCPD_DIR     := user/tcpd
 LINUXD_DIR   := user/linuxd
 TCPC_DIR     := user/tcpc
 TRACED_DIR   := user/traced
+AUDITD_DIR   := user/auditd
 FSD_DIR      := user/fsd
 SUP_DIR      := user/sup
 # RFC 0030 step 3's demonstration payload: built like every user program,
@@ -188,6 +189,7 @@ USER_TCPD    := $(TCPD_DIR)/target/$(TARGET)/release/tcpd
 USER_LINUXD  := $(LINUXD_DIR)/target/$(TARGET)/release/linuxd
 USER_TCPC    := $(TCPC_DIR)/target/$(TARGET)/release/tcpc
 USER_TRACED  := $(TRACED_DIR)/target/$(TARGET)/release/traced
+USER_AUDITD  := $(AUDITD_DIR)/target/$(TARGET)/release/auditd
 BOOTEFI_DIR  := boot/bhaskixboot
 BOOTEFI      := $(BOOTEFI_DIR)/target/x86_64-unknown-uefi/release/bhaskixboot.efi
 USER_FSD     := $(FSD_DIR)/target/$(TARGET)/release/fsd
@@ -231,6 +233,8 @@ TCPC_FLAGS   := -C relocation-model=static -C code-model=small \
                 -C link-arg=-T$(CURDIR)/$(TCPC_DIR)/link.ld
 TRACED_FLAGS := -C relocation-model=static -C code-model=small \
                 -C link-arg=-T$(CURDIR)/$(TRACED_DIR)/link.ld
+AUDITD_FLAGS := -C relocation-model=static -C code-model=small \
+                -C link-arg=-T$(CURDIR)/$(AUDITD_DIR)/link.ld
 FSD_FLAGS    := -C relocation-model=static -C code-model=small \
                 -C link-arg=-T$(CURDIR)/$(FSD_DIR)/link.ld
 
@@ -285,7 +289,7 @@ OVMF_VARS    := $(firstword $(wildcard $(OVMF_DIR)OVMF_VARS$(OVMF_SUFFIX).fd))
 
 .PHONY: FORCE all kernel iso demo demo-fresh test-busybox-v3 check-fpstate-hw run run-uefi release-dist release-finish ceremony-kit progress test test-host test-boot test-boot-uefi test-boot-uefi-qemu64 test-boot-iommu test-keyboard \
         test-boot-iommu-off test-boot-qemu64 test-boot-native test-boot-native-full test-boot-native-tpm \
-        test-boot-native-tpm-tis test-boot-secureboot test-release-keys test-ahci-foreign test-disk-keeps test-placements mkfs bootsign test-shell test-faults test-usb-keyboard test-lacp test-bond test-http fmt clippy gates hooks clean distclean help
+        test-boot-native-tpm-tis test-boot-secureboot test-release-keys test-ahci-foreign test-disk-keeps test-audit-stall test-placements mkfs bootsign audit-verify test-shell test-faults test-usb-keyboard test-lacp test-bond test-http fmt clippy gates hooks clean distclean help
 
 all: iso
 
@@ -309,6 +313,13 @@ $(MKFS): $(wildcard fs/src/*.rs) $(wildcard fs/src/bin/*.rs) fs/Cargo.toml
 $(MKIMAGE): $(wildcard pkg/src/*.rs) $(wildcard pkg/src/bin/*.rs) pkg/Cargo.toml
 	$(CARGO) build --release --target $(HOST_TARGET) -p bhaskix-pkg --features tool
 	@echo "built $@"
+
+# The audit log's host verifier, RFC 0101 step 3: recomputes every chain under
+# a kept disk image's `/audit` and names the first entry that breaks one.
+AUDIT_VERIFY := target/$(HOST_TARGET)/release/audit-verify
+audit-verify:
+	$(CARGO) build --release --target $(HOST_TARGET) -p bhaskix-auditlog --features tool --bin audit-verify
+	@echo "built $(AUDIT_VERIFY)"
 
 # The boot signer, RFC 0091 step 2: `bootsign keygen`, `sign` and `show`. A host
 # program behind `bhaskix-bootsig`'s `tool` feature, for mkimage's reason, and
@@ -391,7 +402,7 @@ FORCE:
 # and mkimage stages, hashes, verifies with the machine's own parsers, and
 # drives the same tar flags this rule always trusted. Assembled twice and
 # byte-compared every build: determinism is a gate, not a hope.
-$(INITRD): $(MKIMAGE) $(shell find $(INITRD_DIR) packages -type f 2>/dev/null | sort) $(PROBE) $(USER_SHELL) $(USER_VFSD) $(USER_CONSOLED) $(USER_BLKD) $(USER_AHCID) $(USER_TPMD) $(USER_NETD) $(USER_IPD) $(USER_DHCPD) $(USER_UDP6) $(USER_TCPD) $(USER_LINUXD) $(USER_TCPC) $(USER_TRACED) $(USER_FSD) $(USER_SUP) $(FS_IMAGE) $(HELLO_BPK) $(GREEDY_BPK) $(BUSYBOX) $(GO_CORPUS_DEP) $(HOSTED) $(GO_CORPUS_STAMP) $(HTTPD_DEP) $(HTTPD_STAMP)
+$(INITRD): $(MKIMAGE) $(shell find $(INITRD_DIR) packages -type f 2>/dev/null | sort) $(PROBE) $(USER_SHELL) $(USER_VFSD) $(USER_CONSOLED) $(USER_BLKD) $(USER_AHCID) $(USER_TPMD) $(USER_NETD) $(USER_IPD) $(USER_DHCPD) $(USER_UDP6) $(USER_TCPD) $(USER_LINUXD) $(USER_TCPC) $(USER_TRACED) $(USER_AUDITD) $(USER_FSD) $(USER_SUP) $(FS_IMAGE) $(HELLO_BPK) $(GREEDY_BPK) $(BUSYBOX) $(GO_CORPUS_DEP) $(HOSTED) $(GO_CORPUS_STAMP) $(HTTPD_DEP) $(HTTPD_STAMP)
 	@mkdir -p $(dir $@)
 	./$(MKIMAGE) $@ $(INITRD_ROOT) --root . --static $(INITRD_DIR) \
 	    --file fs.img=$(FS_IMAGE) \
@@ -634,6 +645,16 @@ $(USER_TRACED): $(TRACED_DIR)/src/main.rs $(TRACED_DIR)/link.ld $(TRACED_DIR)/Ca
 	    $(CARGO) build --release --target $(TARGET)
 	@echo "built $@"
 
+# The audit log's reader -- RFC 0101 step 2. The ring's layout from the
+# telemetry crate the kernel writes it through, and the chain from
+# `bhaskix-auditlog`, the one the host verifier recomputes.
+$(USER_AUDITD): $(AUDITD_DIR)/src/main.rs $(AUDITD_DIR)/link.ld $(AUDITD_DIR)/Cargo.toml \
+              $(wildcard abi/src/*.rs) $(wildcard telemetry/src/*.rs) \
+              $(wildcard auditlog/src/*.rs) $(wildcard sha256/src/*.rs)
+	cd $(AUDITD_DIR) && RUSTFLAGS="$(AUDITD_FLAGS)" \
+	    $(CARGO) build --release --target $(TARGET)
+	@echo "built $@"
+
 
 # The native UEFI loader -- RFC 0028 step 1. Its own target and its own
 # linker convention (PE, efi_main), so its own cargo invocation; no RUSTFLAGS
@@ -823,7 +844,7 @@ run-uefi: $(ISO)
 test: fmt clippy test-host check-fpstate-hw gates test-boot test-boot-uefi test-boot-iommu test-boot-iommu-off \
       test-boot-qemu64 test-boot-uefi-qemu64 test-boot-native test-boot-native-full test-boot-native-tpm \
       test-boot-native-tpm-tis test-boot-secureboot test-release-keys test-placements test-shell \
-      test-ahci-foreign test-disk-keeps test-keyboard test-usb-keyboard test-busybox test-bond test-lacp \
+      test-ahci-foreign test-disk-keeps test-audit-stall test-keyboard test-usb-keyboard test-busybox test-bond test-lacp \
       test-faults test-http
 	@echo
 	@echo "  all checks passed"
@@ -959,8 +980,16 @@ test-ahci-foreign: $(ISO)
 # kept disk; a third time, the package still listed and running; and a disk
 # that is not the project's, whose sha256 must not change. Every other lane
 # starts from a fresh marked disk, so none of them can see any of this.
-test-disk-keeps: $(ISO)
-	tests/qemu/disk-keeps-test.sh
+# Its logs kept in build/ on a failure, as CI keeps them: a boot 1 that failed
+# once on 2026-11-01 left nothing to read (TRACKER §3).
+test-disk-keeps: $(ISO) audit-verify
+	BHASKIX_KEEP_LOGS=build/disk-keeps-logs tests/qemu/disk-keeps-test.sh
+
+# RFC 0101 step 3: the audit log fails closed, and only where it should. Its
+# own image (`bhaskix.fault=audit-stall`) and its own lane, because a full log
+# refuses the grants the rest of the boot's gates depend on.
+test-audit-stall: $(ISO)
+	BHASKIX_KEEP_LOGS=build/audit-stall-logs tests/qemu/audit-stall-test.sh
 
 # RFC 0094 step 5: an image carrying Ubuntu's x86-64-v3 BusyBox -- the build
 # that turned CI run 874 red -- booted to show it runs now that AVX is enabled.
@@ -1129,6 +1158,7 @@ fmt:
 	cd $(TCPD_DIR) && $(CARGO) fmt --all --check
 	cd $(TCPC_DIR) && $(CARGO) fmt --all --check
 	cd $(TRACED_DIR) && $(CARGO) fmt --all --check
+	cd $(AUDITD_DIR) && $(CARGO) fmt --all --check
 	cd $(BOOTEFI_DIR) && $(CARGO) fmt --all --check
 	cd $(FSD_DIR) && $(CARGO) fmt --all --check
 	cd $(SUP_DIR) && $(CARGO) fmt --all --check
@@ -1167,6 +1197,8 @@ clippy:
 	cd $(TCPC_DIR) && RUSTFLAGS="$(TCPC_FLAGS)" \
 	    $(CARGO) clippy --release --target $(TARGET) -- -D warnings
 	cd $(TRACED_DIR) && RUSTFLAGS="$(TRACED_FLAGS)" \
+	    $(CARGO) clippy --release --target $(TARGET) -- -D warnings
+	cd $(AUDITD_DIR) && RUSTFLAGS="$(AUDITD_FLAGS)" \
 	    $(CARGO) clippy --release --target $(TARGET) -- -D warnings
 	cd $(BOOTEFI_DIR) && $(CARGO) clippy --release --target x86_64-unknown-uefi -- -D warnings
 	cd $(SUP_DIR) && RUSTFLAGS="$(SUP_FLAGS)" \
@@ -1225,6 +1257,9 @@ gates:
 	@$(CARGO) build --quiet --target $(HOST_TARGET) -p bhaskix-bootsig --features tool --bin bootsign \
 	    && printf '  \033[1;32mok\033[0m    the boot signer still builds\n' \
 	    || { echo "  FAIL  the boot signer does not build"; exit 1; }
+	@$(CARGO) build --quiet --target $(HOST_TARGET) -p bhaskix-auditlog --features tool --bin audit-verify \
+	    && printf '  \033[1;32mok\033[0m    the audit log verifier still builds\n' \
+	    || { echo "  FAIL  the audit log verifier does not build"; exit 1; }
 # No signing secret is tracked -- GOVERNANCE.md section 5's promise, a gate
 # since RFC 0091 step 6 (2026-10-29), before the first release key exists. And
 # watched refusing each kind, in throwaway repositories, so nothing key-shaped

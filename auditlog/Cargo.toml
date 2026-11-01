@@ -1,0 +1,51 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# RFC 0101 steps 2 and 3: the audit log as it is kept -- an entry per record,
+# each chained to the one before it -- and the check that names the first
+# entry a kept log breaks at. `bin/auditd` writes through this, and the host
+# tool `audit-verify` reads a kept disk's log back through it, so the writer and
+# the checker share one definition of a link.
+#
+# Its own crate, not part of `bhaskix-telemetry`, so that the kernel, which links
+# that crate, stays free of a hash function (RFC 0101 design item 2).
+[package]
+name = "bhaskix-auditlog"
+description = "The audit log's kept form: hash-chained entries, and the check that names where a kept log was edited."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[lib]
+name = "bhaskix_auditlog"
+path = "src/lib.rs"
+
+# The host verifier. Behind a feature, as `mkfs` is, because the workspace
+# builds for `x86_64-unknown-none` and this tool needs `std`; `make
+# audit-verify` builds it, and `make gates` checks that it still does.
+[[bin]]
+name = "audit-verify"
+path = "src/bin/audit-verify.rs"
+required-features = ["tool"]
+
+[dependencies]
+bhaskix-sha256 = { path = "../sha256" }
+bhaskix-telemetry = { path = "../telemetry" }
+# The host tool only: it reads a kept disk image through the filesystem's own
+# reader, so it checks the log where `bin/auditd` put it. Optional, so that
+# `bin/auditd` links the chain and not a filesystem reader it never uses.
+bhaskix-fs = { path = "../fs", optional = true }
+
+[features]
+# Off by default, so neither the freestanding build nor `bin/auditd` sees it.
+tool = ["dep:bhaskix-fs"]
+
+[lints]
+workspace = true
+
+[package.metadata.bhaskix]
+# Zero, and `forbid(unsafe_code)` in the crate root says it again: hashing and
+# comparing bytes needs none.
+unsafe_budget = 0

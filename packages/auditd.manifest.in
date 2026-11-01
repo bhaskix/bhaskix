@@ -1,0 +1,17 @@
+# The audit log's reader and writer (RFC 0101): its report page, a wake for
+# its deadline, the ring's tail page it writes one word into, the audit ring
+# read-only, one page of its own to write from, and -- on a kept disk -- the
+# writable /audit directory, where it adds a file per boot.
+package auditd
+version 0.1.0
+
+program bin/auditd
+entry hertz
+cap memory pages=1
+cap notification
+cap memory pages=1
+cap memory pages=16
+cap memory pages=1
+cap directory writable
+
+payload bin/auditd from user/auditd/target/x86_64-unknown-none/release/auditd

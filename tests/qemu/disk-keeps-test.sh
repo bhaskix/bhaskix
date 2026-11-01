@@ -151,6 +151,64 @@ check "$WORK/boot3.log" "boot 3 kept the disk again" \
 check "$WORK/boot3.log" "the package boot 1 installed is still installed, two reboots later" "(^|[^0-9])1 installed"
 check "$WORK/boot3.log" "and it runs" "namaste from an installed package"
 
+# RFC 0101 step 3: every boot kept its audit log, one file each under
+# /audit, and a program that is not the writer recomputes every chain from the
+# disk's bytes. Then one byte of a kept record is changed, in a copy, and the
+# verifier must name that entry -- a check that the check can fail.
+echo "the audit logs the boots kept, checked by something other than their writer..."
+VERIFY="$REPO_ROOT/target/x86_64-unknown-linux-gnu/release/audit-verify"
+if [[ ! -x $VERIFY ]]; then
+    fail "no audit verifier at $VERIFY -- run make audit-verify"
+elif "$VERIFY" "$DISK" > "$WORK/verify.out" 2>&1; then
+    # Every log whole, and the two boots this script logs itself each found by
+    # the file its own boot report named. Not a count of files: boot 2 is
+    # boot-test.sh's iommu lane, which boots a second time on the same disk
+    # for its refused dial, so the disk holds four.
+    whole=$(grep -c ': [1-9][0-9]* records, chain whole' "$WORK/verify.out")
+    named=0
+    for boot in 1 3; do
+        id=$(grep -oE 'kept in /audit/[0-9a-f]{16}' "$WORK/boot$boot.log" | head -1 | cut -c16-)
+        [[ -n $id ]] && grep -q "^audit/$id: [1-9][0-9]* records, chain whole" "$WORK/verify.out" \
+            && named=$((named + 1))
+    done
+    if ((named == 2 && whole >= 3)); then
+        pass "$whole boots' audit logs, every chain whole, boots 1 and 3 each found by the name they printed: $(head -1 "$WORK/verify.out" | cut -c1-90)..."
+    else
+        fail "the verifier found $whole whole log(s), $named of boots 1 and 3 by name: $(tr '\n' ' ' < "$WORK/verify.out" | cut -c1-200)"
+    fi
+    # The first log's second entry, found by its shape: a block whose first
+    # entry is sequence 0, the attach record (kind 1), chained from nothing.
+    TAMPERED="$WORK/tampered.img"
+    cp "$DISK" "$TAMPERED"
+    if python3 -I - "$TAMPERED" <<'PY'
+import sys
+path = sys.argv[1]
+image = bytearray(open(path, "rb").read())
+for block in range(0, len(image), 4096):
+    entry = image[block:block + 256]
+    if (len(entry) == 256 and entry[0:8] == bytes(8) and entry[16] == 1
+            and entry[64:96] == bytes(32) and any(entry[96:128])
+            and int.from_bytes(entry[128:136], "little") == 1):
+        image[block + 128 + 40] ^= 0x01  # entry 1's subject, one bit
+        open(path, "wb").write(image)
+        sys.exit(0)
+sys.exit(1)
+PY
+    then
+        if "$VERIFY" "$TAMPERED" > "$WORK/tampered.out" 2>&1; then
+            fail "one bit of a kept record changed and the verifier still called every chain whole"
+        elif grep -q 'BROKEN at entry 1: its record and its link disagree' "$WORK/tampered.out"; then
+            pass "one bit of a kept record changed, and the verifier named the entry: $(grep -m1 BROKEN "$WORK/tampered.out" | cut -c1-90)"
+        else
+            fail "the changed record was not named: $(tr '\n' ' ' < "$WORK/tampered.out" | cut -c1-200)"
+        fi
+    else
+        fail "no kept audit log was found in the disk's blocks to change"
+    fi
+else
+    fail "the verifier refused the kept disk: $(tr '\n' ' ' < "$WORK/verify.out" | cut -c1-200)"
+fi
+
 echo "boot 4 of 4: a disk that is not the project's..."
 FOREIGN="$WORK/foreign.img"
 printf 'FOREIGN-DOMAIN-DISK-NOT-OURS' > "$FOREIGN"

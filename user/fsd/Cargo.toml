@@ -45,7 +45,9 @@ asm_budget = 4
 # 55 at RFC 0030 step 3 (2026-08-18): two more lines for the bulk page
 # viewed read-only in WRITE_FROM -- the same page, the same promise, the
 # read direction.
-unsafe_budget = 55
+# 56 on 2026-11-01, RFC 0101 step 2: the report page's twelfth word, `/audit`'s
+# writable handle, written beside the eleven before it.
+unsafe_budget = 56
 #
 # Up three for the comment on `rsi`: the `unsafe` counter counts lines
 # inside an `unsafe` block, and an explanation of why a register is declared

@@ -613,6 +613,7 @@ fn report(
     stale: u64,
     pkg: u64,
     tmp: u64,
+    audit: u64,
 ) {
     // SAFETY: the last page of the memory this program holds and mapped
     // writable, and nothing else in this program uses it.
@@ -627,6 +628,7 @@ fn report(
         core::ptr::write_volatile(at.add(8), stale);
         core::ptr::write_volatile(at.add(9), pkg);
         core::ptr::write_volatile(at.add(10), tmp);
+        core::ptr::write_volatile(at.add(11), audit);
         core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
         core::ptr::write_volatile(at, MARKER);
     }
@@ -668,7 +670,7 @@ extern "C" fn fsd_main() -> ! {
     mark(2);
     let sectors = store.sectors;
     if sectors == 0 {
-        report(0, 0, 0, 0, 0, 0, 0, 0, 0);
+        report(0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
         exit()
     }
 
@@ -678,7 +680,7 @@ extern "C" fn fsd_main() -> ! {
         unsafe { core::slice::from_raw_parts_mut(CACHE_AT as *mut u8, CACHE_PAGES * 4096) };
     mark(3);
     let Ok(mut cache) = Cache::new(frames, store) else {
-        report(0, 0, 0, 0, sectors, 0, 0, 0, 0);
+        report(0, 0, 0, 0, sectors, 0, 0, 0, 0, 0);
         exit()
     };
 
@@ -687,13 +689,13 @@ extern "C" fn fsd_main() -> ! {
     // came off a disk through another domain.
     mark(4);
     let Ok(mut mounted) = Filesystem::mount(&mut cache) else {
-        report(0, 0, 0, 0, sectors, 0, 0, 0, 0);
+        report(0, 0, 0, 0, sectors, 0, 0, 0, 0, 0);
         exit()
     };
     mark(6);
     let blocks = mounted.superblock().blocks;
     let Ok(root) = mounted.root() else {
-        report(blocks, 0, 0, 0, sectors, 0, 0, 0, 0);
+        report(blocks, 0, 0, 0, sectors, 0, 0, 0, 0, 0);
         exit()
     };
 
@@ -702,7 +704,7 @@ extern "C" fn fsd_main() -> ! {
     mounted.list(&root, |_| entries += 1);
 
     let Ok((_, inode)) = mounted.lookup(&root, b"on-a-disk") else {
-        report(blocks, entries, 0, 0, sectors, 0, 0, 0, 0);
+        report(blocks, entries, 0, 0, sectors, 0, 0, 0, 0, 0);
         exit()
     };
     mark(8);
@@ -740,7 +742,18 @@ extern "C" fn fsd_main() -> ! {
     // that names anything above it.
     let pkg = {
         let Ok((mut volume, _)) = Volume::mount(cache) else {
-            report(blocks, entries, read as u64, matched, sectors, 0, 0, 0, 0);
+            report(
+                blocks,
+                entries,
+                read as u64,
+                matched,
+                sectors,
+                0,
+                0,
+                0,
+                0,
+                0,
+            );
             exit()
         };
         let root_index = volume.superblock().root;
@@ -776,7 +789,18 @@ extern "C" fn fsd_main() -> ! {
     const TMP_DEPTH: u32 = 4;
     let tmp = {
         let Ok((mut volume, _)) = Volume::mount(cache) else {
-            report(blocks, entries, read as u64, matched, sectors, 0, 0, 0, 0);
+            report(
+                blocks,
+                entries,
+                read as u64,
+                matched,
+                sectors,
+                0,
+                0,
+                0,
+                0,
+                0,
+            );
             exit()
         };
         let root_index = volume.superblock().root;
@@ -811,6 +835,45 @@ extern "C" fn fsd_main() -> ! {
         }
     };
 
+    // RFC 0101 step 2: the audit log's directory, at the root beside `pkg`,
+    // made here if the disk does not have one yet -- so a kept disk holds a
+    // file per boot under it. Its writable handle is what the kernel stamps
+    // into `bin/auditd`'s capability: it can add files under /audit and reach
+    // nothing else, because it holds nothing that names anything else.
+    let audit = {
+        let Ok((mut volume, _)) = Volume::mount(cache) else {
+            report(
+                blocks,
+                entries,
+                read as u64,
+                matched,
+                sectors,
+                0,
+                0,
+                0,
+                0,
+                0,
+            );
+            exit()
+        };
+        let root_index = volume.superblock().root;
+        let made = match volume.lookup(root_index, b"audit") {
+            Ok((index, inode)) if inode.kind == Kind::Directory => Ok((index, inode.generation)),
+            // A *file* called `audit` is somebody's, and creating over it would
+            // destroy it: no handle, and the log stays in memory, said so.
+            Ok(_) => Err(()),
+            Err(_) => volume
+                .create(root_index, b"audit", Kind::Directory)
+                .and_then(|index| volume.inode(index).map(|inode| (index, inode.generation)))
+                .map_err(|_| ()),
+        };
+        cache = volume.into_cache();
+        match made {
+            Ok((index, generation)) => dir::handle_writable(index, generation),
+            Err(()) => 0,
+        }
+    };
+
     report(
         blocks,
         entries,
@@ -821,6 +884,7 @@ extern "C" fn fsd_main() -> ! {
         stale,
         pkg,
         tmp,
+        audit,
     );
 
     // Not `exit`. A service that has answered one question is not a service

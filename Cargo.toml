@@ -78,6 +78,9 @@ members = [
     # emits through it, `bin/traced` decodes through it, and a host test
     # drives both sides in one process.
     "telemetry",
+    # RFC 0101 -- the audit log as it is kept, and its check; the hash lives here
+    # and not in `telemetry`, so the kernel links none.
+    "auditlog",
 
     # Phase 2 — RFC 0027 step 1. The client side of the network: the
     # exchange shapes, the refusal decoding and the wait discipline that

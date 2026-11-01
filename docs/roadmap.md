@@ -402,7 +402,11 @@ cost* and is not a schedule.
   audit-grade naming. **Where it stands, 2026-10-31**:
   [RFC 0101](rfc/0101-a-log-that-cannot-be-quietly-edited.md) drafted, nothing built, and all four
   questions decided by the lead that day: fail closed, the chain in a ring-3 `auditd`, the anchor
-  and attestation in a later RFC, and capability and domain events first, kept on the disk
+  and attestation in a later RFC, and capability and domain events first, kept on the disk.
+  **2026-11-01: all three steps built**, for the lead to accept -- every authority change through
+  a system call reserved before and recorded after, a grant refused when the log is full, the
+  chain kept under `/audit` and checked by `audit-verify`. Owed: the head's anchor and remote
+  attestation (a later RFC), and rotation of a kept disk's logs
 - **Hosted-process address-space randomisation** — **before the L1 row below, and that is the
   point.** Bhaskix's own services are Rust; the software L1–L4 brings is C, and a hosted process at
   a fixed image base with a fixed stack turns any bug in BusyBox or `curl` into a reliable exploit.

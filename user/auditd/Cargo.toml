@@ -1,0 +1,46 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# The audit log's reader and writer -- RFC 0101 step 2. It holds the audit ring
+# read-only, its tail read-write, a page to write from, and on a kept disk the
+# writable /audit directory; it chains every record with `bhaskix-auditlog`,
+# the same definition of a link the host verifier recomputes.
+#
+# Not a member of the root workspace, for the reason user/netd/Cargo.toml
+# gives: it needs its own code model and its own linker script, and a
+# workspace member cannot have its own `rustflags`.
+[workspace]
+
+[package]
+name = "bhaskix-user-auditd"
+description = "The audit log's reader: drains the audit ring, chains every record, and keeps the chain on the disk or in memory."
+version = "0.0.0"
+edition = "2024"
+authors = ["Tarun Kumar Kushwaha"]
+repository = "https://github.com/bhaskix/bhaskix"
+license = "Apache-2.0"
+
+[[bin]]
+name = "auditd"
+path = "src/main.rs"
+
+[dependencies]
+bhaskix-abi = { path = "../../abi" }
+bhaskix-telemetry = { path = "../../telemetry" }
+# Without its `tool` feature: the chain and nothing else, not the filesystem
+# reader the host verifier mounts a disk image with.
+bhaskix-auditlog = { path = "../../auditlog" }
+
+[profile.release]
+panic = "abort"
+opt-level = "s"
+
+[package.metadata.bhaskix]
+# 4, as `bin/traced`'s: the `_start` stub, the `syscall` sequence, `rdtsc` for
+# the deadline, and the `ud2` in its panic handler.
+asm_budget = 4
+# 29, measured, no headroom: the syscall block, `rdtsc`, the `ud2`, the
+# report-page writes, the loads from the ring and the tail page it mapped, its
+# own tail word, and the entry copied into its transfer page. Every decision
+# about those bytes -- the layout, the chain -- is `bhaskix-telemetry`'s and
+# `bhaskix-auditlog`'s safe code; the unsafe here is the loads and stores.
+unsafe_budget = 29

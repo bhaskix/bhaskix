@@ -1296,15 +1296,43 @@ else
     status=1
 fi
 
-# RFC 0101 step 1: every path that moves authority asks the audit log first.
-# Until bin/auditd attaches (step 2) the log counts by kind and records nothing,
-# and nothing may be refused. Each kind must be nonzero: a boot grants, derives,
-# revokes, and makes and ends domains, so a zero is a site that stopped asking.
-if grep -qE "audit +inactive until auditd attaches: [1-9][0-9]* grant\(s\), [1-9][0-9]* derive\(s\), [1-9][0-9]* revocation\(s\), [1-9][0-9]* domain\(s\) created, [1-9][0-9]* ended -- counted, not recorded; 0 refused" "$LOG"; then
-    pass "audit: every kind of authority change was asked about, and none refused"
+# RFC 0101 steps 1 and 2: every path that moves authority asks the audit log
+# first, and from bin/auditd's attaching, every such operation is a record in a
+# hash chain. Three lines.
+#
+# Before it: each kind counted, nonzero -- a boot grants, derives, revokes, and
+# makes and ends domains, so a zero is a site that stopped asking -- and the
+# chain's first record must say the same total. Compared in the shell, not with
+# a backreference, which not every grep this runs under accepts.
+before=$(sed 's/\x1b\[[0-9;]*m//g; s/\r$//' "$LOG" | grep -aE "audit before +[1-9][0-9]* grant\(s\), [1-9][0-9]* derive\(s\), [1-9][0-9]* revocation\(s\), [1-9][0-9]* domain\(s\) created, [1-9][0-9]* ended before bin/auditd attached -- counted, and the first record says [0-9]+ of [0-9]+$" | head -1)
+if [[ $before =~ says\ ([0-9]+)\ of\ ([0-9]+)$ ]] && [[ ${BASH_REMATCH[1]} == "${BASH_REMATCH[2]}" ]]; then
+    pass "audit: every kind of authority change was asked about before the reader, and its first record counts them"
 else
-    fail "the audit line is missing, refused something, or a kind was never asked about"
-    sed 's/\x1b\[[0-9;]*m//g' "$LOG" | grep -a 'audit  ' | head -1 | sed 's/^/      /'
+    fail "the audit counts before the reader are missing, a kind was never asked about, or the first record disagrees"
+    sed 's/\x1b\[[0-9;]*m//g' "$LOG" | grep -a 'audit before' | head -1 | sed 's/^/      /'
+    status=1
+fi
+# The chain: records in the ring's own order, nothing unrecorded, nothing
+# refused -- and on a machine with a kept disk, kept on it.
+if [[ $MODE == iommu ]]; then
+    kept='kept in /audit/[0-9a-f]{16} \([1-9][0-9]* bytes\)'
+else
+    kept='(kept in /audit/[0-9a-f]{16} \([1-9][0-9]* bytes\)|in memory, not persisted \(no kept disk\))'
+fi
+if grep -qE "audit +recording: [1-9][0-9]* records chained by bin/auditd, head [0-9a-f]{16}\.\.\., $kept; 0 out of order, 0 unrecorded, 0 refused" "$LOG"; then
+    pass "audit: bin/auditd chained every record in order, nothing unrecorded or refused$([[ $MODE == iommu ]] && echo ', kept on the disk')"
+else
+    fail "bin/auditd's chain is missing, out of order, has gaps or refusals$([[ $MODE == iommu ]] && echo ', or was not kept on the disk')"
+    sed 's/\x1b\[[0-9;]*m//g' "$LOG" | grep -a 'audit  ' | head -2 | sed 's/^/      /'
+    status=1
+fi
+# Names that survive reuse: two probe domains' records found by name, where
+# the second usually takes the first one's slot and must not be named as it.
+if grep -qE "audit names +two probes' records found by name: domain [0-9]+ generation [0-9]+, then domain [0-9]+ generation [0-9]+(, the same slot)?; capability serials [1-9][0-9]* and [1-9][0-9]*" "$LOG"; then
+    pass "audit: a domain is named with its incarnation and a capability by its serial"
+else
+    fail "the audit naming self-test did not pass"
+    sed 's/\x1b\[[0-9;]*m//g' "$LOG" | grep -a 'audit names' | head -1 | sed 's/^/      /'
     status=1
 fi
 
@@ -1806,9 +1834,11 @@ fi
 # loosening it to a range would give up what this check is for, which is
 # noticing when `/bin` changes at all.
 # 19 since 2026-10-08: `bin/tpmd`, RFC 0089 step 5c, in every image.
-bin_expected=19
+# 20 since 2026-11-01: `bin/auditd`, RFC 0101 step 2 -- twice in two files, as
+# this comment says, a fourth time.
+bin_expected=20
 if tar tf "$REPO_ROOT/build/initrd.tar" 2>/dev/null | grep -q 'bin/go-hello'; then
-    bin_expected=20
+    bin_expected=21
 fi
 if grep -qE "vfs +[0-9]+ entries in /, $bin_expected in /bin; bin/probe is ELF64, entry 0x10000000, 3 segments" "$LOG"; then
     pass "paths resolve, bad paths are refused, and bin/probe parses as ELF64"

@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | ⬜ **Draft 2026-10-31 — ~~nothing built~~ step 1 built 2026-11-01** (naming, the record, the ledger, the eight sites; counted, not yet recorded). ~~Questions for the lead~~ All four decided by the lead the same day, each as proposed, and three more on 2026-11-01 (§*Implementation plan*). Drafted at the lead's request, as Phase 3's third row. |
+| **Status** | ⬜ **Draft 2026-10-31 — ~~nothing built~~ ~~step 1 built 2026-11-01~~ all three steps built 2026-11-01**, for the lead to accept: every authority change through a system call reserved before and recorded after, a grant refused when the log is full, the chain kept on the disk and checked by a host verifier. ~~Questions for the lead~~ All four decided by the lead the same day, each as proposed, and three more on 2026-11-01 (§*Implementation plan*). Drafted at the lead's request, as Phase 3's third row. |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | kernel (telemetry), userspace (an audit service), tpm |
 | **Milestone** | Phase 3, *audit framework* ([roadmap.md](../roadmap.md)): threat T8 |
@@ -188,6 +188,24 @@ Written 2026-11-01, with three more decisions the lead made that day, each as re
   makes and reports, appended a block per write; with no kept disk, in memory.
 - **The boot report** prints the records, the chain's head, and whether it is persisted.
 
+  **Built 2026-11-01.** An `iommu` boot: `audit before  53 grant(s), 17 derive(s), 7
+  revocation(s), 114 domain(s) created, 95 ended before bin/auditd attached -- counted, and the
+  first record says 286 of 286`, then `audit  recording: 789 records chained by bin/auditd, head
+  ee923ba2572b5725..., kept in /audit/9e711f83bc884fa3 (100992 bytes); 0 out of order, 0
+  unrecorded, 0 refused`. A boot with no kept disk says `in memory, not persisted (no kept disk)`.
+  **Names that survive reuse**, gated: two probe domains derive and revoke through the system
+  call's own path and end, and their records are found by name -- `domain 42 generation 3, then
+  domain 42 generation 4, the same slot; capability serials 1041 and 1044`. **Its arm found the
+  test weak**: with every record's generation dropped it still passed, because it named both sides
+  with the same function. It now builds the expected name from the domain table, and the same arm
+  turns it red (no record found by name).
+  - The ring is 512 records in nine pages, 64 of them headroom, read-only to `auditd`.
+  - The boot's file is named by the first half of its 128-bit identity, in hex.
+  - A kept entry is 128 bytes: the record, the link before it, its own link, where a link is
+    `sha256("BHXAUDIT" ‖ previous ‖ record)`. 32 entries fill a block, and a partial block is
+    rewritten until it fills, so a file is always whole entries.
+  - `bin/fsd` makes `/audit` beside `/pkg` and reports its handle as a twelfth word.
+
 **Step 3 -- shown to fail closed, and checked by something other than the writer.**
 - **A fault, `bhaskix.fault=audit-stall`**: `auditd` stops draining. A grant is then refused
   once the ring passes its headroom, while a revocation and a domain's end still happen, and the
@@ -198,3 +216,22 @@ Written 2026-11-01, with three more decisions the lead made that day, each as re
   - a byte of a kept record flipped;
   - the headroom removed, so a stalled ring grants anyway;
   - a revocation refused like a grant.
+
+  **Built 2026-11-01.**
+  - `make test-audit-stall`: `a derive was refused with AUDIT_FULL after 180 were recorded; a
+    revocation and a domain's end still happened after it`, and past the headroom a revocation
+    proceeded and was counted as a gap.
+  - `make test-disk-keeps` now runs `audit-verify` over the disk it booted on: four whole logs,
+    one per boot -- the `iommu` lane it runs as its second boot boots twice -- with boots 1 and 3
+    each found by the file name their own report printed.
+  - **The tamper check is part of the lane**: one bit of the second entry of a kept log, changed
+    in a copy, is named -- `BROKEN at entry 1: its record and its link disagree`.
+  - Armed, one at a time, each red and restored:
+    - refusals turned into gaps: `refused false`;
+    - a revocation reserved like a grant: `revoked after false`;
+    - the verifier's previous-link check removed: the host test of a removed record.
+  - **Not built, and said so**:
+    - the loader's boot-signature verdict as a record (design item 5's third event);
+    - any rotation: a kept disk gains a file per boot and nothing removes them;
+    - an anchor for the chain's head, so a log replaced whole by another valid chain is not
+      detected (design item 4, a later RFC).

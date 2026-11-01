@@ -222,8 +222,10 @@ in the second table. **2026-10-20**: one more row filed, read from the code rath
 than seen — a hosted `write` after its connection has finished — ~~and added to
 the table below~~ and closed the same day, so it is in the second table.
 **Read row by row again on 2026-11-01, for the freeze: twenty-two rows not
-closed**, and twenty-three later that day, when building the audit log found one by
-reading (the last row below). Two of this table's rows closed since the refresh -- the LACP test's
+closed**, twenty-three later that day, when building the audit log found one by
+reading (the last row below), and twenty-four when its suite found that no boot
+gate reads a lock-order report printed late in a boot -- a gap in the tests, not
+something a user meets, so not in the table below. Two of this table's rows closed since the refresh -- the LACP test's
 report (2026-10-29, the lane's own fault) and the second boot's `block service
 FAILED` (2026-10-30) -- and both are in the second table now, with the eleven
 other rows closed since 2026-10-20 that a user could have met. The table still

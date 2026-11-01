@@ -3,7 +3,8 @@
 # The security model
 
 **Verified** 2026-10-30 against `aa2dcc5`, by booting `make demo` and typing every command shown;
-the rest checked against `docs/security.md` at that commit.
+the rest checked against `docs/security.md` at that commit. *What it writes down* on 2026-11-01,
+from an `iommu` boot of the change that built it, and `audit-verify` run on a disk four boots kept.
 
 Bhaskix's security rests on one rule: **a program can do exactly what the
 capabilities it holds allow, and nothing else.** There is no superuser to become,
@@ -68,6 +69,43 @@ from it**, wherever it was passed, at once. That is checked on every boot.
   UEFI Secure Boot on, refuses a set that fails. The project's own keys do not
   exist yet; [Sign your own boot](secure-boot.md) shows how to use yours.
 
+## What it writes down
+
+Every change of authority made through a system call is recorded: a capability
+derived, handed to another domain or revoked, and a domain created or ended. The
+kernel asks the log before such a change and records it after. **A change that
+would give authority is refused when the log has no room** -- the program is told
+`AUDIT_FULL` -- while one that takes authority away always happens, because
+refusing it would leave the authority in place.
+
+`bin/auditd` chains each record to the one before it with SHA-256 and, where the
+machine has a disk Bhaskix keeps, writes them to `/audit` on it, one file per
+boot. The boot report says what it did:
+
+```
+audit before   53 grant(s), 17 derive(s), 7 revocation(s), 114 domain(s) created, 95 ended before bin/auditd attached -- counted, and the first record says 286 of 286
+audit          recording: 789 records chained by bin/auditd, head ee923ba2572b5725..., kept in /audit/9e711f83bc884fa3 (100992 bytes); 0 out of order, 0 unrecorded, 0 refused
+```
+
+With no kept disk it says `in memory, not persisted`. To check a kept disk from
+outside, with a program that is not the one that wrote it, from a checkout of
+the source:
+
+```sh
+make audit-verify
+target/x86_64-unknown-linux-gnu/release/audit-verify domain.img
+```
+
+It prints one line per boot's log: `chain whole` with its record count, or the
+first entry that does not follow from the ones before it.
+
+What it does not show:
+- a log **replaced whole** by another valid chain -- nothing anchors the chain's
+  head yet;
+- what happened before `bin/auditd` started, which is counted and not recorded;
+- what a compromised `bin/auditd` chose not to write;
+- capabilities the kernel makes for itself at boot.
+
 ## What it does not protect yet
 
 From [security.md](../security.md), in its words where they are short:
@@ -76,7 +114,7 @@ From [security.md](../security.md), in its words where they are short:
 |---|---|
 | **Virtual machines** | Domains are meant to isolate guests too, but there is no hardware virtualisation yet, so there are no guests to isolate |
 | **Updates** | There is no update mechanism, so nothing signs, stages or rolls one back |
-| **Audit** | There is no tamper-evident audit log or remote attestation yet; the telemetry plane that would feed them is built |
+| **Audit** | ~~There is no tamper-evident audit log or remote attestation yet~~ The log is kept since 2026-11-01 (above), but nothing anchors it, so a log replaced whole is not detected; there is no remote attestation |
 | **Old signed boots** | An older signed boot set still verifies; refusing it needs a rollback counter not yet built |
 | **The Linux adapter** | `bin/linuxd` holds the authority for every hosted program, so a compromise of it reaches all of their files — the concentration point the design accepts, and states |
 | **Randomness** | One entropy source, the CPU's `RDRAND`, with no pool behind it |
