@@ -5011,14 +5011,6 @@ fn start_program(frame: &SyscallFrame) -> Outcome {
     }
 }
 
-/// Performs an `Invoke`, including the cross-domain grant.
-/// Gives the caller being answered a copy of a capability the server holds.
-///
-/// Two stages, like [`grant`], and for the same reason: the server's CSpace
-/// and the caller's cannot both be held at once. Derive first from the
-/// server's, then install into the caller's — and if the install fails, the
-/// derived capability is destroyed rather than left in the arena charged to a
-/// domain that cannot name it.
 /// Completes a staged gift at the rendezvous, or refuses the call.
 ///
 /// RFC 0022 step 2, run **on the server thread** inside its receive path —
@@ -5036,7 +5028,9 @@ fn start_program(frame: &SyscallFrame) -> Outcome {
 /// back — the caller's staged gift (so a retry loop stages once, the draft
 /// answer to the RFC's open question 3) and the server's declared slot (a
 /// service asked for something this caller could not give is still owed its
-/// next legitimate capability).
+/// next legitimate capability). A failure after the derive also destroys the
+/// derived capability and gives back the recipient's charge, as `hand` does:
+/// left in the arena it would be held by no one and never revoked.
 pub(crate) fn complete_gift(caller: u32, endpoint: u32, server: u32) -> Result<bool, u32> {
     let Some(gift) = crate::sched::take_staged_gift(caller, endpoint) else {
         return Ok(false);
@@ -5123,11 +5117,13 @@ pub(crate) fn complete_gift(caller: u32, endpoint: u32, server: u32) -> Result<b
         if owner.charge_capability().is_err() {
             return Err(Status::QuotaExceeded);
         }
-        owner
-            .cspace
-            .install_at(destination as usize, derived)
-            .map_err(|_| Status::SlotUnavailable)
-            .map(|()| owner.generation())
+        match owner.cspace.install_at(destination as usize, derived) {
+            Ok(()) => Ok(owner.generation()),
+            Err(_) => {
+                owner.release_capability();
+                Err(Status::SlotUnavailable)
+            }
+        }
     });
     match installed {
         Some(Ok(generation)) => {
@@ -5137,17 +5133,24 @@ pub(crate) fn complete_gift(caller: u32, endpoint: u32, server: u32) -> Result<b
             });
             Ok(true)
         }
-        Some(Err(status)) => {
+        other => {
+            cap::with_arena(|arena| arena.revoke_unchecked(derived));
             restore(gift);
-            Err(status as u32)
-        }
-        None => {
-            restore(gift);
-            Err(Status::NoDomain as u32)
+            match other {
+                Some(Err(status)) => Err(status as u32),
+                _ => Err(Status::NoDomain as u32),
+            }
         }
     }
 }
 
+/// Gives the caller being answered a copy of a capability the server holds.
+///
+/// Two stages, like [`grant`], and for the same reason: the server's CSpace
+/// and the caller's cannot both be held at once. Derive first from the
+/// server's, then install into the caller's — and if the install fails, the
+/// derived capability is destroyed rather than left in the arena charged to a
+/// domain that cannot name it.
 fn hand(frame: &SyscallFrame) -> Outcome {
     let Ok(resolved) = resolve_for_ipc(frame.capability, ObjectKind::Endpoint) else {
         return Outcome::err(Status::WrongObject);
@@ -5309,8 +5312,9 @@ fn hand(frame: &SyscallFrame) -> Outcome {
     }
 }
 
-/// `INVOKE` on `id`'s own CSpace. Also the way in for the audit self-tests
-/// (RFC 0101), which must reach the system call's own path, not a copy of it.
+/// Performs an `Invoke`, including the cross-domain grant. Also the way in
+/// for the audit self-tests (RFC 0101), which must reach the system call's
+/// own path, not a copy of it.
 pub(crate) fn invoke(id: domain::DomainId, frame: &mut SyscallFrame) -> Outcome {
     // A grant needs two domains' CSpaces and cannot hold both tables at once,
     // so it is resolved in stages rather than done in place.

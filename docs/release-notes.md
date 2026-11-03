@@ -101,9 +101,11 @@ document, release note or README may state or imply that it works."*
 | Hosted Linux processes `fork` (a copy the kernel makes), wait on futexes, send, take and catch signals, are ended while running, and write and truncate files on disk | the gates of RFC 0079, 0080, 0083, 0084 and 0085, and of RFC 0060, 0065 and 0077 — all accepted |
 | **Since 2026-10-31: the fork glibc makes, threads glibc can join, a program that can find itself, and the vfork Go starts programs with.** A forked child starts with its parent's whole register file, floating-point state and thread-local base; a thread made by `pthread_create` can be joined; `readlink("/proc/self/exe")`, `cmdline` and `environ` answer for a program the adapter exec'd; `SIGCHLD` reaches a handler, and `SIG_IGN` reaps children | the probes `linux fork reg`, `linux join`, `linux vfork` and the hosted program's line, each armed; [RFC 0096](rfc/0096-a-fork-glibc-can-make.md), [0097](rfc/0097-threads-glibc-can-join.md) and [0098](rfc/0098-a-program-that-can-find-itself.md) accepted 2026-10-31, [0099](rfc/0099-children-a-shell-and-go-can-start-and-hear-from.md) accepted 2026-11-01 |
 | **Records what it booted in a TPM, and checks the record.** The native loader measures the kernel and initrd into PCR 9 and the command line into PCR 8. The event log reaches the kernel, and `bin/tpmd` **replays it against the TPM**: `log and TPM agree on PCRs 0-9` (2026-10-19), and a log that lies about the kernel is caught | `make test-boot-native-tpm` and `-tpm-tis`, against an emulated TPM (swtpm) over CRB and TIS. ~~**locally only** — it needs Docker, and CI does not run it yet. RFC 0089 is a **draft**, and nothing *verifies* the measurements~~ — **wrong since 2026-10-11, corrected 2026-10-19**: CI runs both lanes, and RFC 0089 was accepted 2026-10-11. On the SR550's own TPM: `log and TPM agree on PCRs 0-7, 9 ... over FIFO` (2026-10-11). **Recorded, not refused**: see below |
+| **Since 2026-11-01: writes down every change of authority, in a log that shows an edit.** Every capability grant, derive and revocation made through a system call, and every domain created or ended, is a record in a ring the kernel keeps; `bin/auditd` chains them with SHA-256 and keeps them on the disk, a file per boot. A grant is refused (`AUDIT_FULL`) when the log has no room, while a revocation and a domain's end still happen. **Nothing anchors the chain yet**: a log replaced whole, not edited, is not detected ([RFC 0101](rfc/0101-a-log-that-cannot-be-quietly-edited.md), accepted 2026-11-03) | the `audit` gates on every boot lane; `make test-disk-keeps`, where the host's `audit-verify` checks four boots' chains whole and names the entry a flipped bit broke; `make test-audit-stall`, where a full log refuses a grant and a revocation and an ending still happen |
+| **Since 2026-11-01: the native loader boots from two signed slots, and falls back.** On a second disk holding slots A and B and a one-block record, a slot on trial spends a boot before it is taken and the active slot returns when its tries run out; a slot whose set does not verify falls back to the other in the same boot; a damaged record is not believed, and nothing is written. **Nothing in the running system writes a slot yet**, and a tool stands in ([RFC 0100](rfc/0100-an-update-that-cannot-go-back.md) step 1 of 3) | `make test-boot-slots`: ten checks, in `make test` and CI |
 | **Boots on physical hardware** — a Lenovo SR550, read over serial-over-LAN | 2026-08-23 through Limine; through its own loader to the user-mode shell since 2026-10-11 |
 
-Alongside, **as measured on 2026-11-01**: **69 of 101 RFCs accepted** (67 of 101
+Alongside, **as measured on 2026-11-03**: **70 of 101 RFCs accepted** (69 of 101 on 2026-11-01; 67 of 101
 on 2026-10-31; 63 of 93 on 2026-10-29; 61 of 93 on 2026-10-20, before the lead accepted RFC 0092 and RFC
 0093; 61 of 92 on 2026-10-19, before RFC 0093 was drafted), each
 accepted one implemented and measured rather than merely written. The command:
@@ -229,7 +231,8 @@ something a user meets, so not in the table below. Two of this table's rows clos
 report (2026-10-29, the lane's own fault) and the second boot's `block service
 FAILED` (2026-10-30) -- and both are in the second table now, with the eleven
 other rows closed since 2026-10-20 that a user could have met. The table still
-groups one family and leaves out the `uefi, qemu64` lane, so it has twenty-one rows.
+groups one family and leaves out the `uefi, qemu64` lane, so it has twenty-one rows. **2026-11-03**: the row found by
+reading closed, on the lead's word -- twenty-three rows not closed, and twenty in the table below.
 
 | Defect — what you would see | Rate, as TRACKER states it | Fix |
 |---|---|---|
@@ -253,7 +256,6 @@ groups one family and leaves out the `uefi, qemu64` lane, so it has twenty-one r
 | The native TPM lane's second serial log comes back empty | 1 in 9 runs (2026-10-11) | instrumented, not explained |
 | BusyBox `sh` faults at `0x48` | ~2% of harness runs; 0 of 8,443 CI boots (2026-10-04) | likely fixed 2026-10-02, not proven |
 | A per-CPU hold count underflows (the remainder of the old "445 ms wake" row) | no specimen in 450 boots of one image (2026-08-28) | a cause guarded 2026-09-03; not shown to be *the* cause |
-| A capability passed with a call, which the receiving service cannot accept, is left in the kernel's capability table, reachable by nobody | not seen; found by reading the code (2026-11-01) | not fixed; recorded for the lead |
 
 **Several of these have fixes waiting on a count**, and the column says which.
 "Likely fixed, not proven" means exactly that: a clean run at the old rate is
@@ -263,6 +265,7 @@ not yet absence.
 
 | Defect | Closed |
 |---|---|
+| A capability passed with a call, which the receiving service cannot accept, was left in the kernel's capability table, reachable by nobody | **2026-11-03**, on the lead's word: seen first by a new self-test phase (one capability left behind per refused call), then fixed as its sibling paths already were; the `gift` gate reads it |
 | The first lock-order violation of a boot, if it came while that CPU held a lock taken by `try_lock`, panicked the kernel in the code meant to report it | **2026-11-01**, found as a host-test flake (1 run in 200): a guard with no rank was sampled as `1 << 255`, and overflow checks are on in the release kernel. A test now holds one open at a violation, and was red first |
 | `uname -a` cut its version field one character short | **2026-10-31**, the day it was found; a host test holds every field to its width |
 | Interactive BusyBox `sh` could not run a command that is not one of its builtins | **2026-10-31**, by [RFC 0096](rfc/0096-a-fork-glibc-can-make.md): `uname -a` runs from the prompt, gated |

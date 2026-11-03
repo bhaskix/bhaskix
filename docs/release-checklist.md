@@ -132,7 +132,8 @@ nothing in them is blocked. The two items above that are the lead's are past the
       not closed (twenty-four on the evening of 2026-10-19), twenty-three that day when one was
       filed from reading the code, and twenty-four when a gap in the boot gates was filed. The LACP and second-boot rows moved to
       the closed table, with eleven more closed since 2026-10-20 that a user could have met; the open table has twenty-one rows (one family grouped, the `uefi, qemu64` lane left out).
-      **On the 15th, count again** if §3 has changed since.
+      **2026-11-03**: twenty-three, the gift row closed on the lead's word, and the note's open
+      table twenty rows. **On the 15th, count again** if §3 has changed since.
 
 ## One week before — 22 November: the candidate
 

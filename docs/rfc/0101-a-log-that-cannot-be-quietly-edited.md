@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | ⬜ **Draft 2026-10-31 — ~~nothing built~~ ~~step 1 built 2026-11-01~~ all three steps built 2026-11-01**, for the lead to accept: every authority change through a system call reserved before and recorded after, a grant refused when the log is full, the chain kept on the disk and checked by a host verifier. ~~Questions for the lead~~ All four decided by the lead the same day, each as proposed, and three more on 2026-11-01 (§*Implementation plan*). Drafted at the lead's request, as Phase 3's third row. |
+| **Status** | ✅ **ACCEPTED 2026-11-03 by the project lead**, on CI runs 897 and 898's green. Drafted 2026-10-31; ~~nothing built~~ ~~step 1 built 2026-11-01~~ all three steps built 2026-11-01: every authority change through a system call reserved before and recorded after, a grant refused when the log is full, the chain kept on the disk and checked by a host verifier. ~~Questions for the lead~~ All four decided by the lead the same day, each as proposed, and three more on 2026-11-01 (§*Implementation plan*). Drafted at the lead's request, as Phase 3's third row. |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | kernel (telemetry), userspace (an audit service), tpm |
 | **Milestone** | Phase 3, *audit framework* ([roadmap.md](../roadmap.md)): threat T8 |

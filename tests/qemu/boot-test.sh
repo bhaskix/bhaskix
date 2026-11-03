@@ -5192,8 +5192,14 @@ fi
 # one: restoration is the part a simpler implementation silently gets wrong,
 # by consuming the declaration on the failure path and leaving the service
 # one failed caller away from deafness.
-if grep -qE "gift .*unmapped, destroyed and unnamed what it had lent" "$LOG"; then
-    pass "a capability crossed in a call; a refusal restored; a lender's death revoked"
+#
+# Since 2026-11-03 it is also matched on the occupied slot: a gift whose
+# install the recipient's declared slot refuses, because the slot is already
+# full, must refuse the call and leave nothing behind -- before then the
+# derived capability stayed in the arena, charged to the service, held by no
+# one and never revoked (TRACKER, found 2026-11-01 by reading).
+if grep -qE "gift .*a declared slot already filled refused the call and left nothing in the arena; and the lender's death unmapped, destroyed and unnamed what it had lent" "$LOG"; then
+    pass "a capability crossed in a call; a refusal restored and left nothing behind; a lender's death revoked"
 elif grep -qE "gift +skipped" "$LOG"; then
     pass "gift self-test skipped on this machine, too few cpus"
 else

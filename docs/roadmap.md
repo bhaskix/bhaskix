@@ -407,7 +407,8 @@ cost* and is not a schedule.
   [RFC 0101](rfc/0101-a-log-that-cannot-be-quietly-edited.md) drafted, nothing built, and all four
   questions decided by the lead that day: fail closed, the chain in a ring-3 `auditd`, the anchor
   and attestation in a later RFC, and capability and domain events first, kept on the disk.
-  **2026-11-01: all three steps built**, for the lead to accept -- every authority change through
+  **2026-11-01: all three steps built**, ~~for the lead to accept~~ **accepted by the lead
+  2026-11-03** -- every authority change through
   a system call reserved before and recorded after, a grant refused when the log is full, the
   chain kept under `/audit` and checked by `audit-verify`. Owed: the head's anchor and remote
   attestation (a later RFC), and rotation of a kept disk's logs

@@ -2488,6 +2488,15 @@ static GIFT_LENDING_BITS: core::sync::atomic::AtomicU32 = core::sync::atomic::At
 /// The `Memory` object the client lends in the revocation phase, as its
 /// packed identity, or `u64::MAX` while there is none.
 static GIFT_OBJECT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
+/// The service's domain, for the client's occupied-slot phase to count what
+/// the arena charges it.
+static GIFT_SERVICE_DOMAIN: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(u32::MAX);
+/// The occupied-slot verdict, one bit per property: refused with
+/// `SlotUnavailable`, the arena's count for the service unchanged, its held
+/// count unchanged. The two counts, before and after, for the failure report.
+static GIFT_OCCUPIED_BITS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static GIFT_OCCUPIED_COUNTS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// The service half of `gift_self_test`. Declares when the phase says to,
 /// receives, checks its own CSpace, replies.
@@ -2629,6 +2638,51 @@ extern "C" fn gift_client(_argument: u64) -> ! {
     // teardown.
     let _ = sched::take_staged_gift(me, endpoint.as_u32());
 
+    // The occupied slot: the service declares slot 5, which phase 2's gift
+    // still fills, so the derive succeeds and the install refuses. The call
+    // is refused, and the derived capability must not be left in the arena
+    // charged to the service, held by no one and never revoked -- nor the
+    // service's quota spent on it. Counted by owner, and with the arena and
+    // the domain table taken one after the other, never one inside the other.
+    let service = GIFT_SERVICE_DOMAIN.load(Ordering::Acquire);
+    let count = || {
+        let charged = cap::with_arena(|arena| {
+            arena
+                .survivors()
+                .filter(|survivor| survivor.owner == service)
+                .count() as u64
+        });
+        let held = domain::with(domain::DomainId::from_u32(service), |owner| {
+            u64::from(owner.held_capabilities())
+        })
+        .unwrap_or(u64::MAX);
+        (charged, held)
+    };
+    let _ = ipc::call(endpoint, 0, 1, [63, 5, 0, 0]);
+    let (charged_before, held_before) = count();
+    stage(2);
+    let occupied = ipc::call(endpoint, 0, 3, [5, 0, 0, 0]);
+    let (charged_after, held_after) = count();
+    let _ = sched::take_staged_gift(me, endpoint.as_u32());
+    let refused = matches!(
+        occupied,
+        Err(ipc::IpcError::Refused(raw))
+            if raw == syscall::Status::SlotUnavailable as u32
+    );
+    GIFT_OCCUPIED_BITS.store(
+        u32::from(refused)
+            | u32::from(charged_after == charged_before) << 1
+            | u32::from(held_after == held_before) << 2,
+        Ordering::Release,
+    );
+    GIFT_OCCUPIED_COUNTS.store(
+        (charged_before & 0xffff)
+            | (charged_after & 0xffff) << 16
+            | (held_before & 0xffff) << 32
+            | (held_after & 0xffff) << 48,
+        Ordering::Release,
+    );
+
     // Phase 7: a real lending — a `Memory` object this domain *owns*, gifted
     // away, for the harness to end by killing this domain. The gift is the
     // same mechanism phase 2 proved; what phase 7 stages is the object whose
@@ -2689,6 +2743,7 @@ fn gift_self_test(hhdm_base: u64, cpus: u32) -> bool {
         println!("\x1b[91m    gift           FAILED to create the domains\x1b[0m");
         return false;
     };
+    GIFT_SERVICE_DOMAIN.store(server_side.as_u32(), Ordering::Release);
 
     // The client's slot 2 holds a giftable object **with** GRANT; slot 3
     // holds the same object **without** it. A notification stands in for the
@@ -2806,26 +2861,37 @@ fn gift_self_test(hhdm_base: u64, cpus: u32) -> bool {
     // Every recorded byte must be 1 — the phase ran and its check passed.
     // Phases: 1 sanity, 2 gifted, 3 consumed, 4 no-GRANT refusal,
     // 5 restoration, 6 no-declaration refusal, 7 a memory object lent.
+    let occupied = GIFT_OCCUPIED_BITS.load(Ordering::Acquire);
     let ok = (1..=7u32).all(|phase| (saw >> (phase * 8)) & 0xff == 1)
-        // The refused calls were never delivered: five delivered calls
-        // (phases 1, 2, 5, 7's declare-then-gift pair) plus the closing one —
-        // the refusals of phases 4 and 6 must not appear as served messages.
-        && served == 6
+        // The refused calls were never delivered: six delivered calls
+        // (phases 1, 2, 5, the occupied slot's declaration, 7's
+        // declare-then-gift pair) plus the closing one — the refusals of
+        // phases 4 and 6 and of the occupied slot must not appear as served
+        // messages.
+        && served == 7
         && landed == 3
+        && occupied == 0b111
         && lending_ended;
     if ok {
         println!(
             "    gift           a capability crossed in a call, landed only where declared, was \
              consumed by its ride; a giftless call was untouched; no declaration refused the \
              call rather than delivering it bare; no GRANT refused the call whole and restored \
-             the declaration it could not use; and the lender's death unmapped, destroyed and \
+             the declaration it could not use; a declared slot already filled refused the call \
+             and left nothing in the arena; and the lender's death unmapped, destroyed and \
              unnamed what it had lent"
         );
     } else {
         let bits = GIFT_LENDING_BITS.load(Ordering::Acquire);
+        let counts = GIFT_OCCUPIED_COUNTS.load(Ordering::Acquire);
         println!(
             "\x1b[91m    gift           FAILED: phases {saw:#x}, served {served}, landed \
-             {landed}, lending ended {lending_ended} (bits {bits:#07b})\x1b[0m"
+             {landed}, lending ended {lending_ended} (bits {bits:#07b}), occupied slot \
+             {occupied:#05b} (charged {} -> {}, held {} -> {})\x1b[0m",
+            counts & 0xffff,
+            (counts >> 16) & 0xffff,
+            (counts >> 32) & 0xffff,
+            (counts >> 48) & 0xffff,
         );
     }
     ok
