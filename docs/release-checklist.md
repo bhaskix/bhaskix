@@ -126,14 +126,18 @@ nothing in them is blocked. The two items above that are the lead's are past the
 - [ ] **Freeze** — *engineering*. From here on only fixes, tests and documents land. Work that
       changes a service's lifecycle either lands before the 15th with its suite green, or waits
       until after the release. ~~RFC 0092's listener close is the one in flight~~ — it landed
-      2026-10-20 with its suite green, and was accepted 2026-10-29.
+      2026-10-20 with its suite green, and was accepted 2026-10-29. **Begun early, 2026-11-05, on
+      the lead's word**: RFC 0100 step 2 landed that day with its suite green, and from it only
+      fixes, tests and documents; RFC 0036 and RFC 0100 step 3 wait until after the release.
 - [x] **The defects table re-counted** against TRACKER §3, and any row closed since the refresh
       moved to the note's "closed" table. **Done early, 2026-11-01**, row by row: twenty-two rows
       not closed (twenty-four on the evening of 2026-10-19), twenty-three that day when one was
       filed from reading the code, and twenty-four when a gap in the boot gates was filed. The LACP and second-boot rows moved to
       the closed table, with eleven more closed since 2026-10-20 that a user could have met; the open table has twenty-one rows (one family grouped, the `uefi, qemu64` lane left out).
       **2026-11-03**: twenty-three, the gift row closed on the lead's word, and the note's open
-      table twenty rows. **On the 15th, count again** if §3 has changed since.
+      table twenty rows. **2026-11-05**: the ring-station row closed on its count, and the
+      `xstate cost` row of 2026-11-03 counted -- twenty-three, and the note's open table nineteen.
+      **On the 15th, count again** if §3 has changed since.
 
 ## One week before — 22 November: the candidate
 

@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | ⬜ **Draft 2026-08-21** — the half of [security.md](../security.md) §1 gap 3 that the hosted-layout work deliberately did not do, opened the same day that work landed so the split is a decision rather than an omission. **Nothing here is built** |
+| **Status** | ⬜ **Draft 2026-08-21** — the half of [security.md](../security.md) §1 gap 3 that the hosted-layout work deliberately did not do, opened the same day that work landed so the split is a decision rather than an omission. **Nothing here is built**. **After the release, by the lead's decision of 2026-11-05.** Measured that day: every hosted program the build makes (BusyBox, its v3 build, the Go server) is `ET_EXEC` with no interpreter, so this RFC moves none of them until they are built static-PIE -- and the stack, which this RFC does not cover, is fixed too (`security.md` §1 gap 3) |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | elf, kernel (the program loader), userspace (`bin/linuxd`'s policy) |
 | **Milestone** | Phase 3, beside the hosted-layout row it completes — and **after** L1 has real C programs to protect, because until then it is a mechanism with no adversary |

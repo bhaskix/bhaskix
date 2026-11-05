@@ -423,7 +423,11 @@ cost* and is not a schedule.
   a deliberate decision taken on 2026-08-13 — they were all at one address, which made a debugger
   useless — and are asserted by boot gates. Note also that the ELF loader refuses `ET_DYN` for ring
   3 on purpose, to keep relocation processing out of the program loader; native ASLR would reopen
-  that and is a separate decision needing an RFC
+  that and is a separate decision needing an RFC. **Where it stands, 2026-11-05**: the `mmap` region
+  is drawn per process, 28 bits, since 2026-08-21; the image and the stack are not. The image is
+  [RFC 0036](rfc/0036-a-relocatable-program-in-ring-3.md), a draft, **after the release by the lead's
+  decision of that day**; the stack of a program `bin/linuxd` exec's is at `0x6000_0000_0000` every
+  time
 - **Linux compatibility L1** — see the section below. It sits here because a container runtime that
   cannot run BusyBox is a container runtime for nothing. It is also what makes `bin/linuxd` the
   largest concentration of authority in the system — supervisor handles, a directory capability and

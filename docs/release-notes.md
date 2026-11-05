@@ -232,7 +232,7 @@ report (2026-10-29, the lane's own fault) and the second boot's `block service
 FAILED` (2026-10-30) -- and both are in the second table now, with the eleven
 other rows closed since 2026-10-20 that a user could have met. The table still
 groups one family and leaves out the `uefi, qemu64` lane, so it has twenty-one rows. **2026-11-03**: the row found by
-reading closed, on the lead's word -- twenty-three rows not closed, and twenty in the table below.
+reading closed, on the lead's word -- twenty-three rows not closed, and twenty in the table below. That day's suite filed one more, a timing gate's floor missed on a busy host: a test's limit and not something a user meets, so not in the table. **2026-11-05**: twenty-four with it, and the ring-station row closed on its own count: **twenty-three rows not closed, and nineteen in the table below**.
 
 | Defect — what you would see | Rate, as TRACKER states it | Fix |
 |---|---|---|
@@ -240,8 +240,7 @@ reading closed, on the lead's word -- twenty-three rows not closed, and twenty i
 | The four-client TCP act accepts nobody: `tcp four FAILED ... 0 accepted` | **3 sightings** (2026-10-12, twice on 2026-10-15). A fourth was counted, and dated 2026-10-16; it ran on 2026-10-19, was the test harness's own fault, and is withdrawn | not explained |
 | The inbound TCP echo is served and the host never receives the bytes | **4 sightings** (CI 2026-09-13, 09-23, 10-08; locally 10-15) | the host's driver changed 2026-10-19 to stay and hear its reply; open until it has gone a while without a sighting |
 | A hosted UDP read never ends (the probe thread spins) | 5 times locally, the last 2026-10-10; 0 in 8,065 CI boots | none |
-| A ring-station scheduler self-test halts with a station asleep on its own turn | 20 in 7,891 boots before a fix of 2026-09-28; **0 in 657 since** (2026-10-04) | fix landed; open until ~1,200 clean boots |
-| A lock-order self-test fails: a wait queue taken while holding another lock | 4 in 7,681 boots; last 2026-09-23 | a cause fixed 2026-09-28; open until ~5,800 clean boots |
+| A lock-order self-test fails: a wait queue taken while holding another lock | 4 in 7,681 boots; last 2026-09-23; **0 in 2,361 since** (2026-11-05) | a cause fixed 2026-09-28; open until ~5,800 clean boots |
 | The lock-order detector fires in CI: one real ordering violation | 1 sighting, CI run 489 (2026-09-02); again 2026-09-04 | not explained |
 | Lock accounting disagrees with the locks actually held (`no open guard`) | four specimens, the last 1 boot in 24 at eight CPUs (2026-09-04); two were withdrawn as instrument errors | one specimen unexplained |
 | The two-wake-sources self-test (RFC 0057) fails | ~2 boots in 1,200; last 2026-09-04 | none |
@@ -265,6 +264,7 @@ not yet absence.
 
 | Defect | Closed |
 |---|---|
+| A ring-station scheduler self-test halted with a station asleep on its own turn (about 1 boot in 400) | **2026-11-05**, on its own count: fixed 2026-09-28, then 0 sightings in 2,361 CI boots against 20 in 7,891 before |
 | A capability passed with a call, which the receiving service cannot accept, was left in the kernel's capability table, reachable by nobody | **2026-11-03**, on the lead's word: seen first by a new self-test phase (one capability left behind per refused call), then fixed as its sibling paths already were; the `gift` gate reads it |
 | The first lock-order violation of a boot, if it came while that CPU held a lock taken by `try_lock`, panicked the kernel in the code meant to report it | **2026-11-01**, found as a host-test flake (1 run in 200): a guard with no rank was sampled as `1 << 255`, and overflow checks are on in the release kernel. A test now holds one open at a violation, and was red first |
 | `uname -a` cut its version field one character short | **2026-10-31**, the day it was found; a host test holds every field to its width |

@@ -1595,7 +1595,8 @@ mod tests {
 /// obligation and belongs in an RFC rather than in this function.
 ///
 /// So this is **partial** ASLR, and saying which part is the point: the heap
-/// and every shared mapping move; the text does not.
+/// and every shared mapping move; the text does not, and neither does the
+/// stack `bin/linuxd` gives a program it exec's (`EXEC_STACK_BASE`).
 pub mod layout {
     /// The lowest address `mmap` may return.
     ///

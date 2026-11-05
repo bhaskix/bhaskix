@@ -335,8 +335,9 @@ Builds on **stable Rust** — no nightly, no `#![feature]` anywhere in the tree
 
 `make test` runs, cheapest first, so a trivial mistake fails in seconds rather
 than after a QEMU boot: `rustfmt`; `clippy` on both the freestanding and host
-targets; **1,450 host tests** (recounted 2026-10-29 from a `make test` run on
-`0597e9a`; 1,448 earlier that day on `7267ed9`, which the website showed while
+targets; **1,538 host tests** (recounted 2026-11-05 from a `make test` run on
+`72f181f`, RFC 0100 step 2, where this line still read 1,450 from 2026-10-29's
+run on `0597e9a` and the website showed 1,515; 1,448 earlier that day on `7267ed9`, which the website showed while
 this line still read 1,414 from `18985db`; 1,411 on 2026-10-20 on `61bb353`, 1,407 earlier that day on `a8c0df0`, and 1,339 from 2026-10-08, and 1,010, recounted 2026-08-24 from a
 `make test-host` run, for six weeks; before
 that this line said "346 host assertions" for months, carried forward uncounted,
