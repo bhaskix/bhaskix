@@ -1115,6 +1115,21 @@ the distinction is in the table rather than in somebody's head.
 
 Newest first. One entry per meaningful change of project state.
 
+### 2026-11-05 (the README's `make test` time, timed)
+
+- **The README said `make test` takes about six minutes.** It said so from 2026-08-07, when the line
+  was written; three quiet-host runs on 2026-11-05 took 42 min 35 s, 43 min 26 s and 42 min 24 s.
+  Corrected in place, with the old figure and its date. Found reading the README for figures the
+  day's other corrections might have missed.
+- **The guide *Build from source* gave 36 minutes, 2,542 checks and 1,452 host tests, undated** --
+  a true reading from empty caches on 2026-10-30. It is dated now, beside the day's warm figures,
+  and says a fresh clone will take longer than either, since the suite has grown.
+- **`security.md`'s T7 row opened with "no signing, no A/B slots, no rollback counter"**, though its
+  own later text recorded all three built. Struck and dated, as T6's false clauses already were,
+  keeping *planned* for T6's reason: the preview's loader trusts no key. The paragraph above the
+  table still said the kernel is loaded with no authenticity check, true of the preview's loader
+  and not of one built with its owner's key since 2026-10-29; it says which now.
+
 ### 2026-11-05 (the release note's rates recounted with the tool; a second sighting nobody recorded)
 
 - **Every row of the release note's open table the tool can count, counted over all CI history**

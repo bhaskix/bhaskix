@@ -120,9 +120,11 @@ make test
 
 runs everything CI runs: formatting, lints, the host tests, the project's
 invariant gates, and every boot lane — each boot checks hundreds of lines of the
-machine's own report. It is serial on purpose and takes a while: from empty
-build caches, 36 minutes on the machine these pages were checked on, counting
-2,542 passing checks and 1,452 host tests. It ends:
+machine's own report. It is serial on purpose and takes a while: about 43
+minutes on the machine these pages were checked on, with its build caches warm,
+counting 2,664 passing checks and 1,538 host tests (2026-11-05). From empty
+caches it took 36 minutes on 2026-10-30, when it counted 2,542 and 1,452; the
+suite has grown since, so expect longer from a fresh clone. It ends:
 
 ```
 …

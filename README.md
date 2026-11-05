@@ -326,8 +326,12 @@ make                    # build the kernel and a bootable ISO
 make demo               # boot the full machine and use its shell
 make run                # boot a bare machine in QEMU (BIOS)
 make run-uefi           # boot it in QEMU (UEFI, via OVMF)
-make test               # everything CI runs -- about six minutes
+make test               # everything CI runs, and more -- about 43 minutes
 ```
+
+**About 43 minutes on a quiet host**, measured three times on 2026-11-05 (42 min 35 s,
+43 min 26 s, 42 min 24 s). The comment above said *about six minutes* from 2026-08-07, when it
+was written, until it was timed again on 2026-11-05.
 
 Builds on **stable Rust** — no nightly, no `#![feature]` anywhere in the tree
 (see [docs/nightly-features.md](docs/nightly-features.md)). Verified with Rust
