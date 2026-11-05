@@ -236,7 +236,7 @@ reading closed, on the lead's word -- twenty-three rows not closed, and twenty i
 
 | Defect — what you would see | Rate, as TRACKER states it | Fix |
 |---|---|---|
-| An outbound TCP demonstration stalls: `connected, stream still in flight` | 11 sightings in 7,762 boots, 1 in 705, counted by the tool; the latest specimens 2026-09-29 (CI run 782) and 2026-10-02 | none |
+| An outbound TCP demonstration stalls: `connected, stream still in flight` | ~~11 sightings in 7,762 boots, 1 in 705, counted by the tool; the latest specimens 2026-09-29 (CI run 782) and 2026-10-02~~ **15 in 10,258 CI boots, 1 in 683**, counted by the tool 2026-11-05 -- the 11 was a count of 2026-09-28 and four came after it; the latest CI specimens 2026-10-12 and 2026-11-01, and one local, 2026-10-31 | none |
 | The four-client TCP act accepts nobody: `tcp four FAILED ... 0 accepted` | **3 sightings** (2026-10-12, twice on 2026-10-15). A fourth was counted, and dated 2026-10-16; it ran on 2026-10-19, was the test harness's own fault, and is withdrawn | not explained |
 | The inbound TCP echo is served and the host never receives the bytes | **4 sightings** (CI 2026-09-13, 09-23, 10-08; locally 10-15) | the host's driver changed 2026-10-19 to stay and hear its reply; open until it has gone a while without a sighting |
 | A hosted UDP read never ends (the probe thread spins) | 5 times locally, the last 2026-10-10; 0 in 8,065 CI boots | none |
