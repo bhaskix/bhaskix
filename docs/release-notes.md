@@ -253,7 +253,7 @@ reading closed, on the lead's word -- twenty-three rows not closed, and twenty i
 | A boot stops printing partway through a test | 1 sighting, CI run 792 (2026-09-30) | unexplained, not yet instrumented |
 | A `poll` probe says "not ready" for a domain with no console grant | 1 sighting (2026-10-12) | parked until the next one; the cause is an inference |
 | The native TPM lane's second serial log comes back empty | 1 in 9 local runs (2026-10-11); never on CI, whose two `COM2 is missing` failures that day had other causes, both fixed then (2026-11-05) | instrumented, not explained |
-| BusyBox `sh` faults at `0x48` | ~2% of harness runs; 0 of 8,443 CI boots (2026-10-04) | likely fixed 2026-10-02, not proven |
+| BusyBox `sh` faults at `0x48` | ~2% of harness runs; 0 of 8,443 CI boots (2026-10-04); 0 in 164 loaded local boots read whole, the window open in two (2026-11-05) | likely fixed 2026-10-02, not proven -- **seen at work once** (2026-11-05): a loaded boot met the specimen's state, the fix loaded the base, and BusyBox ran |
 | A per-CPU hold count underflows (the remainder of the old "445 ms wake" row) | no specimen in 450 boots of one image (2026-08-28) | a cause guarded 2026-09-03; not shown to be *the* cause |
 
 **Several of these have fixes waiting on a count**, and the column says which.
