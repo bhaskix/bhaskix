@@ -70,6 +70,11 @@ ISO="${BHASKIX_ISO:-$REPO_ROOT/build/busybox.iso}"
 status=0
 pass() { printf '\033[1;32mok\033[0m    %s\n' "$*"; }
 fail() { printf '\033[1;31mFAIL\033[0m  %s\n' "$*" >&2; }
+# Every way this lane fails ends here, so the one file that can say *why* is
+# always named.
+say_where_the_log_is() {
+    printf '\033[2mnote\033[0m  the serial log of this failing run is kept at %s\n' "$LOG" >&2
+}
 
 cleanup() {
     exec 3>&- 2>/dev/null || true
@@ -81,6 +86,23 @@ cleanup() {
     # run beside it. It builds its own image now, so cleanup has nothing to undo.
 }
 trap cleanup EXIT
+
+# **A write into a machine that has gone fails; it does not end the lane.**
+# Keystrokes go into a FIFO whose reader is QEMU, and once QEMU has exited a
+# write raises SIGPIPE, which ended this script on the spot -- before the line
+# that says where the serial log is. That is how TRACKER §3's "never granted the
+# console" row lost its only specimen on 2026-09-30: the log was written and
+# kept, and nobody was told where. Reproduced 2026-11-05 with a three-second
+# timeout: the same two FAIL lines, exit 141, no path. Caught, the write fails
+# with EPIPE instead, and the lane goes on to say what it saw.
+#
+# **Caught, not ignored.** `trap '' PIPE` was the first version, and an ignored
+# signal is inherited by every program this lane starts: `seq 1 200000 | head
+# -1` then printed `write error: Broken pipe` and returned 1 where it had
+# returned 141, which under `pipefail` changes what a pipeline answers. A
+# caught signal is reset to its default across `exec`, so `grep`, `head` and
+# QEMU behave as they did. Measured 2026-11-05 on bash 5.0.17.
+trap ':' PIPE
 
 # ~~**`BUSYBOX_IN_IMAGE=1`, because it is no longer in the image by default.**
 # The root filesystem is read into one contiguous allocation and the buddy
@@ -155,7 +177,12 @@ if await "/ #"; then
     pass "BusyBox's sh reached its prompt"
 else
     fail "BusyBox's sh never reached a prompt"
-    status=1
+    # Nothing below can pass without a prompt to type at, and the machine is
+    # gone or about to be: `await` gives up when QEMU has exited or when
+    # `TIMEOUT` has run out, and `TIMEOUT` is QEMU's own limit too. So stop
+    # here and say where the log is, rather than type at nothing.
+    say_where_the_log_is
+    exit 1
 fi
 
 # **The assertion this lane exists for, and it must not be able to pass for the
@@ -380,7 +407,7 @@ exec 3>&-
 wait "$qemu" 2>/dev/null
 
 if [[ $status -ne 0 ]]; then
-    printf '\033[2mnote\033[0m  the serial log of this failing run is kept at %s\n' "$LOG" >&2
+    say_where_the_log_is
     exit 1
 fi
 echo

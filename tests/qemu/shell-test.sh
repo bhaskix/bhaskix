@@ -338,6 +338,20 @@ else
     trap 'stop_machine; rm -f "$LOG" "$FIFO"' EXIT
 fi
 
+# **A write into a machine that has gone fails; it does not end the lane.** The
+# typing goes into a FIFO whose reader is QEMU, and once QEMU has exited a write
+# raises SIGPIPE, which ended this script on the spot -- under the trap just
+# above, which *removes the log* unless the caller named it, and before
+# `cleanup_session` below could keep it. So a machine that died
+# mid-conversation, the run most worth reading, left exit 141, no FAIL line and
+# no serial log. Shown 2026-11-05 by killing QEMU three lines in;
+# `busybox-test.sh` had lost a specimen the same way on 2026-09-30. Caught, the
+# write fails with EPIPE instead, and the lane goes on to the checks that say
+# what the session held. **Caught, not ignored**, for the reason
+# `busybox-test.sh` gives: an ignored signal is inherited by every program the
+# lane starts, and changes what their pipelines answer.
+trap ':' PIPE
+
 # The domain's disk is written to now, so it is rebuilt before every run.
 # A fixture a test mutates is a fixture whose next run starts somewhere nobody
 # chose, and this one carries the marker other checks look for in sector zero.
@@ -431,6 +445,9 @@ if await "$started" && await "$prompt"; then
     PROMPT_MS=$(( $(date +%s%3N) - SHELL_STARTED_MS ))
     first=1
     while IFS= read -r -d $'\r' line; do
+        # A machine that has gone stops the typing, rather than every line
+        # left failing to write (see `trap ':' PIPE` above).
+        kill -0 "$qemu" 2>/dev/null || break
         printf '%s\r' "$line" >&3
 
         # Paced by the machine, not by a clock.
