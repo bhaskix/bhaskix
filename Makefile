@@ -1344,6 +1344,20 @@ gates:
 	else \
 	    printf '  \033[1;32mok\033[0m    the guides check refuses a guide wrong five ways\n'; \
 	fi
+# A table row has no more cells than its table has columns. GitHub drops a
+# row's extra cells without a word, and a `|` left unescaped -- in a code span
+# too -- makes one: on 2026-11-05 eight rows were hiding text that way, 9,548
+# characters of TRACKER's status table and 30,890 of one defect row, its status
+# among them. Watched refusing the fixture's one wide row and nothing else in it.
+	tools/check-md-tables.py
+	@mkdir -p build
+	@if tools/check-md-tables.py --only tests/fixtures/md-tables/wide.md >build/md-tables-fixture.log 2>&1; then \
+	    printf '  \033[1;31mFAIL\033[0m  the table check accepted a row wider than its table\n'; exit 1; \
+	elif [ "$$(grep -c 'FAIL' build/md-tables-fixture.log)" != 1 ] || ! grep -q 'wide.md:11:' build/md-tables-fixture.log; then \
+	    printf '  \033[1;31mFAIL\033[0m  the table check did not name the fixture'"'"'s one wide row, and only it\n'; exit 1; \
+	else \
+	    printf '  \033[1;32mok\033[0m    the table check refuses a row wider than its table, and only that row\n'; \
+	fi
 # And watched refusing one. `architecture.md` §7 claimed for a year that
 # architecture-specific instructions appear only in `arch/` while nothing checked
 # it; the fixture is a crate holding one instruction and declaring no budget,

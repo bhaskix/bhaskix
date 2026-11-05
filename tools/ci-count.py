@@ -59,6 +59,14 @@ denominator would divide real sightings by boots that could never have produced
 a visible one, and report a rate too low. They are excluded, and that means the
 *incidence* is higher than the count even when the *rate* is right.
 
+**4. A run's number is its workflow's, not the repository's.** Boots were
+looked up by `run_number`, and the `release` workflow has a run 1 and a run 2
+(2026-10-20 and 2026-10-31) that took the places of `ci` runs 1 and 2, two
+boots each -- so from 2026-10-20 every window reaching back to 2026-08-03
+counted four boots too few: 10,338 for 10,342. Found 2026-11-05 by adding up
+a window by hand and getting a different total. Keyed by run id now; the
+`lanes.json` cache always was.
+
 # What it cannot tell you
 
 **Zero before a detector existed is blind, not clean.** This tool counts what
@@ -227,7 +235,8 @@ def boots_in(run, lanes):
     """Boots in this run whose failure would have been reported."""
     if run["name"] == "soak":
         return SOAK_BOOTS
-    return lanes.get(run["run_number"], 0)
+    # By id: a run's *number* is its workflow's -- see reason 4 above.
+    return lanes.get(run["id"], 0)
 
 
 LANES = CACHE / "lanes.json"
@@ -355,7 +364,7 @@ def main():
         if i % 25 == 0:
             print(f"{DIM}  ... {i}/{len(runs)}{RESET}", file=sys.stderr)
         if run["name"] != "soak":
-            lanes[run["run_number"]] = lane_count(run, by_id)
+            lanes[run["id"]] = lane_count(run, by_id)
         if run["conclusion"] != "failure" and run["run_attempt"] == 1:
             continue  # nothing failed in it, so nothing to read
         for job, name, attempt in failed_jobs(run, by_run):

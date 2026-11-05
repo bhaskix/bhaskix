@@ -236,7 +236,7 @@ reading closed, on the lead's word -- twenty-three rows not closed, and twenty i
 
 | Defect — what you would see | Rate, as TRACKER states it | Fix |
 |---|---|---|
-| An outbound TCP demonstration stalls: `connected, stream still in flight` | ~~11 sightings in 7,762 boots, 1 in 705, counted by the tool; the latest specimens 2026-09-29 (CI run 782) and 2026-10-02~~ **15 in 10,258 CI boots, 1 in 683**, counted by the tool 2026-11-05 -- the 11 was a count of 2026-09-28 and four came after it; the latest CI specimens 2026-10-12 and 2026-11-01, and one local, 2026-10-31 | none |
+| An outbound TCP demonstration stalls: `connected, stream still in flight` | ~~11 sightings in 7,762 boots, 1 in 705, counted by the tool; the latest specimens 2026-09-29 (CI run 782) and 2026-10-02~~ ~~**15 in 10,258 CI boots, 1 in 683**~~ **16 in 10,352 CI boots, 1 in 647**, counted by the tool 2026-11-05, the sixteenth that evening (CI run 906) -- the 11 was a count of 2026-09-28 and four came after it; the latest CI specimens 2026-11-01 and 2026-11-05, and one local, 2026-10-31 | none |
 | The four-client TCP act accepts nobody: `tcp four FAILED ... 0 accepted` | **3 sightings** (2026-10-12, twice on 2026-10-15). A fourth was counted, and dated 2026-10-16; it ran on 2026-10-19, was the test harness's own fault, and is withdrawn. All three were local; none in the 153 CI runs since the act was added (2026-11-05) | not explained |
 | The inbound TCP echo is served and the host never receives the bytes | **4 sightings** (CI 2026-09-13, 09-23, 10-08; locally 10-15); none in the 56 CI runs since the 2026-10-19 change (2026-11-05) | the host's driver changed 2026-10-19 to stay and hear its reply; open until it has gone a while without a sighting |
 | A hosted UDP read never ends (the probe thread spins) | 5 times locally, the last 2026-10-10; 0 in 10,278 CI boots (2026-11-05) | none |
@@ -254,7 +254,9 @@ reading closed, on the lead's word -- twenty-three rows not closed, and twenty i
 | A `poll` probe says "not ready" for a domain with no console grant | 1 sighting, local (2026-10-12); 0 in 6,698 CI boots since the probe was added on 2026-08-28 (counted 2026-11-05) | parked until the next one; the cause is an inference |
 | The native TPM lane's second serial log comes back empty | 1 in 9 local runs (2026-10-11); never on CI, whose two `COM2 is missing` failures that day had other causes, both fixed then (2026-11-05) | instrumented, not explained |
 | BusyBox `sh` faults at `0x48` | ~2% of harness runs; 0 of 8,443 CI boots (2026-10-04); 0 in 164 loaded local boots read whole, the window open in two (2026-11-05) | likely fixed 2026-10-02, not proven -- **seen at work once** (2026-11-05): a loaded boot met the specimen's state, the fix loaded the base, and BusyBox ran |
-| A per-CPU hold count underflows (the remainder of the old "445 ms wake" row) | no specimen in 450 boots of one image (2026-08-28) | a cause guarded 2026-09-03; not shown to be *the* cause |
+| A per-CPU hold count underflows (the remainder of the old "445 ms wake" row) | no specimen in 450 boots of one image (2026-08-28); on CI none since 2026-08-18, in at least 5,754 boots of the lanes that fail on it (2026-11-05) | a cause guarded 2026-09-03; not shown to be *the* cause |
+
+**Every CI-boot figure above counted from the start of CI's history, 2026-08-03, is four boots short** (2026-11-05): the counting tool looked a run's boots up by its *number*, which is per workflow, and the release workflow's runs 1 and 2 took the places of CI runs 1 and 2 -- so 10,338 is 10,342. Found and fixed that day; the figures stand as counted, each low by under 0.04%; those counted from a later date are not affected, and the outbound TCP row's 10,352 was counted after the fix.
 
 **Several of these have fixes waiting on a count**, and the column says which.
 "Likely fixed, not proven" means exactly that: a clean run at the old rate is
