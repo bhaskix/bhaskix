@@ -357,9 +357,10 @@ triggers six CPU exceptions and checks each is reported rather than
 triple-faulting. Any `FAILED` the kernel prints fails the run, whether or not a
 gate was looking for that particular one.
 
-That is ~~**1,262 assertions**~~ **2,716 assertions**, counted 2026-11-05 -- the same in all
-seven full suites run that day; 1,262 was this line's from 2026-08-24 and nothing recounted it
-here for ten weeks -- on a definition written down at last on 2026-08-24: every line a harness prints through its own success marker during
+That is ~~**1,262 assertions**~~ ~~**2,716 assertions**~~ **2,718 assertions**, counted
+2026-11-06 on the suite of `5930905` -- whose own table gate added two lines; 2,716 was all seven
+full suites of 2026-11-05 before it, and 1,262 this line's from 2026-08-24, which nothing
+recounted for ten weeks -- on a definition written down at last on 2026-08-24: every line a harness prints through its own success marker during
 one `make test`, counted once per run — so a gate that answers on five
 placements counts five times, because the suite executes it five times. Run it
 yourself:
@@ -369,8 +370,8 @@ make test | sed 's/\x1b\[[0-9;]*m//g' | grep -cE '^ *ok +'
 ```
 
 [TRACKER.md](TRACKER.md)'s suite cell counts **2,664** for the same runs, by a narrower rule it
-states -- `ok ` at a line's very start -- which leaves out the 52 lines `make gates` prints
-indented. Both are right by their own rule; this one is the command above.
+states -- `ok ` at a line's very start -- which leaves out the lines `make gates` prints
+indented: 52 on 2026-11-05, 54 since the table gate. Both are right by their own rule; this one is the command above.
 
 > This line said **"601 checks"** and had been stale since at least
 > 2026-08-14, when [TRACKER.md](TRACKER.md) recorded that it no longer matched
