@@ -117,7 +117,7 @@ chooses, nothing to parse but offsets:
 |---|---|---|
 | 0 | 16 | magic `"bhaskix boot v1\0"` — domain separation: a signature over this can never be a signature over anything else the project signs |
 | 16 | 4 | algorithm — `1` is SLH-DSA-SHA2-128s; the only value step 1 accepts |
-| 20 | 4 | security version — **must be 0** until secure update (T7) gives it a meaning; carried now so a format change is not needed then |
+| 20 | 4 | security version — ~~**must be 0** until secure update (T7) gives it a meaning~~ **given its meaning 2026-11-03 by [RFC 0100](0100-an-update-that-cannot-go-back.md) step 2**: checked, once the signature verifies, against a rollback counter in the TPM; 0 is no version. Carried from the start, so no format change was needed |
 | 24 | 8 | key id — the first 8 bytes of SHA-256 over the public key |
 | 32 | 32 | SHA-256 of `bhaskix\kernel`, as read |
 | 64 | 32 | SHA-256 of `bhaskix\initrd.tar`, as read |

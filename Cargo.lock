@@ -119,6 +119,10 @@ name = "bhaskix-rand"
 version = "0.0.0"
 
 [[package]]
+name = "bhaskix-rollback"
+version = "0.0.0"
+
+[[package]]
 name = "bhaskix-service"
 version = "0.0.0"
 dependencies = [

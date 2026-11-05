@@ -10,7 +10,7 @@
 //! |---|---|---|
 //! | 0 | 16 | [`MAGIC`], so a signature over this is never one over anything else the project signs |
 //! | 16 | 4 | algorithm: [`ALGORITHM`] is the only one accepted |
-//! | 20 | 4 | security version: must be 0 until secure update gives it a meaning |
+//! | 20 | 4 | security version: the set's place against the rollback counter (RFC 0100 step 2); 0 is none |
 //! | 24 | 8 | key id: the first 8 bytes of SHA-256 over the public key |
 //! | 32 | 32 | SHA-256 of `bhaskix\kernel` |
 //! | 64 | 32 | SHA-256 of `bhaskix\initrd.tar` |
@@ -22,6 +22,12 @@
 //! [`check`] takes the digests of what the loader holds rather than the
 //! buffers themselves, so this stays pure: hashing what was read is the
 //! loader's job, and it measures before anything here runs.
+//!
+//! **The security version** ([RFC 0100](../../docs/rfc/0100-an-update-that-cannot-go-back.md)
+//! step 2) "must be 0 until secure update gives it a meaning" until
+//! 2026-11-03, and is read now: [`check`] takes the rollback counter's floor
+//! and refuses a set whose version is below it, **after** the signature has
+//! verified, since a version nobody signed is a number anyone could write.
 
 use crate::slh_dsa::{self, PUBLIC_KEY_BYTES, SIGNATURE_BYTES};
 use bhaskix_sha256::{DIGEST, digest};
@@ -72,8 +78,14 @@ pub enum Refusal {
     NotAStatement,
     /// The statement names an algorithm other than [`ALGORITHM`].
     UnknownAlgorithm(u32),
-    /// The statement's security version is not 0.
-    SecurityVersion(u32),
+    /// The set is genuinely signed and older than the rollback counter
+    /// allows: its security version is below the counter's floor.
+    RolledBack {
+        /// The set's security version.
+        version: u32,
+        /// The counter's floor.
+        floor: u32,
+    },
     /// The kernel read is not the one the statement names.
     KernelDiffers,
     /// The initrd read is not the one the statement names.
@@ -96,7 +108,9 @@ impl Refusal {
             Self::UnknownAlgorithm(_) => {
                 "the statement names an algorithm this loader does not know"
             }
-            Self::SecurityVersion(_) => "the statement's security version is not 0",
+            Self::RolledBack { .. } => {
+                "the set is signed, and older than the rollback counter allows"
+            }
             Self::KernelDiffers => "the kernel is not the one boot.sig names",
             Self::InitrdDiffers => "the initrd is not the one boot.sig names",
             Self::BootConfDiffers => "boot.conf is not the one boot.sig names",
@@ -116,13 +130,13 @@ pub struct BootSig<'a> {
 
 impl<'a> BootSig<'a> {
     /// Reads `bytes` as a `boot.sig`: exactly [`BOOT_SIG_BYTES`], the magic,
-    /// the one algorithm, and a security version of 0.
+    /// and the one algorithm. Any security version is read; [`check`] is
+    /// what weighs it, once the signature has verified.
     ///
     /// # Errors
     ///
-    /// The first of [`Refusal::WrongSize`], [`Refusal::NotAStatement`],
-    /// [`Refusal::UnknownAlgorithm`] and [`Refusal::SecurityVersion`] that
-    /// holds.
+    /// The first of [`Refusal::WrongSize`], [`Refusal::NotAStatement`] and
+    /// [`Refusal::UnknownAlgorithm`] that holds.
     pub fn parse(bytes: &'a [u8]) -> Result<Self, Refusal> {
         if bytes.len() != BOOT_SIG_BYTES {
             return Err(Refusal::WrongSize);
@@ -136,14 +150,9 @@ impl<'a> BootSig<'a> {
             signature,
         };
         match sig.word(16) {
-            ALGORITHM => {}
-            other => return Err(Refusal::UnknownAlgorithm(other)),
+            ALGORITHM => Ok(sig),
+            other => Err(Refusal::UnknownAlgorithm(other)),
         }
-        match sig.word(20) {
-            0 => {}
-            other => return Err(Refusal::SecurityVersion(other)),
-        }
-        Ok(sig)
     }
 
     fn word(&self, at: usize) -> u32 {
@@ -154,6 +163,13 @@ impl<'a> BootSig<'a> {
 
     fn digest_at(&self, at: usize) -> &[u8] {
         &self.statement[at..at + DIGEST]
+    }
+
+    /// The security version the statement names: believed only once
+    /// [`check`] has verified the signature over it.
+    #[must_use]
+    pub fn security_version(&self) -> u32 {
+        self.word(20)
     }
 
     /// The key id the statement names.
@@ -180,14 +196,16 @@ impl<'a> BootSig<'a> {
     }
 }
 
-/// The statement naming `digests` under the key with id `key_id`: what
-/// `bootsign` signs (RFC 0091 step 2).
+/// The statement naming `digests` at security version `version` under the
+/// key with id `key_id`: what `bootsign` signs (RFC 0091 step 2; the version
+/// RFC 0100 step 2's).
 #[cfg(feature = "sign")]
 #[must_use]
-pub fn statement(key_id: &KeyId, digests: &Digests) -> [u8; STATEMENT_BYTES] {
+pub fn statement(key_id: &KeyId, digests: &Digests, version: u32) -> [u8; STATEMENT_BYTES] {
     let mut bytes = [0; STATEMENT_BYTES];
     bytes[..16].copy_from_slice(&MAGIC);
     bytes[16..20].copy_from_slice(&ALGORITHM.to_le_bytes());
+    bytes[20..24].copy_from_slice(&version.to_le_bytes());
     bytes[24..32].copy_from_slice(key_id);
     bytes[32..64].copy_from_slice(&digests.kernel);
     bytes[64..96].copy_from_slice(&digests.initrd);
@@ -195,11 +213,21 @@ pub fn statement(key_id: &KeyId, digests: &Digests) -> [u8; STATEMENT_BYTES] {
     bytes
 }
 
+/// A boot set [`check`] accepted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Verified {
+    /// The key that verified it.
+    pub key_id: KeyId,
+    /// Its security version, now that a signature covers it.
+    pub version: u32,
+}
+
 /// Verifies `boot_sig` for the boot set whose files hash to `held`, against
-/// the keys the loader holds, in RFC 0091's order: the statement read, the
-/// three digests compared, the key found, the signature verified.
-///
-/// Returns the id of the key that verified it.
+/// the keys the loader holds, in RFC 0091's order -- the statement read, the
+/// three digests compared, the key found, the signature verified -- and then
+/// RFC 0100's: the signed security version against the rollback counter's
+/// `floor`. A floor of 0 refuses nothing; it is what a machine with no
+/// counter passes.
 ///
 /// # Errors
 ///
@@ -208,7 +236,8 @@ pub fn check(
     boot_sig: &[u8],
     keys: &[[u8; PUBLIC_KEY_BYTES]],
     held: &Digests,
-) -> Result<KeyId, Refusal> {
+    floor: u32,
+) -> Result<Verified, Refusal> {
     let sig = BootSig::parse(boot_sig)?;
     if *sig.digest_at(32) != held.kernel {
         return Err(Refusal::KernelDiffers);
@@ -223,9 +252,15 @@ pub fn check(
     let Some(key) = keys.iter().find(|key| key_id(key) == named) else {
         return Err(Refusal::UnknownKey(named));
     };
-    slh_dsa::verify(sig.statement, sig.signature, &[], key)
-        .map(|()| named)
-        .map_err(|_| Refusal::BadSignature)
+    slh_dsa::verify(sig.statement, sig.signature, &[], key).map_err(|_| Refusal::BadSignature)?;
+    let version = sig.security_version();
+    if version < floor {
+        return Err(Refusal::RolledBack { version, floor });
+    }
+    Ok(Verified {
+        key_id: named,
+        version,
+    })
 }
 
 #[cfg(test)]
@@ -301,12 +336,15 @@ mod tests {
     }
 
     #[test]
-    fn a_security_version_other_than_0_is_refused() {
+    fn any_security_version_is_read_and_none_is_believed_unsigned() {
         let mut bytes = boot_sig();
-        bytes[20..24].copy_from_slice(&1u32.to_le_bytes());
+        bytes[20..24].copy_from_slice(&7u32.to_le_bytes());
+        assert_eq!(BootSig::parse(&bytes).unwrap().security_version(), 7);
+        // A version below the floor with no signature is refused for the
+        // signature, not the version: an unsigned number is not a version.
         assert_eq!(
-            BootSig::parse(&bytes).err(),
-            Some(Refusal::SecurityVersion(1))
+            check(&bytes, &[KEY], &held(), 8),
+            Err(Refusal::BadSignature)
         );
     }
 
@@ -315,24 +353,33 @@ mod tests {
         let bytes = boot_sig();
         let mut wrong = held();
         wrong.kernel[31] ^= 1;
-        assert_eq!(check(&bytes, &[KEY], &wrong), Err(Refusal::KernelDiffers));
+        assert_eq!(
+            check(&bytes, &[KEY], &wrong, 0),
+            Err(Refusal::KernelDiffers)
+        );
         let mut wrong = held();
         wrong.initrd[0] ^= 1;
-        assert_eq!(check(&bytes, &[KEY], &wrong), Err(Refusal::InitrdDiffers));
+        assert_eq!(
+            check(&bytes, &[KEY], &wrong, 0),
+            Err(Refusal::InitrdDiffers)
+        );
         let mut wrong = held();
         wrong.boot_conf = digest(b"cmdline=\n");
-        assert_eq!(check(&bytes, &[KEY], &wrong), Err(Refusal::BootConfDiffers));
+        assert_eq!(
+            check(&bytes, &[KEY], &wrong, 0),
+            Err(Refusal::BootConfDiffers)
+        );
     }
 
     #[test]
     fn a_key_the_loader_does_not_hold_is_named() {
         let other = [8; PUBLIC_KEY_BYTES];
         assert_eq!(
-            check(&boot_sig(), &[other], &held()),
+            check(&boot_sig(), &[other], &held(), 0),
             Err(Refusal::UnknownKey(key_id(&KEY)))
         );
         assert_eq!(
-            check(&boot_sig(), &[], &held()),
+            check(&boot_sig(), &[], &held(), 0),
             Err(Refusal::UnknownKey(key_id(&KEY)))
         );
     }
@@ -341,7 +388,7 @@ mod tests {
     fn a_statement_that_passes_every_other_check_still_needs_its_signature() {
         // Every check before the signature holds; the signature is zeroes.
         assert_eq!(
-            check(&boot_sig(), &[KEY], &held()),
+            check(&boot_sig(), &[KEY], &held(), 0),
             Err(Refusal::BadSignature)
         );
     }
@@ -352,7 +399,10 @@ mod tests {
             Refusal::WrongSize,
             Refusal::NotAStatement,
             Refusal::UnknownAlgorithm(2),
-            Refusal::SecurityVersion(1),
+            Refusal::RolledBack {
+                version: 1,
+                floor: 2,
+            },
             Refusal::KernelDiffers,
             Refusal::InitrdDiffers,
             Refusal::BootConfDiffers,

@@ -25,6 +25,7 @@
 
 use core::panic::PanicInfo;
 
+mod counter;
 mod efi;
 mod handoff;
 mod paging;
@@ -788,6 +789,40 @@ fn report_signature(signature: Signature, secure_boot: efi::SecureBoot, falling_
     diag(line.as_str());
 }
 
+/// The set's security version against the rollback counter (RFC 0100 step
+/// 2): a verified set's, or a refused one's and the floor it fell below.
+fn report_version(signature: Signature, version: Option<u32>, counter: &counter::Counter) {
+    let mut line = Line::new();
+    match (version, signature) {
+        (Some(version), _) => {
+            line.push("bhaskixboot: security version ");
+            line.push_dec(u64::from(version));
+            match counter {
+                counter::Counter::Here { .. } => {
+                    line.push("; the rollback counter is at ");
+                    line.push_dec(u64::from(counter.floor()));
+                }
+                counter::Counter::Absent => line.push("; no rollback counter to hold it to"),
+            }
+        }
+        (
+            None,
+            Signature::NotVerified(Unverified::Refused(
+                bhaskix_bootsig::statement::Refusal::RolledBack { version, floor },
+            )),
+        ) => {
+            line.push("bhaskixboot: security version ");
+            line.push_dec(u64::from(version));
+            line.push(" is below the rollback counter's ");
+            line.push_dec(u64::from(floor));
+            line.push(": an older set, signed and refused");
+        }
+        _ => return,
+    }
+    line.push("\r\n");
+    diag(line.as_str());
+}
+
 /// One line, assembled before it is written. **`diag` must be handed whole
 /// lines**: it writes the wire and the firmware console, and OVMF mirrors its
 /// console onto the same wire, so a line written in pieces arrives with each
@@ -986,6 +1021,12 @@ extern "efiapi" fn efi_main(image_handle: usize, system_table: *mut SystemTable)
     let plan = slot_disk.as_mut().map(plan_slots);
     let secure_boot = efi::secure_boot(table);
 
+    // **RFC 0100 step 2: the rollback counter**, read before any set is
+    // checked, so every set this boot reads -- a slot's or the ESP's -- is
+    // held to its floor. Created only on a boot that found a slot disk.
+    let counter = counter::open(table, slot_disk.is_some());
+    let floor = counter.floor();
+
     // The sources, in order: the ESP alone; or the first slot, the other, and
     // -- only when neither verified and Secure Boot is off -- the first again,
     // booted unverified and said so, as an unverified set on the ESP is.
@@ -996,7 +1037,7 @@ extern "efiapi" fn efi_main(image_handle: usize, system_table: *mut SystemTable)
     let mut conf = [0u8; 4096];
     let mut sig = [0u8; 8192];
     let mut attempt = 0;
-    let (kernel_len, initrd_len, conf_len, tcg2, signature) = loop {
+    let (kernel_len, initrd_len, conf_len, tcg2, signature, version, booted_slot) = loop {
         let slot = attempts[attempt];
         let set = match (slot, slot_disk.as_mut()) {
             (Some(slot), Some(disk)) => read_slot_set(
@@ -1066,6 +1107,8 @@ extern "efiapi" fn efi_main(image_handle: usize, system_table: *mut SystemTable)
             report_secure_boot(secure_boot);
         }
         let started = tsc();
+        // The set's security version, once a signature covers it.
+        let mut version = None;
         let signature = match set.sig_read {
             Err(why) => Signature::NotVerified(why),
             Ok(_) if set.conf_unreadable => Signature::NotVerified(Unverified::Unreadable),
@@ -1075,11 +1118,14 @@ extern "efiapi" fn efi_main(image_handle: usize, system_table: *mut SystemTable)
                     initrd: bhaskix_sha256::digest(&initrd_buffer[..set.initrd_len]),
                     boot_conf: bhaskix_sha256::digest(&conf[..set.conf_len]),
                 };
-                match bhaskix_bootsig::check(&sig[..len], keys::KEYS, &held) {
-                    Ok(key_id) => Signature::Verified {
-                        key_id,
-                        secure_boot: secure_boot == efi::SecureBoot::On,
-                    },
+                match bhaskix_bootsig::check(&sig[..len], keys::KEYS, &held, floor) {
+                    Ok(verified) => {
+                        version = Some(verified.version);
+                        Signature::Verified {
+                            key_id: verified.key_id,
+                            secure_boot: secure_boot == efi::SecureBoot::On,
+                        }
+                    }
                     Err(refusal) => Signature::NotVerified(Unverified::Refused(refusal)),
                 }
             }
@@ -1108,12 +1154,15 @@ extern "efiapi" fn efi_main(image_handle: usize, system_table: *mut SystemTable)
             && !verified
             && (attempt == 0 || (attempt == 1 && secure_boot != efi::SecureBoot::On));
         report_signature(signature, secure_boot, falling_back);
+        report_version(signature, version, &counter);
         let done = (
             set.kernel_len,
             set.initrd_len,
             set.conf_len,
             tcg2,
             signature,
+            version,
+            slot,
         );
         let Some(slot) = slot else {
             break done;
@@ -1143,6 +1192,24 @@ extern "efiapi" fn efi_main(image_handle: usize, system_table: *mut SystemTable)
         attempt = 2;
     };
     efi::close(root);
+    // **The counter moves, if it moves, and is locked** -- before the policy
+    // below can refuse, so a refused boot leaves it locked too. It moves only
+    // for a verified set the record marks good: the active slot's.
+    let marked_good = match (
+        booted_slot,
+        slot_disk.as_ref().and_then(|disk| disk.record.ok()),
+    ) {
+        (Some(slot), Some(record)) => record.active == slot,
+        _ => false,
+    };
+    counter::advance_and_lock(
+        &counter,
+        bhaskix_rollback::Booted {
+            version: version.unwrap_or(0),
+            verified: version.is_some(),
+            marked_good,
+        },
+    );
     // The command line the kernel is handed: the booted set's.
     let conf_text = core::str::from_utf8(&conf[..conf_len]).unwrap_or("");
     let cmdline = conf_text

@@ -43,6 +43,11 @@ bhaskix-sha256 = { path = "../../sha256" }
 # RFC 0100 step 1: the slot disk -- its GPT, slot headers, record and the boot
 # plan -- as host-tested arithmetic; the loader performs the reads and the one write.
 bhaskix-slotdisk = { path = "../../slotdisk" }
+# RFC 0100 step 2: the rollback counter -- the TPM commands that create, read,
+# advance and lock its NV index, and the rule for when it moves. The one crate
+# in the tree that builds a TPM command able to write, and only this loader may
+# depend on it (`tools/check-deps.py`).
+bhaskix-rollback = { path = "../../rollback" }
 
 [profile.release]
 panic = "abort"
@@ -123,4 +128,8 @@ asm_budget = 6
 # `WriteBlocks` and `FlushBlocks` the slot record needs, each laid out by rustfmt
 # a few lines long; and the scratch pages `slots.rs` reads small structures into.
 # Every decision about those bytes is `bhaskix-slotdisk`'s, at budget zero.
-unsafe_budget = 196
+# 205 on 2026-11-03, RFC 0100 step 2: nine lines, the one `SubmitCommand` call
+# that carries the rollback counter's commands to the TPM, its five arguments
+# laid out by rustfmt one to a line. Every byte sent and every reading of a
+# response is `bhaskix-rollback`'s, at budget zero.
+unsafe_budget = 205

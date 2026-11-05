@@ -1,0 +1,34 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# RFC 0100 step 2: the rollback counter as bytes and arithmetic -- the TPM
+# commands that create, read, advance and lock one NV bits index, the parsers
+# for what a TPM answers, and the rule that says when the counter moves.
+#
+# Depends on nothing, as `bhaskix-tpm` depends on nothing: a command is bytes a
+# TPM reads and a response is bytes a TPM wrote. The loader hands them to the
+# firmware's `SubmitCommand`. **Only the loader may link this crate**
+# (`tools/check-deps.py`): `bin/tpmd` builds no command but `TPM2_PCR_Read`,
+# and RFC 0089's read-only rule is reopened for this one index alone.
+[package]
+name = "bhaskix-rollback"
+description = "The rollback counter: a TPM NV bits index, as commands, responses and arithmetic."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[lib]
+name = "bhaskix_rollback"
+path = "src/lib.rs"
+
+[dependencies]
+
+[lints]
+workspace = true
+
+[package.metadata.bhaskix]
+# Zero, and `forbid(unsafe_code)` says it again: the firmware call is the
+# loader's.
+unsafe_budget = 0

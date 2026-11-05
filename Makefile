@@ -289,7 +289,7 @@ OVMF_VARS    := $(firstword $(wildcard $(OVMF_DIR)OVMF_VARS$(OVMF_SUFFIX).fd))
 
 .PHONY: FORCE all kernel iso demo demo-fresh test-busybox-v3 check-fpstate-hw run run-uefi release-dist release-finish ceremony-kit progress test test-host test-boot test-boot-uefi test-boot-uefi-qemu64 test-boot-iommu test-keyboard \
         test-boot-iommu-off test-boot-qemu64 test-boot-native test-boot-native-full test-boot-native-tpm \
-        test-boot-native-tpm-tis test-boot-secureboot test-release-keys test-ahci-foreign test-disk-keeps test-audit-stall test-boot-slots test-placements mkfs bootsign audit-verify test-shell test-faults test-usb-keyboard test-lacp test-bond test-http fmt clippy gates hooks clean distclean help
+        test-boot-native-tpm-tis test-boot-secureboot test-release-keys test-ahci-foreign test-disk-keeps test-audit-stall test-boot-slots test-boot-rollback test-placements mkfs bootsign audit-verify test-shell test-faults test-usb-keyboard test-lacp test-bond test-http fmt clippy gates hooks clean distclean help
 
 all: iso
 
@@ -845,7 +845,7 @@ run-uefi: $(ISO)
 test: fmt clippy test-host check-fpstate-hw gates test-boot test-boot-uefi test-boot-iommu test-boot-iommu-off \
       test-boot-qemu64 test-boot-uefi-qemu64 test-boot-native test-boot-native-full test-boot-native-tpm \
       test-boot-native-tpm-tis test-boot-secureboot test-release-keys test-placements test-shell \
-      test-ahci-foreign test-disk-keeps test-audit-stall test-boot-slots test-keyboard test-usb-keyboard test-busybox test-bond test-lacp \
+      test-ahci-foreign test-disk-keeps test-audit-stall test-boot-slots test-boot-rollback test-keyboard test-usb-keyboard test-busybox test-bond test-lacp \
       test-faults test-http
 	@echo
 	@echo "  all checks passed"
@@ -1063,6 +1063,14 @@ test-boot-native-full: $(BOOTEFI) $(ISO) bootsign
 # a damaged record not believed, and no slot disk read from the ESP as before.
 test-boot-slots: $(BOOTEFI) $(ISO) bootsign
 	BHASKIX_KEEP_LOGS=build/slot-boot-logs tests/qemu/slot-boot-test.sh
+
+# RFC 0100 step 2: the rollback counter in an emulated TPM whose state outlives
+# each boot -- created on the first boot with a slot disk, moved only by a set
+# marked good, locked every boot and the lock proven, and a genuinely signed
+# older set refused, from a slot or from the ESP. Needs docker for
+# `tools/swtpm.sh`, and says `skip` without it, as the TPM lanes do.
+test-boot-rollback: $(BOOTEFI) $(ISO) bootsign
+	BHASKIX_KEEP_LOGS=build/slot-rollback-logs tests/qemu/slot-rollback-test.sh
 
 # RFC 0089: the native lane with a TPM 2.0 attached, through the emulator
 # `tools/swtpm.sh` runs in a container. In `make test` since step 2 gave it

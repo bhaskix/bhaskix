@@ -7,7 +7,8 @@
 //!
 //! ```text
 //! bootsign keygen [--test]                      a key pair, outside the tree
-//! bootsign sign --key <file.secret> <esp-dir>   writes <esp-dir>/bhaskix/boot.sig
+//! bootsign sign --key <file.secret> [--security-version N] <esp-dir>
+//!                                               writes <esp-dir>/bhaskix/boot.sig
 //! bootsign show <esp-dir> [--public <file>]...  what the loader would decide
 //! ```
 //!
@@ -24,6 +25,12 @@
 //! two `boot.sig` files that both verify. Every `boot.sig` is checked with the
 //! loader's own `check` before it is written; one that would not verify is
 //! never written.
+//!
+//! **The security version** (RFC 0100 step 2) is 0 unless `--security-version`
+//! says otherwise, and at most 64, the versions the rollback counter can
+//! record. Raise it for a set that fixes something an older set must never be
+//! booted again to undo: once a set at that version has been marked good on a
+//! machine, its loader refuses every set below it.
 
 use bhaskix_bootsig::slh_dsa::{self, N, PUBLIC_KEY_BYTES, SECRET_KEY_BYTES};
 use bhaskix_bootsig::statement::{self, BOOT_SIG_BYTES, BootSig, Digests, KeyId, TEST_KEY_ID};
@@ -41,8 +48,14 @@ const RESET: &str = "\x1b[0m";
 
 const USAGE: &str = "usage:
   bootsign keygen [--test]
-  bootsign sign --key <file.secret> <esp-dir>
+  bootsign sign --key <file.secret> [--security-version N] <esp-dir>
   bootsign show <esp-dir> [--public <file.public>]...";
+
+/// The highest security version the rollback counter records, one per bit
+/// of its TPM index: `bhaskix-rollback`'s `MAX_VERSION`, repeated because only
+/// the loader may link that crate. A set above it would verify and could never
+/// be recorded, so it is not made.
+const MAX_SECURITY_VERSION: u32 = 64;
 
 /// The test key's file names, under `tests/keys/`.
 const TEST_KEY: &str = "bootsig-TEST-KEY";
@@ -209,30 +222,41 @@ fn key_label(id: &KeyId) -> String {
 }
 
 fn sign(args: &[String]) -> Result<(), Refused> {
-    let [flag, key, esp] = args else {
-        return Err(Refused(format!(
-            "sign takes --key <file.secret> <esp-dir>\n{USAGE}"
-        )));
+    let takes = || {
+        Refused(format!(
+            "sign takes --key <file.secret> [--security-version N] <esp-dir>\n{USAGE}"
+        ))
     };
-    if flag != "--key" {
-        return Err(Refused(format!(
-            "sign takes --key <file.secret> <esp-dir>\n{USAGE}"
-        )));
-    }
+    let (key, version, esp) = match args {
+        [flag, key, esp] if flag == "--key" => (key, 0, esp),
+        [flag, key, vflag, version, esp] if flag == "--key" && vflag == "--security-version" => {
+            let version: u32 = version.parse().map_err(|_| {
+                Refused(format!("--security-version takes a number, not {version}"))
+            })?;
+            if version > MAX_SECURITY_VERSION {
+                return Err(Refused(format!(
+                    "--security-version {version} is above {MAX_SECURITY_VERSION}, the most the \
+                     rollback counter can record"
+                )));
+            }
+            (key, version, esp)
+        }
+        _ => return Err(takes()),
+    };
     let sk = secret_key(Path::new(key))?;
     let mut pk = [0; PUBLIC_KEY_BYTES];
     pk.copy_from_slice(&sk[2 * N..]);
     let id = statement::key_id(&pk);
     let esp = Path::new(esp);
     let digests = held(esp)?;
-    let stmt = statement::statement(&id, &digests);
+    let stmt = statement::statement(&id, &digests, version);
     let signature = slh_dsa::sign(&stmt, &[], &sk, Some(&random::<N>()?))
         .map_err(|e| Refused(format!("signing failed: {e:?}")))?;
     let mut file = Vec::with_capacity(BOOT_SIG_BYTES);
     file.extend_from_slice(&stmt);
     file.extend_from_slice(&signature);
     // The loader's own check, before anything is written.
-    if let Err(refusal) = statement::check(&file, &[pk], &digests) {
+    if let Err(refusal) = statement::check(&file, &[pk], &digests, 0) {
         return Err(Refused(format!(
             "the boot.sig this made does not verify ({}): the secret key is damaged",
             refusal.describe()
@@ -242,7 +266,7 @@ fn sign(args: &[String]) -> Result<(), Refused> {
     fs::write(&out, &file)
         .map_err(|e| Refused(format!("could not write {}: {e}", out.display())))?;
     println!(
-        "{GREEN}ok{RESET}    signed {} with key {}",
+        "{GREEN}ok{RESET}    signed {} with key {}, security version {version}",
         out.display(),
         key_label(&id)
     );
@@ -276,6 +300,7 @@ fn show(args: &[String]) -> Result<(), Refused> {
     let named = sig.digests();
     let held = held(esp)?;
     println!("      boot.sig   key {}", key_label(&sig.key_id()));
+    println!("      version    {}", sig.security_version());
     for (file, statement, read) in [
         ("kernel", named.kernel, held.kernel),
         ("initrd.tar", named.initrd, held.initrd),
@@ -292,9 +317,12 @@ fn show(args: &[String]) -> Result<(), Refused> {
         println!("      {DIM}signature not checked: no --public key given{RESET}");
         return Ok(());
     }
-    match statement::check(&bytes, &keys, &held) {
-        Ok(id) => {
-            println!("{GREEN}ok{RESET}    verified: key {}", key_label(&id));
+    match statement::check(&bytes, &keys, &held, 0) {
+        Ok(verified) => {
+            println!(
+                "{GREEN}ok{RESET}    verified: key {}",
+                key_label(&verified.key_id)
+            );
             Ok(())
         }
         Err(refusal) => {

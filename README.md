@@ -176,10 +176,12 @@ The `-ix` is the Unix lineage, the same suffix Minix and Linux carry.
 > or ended, is recorded in a hash chain `bin/auditd` keeps on the disk, a grant is refused when the
 > log is full, and a host tool names any record edited since -- but nothing anchors the chain's
 > head yet, so a log replaced whole is not detected. And **two boot slots**
-> ([RFC 0100](docs/rfc/0100-an-update-that-cannot-go-back.md), step 1 of 3): the loader boots from
-> a second disk holding sets A and B, spends a trial's boot before taking it, and falls back when
-> a set does not verify -- but nothing in the running system writes a slot yet, and no counter
-> refuses an older signed set.
+> ([RFC 0100](docs/rfc/0100-an-update-that-cannot-go-back.md), steps 1 and 2 of 3): the loader
+> boots from a second disk holding sets A and B, spends a trial's boot before taking it, and falls
+> back when a set does not verify; and since 2026-11-03 a **rollback counter** in the TPM refuses a
+> genuinely signed set older than the newest one booted as the active slot -- but nothing in the
+> running system writes a slot yet, and a TPM whose owner has no password lets anything that can
+> command it delete the counter.
 >
 > Nothing here should run anywhere that matters — see [SECURITY.md](SECURITY.md).
 >

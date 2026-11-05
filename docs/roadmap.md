@@ -396,8 +396,10 @@ cost* and is not a schedule.
   boot, the verified in-memory initrd as the immutable root for now, and a package key of its own.
   **2026-11-01**: the fifth decided (an update arrives from the kept disk first), and step 1 of 3
   built -- two slots on a second GPT disk, a trial that spends a boot before it is taken, and
-  fallback to the other slot in the same boot. Owed: the rollback counter (step 2) and the update
-  service (step 3)
+  fallback to the other slot in the same boot. ~~Owed: the rollback counter (step 2) and the update
+  service (step 3)~~ **2026-11-03: step 2 built** -- a rollback counter in the TPM, moved only by
+  the active slot's verified set and locked every boot, refusing a signed older set from a slot or
+  the ESP. Owed: the update service (step 3), after the release by the lead's decision of that day
 - **Audit framework** — hash-chained log over the telemetry plane, remote attestation. Third
   because the plane it consumes **already exists** ([RFC 0026](rfc/0026-telemetry-plane.md),
   Phase 2), which makes this the cheapest of the three to start and the one that moves T8 off

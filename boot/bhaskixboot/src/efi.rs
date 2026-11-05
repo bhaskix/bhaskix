@@ -241,8 +241,9 @@ struct SerialIo {
     mode: usize,
 }
 
-/// `EFI_TCG2_PROTOCOL`, down to the two calls RFC 0089 makes: the log
-/// (step 3) and the measurement (step 2).
+/// `EFI_TCG2_PROTOCOL`, down to the calls this loader makes: the log and the
+/// measurement (RFC 0089 steps 3 and 2), and a command to the TPM -- the
+/// rollback counter's, RFC 0100 step 2.
 ///
 /// `get_capability` is named so the offsets are right; nothing calls it.
 #[repr(C)]
@@ -261,6 +262,16 @@ pub struct Tcg2 {
         data_to_hash: u64,
         data_to_hash_len: u64,
         event: *const u8,
+    ) -> usize,
+    /// `SubmitCommand(This, InputParameterBlockSize, InputParameterBlock,
+    /// OutputParameterBlockSize, OutputParameterBlock)` -- EDK2's
+    /// `Tcg2Protocol.h`, the member after `HashLogExtendEvent`.
+    submit_command: unsafe extern "efiapi" fn(
+        this: *mut Tcg2,
+        input_size: u32,
+        input: *const u8,
+        output_size: u32,
+        output: *mut u8,
     ) -> usize,
 }
 
@@ -1040,6 +1051,35 @@ pub fn hash_log_extend_event(protocol: *mut Tcg2, bytes: &[u8], event: &[u8]) ->
             bytes.as_ptr() as u64,
             bytes.len() as u64,
             event.as_ptr(),
+        )
+    };
+    if status == SUCCESS {
+        Ok(())
+    } else {
+        Err(status)
+    }
+}
+
+/// Sends `command` to the TPM and lets the firmware write its response into
+/// `response` -- `SubmitCommand`, RFC 0100 step 2. The response says its own
+/// length, and every parser of it checks that against the buffer. Before
+/// `ExitBootServices` only.
+pub fn submit_command(
+    protocol: *mut Tcg2,
+    command: &[u8],
+    response: &mut [u8],
+) -> Result<(), usize> {
+    // SAFETY: `protocol` came from `LocateProtocol` with the TCG2 GUID and is
+    // the firmware's; both buffers are live for the call, the firmware only
+    // reads `command`, and it writes no more of `response` than its length,
+    // which is what is passed.
+    let status = unsafe {
+        ((*protocol).submit_command)(
+            protocol,
+            command.len() as u32,
+            command.as_ptr(),
+            response.len() as u32,
+            response.as_mut_ptr(),
         )
     };
     if status == SUCCESS {

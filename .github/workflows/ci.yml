@@ -293,10 +293,17 @@ jobs:
       # RFC 0100 step 1: A/B slots on a second disk -- a trial spent and ended, a
       # damaged slot refused with the other booted in the same boot, a damaged
       # record not believed, and no slot disk read from the ESP as before.
+      # Its recipe keeps a failing run's boot logs in build/slot-boot-logs, which
+      # the upload below names; an env value here would be overridden by it.
       - name: Boot the native loader from an A/B slot disk
-        env:
-          BHASKIX_KEEP_LOGS: slot-boot-logs
         run: make test-boot-slots
+      # RFC 0100 step 2: the rollback counter in an emulated TPM, kept across
+      # the lane's boots -- created, moved only by a set marked good, locked
+      # every boot, and a signed older set refused from a slot and the ESP.
+      - name: Refuse a signed older boot set by a rollback counter in the TPM (swtpm)
+        env:
+          BHASKIX_REQUIRE: 1
+        run: make test-boot-rollback
       - name: Boot through the native loader with a TPM 2.0 (swtpm)
         env:
           BHASKIX_REQUIRE: 1
@@ -337,6 +344,8 @@ jobs:
             native-full.log
             native-tpm.log
             native-tpm-tis.log
+            build/slot-boot-logs/
+            build/slot-rollback-logs/
             ci-env-native.txt
           retention-days: 7
 

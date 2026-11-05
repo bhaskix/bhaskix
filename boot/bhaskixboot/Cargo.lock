@@ -25,6 +25,10 @@ name = "bhaskix-rand"
 version = "0.0.0"
 
 [[package]]
+name = "bhaskix-rollback"
+version = "0.0.0"
+
+[[package]]
 name = "bhaskix-sha256"
 version = "0.0.0"
 
@@ -44,6 +48,7 @@ dependencies = [
  "bhaskix-bootsig",
  "bhaskix-elf",
  "bhaskix-rand",
+ "bhaskix-rollback",
  "bhaskix-sha256",
  "bhaskix-slotdisk",
  "bhaskix-tcglog",

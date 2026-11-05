@@ -83,6 +83,9 @@ members = [
     "auditlog",
     # RFC 0100 -- the A/B slot disk the native loader boots from, as arithmetic.
     "slotdisk",
+    # RFC 0100 step 2 -- the rollback counter's TPM commands and arithmetic.
+    # Only the loader may link it (`tools/check-deps.py`).
+    "rollback",
 
     # Phase 2 — RFC 0027 step 1. The client side of the network: the
     # exchange shapes, the refusal decoding and the wait discipline that

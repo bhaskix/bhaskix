@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | ⬜ **Draft 2026-10-31 — ~~nothing built~~ step 1 of 3 built 2026-11-01** (two slots on a GPT disk, the record, fallback, in the native loader); implementation plan written that day. ~~Questions for the lead~~ Questions 1-4 decided by the lead the same day, each as proposed; ~~question 5 open~~ question 5 decided by the lead on 2026-11-01, as proposed (§*Unresolved questions*). Drafted at the lead's request, as Phase 3's second row. |
+| **Status** | ⬜ **Draft 2026-10-31 — ~~nothing built~~ ~~step 1 of 3 built 2026-11-01~~ steps 1 and 2 of 3 built** (2026-11-01: two slots on a GPT disk, the record, fallback, in the native loader; 2026-11-03: the rollback counter in the TPM, and a signed older set refused); implementation plan written 2026-11-01, step 2's decisions added 2026-11-03. ~~Questions for the lead~~ Questions 1-4 decided by the lead the same day, each as proposed; ~~question 5 open~~ question 5 decided by the lead on 2026-11-01, as proposed (§*Unresolved questions*). Drafted at the lead's request, as Phase 3's second row. |
 | **Author(s)** | Tarun Kumar Kushwaha |
 | **Subsystem** | boot (`boot/bhaskixboot`), userspace (an update service), tpm, tools |
 | **Milestone** | Phase 3, *secure update* ([roadmap.md](../roadmap.md)): threat T7 |
@@ -199,13 +199,84 @@ Written 2026-11-01, with two more decisions the lead made that day, each as reco
       path's `-- booting`.
   - **Not built in step 1**:
     - the running system cannot write a slot or mark one good; the tool stands in;
-    - no counter refuses an older signed set;
+    - ~~no counter refuses an older signed set~~ -- step 2, below;
     - the slot disk is a second disk, not partitions of the kept one.
 
 **Step 2 -- the counter.** `boot.sig`'s security version given its meaning in `bhaskix-bootsig`
 and `bootsign`; a TPM NV counter the loader reads, refusing a set below it, and advances to a
 slot's version only once that slot has been marked good; the NV commands in a crate `bin/tpmd`
 cannot link (RFC 0089's rule, reopened for this counter alone).
+
+- **Decided by the lead on 2026-11-03, each as recommended:**
+  - with **no usable counter** -- no TPM, a TPM that will not create it, or an index another
+    program holds -- the loader boots and says so, in the capitals its other warnings use;
+  - the counter is **created on the first boot that finds a slot disk**; a loader that finds
+    none never writes to a TPM, so every machine without slots is untouched;
+  - it is tested on **QEMU and swtpm only**, and the SR550's TPM is not touched until the lead
+    says otherwise.
+- **The design, decided while building it and recorded here because it is policy:**
+  - **one NV index of the *bits* type**, `0x01844858`, in the TCG registry's owner range
+    (`0x01800000-0x01BFFFFF`). A security version `v` sets bit `v-1`; the **floor** is the
+    highest bit set, plus one; a set below the floor is refused. *Bits and not a counter*,
+    because a TPM counter index begins at the highest value any counter on that TPM has held,
+    not at 0, while `NV_SetBits` starts an unwritten index at 0 and only ORs (the reference
+    implementation's `NV_SetBits.c`). The price is **64 versions**, raised only for a fix that
+    must never be undone by booting an older set;
+  - **the TPM enforces who moves it**, not convention: the index carries `WRITE_STCLEAR`, and
+    the loader write-locks it on every boot that finds it -- after any advance, before the
+    kernel runs -- and **proves the lock** with a write of no bits, which the TPM must refuse
+    with `TPM_RC_NV_LOCKED` and which changes nothing if it does not. Until the next restart
+    nothing that runs after the loader can set a bit: not the kernel, not `bin/tpmd`;
+  - **it moves only for a verified set the record marks good** -- the active slot's -- and
+    above the floor: a trial, a fallback to the slot that is not active, an unverified set, a
+    set read while the record was damaged, and a set read from the ESP never move it. The rule
+    is `bhaskix-rollback::advance`, host-tested;
+  - **it is checked on every boot that finds it**, the ESP's set included, so taking the slot
+    disk away is no way around it. A rolled-back set is a verification failure, and takes that
+    path: the other slot in the same boot; with Secure Boot on and nothing left, refused; with
+    it off, booted and said so, as an unsigned set is;
+  - the version is believed only **after** the signature verifies: a number nobody signed is
+    not a version;
+  - the loader reads `TPMA_PERMANENT` and says whether the TPM's **owner has a password**.
+    Without one, anything that can command the TPM can delete the index -- an index the owner
+    made cannot carry `POLICY_DELETE` (`NvDefineSpace`) -- and with it the counter's history;
+  - **no PCR changes**: none of these commands extends a PCR, so the event log and `bin/tpmd`'s
+    replay are as they were;
+  - the loader's write rule becomes: the slot record, and this one index -- created once, a bit
+    set on an advance, locked every boot. The lock is one NV write per boot.
+
+  **Built 2026-11-03.**
+  - **`bhaskix-rollback`**, host-tested, 21 tests: the commands (`NV_ReadPublic`,
+    `NV_DefineSpace` under the owner, `NV_Read`, `NV_SetBits` and `NV_WriteLock` under the index's
+    own empty password, `GetCapability` for `TPMA_PERMANENT`), byte for byte against the layouts
+    transcribed from EDK2's `Tpm2NVStorage.c` and `Tpm2Help.c` and the reference implementation;
+    their responses' parsers; the floor, the bit a version sets, and the rule for an advance.
+    **Only the loader may link it**: `tools/check-deps.py` gained `ONLY_FROM`, and was seen
+    failing with the crate added to `bin/tpmd` (by its placement too) and to the kernel.
+  - **`bhaskix-bootsig`**: any version parses; `check` takes the floor and refuses
+    `RolledBack { version, floor }` after the signature verifies. **`bootsign sign
+    --security-version N`**, refused above 64; `bootsign show` prints the version. Two
+    integration tests sign at version 3 with the published test key and hold the loader's own
+    check to floors 0, 3 and 4.
+  - **The loader** binds `SubmitCommand`, the member after `HashLogExtendEvent`
+    (`Tcg2Protocol.h`), and its new `counter.rs` opens, advances, locks and proves. Its `unsafe`
+    budget rose by the nine lines of that one call.
+  - **`make test-boot-rollback`**, in `make test` and CI: the native loader under OVMF with
+    swtpm, its state wiped once and kept across nine boots, and eleven checks -- the counter
+    created on a TPM never used and advanced to the active set's version 1; a signed version 0
+    on trial refused and A booted in the same boot; a version 2 on trial booted without moving
+    it; marked active, moved to 2; a signed version 1 marked active refused and B, at version 3
+    and not marked good, booted without moving it; a version-1 set on the ESP, with no slot
+    disk, held to the counter too; no slot disk on a TPM never used, twice, and nothing
+    created; no TPM, said in capitals. **The emulated TPM accepting every command is the
+    independent check of the bytes.**
+  - **Armed, one at a time, each red and restored**: no lock (five checks), the floor ignored
+    (three), a trial or fallback allowed to move it (four, once boot 5 was given a fallback
+    newer than the counter -- its first version fell back to a set already at the floor, and
+    could not see the fault), and the counter created without a slot disk (two).
+  - **Not built in step 2**: the running system still cannot write a slot or mark one good;
+    nothing anchors the counter against an owner who deletes it; and the preview's loader
+    trusts no key, so on the preview no set verifies and the counter never moves.
 
 **Step 3 -- the update service.** A ring-3 program holding the inactive slot's blocks and the
 record, and nothing else: it verifies a set found on the kept disk against the release's key,

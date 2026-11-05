@@ -113,9 +113,9 @@ From [security.md](../security.md), in its words where they are short:
 | | Not yet |
 |---|---|
 | **Virtual machines** | Domains are meant to isolate guests too, but there is no hardware virtualisation yet, so there are no guests to isolate |
-| **Updates** | ~~There is no update mechanism, so nothing signs, stages or rolls one back~~ Since 2026-11-01 the loader boots from two slots and falls back to the other when one does not verify ([Sign your own boot](secure-boot.md), part 4); nothing in the running system writes a slot yet, and no counter refuses an older signed set |
+| **Updates** | ~~There is no update mechanism, so nothing signs, stages or rolls one back~~ Since 2026-11-01 the loader boots from two slots and falls back to the other when one does not verify ([Sign your own boot](secure-boot.md), part 4); since 2026-11-03 a counter in the TPM refuses an older signed set (part 5); nothing in the running system writes a slot yet |
 | **Audit** | ~~There is no tamper-evident audit log or remote attestation yet~~ The log is kept since 2026-11-01 (above), but nothing anchors it, so a log replaced whole is not detected; there is no remote attestation |
-| **Old signed boots** | An older signed boot set still verifies; refusing it needs a rollback counter not yet built |
+| **Old signed boots** | ~~An older signed boot set still verifies; refusing it needs a rollback counter not yet built~~ Since 2026-11-03 refused once a newer one has booted as the active slot -- on a machine with a TPM and a slot disk. Without either, an older signed set still verifies; and on a TPM whose owner has no password, anything that can command it can delete the counter |
 | **The Linux adapter** | `bin/linuxd` holds the authority for every hosted program, so a compromise of it reaches all of their files — the concentration point the design accepts, and states |
 | **Randomness** | One entropy source, the CPU's `RDRAND`, with no pool behind it |
 | **Firmware** | A compromised firmware verifies whatever it likes; nothing here defends against it |

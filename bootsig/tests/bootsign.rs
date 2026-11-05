@@ -251,3 +251,77 @@ fn the_test_key_is_named_as_one_wherever_it_signs() {
     let out = run(&["show", path(&esp), "--public", path(&public)], &[]);
     assert!(text(&out).contains("TEST KEY"), "{}", text(&out));
 }
+
+#[test]
+fn a_signed_security_version_is_read_back_and_a_set_below_the_floor_is_refused() {
+    use bhaskix_bootsig::statement::{self, Digests, Refusal};
+    use bhaskix_sha256::digest;
+
+    let scratch = Scratch::new();
+    let keys = Path::new(env!("CARGO_MANIFEST_DIR")).join("../tests/keys");
+    let secret = keys.join("bootsig-TEST-KEY.secret");
+    let esp = scratch.esp(Some(b"cmdline=\n"));
+    let out = run(
+        &[
+            "sign",
+            "--key",
+            path(&secret),
+            "--security-version",
+            "3",
+            path(&esp),
+        ],
+        &[],
+    );
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(text(&out).contains("security version 3"), "{}", text(&out));
+    let out = run(&["show", path(&esp)], &[]);
+    assert!(text(&out).contains("version    3"), "{}", text(&out));
+
+    // The loader's own check, as the loader calls it: at or below the
+    // version the set verifies, and above it the set is named as rolled
+    // back -- after its signature verified, so the refusal says the set is
+    // genuine and old, not forged.
+    let file = fs::read(esp.join("bhaskix/boot.sig")).unwrap();
+    let mut public = [0u8; bhaskix_bootsig::slh_dsa::PUBLIC_KEY_BYTES];
+    public.copy_from_slice(&fs::read(keys.join("bootsig-TEST-KEY.public")).unwrap());
+    let held = Digests {
+        kernel: digest(&fs::read(esp.join("bhaskix/kernel")).unwrap()),
+        initrd: digest(&fs::read(esp.join("bhaskix/initrd.tar")).unwrap()),
+        boot_conf: digest(b"cmdline=\n"),
+    };
+    for floor in [0, 3] {
+        let verified = statement::check(&file, &[public], &held, floor).unwrap();
+        assert_eq!(verified.version, 3);
+    }
+    assert_eq!(
+        statement::check(&file, &[public], &held, 4),
+        Err(Refusal::RolledBack {
+            version: 3,
+            floor: 4
+        })
+    );
+}
+
+#[test]
+fn a_security_version_the_counter_cannot_record_is_not_signed() {
+    let scratch = Scratch::new();
+    let keys = Path::new(env!("CARGO_MANIFEST_DIR")).join("../tests/keys");
+    let secret = keys.join("bootsig-TEST-KEY.secret");
+    let esp = scratch.esp(None);
+    for (version, said) in [("65", "above 64"), ("three", "takes a number")] {
+        let out = run(
+            &[
+                "sign",
+                "--key",
+                path(&secret),
+                "--security-version",
+                version,
+                path(&esp),
+            ],
+            &[],
+        );
+        assert!(!out.status.success());
+        assert!(text(&out).contains(said), "{}", text(&out));
+        assert!(!esp.join("bhaskix/boot.sig").exists());
+    }
+}

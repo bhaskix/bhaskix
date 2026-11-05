@@ -130,6 +130,10 @@ LAYERS = {
     # RFC 0100 step 1: the slot disk -- its GPT, slot headers, record and boot plan --
     # as arithmetic the native loader decides with. A leaf: it depends on nothing.
     "bhaskix-slotdisk": -3,
+    # RFC 0100 step 2: the rollback counter -- the TPM commands that create,
+    # read, advance and lock one NV index, and when it moves. A leaf, and more
+    # than a leaf: ONLY_FROM below names the one crate that may reach it.
+    "bhaskix-rollback": -3,
     # RFC 0091's boot-set signature check: SHA-256 below it and nothing else,
     # and the native loader above it.
     "bhaskix-bootsig": -2,
@@ -346,6 +350,16 @@ PLACEMENTS: dict[str, set[str]] = {
 # graph, and worth more than the surface it adds.
 ALLOWED_EXTERNAL: set[str] = {"libfuzzer-sys"}
 
+# Crates only the named crates may depend on, whatever their layers allow.
+#
+# RFC 0100 step 2: `bhaskix-rollback` builds the TPM commands that create the
+# rollback counter, set its bits and lock it. RFC 0089 kept the TPM read-only --
+# `bin/tpmd` builds no command but `TPM2_PCR_Read`, and its placement above says
+# so -- and RFC 0100 reopens that for this one index, from the native loader,
+# before it hands over. This keeps the kernel and every other crate out too, so
+# the commands that move the counter exist in one binary.
+ONLY_FROM: dict[str, set[str]] = {"bhaskix-rollback": {"bhaskixboot"}}
+
 RED, GREEN, RESET = "\033[1;31m", "\033[1;32m", "\033[0m"
 
 
@@ -381,6 +395,13 @@ def main() -> int:
         graph[name] = deps
 
     for crate, deps in sorted(graph.items()):
+        for dep in deps:
+            if dep in ONLY_FROM and crate not in ONLY_FROM[dep]:
+                print(f"{RED}FAIL{RESET}  {crate} depends on '{dep}', which only "
+                      f"{', '.join(sorted(ONLY_FROM[dep]))} may reach.")
+                print("        Its commands write to a TPM; see ONLY_FROM in this script.")
+                status = 1
+
         if crate in PLACEMENTS:
             for dep in sorted(set(deps) - PLACEMENTS[crate]):
                 print(f"{RED}FAIL{RESET}  {crate} depends on '{dep}', which a placement "

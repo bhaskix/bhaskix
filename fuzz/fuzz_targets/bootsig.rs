@@ -95,7 +95,9 @@ fn arm_a(data: &[u8]) {
     if let Ok(sig) = BootSig::parse(data) {
         let _ = sig.key_id();
     }
-    let _ = statement::check(data, &[KEY], &held());
+    // The floor from the input too, so the version's comparison is driven.
+    let floor = data.first().map_or(0, |byte| u32::from(*byte));
+    let _ = statement::check(data, &[KEY], &held(), floor);
 }
 
 fn arm_b(data: &[u8]) {
@@ -130,7 +132,7 @@ fn arm_b(data: &[u8]) {
     }
     input.fill(&mut file[128..]);
     assert!(
-        statement::check(&file, &[KEY], &held).is_err(),
+        statement::check(&file, &[KEY], &held, version).is_err(),
         "a boot.sig nobody signed was accepted"
     );
 }
