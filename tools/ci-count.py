@@ -30,15 +30,21 @@ so this reads job logs, which cost about 2.5 s each and are cached below.
 
 # What it costs, measured rather than promised
 
-A first full-history question is about **25 minutes**; a repeat is about
-**20 seconds**. Three things are cached under `build/ci-logs/`, and each was
+A first full-history question was about **25 minutes** and a repeat about
+**20 seconds** when this was written; **measured again 2026-11-05, over 991
+runs: about 45 minutes, and 36 seconds** -- the history had grown, and until
+that day a repeat also paid for every log GitHub had dropped (the fourth cache,
+below). Three things are cached under `build/ci-logs/`, and each was
 added because the previous version's speed claim turned out to be false when
 somebody timed it: the job logs, the per-run boot counts (`lanes.json`), and
 the per-run failed-job listings (`failed-jobs.json`). None of the three can go
 stale -- a completed run's logs, jobs and job list never change again. Caching
 only the logs left a repeat at twenty minutes; adding the lane counts left it
-at five; the job listings took it to twenty seconds. Delete the directory to
-start over.
+at five; the job listings took it to twenty seconds. **A fourth since
+2026-11-05**: a `<job>.gone` marker for each log GitHub answered `410 Gone`,
+because those were asked for again on every question and the twenty seconds
+had quietly stopped being true once the oldest logs passed their retention.
+Delete the directory to start over.
 
 **2. A re-run erases the evidence from the run's own conclusion.** A job that
 failed and was re-run to green leaves the run reading `success`. Two of the
@@ -187,14 +193,32 @@ def job_log(job):
     """A job's log, from the cache if it is there. Logs never change."""
     CACHE.mkdir(parents=True, exist_ok=True)
     kept = CACHE / f"{job}.log"
+    gone = CACHE / f"{job}.gone"
     if kept.exists():
         return kept.read_text(encoding="utf-8", errors="replace")
-    out = gh(f"/repos/{REPO}/actions/jobs/{job}/logs", escapes=True)
-    if out is None:
+    if gone.exists():
+        return None
+    done = subprocess.run(
+        ["gh", "api", "--allow-escape-sequences", f"/repos/{REPO}/actions/jobs/{job}/logs"],
+        capture_output=True,
+        text=True,
+    )
+    if done.returncode != 0:
         # GitHub drops logs after its retention window. Recorded as unreadable
         # rather than counted as clean: see "Zero ... is blind, not clean".
+        #
+        # **Only a 410 is remembered.** That is GitHub saying the log is gone,
+        # and a dropped log does not come back. Until 2026-11-05 nothing was
+        # remembered, so every question asked again for all 265 of them: a
+        # repeat took 192 s, and 36 s with them remembered (991 runs, the same
+        # answer both times). The 410s did not count against the rate limit;
+        # the cost was the time. Any other failure -- the network, a rate
+        # limit, a 404 -- is asked again next time, and a 404 was seen to leave
+        # no marker.
+        if "HTTP 410" in done.stderr:
+            gone.touch()
         return None
-    text = ESCAPE.sub("", out)
+    text = ESCAPE.sub("", done.stdout)
     kept.write_text(text, encoding="utf-8")
     return text
 

@@ -86,7 +86,7 @@ document, release note or README may state or imply that it works."*
 
 | It does this | Proven by |
 |---|---|
-| Boots on BIOS, on UEFI, and on its own loader `bhaskixboot.efi` | the boot lanes; **184 passing checks** on the BIOS lane alone (`ok` lines, measured 2026-10-31 on `c847297`; 173 on 2026-10-19, 162 on 2026-10-08, 119 on 2026-08-30). ~~**CI runs no native-loader lane**; locally it runs three.~~ **Wrong since 2026-10-11, corrected 2026-10-19**: CI runs four native-loader lanes, two of them with an emulated TPM. On the one physical machine, **it boots through its own loader to the user-mode shell** — sixteen CPUs, observed 2026-10-11 (see [the hardware](#what-the-one-piece-of-hardware-told-us)) |
+| Boots on BIOS, on UEFI, and on its own loader `bhaskixboot.efi` | the boot lanes; **184 passing checks** on the BIOS lane alone (`ok` lines, measured 2026-10-31 on `c847297`; 173 on 2026-10-19, 162 on 2026-10-08, 119 on 2026-08-30). ~~**CI runs no native-loader lane**; locally it runs three.~~ **Wrong since 2026-10-11, corrected 2026-10-19**: CI runs ~~four native-loader lanes, two of them with an emulated TPM~~ **six native-loader lanes, three of them with an emulated TPM** -- the slot lane joined on 2026-11-01 and the rollback lane on 2026-11-05, and this sentence said four until it was read against `ci.yml` on 2026-11-05. On the one physical machine, **it boots through its own loader to the user-mode shell** — sixteen CPUs, observed 2026-10-11 (see [the hardware](#what-the-one-piece-of-hardware-told-us)) |
 | Starts its CPUs with its own INIT-SIPI and schedules across them | boot lanes, `threads`/`migration` gates — four CPUs in the lanes, eight in the soaks, and **16 of 16** on the SR550 |
 | Runs ring 3 programs holding capabilities and nothing else | boot lanes, `ring 3` and fault-injection gates |
 | Answers a user-mode shell from services in separate domains — block driver, console, filesystem | `shell-test.sh`; **23 gates** (`user` mode), **55** (`iommu` mode), measured 2026-10-31 on `9ec4fa2` (23 and 54 on 2026-10-19; 22 and 53 on 2026-08-30) |
@@ -237,22 +237,22 @@ reading closed, on the lead's word -- twenty-three rows not closed, and twenty i
 | Defect — what you would see | Rate, as TRACKER states it | Fix |
 |---|---|---|
 | An outbound TCP demonstration stalls: `connected, stream still in flight` | ~~11 sightings in 7,762 boots, 1 in 705, counted by the tool; the latest specimens 2026-09-29 (CI run 782) and 2026-10-02~~ **15 in 10,258 CI boots, 1 in 683**, counted by the tool 2026-11-05 -- the 11 was a count of 2026-09-28 and four came after it; the latest CI specimens 2026-10-12 and 2026-11-01, and one local, 2026-10-31 | none |
-| The four-client TCP act accepts nobody: `tcp four FAILED ... 0 accepted` | **3 sightings** (2026-10-12, twice on 2026-10-15). A fourth was counted, and dated 2026-10-16; it ran on 2026-10-19, was the test harness's own fault, and is withdrawn | not explained |
-| The inbound TCP echo is served and the host never receives the bytes | **4 sightings** (CI 2026-09-13, 09-23, 10-08; locally 10-15) | the host's driver changed 2026-10-19 to stay and hear its reply; open until it has gone a while without a sighting |
-| A hosted UDP read never ends (the probe thread spins) | 5 times locally, the last 2026-10-10; 0 in 8,065 CI boots | none |
+| The four-client TCP act accepts nobody: `tcp four FAILED ... 0 accepted` | **3 sightings** (2026-10-12, twice on 2026-10-15). A fourth was counted, and dated 2026-10-16; it ran on 2026-10-19, was the test harness's own fault, and is withdrawn. All three were local; none in the 153 CI runs since the act was added (2026-11-05) | not explained |
+| The inbound TCP echo is served and the host never receives the bytes | **4 sightings** (CI 2026-09-13, 09-23, 10-08; locally 10-15); none in the 56 CI runs since the 2026-10-19 change (2026-11-05) | the host's driver changed 2026-10-19 to stay and hear its reply; open until it has gone a while without a sighting |
+| A hosted UDP read never ends (the probe thread spins) | 5 times locally, the last 2026-10-10; 0 in 10,278 CI boots (2026-11-05) | none |
 | A lock-order self-test fails: a wait queue taken while holding another lock | 4 in 7,681 boots; last 2026-09-23; **0 in 2,361 since** (2026-11-05) | a cause fixed 2026-09-28; open until ~5,800 clean boots |
-| The lock-order detector fires in CI: one real ordering violation | 1 sighting, CI run 489 (2026-09-02); again 2026-09-04 | not explained |
+| The lock-order detector fires in CI: one real ordering violation | 1 sighting, CI run 489 (2026-09-02); again 2026-09-04. In all, 4 CI runs have printed a real violation, 4 in 10,278 boots, none since 2026-09-23 (2026-11-05) | not explained |
 | Lock accounting disagrees with the locks actually held (`no open guard`) | four specimens, the last 1 boot in 24 at eight CPUs (2026-09-04); two were withdrawn as instrument errors | one specimen unexplained |
-| The two-wake-sources self-test (RFC 0057) fails | ~2 boots in 1,200; last 2026-09-04 | none |
+| The two-wake-sources self-test (RFC 0057) fails | ~~~2 boots in 1,200; last 2026-09-04~~ **3 in 10,278 CI boots, the last 2026-09-09** -- a soak run nobody had recorded (2026-11-05) | none |
 | CI's `interactive shell` job goes red | ~1 in 21 runs after a split; mostly other rows' defects surfacing there | none of its own |
-| The TCP self-test reports a connection served without a verified SYN cookie | 4 sightings; 0 in 6,427 CI boots (2026-09-14); 0 in 24 at eight CPUs (2026-10-02) | not claimed fixed; the old reproducer no longer reproduces |
-| A freshly created domain refuses the Linux personality | 1 sighting each in two forms (2026-09-02, 2026-09-13); 0 in 6,427 CI boots | both known windows shut; open |
+| The TCP self-test reports a connection served without a verified SYN cookie | 4 sightings; 0 in ~~6,427~~ 10,278 CI boots (2026-11-05); 0 in 24 at eight CPUs (2026-10-02) | not claimed fixed; the old reproducer no longer reproduces |
+| A freshly created domain refuses the Linux personality | 1 sighting each in two forms (2026-09-02, 2026-09-13); 0 in ~~6,427~~ 10,278 CI boots, under both wordings the kernel has printed (2026-11-05) | both known windows shut; open |
 | A Linux memory self-test sees `mmap` return 0 or 1 | **3 specimens** (2026-09-02 twice, 2026-10-09) | ~~likely fixed, not proven~~ — the third specimen refuted the fix (2026-10-09); a detector was built 2026-10-10 and has not yet fired |
 | The hosted TCP server demonstration quits without answering | 1 sighting (2026-09-30) | mitigated, not closed |
 | The BusyBox test's keyboard is never handed over, and `sh` shows no prompt | 1 local suite (2026-09-30); not in CI | none |
 | A boot stops printing partway through a test | 1 sighting, CI run 792 (2026-09-30) | unexplained, not yet instrumented |
 | A `poll` probe says "not ready" for a domain with no console grant | 1 sighting (2026-10-12) | parked until the next one; the cause is an inference |
-| The native TPM lane's second serial log comes back empty | 1 in 9 runs (2026-10-11) | instrumented, not explained |
+| The native TPM lane's second serial log comes back empty | 1 in 9 local runs (2026-10-11); never on CI, whose two `COM2 is missing` failures that day had other causes, both fixed then (2026-11-05) | instrumented, not explained |
 | BusyBox `sh` faults at `0x48` | ~2% of harness runs; 0 of 8,443 CI boots (2026-10-04) | likely fixed 2026-10-02, not proven |
 | A per-CPU hold count underflows (the remainder of the old "445 ms wake" row) | no specimen in 450 boots of one image (2026-08-28) | a cause guarded 2026-09-03; not shown to be *the* cause |
 
