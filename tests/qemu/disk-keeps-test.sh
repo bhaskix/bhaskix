@@ -47,6 +47,19 @@ stop_machine() {
     fi
 }
 trap 'stop_machine; rm -rf "$WORK"' EXIT
+# **A write into a machine that has gone fails; it does not end the lane.** The
+# typing goes into a FIFO whose reader is QEMU, and once QEMU has exited a write
+# raises SIGPIPE, which ended this script on the spot -- under the trap just
+# above, which removes the work directory, and before the end of the script
+# could copy a failing run's logs to `BHASKIX_KEEP_LOGS`. So a boot that died
+# while being typed at left exit 141, no FAIL line and no log, on CI and under
+# `make test` alike, both of which set that variable. Shown 2026-11-06 by
+# killing boot 1's QEMU after its first typed line; `shell-test.sh` and
+# `busybox-test.sh` were fixed for the same death the day before. **Caught, not
+# ignored**, for the reason `busybox-test.sh` gives: an ignored signal is
+# inherited by every program the lane starts, and changes what their pipelines
+# answer.
+trap ':' PIPE
 
 # shellcheck source=tests/qemu/devices.sh
 source "$REPO_ROOT/tests/qemu/devices.sh"
@@ -95,6 +108,9 @@ boot_and_type() {
     if await "$STARTED" && await "$PROMPT"; then
         local first=1 line tries
         for line in "$@" nosuchcommand; do
+            # A machine that has gone stops the typing, rather than every line
+            # left failing to write (see `trap ':' PIPE` above).
+            kill -0 "$qemu" 2>/dev/null || break
             printf '%s\r' "$line" >&3
             tries=0
             until grep -qF -- "$PROMPT$line" "$log" 2>/dev/null; do
