@@ -90,6 +90,35 @@ qemu-system-x86_64: Could not set up host forwarding rule 'tcp:127.0.0.1:18080-:
 End the other QEMU (`pkill qemu-system-x86`), or change the host port in the
 command.
 
+## `pkg list` says a package is unfinished
+
+An install stopped part way and left the package's files but not its record --
+the machine was switched off during `pkg install`, or the installer refused one
+of the package's files. Nothing about it is installed, and `pkg run` will not
+start it. Do what the line says, then install again. Reproduced 2026-11-06 by
+stopping a machine just after `pkg install hello.bpk` printed `verified`; this
+is the next boot, on the same disk:
+
+```
+bhaskix$ pkg list
+  hello      unfinished -- 'pkg remove hello' clears it
+  0 installed, 1 unfinished
+bhaskix$ pkg run hello
+  pkg: hello did not finish installing -- 'pkg remove hello' clears it
+bhaskix$ pkg remove hello
+  removed    hello -- 42211630 cycles through the journal
+bhaskix$ pkg install hello.bpk
+  verified   hello 0.1.0 -- 1 files, 20480 bytes, digests good
+  installed  /pkg/hello -- 15408 payload bytes through the journal in 5 writes, 283158354 cycles
+bhaskix$ pkg run hello
+  running    hello (15408 bytes, grants from its manifest)
+namaste from an installed package
+  it ended cleanly
+```
+
+[The shell and packages](shell-and-packages.md#an-install-that-did-not-finish)
+shows an install that cannot finish, from its start.
+
 ## Red lines in the boot report
 
 Every line of the boot report is a check the machine just ran. A **red** line is

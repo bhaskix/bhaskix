@@ -139,7 +139,9 @@ no second database to disagree with the first. The shell grows one command famil
 actor that holds filesystem and spawn authority; a separate `pkgd` domain is an isolation
 boundary with no adversary behind it (alternatives, below). Failure order is chosen so a
 crash cannot lie: **install writes payload first, record last** — a torn install leaves
-sweepable droppings and no claim of success; **remove deletes the record first, payload
+sweepable droppings and no claim of success (true of the record from step 3; **`pkg list` counted
+the droppings as installed until 2026-11-06**, and a second install called them `already
+installed` — the shell read the directory, not the record. Fixed that day; TRACKER §3); **remove deletes the record first, payload
 after** — a torn remove leaves droppings and no claim of presence. Hashes are verified on
 install, before the record exists.
 
@@ -215,8 +217,11 @@ compared against the outgoing rule's once, at the migration commit. Boot gates p
 placement: the install/run/remove cycle on the writable filesystem — installed and
 verified, spawned with manifest-derived grants and *reporting through them*, removed and
 **refused** on re-spawn; a bad-hash package refused before any record exists; an over-asking
-manifest refused whole. Torn-install recovery exercised by the failure-order tests
-host-side, where the journal's promises are already proven.
+manifest refused whole. ~~Torn-install recovery exercised by the failure-order tests
+host-side, where the journal's promises are already proven.~~ **No such test was written**
+(found 2026-11-06, looking for it): the install's order lives in the shell, which runs only in
+ring 3. Torn-install recovery is gated live from that day, in `shell-test.sh`, by `deep.bpk` --
+a package the installer cannot finish, on purpose.
 
 ## Unresolved questions
 

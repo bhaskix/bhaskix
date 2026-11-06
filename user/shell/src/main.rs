@@ -1796,6 +1796,47 @@ fn pkg_place_file(path: &[u8], bytes: &[u8], writes: &mut u64) -> bool {
     placed
 }
 
+/// What a package's directory under `/pkg` says about its install.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Install {
+    /// The `manifest` record is there: the install finished.
+    Finished,
+    /// A directory and no record: an install that stopped part way, cut off
+    /// by a machine that died or by a payload the installer refused.
+    Unfinished,
+}
+
+/// Reads the state of the package directory held at `held`. **Only the
+/// record claims an install** -- RFC 0030 writes payloads first and the
+/// record last so that a torn install makes no claim -- so its presence is
+/// the answer, and the directory's is not. `None` when the question itself
+/// was refused, which is reported here.
+///
+/// Until 2026-11-06 `pkg list` and a second `pkg install` read the
+/// directory instead, and listed a torn install as installed (TRACKER
+/// section 3).
+fn pkg_install_state(held: u64) -> Option<Install> {
+    let (record, _) = Chunk::take(b"manifest");
+    let opened = dir_call(held, PKG_FILE, dir::OPEN_AT, record.pack(0));
+    if opened.delivered() && opened.raw() == dir::OK {
+        syscall(syscall::INVOKE, PKG_FILE, method::DELETE, [0; 4]);
+        return Some(Install::Finished);
+    }
+    if opened.delivered() && opened.raw() == dir::NO_SUCH_NAME {
+        return Some(Install::Unfinished);
+    }
+    pkg_refused(b"looking for the record", opened.raw());
+    None
+}
+
+/// The way out of an unfinished install, said the same way everywhere:
+/// `pkg remove` deletes a record that is not there and sweeps the rest.
+fn pkg_clear_hint(name: &[u8]) {
+    write(b"'pkg remove ");
+    write(name);
+    write(b"' clears it");
+}
+
 /// `pkg install <file>`: reads a `.bpk` out of the boot image, verifies it
 /// whole -- the same parser the build tools use, in ring 3 -- and installs
 /// it under `/pkg`, payloads first and the manifest record last, so a crash
@@ -1859,8 +1900,10 @@ fn pkg_install(file: &[u8]) {
 ",
     );
 
-    // The package's own directory. EXISTS is "already installed", which is
-    // an answer and not an error to bury.
+    // The package's own directory. EXISTS is an answer and not an error to
+    // bury -- but the directory's answer, not the record's, so the record is
+    // asked: present is "already installed", absent an install that did not
+    // finish, which the user can clear.
     let (chunk, more) = Chunk::take(manifest.name);
     if !more.is_empty() {
         pkg_refused(b"a package name over sixteen bytes", 0);
@@ -1868,10 +1911,26 @@ fn pkg_install(file: &[u8]) {
     }
     let made = dir_call(PKG_DIR, PKG_WORK, dir::MAKE_DIRECTORY_AT, chunk.pack(0));
     if made.delivered() && made.raw() == dir::EXISTS {
-        write(
-            b"  [93mpkg: already installed -- 'pkg remove' it first[0m
-",
-        );
+        let opened = dir_call(PKG_DIR, PKG_WORK, dir::OPEN_AT, chunk.pack(0));
+        if !opened.delivered() || opened.raw() != dir::OK {
+            pkg_refused(b"opening the package", opened.raw());
+            return;
+        }
+        let state = pkg_install_state(PKG_WORK);
+        syscall(syscall::INVOKE, PKG_WORK, method::DELETE, [0; 4]);
+        match state {
+            Some(Install::Finished) => {
+                write(b"  \x1b[93mpkg: already installed -- 'pkg remove' it first\x1b[0m\n");
+            }
+            Some(Install::Unfinished) => {
+                write(b"  \x1b[93mpkg: an install of ");
+                write(manifest.name);
+                write(b" did not finish -- ");
+                pkg_clear_hint(manifest.name);
+                write(b", then install again\x1b[0m\n");
+            }
+            None => {}
+        }
         return;
     }
     if !made.delivered() || made.raw() != dir::OK {
@@ -1926,10 +1985,13 @@ fn pkg_install(file: &[u8]) {
     }
 }
 
-/// `pkg list`: what is installed, one line each.
+/// `pkg list`: what is installed, one line each -- and apart from it, any
+/// install that did not finish, with how to clear it. Counted by the record,
+/// not the directory (see [`pkg_install_state`]).
 fn pkg_list() {
     let mut index = 0u64;
     let mut count = 0u64;
+    let mut unfinished = 0u64;
     loop {
         let reply = call(PKG_DIR, dir::LIST_AT, [index, 0, 0, 0]);
         if !reply.delivered() {
@@ -1938,17 +2000,46 @@ fn pkg_list() {
         }
         match reply.args[0] {
             dir::OK => {
-                let length = dir::listing_length(reply.args[3]);
+                let length = dir::listing_length(reply.args[3]).min(16);
                 let mut name = [0u8; 16];
                 name[..8].copy_from_slice(&reply.args[1].to_le_bytes());
                 name[8..].copy_from_slice(&reply.args[2].to_le_bytes());
-                write(b"  [1;32m");
-                write(&name[..length.min(16)]);
-                write(
-                    b"[0m
-",
-                );
-                count += 1;
+                let listed = &name[..length];
+                let (chunk, _) = Chunk::take(listed);
+                let opened = dir_call(PKG_DIR, PKG_WORK, dir::OPEN_AT, chunk.pack(0));
+                if !opened.delivered() || opened.raw() != dir::OK {
+                    pkg_refused(b"opening a package", opened.raw());
+                    return;
+                }
+                let state = pkg_install_state(PKG_WORK);
+                syscall(syscall::INVOKE, PKG_WORK, method::DELETE, [0; 4]);
+                match state {
+                    Some(Install::Finished) => {
+                        write(b"  \x1b[1;32m");
+                        write(listed);
+                        write(b"\x1b[0m\n");
+                        count += 1;
+                    }
+                    Some(Install::Unfinished) => {
+                        // One colour for the whole line, and the state in the
+                        // column `pkg install` prints its own in.
+                        write(b"  \x1b[93m");
+                        write(listed);
+                        let mut column = listed.len();
+                        loop {
+                            write(b" ");
+                            column += 1;
+                            if column >= 11 {
+                                break;
+                            }
+                        }
+                        write(b"unfinished -- ");
+                        pkg_clear_hint(listed);
+                        write(b"\x1b[0m\n");
+                        unfinished += 1;
+                    }
+                    None => return,
+                }
             }
             dir::END => break,
             other => {
@@ -1960,10 +2051,13 @@ fn pkg_list() {
     }
     write(b"  ");
     write_number(count);
-    write(
-        b" installed
-",
-    );
+    write(b" installed");
+    if unfinished > 0 {
+        write(b", ");
+        write_number(unfinished);
+        write(b" unfinished");
+    }
+    write(b"\n");
 }
 
 /// Removes every file entry of the directory held at `held`, restarting at
@@ -2139,6 +2233,16 @@ fn pkg_run(name: &[u8]) {
     // that was reviewed -- this file, not a memory of it.
     let (record, _) = Chunk::take(b"manifest");
     let record_handle = dir_call(PKG_WORK, PKG_FILE, dir::OPEN_AT, record.pack(0));
+    if record_handle.delivered() && record_handle.raw() == dir::NO_SUCH_NAME {
+        // A directory and no record: an install that did not finish, which
+        // answered `opening the record refused (1)` until 2026-11-06.
+        write(b"  \x1b[93mpkg: ");
+        write(name);
+        write(b" did not finish installing -- ");
+        pkg_clear_hint(name);
+        write(b"\x1b[0m\n");
+        return;
+    }
     if !record_handle.delivered() || record_handle.raw() != dir::OK {
         pkg_refused(b"opening the record", record_handle.raw());
         return;

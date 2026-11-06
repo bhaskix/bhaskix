@@ -1,0 +1,15 @@
+# The install that cannot finish: the same greeting binary as `hello`, whose
+# one payload is three components deep. The manifest grammar admits that path
+# and the shell's installer places at most two, and it finds out only after
+# `/pkg/deep` exists -- so installing this leaves a directory and no record,
+# which is what a machine that dies mid-install leaves too. It exists so that
+# what every `pkg` command says about a torn install is a gate rather than a
+# promise (TRACKER section 3, 2026-11-06).
+package deep
+version 0.1.0
+
+program bin/x/deep
+entry hertz
+cap console
+
+payload bin/x/deep from user/hello/target/x86_64-unknown-none/release/hello

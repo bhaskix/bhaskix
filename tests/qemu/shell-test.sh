@@ -268,12 +268,23 @@ else
         # writable filesystem, out of an archive the boot image carries. The
         # same install twice, because the second answer -- already installed
         # -- proves the record was written and read back, not just printed.
+        # (It proved that only from 2026-11-06. Until then `already installed`
+        # was the package *directory's* answer, and an install that never
+        # wrote its record got it too -- TRACKER section 3.)
         commands+=$'pkg install hello.bpk\r'$'pkg list\r'$'pkg install hello.bpk\r'
         # RFC 0030 step 4: the installed program runs with grants derived
         # from its manifest -- and the over-asker is refused whole before
         # any domain exists. `run` comes after `spawn`'s own arc so the one
         # child the envelope allows is free again.
         commands+=$'pkg install greedy.bpk\r'$'pkg run greedy\r'$'pkg run hello\r'
+        # A torn install, made on purpose: `deep.bpk` verifies whole and its
+        # payload is deeper than the installer places, which it learns only
+        # after `/pkg/deep` exists -- the state a machine that dies mid-install
+        # leaves. RFC 0030 says only the record claims an install; until
+        # 2026-11-06 `pkg list` counted the directory, `pkg run` answered
+        # `opening the record refused (1)`, and a second install `already
+        # installed`. Each says what happened now, and `pkg remove` clears it.
+        commands+=$'pkg install deep.bpk\r'$'pkg list\r'$'pkg run deep\r'$'pkg install deep.bpk\r'$'pkg remove deep\r'
         # RFC 0030 step 5: removal, and the ordering proof that can be seen
         # from outside -- after `pkg remove`, running refuses off the gone
         # record, and a REINSTALL succeeds, which no surviving dropping
@@ -663,7 +674,16 @@ else
             "the run was watched to its end:it ended cleanly"
             "the package was removed:removed.*hello"
             "a removed program will not run:pkg: not installed"
-            "reinstall after remove succeeded, so nothing survived:2 installed"
+            "a package the installer cannot place said its install did not finish:the install did not finish -- no record was written"
+            "the torn install is listed as unfinished, and how to clear it:deep +unfinished -- 'pkg remove deep' clears it"
+            "the listing counts it apart from what is installed:(^|[^0-9])2 installed, 1 unfinished"
+            "running a torn install says it did not finish:pkg: deep did not finish installing -- 'pkg remove deep' clears it"
+            "installing over a torn install says so, not that it is installed:pkg: an install of deep did not finish -- 'pkg remove deep' clears it"
+            "remove cleared the torn install:removed.*deep"
+            # Not followed by a comma: the torn install's listing above reads
+            # `2 installed, 1 unfinished`, which would otherwise satisfy this
+            # by itself -- and a remove that left deep behind would read so.
+            "reinstall after remove succeeded, so nothing survived:(^|[^0-9])2 installed($|[^,])"
             "the install said its price:payload bytes through the journal in [1-9][0-9]* writes, [1-9][0-9]* cycles"
             "the removal said its price:cycles through the journal"
         )

@@ -4,6 +4,7 @@
 
 **Verified** 2026-10-19 against `9a87171`, under QEMU 4.2.1, by booting copies
 of that commit's ISO and loader exactly as below and typing every command shown.
+The `ls /` listing was re-run 2026-11-06, when `deep.bpk` joined the image.
 
 This guide boots Bhaskix in QEMU, tries its shell, and leaves. Expect about ten
 minutes, most of it the first boot.
@@ -243,6 +244,7 @@ its `files` capability:
 bhaskix$ ls /
        228  README
          0  bin/
+     20480  deep.bpk
          0  etc/
     131072  fs.img
      20480  greedy.bpk

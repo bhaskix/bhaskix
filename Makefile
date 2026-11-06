@@ -174,6 +174,7 @@ GO_CORPUS_DEP   :=
 GO_CORPUS_FILE  :=
 endif
 GREEDY_BPK   := build/greedy.bpk
+DEEP_BPK     := build/deep.bpk
 USER_SHELL   := $(SHELL_DIR)/target/$(TARGET)/release/shell
 USER_SUP     := $(SUP_DIR)/target/$(TARGET)/release/sup
 USER_VFSD    := $(VFSD_DIR)/target/$(TARGET)/release/vfsd
@@ -402,12 +403,13 @@ FORCE:
 # and mkimage stages, hashes, verifies with the machine's own parsers, and
 # drives the same tar flags this rule always trusted. Assembled twice and
 # byte-compared every build: determinism is a gate, not a hope.
-$(INITRD): $(MKIMAGE) $(shell find $(INITRD_DIR) packages -type f 2>/dev/null | sort) $(PROBE) $(USER_SHELL) $(USER_VFSD) $(USER_CONSOLED) $(USER_BLKD) $(USER_AHCID) $(USER_TPMD) $(USER_NETD) $(USER_IPD) $(USER_DHCPD) $(USER_UDP6) $(USER_TCPD) $(USER_LINUXD) $(USER_TCPC) $(USER_TRACED) $(USER_AUDITD) $(USER_FSD) $(USER_SUP) $(FS_IMAGE) $(HELLO_BPK) $(GREEDY_BPK) $(BUSYBOX) $(GO_CORPUS_DEP) $(HOSTED) $(GO_CORPUS_STAMP) $(HTTPD_DEP) $(HTTPD_STAMP)
+$(INITRD): $(MKIMAGE) $(shell find $(INITRD_DIR) packages -type f 2>/dev/null | sort) $(PROBE) $(USER_SHELL) $(USER_VFSD) $(USER_CONSOLED) $(USER_BLKD) $(USER_AHCID) $(USER_TPMD) $(USER_NETD) $(USER_IPD) $(USER_DHCPD) $(USER_UDP6) $(USER_TCPD) $(USER_LINUXD) $(USER_TCPC) $(USER_TRACED) $(USER_AUDITD) $(USER_FSD) $(USER_SUP) $(FS_IMAGE) $(HELLO_BPK) $(GREEDY_BPK) $(DEEP_BPK) $(BUSYBOX) $(GO_CORPUS_DEP) $(HOSTED) $(GO_CORPUS_STAMP) $(HTTPD_DEP) $(HTTPD_STAMP)
 	@mkdir -p $(dir $@)
 	./$(MKIMAGE) $@ $(INITRD_ROOT) --root . --static $(INITRD_DIR) \
 	    --file fs.img=$(FS_IMAGE) \
 	    --file hello.bpk=$(HELLO_BPK) \
 	    --file greedy.bpk=$(GREEDY_BPK) \
+	    --file deep.bpk=$(DEEP_BPK) \
 	    $(GO_CORPUS_FILE) \
 	    $(HTTPD_FILE) \
 	    --file bin/hosted=$(HOSTED) \
@@ -418,6 +420,7 @@ $(INITRD): $(MKIMAGE) $(shell find $(INITRD_DIR) packages -type f 2>/dev/null | 
 	    --file fs.img=$(FS_IMAGE) \
 	    --file hello.bpk=$(HELLO_BPK) \
 	    --file greedy.bpk=$(GREEDY_BPK) \
+	    --file deep.bpk=$(DEEP_BPK) \
 	    $(GO_CORPUS_FILE) \
 	    $(HTTPD_FILE) \
 	    --file bin/hosted=$(HOSTED) \
@@ -513,6 +516,14 @@ $(HELLO_BPK): $(MKIMAGE) $(HELLO) packages/demo/hello.manifest.in
 $(GREEDY_BPK): $(MKIMAGE) $(HELLO) packages/demo/greedy.manifest.in
 	./$(MKIMAGE) --bpk $@ build/bpk_stage_greedy --root . \
 	    --package packages/demo/greedy.manifest.in
+
+# The install that cannot finish (TRACKER section 3, 2026-11-06): verified
+# whole, and its one payload three components deep, which the shell's
+# installer refuses only after the package's directory exists -- so a torn
+# install, and what each `pkg` command says about it, is a gate.
+$(DEEP_BPK): $(MKIMAGE) $(HELLO) packages/demo/deep.manifest.in
+	./$(MKIMAGE) --bpk $@ build/bpk_stage_deep --root . \
+	    --package packages/demo/deep.manifest.in
 
 # The filesystem service as a program, for the domain placement. Rebuilt when
 # the service crate changes too: the same crate is compiled into the kernel for

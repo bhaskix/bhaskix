@@ -5,7 +5,9 @@
 **Verified** 2026-10-19 against `9a87171`, under QEMU 4.2.1, on the machine
 [*A fuller machine*](get-started.md#a-fuller-machine-a-disk-and-a-network)
 builds, with every command below typed at it and its output copied from that
-session.
+session. Both file listings and *An install that did not finish* were re-run
+2026-11-06, when `deep.bpk` joined the image -- the kernel shell's on an image
+built for it, as the project's shell test builds one.
 
 Bhaskix's shell looks like a Unix shell and is not one. It is an ordinary
 program in ring 3, and **it can do nothing it does not hold a capability for**:
@@ -49,6 +51,7 @@ no longer exists, and the filesystem says so instead of answering for it.
 bhaskix$ ls /
        228  README
          0  bin/
+     20480  deep.bpk
          0  etc/
     131072  fs.img
      20480  greedy.bpk
@@ -155,6 +158,36 @@ bhaskix$ pkg list
 
 Nothing ran and nothing was granted: the refusal comes before any domain
 exists.
+
+### An install that did not finish
+
+`pkg install` writes a package's files first and its record last, and **only the
+record says a package is installed**. So an install that stops part way -- the
+machine lost power, or the installer refused one of the files -- leaves files
+and no record, and every `pkg` command says so. `deep.bpk` stops on purpose: the
+path of its one file, `bin/x/deep`, has three parts, the installer places at
+most two, and it finds that out only after the package's directory exists:
+
+```
+bhaskix$ pkg install deep.bpk
+  verified   deep 0.1.0 -- 1 files, 20480 bytes, digests good
+  pkg: a path deeper than two components refused (0)
+  pkg: the install did not finish -- no record was written
+bhaskix$ pkg list
+  deep       unfinished -- 'pkg remove deep' clears it
+  0 installed, 1 unfinished
+bhaskix$ pkg run deep
+  pkg: deep did not finish installing -- 'pkg remove deep' clears it
+bhaskix$ pkg remove deep
+  removed    deep -- 36105646 cycles through the journal
+bhaskix$ pkg list
+  0 installed
+```
+
+A second `pkg install` of an unfinished package says the same and asks for the
+`pkg remove` first. (Until 2026-11-06 an install cut short was listed as
+installed, `pkg run` answered `opening the record refused (1)`, and a second
+install `already installed`.)
 
 **What you install stays.** The writable filesystem is kept from one boot to
 the next, so a package installed once is there afterwards. (Until 2026-10-30
@@ -295,6 +328,7 @@ bhaskix> lsblk
 bhaskix> ls
        228  README
          0  bin/
+     20480  deep.bpk
          0  etc/
     131072  fs.img
      20480  greedy.bpk
