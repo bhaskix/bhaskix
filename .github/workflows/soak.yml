@@ -66,6 +66,14 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # **No toolchain arrives by accident** (2026-11-07). Every job installs the
+  # pinned toolchain with `rustup install` before anything uses it. Until then
+  # it arrived as a side effect: of `rustup show active-toolchain`, which the
+  # runner's rustup has called deprecated in every job since early September
+  # ("scripts relying on this behavior in `rustup` may stop working in the
+  # future"), or of the first `cargo`. With auto-install off, a step that
+  # still leans on it fails now, not on the day rustup drops it.
+  RUSTUP_AUTO_INSTALL: 0
 
 jobs:
   soak:
@@ -76,7 +84,7 @@ jobs:
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v7
-      - run: rustup show active-toolchain
+      - run: rustup install && rustup show active-toolchain
 
       - name: Install QEMU, xorriso
         run: |

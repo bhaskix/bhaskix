@@ -36,6 +36,14 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # **No toolchain arrives by accident** (2026-11-07). Every job installs the
+  # pinned toolchain with `rustup install` before anything uses it. Until then
+  # it arrived as a side effect: of `rustup show active-toolchain`, which the
+  # runner's rustup has called deprecated in every job since early September
+  # ("scripts relying on this behavior in `rustup` may stop working in the
+  # future"), or of the first `cargo`. With auto-install off, a step that
+  # still leans on it fails now, not on the day rustup drops it.
+  RUSTUP_AUTO_INSTALL: 0
 
 jobs:
   # --- fast feedback ------------------------------------------------------
@@ -46,7 +54,7 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
-      - run: rustup show active-toolchain   # honours rust-toolchain.toml
+      - run: rustup install && rustup show active-toolchain   # honours rust-toolchain.toml
       - run: make fmt
 
   gates:
@@ -63,6 +71,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
+      - run: rustup install && rustup show active-toolchain
       - name: Containment, vendor strings, SPDX, unsafe budgets, dependencies
         run: make gates
 
@@ -74,7 +83,7 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
-      - run: rustup show active-toolchain
+      - run: rustup install && rustup show active-toolchain
       - run: make clippy
 
   test-host:
@@ -83,7 +92,7 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
-      - run: rustup show active-toolchain
+      - run: rustup install && rustup show active-toolchain
       - run: make test-host
       # RFC 0094 step 3's floating-point check against the real XRSTOR and
       # FXRSTOR on the runner's own CPU: every image it accepts must load.
@@ -109,7 +118,7 @@ jobs:
         cpu: [qemu64, max]
     steps:
       - uses: actions/checkout@v7
-      - run: rustup show active-toolchain
+      - run: rustup install && rustup show active-toolchain
 
       # **No apt cache, and each half of the install timed (2026-11-07).** From
       # 2026-08-31 a step here cached apt's archives, and this comment said a
@@ -253,7 +262,7 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
-      - run: rustup show active-toolchain
+      - run: rustup install && rustup show active-toolchain
 
       - name: Install QEMU, xorriso, OVMF
         run: |
@@ -365,7 +374,7 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
-      - run: rustup show active-toolchain
+      - run: rustup install && rustup show active-toolchain
 
       # No apt cache, and each half of the install timed (2026-11-07). The cache
       # that stood here never saved once, so its comment's claim that a hit skips
@@ -450,7 +459,7 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
-      - run: rustup show active-toolchain
+      - run: rustup install && rustup show active-toolchain
 
       # No apt cache, and each half of the install timed (2026-11-07). The cache
       # that stood here never saved once, so its comment's claim that a hit skips
@@ -588,7 +597,7 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
-      - run: rustup show active-toolchain
+      - run: rustup install && rustup show active-toolchain
 
       - name: Install QEMU, xorriso
         run: |
@@ -644,7 +653,7 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
-      - run: rustup show active-toolchain
+      - run: rustup install && rustup show active-toolchain
 
       # No apt cache, and each half of the install timed (2026-11-07). The cache
       # that stood here never saved once, so its comment's claim that a hit skips

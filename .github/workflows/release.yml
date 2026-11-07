@@ -18,6 +18,11 @@ on:
 permissions:
   contents: write # to open the draft release, and nothing else
 
+env:
+  # The pinned toolchain is installed by name before anything uses it, and
+  # never as a side effect; ci.yml's env block says why (2026-11-07).
+  RUSTUP_AUTO_INSTALL: 0
+
 jobs:
   draft:
     name: draft release
@@ -25,7 +30,7 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
-      - run: rustup show active-toolchain # honours rust-toolchain.toml
+      - run: rustup install && rustup show active-toolchain # honours rust-toolchain.toml
 
       - name: Install xorriso
         run: |

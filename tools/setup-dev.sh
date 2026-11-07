@@ -90,10 +90,18 @@ else
 fi
 
 if (( CHECK_ONLY == 0 )) && command -v rustup >/dev/null 2>&1; then
-    # rustup reads rust-toolchain.toml and installs the pinned channel,
-    # components, and the x86_64-unknown-none target automatically.
+    # The toolchain rust-toolchain.toml names -- channel, components and
+    # targets -- asked for by name. From rustup 1.28 (2025-03) a bare
+    # `rustup install` does that; an older rustup refuses it (1.27.1: exit
+    # 1) and installs the toolchain as a side effect of `rustup show`, which
+    # newer ones call deprecated and may drop (2026-11-07, both measured).
     say "Syncing toolchain from rust-toolchain.toml"
-    ( cd "$REPO_ROOT" && rustup show active-toolchain )
+    rustup_version=$(rustup --version 2>/dev/null | awk '{ print $2 }')
+    if printf '1.28.0\n%s\n' "$rustup_version" | sort -V -C; then
+        ( cd "$REPO_ROOT" && rustup install && rustup show active-toolchain )
+    else
+        ( cd "$REPO_ROOT" && rustup show active-toolchain )
+    fi
     ok "toolchain matches rust-toolchain.toml"
 fi
 
