@@ -44,7 +44,6 @@ qemu.pid
 /fuzz/corpus/
 /fuzz/artifacts/
 /fuzz/coverage/
-.aptcache
 
 # Scratch reference material -- switch configs, vendor dumps. Never published:
 # these describe somebody else's production infrastructure.
