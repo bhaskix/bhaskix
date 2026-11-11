@@ -136,7 +136,7 @@ nothing in them is blocked. The two items above that are the lead's are past the
       the closed table, with eleven more closed since 2026-10-20 that a user could have met; the open table has twenty-one rows (one family grouped, the `uefi, qemu64` lane left out).
       **2026-11-03**: twenty-three, the gift row closed on the lead's word, and the note's open
       table twenty rows. **2026-11-05**: the ring-station row closed on its count, and the
-      `xstate cost` row of 2026-11-03 counted -- twenty-three, and the note's open table nineteen. **2026-11-06**: a torn `pkg install` filed -- twenty-four, and the note's open table twenty; fixed the same day, leaving one row for after the release that a user does not meet -- twenty-four, and the note's open table nineteen.
+      `xstate cost` row of 2026-11-03 counted -- twenty-three, and the note's open table nineteen. **2026-11-06**: a torn `pkg install` filed -- twenty-four, and the note's open table twenty; fixed the same day, leaving one row for after the release that a user does not meet -- twenty-four, and the note's open table nineteen. **2026-11-11**: a refused `clone` filed and fixed the same day -- unchanged.
       **On the 15th, count again** if §3 has changed since.
 
 ## One week before — 22 November: the candidate

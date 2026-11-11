@@ -1237,6 +1237,12 @@ extern "C" fn continue_on_guarded_stack(handoff: u64) -> ! {
     ) {
         println!("\x1b[91m    linux clone    FAILED\x1b[0m");
     }
+    if !futex_stress_self_test(
+        handoff.hhdm_base.as_u64(),
+        bhaskix_arch::percpu::online_count(),
+    ) {
+        println!("\x1b[91m    linux mutex    FAILED\x1b[0m");
+    }
     if !corpus_self_test(
         handoff.hhdm_base.as_u64(),
         bhaskix_arch::percpu::online_count(),
@@ -3343,9 +3349,12 @@ const STARTED_IMAGE_MAX: usize = 256 * 1024;
 /// The address space is **not** installed here: this thread belongs to a
 /// domain whose space is already live, and the scheduler switches to it the
 /// same way it does for every other thread of that domain.
-pub extern "C" fn cloned_thread(domain: u64) -> ! {
-    let id = domain::DomainId::from_u32(domain as u32);
-    let Some((entry, stack, tls)) = domain::take_pending_clone(id) else {
+pub extern "C" fn cloned_thread(start: u64) -> ! {
+    // Which domain, and which of its waiting clones is this thread's: each
+    // has an entry of its own, so two threads starting at once on two CPUs
+    // cannot take each other's stack.
+    let (id, index) = domain::clone_start_of(start);
+    let Some((entry, stack, tls)) = domain::take_pending_clone(id, index) else {
         sched::exit()
     };
     // **The child's one argument.** Linux installs `tls` as a segment base
@@ -3376,7 +3385,7 @@ pub extern "C" fn cloned_thread(domain: u64) -> ! {
     unsafe { bhaskix_arch::paging::switch_address_space(root) };
     // The note, as every direct entry into ring 3 must: this thread speaks
     // Linux because its domain does, and the syscall entry reads it.
-    telemetry::note_domain(domain as u32);
+    telemetry::note_domain(id.as_u32());
     // SAFETY: `entry` and `stack` are the *caller's own* addresses in the
     // caller's own space -- a hosted program pointing at memory it does not
     // hold gets a fault in ring 3, which ends the thread, exactly as a
@@ -8713,6 +8722,404 @@ fn thread_join_self_test(hhdm_base: u64, cpus: u32) -> bool {
             "\x1b[91m    linux join     FAILED: tid {tid}, the word at once {at_once:#x}, {waits} \
              wait(s), the last answered {}, the word after {after:#x}, finished {done}\x1b[0m",
             last as i64
+        );
+        false
+    }
+}
+
+/// The contention probe -- RFC 0005 step 6. Assembled from
+/// [`tools/probes/linux-futex-stress.s`](../../tools/probes/linux-futex-stress.s)
+/// by [`tools/probe-bytes.sh`](../../tools/probe-bytes.sh): four threads of one
+/// hosted program, three of them cloned with glibc's `pthread_create` flags,
+/// take one futex lock 500 times each, then pass a turn round a ring of
+/// themselves 125 times each, and the creator joins the three the way glibc's
+/// `pthread_join` does.
+#[rustfmt::skip]
+const FUTEX_STRESS_CODE: [u8; 682] = [
+    0x49, 0x89, 0xff,                         // mov %rdi,%r15
+    0x41, 0xc7, 0x87, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // movl $0x0,0x400(%r15)
+    0x41, 0xc7, 0x87, 0x00, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // movl $0x0,0x500(%r15)
+    0x41, 0xbe, 0x01, 0x00, 0x00, 0x00,       // mov $0x1,%r14d
+    0x4c, 0x89, 0xf0,                         // mov %r14,%rax
+    0x48, 0xc1, 0xe0, 0x06,                   // shl $0x6,%rax
+    0x49, 0x8d, 0x94, 0x07, 0x00, 0x04, 0x00, 0x00, // lea 0x400(%r15,%rax,1),%rdx
+    0x49, 0x89, 0xd2,                         // mov %rdx,%r10
+    0x4c, 0x89, 0xf0,                         // mov %r14,%rax
+    0x48, 0xc1, 0xe0, 0x08,                   // shl $0x8,%rax
+    0x4d, 0x8d, 0x84, 0x07, 0x00, 0x07, 0x00, 0x00, // lea 0x700(%r15,%rax,1),%r8
+    0x4c, 0x89, 0xf0,                         // mov %r14,%rax
+    0x48, 0xc1, 0xe0, 0x0c,                   // shl $0xc,%rax
+    0x48, 0x89, 0xe6,                         // mov %rsp,%rsi
+    0x48, 0x29, 0xc6,                         // sub %rax,%rsi
+    0x48, 0x83, 0xe6, 0xf0,                   // and $0xfffffffffffffff0,%rsi
+    0xbf, 0x00, 0x0f, 0x3d, 0x00,             // mov $0x3d0f00,%edi
+    0xb8, 0x38, 0x00, 0x00, 0x00,             // mov $0x38,%eax
+    0x0f, 0x05,                               // syscall
+    0x48, 0x85, 0xc0,                         // test %rax,%rax
+    0x74, 0x33,                               // je 95 <worker>
+    0x48, 0x83, 0xf8, 0xf5,                   // cmp $0xfffffffffffffff5,%rax
+    0x75, 0x17,                               // jne 7f <clone_next+0x60>
+    0x49, 0xff, 0x47, 0x50,                   // incq 0x50(%r15)
+    0x49, 0x81, 0x7f, 0x50, 0xe8, 0x03, 0x00, 0x00, // cmpq $0x3e8,0x50(%r15)
+    0x73, 0x09,                               // jae 7f <clone_next+0x60>
+    0xb8, 0x18, 0x00, 0x00, 0x00,             // mov $0x18,%eax
+    0x0f, 0x05,                               // syscall
+    0xeb, 0xa0,                               // jmp 1f <clone_next>
+    0x49, 0x89, 0x47, 0x18,                   // mov %rax,0x18(%r15)
+    0x78, 0x04,                               // js 89 <clone_next+0x6a>
+    0x49, 0xff, 0x47, 0x10,                   // incq 0x10(%r15)
+    0x49, 0xff, 0xc6,                         // inc %r14
+    0x49, 0x83, 0xfe, 0x04,                   // cmp $0x4,%r14
+    0x72, 0x8d,                               // jb 1f <clone_next>
+    0x45, 0x31, 0xf6,                         // xor %r14d,%r14d
+    0x4c, 0x89, 0xf3,                         // mov %r14,%rbx
+    0x48, 0xc1, 0xe3, 0x07,                   // shl $0x7,%rbx
+    0x49, 0x8d, 0x9c, 0x1f, 0x80, 0x00, 0x00, 0x00, // lea 0x80(%r15,%rbx,1),%rbx
+    0x45, 0x31, 0xe4,                         // xor %r12d,%r12d
+    0x31, 0xc0,                               // xor %eax,%eax
+    0xb9, 0x01, 0x00, 0x00, 0x00,             // mov $0x1,%ecx
+    0xf0, 0x41, 0x0f, 0xb1, 0x8f, 0x00, 0x04, 0x00, 0x00, // lock cmpxchg %ecx,0x400(%r15)
+    0x74, 0x63,                               // je 11c <locked>
+    0x83, 0xf8, 0x02,                         // cmp $0x2,%eax
+    0x74, 0x10,                               // je ce <wait>
+    0xb8, 0x02, 0x00, 0x00, 0x00,             // mov $0x2,%eax
+    0x41, 0x87, 0x87, 0x00, 0x04, 0x00, 0x00, // xchg %eax,0x400(%r15)
+    0x85, 0xc0,                               // test %eax,%eax
+    0x74, 0x4e,                               // je 11c <locked>
+    0x49, 0x8d, 0xbf, 0x00, 0x04, 0x00, 0x00, // lea 0x400(%r15),%rdi
+    0xbe, 0x80, 0x00, 0x00, 0x00,             // mov $0x80,%esi
+    0xba, 0x02, 0x00, 0x00, 0x00,             // mov $0x2,%edx
+    0x45, 0x31, 0xd2,                         // xor %r10d,%r10d
+    0xb8, 0xca, 0x00, 0x00, 0x00,             // mov $0xca,%eax
+    0x0f, 0x05,                               // syscall
+    0x48, 0xff, 0x43, 0x08,                   // incq 0x8(%rbx)
+    0x48, 0x85, 0xc0,                         // test %rax,%rax
+    0x75, 0x06,                               // jne f8 <wait+0x2a>
+    0x48, 0xff, 0x43, 0x10,                   // incq 0x10(%rbx)
+    0xeb, 0x14,                               // jmp 10c <wait+0x3e>
+    0x48, 0x83, 0xf8, 0xf5,                   // cmp $0xfffffffffffffff5,%rax
+    0x75, 0x06,                               // jne 104 <wait+0x36>
+    0x48, 0xff, 0x43, 0x18,                   // incq 0x18(%rbx)
+    0xeb, 0x08,                               // jmp 10c <wait+0x3e>
+    0x48, 0xff, 0x43, 0x30,                   // incq 0x30(%rbx)
+    0x48, 0x89, 0x43, 0x38,                   // mov %rax,0x38(%rbx)
+    0xb8, 0x02, 0x00, 0x00, 0x00,             // mov $0x2,%eax
+    0x41, 0x87, 0x87, 0x00, 0x04, 0x00, 0x00, // xchg %eax,0x400(%r15)
+    0x85, 0xc0,                               // test %eax,%eax
+    0x75, 0xb2,                               // jne ce <wait>
+    0x4d, 0x8b, 0x6f, 0x08,                   // mov 0x8(%r15),%r13
+    0x49, 0xff, 0xc5,                         // inc %r13
+    0x41, 0xf7, 0xc4, 0x03, 0x00, 0x00, 0x00, // test $0x3,%r12d
+    0x75, 0x07,                               // jne 133 <locked+0x17>
+    0xb8, 0x18, 0x00, 0x00, 0x00,             // mov $0x18,%eax
+    0x0f, 0x05,                               // syscall
+    0x4d, 0x89, 0x6f, 0x08,                   // mov %r13,0x8(%r15)
+    0xf0, 0x41, 0xff, 0x8f, 0x00, 0x04, 0x00, 0x00, // lock decl 0x400(%r15)
+    0x74, 0x3a,                               // je 17b <unlocked>
+    0x41, 0xc7, 0x87, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // movl $0x0,0x400(%r15)
+    0x49, 0x8d, 0xbf, 0x00, 0x04, 0x00, 0x00, // lea 0x400(%r15),%rdi
+    0xbe, 0x81, 0x00, 0x00, 0x00,             // mov $0x81,%esi
+    0xba, 0x01, 0x00, 0x00, 0x00,             // mov $0x1,%edx
+    0xb8, 0xca, 0x00, 0x00, 0x00,             // mov $0xca,%eax
+    0x0f, 0x05,                               // syscall
+    0x48, 0xff, 0x43, 0x20,                   // incq 0x20(%rbx)
+    0x48, 0x85, 0xc0,                         // test %rax,%rax
+    0x78, 0x06,                               // js 173 <locked+0x57>
+    0x48, 0x01, 0x43, 0x28,                   // add %rax,0x28(%rbx)
+    0xeb, 0x08,                               // jmp 17b <unlocked>
+    0x48, 0xff, 0x43, 0x30,                   // incq 0x30(%rbx)
+    0x48, 0x89, 0x43, 0x38,                   // mov %rax,0x38(%rbx)
+    0x49, 0xff, 0xc4,                         // inc %r12
+    0x4c, 0x89, 0x23,                         // mov %r12,(%rbx)
+    0x49, 0x81, 0xfc, 0xf4, 0x01, 0x00, 0x00, // cmp $0x1f4,%r12
+    0x0f, 0x82, 0x19, 0xff, 0xff, 0xff,       // jb a7 <pass>
+    0xf0, 0x49, 0xff, 0x47, 0x38,             // lock incq 0x38(%r15)
+    0x45, 0x31, 0xe4,                         // xor %r12d,%r12d
+    0x41, 0x8b, 0x97, 0x00, 0x05, 0x00, 0x00, // mov 0x500(%r15),%edx
+    0x89, 0xd0,                               // mov %edx,%eax
+    0x83, 0xe0, 0x03,                         // and $0x3,%eax
+    0x44, 0x39, 0xf0,                         // cmp %r14d,%eax
+    0x74, 0x3b,                               // je 1e2 <mine>
+    0x49, 0x8d, 0xbf, 0x00, 0x05, 0x00, 0x00, // lea 0x500(%r15),%rdi
+    0xbe, 0x80, 0x00, 0x00, 0x00,             // mov $0x80,%esi
+    0x45, 0x31, 0xd2,                         // xor %r10d,%r10d
+    0xb8, 0xca, 0x00, 0x00, 0x00,             // mov $0xca,%eax
+    0x0f, 0x05,                               // syscall
+    0x48, 0xff, 0x43, 0x48,                   // incq 0x48(%rbx)
+    0x48, 0x85, 0xc0,                         // test %rax,%rax
+    0x75, 0x06,                               // jne 1cc <turn+0x36>
+    0x48, 0xff, 0x43, 0x50,                   // incq 0x50(%rbx)
+    0xeb, 0xca,                               // jmp 196 <turn>
+    0x48, 0x83, 0xf8, 0xf5,                   // cmp $0xfffffffffffffff5,%rax
+    0x75, 0x06,                               // jne 1d8 <turn+0x42>
+    0x48, 0xff, 0x43, 0x58,                   // incq 0x58(%rbx)
+    0xeb, 0xbe,                               // jmp 196 <turn>
+    0x48, 0xff, 0x43, 0x30,                   // incq 0x30(%rbx)
+    0x48, 0x89, 0x43, 0x38,                   // mov %rax,0x38(%rbx)
+    0xeb, 0xb4,                               // jmp 196 <turn>
+    0xff, 0xc2,                               // inc %edx
+    0x41, 0x89, 0x97, 0x00, 0x05, 0x00, 0x00, // mov %edx,0x500(%r15)
+    0x49, 0x8d, 0xbf, 0x00, 0x05, 0x00, 0x00, // lea 0x500(%r15),%rdi
+    0xbe, 0x81, 0x00, 0x00, 0x00,             // mov $0x81,%esi
+    0xba, 0xff, 0xff, 0xff, 0x7f,             // mov $0x7fffffff,%edx
+    0xb8, 0xca, 0x00, 0x00, 0x00,             // mov $0xca,%eax
+    0x0f, 0x05,                               // syscall
+    0x48, 0xff, 0x43, 0x60,                   // incq 0x60(%rbx)
+    0x48, 0x85, 0xc0,                         // test %rax,%rax
+    0x78, 0x06,                               // js 212 <mine+0x30>
+    0x48, 0x01, 0x43, 0x68,                   // add %rax,0x68(%rbx)
+    0xeb, 0x08,                               // jmp 21a <mine+0x38>
+    0x48, 0xff, 0x43, 0x30,                   // incq 0x30(%rbx)
+    0x48, 0x89, 0x43, 0x38,                   // mov %rax,0x38(%rbx)
+    0x49, 0xff, 0xc4,                         // inc %r12
+    0x4c, 0x89, 0x63, 0x40,                   // mov %r12,0x40(%rbx)
+    0x49, 0x83, 0xfc, 0x7d,                   // cmp $0x7d,%r12
+    0x0f, 0x82, 0x6b, 0xff, 0xff, 0xff,       // jb 196 <turn>
+    0xf0, 0x49, 0xff, 0x47, 0x48,             // lock incq 0x48(%r15)
+    0x4d, 0x85, 0xf6,                         // test %r14,%r14
+    0x74, 0x0b,                               // je 240 <join_all>
+    0x31, 0xff,                               // xor %edi,%edi
+    0xb8, 0x3c, 0x00, 0x00, 0x00,             // mov $0x3c,%eax
+    0x0f, 0x05,                               // syscall
+    0xeb, 0xfe,                               // jmp 23e <mine+0x5c>
+    0x41, 0xbe, 0x01, 0x00, 0x00, 0x00,       // mov $0x1,%r14d
+    0x4c, 0x89, 0xf0,                         // mov %r14,%rax
+    0x48, 0xc1, 0xe0, 0x06,                   // shl $0x6,%rax
+    0x4d, 0x8d, 0xac, 0x07, 0x00, 0x04, 0x00, 0x00, // lea 0x400(%r15,%rax,1),%r13
+    0x45, 0x31, 0xe4,                         // xor %r12d,%r12d
+    0x41, 0x8b, 0x55, 0x00,                   // mov 0x0(%r13),%edx
+    0x85, 0xd2,                               // test %edx,%edx
+    0x74, 0x21,                               // je 281 <joined>
+    0x4c, 0x89, 0xef,                         // mov %r13,%rdi
+    0x31, 0xf6,                               // xor %esi,%esi
+    0x45, 0x31, 0xd2,                         // xor %r10d,%r10d
+    0xb8, 0xca, 0x00, 0x00, 0x00,             // mov $0xca,%eax
+    0x0f, 0x05,                               // syscall
+    0x49, 0xff, 0x47, 0x28,                   // incq 0x28(%r15)
+    0x49, 0xff, 0xc4,                         // inc %r12
+    0x49, 0x81, 0xfc, 0xa0, 0x86, 0x01, 0x00, // cmp $0x186a0,%r12
+    0x72, 0xd9,                               // jb 258 <join>
+    0xeb, 0x04,                               // jmp 285 <joined+0x4>
+    0x49, 0xff, 0x47, 0x20,                   // incq 0x20(%r15)
+    0x41, 0x8b, 0x45, 0x00,                   // mov 0x0(%r13),%eax
+    0x49, 0x09, 0x47, 0x30,                   // or %rax,0x30(%r15)
+    0x49, 0xff, 0xc6,                         // inc %r14
+    0x49, 0x83, 0xfe, 0x04,                   // cmp $0x4,%r14
+    0x72, 0xb0,                               // jb 246 <join_next>
+    0x41, 0x8b, 0x87, 0x00, 0x05, 0x00, 0x00, // mov 0x500(%r15),%eax
+    0x49, 0x89, 0x47, 0x40,                   // mov %rax,0x40(%r15)
+    0x49, 0xc7, 0x07, 0x01, 0x00, 0x00, 0x00, // movq $0x1,(%r15)
+    0xeb, 0xfe,                               // jmp 2a8 <joined+0x27>
+];
+
+/// Where the contention probe's report page lands physically.
+static FUTEX_STRESS_REPORT_PA: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+/// Where the contention probe runs, in [`enter_probe`]'s layout.
+const FUTEX_STRESS_AT: u64 = 0x0000_0000_3900_0000;
+
+/// The threads the contention probe runs, its creator among them.
+///
+/// Written in the probe, and here only to check what it reports; so are the
+/// two below.
+const FUTEX_STRESS_THREADS: usize = 4;
+
+/// The passes each thread makes through the lock -- the probe's `cmp $500`.
+const FUTEX_STRESS_PASSES: u64 = 500;
+
+/// The turns each thread takes round the ring -- the probe's `cmp $125`.
+const FUTEX_STRESS_TURNS: u64 = 125;
+
+extern "C" fn ring3_futex_stress(hhdm_base: u64) -> ! {
+    enter_probe(
+        hhdm_base,
+        &FUTEX_STRESS_CODE,
+        FUTEX_STRESS_AT,
+        &FUTEX_STRESS_REPORT_PA,
+        0,
+    )
+}
+
+/// RFC 0005 step 6: **whether a futex holds under contention.** The RFC asked
+/// for this test by name, because a subtly wrong futex does not produce an
+/// error: it produces a program that deadlocks under contention, occasionally,
+/// on a machine with more cores than the one it was tested on. Every other
+/// futex probe pairs one sleeper with one waker; this one puts four threads,
+/// started on CPUs in the kernel's rotation, on one lock and then on one ring.
+///
+/// **Two phases, because the lock cannot see a lost wake.** A waiter that
+/// sleeps through its wake is woken by the next contended unlock, so the lock
+/// came through 8,000 passes with the adapter's compare-before-park removed
+/// (2026-11-11, in a first version of the probe that was only the lock). What the lock proves is that four threads' worth of sleeping
+/// and waking leaves it exclusive -- a lock with two holders loses counts. The
+/// ring is where every wake is needed: one turn word, moved on only by the
+/// thread whose turn it is, which then wakes every sleeper on it, so a lost
+/// wake stops the ring and the probe never says it finished. The failure line
+/// reads the page anyway and says how far each thread got.
+///
+/// A run in which no wait ever slept is a failure, not a pass: it contended
+/// nothing, so it tested nothing.
+fn futex_stress_self_test(hhdm_base: u64, cpus: u32) -> bool {
+    use core::sync::atomic::Ordering;
+
+    if cpus < 2 {
+        println!("\x1b[93m    linux mutex    skipped, needs a second cpu\x1b[0m");
+        return true;
+    }
+    let cpu = cpus.saturating_sub(1);
+    FUTEX_STRESS_REPORT_PA.store(0, Ordering::Release);
+    let Ok(realm) = domain::create("mutex", domain::ResourceEnvelope::new()) else {
+        println!("\x1b[91m    linux mutex    FAILED: no domain\x1b[0m");
+        return false;
+    };
+    if !tag_linux(realm, "linux mutex    ") {
+        return false;
+    }
+    let options = sched::SpawnOptions::new()
+        .pinned()
+        .in_domain(realm.as_u32());
+    let refused_before = syscall::CLONE_RECORDS_REFUSED.load(Ordering::Relaxed);
+    let started = bhaskix_arch::tsc::read();
+    if sched::spawn_on_with(
+        cpu,
+        "mutex",
+        ring3_futex_stress,
+        hhdm_base,
+        hhdm_base,
+        options,
+    )
+    .is_err()
+    {
+        println!("\x1b[91m    linux mutex    FAILED: the probe would not spawn\x1b[0m");
+        retire_probe(realm);
+        return false;
+    }
+    // Words 0-15 the creator's, 16-79 a block of sixteen for each thread; see
+    // the probe. Word 0 is the creator's last store, so it is read first.
+    let mut words = [0u64; 80];
+    let mut finished = false;
+    for _ in 0..3000 {
+        let report_pa = FUTEX_STRESS_REPORT_PA.load(Ordering::Acquire);
+        if let Some(read) = finished_report(hhdm_base, report_pa, &[0]) {
+            words = read;
+            finished = true;
+            break;
+        }
+        wait_millis(5);
+    }
+    let took = bhaskix_arch::tsc::to_nanos(bhaskix_arch::tsc::read().saturating_sub(started))
+        .map_or(0, |nanos| nanos / 1_000_000);
+    if !finished {
+        // **A hang is read anyway**, before the domain goes: nothing will
+        // finish now, and how far each thread got is the whole diagnosis.
+        let report_pa = FUTEX_STRESS_REPORT_PA.load(Ordering::Acquire);
+        if report_pa != 0 {
+            for (index, word) in words.iter_mut().enumerate() {
+                *word = report_page_word(hhdm_base + report_pa, index);
+            }
+        }
+    }
+    // The lock word and the turn word as they stand -- past the words read
+    // above, at 0x400 and 0x500 -- because a hang is diagnosed by where they
+    // were left, and the creator copies the turn out only when it finishes.
+    let (lock_now, turn_now) = match FUTEX_STRESS_REPORT_PA.load(Ordering::Acquire) {
+        0 => (0, 0),
+        report_pa => (
+            report_page_word(hhdm_base + report_pa, 0x400 / 8) & 0xffff_ffff,
+            report_page_word(hhdm_base + report_pa, 0x500 / 8) & 0xffff_ffff,
+        ),
+    };
+    retire_probe(realm);
+    let records_refused = syscall::CLONE_RECORDS_REFUSED.load(Ordering::Relaxed) - refused_before;
+
+    let [
+        done,
+        counter,
+        clones,
+        last_clone,
+        joins,
+        join_waits,
+        tid_after,
+        through_lock,
+        turn_after,
+        through_ring,
+        refused,
+        ..,
+    ] = words;
+    // Each thread's block: the lock's passes, waits, waits answered 0, waits
+    // answered EAGAIN, wakes, threads woken; other answers and the last of
+    // them; the ring's turns, waits, waits answered 0, waits answered EAGAIN,
+    // wakes, threads woken.
+    let block = |thread: usize, field: usize| words[16 + 16 * thread + field];
+    let total = |field: usize| -> u64 {
+        (0..FUTEX_STRESS_THREADS)
+            .map(|thread| block(thread, field))
+            .fold(0u64, u64::saturating_add)
+    };
+    let (waits, slept, eagain, wakes, woken, other) =
+        (total(1), total(2), total(3), total(4), total(5), total(6));
+    let (ring_waits, ring_slept, ring_eagain, ring_wakes, ring_woken) =
+        (total(9), total(10), total(11), total(12), total(13));
+    let last_other = (0..FUTEX_STRESS_THREADS)
+        .map(|thread| block(thread, 7))
+        .find(|&answer| answer != 0)
+        .unwrap_or(0);
+    let threads = FUTEX_STRESS_THREADS as u64;
+    let (passes, turns) = (FUTEX_STRESS_PASSES * threads, FUTEX_STRESS_TURNS * threads);
+    let cloned = threads - 1;
+    let every = |field: usize, each: u64| {
+        (0..FUTEX_STRESS_THREADS).all(|thread| block(thread, field) == each)
+    };
+    if done == 1
+        && clones == cloned
+        && joins == cloned
+        && tid_after & 0xffff_ffff == 0
+        && through_lock == threads
+        && through_ring == threads
+        && every(0, FUTEX_STRESS_PASSES)
+        && every(8, FUTEX_STRESS_TURNS)
+        && counter == passes
+        && turn_after == turns
+        && other == 0
+        && refused == 0
+        && slept >= 1
+        && ring_slept >= 1
+    {
+        println!(
+            "    linux mutex    {threads} threads took one futex lock {passes} times and the \
+             counter it guards reads {counter}: {slept} waits slept and were woken, {eagain} \
+             answered EAGAIN, {wakes} wakes woke {woken}; then passed one turn {turn_after} \
+             times round a ring of themselves: {ring_slept} waits slept and were woken, \
+             {ring_eagain} answered EAGAIN, {ring_wakes} wakes woke {ring_woken}; the creator \
+             cloned {clones} with glibc's flags, {refused} refused, and joined them \
+             ({join_waits} waits), in {took} ms"
+        );
+        true
+    } else {
+        println!(
+            "\x1b[91m    linux mutex    FAILED: finished {done}; the lock: {through_lock} of \
+             {threads} threads through ({}, {}, {}, {} of {FUTEX_STRESS_PASSES} passes), the \
+             counter {counter} of {passes}, {waits} waits, {slept} slept, {eagain} EAGAIN, \
+             {wakes} wakes woke {woken}, the lock word {lock_now} now; the ring: {through_ring} of \
+             {threads} through ({}, {}, {}, {} of {FUTEX_STRESS_TURNS} turns), the turn \
+             {turn_after} of {turns} (the word {turn_now} now), \
+             {ring_waits} waits, {ring_slept} slept, {ring_eagain} EAGAIN, {ring_wakes} wakes \
+             woke {ring_woken}; {clones} clones made, the last answered {}, {refused} refused \
+             and asked again ({records_refused} for want of a start record in the nucleus); \
+             {joins} of {cloned} \
+             joined ({join_waits} waits), the tid words after {tid_after:#x}; {other} other \
+             answers, the first {}; {took} ms\x1b[0m",
+            block(0, 0),
+            block(1, 0),
+            block(2, 0),
+            block(3, 0),
+            block(0, 8),
+            block(1, 8),
+            block(2, 8),
+            block(3, 8),
+            last_clone as i64,
+            last_other as i64
         );
         false
     }

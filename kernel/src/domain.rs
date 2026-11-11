@@ -793,11 +793,21 @@ pub struct Domain {
     /// a thread entry point takes one word and this needs three, and a domain
     /// is the identity both sides already agree on.
     pending_start: Option<(crate::shared::MemoryId, usize, u64)>,
-    /// A Linux `clone`'s parameters, waiting for the thread it creates —
-    /// RFC 0005 step 6's missing half. `(entry, stack, tls)`, all three the
+    /// Linux `clone`s' parameters, each waiting for the thread spawned for it
+    /// — RFC 0005 step 6's missing half. `(entry, stack, tls)`, all three the
     /// caller's own: the personality creates a thread in the domain the
     /// caller already has, running code the caller already mapped.
-    pending_clone: Option<(u64, u64, u64)>,
+    ///
+    /// **A table, each entry bound to one thread** (2026-11-11). It was one
+    /// record a domain, refused while full, so a `clone` made before the
+    /// previous child had started on its CPU was refused, and `bin/linuxd`
+    /// answered it `EAGAIN` -- which Linux never answers for this. The futex
+    /// contention probe found it, its third back-to-back `clone` refused. One
+    /// record cannot simply be shared: two clones racing for it would have a
+    /// thread start on the other's stack. So each clone parks in an entry of
+    /// its own, and the thread spawned for it is told which
+    /// ([`clone_start_word`]).
+    pending_clones: [Option<(u64, u64, u64)>; PENDING_CLONES],
     /// What it may touch.
     pub cspace: CSpace,
     /// What it may consume.
@@ -836,7 +846,7 @@ impl Domain {
             ended: None,
             notify: None,
             pending_start: None,
-            pending_clone: None,
+            pending_clones: [None; PENDING_CLONES],
             cspace: CSpace::new(),
             envelope: ResourceEnvelope::new(),
             held_capabilities: 0,
@@ -1016,35 +1026,73 @@ impl core::fmt::Debug for Name {
 /// Which CPU the next started program is pinned to.
 static NEXT_CPU: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
-/// Parks a `clone`'s parameters for the thread about to be spawned.
+/// How many of one domain's `clone`s may wait at once for their threads to
+/// start -- the entries of [`Domain::pending_clones`].
 ///
-/// Refused if one is already waiting: two clones racing for one slot would
-/// have a thread start on the other's stack, which is the corruption this
-/// whole step exists to avoid.
+/// Sixteen, which is `bin/linuxd`'s own bound: it gives each hosted process
+/// sixteen trampoline slots and answers a seventeenth `clone` in flight
+/// `EAGAIN` itself, so a full table here is a bound that adapter already
+/// keeps, not a new one.
+pub const PENDING_CLONES: usize = 16;
+
+impl Domain {
+    /// Parks a `clone`'s parameters in a free entry and answers which, or
+    /// `None` when every entry has a thread still on its way to collect it.
+    fn park_clone(&mut self, clone: (u64, u64, u64)) -> Option<usize> {
+        let index = self.pending_clones.iter().position(Option::is_none)?;
+        self.pending_clones[index] = Some(clone);
+        Some(index)
+    }
+
+    /// Takes entry `index`'s parameters, if it holds any.
+    fn take_clone(&mut self, index: usize) -> Option<(u64, u64, u64)> {
+        self.pending_clones.get_mut(index)?.take()
+    }
+}
+
+/// Parks a `clone`'s parameters for the thread about to be spawned, and
+/// answers the entry that thread must be told -- see [`clone_start_word`].
+///
+/// An entry of its own, never one shared: two clones racing for one record
+/// would have a thread start on the other's stack, which is the corruption
+/// this whole step exists to avoid.
 ///
 /// # Errors
 ///
-/// [`DomainError::NoSuchDomain`], or [`DomainError::HasThreads`] when a
-/// clone is already pending — the nearest existing variant for "not now".
+/// [`DomainError::NoSuchDomain`], or [`DomainError::HasThreads`] when all
+/// [`PENDING_CLONES`] entries are waiting — the nearest existing variant for
+/// "not now".
 pub fn record_pending_clone(
     id: DomainId,
     entry: u64,
     stack: u64,
     tls: u64,
-) -> Result<(), DomainError> {
+) -> Result<usize, DomainError> {
     with(id, |domain| {
-        if domain.pending_clone.is_some() {
-            return Err(DomainError::HasThreads);
-        }
-        domain.pending_clone = Some((entry, stack, tls));
-        Ok(())
+        domain
+            .park_clone((entry, stack, tls))
+            .ok_or(DomainError::HasThreads)
     })
     .unwrap_or(Err(DomainError::NoSuchDomain))
 }
 
-/// Takes the parked `clone` parameters, if any.
-pub fn take_pending_clone(id: DomainId) -> Option<(u64, u64, u64)> {
-    with(id, |domain| domain.pending_clone.take()).flatten()
+/// Takes the `clone` parameters parked in entry `index`, if any.
+pub fn take_pending_clone(id: DomainId, index: usize) -> Option<(u64, u64, u64)> {
+    with(id, |domain| domain.take_clone(index)).flatten()
+}
+
+/// The one word a cloned thread's entry point is given: its domain in the low
+/// half and its entry in [`Domain::pending_clones`] in the high, because a
+/// thread entry takes one word and the thread needs both.
+#[must_use]
+pub fn clone_start_word(id: DomainId, index: usize) -> u64 {
+    u64::from(id.as_u32()) | ((index as u64) << 32)
+}
+
+/// The domain and entry a [`clone_start_word`] names.
+#[must_use]
+pub fn clone_start_of(word: u64) -> (DomainId, usize) {
+    (DomainId::from_u32(word as u32), (word >> 32) as usize)
 }
 
 /// Records the image a domain is about to be started with.
@@ -1347,7 +1395,7 @@ pub fn create_under(
         ended: None,
         notify: None,
         pending_start: None,
-        pending_clone: None,
+        pending_clones: [None; PENDING_CLONES],
         cspace: CSpace::new(),
         envelope,
         held_capabilities: 0,
@@ -1961,6 +2009,51 @@ mod tests {
         let budget = FrameBudget::empty();
         budget.open(cap);
         budget
+    }
+
+    /// 2026-11-11: one record a domain refused a `clone` made before the
+    /// previous child had started, and the futex contention probe's third
+    /// back-to-back `clone` was answered `EAGAIN`. Each waiting clone keeps
+    /// its own parameters until the thread told its entry takes them -- out of
+    /// order, as threads on different CPUs start -- and only a full table
+    /// refuses.
+    #[test]
+    fn clones_waiting_to_start_each_keep_their_own_parameters() {
+        let mut domain = domain(ResourceEnvelope::new());
+        let params = |n: usize| (0x1000 + n as u64, 0x2000 + n as u64, 0x3000 + n as u64);
+
+        // The case the probe met: three clones before any child had started.
+        for n in 0..3 {
+            assert_eq!(
+                domain.park_clone(params(n)),
+                Some(n),
+                "clone {n} was refused while {n} waited to start"
+            );
+        }
+        // Taken out of order, as threads on different CPUs start, each entry
+        // answers its own clone, once.
+        assert_eq!(domain.take_clone(2), Some(params(2)));
+        assert_eq!(domain.take_clone(0), Some(params(0)));
+        assert_eq!(domain.take_clone(0), None, "an entry is taken once");
+        // A freed entry is used again, and holds the new clone, not the old.
+        assert_eq!(domain.park_clone(params(42)), Some(0));
+        assert_eq!(domain.take_clone(0), Some(params(42)));
+        assert_eq!(domain.take_clone(1), Some(params(1)));
+
+        // Only a full table refuses.
+        for n in 0..PENDING_CLONES {
+            assert_eq!(domain.park_clone(params(n)), Some(n));
+        }
+        assert_eq!(
+            domain.park_clone(params(99)),
+            None,
+            "a full table must refuse"
+        );
+        assert_eq!(domain.take_clone(PENDING_CLONES), None, "past the table");
+
+        // The word a cloned thread starts with names both halves.
+        let (id, index) = clone_start_of(clone_start_word(DomainId::from_u32(63), 15));
+        assert_eq!((id.as_u32(), index), (63, 15));
     }
 
     #[test]

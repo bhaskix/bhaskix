@@ -58,7 +58,7 @@ acceptance call stays theirs~~ **and accepted it as amended the same day.**
 | 3 | Initial process image | ✅ The `AT_RANDOM` gate |
 | 4 | Signals | ✅ [RFC 0083](0083-a-signal-a-process-can-catch.md) — delivered at a call or a fault, and nowhere else |
 | 5 | Memory | ✅ Including RFC 0086 step 5's `MADV_DONTNEED` that really discards |
-| 6 | Threads and futex, with a contention stress test | **Part** — `clone`, `gettid`, `exit_group` and `futex` gated; `tgkill` delivers only a fatal signal a thread sends itself; **no contention stress test exists** |
+| 6 | Threads and futex, with a contention stress test | **Part** — `clone`, `gettid`, `exit_group` and `futex` gated; `tgkill` delivers only a fatal signal a thread sends itself; ~~**no contention stress test exists**~~ **the contention stress test exists since 2026-11-11** -- `linux mutex`, every boot: four threads on one futex lock, then on one turn ring, armed three ways |
 | 7 | Tier 0: corpus programs 1–5 pass | **Superseded by step 10** — below |
 | 8 | Tier 1, with its fuzz target | **Part** — all but `readlinkat` and `/proc/self/exe`, left out on purpose (step 8's record) |
 | 9 | Tier 2: sockets and `epoll` | **Part** — UDP, server-side TCP and edge-triggered `epoll` gated; ~~**no `connect`**, so hosted TCP is server-only, and IPv4 UDP loopback was never shown~~ **both carried items done 2026-10-16**: `connect` ([RFC 0090](0090-a-hosted-program-that-dials-out.md)), and IPv4 UDP loopback, shown over `127.0.0.1` |
@@ -91,7 +91,9 @@ without the workload; it is no longer an acceptance gate.
   needs its own path.
 - **Asynchronous signal delivery** — `SIGURG`, and `tgkill` beyond a fatal signal to oneself —
   is [RFC 0083](0083-a-signal-a-process-can-catch.md)'s recorded limit, under its trigger.
-- **A futex contention stress test** (step 6), ~~**a fuzz target over the argument decoder** (the
+- ~~**A futex contention stress test** (step 6)~~ (**done 2026-11-11**: `linux mutex`, four
+  threads on one futex lock and then on one turn ring, on every boot -- TRACKER §7),
+  ~~**a fuzz target over the argument decoder** (the
   testing plan; the two targets that exist cover the `dirent` encoder and `sockaddr` parsing)~~
   (**done 2026-10-29**: `linux_decoder`, which found a nucleus panic on the way -- TRACKER §3),
   **rule 2's negative test restated for the adapter** (the capabilities are the adapter's, not
@@ -1411,8 +1413,9 @@ before M5 delivers user mode and M6 delivers the ELF loader.
 5. **Memory.** `mmap`, `munmap`, `mprotect`, `madvise` over the existing
    region map, which already makes `W^X` unrepresentable. ✅ **Done.**
 6. **Threads and futex.** `clone`, `gettid`, `tgkill`, `exit_group`, `futex`,
-   with a dedicated contention stress test. **Part** — no stress test, and `tgkill` only to
-   end oneself; both carried out by "What it is judged against".
+   with a dedicated contention stress test. **Part** — ~~no stress test, and~~ `tgkill` only to
+   end oneself, carried out by "What it is judged against". The stress test was carried with
+   it and is **done 2026-11-11** (`linux mutex`).
 7. **Tier 0 gate.** Corpus programs 1–5 pass. This is the milestone worth
    announcing: a real Go binary, unmodified, on Bhaskix. **Superseded by step 10**, amendment
    of 2026-10-07 — program 5 (`SIGURG`) carried out.

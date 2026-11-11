@@ -3102,6 +3102,16 @@ pub fn arm_answers() -> [u64; 6] {
     core::array::from_fn(|index| ARM_ANSWERS[index].load(Ordering::Relaxed))
 }
 
+/// `SPAWN_THREAD`s refused because no start record was free for the new
+/// thread's `clone` parameters. There was one record a domain until
+/// 2026-11-11, when the futex contention probe's third back-to-back `clone`
+/// was refused while its second child had not yet started; `bin/linuxd`
+/// answers the refusal `EAGAIN`, which Linux never gives for this. Now a
+/// `clone` is refused only while [`crate::domain::PENDING_CLONES`] others of
+/// its domain are still waiting to start. The contention probe prints the
+/// count.
+pub static CLONE_RECORDS_REFUSED: AtomicU64 = AtomicU64::new(0);
+
 /// The Linux number of `futex`.
 const LINUX_FUTEX: u64 = 202;
 
@@ -4353,9 +4363,11 @@ fn domain_supervise(frame: &SyscallFrame) -> Option<Outcome> {
             if entry == 0 || stack == 0 {
                 return Some(Outcome::err(Status::WrongObject));
             }
-            if crate::domain::record_pending_clone(target, entry, stack, argument).is_err() {
+            let Ok(index) = crate::domain::record_pending_clone(target, entry, stack, argument)
+            else {
+                CLONE_RECORDS_REFUSED.fetch_add(1, Ordering::Relaxed);
                 return Some(Outcome::err(Status::QuotaExceeded));
-            }
+            };
             let cpu = crate::domain::next_start_cpu();
             let options = crate::sched::SpawnOptions::new()
                 .pinned()
@@ -4364,13 +4376,13 @@ fn domain_supervise(frame: &SyscallFrame) -> Option<Outcome> {
                 cpu,
                 "cloned",
                 crate::cloned_thread,
-                u64::from(target.as_u32()),
+                crate::domain::clone_start_word(target, index),
                 crate::shared::hhdm(),
                 options,
             ) {
                 Ok(id) => Outcome::ok(u64::from(id)),
                 Err(_) => {
-                    crate::domain::take_pending_clone(target);
+                    crate::domain::take_pending_clone(target, index);
                     Outcome::err(Status::Exhausted)
                 }
             }

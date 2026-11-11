@@ -2985,6 +2985,48 @@ else
     status=1
 fi
 
+# RFC 0005 step 6: a futex under contention, the stress test the RFC asked
+# for by name -- a subtly wrong futex produces no error, only a program that
+# deadlocks now and then on a machine with more cores. Four threads of one
+# hosted program, three cloned with glibc's flags onto CPUs in the kernel's
+# rotation, take one futex lock 500 times each, then pass one turn round a
+# ring of themselves 125 times each, and the creator joins the three. The lock
+# is checked for two holders (a lost count); the ring for a lost wake, which
+# the lock cannot see -- a later contended unlock wakes whoever slept through
+# theirs -- and which stops the ring at once. A phase in which no wait slept
+# contended nothing, so the kernel fails that too rather than passing it; and
+# so does a clone refused while its siblings were starting, which Linux never
+# refuses and which this probe found the nucleus refusing (2026-11-11).
+if grep -qE "linux mutex +4 threads took one futex lock 2000 times and the counter it guards reads 2000: [1-9][0-9]* waits slept and were woken, [0-9]+ answered EAGAIN, [0-9]+ wakes woke [0-9]+; then passed one turn 500 times round a ring of themselves: [1-9][0-9]* waits slept and were woken, [0-9]+ answered EAGAIN, [0-9]+ wakes woke [0-9]+; the creator cloned 3 with glibc's flags, 0 refused, and joined them \([0-9]+ waits\), in [0-9]+ ms" "$LOG"; then
+    pass "four threads contended for one futex lock, then passed every turn round a ring of themselves: $(grep -oE 'round a ring of themselves: [0-9]+ waits slept' "$LOG" | head -1 | grep -oE '[0-9]+ waits slept')"
+elif grep -qE "linux mutex +skipped, needs a second cpu" "$LOG"; then
+    pass "the contention probe needs a second cpu, and said so"
+else
+    fail "the futex contention probe failed -- its line below says which check"
+    grep -E "linux mutex" "$LOG" || true
+    status=1
+fi
+
+# What the futex sleepers leave behind. A wake slot whose notification still
+# holds a bit after its sleeper has gone hands that bit, as a wake nobody sent,
+# to the next thread parked there -- a pipe reader, a wait4, a futex -- and the
+# contention probe above is the heaviest use of those sixteen slots a boot
+# makes. The kernel has printed this line on every boot with console input
+# since the pool was shared, and it was read by nothing until the probe above
+# (2026-11-11). A boot without console input never reaches it, and says so.
+if grep -qE "futex wakes +none of 16 notifications was left holding bits nobody took" "$LOG"; then
+    pass "no futex wake slot was left holding a wake nobody took"
+elif grep -qE "futex wakes +[0-9]+ of 16 notifications still hold bits" "$LOG"; then
+    fail "a futex wake slot was left holding a wake nobody took"
+    grep -aE "futex wakes" "$LOG" || true
+    status=1
+elif grep -qF "no console input on this machine, so no shell." "$LOG"; then
+    pass "no console input on this machine, so the futex wake slots are not counted"
+else
+    fail "the futex wake slots were never counted"
+    status=1
+fi
+
 # RFC 0099: a vfork with Go's flags holds its parent until the child has ended,
 # so wait4(WNOHANG) collects it the moment clone returns; the child's SIGCHLD
 # reaches the parent's handler once; SIG_IGN on SIGCHLD reaps a child for its
