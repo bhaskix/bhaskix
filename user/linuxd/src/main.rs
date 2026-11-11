@@ -2171,7 +2171,7 @@ fn answer(request: &PersonalityCall) -> (u64, Answer) {
         OPENAT => {
             return (
                 REPLY_VALUE,
-                answer_openat(request, request.second(), request.third()),
+                answer_openat_at(request, request.first(), request.second(), request.third()),
             );
         }
         OPEN => {
@@ -5213,6 +5213,97 @@ fn answer_openat(request: &PersonalityCall, path_at: u64, flags: u64) -> Answer 
     open_the_file(request, path_at, flags)
 }
 
+/// Answers a hosted `openat(dirfd, path, flags)` with its descriptor read.
+///
+/// **The descriptor was ignored until 2026-11-11.** This call handed only the
+/// path and the flags on, so a relative name was resolved in the root whatever
+/// directory the descriptor named: `openat(fd_of("/tmp"), "inner")` opened
+/// `/inner` -- the wrong file, though one inside what this adapter holds -- and
+/// a descriptor that was not a directory, or not open, was not refused. Found
+/// by RFC 0005's rule 2 test, `linux confined`, which holds it to Linux's
+/// rules, in their order:
+///
+/// - an absolute name ignores the descriptor;
+/// - `AT_FDCWD` is the working directory, which for every hosted process is
+///   the root ([`answer_getcwd`]);
+/// - otherwise the descriptor must be open (`EBADF`) and a directory
+///   (`ENOTDIR`), and the name is resolved in the capability *it* holds.
+///
+/// **One component, and nothing written**, as in the root. A deeper name is
+/// `ENOENT`; `..` is refused by the filesystem service, because a directory
+/// that answered it would hand out its parent; and a write is `EROFS`, because
+/// every directory descriptor this adapter makes was reached through the
+/// read-only root -- the one writable directory is reached by name, as
+/// `/tmp/<name>`, and a descriptor for `/tmp` carries the root's rights. `.` is
+/// the directory itself, opened again.
+fn answer_openat_at(request: &PersonalityCall, dirfd: u64, path_at: u64, flags: u64) -> Answer {
+    use bhaskix_personality::file::{Entry, Kind, open, plan_openat};
+
+    // Linux reads the descriptor as an `int`, whatever is above it.
+    let dirfd = dirfd as u32 as i32;
+    if dirfd == AT_FDCWD as u32 as i32 {
+        return answer_openat(request, path_at, flags);
+    }
+    let mut name = [0u8; MAX_NAME];
+    if !copy_in(request.domain, path_at, &mut name) {
+        return Answer::error(-14); // EFAULT
+    }
+    if name.first() == Some(&b'/') {
+        return answer_openat(request, path_at, flags);
+    }
+    let Some(process) = process_for(request.domain) else {
+        return Answer::error(-11); // EAGAIN
+    };
+    let Some(directory) = process.descriptors.get(dirfd).copied() else {
+        return Answer::error(-9); // EBADF
+    };
+    if directory.kind != Kind::Directory {
+        return Answer::error(-20); // ENOTDIR
+    }
+    // A descriptor for the root names the directory every name is resolved in
+    // already, `/proc` and `/tmp/<name>` included.
+    if directory.handle == ROOT_DIR {
+        return answer_openat(request, path_at, flags);
+    }
+    let plan = match plan_openat(flags) {
+        Ok(plan) => plan,
+        Err(errno) => return Answer::error(errno),
+    };
+    if plan.writable {
+        return Answer::error(-30); // EROFS
+    }
+    if names_own_root(&name) {
+        if let Err(errno) = bhaskix_personality::file::plan_truncation(
+            plan,
+            bhaskix_personality::file::Target::Directory,
+        ) {
+            return Answer::error(errno);
+        }
+        // The same capability, a second row naming it: `close` counts the
+        // rows, as it does for `dup`, so neither gives it back while the
+        // other is open. Its own offset, because it is a new open.
+        let again = Entry {
+            handle: directory.handle,
+            inode: directory.inode,
+            kind: Kind::Directory,
+            close_on_exec: flags & open::CLOEXEC != 0,
+            offset: 0,
+            size: directory.size,
+            readable: true,
+            writable: false,
+        };
+        return match process.descriptors.insert(again, 0) {
+            Ok(descriptor) => Answer::ok(descriptor as u64),
+            Err(errno) => Answer::error(errno),
+        };
+    }
+    let Some(component) = one_component(&name) else {
+        trace_file(-2, STAGE_BAD_NAME, 0);
+        return Answer::error(-2); // ENOENT
+    };
+    open_component_in(request, directory.handle, component, flags, plan)
+}
+
 /// Where an `open` stopped, for the record's second word. A hosted program
 /// sees one `ENOENT`; whoever is debugging sees which of four it was.
 const STAGE_BAD_NAME: i64 = -101;
@@ -5257,7 +5348,7 @@ const STAGE_EXEC_MAP: i64 = -145;
 
 /// The work behind [`answer_openat`], so that every path through it is traced.
 fn open_the_file(request: &PersonalityCall, path_at: u64, flags: u64) -> Answer {
-    use bhaskix_personality::file::{Entry, Kind, open, plan_openat};
+    use bhaskix_personality::file::plan_openat;
 
     // **The plan is used now** — RFC 0060. Until then this refused every
     // non-read-only open with `EROFS` before looking at anything, computed the
@@ -5295,24 +5386,30 @@ fn open_the_file(request: &PersonalityCall, path_at: u64, flags: u64) -> Answer 
     if plan.writable {
         return Answer::error(-30); // EROFS
     }
-    let Some(component) = one_component(&name) else {
-        // **`/` and `.` are this process's own root**, and answering them is
-        // what makes a directory readable at all: `getdents64` needs a
-        // descriptor, and until now the only way to get one was to name a
-        // directory *inside* the root -- so the root itself, which is the
-        // one directory every hosted process has, was the one it could not
-        // list.
-        if names_own_root(&name) {
-            // `EISDIR`, as Linux answers `open("/", O_RDONLY | O_TRUNC)` --
-            // measured, not recalled. RFC 0077.
-            if let Err(errno) = bhaskix_personality::file::plan_truncation(
-                plan,
-                bhaskix_personality::file::Target::Directory,
-            ) {
-                return Answer::error(errno);
-            }
-            return open_own_root(request, flags);
+    // **`/` and `.` are this process's own root**, and answering them is
+    // what makes a directory readable at all: `getdents64` needs a
+    // descriptor, and until now the only way to get one was to name a
+    // directory *inside* the root -- so the root itself, which is the one
+    // directory every hosted process has, was the one it could not list.
+    //
+    // **Asked before a name is taken as one component** (2026-11-11). This
+    // was asked only when [`one_component`] found none, and `.` *is* one
+    // component, so it went to the filesystem service as a name -- which
+    // refuses `.` as one, rightly -- and `open(".")` and `stat(".")` answered
+    // `ENOENT` on every machine that had a root to give. The `.` here was
+    // never reached. Found by RFC 0005's rule 2 test, `linux confined`.
+    if names_own_root(&name) {
+        // `EISDIR`, as Linux answers `open("/", O_RDONLY | O_TRUNC)` --
+        // measured, not recalled. RFC 0077.
+        if let Err(errno) = bhaskix_personality::file::plan_truncation(
+            plan,
+            bhaskix_personality::file::Target::Directory,
+        ) {
+            return Answer::error(errno);
         }
+        return open_own_root(request, flags);
+    }
+    let Some(component) = one_component(&name) else {
         // **Three different refusals answered `-2` and the record could not
         // tell them apart** -- the mistake this project has now made five
         // times, and the reason the second word of the record is a *stage*
@@ -5322,10 +5419,27 @@ fn open_the_file(request: &PersonalityCall, path_at: u64, flags: u64) -> Answer 
         return Answer::error(-2); // ENOENT
     };
 
+    open_component_in(request, ROOT_DIR, component, flags, plan)
+}
+
+/// Opens one name inside `directory` -- the root, or a directory a descriptor
+/// names -- into a slot of the file pool, and gives the caller a descriptor
+/// for it. The second half of [`open_the_file`], shared with
+/// [`answer_openat_at`] so that a name is opened one way wherever it is
+/// resolved.
+fn open_component_in(
+    request: &PersonalityCall,
+    directory: u64,
+    component: &[u8],
+    flags: u64,
+    plan: bhaskix_personality::file::OpenPlan,
+) -> Answer {
+    use bhaskix_personality::file::{Entry, Kind, open};
+
     let Some(slot) = claim_file_slot() else {
         return Answer::error(-24); // EMFILE
     };
-    let opened = match resolve_into(slot, component) {
+    let opened = match resolve_into(directory, slot, component) {
         Ok(opened) => opened,
         Err(errno) => {
             release_file_slot(slot);
@@ -5393,14 +5507,6 @@ fn names_own_root(name: &[u8]) -> bool {
     !name.is_empty() && (name == b"." || name.iter().all(|byte| *byte == b'/'))
 }
 
-/// Opens the directory capability this process was given, as a descriptor.
-///
-/// **The handle is [`ROOT_DIR`] itself and no slot is claimed**, because
-/// there is nothing to claim: the capability is already held, at a fixed
-/// slot, for the life of this program. That makes `close` a special case,
-/// and [`answer_close`] carries the guard — releasing this handle would
-/// `DELETE` the adapter's only directory and every hosted process on the
-/// machine would stop finding files.
 /// Opens a name inside the one writable directory — RFC 0060.
 ///
 /// The mirror of the read path against a different capability: it resolves
@@ -5548,9 +5654,46 @@ fn open_writable(
     }
 }
 
+/// Whether this program holds anything at `slot`.
+///
+/// Asked of the kernel, which answers `NO_SUCH_CAPABILITY` for an empty slot
+/// and `REVOKED` for a dead one before it looks at the method -- the question
+/// `bin/ipd` asks of its own endpoint. `INFO` is not a method a directory's
+/// endpoint answers, so a held one says `WRONG_OBJECT` and nothing is done:
+/// no service is called and nothing in the slot changes.
+fn holds_capability(slot: u64) -> bool {
+    let answer = call(syscall::INVOKE, slot, method::INFO, [0; 4]).status;
+    answer != status::NO_SUCH_CAPABILITY && answer != status::REVOKED
+}
+
+/// Opens the directory capability this process was given, as a descriptor.
+///
+/// **The handle is [`ROOT_DIR`] itself and no slot is claimed**, because
+/// there is nothing to claim: the capability is already held, at a fixed
+/// slot, for the life of this program. That makes `close` a special case,
+/// and [`answer_close`] carries the guard — releasing this handle would
+/// `DELETE` the adapter's only directory and every hosted process on the
+/// machine would stop finding files.
+///
+/// **And only when it is held** -- see the first lines below. This comment
+/// sat above [`open_writable`], run into that function's own, from 2026-08-31
+/// to 2026-11-11.
 fn open_own_root(request: &PersonalityCall, flags: u64) -> Answer {
     use bhaskix_personality::file::{Entry, Kind, open};
 
+    // **Only if there is a root to open** (2026-11-11). This handed out a
+    // descriptor for [`ROOT_DIR`] without asking whether the slot held
+    // anything, so on a machine with no filesystem service -- the plain ISO,
+    // with no disk -- a hosted program was told `/` existed and was a
+    // directory, and `stat("/")` and `access("/")` agreed with it; a
+    // `getdents64` on it then answered `EIO`. RFC 0005's rule 2 says a program
+    // with no filesystem capability fails every open, and this was the one
+    // that did not. `ENOENT`, as every name under a root that is not there
+    // answers. Found by `linux confined`, red first.
+    if !holds_capability(ROOT_DIR) {
+        trace_file(-2, STAGE_NO_DIRECTORY, 0);
+        return Answer::error(-2); // ENOENT
+    }
     // No access-mode check here: [`open_the_file`] refuses anything but
     // `O_RDONLY` with `EROFS` before it reaches this, and a second check that
     // cannot fire is a check nobody can watch fail.
@@ -6267,6 +6410,15 @@ fn answer_unlink(request: &PersonalityCall, path_at: u64) -> Answer {
         bhaskix_abi::dir::REMOVE_AT,
         packed,
     );
+    // **`EROFS` when there is no writable directory, as `mkdir` says it**
+    // (2026-11-11). This answered `EIO` -- an I/O error, on a machine that
+    // had done no I/O -- because a call to an empty slot is refused like any
+    // other; `mkdir` and `open(O_CREAT)` had answered the same state `EROFS`
+    // all along. Found by `linux confined`. A refusal by the service itself
+    // is still `EIO`.
+    if reply.status == status::NO_SUCH_CAPABILITY || reply.status == status::REVOKED {
+        return Answer::error(-30); // EROFS: no writable directory is held
+    }
     if reply.status != status::OK {
         return Answer::error(-5); // EIO
     }
@@ -7425,7 +7577,8 @@ struct Opened {
     directory: bool,
 }
 
-/// Resolves one name in this process's root directory into `slot`.
+/// Resolves one name in `directory` -- the root, or a directory a descriptor
+/// names (2026-11-11) -- into `slot`.
 ///
 /// **Extracted at RFC 0059 rather than copied.** `execve` has to resolve a
 /// name exactly the way `open` does — same directory, same one component, same
@@ -7442,11 +7595,11 @@ struct Opened {
 /// The Linux errno to answer with. `ENOENT` for every way the service can say
 /// no, because that is the truth a hosted program can act on; *which* way it
 /// was goes into the trace record, for whoever is reading a boot.
-fn resolve_into(slot: u64, component: &[u8]) -> Result<Opened, i64> {
+fn resolve_into(directory: u64, slot: u64, component: &[u8]) -> Result<Opened, i64> {
     // Where the answer may land, said before asking and addressed to the
     // service being asked -- the protocol's own rule, and what stops a
     // capability arriving somewhere the caller did not choose.
-    let declared = call(syscall::INVOKE, ROOT_DIR, method::EXPECT, [slot, 0, 0, 0]);
+    let declared = call(syscall::INVOKE, directory, method::EXPECT, [slot, 0, 0, 0]);
     if declared.status != status::OK {
         trace_file(-2, STAGE_NO_DIRECTORY, declared.status);
         return Err(-2);
@@ -7463,7 +7616,7 @@ fn resolve_into(slot: u64, component: &[u8]) -> Result<Opened, i64> {
     // and cost a boot to read.
     let reply = call(
         syscall::CALL,
-        ROOT_DIR,
+        directory,
         bhaskix_abi::dir::OPEN_AT,
         chunk.pack(0),
     );
@@ -8334,7 +8487,7 @@ fn stage_from_filesystem(name: &[u8]) -> Result<Staged, i64> {
     let Some(slot) = claim_file_slot() else {
         return Err(-24); // EMFILE
     };
-    let opened = match resolve_into(slot, component) {
+    let opened = match resolve_into(ROOT_DIR, slot, component) {
         Ok(opened) => opened,
         Err(errno) => {
             release_file_slot(slot);

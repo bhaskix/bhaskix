@@ -9125,6 +9125,841 @@ fn futex_stress_self_test(hhdm_base: u64, cpus: u32) -> bool {
     }
 }
 
+/// RFC 0005's rule 2, restated for the adapter -- the probe. Assembled from
+/// [`tools/probes/linux-confined.s`](../../tools/probes/linux-confined.s) by
+/// [`tools/probe-bytes.sh`](../../tools/probe-bytes.sh): one hosted program
+/// makes every call `bin/linuxd` answers that reaches a file by name, and
+/// stores each answer as it came back. What each should have been is
+/// [`CONFINED_CASES`], here, where the reasons can be written beside it.
+#[rustfmt::skip]
+const CONFINED_CODE: [u8; 1887] = [
+    0x49, 0x89, 0xff,                         // mov %rdi,%r15
+    0x49, 0x89, 0xf6,                         // mov %rsi,%r14
+    0x4d, 0x89, 0x77, 0x08,                   // mov %r14,0x8(%r15)
+    0x48, 0x8d, 0x3d, 0xaf, 0x06, 0x00, 0x00, // lea 0x6af(%rip),%rdi # 6c0 <p_inner>
+    0xbe, 0x00, 0x00, 0x00, 0x00,             // mov $0x0,%esi
+    0xba, 0x00, 0x00, 0x00, 0x00,             // mov $0x0,%edx
+    0xb8, 0x02, 0x00, 0x00, 0x00,             // mov $0x2,%eax
+    0x0f, 0x05,                               // syscall
+    0x49, 0x89, 0x47, 0x40,                   // mov %rax,0x40(%r15)
+    0x49, 0x0f, 0xba, 0x6f, 0x10, 0x00,       // btsq $0x0,0x10(%r15)
+    0x48, 0x85, 0xc0,                         // test %rax,%rax
+    0x78, 0x0a,                               // js 3b <_start+0x3b>
+    0x48, 0x89, 0xc7,                         // mov %rax,%rdi
+    0xb8, 0x03, 0x00, 0x00, 0x00,             // mov $0x3,%eax
+    0x0f, 0x05,                               // syscall
+    0x48, 0xc7, 0xc7, 0x9c, 0xff, 0xff, 0xff, // mov $0xffffffffffffff9c,%rdi
+    0x48, 0x8d, 0x35, 0x7e, 0x06, 0x00, 0x00, // lea 0x67e(%rip),%rsi # 6c7 <p_inner_relative>
+    0xba, 0x00, 0x00, 0x00, 0x00,             // mov $0x0,%edx
+    0x45, 0x31, 0xd2,                         // xor %r10d,%r10d
+    0xb8, 0x01, 0x01, 0x00, 0x00,             // mov $0x101,%eax
+    0x0f, 0x05,                               // syscall
+    0x49, 0x89, 0x47, 0x48,                   // mov %rax,0x48(%r15)
+    0x49, 0x0f, 0xba, 0x6f, 0x10, 0x01,       // btsq $0x1,0x10(%r15)
+    0x48, 0x85, 0xc0,                         // test %rax,%rax
+    0x78, 0x0a,                               // js 71 <_start+0x71>
+    0x48, 0x89, 0xc7,                         // mov %rax,%rdi
+    0xb8, 0x03, 0x00, 0x00, 0x00,             // mov $0x3,%eax
+    0x0f, 0x05,                               // syscall
+    0x48, 0x8d, 0x3d, 0x55, 0x06, 0x00, 0x00, // lea 0x655(%rip),%rdi # 6cd <p_root>
+    0xbe, 0x00, 0x00, 0x01, 0x00,             // mov $0x10000,%esi
+    0xba, 0x00, 0x00, 0x00, 0x00,             // mov $0x0,%edx
+    0xb8, 0x02, 0x00, 0x00, 0x00,             // mov $0x2,%eax
+    0x0f, 0x05,                               // syscall
+    0x49, 0x89, 0x47, 0x50,                   // mov %rax,0x50(%r15)
+    0x49, 0x0f, 0xba, 0x6f, 0x10, 0x02,       // btsq $0x2,0x10(%r15)
+    0x48, 0x85, 0xc0,                         // test %rax,%rax
+    0x78, 0x0a,                               // js a2 <_start+0xa2>
+    0x48, 0x89, 0xc7,                         // mov %rax,%rdi
+    0xb8, 0x03, 0x00, 0x00, 0x00,             // mov $0x3,%eax
+    0x0f, 0x05,                               // syscall
+    0x48, 0x8d, 0x3d, 0x26, 0x06, 0x00, 0x00, // lea 0x626(%rip),%rdi # 6cf <p_dot>
+    0xbe, 0x00, 0x00, 0x00, 0x00,             // mov $0x0,%esi
+    0xba, 0x00, 0x00, 0x00, 0x00,             // mov $0x0,%edx
+    0xb8, 0x02, 0x00, 0x00, 0x00,             // mov $0x2,%eax
+    0x0f, 0x05,                               // syscall
+    0x49, 0x89, 0x47, 0x58,                   // mov %rax,0x58(%r15)
+    0x49, 0x0f, 0xba, 0x6f, 0x10, 0x03,       // btsq $0x3,0x10(%r15)
+    0x48, 0x85, 0xc0,                         // test %rax,%rax
+    0x78, 0x0a,                               // js d3 <_start+0xd3>
+    0x48, 0x89, 0xc7,                         // mov %rax,%rdi
+    0xb8, 0x03, 0x00, 0x00, 0x00,             // mov $0x3,%eax
+    0x0f, 0x05,                               // syscall
+    0x48, 0xc7, 0xc7, 0x9c, 0xff, 0xff, 0xff, // mov $0xffffffffffffff9c,%rdi
+    0x48, 0x8d, 0x35, 0xf3, 0x05, 0x00, 0x00, // lea 0x5f3(%rip),%rsi # 6d4 <p_tmp>
+    0xba, 0x00, 0x00, 0x01, 0x00,             // mov $0x10000,%edx
+    0x45, 0x31, 0xd2,                         // xor %r10d,%r10d
+    0xb8, 0x01, 0x01, 0x00, 0x00,             // mov $0x101,%eax
+    0x0f, 0x05,                               // syscall
+    0x49, 0x89, 0x47, 0x60,                   // mov %rax,0x60(%r15)
+    0x49, 0x0f, 0xba, 0x6f, 0x10, 0x04,       // btsq $0x4,0x10(%r15)
+    0x48, 0x85, 0xc0,                         // test %rax,%rax
+    0x78, 0x0a,                               // js 109 <_start+0x109>
+    0x48, 0x89, 0xc7,                         // mov %rax,%rdi
+    0xb8, 0x03, 0x00, 0x00, 0x00,             // mov $0x3,%eax
+    0x0f, 0x05,                               // syscall
+    0x48, 0x8d, 0x3d, 0xbd, 0x05, 0x00, 0x00, // lea 0x5bd(%rip),%rdi # 6cd <p_root>
+    0x49, 0x8d, 0xb7, 0x00, 0x08, 0x00, 0x00, // lea 0x800(%r15),%rsi
+    0xb8, 0x04, 0x00, 0x00, 0x00,             // mov $0x4,%eax
+    0x0f, 0x05,                               // syscall
+    0x49, 0x89, 0x47, 0x68,                   // mov %rax,0x68(%r15)
+    0x49, 0x0f, 0xba, 0x6f, 0x10, 0x05,       // btsq $0x5,0x10(%r15)
+    0x48, 0xc7, 0xc7, 0x9c, 0xff, 0xff, 0xff, // mov $0xffffffffffffff9c,%rdi
+    0x48, 0x8d, 0x35, 0x8a, 0x05, 0x00, 0x00, // lea 0x58a(%rip),%rsi # 6c0 <p_inner>
+    0x49, 0x8d, 0x97, 0x00, 0x08, 0x00, 0x00, // lea 0x800(%r15),%rdx
+    0x45, 0x31, 0xd2,                         // xor %r10d,%r10d
+    0xb8, 0x06, 0x01, 0x00, 0x00,             // mov $0x106,%eax
+    0x0f, 0x05,                               // syscall
+    0x49, 0x89, 0x47, 0x70,                   // mov %rax,0x70(%r15)
+    0x49, 0x0f, 0xba, 0x6f, 0x10, 0x06,       // btsq $0x6,0x10(%r15)
+    0x48, 0x8d, 0x3d, 0x75, 0x05, 0x00, 0x00, // lea 0x575(%rip),%rdi # 6cd <p_root>
+    0xbe, 0x00, 0x00, 0x00, 0x00,             // mov $0x0,%esi
+    0xb8, 0x15, 0x00, 0x00, 0x00,             // mov $0x15,%eax
+    0x0f, 0x05,                               // syscall
+    0x49, 0x89, 0x47, 0x78,                   // mov %rax,0x78(%r15)
+    0x49, 0x0f, 0xba, 0x6f, 0x10, 0x07,       // btsq $0x7,0x10(%r15)
+    0x48, 0x8d, 0x3d, 0x4b, 0x05, 0x00, 0x00, // lea 0x54b(%rip),%rdi # 6c0 <p_inner>
+    0xbe, 0x04, 0x00, 0x00, 0x00,             // mov $0x4,%esi
+    0xb8, 0x15, 0x00, 0x00, 0x00,             // mov $0x15,%eax
+    0x0f, 0x05,                               // syscall
+    0x49, 0x89, 0x87, 0x80, 0x00, 0x00, 0x00, // mov %rax,0x80(%r15)
+    0x49, 0x0f, 0xba, 0x6f, 0x10, 0x08,       // btsq $0x8,0x10(%r15)
+    0x48, 0x8d, 0x3d, 0x44, 0x05, 0x00, 0x00, // lea 0x544(%rip),%rdi # 6d9 <p_greeting>
+    0xbe, 0x00, 0x00, 0x00, 0x00,             // mov $0x0,%esi
+    0xba, 0x00, 0x00, 0x00, 0x00,             // mov $0x0,%edx
+    0xb8, 0x02, 0x00, 0x00, 0x00,             // mov $0x2,%eax
+    0x0f, 0x05,                               // syscall
+    0x49, 0x89, 0x87, 0x88, 0x00, 0x00, 0x00, // mov %rax,0x88(%r15)
+    0x49, 0x0f, 0xba, 0x6f, 0x10, 0x09,       // btsq $0x9,0x10(%r15)
+    0x48, 0x85, 0xc0,                         // test %rax,%rax
+    0x78, 0x0a,                               // js 1c2 <_start+0x1c2>
+    0x48, 0x89, 0xc7,                         // mov %rax,%rdi
+    0xb8, 0x03, 0x00, 0x00, 0x00,             // mov $0x3,%eax
+    0x0f, 0x05,                               // syscall
+    0x48, 0x8d, 0x3d, 0x1a, 0x05, 0x00, 0x00, // lea 0x51a(%rip),%rdi # 6e3 <p_up_greeting>
+    0xbe, 0x00, 0x00, 0x00, 0x00,             // mov $0x0,%esi
+    0xba, 0x00, 0x00, 0x00, 0x00,             // mov $0x0,%edx
+    0xb8, 0x02, 0x00, 0x00, 0x00,             // mov $0x2,%eax
+    0x0f, 0x05,                               // syscall
+    0x49, 0x89, 0x87, 0x90, 0x00, 0x00, 0x00, // mov %rax,0x90(%r15)
+    0x49, 0x0f, 0xba, 0x6f, 0x10, 0x0a,       // btsq $0xa,0x10(%r15)
+    0x48, 0x85, 0xc0,                         // test %rax,%rax
+    0x78, 0x0a,                               // js 1f6 <_start+0x1f6>
+    0x48, 0x89, 0xc7,                         // mov %rax,%rdi
+    0xb8, 0x03, 0x00, 0x00, 0x00,             // mov $0x3,%eax
+    0x0f, 0x05,                               // syscall
+    0x48, 0x8d, 0x3d, 0xf2, 0x04, 0x00, 0x00, // lea 0x4f2(%rip),%rdi # 6ef <p_sub_inner>
+    0xbe, 0x00, 0x00, 0x00, 0x00,             // mov $0x0,%esi
+    0xba, 0x00, 0x00, 0x00, 0x00,             // mov $0x0,%edx
+    0xb8, 0x02, 0x00, 0x00, 0x00,             // mov $0x2,%eax
+    0x0f, 0x05,                               // syscall
+    0x49, 0x89, 0x87, 0x98, 0x00, 0x00, 0x00, // mov %rax,0x98(%r15)
+    0x49, 0x0f, 0xba, 0x6f, 0x10, 0x0b,       // btsq $0xb,0x10(%r15)
+    0x48, 0x85, 0xc0,                         // test %rax,%rax
+    0x78, 0x0a,                               // js 22a <_start+0x22a>
+    0x48, 0x89, 0xc7,                         // mov %rax,%rdi
+    0xb8, 0x03, 0x00, 0x00, 0x00,             // mov $0x3,%eax
+    0x0f, 0x05,                               // syscall
+    0x48, 0x8d, 0x3d, 0xa8, 0x04, 0x00, 0x00, // lea 0x4a8(%rip),%rdi # 6d9 <p_greeting>
+    0x49, 0x8d, 0xb7, 0x00, 0x08, 0x00, 0x00, // lea 0x800(%r15),%rsi
+    0xb8, 0x06, 0x00, 0x00, 0x00,             // mov $0x6,%eax
+    0x0f, 0x05,                               // syscall
+    0x49, 0x89, 0x87, 0xa0, 0x00, 0x00, 0x00, // mov %rax,0xa0(%r15)
+    0x49, 0x0f, 0xba, 0x6f, 0x10, 0x0c,       // btsq $0xc,0x10(%r15)
+    0x48, 0x8d, 0x3d, 0x86, 0x04, 0x00, 0x00, // lea 0x486(%rip),%rdi # 6d9 <p_greeting>
+    0x48, 0x8d, 0x35, 0x5e, 0x04, 0x00, 0x00, // lea 0x45e(%rip),%rsi # 6b8 <empty>
+    0x48, 0x8d, 0x15, 0x57, 0x04, 0x00, 0x00, // lea 0x457(%rip),%rdx # 6b8 <empty>
+    0xb8, 0x3b, 0x00, 0x00, 0x00,             // mov $0x3b,%eax
+    0x0f, 0x05,                               // syscall
+    0x49, 0x89, 0x87, 0xa8, 0x00, 0x00, 0x00, // mov %rax,0xa8(%r15)
+    0x49, 0x0f, 0xba, 0x6f, 0x10, 0x0d,       // btsq $0xd,0x10(%r15)
+    0x48, 0x8d, 0x3d, 0x7e, 0x04, 0x00, 0x00, // lea 0x47e(%rip),%rdi # 6fa <p_execed>
+    0xbe, 0x00, 0x00, 0x00, 0x00,             // mov $0x0,%esi
+    0xba, 0x00, 0x00, 0x00, 0x00,             // mov $0x0,%edx
+    0xb8, 0x02, 0x00, 0x00, 0x00,             // mov $0x2,%eax
+    0x0f, 0x05,                               // syscall
+    0x49, 0x89, 0x87, 0xb0, 0x00, 0x00, 0x00, // mov %rax,0xb0(%r15)
+    0x49, 0x0f, 0xba, 0x6f, 0x10, 0x0e,       // btsq $0xe,0x10(%r15)
+    0x48, 0x85, 0xc0,                         // test %rax,%rax
+    0x78, 0x0a,                               // js 2a9 <_start+0x2a9>
+    0x48, 0x89, 0xc7,                         // mov %rax,%rdi
+    0xb8, 0x03, 0x00, 0x00, 0x00,             // mov $0x3,%eax
+    0x0f, 0x05,                               // syscall
+    0x48, 0x8d, 0x3d, 0x10, 0x04, 0x00, 0x00, // lea 0x410(%rip),%rdi # 6c0 <p_inner>
+    0xbe, 0x01, 0x00, 0x00, 0x00,             // mov $0x1,%esi
+    0xba, 0x00, 0x00, 0x00, 0x00,             // mov $0x0,%edx
+    0xb8, 0x02, 0x00, 0x00, 0x00,             // mov $0x2,%eax
+    0x0f, 0x05,                               // syscall
+    0x49, 0x89, 0x87, 0xe0, 0x00, 0x00, 0x00, // mov %rax,0xe0(%r15)
+    0x49, 0x0f, 0xba, 0x6f, 0x10, 0x14,       // btsq $0x14,0x10(%r15)
+    0x48, 0x85, 0xc0,                         // test %rax,%rax
+    0x78, 0x0a,                               // js 2dd <_start+0x2dd>
+    0x48, 0x89, 0xc7,                         // mov %rax,%rdi
+    0xb8, 0x03, 0x00, 0x00, 0x00,             // mov $0x3,%eax
+    0x0f, 0x05,                               // syscall
+    0x48, 0x8d, 0x3d, 0x22, 0x04, 0x00, 0x00, // lea 0x422(%rip),%rdi # 706 <p_made>
+    0xbe, 0xed, 0x01, 0x00, 0x00,             // mov $0x1ed,%esi
+    0xb8, 0x53, 0x00, 0x00, 0x00,             // mov $0x53,%eax
+    0x0f, 0x05,                               // syscall
+    0x49, 0x89, 0x87, 0xe8, 0x00, 0x00, 0x00, // mov %rax,0xe8(%r15)
+    0x49, 0x0f, 0xba, 0x6f, 0x10, 0x15,       // btsq $0x15,0x10(%r15)
+    0x4d, 0x85, 0xf6,                         // test %r14,%r14
+    0x0f, 0x85, 0xc2, 0x00, 0x00, 0x00,       // jne 3c8 <held>
+    0x48, 0x8d, 0x3d, 0xff, 0x03, 0x00, 0x00, // lea 0x3ff(%rip),%rdi # 70c <p_tmp_file>
+    0xbe, 0x41, 0x02, 0x00, 0x00,             // mov $0x241,%esi
+    0xba, 0xa4, 0x01, 0x00, 0x00,             // mov $0x1a4,%edx
+    0xb8, 0x02, 0x00, 0x00, 0x00,             // mov $0x2,%eax
+    0x0f, 0x05,                               // syscall
+    0x49, 0x89, 0x87, 0xb8, 0x00, 0x00, 0x00, // mov %rax,0xb8(%r15)
+    0x49, 0x0f, 0xba, 0x6f, 0x10, 0x0f,       // btsq $0xf,0x10(%r15)
+    0x48, 0x85, 0xc0,                         // test %rax,%rax
+    0x78, 0x0a,                               // js 33a <_start+0x33a>
+    0x48, 0x89, 0xc7,                         // mov %rax,%rdi
+    0xb8, 0x03, 0x00, 0x00, 0x00,             // mov $0x3,%eax
+    0x0f, 0x05,                               // syscall
+    0x48, 0x8d, 0x3d, 0xd9, 0x03, 0x00, 0x00, // lea 0x3d9(%rip),%rdi # 71a <p_tmp_dir>
+    0xbe, 0xed, 0x01, 0x00, 0x00,             // mov $0x1ed,%esi
+    0xb8, 0x53, 0x00, 0x00, 0x00,             // mov $0x53,%eax
+    0x0f, 0x05,                               // syscall
+    0x49, 0x89, 0x87, 0xc0, 0x00, 0x00, 0x00, // mov %rax,0xc0(%r15)
+    0x49, 0x0f, 0xba, 0x6f, 0x10, 0x10,       // btsq $0x10,0x10(%r15)
+    0x48, 0x8d, 0x3d, 0xab, 0x03, 0x00, 0x00, // lea 0x3ab(%rip),%rdi # 70c <p_tmp_file>
+    0xbe, 0x00, 0x00, 0x00, 0x00,             // mov $0x0,%esi
+    0xb8, 0x57, 0x00, 0x00, 0x00,             // mov $0x57,%eax
+    0x0f, 0x05,                               // syscall
+    0x49, 0x89, 0x87, 0xc8, 0x00, 0x00, 0x00, // mov %rax,0xc8(%r15)
+    0x49, 0x0f, 0xba, 0x6f, 0x10, 0x11,       // btsq $0x11,0x10(%r15)
+    0x48, 0x8d, 0x3d, 0x99, 0x03, 0x00, 0x00, // lea 0x399(%rip),%rdi # 71a <p_tmp_dir>
+    0xbe, 0x00, 0x00, 0x00, 0x00,             // mov $0x0,%esi
+    0xb8, 0x54, 0x00, 0x00, 0x00,             // mov $0x54,%eax
+    0x0f, 0x05,                               // syscall
+    0x49, 0x89, 0x87, 0xd0, 0x00, 0x00, 0x00, // mov %rax,0xd0(%r15)
+    0x49, 0x0f, 0xba, 0x6f, 0x10, 0x12,       // btsq $0x12,0x10(%r15)
+    0x48, 0x8d, 0x3d, 0x1f, 0x03, 0x00, 0x00, // lea 0x31f(%rip),%rdi # 6c0 <p_inner>
+    0x48, 0x8d, 0x35, 0x10, 0x03, 0x00, 0x00, // lea 0x310(%rip),%rsi # 6b8 <empty>
+    0x48, 0x8d, 0x15, 0x09, 0x03, 0x00, 0x00, // lea 0x309(%rip),%rdx # 6b8 <empty>
+    0xb8, 0x3b, 0x00, 0x00, 0x00,             // mov $0x3b,%eax
+    0x0f, 0x05,                               // syscall
+    0x49, 0x89, 0x87, 0xd8, 0x00, 0x00, 0x00, // mov %rax,0xd8(%r15)
+    0x49, 0x0f, 0xba, 0x6f, 0x10, 0x13,       // btsq $0x13,0x10(%r15)
+    0xe9, 0xf7, 0x01, 0x00, 0x00,             // jmpq 5bf <control>
+    0x48, 0x8d, 0x3d, 0xfe, 0x02, 0x00, 0x00, // lea 0x2fe(%rip),%rdi # 6cd <p_root>
+    0xbe, 0x00, 0x00, 0x01, 0x00,             // mov $0x10000,%esi
+    0x31, 0xd2,                               // xor %edx,%edx
+    0xb8, 0x02, 0x00, 0x00, 0x00,             // mov $0x2,%eax
+    0x0f, 0x05,                               // syscall
+    0x49, 0x89, 0x47, 0x28,                   // mov %rax,0x28(%r15)
+    0x49, 0x89, 0xc5,                         // mov %rax,%r13
+    0x4c, 0x89, 0xef,                         // mov %r13,%rdi
+    0x48, 0x8d, 0x35, 0xf5, 0x02, 0x00, 0x00, // lea 0x2f5(%rip),%rsi # 6e3 <p_up_greeting>
+    0xba, 0x00, 0x00, 0x00, 0x00,             // mov $0x0,%edx
+    0x45, 0x31, 0xd2,                         // xor %r10d,%r10d
+    0xb8, 0x01, 0x01, 0x00, 0x00,             // mov $0x101,%eax
+    0x0f, 0x05,                               // syscall
+    0x49, 0x89, 0x87, 0xf0, 0x00, 0x00, 0x00, // mov %rax,0xf0(%r15)
+    0x49, 0x0f, 0xba, 0x6f, 0x10, 0x16,       // btsq $0x16,0x10(%r15)
+    0x48, 0x85, 0xc0,                         // test %rax,%rax
+    0x78, 0x0a,                               // js 419 <held+0x51>
+    0x48, 0x89, 0xc7,                         // mov %rax,%rdi
+    0xb8, 0x03, 0x00, 0x00, 0x00,             // mov $0x3,%eax
+    0x0f, 0x05,                               // syscall
+    0x4c, 0x89, 0xef,                         // mov %r13,%rdi
+    0x48, 0x8d, 0x35, 0xa4, 0x02, 0x00, 0x00, // lea 0x2a4(%rip),%rsi # 6c7 <p_inner_relative>
+    0xba, 0x00, 0x00, 0x00, 0x00,             // mov $0x0,%edx
+    0x45, 0x31, 0xd2,                         // xor %r10d,%r10d
+    0xb8, 0x01, 0x01, 0x00, 0x00,             // mov $0x101,%eax
+    0x0f, 0x05,                               // syscall
+    0x49, 0x89, 0x87, 0xf8, 0x00, 0x00, 0x00, // mov %rax,0xf8(%r15)
+    0x49, 0x0f, 0xba, 0x6f, 0x10, 0x17,       // btsq $0x17,0x10(%r15)
+    0x48, 0x85, 0xc0,                         // test %rax,%rax
+    0x78, 0x0a,                               // js 44e <held+0x86>
+    0x48, 0x89, 0xc7,                         // mov %rax,%rdi
+    0xb8, 0x03, 0x00, 0x00, 0x00,             // mov $0x3,%eax
+    0x0f, 0x05,                               // syscall
+    0x4c, 0x89, 0xe8,                         // mov %r13,%rax
+    0x48, 0x85, 0xc0,                         // test %rax,%rax
+    0x78, 0x0a,                               // js 460 <held+0x98>
+    0x48, 0x89, 0xc7,                         // mov %rax,%rdi
+    0xb8, 0x03, 0x00, 0x00, 0x00,             // mov $0x3,%eax
+    0x0f, 0x05,                               // syscall
+    0x48, 0x8d, 0x3d, 0xc3, 0x02, 0x00, 0x00, // lea 0x2c3(%rip),%rdi # 72a <p_tmp_found>
+    0xbe, 0x41, 0x02, 0x00, 0x00,             // mov $0x241,%esi
+    0xba, 0xa4, 0x01, 0x00, 0x00,             // mov $0x1a4,%edx
+    0xb8, 0x02, 0x00, 0x00, 0x00,             // mov $0x2,%eax
+    0x0f, 0x05,                               // syscall
+    0x49, 0x89, 0x87, 0x18, 0x01, 0x00, 0x00, // mov %rax,0x118(%r15)
+    0x49, 0x0f, 0xba, 0x6f, 0x10, 0x1b,       // btsq $0x1b,0x10(%r15)
+    0x48, 0x85, 0xc0,                         // test %rax,%rax
+    0x78, 0x0a,                               // js 494 <held+0xcc>
+    0x48, 0x89, 0xc7,                         // mov %rax,%rdi
+    0xb8, 0x03, 0x00, 0x00, 0x00,             // mov $0x3,%eax
+    0x0f, 0x05,                               // syscall
+    0x48, 0x8d, 0x3d, 0x39, 0x02, 0x00, 0x00, // lea 0x239(%rip),%rdi # 6d4 <p_tmp>
+    0xbe, 0x00, 0x00, 0x01, 0x00,             // mov $0x10000,%esi
+    0x31, 0xd2,                               // xor %edx,%edx
+    0xb8, 0x02, 0x00, 0x00, 0x00,             // mov $0x2,%eax
+    0x0f, 0x05,                               // syscall
+    0x49, 0x89, 0x87, 0x10, 0x01, 0x00, 0x00, // mov %rax,0x110(%r15)
+    0x49, 0x0f, 0xba, 0x6f, 0x10, 0x1a,       // btsq $0x1a,0x10(%r15)
+    0x49, 0x89, 0xc4,                         // mov %rax,%r12
+    0x4c, 0x89, 0xe7,                         // mov %r12,%rdi
+    0x48, 0x8d, 0x35, 0x7b, 0x02, 0x00, 0x00, // lea 0x27b(%rip),%rsi # 73e <p_found>
+    0xba, 0x00, 0x00, 0x00, 0x00,             // mov $0x0,%edx
+    0x45, 0x31, 0xd2,                         // xor %r10d,%r10d
+    0xb8, 0x01, 0x01, 0x00, 0x00,             // mov $0x101,%eax
+    0x0f, 0x05,                               // syscall
+    0x49, 0x89, 0x87, 0x20, 0x01, 0x00, 0x00, // mov %rax,0x120(%r15)
+    0x49, 0x0f, 0xba, 0x6f, 0x10, 0x1c,       // btsq $0x1c,0x10(%r15)
+    0x48, 0x85, 0xc0,                         // test %rax,%rax
+    0x78, 0x0a,                               // js 4ee <held+0x126>
+    0x48, 0x89, 0xc7,                         // mov %rax,%rdi
+    0xb8, 0x03, 0x00, 0x00, 0x00,             // mov $0x3,%eax
+    0x0f, 0x05,                               // syscall
+    0x4c, 0x89, 0xe7,                         // mov %r12,%rdi
+    0x48, 0x8d, 0x35, 0xcf, 0x01, 0x00, 0x00, // lea 0x1cf(%rip),%rsi # 6c7 <p_inner_relative>
+    0xba, 0x00, 0x00, 0x00, 0x00,             // mov $0x0,%edx
+    0x45, 0x31, 0xd2,                         // xor %r10d,%r10d
+    0xb8, 0x01, 0x01, 0x00, 0x00,             // mov $0x101,%eax
+    0x0f, 0x05,                               // syscall
+    0x49, 0x89, 0x87, 0x28, 0x01, 0x00, 0x00, // mov %rax,0x128(%r15)
+    0x49, 0x0f, 0xba, 0x6f, 0x10, 0x1d,       // btsq $0x1d,0x10(%r15)
+    0x48, 0x85, 0xc0,                         // test %rax,%rax
+    0x78, 0x0a,                               // js 523 <held+0x15b>
+    0x48, 0x89, 0xc7,                         // mov %rax,%rdi
+    0xb8, 0x03, 0x00, 0x00, 0x00,             // mov $0x3,%eax
+    0x0f, 0x05,                               // syscall
+    0x4c, 0x89, 0xe7,                         // mov %r12,%rdi
+    0x48, 0x8d, 0x35, 0xa4, 0x01, 0x00, 0x00, // lea 0x1a4(%rip),%rsi # 6d1 <p_dotdot>
+    0xba, 0x00, 0x00, 0x00, 0x00,             // mov $0x0,%edx
+    0x45, 0x31, 0xd2,                         // xor %r10d,%r10d
+    0xb8, 0x01, 0x01, 0x00, 0x00,             // mov $0x101,%eax
+    0x0f, 0x05,                               // syscall
+    0x49, 0x89, 0x87, 0x30, 0x01, 0x00, 0x00, // mov %rax,0x130(%r15)
+    0x49, 0x0f, 0xba, 0x6f, 0x10, 0x1e,       // btsq $0x1e,0x10(%r15)
+    0x48, 0x85, 0xc0,                         // test %rax,%rax
+    0x78, 0x0a,                               // js 558 <held+0x190>
+    0x48, 0x89, 0xc7,                         // mov %rax,%rdi
+    0xb8, 0x03, 0x00, 0x00, 0x00,             // mov $0x3,%eax
+    0x0f, 0x05,                               // syscall
+    0x4c, 0x89, 0xe7,                         // mov %r12,%rdi
+    0x48, 0x8d, 0x35, 0x6d, 0x01, 0x00, 0x00, // lea 0x16d(%rip),%rsi # 6cf <p_dot>
+    0xba, 0x00, 0x00, 0x00, 0x00,             // mov $0x0,%edx
+    0x45, 0x31, 0xd2,                         // xor %r10d,%r10d
+    0xb8, 0x01, 0x01, 0x00, 0x00,             // mov $0x101,%eax
+    0x0f, 0x05,                               // syscall
+    0x49, 0x89, 0x87, 0x38, 0x01, 0x00, 0x00, // mov %rax,0x138(%r15)
+    0x49, 0x0f, 0xba, 0x6f, 0x10, 0x1f,       // btsq $0x1f,0x10(%r15)
+    0x48, 0x85, 0xc0,                         // test %rax,%rax
+    0x78, 0x0a,                               // js 58d <held+0x1c5>
+    0x48, 0x89, 0xc7,                         // mov %rax,%rdi
+    0xb8, 0x03, 0x00, 0x00, 0x00,             // mov $0x3,%eax
+    0x0f, 0x05,                               // syscall
+    0x4c, 0x89, 0xe0,                         // mov %r12,%rax
+    0x48, 0x85, 0xc0,                         // test %rax,%rax
+    0x78, 0x0a,                               // js 59f <held+0x1d7>
+    0x48, 0x89, 0xc7,                         // mov %rax,%rdi
+    0xb8, 0x03, 0x00, 0x00, 0x00,             // mov $0x3,%eax
+    0x0f, 0x05,                               // syscall
+    0x48, 0x8d, 0x3d, 0x84, 0x01, 0x00, 0x00, // lea 0x184(%rip),%rdi # 72a <p_tmp_found>
+    0xbe, 0x00, 0x00, 0x00, 0x00,             // mov $0x0,%esi
+    0xb8, 0x57, 0x00, 0x00, 0x00,             // mov $0x57,%eax
+    0x0f, 0x05,                               // syscall
+    0x49, 0x89, 0x87, 0x40, 0x01, 0x00, 0x00, // mov %rax,0x140(%r15)
+    0x49, 0x0f, 0xba, 0x6f, 0x10, 0x20,       // btsq $0x20,0x10(%r15)
+    0x48, 0x8d, 0x3d, 0x87, 0x01, 0x00, 0x00, // lea 0x187(%rip),%rdi # 74d <p_status>
+    0x31, 0xf6,                               // xor %esi,%esi
+    0x31, 0xd2,                               // xor %edx,%edx
+    0xb8, 0x02, 0x00, 0x00, 0x00,             // mov $0x2,%eax
+    0x0f, 0x05,                               // syscall
+    0x49, 0x89, 0x47, 0x20,                   // mov %rax,0x20(%r15)
+    0x49, 0x89, 0xc5,                         // mov %rax,%r13
+    0x48, 0x85, 0xc0,                         // test %rax,%rax
+    0x78, 0x17,                               // js 5f4 <control+0x35>
+    0x4c, 0x89, 0xef,                         // mov %r13,%rdi
+    0x49, 0x8d, 0xb7, 0x00, 0x0a, 0x00, 0x00, // lea 0xa00(%r15),%rsi
+    0xba, 0x00, 0x02, 0x00, 0x00,             // mov $0x200,%edx
+    0x31, 0xc0,                               // xor %eax,%eax
+    0x0f, 0x05,                               // syscall
+    0x49, 0x89, 0x47, 0x18,                   // mov %rax,0x18(%r15)
+    0x4c, 0x89, 0xef,                         // mov %r13,%rdi
+    0x48, 0x8d, 0x35, 0xc9, 0x00, 0x00, 0x00, // lea 0xc9(%rip),%rsi # 6c7 <p_inner_relative>
+    0xba, 0x00, 0x00, 0x00, 0x00,             // mov $0x0,%edx
+    0x45, 0x31, 0xd2,                         // xor %r10d,%r10d
+    0xb8, 0x01, 0x01, 0x00, 0x00,             // mov $0x101,%eax
+    0x0f, 0x05,                               // syscall
+    0x49, 0x89, 0x87, 0x00, 0x01, 0x00, 0x00, // mov %rax,0x100(%r15)
+    0x49, 0x0f, 0xba, 0x6f, 0x10, 0x18,       // btsq $0x18,0x10(%r15)
+    0x48, 0x85, 0xc0,                         // test %rax,%rax
+    0x78, 0x0a,                               // js 629 <control+0x6a>
+    0x48, 0x89, 0xc7,                         // mov %rax,%rdi
+    0xb8, 0x03, 0x00, 0x00, 0x00,             // mov $0x3,%eax
+    0x0f, 0x05,                               // syscall
+    0x48, 0xc7, 0xc7, 0x63, 0x00, 0x00, 0x00, // mov $0x63,%rdi
+    0x48, 0x8d, 0x35, 0x90, 0x00, 0x00, 0x00, // lea 0x90(%rip),%rsi # 6c7 <p_inner_relative>
+    0xba, 0x00, 0x00, 0x00, 0x00,             // mov $0x0,%edx
+    0x45, 0x31, 0xd2,                         // xor %r10d,%r10d
+    0xb8, 0x01, 0x01, 0x00, 0x00,             // mov $0x101,%eax
+    0x0f, 0x05,                               // syscall
+    0x49, 0x89, 0x87, 0x08, 0x01, 0x00, 0x00, // mov %rax,0x108(%r15)
+    0x49, 0x0f, 0xba, 0x6f, 0x10, 0x19,       // btsq $0x19,0x10(%r15)
+    0x48, 0x85, 0xc0,                         // test %rax,%rax
+    0x78, 0x0a,                               // js 662 <control+0xa3>
+    0x48, 0x89, 0xc7,                         // mov %rax,%rdi
+    0xb8, 0x03, 0x00, 0x00, 0x00,             // mov $0x3,%eax
+    0x0f, 0x05,                               // syscall
+    0x4c, 0x89, 0xef,                         // mov %r13,%rdi
+    0x48, 0x8d, 0x35, 0x54, 0x00, 0x00, 0x00, // lea 0x54(%rip),%rsi # 6c0 <p_inner>
+    0xba, 0x00, 0x00, 0x00, 0x00,             // mov $0x0,%edx
+    0x45, 0x31, 0xd2,                         // xor %r10d,%r10d
+    0xb8, 0x01, 0x01, 0x00, 0x00,             // mov $0x101,%eax
+    0x0f, 0x05,                               // syscall
+    0x49, 0x89, 0x87, 0x48, 0x01, 0x00, 0x00, // mov %rax,0x148(%r15)
+    0x49, 0x0f, 0xba, 0x6f, 0x10, 0x21,       // btsq $0x21,0x10(%r15)
+    0x48, 0x85, 0xc0,                         // test %rax,%rax
+    0x78, 0x0a,                               // js 697 <control+0xd8>
+    0x48, 0x89, 0xc7,                         // mov %rax,%rdi
+    0xb8, 0x03, 0x00, 0x00, 0x00,             // mov $0x3,%eax
+    0x0f, 0x05,                               // syscall
+    0x4c, 0x89, 0xe8,                         // mov %r13,%rax
+    0x48, 0x85, 0xc0,                         // test %rax,%rax
+    0x78, 0x0a,                               // js 6a9 <control+0xea>
+    0x48, 0x89, 0xc7,                         // mov %rax,%rdi
+    0xb8, 0x03, 0x00, 0x00, 0x00,             // mov $0x3,%eax
+    0x0f, 0x05,                               // syscall
+    0x49, 0xc7, 0x07, 0x01, 0x00, 0x00, 0x00, // movq $0x1,(%r15)
+    0xeb, 0xfe,                               // jmp 6b0 <control+0xf1>
+    0x66, 0x0f, 0x1f, 0x44, 0x00, 0x00,       // nopw 0x0(%rax,%rax,1)
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // empty: 8 zero bytes
+    0x2f, 0x69, 0x6e, 0x6e, 0x65, 0x72, 0x00, // p_inner: "/inner"
+    0x69, 0x6e, 0x6e, 0x65, 0x72, 0x00,       // p_inner_relative: "inner"
+    0x2f, 0x00,                               // p_root: "/"
+    0x2e, 0x00,                               // p_dot: "."
+    0x2e, 0x2e, 0x00,                         // p_dotdot: ".."
+    0x2f, 0x74, 0x6d, 0x70, 0x00,             // p_tmp: "/tmp"
+    0x2f, 0x67, 0x72, 0x65, 0x65, 0x74, 0x69, 0x6e, 0x67, 0x00, // p_greeting: "/greeting"
+    0x2e, 0x2e, 0x2f, 0x67, 0x72, 0x65, 0x65, 0x74, 0x69, 0x6e, 0x67, 0x00, // p_up_greeting: "../greeting"
+    0x2f, 0x73, 0x75, 0x62, 0x2f, 0x69, 0x6e, 0x6e, 0x65, 0x72, 0x00, // p_sub_inner: "/sub/inner"
+    0x2f, 0x62, 0x69, 0x6e, 0x2f, 0x65, 0x78, 0x65, 0x63, 0x65, 0x64, 0x00, // p_execed: "/bin/execed"
+    0x2f, 0x6d, 0x61, 0x64, 0x65, 0x00,       // p_made: "/made"
+    0x2f, 0x74, 0x6d, 0x70, 0x2f, 0x63, 0x6f, 0x6e, 0x66, 0x69, 0x6e, 0x65, 0x64, 0x00, // p_tmp_file: "/tmp/confined"
+    0x2f, 0x74, 0x6d, 0x70, 0x2f, 0x63, 0x6f, 0x6e, 0x66, 0x69, 0x6e, 0x65, 0x64, 0x2e, 0x64, 0x00, // p_tmp_dir: "/tmp/confined.d"
+    0x2f, 0x74, 0x6d, 0x70, 0x2f, 0x63, 0x6f, 0x6e, 0x66, 0x69, 0x6e, 0x65, 0x64, 0x2e, 0x66, 0x6f, 0x75, 0x6e, 0x64, 0x00, // p_tmp_found: "/tmp/confined.found"
+    0x63, 0x6f, 0x6e, 0x66, 0x69, 0x6e, 0x65, 0x64, 0x2e, 0x66, 0x6f, 0x75, 0x6e, 0x64, 0x00, // p_found: "confined.found"
+    0x2f, 0x70, 0x72, 0x6f, 0x63, 0x2f, 0x73, 0x65, 0x6c, 0x66, 0x2f, 0x73, 0x74, 0x61, 0x74, 0x75, 0x73, 0x00, // p_status: "/proc/self/status"
+];
+
+/// Where the confinement probe's report page lands physically.
+static CONFINED_REPORT_PA: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// What the confinement probe is told in `rsi`: 1 when the adapter holds a
+/// directory. Set by [`confined_self_test`] before the probe is spawned.
+static CONFINED_HOLDS_DIRECTORY: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+/// Where the confinement probe runs, in [`enter_probe`]'s layout.
+const CONFINED_AT: u64 = 0x0000_0000_3a00_0000;
+
+extern "C" fn ring3_confined(hhdm_base: u64) -> ! {
+    enter_probe(
+        hhdm_base,
+        &CONFINED_CODE,
+        CONFINED_AT,
+        &CONFINED_REPORT_PA,
+        CONFINED_HOLDS_DIRECTORY.load(core::sync::atomic::Ordering::Acquire),
+    )
+}
+
+/// What one of the confinement probe's calls should answer.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Reach {
+    /// Refused, with exactly this errno, negative as the call returns it.
+    /// **The errno and not only the sign**: a refusal for the wrong reason --
+    /// an `EFAULT` from a pointer the probe got wrong -- would otherwise pass
+    /// as confinement.
+    Refused(i64),
+    /// Answered: a descriptor, or zero.
+    Reached,
+    /// Not made on this kind of machine, and its bit in the mask must be
+    /// clear, so a probe that skipped a call cannot pass for one refused it.
+    NotMade,
+}
+
+impl core::fmt::Display for Reach {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Reach::Refused(errno) => write!(f, "refused {}", Answered(*errno)),
+            Reach::Reached => f.write_str("reached"),
+            Reach::NotMade => f.write_str("not made"),
+        }
+    }
+}
+
+/// An answer as a Linux program reads it: the errno's name where the table
+/// can meet it, the number otherwise.
+struct Answered(i64);
+
+impl core::fmt::Display for Answered {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let name = match self.0 {
+            -2 => "ENOENT",
+            -5 => "EIO",
+            -8 => "ENOEXEC",
+            -9 => "EBADF",
+            -13 => "EACCES",
+            -14 => "EFAULT",
+            -20 => "ENOTDIR",
+            -21 => "EISDIR",
+            -22 => "EINVAL",
+            -30 => "EROFS",
+            -38 => "ENOSYS",
+            _ => return write!(f, "{}", self.0),
+        };
+        f.write_str(name)
+    }
+}
+
+/// One of the confinement probe's calls, in the probe's order: what it is,
+/// and what it should answer when the adapter holds no directory and when it
+/// holds one.
+struct ConfinedCase {
+    call: &'static str,
+    without: Reach,
+    with: Reach,
+}
+
+/// `ENOENT`: no capability the adapter holds names it.
+const CONFINED_ENOENT: Reach = Reach::Refused(-2);
+/// `EROFS`: a write no capability the adapter holds could carry -- this
+/// adapter's answer for a missing writable directory, as `mkdir` gives it.
+const CONFINED_EROFS: Reach = Reach::Refused(-30);
+/// `ENOTDIR`: a name relative to a descriptor that is not a directory.
+const CONFINED_ENOTDIR: Reach = Reach::Refused(-20);
+/// `EBADF`: a name relative to a descriptor that is not open.
+const CONFINED_EBADF: Reach = Reach::Refused(-9);
+
+/// One row of [`CONFINED_CASES`].
+const fn confined(call: &'static str, without: Reach, with: Reach) -> ConfinedCase {
+    ConfinedCase {
+        call,
+        without,
+        with,
+    }
+}
+
+/// **The table the probe is held to.** Every row is read in
+/// `user/linuxd/src/main.rs` and every errno is the one Linux gives for the
+/// same truth: a name that is not there is `ENOENT`, a write with nowhere to
+/// go is `EROFS`, a descriptor that is not a directory is `ENOTDIR` and one
+/// that is not open is `EBADF`.
+///
+/// - Rows 0-8 need the adapter's root. With none they are refused; with one
+///   they are reached -- and that is this probe's own control, because it
+///   shows the same calls, made the same way, succeed where they should.
+/// - Rows 9-14 name what is beyond any grant: `greeting` is on the same disk
+///   one level above `sub`, and `/bin/execed` is the adapter's built-in
+///   program, which can be run and is not a file.
+/// - Rows 15-19 are made only with no directory: with one they would change
+///   the disk, or (`execve` of a file) replace the probe.
+/// - Rows 20-21 are writes outside `/tmp`, refused on every machine.
+/// - Rows 22-23 go through a descriptor for the root, which exists only
+///   where a root is held.
+/// - Rows 24, 25 and 33 go through descriptors on every machine: one for
+///   `/proc/self/status`, which is not a directory; a number nothing is open
+///   at; and an absolute name, which ignores the descriptor as Linux does.
+/// - Rows 26-32 go through a descriptor for `/tmp`, where a directory is
+///   held: a name in it is found there (a file the probe makes, finds and
+///   removes -- the one change these rows make to a disk), a name in the
+///   root is not, and `..` leads nowhere.
+const CONFINED_CASES: [ConfinedCase; 34] = [
+    confined("open(\"/inner\")", CONFINED_ENOENT, Reach::Reached),
+    confined(
+        "openat(AT_FDCWD, \"inner\")",
+        CONFINED_ENOENT,
+        Reach::Reached,
+    ),
+    confined("open(\"/\", O_DIRECTORY)", CONFINED_ENOENT, Reach::Reached),
+    confined("open(\".\")", CONFINED_ENOENT, Reach::Reached),
+    confined(
+        "openat(AT_FDCWD, \"/tmp\", O_DIRECTORY)",
+        CONFINED_ENOENT,
+        Reach::Reached,
+    ),
+    confined("stat(\"/\")", CONFINED_ENOENT, Reach::Reached),
+    confined(
+        "newfstatat(AT_FDCWD, \"/inner\")",
+        CONFINED_ENOENT,
+        Reach::Reached,
+    ),
+    confined("access(\"/\", F_OK)", CONFINED_ENOENT, Reach::Reached),
+    confined("access(\"/inner\", R_OK)", CONFINED_ENOENT, Reach::Reached),
+    confined("open(\"/greeting\")", CONFINED_ENOENT, CONFINED_ENOENT),
+    confined("open(\"../greeting\")", CONFINED_ENOENT, CONFINED_ENOENT),
+    confined("open(\"/sub/inner\")", CONFINED_ENOENT, CONFINED_ENOENT),
+    confined("lstat(\"/greeting\")", CONFINED_ENOENT, CONFINED_ENOENT),
+    confined("execve(\"/greeting\")", CONFINED_ENOENT, CONFINED_ENOENT),
+    confined("open(\"/bin/execed\")", CONFINED_ENOENT, CONFINED_ENOENT),
+    confined(
+        "open(\"/tmp/confined\", O_WRONLY|O_CREAT)",
+        CONFINED_EROFS,
+        Reach::NotMade,
+    ),
+    confined("mkdir(\"/tmp/confined.d\")", CONFINED_EROFS, Reach::NotMade),
+    confined("unlink(\"/tmp/confined\")", CONFINED_EROFS, Reach::NotMade),
+    confined("rmdir(\"/tmp/confined.d\")", CONFINED_EROFS, Reach::NotMade),
+    confined("execve(\"/inner\")", CONFINED_ENOENT, Reach::NotMade),
+    confined("open(\"/inner\", O_WRONLY)", CONFINED_EROFS, CONFINED_EROFS),
+    confined("mkdir(\"/made\")", CONFINED_EROFS, CONFINED_EROFS),
+    confined(
+        "openat(rootfd, \"../greeting\")",
+        Reach::NotMade,
+        CONFINED_ENOENT,
+    ),
+    confined("openat(rootfd, \"inner\")", Reach::NotMade, Reach::Reached),
+    confined(
+        "openat(statusfd, \"inner\")",
+        CONFINED_ENOTDIR,
+        CONFINED_ENOTDIR,
+    ),
+    confined("openat(99, \"inner\")", CONFINED_EBADF, CONFINED_EBADF),
+    confined(
+        "open(\"/tmp\", O_DIRECTORY) for tmpfd",
+        Reach::NotMade,
+        Reach::Reached,
+    ),
+    confined(
+        "open(\"/tmp/confined.found\", O_WRONLY|O_CREAT)",
+        Reach::NotMade,
+        Reach::Reached,
+    ),
+    confined(
+        "openat(tmpfd, \"confined.found\")",
+        Reach::NotMade,
+        Reach::Reached,
+    ),
+    confined("openat(tmpfd, \"inner\")", Reach::NotMade, CONFINED_ENOENT),
+    confined("openat(tmpfd, \"..\")", Reach::NotMade, CONFINED_ENOENT),
+    confined("openat(tmpfd, \".\")", Reach::NotMade, Reach::Reached),
+    confined(
+        "unlink(\"/tmp/confined.found\")",
+        Reach::NotMade,
+        Reach::Reached,
+    ),
+    confined(
+        "openat(statusfd, \"/inner\")",
+        CONFINED_ENOENT,
+        Reach::Reached,
+    ),
+];
+
+/// RFC 0005's rule 2, **restated for the adapter**. The RFC asked that "a
+/// Linux-personality domain holding no filesystem capability must fail every
+/// `openat`, and that test must fail if the personality ever acquires a
+/// fallback path". Since RFC 0032 and RFC 0033 the capabilities are
+/// `bin/linuxd`'s and not the hosted domain's, so the claim is about what a
+/// hosted program can reach through them: **with no directory, nothing; with
+/// one, what is inside it and nothing above it.** The adapter's own -- the
+/// generated `/proc/self` files -- need no capability, and one of them is the
+/// probe's control on both kinds of machine.
+///
+/// **The precondition is read, not assumed** -- the lesson `file_self_test`
+/// paid for, that "no filesystem service" and "a filesystem the adapter was
+/// not given" are different absences. With no filesystem service, every slot
+/// a file is reached through must be empty: the root, the lent page, the
+/// writable directory and the thirty-two file slots. With one, the root must
+/// be held. Any other state is a failure, named.
+fn confined_self_test(hhdm_base: u64, cpus: u32) -> bool {
+    use bhaskix_abi::adapter;
+    use core::sync::atomic::Ordering;
+
+    if cpus < 2 {
+        println!("\x1b[93m    linux confined skipped, needs a second cpu\x1b[0m");
+        return true;
+    }
+    let cpu = cpus.saturating_sub(1);
+
+    let machine_has_files = FS_ENDPOINT.load(Ordering::Acquire) != u64::MAX;
+    let adapter_id = syscall::ADAPTER_DOMAIN.load(Ordering::Relaxed);
+    if adapter_id == u32::MAX {
+        println!("\x1b[91m    linux confined FAILED: there is no adapter to ask\x1b[0m");
+        return false;
+    }
+    let file_slots = (adapter::FILE_FLOOR..=adapter::FILE_TOP).count();
+    let watched = 3 + file_slots;
+    let state = domain::with(domain::DomainId::from_u32(adapter_id), |owner| {
+        let mut held = 0usize;
+        let mut first = None;
+        for slot in [adapter::ROOT_DIR, adapter::LENT, adapter::WRITABLE_DIR]
+            .into_iter()
+            .chain(adapter::FILE_FLOOR..=adapter::FILE_TOP)
+        {
+            if owner.cspace.get(slot).is_some() {
+                held += 1;
+                first.get_or_insert(slot);
+            }
+        }
+        (owner.cspace.get(adapter::ROOT_DIR).is_some(), held, first)
+    });
+    let Some((root_held, held, first_held)) = state else {
+        println!("\x1b[91m    linux confined FAILED: the adapter's domain is gone\x1b[0m");
+        return false;
+    };
+    let with = match (machine_has_files, root_held) {
+        (false, _) if held > 0 => {
+            println!(
+                "\x1b[91m    linux confined FAILED: this machine has no filesystem service and \
+                 the adapter holds {held} of the {watched} slots a file is reached through, the \
+                 first slot {}\x1b[0m",
+                first_held.unwrap_or(0)
+            );
+            return false;
+        }
+        (false, _) => false,
+        (true, true) => true,
+        (true, false) => {
+            println!(
+                "\x1b[91m    linux confined FAILED: this machine has a filesystem and the adapter \
+                 was given no directory\x1b[0m"
+            );
+            return false;
+        }
+    };
+
+    CONFINED_HOLDS_DIRECTORY.store(u64::from(with), Ordering::Release);
+    CONFINED_REPORT_PA.store(0, Ordering::Release);
+    let Ok(realm) = domain::create("confined", domain::ResourceEnvelope::new()) else {
+        println!("\x1b[91m    linux confined FAILED: no domain\x1b[0m");
+        return false;
+    };
+    if !tag_linux(realm, "linux confined ") {
+        return false;
+    }
+    let options = sched::SpawnOptions::new()
+        .pinned()
+        .in_domain(realm.as_u32());
+    if sched::spawn_on_with(
+        cpu,
+        "confined",
+        ring3_confined,
+        hhdm_base,
+        hhdm_base,
+        options,
+    )
+    .is_err()
+    {
+        println!("\x1b[91m    linux confined FAILED: the probe would not spawn\x1b[0m");
+        retire_probe(realm);
+        return false;
+    }
+    // Words 0-7 the probe's own; 8 + n the answer to case n.
+    let mut words = [0u64; 8 + CONFINED_CASES.len()];
+    let mut finished = false;
+    for _ in 0..1000 {
+        let report_pa = CONFINED_REPORT_PA.load(Ordering::Acquire);
+        if let Some(read) = finished_report(hhdm_base, report_pa, &[0]) {
+            words = read;
+            finished = true;
+            break;
+        }
+        wait_millis(5);
+    }
+    if !finished {
+        // Read anyway: which answers arrived says where it stopped -- an
+        // `execve` that succeeded ends the probe without its last word.
+        let report_pa = CONFINED_REPORT_PA.load(Ordering::Acquire);
+        if report_pa != 0 {
+            for (index, word) in words.iter_mut().enumerate() {
+                *word = report_page_word(hhdm_base + report_pa, index);
+            }
+        }
+    }
+    retire_probe(realm);
+
+    let (saw_flag, mask, proc_read, proc_open, root_fd) = (
+        words[1],
+        words[2],
+        words[3] as i64,
+        words[4] as i64,
+        words[5] as i64,
+    );
+    let mut wrong = 0usize;
+    let (mut reached, mut refused) = (0usize, 0usize);
+    // By errno: ENOENT, EROFS, ENOTDIR, EBADF -- every refusal the table names.
+    let mut by_errno = [0usize; 4];
+    for (index, case) in CONFINED_CASES.iter().enumerate() {
+        let expected = if with { case.with } else { case.without };
+        let made = mask & (1 << index) != 0;
+        let answer = words[8 + index] as i64;
+        let right = match expected {
+            Reach::NotMade => !made,
+            Reach::Refused(errno) => made && answer == errno,
+            Reach::Reached => made && answer >= 0,
+        };
+        if right {
+            match expected {
+                Reach::Reached => reached += 1,
+                Reach::Refused(errno) => {
+                    refused += 1;
+                    if let Some(at) = [-2, -30, -20, -9].iter().position(|&e| e == errno) {
+                        by_errno[at] += 1;
+                    }
+                }
+                Reach::NotMade => {}
+            }
+            continue;
+        }
+        wrong += 1;
+        if made {
+            println!(
+                "\x1b[91m    linux confined   {} answered {}, and should be {expected}\x1b[0m",
+                case.call,
+                Answered(answer)
+            );
+        } else {
+            println!(
+                "\x1b[91m    linux confined   {} was not made, and should be {expected}\x1b[0m",
+                case.call
+            );
+        }
+    }
+    let root_fd_right = if with { root_fd >= 0 } else { root_fd == 0 };
+    let proc_right = proc_open >= 0 && proc_read > 0;
+    let [enoent, erofs, enotdir, ebadf] = by_errno;
+    if finished && saw_flag == u64::from(with) && wrong == 0 && root_fd_right && proc_right {
+        if with {
+            println!(
+                "    linux confined a hosted program reached what the adapter's directory holds, \
+                 {reached} of {reached} ways, and nothing above it or outside it: {refused} \
+                 refused ({enoent} ENOENT, {erofs} EROFS, {enotdir} ENOTDIR, {ebadf} EBADF); \
+                 /proc/self/status, which the adapter makes from its record, read {proc_read} \
+                 bytes"
+            );
+        } else {
+            println!(
+                "    linux confined the adapter holds no directory -- slots {}, {} and {} and its \
+                 {file_slots} file slots are empty -- and a hosted program was refused all \
+                 {refused} ways it tried to reach a file by name ({enoent} ENOENT, {erofs} \
+                 EROFS, {enotdir} ENOTDIR, {ebadf} EBADF); /proc/self/status, which the adapter \
+                 makes from its record, read {proc_read} bytes",
+                adapter::ROOT_DIR,
+                adapter::LENT,
+                adapter::WRITABLE_DIR
+            );
+        }
+        true
+    } else {
+        println!(
+            "\x1b[91m    linux confined FAILED: {} held; finished {finished}, the probe saw \
+             {saw_flag}; {wrong} of {} answered otherwise; the root's descriptor {}; \
+             /proc/self/status opened {}, read {proc_read}\x1b[0m",
+            if with { "a directory" } else { "no directory" },
+            CONFINED_CASES.len(),
+            Answered(root_fd),
+            Answered(proc_open)
+        );
+        false
+    }
+}
+
 /// The vfork-and-SIGCHLD probe -- RFC 0099. Assembled from
 /// [`tools/probes/linux-vfork-sigchld.s`](../../tools/probes/linux-vfork-sigchld.s)
 /// by [`tools/probe-bytes.sh`](../../tools/probe-bytes.sh): a vfork with Go's
@@ -32395,6 +33230,13 @@ fn user_shell(handoff: &Handoff) -> Result<(), &'static str> {
     // how the mistake was caught before a boot rather than after one.
     if !hosted_exec_self_test(hhdm, bhaskix_arch::percpu::online_count()) {
         println!("\x1b[91m    hosted exec    FAILED\x1b[0m");
+    }
+    // RFC 0005's rule 2, restated for the adapter: after every file probe,
+    // so their load-bearing order is left as it is, and with every grant the
+    // adapter will get already made -- the precondition is read off its
+    // capability space.
+    if !confined_self_test(hhdm, bhaskix_arch::percpu::online_count()) {
+        println!("\x1b[91m    linux confined FAILED\x1b[0m");
     }
     // **After both probes, and that is the whole reason it is here** rather
     // than with the other personality reports in `kernel_main`: those run

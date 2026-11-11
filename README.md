@@ -339,7 +339,8 @@ Builds on **stable Rust** — no nightly, no `#![feature]` anywhere in the tree
 
 `make test` runs, cheapest first, so a trivial mistake fails in seconds rather
 than after a QEMU boot: `rustfmt`; `clippy` on both the freestanding and host
-targets; **1,538 host tests** (recounted 2026-11-05 from a `make test` run on
+targets; **1,539 host tests** (recounted 2026-11-11 from a `make test` run on the tree of RFC
+0005's rule 2 test, where this line read 1,538 from 2026-11-05's run on
 `72f181f`, RFC 0100 step 2, where this line still read 1,450 from 2026-10-29's
 run on `0597e9a` and the website showed 1,515; 1,448 earlier that day on `7267ed9`, which the website showed while
 this line still read 1,414 from `18985db`; 1,411 on 2026-10-20 on `61bb353`, 1,407 earlier that day on `a8c0df0`, and 1,339 from 2026-10-08, and 1,010, recounted 2026-08-24 from a
@@ -357,8 +358,9 @@ triggers six CPU exceptions and checks each is reported rather than
 triple-faulting. Any `FAILED` the kernel prints fails the run, whether or not a
 gate was looking for that particular one.
 
-That is ~~**1,262 assertions**~~ ~~**2,716 assertions**~~ **2,718 assertions**, counted
-2026-11-06 on the suite of `5930905` -- whose own table gate added two lines; 2,716 was all seven
+That is ~~**1,262 assertions**~~ ~~**2,716 assertions**~~ ~~**2,718 assertions**~~ **2,760
+assertions**, counted 2026-11-11 on the suite of the tree that added RFC 0005's rule 2 test;
+2,718 was 2026-11-06's, on the suite of `5930905` -- whose own table gate added two lines; 2,716 was all seven
 full suites of 2026-11-05 before it, and 1,262 this line's from 2026-08-24, which nothing
 recounted for ten weeks -- on a definition written down at last on 2026-08-24: every line a harness prints through its own success marker during
 one `make test`, counted once per run — so a gate that answers on five
@@ -369,7 +371,7 @@ yourself:
 make test | sed 's/\x1b\[[0-9;]*m//g' | grep -cE '^ *ok +'
 ```
 
-[TRACKER.md](TRACKER.md)'s suite cell counts **2,664** for the same runs, by a narrower rule it
+[TRACKER.md](TRACKER.md)'s suite cell counts ~~**2,664**~~ **2,706** for the same runs, by a narrower rule it
 states -- `ok ` at a line's very start -- which leaves out the lines `make gates` prints
 indented: 52 on 2026-11-05, 54 since the table gate. Both are right by their own rule; this one is the command above.
 

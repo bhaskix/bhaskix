@@ -3819,6 +3819,53 @@ else
     status=1
 fi
 
+# RFC 0005's rule 2, restated for the adapter (2026-11-11): what a hosted
+# program can reach by name is what `bin/linuxd` was given, and nothing else.
+# The RFC asked for "a domain holding no filesystem capability" to fail every
+# `openat`, and for the test to fail if the personality ever acquired a
+# fallback path; the capabilities are the adapter's now, so the kernel reads
+# the adapter's capability space first and the probe is held to one of two
+# tables:
+#
+#   * **no directory held** -- the ordinary case here, and the kernel saw every
+#     slot a file is reached through empty -- and all 25 calls refused, each
+#     with its own errno, not only a negative number;
+#   * **a directory held** -- the disk lanes -- and the 16 calls that need it
+#     reached, which is the probe's control, while the 13 that name what is above
+#     or outside `sub`, or go through a descriptor that is no directory, are
+#     refused.
+#
+# Names relative to a directory descriptor are among them since the same day:
+# `openat` ignored its descriptor and resolved every relative name in the root,
+# so a name looked for in `/tmp` was found one level up.
+#
+# The /proc read is the control on both: the same calls, made the same way,
+# succeed on the one file the adapter makes itself. Each table's line is only
+# accepted beside the boot's own account of its filesystem, so a kernel that
+# chose the wrong table cannot pass. The counts are the table's and are
+# matched whole.
+if grep -qE "linux confined +the adapter holds no directory -- slots 22, 23 and 26 and its 32 file slots are empty -- and a hosted program was refused all 25 ways it tried to reach a file by name \(17 ENOENT, 6 EROFS, 1 ENOTDIR, 1 EBADF\); /proc/self/status, which the adapter makes from its record, read [1-9][0-9]* bytes" "$LOG"; then
+    if grep -qF "fs domain      no block service on this machine" "$LOG"; then
+        pass "the adapter holds no directory, and a hosted program reached no file by any of 25 calls"
+    else
+        fail "the confinement probe ran its no-directory table on a machine that did not say it had no filesystem"
+        status=1
+    fi
+elif grep -qE "linux confined +a hosted program reached what the adapter's directory holds, 16 of 16 ways, and nothing above it or outside it: 13 refused \(9 ENOENT, 2 EROFS, 1 ENOTDIR, 1 EBADF\); /proc/self/status, which the adapter makes from its record, read [1-9][0-9]* bytes" "$LOG"; then
+    if grep -qF "linux domain   holds a directory now" "$LOG"; then
+        pass "a hosted program reached what the adapter's directory holds and nothing above it"
+    else
+        fail "the confinement probe ran its directory table on a machine whose adapter never said it held one"
+        status=1
+    fi
+elif grep -qE "linux confined +skipped, needs a second cpu" "$LOG"; then
+    pass "the confinement probe needs a second cpu, and said so"
+else
+    fail "a hosted program's reach was not what the adapter holds -- the lines below say which call"
+    grep -aE "linux confined" "$LOG" || true
+    status=1
+fi
+
 # RFC 0005 step 8: a hosted program lists a directory, stats a file and seeks
 # inside it.
 #

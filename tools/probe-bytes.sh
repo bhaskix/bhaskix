@@ -18,6 +18,13 @@
 # taken from the assembled binary, `objdump` supplies only the comments, and
 # the two are asserted equal before anything is printed.
 #
+# **Data after a `probe_data:` label is data** (2026-11-11), because `objdump`
+# cannot transcribe it: it decodes a string as instructions and folds a run of
+# zero bytes into `...`, so the first probe with paths in it came out fifteen
+# bytes short and was refused by the assertion below. From that label on, each
+# label is one row -- its bytes from the binary, and a comment saying what they
+# are -- and the same assertion covers the whole.
+#
 #   tools/probe-bytes.sh tools/probes/linux-lister.s LIST_PROBE_CODE
 set -euo pipefail
 
@@ -39,16 +46,29 @@ if readelf -r "$work/probe.o" | grep -q 'R_X86_64'; then
 fi
 objcopy -O binary --only-section=.text "$work/probe.o" "$work/probe.bin"
 objdump -d "$work/probe.o" > "$work/probe.dis"
+nm -n "$work/probe.o" > "$work/probe.syms"
 
-CONST_NAME="$name" python3 - "$work/probe.bin" "$work/probe.dis" <<'PY'
+CONST_NAME="$name" python3 - "$work/probe.bin" "$work/probe.dis" "$work/probe.syms" <<'PY'
 import os, re, sys, pathlib
 
 real = pathlib.Path(sys.argv[1]).read_bytes()
+
+# The labels from `probe_data` on, grouped by address: two labels at one
+# address are one row.
+labels = {}
+for line in pathlib.Path(sys.argv[3]).read_text().splitlines():
+    parts = line.split()
+    if len(parts) == 3 and parts[1] in "tT":
+        labels.setdefault(int(parts[0], 16), []).append(parts[2])
+data_at = next((at for at, names in labels.items() if "probe_data" in names), len(real))
+
 rows, pending = [], None
 for line in pathlib.Path(sys.argv[2]).read_text().splitlines():
     m = re.match(r"\s+([0-9a-f]+):\t((?:[0-9a-f]{2} )+)\s*(.*)$", line)
     if not m:
         continue
+    if int(m.group(1), 16) >= data_at:
+        break
     byts, mnem = m.group(2).split(), m.group(3).strip()
     # A continuation line: bytes with no mnemonic, belonging to the entry above.
     if mnem == "":
@@ -57,6 +77,25 @@ for line in pathlib.Path(sys.argv[2]).read_text().splitlines():
         continue
     pending = (list(byts), re.sub(r"\s+", " ", mnem))
     rows.append(pending)
+
+
+def says(names, chunk):
+    """A data row's comment: its labels, and the string or zeros it holds."""
+    named = ", ".join(n for n in names if n != "probe_data") or "probe_data"
+    if chunk and all(b == 0 for b in chunk):
+        return f"{named}: {len(chunk)} zero bytes"
+    text = chunk.rstrip(b"\0")
+    if chunk.endswith(b"\0") and all(0x20 <= b < 0x7F and b not in b'"\\' for b in text):
+        return f'{named}: "{text.decode()}"'
+    return f"{named}: {len(chunk)} bytes"
+
+
+starts = sorted(at for at in labels if at >= data_at) if data_at < len(real) else []
+for index, at in enumerate(starts):
+    end = starts[index + 1] if index + 1 < len(starts) else len(real)
+    chunk = real[at:end]
+    if chunk:
+        rows.append(([f"{b:02x}" for b in chunk], says(labels[at], chunk)))
 
 built = bytes(int(b, 16) for bs, _ in rows for b in bs)
 assert built == real, (

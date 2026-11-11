@@ -96,9 +96,11 @@ without the workload; it is no longer an acceptance gate.
   ~~**a fuzz target over the argument decoder** (the
   testing plan; the two targets that exist cover the `dirent` encoder and `sockaddr` parsing)~~
   (**done 2026-10-29**: `linux_decoder`, which found a nucleus panic on the way -- TRACKER §3),
-  **rule 2's negative test restated for the adapter** (the capabilities are the adapter's, not
+  ~~**rule 2's negative test restated for the adapter** (the capabilities are the adapter's, not
   the hosted domain's, so "a domain holding no filesystem capability" is not the shape any
-  more), and **the 2× comparison with Linux** (Performance implications) → `TRACKER.md` rows.
+  more)~~ (**done 2026-11-11**: `linux confined`, on every boot -- see Security implications
+  below, and TRACKER §7), and **the 2× comparison with Linux** (Performance implications) →
+  `TRACKER.md` rows.
 - **The confused-deputy rule is not met, by design, and that is accepted with its price**: one
   `bin/linuxd` holds directory, network and `tcpd` authority for every hosted process —
   [RFC 0031](0031-linux-compatibility-as-an-adapter.md)'s I5 departure, priced by
@@ -1282,6 +1284,37 @@ own CSpace. Rule 2 above is the invariant. It needs an explicit negative test:
 a Linux-personality domain holding *no* filesystem capability must fail every
 `openat`, and that test must fail if the personality ever acquires a fallback
 path.
+
+> **Restated for the adapter, and built, 2026-11-11.** Since RFC 0032 and RFC
+> 0033 the capabilities are `bin/linuxd`'s, not the hosted domain's, so the
+> sentence above is now about what a hosted program can reach *through* them:
+> when the adapter holds no directory, nothing; when it holds one, what is
+> inside it and nothing above it. `linux confined` runs on every boot. The
+> kernel first reads the adapter's capability space -- with no filesystem
+> service, the root, the lent page, the writable directory and the thirty-two
+> file slots must all be empty -- and then one hosted program makes every call
+> the adapter answers that reaches a file by name: `open`, `openat` relative and
+> through `AT_FDCWD` and through directory descriptors, `stat`, `lstat`, `newfstatat`,
+> `access`, `execve`, `mkdir`, `unlink`, `rmdir`, with names inside the grant,
+> above it (`../greeting`, `/greeting`, `/sub/inner`) and beside it. Each must
+> answer exactly the errno a table in the kernel gives, and the generated
+> `/proc/self/status` -- the adapter's own, needing no capability -- must open
+> and read, so the refusals are not a probe that cannot make calls. **It failed
+> on purpose** when the adapter was given a fallback that served a name from
+> its `/proc` generator, the shape this paragraph warns of.
+>
+> Where a directory is held it was also made to fail once by granting the
+> adapter the disk's root in place of `sub`: `greeting`, one level up, was
+> opened, `lstat`ed and nearly `execve`d, and the line went red.
+>
+> **And it was red before it was green, four ways, each seen on a boot**: the
+> adapter answered `open("/")`, `stat("/")` and `access("/")` with success on a
+> machine with no filesystem -- it handed out a descriptor for an empty slot;
+> `unlink` under `/tmp` with `EIO` where `mkdir` says `EROFS`; `open(".")` with
+> `ENOENT` on a machine *with* one, because `.` went to the filesystem service
+> as a name; and `openat` ignored its directory descriptor, so a name looked for
+> in `/tmp` was found in the root -- the wrong file, though one inside the
+> grant. All four fixed the same day (TRACKER §3).
 
 **New attack surface: yes, and it is the largest in the project.** Several
 hundred entry points taking pointers and lengths from a process whose entire

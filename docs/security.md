@@ -383,6 +383,19 @@ We will not pretend to cover these. Each has a note on whether it becomes in-sco
 > and cannot name a directory it was not given — a hosted process's `/` *is* that capability, which
 > is `chroot` by construction rather than by check.
 >
+> **Tested on every boot since 2026-11-11, and not before.** `linux confined` -- RFC 0005's rule 2,
+> restated for the adapter -- reads the adapter's capability space and then holds one hosted
+> program to it: with no directory held, every call that reaches a file by name is refused with the
+> errno Linux gives; with one, what is inside it is reached and nothing above it is. **The sentence
+> above was not quite true until that day**: on a machine with no filesystem at all, the adapter
+> answered `open("/")`, `stat("/")` and `access("/")` with success -- a descriptor for an empty
+> slot, presented as a directory. Nothing could be read through it, so no authority leaked; but a
+> program was told something that was not so, and rule 2's test would have been red. And `openat`
+> ignored its directory descriptor, resolving every relative name in the root: a name looked for in
+> `/tmp` was found one level up -- the wrong file, though never one outside the grant. Both fixed
+> the same day (TRACKER §3), and the test went red, as it should, when the adapter was given the
+> disk's root in place of `sub`.
+>
 > The list, in full, as of 2026-08-20: one endpoint, three pages, a write-only console, sixteen
 > notifications, `DomainControl` within a sixteen-domain envelope, one directory, and a supervisor
 > handle per hosted domain. **Every increase on that list is a decision, and each one is recorded in

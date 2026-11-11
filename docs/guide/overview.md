@@ -19,9 +19,10 @@ how it differs from what you may know.
 ## What it does today
 
 Each of these is checked on every boot by the machine itself, in the boot
-report, or by the project's test suite (2,718 checks and 1,538 host tests in
-one run on 2026-11-06, the checks counted as the README counts them; 2,314 and
-1,450 on 2026-10-29, by the tracker's narrower count of `ok` lines):
+report, or by the project's test suite (2,760 checks and 1,539 host tests in
+one run on 2026-11-11, the checks counted as the README counts them; 2,718 and
+1,538 on 2026-11-06; 2,314 and 1,450 on 2026-10-29, by the tracker's narrower
+count of `ok` lines):
 
 - **It boots** on UEFI and BIOS, through Limine or through its own UEFI loader,
   `bhaskixboot.efi`, which also checks a signature over what it starts.
